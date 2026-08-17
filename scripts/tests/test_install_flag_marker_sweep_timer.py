@@ -9,8 +9,11 @@ touched. Unlike the trickle-timer installer, this job is a single
 non-templated dark_factory instance (no project_id argument, no per-project
 config resolution), so the driver has no
 INSTALL_TRICKLE_TIMER_PYTHON/LEGIBILITY_SEARCH_ROOTS equivalent. The fake
-systemctl additionally handles `start <unit>` (always succeeds) since this
-installer, unlike install-trickle-timer.sh, also kicks an immediate
+systemctl additionally handles `start <unit>` (records the call and
+succeeds by default; set FAKE_SYSTEMCTL_FAIL_START=1 to make it fail
+instead, emitting systemd's own wording, so tests can pin that a failing
+one-time drain kick doesn't prevent -- or hide -- the self-verify) since
+this installer, unlike install-trickle-timer.sh, also kicks an immediate
 one-time drain of the current backlog.
 """
 from __future__ import annotations
@@ -36,11 +39,13 @@ _FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 
 Records every invocation (minus `--user`) into a JSON state file at
 $FAKE_SYSTEMCTL_STATE. `enable --now <unit>` marks each non-flag arg as an
-enabled unit; `start <unit>` is recorded and always succeeds (the immediate
-one-time drain kick); `list-timers` echoes back one line per *.timer unit
-enabled so far THIS RUN, unless FAKE_SYSTEMCTL_OMIT_LIST_TIMERS=1 --
-simulating a self-verify failure where `enable` nominally succeeded but the
-unit is absent from `list-timers`.
+enabled unit; `start <unit>` is recorded and succeeds (the immediate
+one-time drain kick), unless FAKE_SYSTEMCTL_FAIL_START=1 -- simulating a
+failed drain kick: the call is still recorded, then systemd's own failure
+wording is printed to stderr and the process exits non-zero; `list-timers`
+echoes back one line per *.timer unit enabled so far THIS RUN, unless
+FAKE_SYSTEMCTL_OMIT_LIST_TIMERS=1 -- simulating a self-verify failure where
+`enable` nominally succeeded but the unit is absent from `list-timers`.
 """
 import json
 import os
@@ -83,6 +88,13 @@ def main(argv):
 
     if verb == "start":
         _save(state)
+        if os.environ.get("FAKE_SYSTEMCTL_FAIL_START") == "1":
+            unit = rest[0] if rest else "<unit>"
+            print(
+                f'Job for {unit} failed. See "journalctl -xeu {unit}" for details.',
+                file=sys.stderr,
+            )
+            return 1
         return 0
 
     if verb == "list-timers":
@@ -124,6 +136,12 @@ def _systemctl_calls(tmp_path):
     if not state_path.is_file():
         return []
     return json.loads(state_path.read_text())["calls"]
+
+
+def _call_index(calls, call):
+    """Index of *call* within *calls* -- used to assert the relative
+    ordering of recorded systemctl invocations."""
+    return calls.index(call)
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +199,15 @@ def test_install_copies_units_enables_timer_and_kicks_drain(tmp_path):
     assert ["daemon-reload"] in calls, f"calls={calls!r}"
     assert ["enable", "--now", TIMER_NAME] in calls, f"calls={calls!r}"
     assert ["start", SERVICE_NAME] in calls, f"calls={calls!r}"
+    assert ["list-timers", "--all"] in calls, f"calls={calls!r}"
+    assert _call_index(calls, ["list-timers", "--all"]) < _call_index(
+        calls, ["start", SERVICE_NAME]
+    ), (
+        "Expected the list-timers self-verify to run BEFORE the one-time "
+        "drain kick (systemctl start): the drain runs a blocking "
+        "Type=oneshot unit, so a self-verify gated behind it would never "
+        f"run if the drain kick failed; calls={calls!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -205,4 +232,38 @@ def test_install_fails_loud_when_timer_absent_from_list_timers(tmp_path):
     assert TIMER_NAME in result.stderr, (
         f"Expected stderr to name the missing timer unit {TIMER_NAME!r}; "
         f"stderr={result.stderr!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 4061 step-1: RED -- the self-verify must run before the one-time
+# drain kick, and must still run (and stay loud) when the drain kick fails
+# ---------------------------------------------------------------------------
+
+def test_self_verify_runs_even_when_drain_kick_fails(tmp_path):
+    xdg_config = tmp_path / "xdg-config"
+
+    result = _run_script(
+        tmp_path,
+        env={
+            "XDG_CONFIG_HOME": str(xdg_config),
+            "FAKE_SYSTEMCTL_FAIL_START": "1",
+        },
+    )
+
+    calls = _systemctl_calls(tmp_path)
+    assert ["list-timers", "--all"] in calls, (
+        f"Expected the list-timers self-verify to run even though the "
+        f"drain kick (systemctl start) failed; calls={calls!r}"
+    )
+    assert ["start", SERVICE_NAME] in calls, f"calls={calls!r}"
+    assert _call_index(calls, ["list-timers", "--all"]) < _call_index(
+        calls, ["start", SERVICE_NAME]
+    ), (
+        "Expected the list-timers self-verify to precede the (failing) "
+        f"one-time drain kick; calls={calls!r}"
+    )
+    assert result.returncode != 0, (
+        f"Expected a failing drain kick to still exit non-zero; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
