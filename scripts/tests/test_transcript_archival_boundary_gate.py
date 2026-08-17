@@ -49,6 +49,7 @@ sys.path wiring is what makes ``import gc_agent_transcripts`` and
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import date
 from pathlib import Path
@@ -209,3 +210,62 @@ class TestE5MiningEnumeratesTheArchive:
                 project_root, cfg.agent_transcript_roots
             ),
         )
+
+    def test_residual_gz_is_not_enumerated_but_is_counted_and_announced(
+        self, tmp_path, caplog
+    ):
+        """RESIDUAL-GZ CONTRACT — the honest successor to Appendix B's "the
+        archived gz transcript" wording for E5.
+
+        Task 3618 dropped gzip from the archive, but the destructive migration
+        sweep that converts the EXISTING corpus
+        (``scripts/migrate_transcript_archive_gunzip.py --apply``) is a
+        human-operated step. Between that merge and the operator's run, every
+        pre-3618 ``.jsonl.gz`` is simply not enumerated — silently absent from
+        the mined corpus. "Accepted" must not mean "invisible" (INV-4), so the
+        gap announces itself: counted by :func:`count_residual_gz` (the
+        machine-readable half) and one greppable WARNING per walk naming the
+        migration script (the human half). Nothing here pins a gunzip
+        round-trip, because there is no longer one to pin; this is where the gz
+        dimension of the matrix now lives.
+        """
+        project_root, archive_root, archived = _archive_a_real_session(tmp_path)
+        cfg = legibility_config.load_config(SHIPPED_LEGIBILITY_YAML)
+        resolved = inventory.resolve_agent_transcript_roots(
+            project_root, cfg.agent_transcript_roots
+        )
+        fake_projects_root = tmp_path / 'claude-projects'
+        fake_projects_root.mkdir()
+
+        # A pre-3618 archive sitting beside its post-3618 successor.
+        residual = archived.with_name(f'{SESSION_SID}-older.jsonl.gz')
+        residual.write_bytes(b'\x1f\x8b\x08\x00 not actually read by anyone ')
+
+        with caplog.at_level(logging.WARNING, logger='legibility.inventory'):
+            records = inventory.enumerate_sessions(
+                fake_projects_root,
+                cfg.cwd_prefixes,
+                SESSION_DATE,
+                agent_transcript_roots=resolved,
+            )
+
+        # NOT enumerated — the walk is a bare rglob('*.jsonl') and stays one.
+        assert [r.path for r in records] == [archived]
+
+        # ...but COUNTED (machine-readable half).
+        assert inventory.count_residual_gz(archive_root) == 1
+
+        # ...and ANNOUNCED exactly once per walk, naming the migration script
+        # so the line is actionable rather than merely alarming (human half).
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'legibility.inventory' and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'scripts/migrate_transcript_archive_gunzip.py' in message
+        assert str(archive_root) in message
+
+        # The signal disappears on its own once the migration has run.
+        residual.unlink()
+        assert inventory.count_residual_gz(archive_root) == 0
