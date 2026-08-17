@@ -3488,8 +3488,12 @@ def test_main_lease_claim_on_free_name_acquires_and_prints_decision_token(
     # reads as "someone else has it"). `none` is the third token in the
     # vocabulary, and it is pinned here because nothing else exercises it.
     assert lines[0] == 'decision=acquired'
-    assert lines[-1] == 'holder_liveness=none'
-    assert len(lines) == 3
+    assert lines[2] == 'holder_liveness=none'
+    # Task 4248 appended a `slug=` line after it (pinned in that task's own
+    # section); anchored by INDEX here so this keeps asserting the position of
+    # `holder_liveness`, which is what this test is about, rather than silently
+    # re-aiming at whatever line happens to be last.
+    assert len(lines) == 4
     assert sr.lease_path_for_name('watcher-df', root=tmp_path).is_file()
 
 
@@ -3935,6 +3939,109 @@ def test_main_lease_claim_explicit_slug_still_overrides_the_derived_default(
     # An explicit --slug remains a deliberate operator override, never shadowed.
     lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
     assert sr.LeaseHolder.from_json(lease_path.read_text()).session_slug == 'watcher-df-OPERATOR'
+
+
+# --- lease-claim's `slug=` diagnostic line (task 4248) ---------------------
+#
+# ADDITIVE and LAST, under 3994's discipline: `decision=` stays line 1 and the
+# human message line 2, so a not-yet-reloaded skill parser reading only the
+# first two lines is unaffected. What the line is FOR, now that the skills no
+# longer pass `--slug`: it makes the CLI-derived identity LEGIBLE, so an agent
+# can cross-check it against `lease-show`'s holder_slug when a heartbeat comes
+# back `result=refused`. It is a diagnostic, NOT a value to thread into the
+# next call -- a shell variable cannot survive to the next Claude Code Bash
+# tool call, which is exactly why the derivation had to move into the CLI.
+
+
+def test_main_lease_claim_prints_the_derived_slug_last_on_the_acquired_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'decision=acquired'
+    assert lines[2] == 'holder_liveness=none'
+    assert lines[3] == f'slug=watcher-df-{_DEAD_PID}'
+    assert len(lines) == 4
+
+
+def test_main_lease_claim_slug_line_names_this_caller_not_the_holder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """On a stand-down the `slug=` line is about US; `holder_liveness=` is about THEM.
+
+    Confusing the two would make the line actively misleading in the one
+    situation it exists for — reconciling a refusal against `lease-show`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli(slug='watcher-df-OTHER', pid=_DEAD_PID)
+    capsys.readouterr()
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'decision=stand-down'
+    assert lines[2] in ('holder_liveness=held', 'holder_liveness=orphaned')
+    assert lines[3] == f'slug=watcher-df-{os.getpid()}'
+    assert 'watcher-df-OTHER' not in lines[3]
+
+
+def test_main_lease_claim_prints_the_slug_line_even_when_it_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The fail-open path keeps its 3994 silence about the HOLDER, but not about US.
+
+    `holder_liveness=` stays ABSENT on a substrate fault, deliberately: we know
+    nothing about a holder and must not assert one either way. The slug is a
+    different fact — it is this caller's own derived identity, which the fault
+    did not make unknown — so it is still emitted, and is in fact most useful
+    here, where the claim's outcome is least certain.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    def _boom(*_args: object, **_kwargs: object) -> sr.LeaseClaim:
+        raise OSError('lease substrate on fire')
+
+    monkeypatch.setattr(sr, 'claim_lease', _boom)
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'decision=proceed'
+    assert lines[2] == f'slug=watcher-df-{_DEAD_PID}'
+    assert not any(line.startswith('holder_liveness=') for line in lines)
+
+
+def test_main_lease_claim_echoes_an_explicit_slug_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-OPERATOR'])
+
+    assert rc == 0
+    # The line reports the slug ACTUALLY claimed with, not the one that would
+    # have been derived — otherwise it would misreport the override path.
+    assert capsys.readouterr().out.splitlines()[-1] == 'slug=watcher-df-OPERATOR'
 
 
 # --- CLI ownership on the mutating verbs (task 3994 defect 1) -------------
