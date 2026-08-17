@@ -186,22 +186,6 @@ class TestWriteHeartbeat:
 
         assert result == tmp_path / 'orchestrator-reify.service.json'
 
-    def test_empty_unit_falls_back_to_deterministic_filename(self, tmp_path):
-        """unit='' never produces a file literally named '.json'; falls back deterministically."""
-        payload = build_heartbeat_payload(
-            unit='',
-            merge_idle=True,
-            depth=0,
-            queue_empty=True,
-            ts_epoch=555.0,
-        )
-
-        result = write_heartbeat(tmp_path, '', payload)
-
-        assert result.name != '.json'
-        assert result.exists()
-        assert result == tmp_path / 'unknown-unit.json'
-
 
 class TestEmptyUnitIsRefused:
     """An empty ``ORCH_UNIT`` must never produce a heartbeat file (task 3951).

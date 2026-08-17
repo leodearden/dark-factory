@@ -30,10 +30,6 @@ from shared import safe_io
 # own (possibly foreign) config.project_root.
 DEFAULT_FLEET_DIR = Path('/home/leo/src/dark-factory/data/fleet')
 
-# Deterministic fallback filename stem for an empty/unresolved unit, so a
-# heartbeat is never written to a file literally named ``.json``.
-_UNKNOWN_UNIT_STEM = 'unknown-unit'
-
 
 def resolve_fleet_dir(env: Mapping[str, str] | None = None) -> Path:
     """Resolve the fleet-common heartbeat directory.
@@ -79,20 +75,41 @@ def write_heartbeat(fleet_dir: Path, unit: str, payload: Mapping[str, Any]) -> P
 
     Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223), which
     creates missing parent directories and does the tmp + ``os.replace`` dance
-    so concurrent readers (γ, ε) never observe a partial write. An
-    empty/unresolved ``unit`` falls back to a deterministic
-    ``unknown-unit.json`` filename rather than a file literally named
-    ``.json``.
+    so concurrent readers (γ, ε) never observe a partial write.
+
+    An empty or whitespace-only ``unit`` raises :class:`ValueError` BEFORE any
+    filesystem work, so a writer that reached this point without a real unit
+    name creates nothing at all (task 3951).  It used to fall back to a
+    deterministic ``unknown-unit.json``; nothing ever read that file
+    (``scripts/drain_check.py`` addresses heartbeats by name via
+    ``heartbeat_path(fleet_dir, unit)`` and never enumerates the directory), so
+    the fallback bought no consumer anything while turning a real
+    misconfiguration into a plausible-looking file in a machine-global,
+    cross-project directory.  A whitespace-only unit is REJECTED, never
+    ``.strip()``ed into a "fixed" name: silently repairing a malformed unit name
+    is the same silent corruption this guard exists to end.
 
     ``mode`` is deliberately left at the helper's umask default rather than
     narrowed: these heartbeats are read by other processes. Exceptions
-    propagate — this site has no fail-open boundary.
+    propagate — this site has no fail-open boundary.  The sole production
+    caller, ``Harness._write_merge_heartbeat``, has its own ``except
+    Exception`` (a heartbeat write must never stop the run loop), so in
+    production this raise surfaces as a logged WARNING rather than a crash —
+    while the corruption is prevented either way.
 
     Returns the final on-disk ``Path``.
     """
     fleet_dir = Path(fleet_dir)
-    stem = unit if unit else _UNKNOWN_UNIT_STEM
-    path = fleet_dir / f'{stem}.json'
+    if not unit or not unit.strip():
+        raise ValueError(
+            f'refusing to write a heartbeat with no unit name (unit={unit!r}) '
+            f'into {fleet_dir}. ORCH_UNIT is unset or blank in the process '
+            'calling Harness._write_merge_heartbeat; set it to this '
+            'orchestrator\'s systemd unit (e.g. orchestrator-dark-factory.service). '
+            'Writing anyway would put an unattributable file in a '
+            'machine-global, cross-project fleet directory.'
+        )
+    path = fleet_dir / f'{unit}.json'
     safe_io.atomic_write_text(
         path,
         json.dumps(payload),
