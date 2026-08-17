@@ -62,6 +62,7 @@ PURE_STDLIB_LEAVES = (
     'agent_result',
     'branch_names',
     'config_dir',
+    'git_async',
     'locking',
     'mcp_envelope',
     'mcp_idempotency',
