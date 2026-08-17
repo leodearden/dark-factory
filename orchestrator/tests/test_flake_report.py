@@ -827,14 +827,23 @@ class TestFlakeLedgerCommand:
     """`orchestrator flake-ledger` end to end.  All sync — the report path has no async."""
 
     def _project(self, tmp_path: Path, *, seed: bool = True) -> tuple[Path, Path]:
-        """Write a config YAML pointing at a tmp project; optionally seed its ledger."""
+        """Write a config YAML pointing at a tmp project; optionally seed its ledger.
+
+        The project root IS ``tmp_path``, not a ``tmp_path/project`` subdir.  conftest's
+        autouse ``_isolate_orch_config`` pins ``ORCH_PROJECT_ROOT`` to ``tmp_path``, and
+        ``settings_customise_sources`` (config.py:4635) orders ``env_settings`` AHEAD of
+        the YAML source — so a nested root would be silently overridden and the command
+        would resolve its ledger path somewhere this fixture never seeded.  Writing the
+        same value into the YAML keeps config and env in agreement, which is exactly the
+        arrangement that fixture's docstring prescribes for config-loading tests.  Do
+        not unset the env var: the pin is a deliberate isolation guard that stops tests
+        writing scheduler state into the live tree.
+        """
         import yaml
 
-        project = tmp_path / 'project'
-        project.mkdir()
-        # The config lives AT the project root — CLAUDE.md's canonical
-        # <project_root>/dark-factory-orchestrator.yaml layout, which is also what
-        # load_config resolves project_root from.
+        project = tmp_path
+        # Config at the project root — CLAUDE.md's canonical
+        # <project_root>/dark-factory-orchestrator.yaml layout.
         cfg = project / 'dark-factory-orchestrator.yaml'
         cfg.write_text(yaml.dump({'project_root': str(project)}))
         if seed:
