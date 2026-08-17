@@ -414,6 +414,27 @@ exists to fix, moved one layer up.
 """
 
 
+# Page/census pairs for the paginated whole-graph reads. Each pair shares an
+# IDENTICAL MATCH/WHERE so the two numbers describe the same population and
+# are therefore directly comparable.
+#
+# The ORDER BY must be a TOTAL order over ROWS, not merely over the entity or
+# edge: the undirected edge pattern yields two rows per edge, so `e.uuid`
+# alone would leave that pair free to reshuffle across a page boundary — and a
+# reshuffle at a boundary drops rows permanently and silently.
+_ALL_VALID_EDGES_MATCH = (
+    'MATCH (n:Entity)-[e:RELATES_TO]-() '
+    'WHERE e.invalid_at IS NULL '
+)
+_ALL_VALID_EDGES_PAGE_TEMPLATE = (
+    _ALL_VALID_EDGES_MATCH
+    + 'RETURN n.uuid, e.uuid, e.fact, e.name '
+    'ORDER BY e.uuid, n.uuid '
+    'SKIP {skip} LIMIT {limit}'
+)
+_ALL_VALID_EDGES_CENSUS = _ALL_VALID_EDGES_MATCH + 'RETURN count(*)'
+
+
 @dataclass(frozen=True)
 class PagedRead:
     """Result of a paginated read: the rows, plus whether they are all of them.
@@ -1794,51 +1815,39 @@ class GraphitiBackend:
         return [row[0] for row in (result.result_set or [])]
 
     @_canonicalize_group_args
-    async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
-        """Return all currently-valid RELATES_TO edges grouped by entity UUID.
+    async def enumerate_all_valid_edges(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE
+    ) -> tuple[dict[str, list[EdgeDict]], PagedRead]:
+        """Paginated variant of get_all_valid_edges that also reports completeness.
 
-        Bulk variant of get_valid_edges_for_node that issues a single Cypher query
-        instead of O(N) per-entity round-trips.  The undirected MATCH pattern causes
-        each directed edge to appear under both its source and target entity: for a
-        directed A→B edge, traversal matches it from A's side (row: A.uuid, e.uuid)
-        and from B's side (row: B.uuid, e.uuid) — two genuinely distinct rows because
-        n.uuid differs.
-
-        Deduplicates in Python, keyed on (n.uuid, e.uuid). RELATES_TO edge uuids
-        are unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
-        redirect_node_edges; task 2210 W6-epsilon repaired legacy dup-uuid edges),
-        so keying on the (entity, edge-uuid) pair is equivalent to the prior
-        element-identity dedup: it preserves the intended double-attribution (each
-        directed edge appears once under each endpoint entity, as distinct
-        (n.uuid, e.uuid) pairs) and still collapses the undirected self-loop
-        double-match (A→A edges, where both traversal directions yield the
-        identical (n.uuid, e.uuid) pair).
-
-        Uses ro_query since no writes are performed.
+        Same grouping and dedup semantics as get_all_valid_edges (which is a
+        thin shim over this method); the difference is that the completeness
+        of the underlying enumeration is returned as a first-class value
+        instead of only reaching a log line.
 
         Args:
             group_id: Project graph to query.
+            page_size: Rows per page. Must stay strictly below the server's
+                result-set cap — see _paged_ro_query.
 
         Returns:
-            Dict mapping entity UUID → list of edge dicts with keys: uuid, fact, name.
-            fact and name default to empty string when the property is NULL.
-            Each directed edge appears under both its source and target entity UUID
-            (double-attribution from the undirected MATCH pattern).
-
-        Note:
-            Using a directed pattern (n:Entity)-[e:RELATES_TO]->() would give
-            single-appearance semantics per edge if ever needed.
+            (grouped, paged) where *grouped* is the same dict
+            get_all_valid_edges returns and *paged* is the PagedRead carrying
+            ``complete``/``rows_seen``/``expected_rows``/``reason``.
         """
         graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH (n:Entity)-[e:RELATES_TO]-() '
-            'WHERE e.invalid_at IS NULL '
-            'RETURN n.uuid, e.uuid, e.fact, e.name'
+        paged = await _paged_ro_query(
+            graph,
+            _ALL_VALID_EDGES_PAGE_TEMPLATE,
+            _ALL_VALID_EDGES_CENSUS,
+            page_size=page_size,
         )
-        result = await graph.ro_query(cypher)
+        # The dedup map is built ONCE across every page, never per page: the
+        # same (n.uuid, e.uuid) pair can straddle a page boundary, and a
+        # per-page map would let the repeat through and double-count the edge.
         seen: dict[tuple[str, str], EdgeDict] = {}
         grouped: dict[str, list[EdgeDict]] = {}
-        for row in (result.result_set or []):
+        for row in paged.rows:
             entity_uuid, edge_uuid = row[0], row[1]
             key = (entity_uuid, edge_uuid)
             if key in seen:
@@ -1858,6 +1867,78 @@ class GraphitiBackend:
             edge = self._edge_dict(row[1], row[2], row[3])
             seen[key] = edge
             grouped.setdefault(entity_uuid, []).append(edge)
+        return grouped, paged
+
+    @_canonicalize_group_args
+    async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
+        """Return all currently-valid RELATES_TO edges grouped by entity UUID.
+
+        Bulk variant of get_valid_edges_for_node that pages through the whole
+        graph instead of O(N) per-entity round-trips.  The undirected MATCH pattern causes
+        each directed edge to appear under both its source and target entity: for a
+        directed A→B edge, traversal matches it from A's side (row: A.uuid, e.uuid)
+        and from B's side (row: B.uuid, e.uuid) — two genuinely distinct rows because
+        n.uuid differs.
+
+        Deduplicates in Python, keyed on (n.uuid, e.uuid). RELATES_TO edge uuids
+        are unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
+        redirect_node_edges; task 2210 W6-epsilon repaired legacy dup-uuid edges),
+        so keying on the (entity, edge-uuid) pair is equivalent to the prior
+        element-identity dedup: it preserves the intended double-attribution (each
+        directed edge appears once under each endpoint entity, as distinct
+        (n.uuid, e.uuid) pairs) and still collapses the undirected self-loop
+        double-match (A→A edges, where both traversal directions yield the
+        identical (n.uuid, e.uuid) pair).
+
+        Uses ro_query since no writes are performed.
+
+        PAGINATED (task 4340).  This read is NOT a single query: FalkorDB
+        truncates every result set at a server-wide RESULTSET_SIZE ceiling,
+        silently, and this query exceeds it on the live corpus.  Measured
+        2026-08-17 with RESULTSET_SIZE=10000::
+
+            graph          rows    distinct edges   an unpaginated read saw
+            dark_factory   24938        12506       10000 rows / 6376 edges (51%)
+            reify          31621        15871       10000 rows
+
+        So roughly HALF the valid-edge corpus was invisible to every caller,
+        with no error and no marker.  Do not "simplify" this back to one
+        query; see _paged_ro_query for the ORDER BY and completeness rules
+        that make paging safe.
+
+        This method deliberately does NOT raise on an incomplete enumeration
+        — it logs a WARNING naming the numbers and returns what it fetched.
+        These graphs are written to continuously by the live memory service,
+        so raising would take down rebuild_entity_summaries, both
+        reconciliation sweeps and a cleanup script for a transient.  The
+        completeness signal is available as a first-class value from
+        enumerate_all_valid_edges for consumers that want to act on it.
+
+        Args:
+            group_id: Project graph to query.
+
+        Returns:
+            Dict mapping entity UUID → list of edge dicts with keys: uuid, fact, name.
+            fact and name default to empty string when the property is NULL.
+            Each directed edge appears under both its source and target entity UUID
+            (double-attribution from the undirected MATCH pattern).
+
+        Note:
+            Using a directed pattern (n:Entity)-[e:RELATES_TO]->() would give
+            single-appearance semantics per edge if ever needed.  It would also
+            roughly halve the row count — but pagination would still be
+            required, because 12506 distinct edges exceeds the cap on its own.
+            Halving buys margin, not correctness.
+        """
+        grouped, paged = await self.enumerate_all_valid_edges(group_id=group_id)
+        if not paged.complete:
+            logger.warning(
+                'get_all_valid_edges(group_id=%r): enumeration INCOMPLETE — '
+                'returning %d rows grouped into %d entities, but %s. '
+                'rows_seen=%s expected_rows=%s',
+                group_id, paged.rows_seen, len(grouped), paged.reason,
+                paged.rows_seen, paged.expected_rows,
+            )
         return grouped
 
     @_canonicalize_group_args
