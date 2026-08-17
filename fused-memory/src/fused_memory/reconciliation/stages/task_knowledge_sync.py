@@ -78,6 +78,7 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     build_task_count_snapshot_unavailable_content,
 )
 from fused_memory.reconciliation.task_filter import (
+    MAX_ACTIVE_TASKS_RENDERED,
     FilteredTaskTree,
     detect_task_dump_contamination,
     filter_task_tree,
@@ -2757,9 +2758,40 @@ def _render_live_workflow_section(
     render, which is precisely the class of degradation this task was filed to
     make visible.
 
+    FAN-OUT CAP.  Only the first
+    :data:`~fused_memory.reconciliation.task_filter.MAX_ACTIVE_TASKS_RENDERED`
+    tasks are probed; an overflow is clipped and reported at WARNING
+    (``reconciliation.live_workflow_render_capped``, naming total/rendered/
+    omitted — no silent truncation, mirroring the ``MAX_DONE_AUDIT_RENDERED``
+    treatment below).
+
+    Capping here is SAFE.  This section is *advisory* input to the Stage 2 LLM
+    about tasks it can see in the Active Task Tree, and that tree is rendered
+    from the identical prefix slice (``render_active_section`` does
+    ``tree.active_tasks[:max_tasks]`` with the same constant, task_filter.py:1614).
+    A task past the cap is therefore one the LLM was never shown and cannot act
+    on, so declining to probe it removes work without removing information.
+    The load-bearing guard against racing a live pipeline is NOT this section
+    but :func:`recon_write_policy.check` Gate 2, which is per-task, uncapped,
+    and evaluated at write time.
+
+    The bound is the deterministic prefix slice, NOT ``render_active_section``'s
+    returned ``visible_active`` list, for two reasons.  (1) That function
+    returns ``[]`` whenever its 50_000-char budget clamp trips
+    (task_filter.py:1622-1635) — reusing it would silently delete this entire
+    section on exactly the largest, most contended cycles.  The prefix slice is
+    the superset of what can appear and never collapses.  (2) It is computed in
+    ``assemble_payload``, while ``memory_consolidator`` calls this renderer by a
+    different path; the slice is reproducible from ``tasks`` alone.
+
+    The cap lives in the RENDERER rather than at its two call sites so
+    task_knowledge_sync and memory_consolidator cannot drift apart.
+
     Args:
         tasks: Task dicts from the active/proactive-sample pool.  Only tasks
             with a parseable ``id`` are inspected (non-int ids are skipped).
+            Clipped to the first ``MAX_ACTIVE_TASKS_RENDERED`` entries — see
+            the fan-out cap paragraph above.
         project_root: Absolute path to the project root, forwarded to the
             detector and used to read the orchestrator lock + scheduler-state
             snapshot for the in-progress corroboration gate.
@@ -2773,6 +2805,32 @@ def _render_live_workflow_section(
     """
     if not tasks:
         return ''
+
+    # Bound the fan-out (task 3778). The caller hands us the FULL active-task
+    # pool, but the Active Task Tree the Stage 2 LLM actually sees is rendered
+    # from the identical prefix slice of the same constant, so probing past it
+    # is git work whose result is discarded. Clip explicitly and report the
+    # drop at WARNING — never a silent truncation. See the docstring's
+    # "Fan-out cap" paragraph for why this is safe and why the prefix slice
+    # (not render_active_section's visible_active) is the right bound.
+    total_active = len(tasks)
+    if total_active > MAX_ACTIVE_TASKS_RENDERED:
+        omitted = total_active - MAX_ACTIVE_TASKS_RENDERED
+        tasks = tasks[:MAX_ACTIVE_TASKS_RENDERED]
+        logger.warning(
+            'reconciliation.live_workflow_render_capped: probed %d of %d active '
+            'task(s); %d omitted by the MAX_ACTIVE_TASKS_RENDERED=%d cap (the '
+            'same cap the Active Task Tree applies, so no visible task is missed)',
+            MAX_ACTIVE_TASKS_RENDERED,
+            total_active,
+            omitted,
+            MAX_ACTIVE_TASKS_RENDERED,
+            extra={
+                'total_active': total_active,
+                'rendered': MAX_ACTIVE_TASKS_RENDERED,
+                'omitted': omitted,
+            },
+        )
 
     # Hoist the project-level orchestrator check: it is constant for this
     # project_root (one lock file regardless of how many tasks are inspected).
