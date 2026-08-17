@@ -309,7 +309,7 @@ class TestQualifiedRefNeverSpansALineBreak:
 
     def test_colon_followed_by_newline_is_not_a_ref(self):
         scan = find_cross_project_task_refs('Notes:\n2500 items', group_id='reify')
-        assert scan.refs == []
+        assert scan.refs == ()
 
     def test_the_same_line_spelling_is_unaffected(self):
         """Guard: the narrowing is across newlines ONLY, not a tightening of the
