@@ -66,7 +66,6 @@ validate_migration_keys = _mod.validate_migration_keys
 UnsafeMigrationKeyError = _mod.UnsafeMigrationKeyError
 write_backup = _mod.write_backup
 default_backup_path = _mod.default_backup_path
-DEFAULT_BACKUP_DIR = _mod.DEFAULT_BACKUP_DIR
 recovery_pointer = _mod.recovery_pointer
 _verify_read_back = _mod._verify_read_back
 
@@ -733,17 +732,16 @@ def test_default_backup_path_is_stamped_per_run():
     does nothing about 3083's own second run, which is precisely the workflow
     docs/task-authoring.md §8 prescribes.
     """
+    # Read through `_mod`, never a module-level copy: the end-to-end tests
+    # below monkeypatch `_mod.DEFAULT_BACKUP_DIR`, and a rebound copy would
+    # silently keep pointing at the real /tmp.
     at_0930 = default_backup_path('3083', now=datetime(2026, 8, 15, 9, 30, 0, tzinfo=UTC))
-    assert at_0930 == DEFAULT_BACKUP_DIR / 'task-3083-metadata-before-20260815T093000Z.json'
+    assert at_0930 == _mod.DEFAULT_BACKUP_DIR / 'task-3083-metadata-before-20260815T093000Z.json'
 
     at_0935 = default_backup_path('3083', now=datetime(2026, 8, 15, 9, 35, 0, tzinfo=UTC))
     assert at_0935 != at_0930
     assert '3083' in at_0935.name
     assert at_0935.suffix == '.json'
-
-    # The two invariants case 11 already pins survive the stamp.
-    assert default_backup_path('3083') != default_backup_path('3141')
-    assert '3083' in str(default_backup_path('3083'))
 
 
 @pytest.mark.asyncio
