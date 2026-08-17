@@ -289,9 +289,22 @@ Investigate this claim against the codebase and call `verification_complete` wit
         # Task 4343: stop discarding AgentVerdict.failed.  The 'agent-failed:'
         # prefix that task 1811 put in `summary` is human-facing prose; the
         # structured fields below are what downstream consumers branch on.
-        # `raw` is {} when the loop returned None/a non-dict, so the fallback
-        # naturally yields the error_summary token passed above.
-        token = (raw.get('warning') or 'verify_failed') if verdict.failed else ''
+        #
+        # Preference chain — warning_origin > warning > 'verify_failed':
+        #   * `warning_origin` is the ACTIONABLE diagnosis.  'cli_output_empty'
+        #     (the CLI returned nothing) and 'cli_output_unparseable' (the CLI
+        #     returned junk) call for different operator responses, so the
+        #     specific one wins when AgentLoop.run() supplies it.
+        #   * `warning` is the generic bucket the loop reports for every
+        #     no-tool-call exit; it is the fallback, never blanked.
+        #   * 'verify_failed' must stay in sync with the error_summary=
+        #     'verify_failed' argument passed to extract_agent_verdict just
+        #     above — rename them together or the two silently split.  `raw`
+        #     is {} when the loop returned None/a non-dict, so that shape
+        #     naturally lands here.
+        token = ''
+        if verdict.failed:
+            token = raw.get('warning_origin') or raw.get('warning') or 'verify_failed'
         return VerificationResult(
             verdict=VerificationVerdict(verdict.verdict),
             confidence=raw.get('confidence', 0.0),
