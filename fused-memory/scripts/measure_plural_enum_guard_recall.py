@@ -463,6 +463,42 @@ _EDGE_PAGE_CYPHER = (
     'SKIP {skip} LIMIT {limit}'
 )
 
+# The empirical completeness proof. Deliberately the SAME MATCH and WHERE as
+# the page query, so the two numbers describe the same population and are
+# therefore comparable; DISTINCT on e.uuid so the undirected match's
+# double-attribution collapses exactly as the paged dict-dedup collapses it.
+#
+# It returns exactly ONE row, which is the whole point: a single-row result
+# can never be truncated by the row cap it is being used to detect. That is
+# what makes `len(facts) == expected` a proof rather than one more heuristic.
+_EDGE_COUNT_CYPHER = (
+    'MATCH (n:Entity)-[e:RELATES_TO]-() '
+    'WHERE e.invalid_at IS NULL '
+    'RETURN count(DISTINCT e.uuid)'
+)
+
+
+async def _census_count(
+    query_fn: Callable[[str], Awaitable[Sequence[Sequence[Any]]]],
+) -> int | None:
+    """Distinct valid edges the store reports, or None if it did not say.
+
+    Every 'it did not say' shape collapses to None — no rows, a null result
+    set, a NULL count, a row with no columns, a non-integer — because the
+    caller treats None as fail-closed and there is nothing to gain by
+    distinguishing between flavours of missing evidence.
+    """
+    rows = list(await query_fn(_EDGE_COUNT_CYPHER) or [])
+    if not rows:
+        return None
+    row = rows[0]
+    if row is None or len(row) == 0 or row[0] is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
+
 
 async def enumerate_valid_edge_facts(
     query_fn: Callable[[str], Awaitable[Sequence[Sequence[Any]]]],
@@ -494,12 +530,34 @@ async def enumerate_valid_edge_facts(
        it anyway.
     2. The ``max_pages`` bound is reached while the last page was still full
        — a suspected shortfall, reported rather than swallowed.
+    3. The census probe did not answer with a usable count. An unavailable
+       proof is not a passing proof.
+    4. The census count and the number enumerated disagree.
 
-    The check is deliberately ``>=`` and not ``>``. Equality is
-    arithmetically safe on a server configured at exactly ``RESULTSET_SIZE``,
-    but that constant is an ASSUMPTION about server configuration, so
-    equality leaves zero margin: a server configured one row lower silently
-    re-opens the truncation. One page of throughput buys that margin.
+    (1) and (2) are STRUCTURAL; (3) and (4) are EMPIRICAL, and the two kinds
+    are deliberately independent rather than redundant.
+
+    The structural check is ``>=`` and not ``>``: equality is arithmetically
+    safe on a server configured at exactly ``RESULTSET_SIZE``, but that
+    constant is an ASSUMPTION about server configuration, so equality leaves
+    zero margin — a server configured one row lower silently re-opens the
+    truncation. One page of throughput buys that margin.
+
+    The census check exists because that reasoning bottoms out on a guess,
+    and the defect class ('a short page was mistaken for end-of-data') does
+    not. If the live server is configured BELOW the assumed constant, then
+    ``page_size < resultset_size`` passes the structural check and the
+    short-page break lies exactly as it would have before — the identical
+    silent truncation, undetected. Comparing what was enumerated against a
+    single-row count that the cap cannot truncate catches that, and catches
+    causes not enumerated here: unstable DISTINCT+SKIP/LIMIT page
+    boundaries, a dropped page.
+
+    Both are kept because they fail differently and usefully. The structural
+    check fails FAST, before any work, with a specific operator-actionable
+    reason ('re-run with a smaller --page-size'); the census check catches
+    everything else, at the cost of only being able to report a bare count
+    mismatch.
     """
     if page_size >= resultset_size:
         logger.warning(
@@ -512,9 +570,19 @@ async def enumerate_valid_edge_facts(
         )
         return {}, False
 
+    # Taken BEFORE paging so the target is fixed up front rather than
+    # inferred from the same pages whose completeness is in question.
+    expected = await _census_count(query_fn)
+    if expected is None:
+        logger.warning(
+            'enumerate_valid_edge_facts: the census probe returned no usable '
+            'count, so completeness cannot be proven. Reporting INCOMPLETE — '
+            'an unavailable proof is not a passing one.',
+        )
+
     facts: dict[str, str] = {}
     skip = 0
-    complete = False
+    paged_to_the_end = False
     for _page in range(max_pages):
         page = await query_fn(
             _EDGE_PAGE_CYPHER.format(skip=skip, limit=page_size),
@@ -529,19 +597,33 @@ async def enumerate_valid_edge_facts(
             # Short (or empty) page, and page_size < resultset_size was
             # checked above — so the server cannot be what shortened it and
             # the data really is exhausted. A FULL page can never prove that,
-            # which is exactly why the loop continues.
-            complete = True
+            # which is exactly why the loop continues. Note this is only the
+            # STRUCTURAL half of the argument; the census check below is what
+            # holds when the assumption behind it does not.
+            paged_to_the_end = True
             break
         skip += len(rows)
 
-    if not complete:
+    if not paged_to_the_end:
         logger.warning(
             'enumerate_valid_edge_facts: hit the %d-page cap (page_size=%d, '
             'enumerated=%d) while the last page was still full — enumeration '
             'is incomplete. Re-run with a larger --page-size.',
             max_pages, page_size, len(facts),
         )
+    elif expected is not None and len(facts) != expected:
+        logger.warning(
+            'enumerate_valid_edge_facts: enumerated %d distinct edges but the '
+            'census reports %d (page_size=%d) — the enumeration is SHORT. '
+            'The most likely cause is a server result-set cap below the '
+            'assumed %d; unstable page boundaries would do it too. Reporting '
+            'INCOMPLETE.',
+            len(facts), expected, page_size, resultset_size,
+        )
 
+    complete = (
+        paged_to_the_end and expected is not None and len(facts) == expected
+    )
     return facts, complete
 
 
