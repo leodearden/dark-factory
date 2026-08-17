@@ -12,7 +12,9 @@ reporting a zero.
 """
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -59,6 +61,8 @@ enumerate_valid_edge_facts = _mod.enumerate_valid_edge_facts
 run = _mod.run
 exit_code = _mod.exit_code
 build_parser = _mod._build_parser
+render_json = _mod.render_json
+render_markdown = _mod.render_markdown
 scan_corpus = _mod.scan_corpus
 triage_rejection = _mod.triage_rejection
 simulate_candidate = _mod.simulate_candidate
@@ -576,6 +580,119 @@ async def test_run_triages_every_rejection_it_reports():
     # 'As of <date>, tasks ...' is the documented recall loss
     assert by_id['beta'].triage == {'adverbial_preamble': 1}
     assert sum(report.triage_totals.values()) == report.totals.guard_rejected
+
+
+# ---------------------------------------------------------------------------
+# Artifact rendering
+# ---------------------------------------------------------------------------
+
+_FIXED_TIMESTAMP = '2026-08-17T00:00:00+00:00'
+
+
+async def _fixed_report():
+    """A report built from a fixed corpus and a fixed, INJECTED timestamp.
+
+    Project ids are deliberately supplied out of alphabetical order so the
+    renderers' explicit sorting is actually exercised rather than
+    accidentally satisfied by insertion order.
+    """
+    source = _FakeEdgeSource({
+        'zeta': (_BETA_FACTS, True),
+        'alpha': (_ALPHA_FACTS, True),
+    })
+    return await run(
+        _args(project_id=['zeta', 'alpha'], measured_at=_FIXED_TIMESTAMP),
+        edge_source=source,
+    )
+
+
+@pytest.mark.asyncio
+async def test_report_rendering_is_deterministic():
+    """Identical reports must render byte-identically.
+
+    These artifacts are COMMITTED, so any nondeterminism — dict iteration
+    order, set ordering, a clock read inside the renderer — shows up
+    forever as meaningless diff churn that hides the one line that
+    actually changed.
+    """
+    first = await _fixed_report()
+    second = await _fixed_report()
+
+    assert render_json(first) == render_json(second)
+    assert render_markdown(first) == render_markdown(second)
+
+
+@pytest.mark.asyncio
+async def test_rendered_sections_are_explicitly_sorted():
+    """Ordering must come from an explicit sort, not from insertion order."""
+    report = await _fixed_report()
+
+    payload = json.loads(render_json(report))
+    assert [p['project_id'] for p in payload['projects']] == ['alpha', 'zeta']
+
+    markdown = render_markdown(report)
+    assert markdown.index('`alpha`') < markdown.index('`zeta`')
+
+
+@pytest.mark.asyncio
+async def test_rendered_json_carries_the_measurement_and_the_verdict():
+    """The JSON must stand alone as the citable record."""
+    report = await _fixed_report()
+    payload = json.loads(render_json(report))
+
+    assert payload['schema_version'] == _mod.SCHEMA_VERSION
+    assert payload['measured_at'] == _FIXED_TIMESTAMP
+    assert payload['verdict'] == report.verdict
+    assert payload['complete'] is True
+    assert payload['totals']['guard_rejected'] == report.totals.guard_rejected
+    assert payload['total_valid_edges'] == report.total_valid_edges
+
+    by_id = {p['project_id']: p for p in payload['projects']}
+    assert by_id['alpha']['valid_edges'] == 3
+    assert by_id['alpha']['scan']['selected'] == 1
+    assert by_id['zeta']['triage'] == {'adverbial_preamble': 1}
+
+    assert [c['name'] for c in payload['candidates']] == list(_mod.CANDIDATE_NAMES)
+    assert payload['revalidation_test'] == _mod.REVALIDATION_TEST
+
+
+@pytest.mark.asyncio
+async def test_rendered_markdown_opens_with_provenance_and_regenerate_command():
+    """A report nobody can regenerate is a transcript with better formatting.
+
+    'Zero matches' is a point-in-time fact about a growing corpus, so the
+    exact command that reproduces it has to travel WITH the numbers.
+    """
+    report = await _fixed_report()
+    markdown = render_markdown(report)
+
+    head = markdown[:1200]
+    assert 'measure_plural_enum_guard_recall.py' in head
+    assert 'uv run python scripts/measure_plural_enum_guard_recall.py' in head
+    assert _FIXED_TIMESTAMP in head
+
+    # the sections the verdict rests on
+    assert 'VERDICT' in markdown
+    assert report.verdict in markdown
+    assert 'RESULTSET_SIZE' in markdown  # the enumeration-coverage note
+    assert _mod.REVALIDATION_TEST in markdown
+
+
+@pytest.mark.asyncio
+async def test_renderers_never_read_the_clock():
+    """Determinism has to be structural, not merely observed.
+
+    The two renders in test_report_rendering_is_deterministic run
+    milliseconds apart, so a renderer reading a coarse clock could pass
+    that test by luck. Rendering a report whose timestamp was injected as a
+    sentinel proves the value came from the DATA.
+    """
+    report = await _fixed_report()
+    sentinel = 'SENTINEL-NOT-A-TIMESTAMP'
+    stamped = dataclasses.replace(report, measured_at=sentinel)
+
+    assert sentinel in render_markdown(stamped)
+    assert json.loads(render_json(stamped))['measured_at'] == sentinel
 
 
 def test_scan_corpus_of_empty_corpus_is_all_zeroes():
