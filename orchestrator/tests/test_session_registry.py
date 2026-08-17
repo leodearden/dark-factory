@@ -3651,10 +3651,9 @@ class TestLeaseSlugIsNotASessionRecordKey:
     record slugs look like ``architect-dark_factory-3133-25737ee4-...``.
 
     The namespaces differ in all three segments:
-    - the LEASE slug is claimant-chosen, prescribed by the skills as
-      ``<lease-role>-<project>-<session pid>``
-      (skills/escalation-watcher/SKILL.md:50) — there is no production
-      *builder* for it, only shell in a SKILL.md, so it is spelled out here;
+    - the LEASE slug is ``<lease name>-<session pid>``, built by
+      ``default_lease_slug`` (task 4248 moved it out of shell in the SKILLs and
+      into the CLI, for the reason 3994 moved the pid there);
     - the RECORD slug comes from ``build_session_slug(role, project, task,
       <uniqueness token>)``, where the token is a session UUID for a
       hand-launched session (``session_hooks.hook_session_slug``) and the
@@ -3676,8 +3675,16 @@ class TestLeaseSlugIsNotASessionRecordKey:
     SESSION_UUID = '25737ee4-3b1e-4a7f-9f0e-6a1c2d3e4f50'
 
     def _lease_slug(self, project: str = 'df', pid: int = 1894895) -> str:
-        """The lease slug exactly as skills/escalation-watcher/SKILL.md:50 builds it."""
-        return f'watcher-{project}-{sr.resolve_session_pid({sr.SESSION_PID_ENV: str(pid)})}'
+        """The lease slug exactly as production builds it (task 4248).
+
+        Routed through ``default_lease_slug`` rather than hand-building the
+        f-string: the disjointness this class pins is only interesting if the
+        left-hand side is the REAL lease slug, so the helper must break when
+        production's builder changes shape.
+        """
+        slug = sr.default_lease_slug(f'watcher-{project}', {sr.SESSION_PID_ENV: str(pid)})
+        assert slug is not None  # pid > 0, so the builder always derives here
+        return slug
 
     def _record_slug(self, project: str = 'dark_factory') -> str:
         """The record slug exactly as session_hooks.hook_session_slug builds it."""

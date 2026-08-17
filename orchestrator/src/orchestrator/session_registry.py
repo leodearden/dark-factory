@@ -1917,6 +1917,55 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     return 0
 
 
+def default_lease_slug(name: str, env: Mapping[str, str] | None = None) -> str | None:
+    """Derive THIS session's lease slug for lease *name*: ``<name>-<session pid>``.
+
+    WHY THIS EXISTS (task 4248). This is ``resolve_session_pid``'s own argument,
+    extended from the pid to the slug. 3994 moved the PID into code because "it
+    depended on every skill doc getting one shell token right" -- and then, in
+    the same change, made the SLUG load-bearing: ``--slug`` became required on
+    ``lease-heartbeat``/``lease-release`` and a mismatch is REFUSED. So the
+    token that decides whether every heartbeat and the final release ACT or are
+    refused was still being assembled in shell, in three SKILL.md files, as
+    ``<role>-<project>-${CLAUDE_PID:-$PPID}`` -- and ``$PPID`` is measurably NOT
+    stable across Claude Code tool calls (1430433 then 1471645, the first
+    already dead), so a session could drift into a slug its own later heartbeat
+    would fail to match. Deriving it HERE makes the correct token structural.
+
+    It must be RE-DERIVABLE rather than carried: each Claude Code Bash tool call
+    is a fresh ``/bin/bash -c``, so a ``SLUG=$(...)`` captured during the claim
+    is gone by the time the heartbeat runs -- the same property that makes ``$$``
+    an unusable pid. Hence a pure function of (name, env), evaluated afresh on
+    every verb, rather than a value threaded through the skills.
+
+    RETURNS None WHEN THE SESSION PID IS UNRESOLVABLE -- deliberately, and
+    specifically NOT ``f'{name}-0'``. ``resolve_session_pid`` may degrade to 0
+    because a pid is a LIVENESS probe and 0 is provably dead, which keeps a
+    crashed holder's lease reapable. A slug is an IDENTITY, and ``{name}-0`` is
+    not unique: two concurrently-degraded sessions contending the same lease
+    name would compute an IDENTICAL slug, so each would pass the other's
+    ``_is_lease_owner`` check and could heartbeat or release the other's lease
+    -- exactly 3994 defect 1 ("any caller may evict/refresh any lease") reopened
+    on the degraded path. Refusing to synthesize a token we cannot make unique
+    is the only answer that keeps the ownership guard honest. The CLI turns the
+    None into a loud ``parser.error`` (exit 2) naming ``$CLAUDE_PID`` and the
+    ``--slug`` override -- the same exit-2 class a slug-less ``lease-claim``
+    already produced pre-4248, so only the DERIVABLE case gains new behaviour.
+
+    SILENT ON THE DEGRADED PATH, on purpose: ``resolve_session_pid`` already
+    emits the loud WARNING for an unresolvable ``CLAUDE_PID``, and the CLI then
+    fails loudly on the None. A warning here would be the third report of one
+    fact. The *name* is passed through verbatim -- a lease slug is never a
+    filesystem path (``lease_path_for_name`` sanitizes only the NAME, and
+    ``sanitize_slug`` applies only to session RECORD slugs), so the ``#`` in a
+    task-scoped ``unblock-df#2085`` needs no escaping; see LeaseHolder.session_slug.
+    """
+    pid = resolve_session_pid(env)
+    if pid <= 0:
+        return None
+    return f'{name}-{pid}'
+
+
 LEASE_HEARTBEAT_TTL = timedelta(hours=2)
 """How long a lease survives with a dead holder pid and no fresh heartbeat
 (mtime touch) before it is stale-reapable. Mirrors NON_TERMINAL_HEARTBEAT_TTL's
