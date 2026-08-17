@@ -65,6 +65,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
+from shared.git_async import run_git
 from shared.proc_group import (
     reap_process_groups,
     scan_process_groups_under_path,
@@ -1895,6 +1896,18 @@ async def _run(
     worktree (recoverable race) from other ``FileNotFoundError``\\ s (e.g.
     missing binary on ``PATH``).
 
+    THIS FUNCTION IS A THIN ADAPTER (task 3778).  The spawn primitive itself —
+    ``create_subprocess_exec``, the forced C locale, stdin feeding, and the
+    cancellation kill+reap — grew here but now lives once in
+    :func:`shared.git_async.run_git`, because fused-memory's live-workflow
+    probes needed the identical primitive and cloning it would have created a
+    lockstep duplicate (INV-5).  What stays HERE is everything orchestrator-
+    specific: the :class:`WorktreeMissing` taxonomy (both the pre-flight and
+    the vanished-between-check-and-spawn race) and the ``(rc, stdout, stderr)``
+    3-tuple return shape this module's call sites destructure.  ``run_git`` is
+    imported by BARE NAME so ``git_ops.run_git`` is the single patchable spawn
+    seam.
+
     Stdin feeding (``input_text``): when provided, the child is spawned with
     ``stdin=PIPE`` and ``input_text.encode()`` is written to it via
     ``communicate(input=...)``.  This is what lets callers pipe a diff into a
@@ -1902,65 +1915,47 @@ async def _run(
     :meth:`GitOps.find_equivalent_commit`).  When ``None`` (the default) the
     behaviour is exactly as before — stdin is not piped and the child inherits
     the parent's — so no existing caller is affected.  The capability is inert
-    unless ``input_text`` is passed.
+    unless ``input_text`` is passed.  Mechanism: ``shared.git_async``.
 
     Locale: ``LC_ALL=C`` and ``LANG=C`` are forced in the child environment so
     that git (and other tools) always emit English-locale diagnostics.  This is
     required for :func:`_git_clean_failure_is_benign`, which substring-matches
     English warning text; a non-C locale would produce translated output that
     the matcher cannot recognise, silently defeating the R3 ENOENT-tolerance
-    fix for the 4892-class warm-lane FAULT.
+    fix for the 4892-class warm-lane FAULT.  Mechanism: ``shared.git_async``,
+    whose module docstring carries this rationale forward — the pin is
+    load-bearing for THIS module, so do not let it be "simplified" away there.
 
-    Cancellation safety (task 2608): if the ``await proc.communicate()`` below
+    Cancellation safety (task 2608): if the underlying ``communicate()`` await
     is cancelled — e.g. by a caller wrapping ``_run`` in
     ``asyncio.wait_for(..., timeout=...)``, as delivered_checks.py's
     ``_run_script_check`` does for script-kind delivered checks — the spawned
     child would otherwise keep running as an orphan with its stdout/stderr
     pipes open. For a persistently-hung script this recurred every scheduler
-    sweep, leaking a process and file descriptors. The child is now
-    best-effort killed and reaped before the triggering exception (including
-    ``asyncio.CancelledError``) is re-raised.
+    sweep, leaking a process and file descriptors. The child is best-effort
+    killed and reaped before the triggering exception (including
+    ``asyncio.CancelledError``) is re-raised.  Mechanism: ``shared.git_async``.
+
+    Note that ``_run`` passes no ``timeout``: callers that want one wrap this
+    call in their own ``asyncio.wait_for``, and that cancellation path is
+    exactly what the kill+reap above covers.
     """
     # Pre-flight: a missing cwd surfaces as a generic FileNotFoundError from
     # posix_spawn whose .filename is not reliably set.  Check explicitly so we
     # can raise a typed exception consumers can pattern-match on.
     if cwd is not None and not Path(cwd).is_dir():
         raise WorktreeMissing(cwd)
-    # Force a stable C locale so git output is always in English and amenable
-    # to substring matching (see docstring above).
-    _env = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'}
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(cwd) if cwd else None,
-            stdin=asyncio.subprocess.PIPE if input_text is not None else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_env,
-        )
+        result = await run_git(cmd, cwd, input_text=input_text)
     except FileNotFoundError as e:
         # Race: cwd existed at the pre-flight check but vanished before spawn.
         # Re-classify as WorktreeMissing if cwd is now gone; otherwise the
-        # error is about the binary itself.
+        # error is about the binary itself.  This is precisely why the shared
+        # helper must NOT swallow FileNotFoundError.
         if cwd is not None and not Path(cwd).is_dir():
             raise WorktreeMissing(cwd) from e
         raise
-    try:
-        stdout, stderr = await proc.communicate(
-            input=input_text.encode() if input_text is not None else None,
-        )
-    except BaseException:
-        # The await was interrupted (most commonly asyncio.CancelledError from
-        # a caller-side asyncio.wait_for(..., timeout=...)) before the child
-        # exited. Best-effort kill + reap it so it doesn't leak as an orphan
-        # process with dangling stdout/stderr pipes, then propagate the
-        # original exception unchanged.
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()  # already exited
-        with contextlib.suppress(BaseException):
-            await proc.wait()  # reap is best-effort; never let it mask the original error
-        raise
-    return proc.returncode if proc.returncode is not None else 1, stdout.decode().strip(), stderr.decode().strip()
+    return result.returncode, result.stdout, result.stderr
 
 
 def _git_clean_failure_is_benign(stderr: str) -> bool:

@@ -19,6 +19,7 @@ from _orch_helpers import (
     assert_isolated_git_repo,
     git_env_with_ceiling,
 )
+from shared.git_async import GitResult
 
 from orchestrator import git_ops as git_ops_module
 from orchestrator.artifacts import TaskArtifacts
@@ -38,7 +39,6 @@ from orchestrator.git_ops import (
     _merge_subject,
     _run,
 )
-from shared.git_async import GitResult
 
 
 @pytest.fixture
@@ -12358,9 +12358,11 @@ class TestRunDelegatesToSharedGitAsync:
             shutil.rmtree(doomed)
             raise FileNotFoundError(2, 'No such file or directory')
 
-        with patch('orchestrator.git_ops.run_git', new=_vanish_then_fail):
-            with pytest.raises(WorktreeMissing) as exc:
-                await _run(['git', 'status'], cwd=doomed)
+        with (
+            patch('orchestrator.git_ops.run_git', new=_vanish_then_fail),
+            pytest.raises(WorktreeMissing) as exc,
+        ):
+            await _run(['git', 'status'], cwd=doomed)
 
         assert exc.value.path == doomed
 
@@ -12372,9 +12374,11 @@ class TestRunDelegatesToSharedGitAsync:
         async def _boom(*args, **kwargs):
             raise FileNotFoundError(2, 'No such file or directory')
 
-        with patch('orchestrator.git_ops.run_git', new=_boom):
-            with pytest.raises(FileNotFoundError) as exc:
-                await _run(['git', 'status'], cwd=tmp_path)
+        with (
+            patch('orchestrator.git_ops.run_git', new=_boom),
+            pytest.raises(FileNotFoundError) as exc,
+        ):
+            await _run(['git', 'status'], cwd=tmp_path)
 
         assert not isinstance(exc.value, WorktreeMissing)
 
