@@ -1029,6 +1029,304 @@ class TestListEntityNodesEmittedCypher:
 
 
 # ---------------------------------------------------------------------------
+# step-18: the shims RAISE on a structural non-enumeration, WARN on an
+#          empirical one
+# ---------------------------------------------------------------------------
+#
+# The split is the whole point, and both halves are load-bearing.
+#
+# RAISE on structural: a refusal returns a FABRICATED empty (zero queries
+# issued), and INCOMPLETE_PAGE_CAP is worse still — rows are ordered by uuid,
+# so a page-capped read returns a PREFIX, and every entity whose edges sort
+# into the unread tail looks edge-less rather than obviously absent. Handing
+# either back as a plain collection is what let '' be written over real
+# summaries. Neither kind is reachable at the shipped defaults, so this raise
+# cannot fire in production today — only under the misconfiguration that would
+# otherwise silently corrupt the graph.
+#
+# WARN on empirical: this half is what keeps the fix from regressing the
+# reviewed design. A census disagreeing by a few rows is the signature of a
+# live graph under concurrent write, and raising there would take down
+# rebuild_entity_summaries, both reconciliation sweeps and a cleanup script
+# for a transient that self-heals next cycle.
+
+
+def _force_paged_kwargs(monkeypatch, **forced):
+    """Re-bind the module-global ``_paged_ro_query`` to force read kwargs.
+
+    The shims deliberately expose NO ``page_size``/``max_pages`` knob — their
+    signatures must stay UNCHANGED, that is the back-compat guarantee the
+    whole task rests on — and the module constants are bound as function
+    defaults at def time, so ``monkeypatch.setattr`` on the constants alone
+    would silently do nothing.  Wrapping the global is what reaches the guards
+    through a shim while still running the REAL guard code rather than a
+    stubbed verdict.
+    """
+    from fused_memory.backends import graphiti_client
+
+    real = graphiti_client._paged_ro_query
+
+    async def forced_paged(*args, **kwargs):
+        return await real(*args, **{**kwargs, **forced})
+
+    monkeypatch.setattr(graphiti_client, '_paged_ro_query', forced_paged)
+
+
+def _refusal(monkeypatch):
+    """Force guard 1: page_size at the assumed cap."""
+    _force_paged_kwargs(
+        monkeypatch, page_size=_LIVE_RESULTSET_CAP, resultset_size=_LIVE_RESULTSET_CAP
+    )
+
+
+def _page_cap(monkeypatch):
+    """Force guard 2: a page budget far too small for the corpus."""
+    _force_paged_kwargs(monkeypatch, page_size=10, max_pages=2)
+
+
+class TestIncompleteEnumerationErrorType:
+    """The exception type itself, before any behaviour that uses it."""
+
+    def test_subclasses_exception_not_baseexception(self):
+        """MUST be an ``Exception``, or it escapes every caller's handler.
+
+        Both reconciliation sweeps catch ``Exception`` while deliberately
+        re-raising ``CancelledError``/``KeyboardInterrupt``/``SystemExit``
+        (stale_status_snapshot_edge_sweep.py, stale_priority_override_edge_sweep.py).
+        Deriving from ``BaseException`` would turn a handled per-cycle error
+        into an unhandled crash that escapes those handlers — converting a
+        self-healing degradation into an outage.
+        """
+        from fused_memory.backends.graphiti_client import IncompleteEnumerationError
+
+        assert issubclass(IncompleteEnumerationError, Exception)
+        assert not issubclass(BaseException, IncompleteEnumerationError)
+
+
+class TestShimsRaiseOnStructuralIncompleteness:
+    """A structurally-incomplete read is not a read: it must not return data."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'force, kind_name',
+        [
+            pytest.param(_refusal, 'INCOMPLETE_STRUCTURAL_REFUSAL', id='refusal'),
+            pytest.param(_page_cap, 'INCOMPLETE_PAGE_CAP', id='page-cap'),
+        ],
+    )
+    async def test_get_all_valid_edges_raises(
+        self, force, kind_name, mock_config, make_backend, monkeypatch
+    ):
+        from fused_memory.backends import graphiti_client
+
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
+        force(monkeypatch)
+
+        # The enumerate_* method still REPORTS rather than raising — the raise
+        # is the shim's policy, not the primitive's.
+        _, paged = await backend.enumerate_all_valid_edges(group_id='test')
+        assert paged.incomplete_kind == getattr(graphiti_client, kind_name)
+
+        with pytest.raises(graphiti_client.IncompleteEnumerationError) as exc:
+            await backend.get_all_valid_edges(group_id='test')
+        message = str(exc.value)
+        # An operator reading only the traceback must learn what to change.
+        assert 'test' in message                       # the group_id
+        assert paged.incomplete_kind in message        # the kind
+        assert paged.reason is not None
+        assert paged.reason in message                 # the diagnostic numbers
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'force, kind_name',
+        [
+            pytest.param(_refusal, 'INCOMPLETE_STRUCTURAL_REFUSAL', id='refusal'),
+            pytest.param(_page_cap, 'INCOMPLETE_PAGE_CAP', id='page-cap'),
+        ],
+    )
+    async def test_list_entity_nodes_raises(
+        self, force, kind_name, mock_config, make_backend, monkeypatch
+    ):
+        from fused_memory.backends import graphiti_client
+
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph(make_entity_node_corpus()))
+        force(monkeypatch)
+
+        _, paged = await backend.enumerate_entity_nodes(group_id='test')
+        assert paged.incomplete_kind == getattr(graphiti_client, kind_name)
+
+        with pytest.raises(graphiti_client.IncompleteEnumerationError) as exc:
+            await backend.list_entity_nodes(group_id='test')
+        message = str(exc.value)
+        assert 'test' in message
+        assert paged.incomplete_kind in message
+        assert paged.reason is not None
+        assert paged.reason in message
+
+    @pytest.mark.asyncio
+    async def test_page_cap_prefix_is_withheld_not_returned(
+        self, mock_config, make_backend, monkeypatch
+    ):
+        """The page-cap case is the dangerous one: a PREFIX, not an obvious zero.
+
+        Rows are ordered by uuid, so a truncated read hands back a complete
+        picture of some entities and a zero-edge picture of the rest — the
+        shape most likely to be mistaken for real data by a caller that
+        checks only truthiness.
+        """
+        from fused_memory.backends.graphiti_client import IncompleteEnumerationError
+
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
+        _page_cap(monkeypatch)
+
+        grouped, paged = await backend.enumerate_all_valid_edges(group_id='test')
+        assert grouped                      # non-empty: the prefix is real data
+        assert paged.rows_seen == 20        # ...and nowhere near the corpus
+        with pytest.raises(IncompleteEnumerationError):
+            await backend.get_all_valid_edges(group_id='test')
+
+
+class TestShimsStillWarnOnEmpiricalIncompleteness:
+    """POLICY PRESERVATION: the reviewed warn-and-return design stays intact.
+
+    If either of these starts raising, the fix has over-reached and taken down
+    the live reconciliation loop for a transient — the exact trade-off design
+    decision #1 rejected.
+    """
+
+    @staticmethod
+    def _short_read_edges():
+        return FakeCappedGraph(
+            make_live_shaped_edge_corpus(), census_override=_LIVE_EDGE_ROWS + 5000
+        )
+
+    @staticmethod
+    def _unusable_census_edges():
+        return FakeCappedGraph(
+            make_live_shaped_edge_corpus(),
+            census_result_set=[],
+            census_result_set_set=True,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'make_graph, kind_name',
+        [
+            pytest.param(
+                _short_read_edges.__func__, 'INCOMPLETE_SHORT_READ', id='short-read'
+            ),
+            pytest.param(
+                _unusable_census_edges.__func__,
+                'INCOMPLETE_CENSUS_UNAVAILABLE',
+                id='census-unavailable',
+            ),
+        ],
+    )
+    async def test_get_all_valid_edges_warns_and_returns(
+        self, make_graph, kind_name, mock_config, make_backend, caplog
+    ):
+        from fused_memory.backends import graphiti_client
+
+        backend = make_backend(mock_config)
+        _wire(backend, make_graph())
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            grouped = await backend.get_all_valid_edges(group_id='test')
+
+        # The data is intact — every distinct edge still reaches the caller.
+        assert grouped
+        assert len(distinct_edge_uuids(grouped)) == _LIVE_DISTINCT_EDGES
+        messages = _warnings(caplog)
+        assert any('get_all_valid_edges' in m for m in messages)
+
+        _, paged = await backend.enumerate_all_valid_edges(group_id='test')
+        assert paged.incomplete_kind == getattr(graphiti_client, kind_name)
+        assert paged.incomplete_kind not in graphiti_client.INCOMPLETE_STRUCTURAL_KINDS
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'graph_kwargs, kind_name',
+        [
+            pytest.param(
+                {'census_override': _LIVE_ENTITY_NODES + 4000},
+                'INCOMPLETE_SHORT_READ',
+                id='short-read',
+            ),
+            pytest.param(
+                {'census_result_set': [], 'census_result_set_set': True},
+                'INCOMPLETE_CENSUS_UNAVAILABLE',
+                id='census-unavailable',
+            ),
+        ],
+    )
+    async def test_list_entity_nodes_warns_and_returns(
+        self, graph_kwargs, kind_name, mock_config, make_backend, caplog
+    ):
+        from fused_memory.backends import graphiti_client
+
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph(make_entity_node_corpus(), **graph_kwargs))
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            nodes = await backend.list_entity_nodes(group_id='test')
+
+        assert len(nodes) == _LIVE_ENTITY_NODES
+        messages = _warnings(caplog)
+        assert any('list_entity_nodes' in m for m in messages)
+
+        _, paged = await backend.enumerate_entity_nodes(group_id='test')
+        assert paged.incomplete_kind == getattr(graphiti_client, kind_name)
+        assert paged.incomplete_kind not in graphiti_client.INCOMPLETE_STRUCTURAL_KINDS
+
+
+class TestCompleteEnumerationIsUnaffected:
+    """Guard against an over-broad raise: a healthy read stays silent."""
+
+    @pytest.mark.asyncio
+    async def test_get_all_valid_edges_neither_raises_nor_warns(
+        self, mock_config, make_backend, caplog
+    ):
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            grouped = await backend.get_all_valid_edges(group_id='test')
+        assert len(distinct_edge_uuids(grouped)) == _LIVE_DISTINCT_EDGES
+        assert _warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_list_entity_nodes_neither_raises_nor_warns(
+        self, mock_config, make_backend, caplog
+    ):
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph(make_entity_node_corpus()))
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            nodes = await backend.list_entity_nodes(group_id='test')
+        assert len(nodes) == _LIVE_ENTITY_NODES
+        assert _warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_empty_graph_still_returns_empty(
+        self, mock_config, make_backend, caplog
+    ):
+        """The distinction the whole fix rests on, from the other side.
+
+        An empty corpus is a COMPLETE enumeration of nothing: census says 0,
+        the first page is short, ``complete is True``. It must keep returning
+        an empty collection quietly — if this raised, the raise would be
+        firing on the very case it exists to tell apart from a refusal.
+        """
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph([]))
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            grouped = await backend.get_all_valid_edges(group_id='test')
+            nodes = await backend.list_entity_nodes(group_id='test')
+        assert grouped == {}
+        assert nodes == []
+        assert _warnings(caplog) == []
+
+
+# ---------------------------------------------------------------------------
 # step-9: live corroboration against a REAL FalkorDB
 # ---------------------------------------------------------------------------
 #
