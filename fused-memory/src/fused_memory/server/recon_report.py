@@ -609,6 +609,21 @@ class ReconReportState:
         # down per-entry — so cross-stage in-run dedup and duplicate_finding
         # citation pointers survive an individual stage's TTL eviction for as
         # long as the run itself is still live.  See tick()'s docstring.
+        # task-4185 (operator ruling 2026-08-12): this index is deliberately
+        # keyed on a PROJECTLESS signature, and stays that way — do NOT
+        # project-namespace the key.  That projectlessness is exactly what
+        # lets a bare top-level task_id (which names no project) fold onto a
+        # foreign citation, and that fold is INTENDED.
+        #
+        # Only the cite_task→cite_task half of the resulting collision is
+        # DETECTABLE, and it is guarded: see cite_task's fold-2 bullet.  The
+        # add_finding → derived-sig half is inherently AMBIGUOUS and is
+        # ACCEPTED — an `add_finding(task_id='42', ...)` call carries no
+        # project whatsoever, so a run containing two projects' findings
+        # about task 42 can still collapse there, and no guard at this layer
+        # can tell that from a genuine duplicate.  That acceptance is
+        # executable, not merely documented, in
+        # test_unpinned_anchor_fold_emits_no_near_collision_warning.
         self._run_sig_index: dict[str, dict[tuple, str]] = {}  # run_id → {sig → finding_id}
         self._run_finding_index: dict[str, dict[str, _ReportEntry]] = {}  # run_id → {finding_id → entry}
         self._run_desc_index: dict[str, dict[str, str]] = {}  # run_id → {desc_hash → finding_id}
@@ -1671,6 +1686,54 @@ class ReconReportState:
             if run_sig_index.get(derived_sig) == finding.finding_id:
                 run_sig_index.pop(derived_sig, None)
 
+    def _derived_sig_anchor_project_id(
+        self, run_id: str, anchor_finding_id: str, c_cited_task_id: str | None
+    ) -> str | None:
+        """Return the project_id that PINS *anchor_finding_id*'s ownership of the
+        derived ``(c_cited_task_id, flag_type)`` signature, or None when the
+        anchor carries no such pin (task-4185).
+
+        The derived signature is deliberately PROJECTLESS (see
+        ``_run_sig_index``'s declaration), so a hit on it does not by itself
+        mean the two findings are about the same task — only about the same
+        task NUMBER. This helper answers the narrower question the guard
+        needs: did the anchor's own primary citation pin that number to a
+        project?
+
+        Returns None — meaning "unpinned, fold as before" — in two cases,
+        neither of which is a mismatch:
+
+        (i) The anchor has no ``cited_tasks`` at all. Its ownership of the
+            derived sig came from :meth:`add_finding`'s ordinary, equally
+            projectless ``(task_id, flag_type)`` key, and a bare top-level
+            ``task_id`` names no project — so there is nothing to compare
+            against and the fold is the INTENDED one (operator ruling
+            2026-08-12; see ``_run_sig_index``).
+
+        (ii) The anchor's primary citation names a DIFFERENT task. Such a
+            citation says nothing about which project THIS task id belongs
+            to, so comparing its project_id would break a legitimate
+            pre-existing fold — pinned by
+            ``test_anchor_citing_a_different_task_still_folds``.
+
+        Reads ``cited_tasks[0]`` — the same slot :meth:`_purge_finding` uses
+        to reconstruct the derived sig it must clear — so registration,
+        cleanup and this guard all agree on which citation owns the key.
+        Comparison runs through :func:`_canonical_sig_field`, the coercion
+        the index itself uses, so an int-vs-str ``task_id`` (common in LLM
+        output) cannot make a genuine pin look like a different task.
+        """
+        resolved = self._resolve_finding(run_id, anchor_finding_id)
+        if resolved is None:
+            return None
+        anchor = resolved[1]
+        if not anchor.cited_tasks:
+            return None
+        primary = anchor.cited_tasks[0]
+        if _canonical_sig_field(primary['task_id']) != c_cited_task_id:
+            return None
+        return primary['project_id']
+
     def _log_cite_task_fold_purge(
         self,
         *,
@@ -1933,6 +1996,29 @@ class ReconReportState:
            exempting one stage from registering it would just let that
            stage's findings silently evade the whole-run fold.
 
+           GUARDED (task-4185): because the derived key is projectless, a
+           hit proves only that two findings name the same task NUMBER. The
+           fold is SKIPPED — both findings kept, each with its own
+           citation, and the anchor's registration left untouched (the
+           derived sig has ONE owner per run; first registrant wins) — when
+           the ANCHOR's primary citation names the SAME task in a DIFFERENT
+           project. An anchor with no citation at all, or one whose primary
+           citation names a different task, carries no project pin and
+           folds exactly as before (:meth:`_derived_sig_anchor_project_id`
+           spells out both cases). A skipped near-collision logs a WARNING
+           and returns the ordinary ``{project_id, task_id, title}``
+           citation dict, NOT ``duplicate_finding``: the finding survives
+           and its citation is recorded, so telling the caller to stop
+           counting it as a new filing would be actively wrong.
+
+           When fold 1 ALSO hits on the same call, fold 1 still wins: the
+           finding is purged and ``duplicate_finding`` is returned as
+           before, and NO near-collision WARNING is emitted — the skip
+           never took effect, so claiming both findings were kept would
+           contradict the purge record logged microseconds later. Skipping
+           fold 2 only ever ADDS survivors relative to the old behaviour;
+           it never rescues a finding fold 1 would have collapsed.
+
         BOTH folds emit a WARNING carrying the losing finding's full content
         (:meth:`_log_cite_task_fold_purge`) immediately BEFORE purging it.
         The purge is wholesale and the returned ``duplicate_finding`` error
@@ -2007,6 +2093,60 @@ class ReconReportState:
             else None
         )
 
+        # task-4185: the derived sig is PROJECTLESS, so a hit can mean two
+        # projects' findings about same-NUMBERED tasks rather than one task.
+        # Per the operator ruling (2026-08-12) the key stays projectless —
+        # only the detectable cite_task→cite_task half is guarded here, by
+        # asking whether the anchor's OWN primary citation pins this task id
+        # to a different project.  An unpinned anchor (see
+        # _derived_sig_anchor_project_id's two None cases) folds as before.
+        entity_project_mismatch = False
+        if entity_existing_id is not None and entity_existing_id != finding.finding_id:
+            anchor_project_id = self._derived_sig_anchor_project_id(
+                run_id, entity_existing_id, c_cited_task_id
+            )
+            if anchor_project_id is not None and anchor_project_id != project_id:
+                entity_project_mismatch = True
+                # task-4185 amend: report the near-collision ONLY on the path
+                # where this finding actually SURVIVES it.  The project-scoped
+                # fold below is checked after this detection and takes
+                # priority when both would hit (see the sequential-branch
+                # comment): it purges this very finding and returns
+                # duplicate_finding, so an unconditional emit here would claim
+                # 'BOTH findings kept' one line before the task-4184 purge
+                # record for the SAME finding_id — a self-contradicting false
+                # positive in the one channel an operator has for this.
+                project_fold_wins = (
+                    project_existing_id is not None
+                    and project_existing_id != finding.finding_id
+                )
+                # This line is the ONLY observable signal that a run actually
+                # contained numerically-colliding cross-project task ids —
+                # which is why it is WARNING and not INFO.  Nothing is
+                # destroyed here (both findings survive), so it needs no
+                # _log_cite_task_fold_purge-style content record; but the
+                # UNGUARDABLE add_finding→derived-sig half (see
+                # ``_run_sig_index``) may have silently folded two projects'
+                # findings elsewhere in this same run, and nothing detects
+                # that after the fact.  An operator who sees this knows to
+                # distrust the run's dedup.  Lazy %-args, never an f-string.
+                if not project_fold_wins:
+                    logger.warning(
+                        'recon_report: cite_task entity-scoped fold SKIPPED — cross-project '
+                        'near-collision on a PROJECTLESS derived signature; BOTH findings kept, '
+                        'each with its own citation. run_id=%r stage=%r skipped_finding_id=%r '
+                        'attempted_citation=%r surviving_finding_id=%r anchor_citation=%r '
+                        'derived_sig=%r flag_type=%r',
+                        run_id,
+                        finding_entry.stage,
+                        finding.finding_id,
+                        (project_id, task_id),
+                        entity_existing_id,
+                        (anchor_project_id, task_id),
+                        derived_sig,
+                        finding.flag_type,
+                    )
+
         # Sequential (not project_hit/entity_hit booleans + a re-derived
         # existing_id) so pyright narrows each *_existing_id to `str` from
         # its own `is not None` check at the call site — see cited_task_key
@@ -2026,7 +2166,11 @@ class ReconReportState:
             self._purge_finding(run_id, finding_entry, finding)
             self._persist_run(run_id)
             return _duplicate_finding_error(project_existing_id)
-        if entity_existing_id is not None and entity_existing_id != finding.finding_id:
+        if (
+            entity_existing_id is not None
+            and entity_existing_id != finding.finding_id
+            and not entity_project_mismatch
+        ):
             self._log_cite_task_fold_purge(
                 run_id=run_id,
                 fold='entity_scoped',
@@ -2042,7 +2186,34 @@ class ReconReportState:
 
         if project_fold_eligible:
             self._run_cited_task_index.setdefault(run_id, {})[cited_task_key] = finding.finding_id
-        if entity_fold_eligible:
+        # task-4185: the derived signature has exactly ONE owner per run and
+        # FIRST REGISTRANT WINS.  A finding whose fold was skipped for a
+        # project mismatch keeps its own citation but does NOT take
+        # ownership: otherwise it would overwrite the anchor, and every
+        # later same-project duplicate of that task would compare against
+        # this FOREIGN citation, see a mismatch, and stop folding — trading
+        # a cross-project over-fold for a same-project under-fold.  It also
+        # keeps _purge_finding's ownership check
+        # (`run_sig_index.get(derived_sig) == finding.finding_id`) honest:
+        # deleting a non-owning finding must not clear the anchor another
+        # finding still owns.  The project-scoped registration above is
+        # deliberately NOT gated — its key already carries project_id, so
+        # this finding legitimately anchors 'other_project:42' for its own
+        # project.
+        #
+        # ACCEPTED consequence (task-4185 amend): duplicates WITHIN the
+        # foreign project are then not deduped by the derived sig at all —
+        # a second other_project:42 citation also finds the original
+        # (dark_factory-pinned) anchor, also mismatches, and also survives.
+        # Those fall back to the project-scoped index above when eligible
+        # ('other_project:42' is a real, project-carrying key); when they
+        # are not eligible for fold 1 (e.g. a non-null top-level task_id),
+        # both foreign findings simply survive.  That under-fold is the
+        # price of first-registrant-wins and is preferred to the
+        # alternative — handing the derived-sig anchor to the foreign
+        # finding and under-folding the ORIGINAL project instead.  Pinned
+        # by test_second_foreign_citation_also_survives.
+        if entity_fold_eligible and not entity_project_mismatch:
             self._run_sig_index.setdefault(run_id, {})[derived_sig] = finding.finding_id
 
         # task-2425 amend: skip the append when an identical {project_id,
