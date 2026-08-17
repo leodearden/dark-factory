@@ -3970,6 +3970,68 @@ def test_main_lease_mutating_verbs_require_slug(
 
 
 @pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_derive_the_owners_slug_when_it_is_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    """THE POINT of task 4248: the CLI re-derives the same slug across invocations.
+
+    Claim and mutate are separate Claude Code Bash tool calls in production —
+    separate `/bin/bash -c` processes — so nothing can be carried between them.
+    Both derive from `$CLAUDE_PID`, so the owner matches itself without ever
+    spelling the token in shell.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+    sr.main(['lease-claim', '--name', 'watcher-df'])
+    capsys.readouterr()
+
+    rc = sr.main([verb, '--name', 'watcher-df'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.splitlines()[0] == 'result=applied'
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_still_refuse_a_stranger_with_a_derived_slug(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    """THE GUARD TEST: defaulting `--slug` is a CALLER-DERIVED default, not a fallback.
+
+    3994's `required=True` comment reads "a silent no-slug fallback would
+    preserve the 'any caller may evict/refresh any lease' defect indefinitely".
+    This pins that the defect stays fixed. The defect 3994 closed was that both
+    verbs mutated UNCONDITIONALLY — no ownership check ran at all. The check
+    still runs; it now compares against a slug derived from THIS caller's own
+    `$CLAUDE_PID`, so a DIFFERENT session derives a DIFFERENT slug and is
+    refused, with the lease body untouched. What 4248 retires is only the
+    requirement that the token be spelled in shell — which is what let it drift.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+    sr.main(['lease-claim', '--name', 'watcher-df'])
+    capsys.readouterr()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    original_body = lease_path.read_text()
+
+    # A different session: same lease name, its own (different) session pid.
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID - 1))
+    rc = sr.main([verb, '--name', 'watcher-df'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'result=refused'
+    # The human line names the REAL holder — the first session's derived slug.
+    assert f'watcher-df-{_DEAD_PID}' in lines[1]
+    assert lease_path.read_text() == original_body
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
 def test_main_lease_mutating_verbs_print_result_applied_for_the_owner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
