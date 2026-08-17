@@ -696,16 +696,54 @@ class TestCapRetryResume:
 # ===================================================================
 
 
-def _write_transcript(base: Path, session_id: str, slug: str = 'myproject') -> Path:
+def _progressed_session_records() -> list[dict]:
+    """Records for a NORMAL session that actually did something.
+
+    A user turn plus an assistant turn carrying a ``tool_use`` block — the shape
+    of any session worth resuming.  This is the DEFAULT fixture content because
+    a transcript's mere existence is no longer the whole resume-eligibility
+    question: the branch also asks whether the transcript records work to
+    continue.  A user-only (or text-only) transcript means "a session that did
+    nothing", which is a DIFFERENT test subject; tests about reachability must
+    not accidentally assert it.
+    """
+    return [
+        {'type': 'user', 'content': 'hi'},
+        {
+            'type': 'assistant',
+            'message': {
+                'role': 'assistant',
+                'content': [
+                    {'type': 'text', 'text': 'reading the file'},
+                    {'type': 'tool_use', 'name': 'Read', 'input': {'file_path': '/tmp/x.py'}},
+                ],
+            },
+        },
+    ]
+
+
+def _write_transcript(
+    base: Path,
+    session_id: str,
+    slug: str = 'myproject',
+    records: list[dict] | None = None,
+) -> Path:
     """Materialise ``<base>/projects/<slug>/<session_id>.jsonl``.
 
     Mirrors the fixture idiom in ``test_cli_invoke.py::TestReadTranscriptRecords``
     — the layout ``_resolve_transcript_path`` globs for.
+
+    *records* defaults to a PROGRESSED session (see
+    ``_progressed_session_records``) so callers that only care about the file
+    being REACHABLE get a transcript representing a healthy, resumable session.
+    Pass *records* explicitly to materialise a specific transcript shape.
     """
     slug_dir = base / 'projects' / slug
     slug_dir.mkdir(parents=True, exist_ok=True)
     transcript = slug_dir / f'{session_id}.jsonl'
-    transcript.write_text(json.dumps({'type': 'user', 'content': 'hi'}) + '\n')
+    if records is None:
+        records = _progressed_session_records()
+    transcript.write_text('\n'.join(json.dumps(r) for r in records) + '\n')
     return transcript
 
 
