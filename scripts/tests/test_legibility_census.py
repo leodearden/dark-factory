@@ -1302,6 +1302,39 @@ def test_render_report_capped_coverage_states_coded_digests_not_drawn_digests():
     )
 
 
+def test_render_report_capped_coverage_names_the_uncoded_digests_when_coding_fell_short():
+    # The storm's shortfall must be LOUD on the coverage line itself, not
+    # merely inferable by subtracting the per-batch bullets rendered below
+    # it -- an operator deciding whether to roll last_census_at back reads
+    # THIS line, and it is the one line whose job is the coverage claim.
+    report = _render(mining_result=_storm_capped_mining_result())
+
+    coverage_line = _coverage_line(report)
+    lowered = coverage_line.lower()
+    assert "6" in coverage_line, "the 6 digests that failed to code must be named"
+    assert "failed to code" in lowered
+    assert "no signal" in lowered, "the shortfall must say these digests contributed nothing"
+
+
+def test_render_report_capped_coverage_omits_the_shortfall_clause_when_every_digest_coded():
+    # A healthy capped run must not grow noise it has to explain away -- a
+    # line trained to be ignored is a line that will be ignored on the run
+    # that matters. This is the branch guard for the shortfall clause: it
+    # must render ONLY when coding actually fell short of what was drawn.
+    report = _render(
+        mining_result=_capped_mining_result(stop_reason="capped", max_batches=2),
+    )
+
+    coverage_line = _coverage_line(report)
+    lowered = coverage_line.lower()
+    assert "failed to code" not in lowered
+    assert "no signal" not in lowered
+    # Not a bare "0" check (a healthy run's line legitimately contains "20",
+    # which itself contains "0") -- assert the shortfall-clause SHAPE is
+    # absent, not merely that some unrelated digit is.
+    assert "0 digest" not in coverage_line, "a healthy run must not render a 0-failure clause"
+
+
 def test_render_report_capped_run_says_the_skipped_sessions_are_not_re_mined():
     # PARTIAL coverage must not read as "the rest gets picked up next time".
     # run_census always advances last_census_at and _census_window_dates
