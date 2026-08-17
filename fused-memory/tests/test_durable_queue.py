@@ -1996,3 +1996,120 @@ class TestTerminalHook:
             await poll_until(_completed, timeout=20.0, interval=0.05)
         finally:
             await q.close()
+
+
+# ------------------------------------------------------------------
+# Schema: the `executed` column (task 4116)
+#
+# POST_EXECUTE_DEAD_PREFIX is documented — in its own definition and again in
+# the write journal's terminal_status schema comment — as an ITEM-level fact:
+# "the backend write LANDED; do not blind-replay". It was computed from a
+# per-ATTEMPT local, so it evaporated the moment an item retried. Persisting it
+# on the row is what makes the item-level claim true.
+# ------------------------------------------------------------------
+
+
+# The pre-4116 DDL, copied literally so this is a real legacy fixture rather
+# than a reference to the current constant (which would make the migration test
+# vacuous the moment the constant changes).
+_LEGACY_CREATE_TABLE = """\
+CREATE TABLE IF NOT EXISTS write_queue (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id    TEXT    NOT NULL,
+    operation   TEXT    NOT NULL,
+    payload     TEXT    NOT NULL,
+    callback_type TEXT,
+    status      TEXT    NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 5,
+    next_retry_at REAL  NOT NULL DEFAULT 0,
+    created_at  REAL    NOT NULL,
+    completed_at REAL,
+    error       TEXT
+);
+"""
+
+
+class TestExecutedColumnSchema:
+    @staticmethod
+    async def _column_names(db) -> tuple[str, ...]:
+        cursor = await db.execute('PRAGMA table_info(write_queue)')
+        return tuple(row[1] for row in await cursor.fetchall())
+
+    @pytest.mark.asyncio
+    async def test_fresh_db_has_executed_column_in_slot_order(self, tmp_path):
+        """PRAGMA column order must equal QueueItem.__slots__, exactly.
+
+        QueueItem.__init__ positionally unpacks a `SELECT *` row into its
+        slots, and NOTHING at either end references the other: the schema
+        never mentions QueueItem and QueueItem never mentions the schema. So
+        the next column added in the wrong position does not raise — every
+        field silently shifts by one, `status` reading as `callback_type` and
+        `attempts` as `status`. This assertion converts that latent
+        silent-corruption trap into a named failure.
+        """
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            workers_per_group=1,
+            semaphore_limit=5,
+        )
+        await q.initialize()
+        try:
+            cols = await self._column_names(q._db)
+            assert 'executed' in cols
+            # Both facts in one assertion: the column exists, AND the SELECT *
+            # order still lines up with the unpack.
+            assert cols == tuple(dq_module.QueueItem.__slots__)
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_legacy_db_is_migrated_and_still_round_trips(self, tmp_path):
+        """A pre-4116 DB gains the column in the SAME position as a fresh one.
+
+        `CREATE TABLE IF NOT EXISTS` is a no-op against an existing table, so
+        a legacy DB needs an explicit ALTER — and ALTER can only APPEND. If the
+        fresh CREATE put `executed` anywhere but last, migrated and fresh DBs
+        would disagree on column order and one of them would corrupt every
+        QueueItem it unpacked. This pins that they agree, and that the
+        pre-existing row survives the migration readable.
+        """
+        data_dir = tmp_path / 'queue'
+        data_dir.mkdir(parents=True, exist_ok=True)
+        db_path = data_dir / 'write_queue.db'
+
+        async with aiosqlite.connect(str(db_path)) as legacy:
+            await legacy.execute(_LEGACY_CREATE_TABLE)
+            await legacy.execute(
+                'INSERT INTO write_queue '
+                '(group_id, operation, payload, callback_type, status, created_at) '
+                "VALUES (?, ?, ?, ?, 'pending', ?)",
+                ('legacy-grp', 'add_episode', '{"content": "pre-migration"}',
+                 None, time.time()),
+            )
+            await legacy.commit()
+
+        # workers_per_group=0 keeps this deterministic: _ensure_workers still
+        # creates the group lock _claim_next needs, but spawns no worker that
+        # could claim the row out from under the assertion below.
+        q = DurableWriteQueue(
+            data_dir=data_dir,
+            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
+            workers_per_group=0,
+            semaphore_limit=5,
+        )
+        await q.initialize()
+        try:
+            cols = await self._column_names(q._db)
+            assert 'executed' in cols, 'a legacy DB must be migrated, not left behind'
+            assert cols == tuple(dq_module.QueueItem.__slots__)
+
+            item = await q._claim_next('legacy-grp')
+            assert item is not None, 'the pre-existing row must survive the migration'
+            assert item.group_id == 'legacy-grp'
+            assert item.operation == 'add_episode'
+            assert item.parsed_payload() == {'content': 'pre-migration'}
+            assert not item.executed, 'no prior attempt executed for a legacy row'
+        finally:
+            await q.close()
