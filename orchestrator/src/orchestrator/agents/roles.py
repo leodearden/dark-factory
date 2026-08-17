@@ -576,6 +576,76 @@ end this turn with verification still pending: this session is one-shot, and
 abandoned work is recorded as a successful run."""
 
 
+# Census-2026-08-16 §1.1 companion to WAIT_PATTERN_GUIDANCE's `Monitor` bullet
+# above (task 4273; plans/confusion-census-2026-08-16.md).  Third sighting of
+# the same shape catalogued as `cand-20260806-12` and `cand-20260812-19` in
+# docs/legibility/confusion-codebook.yaml: a `Read` tool call whose echoed
+# input carried an empty parameter slot between `offset` and `limit`
+# (`"offset": 1240, , "limit": 1`) was rejected by `InputValidationError` as
+# unparseable JSON, and three turns later the agent reissued the IDENTICAL
+# malformed structure with only `limit` edited (1 -> 260) -- rejected
+# identically.  The retry encoded a misdiagnosis: the agent read the
+# rejection as a bad `limit` VALUE rather than a JSON SYNTAX defect.
+#
+# WHAT IS AND IS NOT ADDRESSED.  The stray comma's CAUSE is upstream of this
+# repository -- tool-call generation/serialization for a Claude Code builtin
+# (`Read`) -- and no in-repo code path produces or can intercept it, so this
+# constant does not attempt to detect or repair the malformed JSON.  Only the
+# RETRY facet is in scope: the observed retry edited `limit` while leaving
+# the syntax defect untouched, so the rejection reproduced identically and
+# the turn was wasted.  Retry behaviour of a dispatched agent IS this repo's
+# to fix, through the role system prompts.
+#
+# DISCRIMINATION, NOT DUPLICATION.  WAIT_PATTERN_GUIDANCE's `Monitor` bullet
+# above (roles.py:490-495) already names the OTHER `InputValidationError`
+# shape -- a parameter name the schema does not have, typically a deferred
+# tool called before `ToolSearch` loaded its schema -- which needs the
+# OPPOSITE fix (consult the schema, don't re-emit blindly).  This constant
+# points at that discrimination rather than repeating it; do not delete
+# either bullet as redundant with the other.
+#
+# HARD CONSTRAINT -- do NOT add an `mcp__<family>__<name>` example to this
+# constant.  test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names
+# (task 4107) is parametrized over every role and asserts any fully-qualified
+# MCP tool named in a role's system_prompt is in THAT role's allowed_tools.
+# This constant is spliced into 8 roles with differing allowlists, so naming
+# one MCP tool would fail for whichever roles lack the grant.  `Read`,
+# `ToolSearch` and `InputValidationError` are all builtins and do not match
+# that regex.
+#
+# Plain text, NO literal `{`/`}` braces.  Defensive rather than load-bearing,
+# same as WAIT_PATTERN_GUIDANCE: role prompts reach this only by plain `+`
+# concatenation, which is brace-safe by construction -- role prompts are
+# deliberately NOT f-strings (see the MANDATED_STAGING_COMMAND note at
+# roles.py:332) precisely because they contain literal braces.  Staying
+# brace-free costs nothing and keeps this safe if a future splice site does
+# interpolate it.
+#
+# No sighting COUNT is stated in the text below -- the codebook accrues a new
+# sighting every census cycle, and a number baked into a role prompt goes
+# stale silently while "catalogued sightings all show the same shape" stays
+# true.
+TOOL_CALL_REJECTION_GUIDANCE = """
+## Reading a tool-call rejection before you retry
+
+`InputValidationError` reports a defect in the CALL you just made, and it
+echoes back the exact bytes you sent — read that echo before retrying. It
+reports two different shapes, and they need OPPOSITE fixes:
+
+- "could not be parsed as JSON" means the call's SYNTAX is broken and no
+  parameter VALUE is implicated. Re-emit the entire call from scratch; never
+  copy the rejected call and edit one field. Catalogued sightings of this
+  shape all show a `Read` call whose echoed input carries an empty slot
+  between `offset` and `limit` — editing `limit` and resubmitting the same
+  malformed structure reproduces the identical rejection, because editing a
+  value cannot fix a syntax error.
+- A rejection naming a parameter the schema does not have is the opposite
+  problem: the call parsed fine, but a field is wrong — typically a deferred
+  tool called before `ToolSearch` loaded its schema. Consult the schema; do
+  not re-emit blindly.
+"""
+
+
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
 # both STEWARD "Marking tasks done" call sites (kind="merged" and
 # kind="found_on_main"). Being a single shared constant IS the mechanism that
