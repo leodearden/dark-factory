@@ -2666,3 +2666,62 @@ class TestEffectiveMergeModuleConfigs:
         monkeypatch.setattr(verify_plan_module, '_merge_breadth_is_full', lambda _cfg: False)
 
         assert effective_merge_module_configs(config, [mc_a]) == [mc_a]
+
+
+# ---------------------------------------------------------------------------
+# Version pin survival through the VerifyCmd-layer scoper (task 3931)
+# ---------------------------------------------------------------------------
+
+_PINNED_TYPE_CHAIN_3931 = ROOT_TYPE_CHECK_COMMAND.replace('npx pyright', 'npx pyright@1.1.408')
+_ESC_3805_FILE = 'orchestrator/tests/test_run_vllm_eval.py'
+
+
+class TestVersionPinSurvivesPrefixScoping:
+    """``_scope_prefix_to_keyword`` must keep a pinned npx package version.
+
+    Task 3931 / esc-3805-1 — the LOCKSTEP counterpart of
+    ``test_verify.py::TestVersionPinSurvivesScoping``.
+
+    This function is the ``VerifyCmd``-layer twin of
+    ``verify._scope_to_keyword`` and carries the IDENTICAL byte-offset
+    truncation (``retained = head[: idx + len(keyword)]``); its own docstring
+    states that *raw* "is ALWAYS truncated to everything up to and including
+    the first occurrence of *keyword* before being (re-)parsed". So it strips a
+    version pin exactly the same way, and the two layers must be fixed in the
+    SAME commit or they silently diverge — the trap task 3830 fell into, where
+    a plan named only verify.py while verify_plan.py needed the identical
+    change.
+
+    MEASURED on this branch before the step-6 change (and after step-4, so this
+    is verify_plan.py's own stripping, not the parser's):
+
+        _scope_prefix_to_keyword(PINNED, 'pyright', [file])
+            -> ToolKind.PYRIGHT, renders 'npx pyright <file>'   <-- pin GONE
+    """
+
+    def test_pinned_chain_keeps_its_version(self):
+        cmd = _scope_prefix_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        assert cmd.tool is ToolKind.PYRIGHT
+        assert render(cmd) == f'npx pyright@1.1.408 {_ESC_3805_FILE}', (
+            f'_scope_prefix_to_keyword dropped the version pin, rendering '
+            f'{render(cmd)!r} (task 3931, esc-3805-1). This is the '
+            'VerifyCmd-layer twin of verify._scope_to_keyword and must be '
+            'fixed in lockstep with it — the pair routes through one shared '
+            'split_chain_tail gate and its STRUCTURAL lockstep is a documented '
+            'property'
+        )
+
+    def test_unpinned_chain_scopes_exactly_as_today(self):
+        """Regression floor: the bare spelling is unchanged."""
+        cmd = _scope_prefix_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', [_ESC_3805_FILE])
+        assert cmd.tool is ToolKind.PYRIGHT
+        assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'
+
+    def test_a_longer_unrelated_token_is_not_absorbed(self):
+        """Same boundary rule as verify.py's: widen across `@<version>` ONLY.
+
+        Passes today; it is the floor that makes the step-6 widening provably
+        narrow rather than a general "keep the whole token" change.
+        """
+        cmd = _scope_prefix_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE])
+        assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'

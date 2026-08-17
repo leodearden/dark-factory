@@ -9724,3 +9724,95 @@ class TestRunVerificationThreadsEachLegsOwnDuration:
         assert result.summary == 'Failures: lint issues'
         assert result.category != 'infra_kill'
         assert SIGNAL_KILL_SUMMARY_MARKER not in result.summary
+
+
+# ---------------------------------------------------------------------------
+# Version pin survival through verify's scoping pipeline (task 3931)
+# ---------------------------------------------------------------------------
+
+# LOCAL literals, deliberately not derived from the committed YAML: these guards
+# state the scoper contract for a pinned clause independently of whether the
+# fleet chain is pinned yet (it is not, until step 8 of task 3931).
+_UNPINNED_TYPE_CHAIN_3931 = (
+    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
+    ' && cd ../dashboard && npx pyright && cd ../shared && npx pyright'
+    ' && cd ../escalation && npx pyright && cd ../sampler && npx pyright'
+    ' && cd ../cockpit && npx pyright'
+)
+_PINNED_TYPE_CHAIN_3931 = _UNPINNED_TYPE_CHAIN_3931.replace('npx pyright', 'npx pyright@1.1.408')
+_ESC_3805_FILE = 'orchestrator/tests/test_run_vllm_eval.py'
+
+
+class TestVersionPinSurvivesScoping:
+    """A pinned `npx pyright@<version>` must survive `_scope_to_keyword`.
+
+    Task 3931 / esc-3805-1. Assertions 1 and 2 below are the LOAD-BEARING
+    ones: without them, a version pin in dark-factory-orchestrator.yaml is
+    DECORATIVE on the exact FILE_SCOPED path that generated esc-3805-1 — it
+    reads as pinned in the config and runs unpinned in the gate.
+
+    MEASURED on this branch, before the step-6 change (and after the step-4
+    verify_cmd change, so this is verify.py's own stripping, not the parser's):
+
+        _scope_to_keyword(PINNED,   'pyright', [file])
+            -> 'npx pyright orchestrator/tests/test_run_vllm_eval.py'
+        _scope_to_keyword(UNPINNED, 'pyright', [file])
+            -> 'npx pyright orchestrator/tests/test_run_vllm_eval.py'
+
+    Byte-identical. ``retained = head[: idx + len(keyword)]`` (verify.py) is a
+    BYTE-OFFSET slice, so it cuts mid-token at the `@` and drops `@1.1.408`
+    before the string is ever re-parsed. The pin cannot survive a parser fix
+    alone; the truncation itself has to become token-aware.
+
+    A `.py`-touching diff takes exactly this FILE_SCOPED path: the leading
+    `cd` is folded away, leaving `npx pyright <repo-root-relative-file>` to run
+    FROM THE WORKTREE ROOT and then be wrapped by
+    `_scope_fallback_tool_to_subproject`.
+    """
+
+    def test_pinned_chain_keeps_its_version_through_scope_to_keyword(self):
+        scoped = verify._scope_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        assert scoped == f'npx pyright@1.1.408 {_ESC_3805_FILE}', (
+            f'_scope_to_keyword dropped the version pin, returning {scoped!r} '
+            '(task 3931, esc-3805-1). The byte-offset truncation '
+            '`head[: idx + len(keyword)]` slices mid-token at the `@`, so the '
+            'gate advertises a pinned pyright and runs whatever npx last '
+            'cached'
+        )
+
+    def test_pin_survives_the_uv_subproject_rescope(self):
+        scoped = verify._scope_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        rescoped = verify._scope_fallback_tool_to_subproject(scoped, 'pyright', 'orchestrator')
+        assert rescoped == (
+            f'uv run --project orchestrator npx pyright@1.1.408 {_ESC_3805_FILE}'
+        ), (
+            f'the pin did not survive the uv rescope, giving {rescoped!r} '
+            '(task 3931) — this is the command the FILE_SCOPED fallback path '
+            'actually dispatches for the esc-3805-1 diff'
+        )
+
+    def test_unpinned_chain_scopes_exactly_as_today(self):
+        """Regression floor: the bare spelling's scoped shape is unchanged."""
+        scoped = verify._scope_to_keyword(_UNPINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        assert scoped == f'npx pyright {_ESC_3805_FILE}'
+        assert verify._scope_fallback_tool_to_subproject(scoped, 'pyright', 'orchestrator') == (
+            f'uv run --project orchestrator npx pyright {_ESC_3805_FILE}'
+        )
+
+    def test_a_longer_unrelated_token_is_not_absorbed_by_the_widening(self):
+        """The boundary rule: widen across an `@<version>` suffix ONLY.
+
+        Pins the chosen rule explicitly so the widening cannot creep into "keep
+        the whole token". `npx pyright-foo` is a DIFFERENT tool whose name
+        merely starts with the keyword; today the byte-offset slice truncates
+        it to `npx pyright` and this must stay byte-identical, because
+        retaining `pyright-foo` whole would reclassify the command (ToolKind.NPX)
+        and make `scope_to` replace the tool name with the touched file — the
+        very failure mode the pinned spelling suffered before step 4.
+
+        This assertion PASSES today and is a floor, not a RED: it is what
+        makes the step-6 widening provably narrow.
+        """
+        assert verify._scope_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE]) == (
+            f'npx pyright {_ESC_3805_FILE}'
+        )
