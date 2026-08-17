@@ -804,28 +804,54 @@ def _extract_question(hook_input: Mapping[str, Any]) -> session_registry.Questio
     return session_registry.Question(text=str(message), asked_at=datetime.now(UTC).isoformat())
 
 
-def _record_status_or_none(
+def _prior_record_or_none(
     slug: str,
     root: Path | str | None,
-) -> session_registry.Status | None:
-    """The status of the record at *slug* BEFORE this event refreshes it.
+) -> session_registry.SessionRecord | None:
+    """The record at *slug* as it stood BEFORE this event refreshes it.
 
     None when there is no record yet (the ordinary forked/hand-launched
     first sight) and, fail-soft, when it cannot be read at all -- the same
     hard rule the ownership probe follows: a registry fault degrades to the
     prior behaviour instead of breaking a session. Logged, never silent.
+
+    Callers need both the prior status AND the prior binding to recognise
+    the launch window (see ``_in_unbound_launch_window``), so this returns
+    the whole snapshot rather than a single field.
     """
     try:
-        return session_registry.read_record(slug, root=root).status
+        return session_registry.read_record(slug, root=root)
     except FileNotFoundError:
         return None
     except Exception:
         logger.warning(
-            'pre-refresh status read failed for slug %s; treating it as unsighted',
+            'pre-refresh record read failed for slug %s; treating it as unsighted',
             slug,
             exc_info=True,
         )
         return None
+
+
+def _in_unbound_launch_window(
+    prior: session_registry.SessionRecord | None,
+) -> bool:
+    """Is *prior* a spawn-created record whose owner has not been sighted yet?
+
+    True only for the LAUNCHING-and-still-unbound snapshot spawn-claude.sh
+    writes before the session it launched runs its own SessionStart. In that
+    window the record carries NO ``claude_session_id``, so there is no
+    discriminator (task 4193's whole premise: the stdin ``session_id`` is
+    the only one, and PID lineage cannot substitute). An event arriving here
+    is therefore of UNKNOWN provenance -- it may be the owner's, or a nested
+    ``claude`` that merely inherited ``CLAUDE_SPAWN_SESSION_ID``.
+
+    A LAUNCHING record that IS already bound is not in the window: a bound
+    record has a discriminator, so ``_env_slug_is_owned`` has already proved
+    this event's ownership and the caller may write normally.
+    """
+    if prior is None or prior.status is not session_registry.Status.LAUNCHING:
+        return False
+    return not (prior.claude_session_id or '').strip()
 
 
 def _run_status_refresh_and_retitle(
@@ -845,31 +871,45 @@ def _run_status_refresh_and_retitle(
     same conditional write the pending question already used, so an
     ordinary bound-record event still performs exactly one registry write
     (``refresh_record``'s own); the extra write happens only on the single
-    event that first binds a legacy record -- and never at all while the
-    record is still LAUNCHING, so an inheritor cannot claim a spawn-created
-    record whose owner has not run its SessionStart yet.
+    event that first binds a legacy record.
+
+    While the record is still LAUNCHING AND unbound, this event's provenance
+    is UNKNOWABLE (``_in_unbound_launch_window``), so NOTHING it carries is
+    allowed to land on the spawn-created record: not the binding, not the
+    status, not the pending question. Only the mtime heartbeat is bumped.
+    That record holds role/project/prompt/result_file and is the one
+    spawn-claude.sh's finish() writes ``exited`` to; letting a nested
+    inheritor rewrite it would invert ownership (the failure task 2511
+    fixed) or advertise a still-launching spawn as idle/awaiting-input in
+    the cockpit -- the very lie task 4193 exists to stop. Withholding costs
+    only a deferral: the owner's own SessionStart binds the record and every
+    later event writes normally.
+
+    TRADE-OFF (deliberate): if the owner's SessionStart never lands at all,
+    its own later Stop/Notification is withheld too, so the record stays
+    LAUNCHING until the reaper collects it. That is preferred over the
+    alternative of forking every pre-SessionStart event onto a new slug,
+    which would misroute the OWNER's session whenever its SessionStart is
+    merely slow -- trading a rare stale status for a routine wrong one.
     """
     identity = resolve_hook_identity(hook_input, env)
     slug = hook_session_slug(hook_input, env, root=root)
-    prior_status = _record_status_or_none(slug, root)
-    record = session_registry.refresh_record(slug, root=root, status=status)
+    prior = _prior_record_or_none(slug, root)
+    # Decide the launch window BEFORE the refresh: refresh_record is a
+    # read-modify-WRITE, so passing the status here at all would already have
+    # mutated the spawn-created record by the time any later guard ran.
+    # status=None makes it a pure heartbeat bump, leaving status untouched.
+    in_launch_window = _in_unbound_launch_window(prior)
+    record = session_registry.refresh_record(
+        slug, root=root, status=None if in_launch_window else status
+    )
     # Bind on the record refresh_record RETURNED (post-status-flip), and write
     # after both mutations, so status, question and binding land atomically.
-    #
-    # A still-LAUNCHING record has not been sighted by its owning session's
-    # SessionStart yet. Binding one here would let a nested inheritor whose
-    # event happens to land first (the owner's SessionStart delayed, timed
-    # out under the 10s hook timeout, or failed) claim the spawn-created
-    # record -- which holds role/project/prompt/result_file and is the one
-    # spawn-claude.sh's finish() writes `exited` to -- and invert ownership
-    # permanently, the precise failure task 2511 fixed. Skipping the stamp
-    # costs nothing but a deferral: the owner's own SessionStart binds it.
-    bound = prior_status is not session_registry.Status.LAUNCHING and _bind_claude_session_id(
-        record, hook_input
-    )
-    if question is not None:
+    bound = not in_launch_window and _bind_claude_session_id(record, hook_input)
+    stamp_question = question is not None and not in_launch_window
+    if stamp_question:
         record.question = question
-    if question is not None or bound:
+    if stamp_question or bound:
         session_registry.write_record(record, root=root)
     title = hook_display_title(identity, env, record)
     return osc_retitle_sequence(status, title)

@@ -1491,7 +1491,67 @@ def test_refresh_path_does_not_bind_a_still_launching_record(tmp_path: Path) -> 
 
     sh.run_stop(hook_input, env, root=tmp_path)
 
-    assert sr.read_record(slug, root=tmp_path).claude_session_id is None
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_session_id is None
+    # ...and the STATUS is withheld too, not just the binding. Asserting only
+    # the binding once let the real defect through: refresh_record is a
+    # read-modify-WRITE, so a guard sitting after it still left the nested
+    # Stop advertising a still-launching spawn as `idle` in the cockpit.
+    assert record.status == sr.Status.LAUNCHING
+
+
+def test_refresh_path_withholds_a_question_during_the_unbound_launch_window(
+    tmp_path: Path,
+) -> None:
+    # The question is the attention rail's payload: a nested claude's prompt
+    # landing on the spawner's record would make the cockpit claim the SPAWN
+    # is the thing awaiting input. Withheld on the same unknowable-provenance
+    # grounds as the status and the binding.
+    slug = 'session-cockpit-3215103'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215103
+        ),
+        root=tmp_path,
+    )
+    hook_input = {
+        'session_id': 'uuid-nested',
+        'cwd': '/home/leo/src/dark-factory',
+        'message': 'Do you want to proceed?',
+    }
+
+    sh.run_notification(hook_input, {'CLAUDE_SPAWN_SESSION_ID': slug}, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.question is None
+    assert record.status == sr.Status.LAUNCHING
+    assert record.claude_session_id is None
+
+
+def test_refresh_path_writes_normally_to_a_bound_launching_record(
+    tmp_path: Path,
+) -> None:
+    # The window is LAUNCHING *and unbound*. A LAUNCHING record that already
+    # carries a binding HAS a discriminator, so _env_slug_is_owned has proved
+    # this event belongs to the owner -- withholding there would strand a
+    # legitimately-owned record at `launching`.
+    slug = 'session-cockpit-3215104'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.LAUNCHING,
+            launcher_pid=3215104,
+            claude_session_id='uuid-owner',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'}
+
+    sh.run_stop(hook_input, {'CLAUDE_SPAWN_SESSION_ID': slug}, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.IDLE
+    assert record.claude_session_id == 'uuid-owner'
 
 
 def test_owning_session_start_still_wins_the_launching_record_after_a_nested_stop(
