@@ -958,17 +958,30 @@ def render_markdown(report: Report) -> str:
     lines += ['', '### Rejection samples', '']
     sampled_any = False
     for project in _sorted_projects(report):
-        samples = _rejection_payload(project.scan.rejections)[: report.max_samples]
-        if not samples:
-            continue
-        sampled_any = True
         total = len(project.scan.rejections)
+        # Keyed on 'did this project have rejections', NOT on 'did the cap
+        # leave any samples'. Skipping on the latter made max_samples <= 0
+        # drop the project before the omission note below could fire, so the
+        # section rendered a bare '_None._' while the triage table above
+        # reported a nonzero rejection count — a SILENT cap in the one place
+        # this renderer promises there are none. --max-samples is validated at
+        # the CLI too, but render_markdown is called directly by tests and by
+        # any future caller, so the structure is what has to be safe.
+        if not total:
+            continue
+        # max(..., 0) because a negative slice bound silently means 'all but
+        # the last N', which is a different and much worse cap than 'none'.
+        samples = _rejection_payload(project.scan.rejections)[
+            : max(report.max_samples, 0)
+        ]
+        sampled_any = True
         lines.append(f'**`{project.project_id}`** '
                      f'(showing {len(samples)} of {total:,}):')
         lines.append('')
-        lines += [f'- `{s["triage"]}` @{s["match_start"]}: {s["fact"]}'
-                  for s in samples]
-        lines.append('')
+        if samples:
+            lines += [f'- `{s["triage"]}` @{s["match_start"]}: {s["fact"]}'
+                      for s in samples]
+            lines.append('')
         if total > len(samples):
             # No silent caps: state what the markdown dropped, and where the
             # untruncated list lives.
@@ -1078,6 +1091,29 @@ def _page_size_arg(value: str) -> int:
     return size
 
 
+def _max_samples_arg(value: str) -> int:
+    """``--max-samples`` must be >= 1: a cap of zero is not a cap, it is a hide.
+
+    Mirrors ``_page_size_arg``, which this argument was missing. At 0 (or
+    negative) the markdown's rejection-samples section would show every
+    project's rejections as 'omitted' — legible, since the restructured loop
+    now says so, but there is no legitimate use for asking a report to carry
+    none of its own evidence, and the JSON is the untruncated record for
+    anyone who wants the markdown short.
+    """
+    try:
+        samples = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'{value!r} is not an integer') from None
+    if samples < 1:
+        raise argparse.ArgumentTypeError(
+            f'must be >= 1, got {samples}; the markdown must carry at least '
+            f'one rejection sample per project (the JSON artifact is the '
+            f'untruncated record)'
+        )
+    return samples
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1099,10 +1135,11 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        '--max-samples', dest='max_samples', type=int,
+        '--max-samples', dest='max_samples', type=_max_samples_arg,
         default=DEFAULT_MAX_SAMPLES,
         help=f'Max rejection samples per project in the MARKDOWN report '
-             f'(default: {DEFAULT_MAX_SAMPLES}). The JSON is never truncated.',
+             f'(default: {DEFAULT_MAX_SAMPLES}; must be >= 1). The JSON is '
+             f'never truncated.',
     )
     parser.add_argument(
         '--json-out', dest='json_out', default=DEFAULT_JSON_OUT,

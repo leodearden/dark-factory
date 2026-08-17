@@ -165,18 +165,28 @@ def test_scan_corpus_rejections_are_triageable_records():
     assert by_fact[_PREAMBLE_REJECTION] == _PREAMBLE_REJECTION.index('tasks 1020')
 
 
-@pytest.mark.parametrize(
-    'fact',
-    [
-        # The three shapes pinned by the sweep suite's
-        # test_adverbial_preamble_is_a_documented_under_selection. These are
-        # the RECALL LOSS: the enumeration really is its copula's subject and
-        # the preposition belongs to a scene-setting preamble in front of it.
-        'As of 2026-08-09, tasks 1020 and 1030 are pending.',
-        'In the merge queue, tasks 1020 and 1030 are pending.',
-        'For this cycle, tasks 1020 and 1030 are pending.',
-    ],
-)
+def _first_enumeration_start(fact: str) -> int:
+    """Where the shipped regex's first match begins in *fact*.
+
+    Derived from PLURAL_ENUM_SNAPSHOT_RE rather than from ``fact.index('tasks
+    1020')`` so a shape appended to the shared corpus with different ids — or
+    a differently-spelled plural head — is still located. ``triage_rejection``
+    is defined against the offset the extractor hands it, so taking that
+    offset from the extractor's own pattern is also the faithful input.
+    """
+    match = _mod.PLURAL_ENUM_SNAPSHOT_RE.search(fact)
+    assert match is not None, f'shape does not reach the guard at all: {fact}'
+    return match.start()
+
+
+# Parametrized over the SHARED corpus, not over a copy of it. A fourth preamble
+# shape appended to reconciliation/plural_enum_shapes.py is picked up by the
+# sweep suite and by the candidate simulation automatically; hardcoding the
+# three here would leave triage — the thing that decides whether a future
+# nonzero run reads as recall loss or as a correct rejection — the one consumer
+# that silently stopped covering the full set. A mislabel there UNDERSTATES
+# recall loss with nothing failing.
+@pytest.mark.parametrize('fact', _PREAMBLE_SHAPES)
 def test_triage_rejection_labels_adverbial_preamble(fact):
     """Rejections that cost recall must be separable from correct ones.
 
@@ -185,8 +195,7 @@ def test_triage_rejection_labels_adverbial_preamble(fact):
     loss). Mechanizing it here means a future nonzero run is triaged by the
     committed probe rather than by whoever happens to read the artifact.
     """
-    match_start = fact.index('tasks 1020')
-    assert triage_rejection(fact, match_start) == 'adverbial_preamble'
+    assert triage_rejection(fact, _first_enumeration_start(fact)) == 'adverbial_preamble'
 
 
 @pytest.mark.parametrize(
@@ -1021,6 +1030,59 @@ async def test_rendered_markdown_opens_with_provenance_and_regenerate_command():
     assert report.verdict in markdown
     assert 'RESULTSET_SIZE' in markdown  # the enumeration-coverage note
     assert _mod.REVALIDATION_TEST in markdown
+
+
+def test_build_parser_rejects_a_max_samples_below_one():
+    """A cap of zero is not a cap, it is a hide — and it had no validator.
+
+    ``--page-size`` got ``_page_size_arg``; ``--max-samples`` was a bare
+    ``type=int``, so 0 (or -1) parsed cleanly and suppressed every rejection
+    sample in the markdown.
+    """
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(['--max-samples', '0'])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(['--max-samples', '-1'])
+
+    ok = build_parser().parse_args(['--max-samples', '1'])
+    assert ok.max_samples == 1
+
+
+@pytest.mark.asyncio
+async def test_a_non_positive_max_samples_still_reports_what_it_dropped():
+    """The structural half: render_markdown itself must never cap silently.
+
+    The CLI validator above stops an operator getting here, but
+    ``render_markdown`` is called directly — by these tests, and by anything
+    that builds a Report in code. It used to skip a project whose sample list
+    came back empty, which skipped it BEFORE the 'N further rejection(s)
+    omitted' note could fire: the triage table said `adverbial_preamble 1`
+    while the samples section said `_None._` and claimed nothing was dropped.
+    That is precisely the silent cap the section's own comment forbids.
+    """
+    source = _FakeEdgeSource({
+        'alpha': (_ALPHA_FACTS, True),
+        'beta': (_BETA_FACTS, True),
+    })
+    report = await run(
+        _args(
+            project_id=['alpha', 'beta'],
+            measured_at=_FIXED_TIMESTAMP,
+            max_samples=0,
+        ),
+        edge_source=source,
+    )
+
+    markdown = render_markdown(report)
+
+    # Both projects have exactly one rejection, and both must be accounted for.
+    assert sum(report.triage_totals.values()) == 2
+    assert '_None._' not in markdown
+    assert markdown.count('further rejection(s) omitted here') == 2
+    assert '(showing 0 of 1)' in markdown
+    # ...and the JSON is still the untruncated record it points readers at.
+    payload = json.loads(render_json(report))
+    assert sum(len(p['rejections']) for p in payload['projects']) == 2
 
 
 @pytest.mark.asyncio
