@@ -110,9 +110,21 @@ FUSED_MEMORY_HEALTH_TIMEOUT_SECS = 15
 # wedge the task-1731 rationale above describes, while a slow FalkorDB/Qdrant
 # no longer reads as one. The path is pinned against the server's actual
 # registered routes by the drift test in
-# tests/scripts/test_orchestrator_watchdog.py — a typo would 404, and
-# probe_health() treats ANY response (404 included) as alive, so a mistyped
-# path would silently disable the kill decision entirely.
+# tests/scripts/test_orchestrator_watchdog.py.
+#
+# WHAT A TYPO'D PATH ACTUALLY COSTS (be precise here — the obvious reading is
+# wrong): it does NOT disable the kill decision. A 404 is still SERVED BY THE
+# ASYNCIO LOOP, so a wedged loop answers a mistyped path exactly as it answers
+# a correct one — i.e. not at all — and is still classified 'wedged' and
+# killed. A typo merely degrades the probe from "zero-I/O route served" to
+# "router 404 served"; both are valid liveness signals, so restart behaviour is
+# unchanged. (That is also why the rollout window — this watchdog deployed from
+# the repo before fused-memory.service restarts with the new route — is safe.)
+# The drift test therefore exists to keep the probe pointed at the INTENDED
+# zero-I/O route, not to stop the detector going blind. Do NOT "fix" this by
+# making probe_health() reject non-200: that would resurrect the exact
+# false-wedge class this task removed, since /health's 503-means-degraded-but
+# -alive would start reading as dead.
 FUSED_MEMORY_ALIVE_URL = f"http://127.0.0.1:{FUSED_MEMORY_PORT}/alive"
 # DELIBERATELY NOT SHORTENED below the /health budget, despite /alive doing no
 # I/O. Shortening it would trade one false-positive class for another: a 25s
@@ -474,9 +486,7 @@ def probe_port(port: int) -> bool:
     return False
 
 
-def probe_health(
-    url: str = FUSED_MEMORY_HEALTH_URL, timeout: float = FUSED_MEMORY_HEALTH_TIMEOUT_SECS
-) -> bool:
+def probe_health(url: str, timeout: float) -> bool:
     """Return True iff *url* returns ANY HTTP response within *timeout* seconds.
 
     Deliberately inverted fail-direction vs. probe_port(): probe_port defaults
@@ -498,10 +508,22 @@ def probe_health(
     HTTP response at all within the timeout — that is the only case that
     should return False here.
 
-    TWO CALLERS, ONE FAIL-DIRECTION (task 3765). This now serves both the kill
-    decision's /alive probe (_fused_memory_liveness_verdict passes
-    FUSED_MEMORY_ALIVE_URL explicitly) and its original FUSED_MEMORY_HEALTH_URL
-    default. The inverted fail-direction above is correct for both and stays
+    ROUTE-NEUTRAL BY CONSTRUCTION — *url* AND *timeout* ARE REQUIRED (task
+    3765). Despite the name, this asks only "does this URL answer at all"; it
+    knows nothing about /health's body or semantics. It deliberately carries NO
+    defaults, because the obvious ones are a live footgun: after task 3765 the
+    sole production caller is the kill decision (_fused_memory_liveness_verdict,
+    which passes FUSED_MEMORY_ALIVE_URL + FUSED_MEMORY_ALIVE_TIMEOUT_SECS), and
+    a FUSED_MEMORY_HEALTH_URL default would leave a bare ``probe_health()`` one
+    keystroke away from silently reinstating the load-dependent readiness probe
+    inside a liveness decision — precisely the defect that task removed. The
+    constants-and-verdict drift tests would not catch that, so the signature
+    does: there is nothing to fall back TO, and every caller must name its
+    route. (The /health BODY has its own consumer, _fused_memory_recon_busy_verdict(),
+    which bypasses this helper and calls urlopen directly because it needs the
+    recon_busy payload rather than a yes/no.)
+
+    ONE FAIL-DIRECTION, CORRECT FOR EITHER ROUTE. The inversion above stays
     untouched: /alive returns only 200, so its "responded at all" reading is
     trivially the same signal, and /health's 503-means-alive reading is exactly
     what keeps a degraded store from being mistaken for a dead loop.

@@ -4283,9 +4283,24 @@ def test_watchdog_probed_routes_are_registered_in_fused_memory_server() -> None:
     the server's routes are read as TEXT out of its @mcp.custom_route
     decorators.
 
-    A typo'd path would otherwise 404 — and probe_health treats ANY HTTP
-    response, 404 included, as ALIVE, so the kill decision would silently
-    become a no-op that never kills anything.
+    WHAT THIS DOES AND DOES NOT PROTECT (the tempting reading is wrong, and
+    getting it wrong invites a harmful "fix"). A typo'd path 404s, and
+    probe_health treats ANY HTTP response — 404 included — as ALIVE. That does
+    NOT blind the kill decision: a 404 is still SERVED BY THE ASYNCIO LOOP, so
+    a genuinely wedged loop fails to answer a mistyped path exactly as it fails
+    to answer a correct one, and is still classified 'wedged' and killed. A
+    typo only degrades the probe from "zero-I/O route served" to "router 404
+    served" — both valid liveness signals, restart behaviour unchanged. (Which
+    is also why the rollout window, watchdog deployed from the repo before
+    fused-memory.service restarts carrying /alive, is safe rather than
+    dangerous.)
+
+    So this guard exists to keep the probe pointed at the INTENDED zero-I/O
+    route — i.e. to stop the kill decision quietly drifting back onto a
+    load-bearing one — not to stop the detector going blind. Do not "harden"
+    probe_health into rejecting non-200 on the strength of this test: that
+    would resurrect the false-wedge class task 3765 removed, because /health's
+    503-means-degraded-but-alive would start reading as dead.
     """
     wdog = _load_watchdog()
 
@@ -4356,6 +4371,33 @@ class _FakeHealthResponse:
         return self.status
 
 
+def test_probe_health_requires_an_explicit_url_and_timeout() -> None:
+    """probe_health must carry NO defaults — neither url nor timeout (task 3765).
+
+    REGRESSION GUARD, not style. After task 3765 the only production caller is
+    the kill decision, which passes FUSED_MEMORY_ALIVE_URL. A
+    FUSED_MEMORY_HEALTH_URL default would leave a bare ``probe_health()`` one
+    keystroke from silently reinstating the load-dependent readiness probe
+    inside a liveness decision — the exact defect this task removed — and
+    neither the constants test above nor test_liveness_verdict_probes_alive_not_health
+    below would catch it, since both assert on what the CURRENT caller does.
+    The signature is what makes that mistake impossible: there is nothing to
+    fall back to.
+    """
+    import inspect  # noqa: PLC0415
+
+    wdog = _load_watchdog()
+    params = inspect.signature(wdog.probe_health).parameters
+
+    for name in ("url", "timeout"):
+        assert name in params, f"probe_health lost its {name!r} parameter"
+        assert params[name].default is inspect.Parameter.empty, (
+            f"probe_health's {name!r} must stay REQUIRED; found default "
+            f"{params[name].default!r}. A route-implying default lets a future "
+            "bare probe_health() call put /health back into the kill decision."
+        )
+
+
 def test_probe_health_true_on_200(monkeypatch: pytest.MonkeyPatch) -> None:
     """probe_health returns True when urlopen succeeds with a 2xx response."""
     wdog = _load_watchdog()
@@ -4364,7 +4406,10 @@ def test_probe_health_true_on_200(monkeypatch: pytest.MonkeyPatch) -> None:
         return _FakeHealthResponse(200)
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
-    assert wdog.probe_health() is True
+    assert (
+        wdog.probe_health(wdog.FUSED_MEMORY_ALIVE_URL, wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS)
+        is True
+    )
 
 
 def test_probe_health_true_on_503_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4383,7 +4428,10 @@ def test_probe_health_true_on_503_degraded(monkeypatch: pytest.MonkeyPatch) -> N
         )
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
-    assert wdog.probe_health() is True
+    assert (
+        wdog.probe_health(wdog.FUSED_MEMORY_HEALTH_URL, wdog.FUSED_MEMORY_HEALTH_TIMEOUT_SECS)
+        is True
+    )
 
 
 def test_probe_health_false_on_url_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4394,7 +4442,10 @@ def test_probe_health_false_on_url_error(monkeypatch: pytest.MonkeyPatch) -> Non
         raise wdog.urllib.error.URLError("connection refused")
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
-    assert wdog.probe_health() is False
+    assert (
+        wdog.probe_health(wdog.FUSED_MEMORY_ALIVE_URL, wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS)
+        is False
+    )
 
 
 def test_probe_health_false_on_connection_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4405,7 +4456,10 @@ def test_probe_health_false_on_connection_refused(monkeypatch: pytest.MonkeyPatc
         raise ConnectionRefusedError("connection refused")
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
-    assert wdog.probe_health() is False
+    assert (
+        wdog.probe_health(wdog.FUSED_MEMORY_ALIVE_URL, wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS)
+        is False
+    )
 
 
 def test_probe_health_false_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4420,7 +4474,10 @@ def test_probe_health_false_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
         raise TimeoutError("timed out")
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
-    assert wdog.probe_health() is False
+    assert (
+        wdog.probe_health(wdog.FUSED_MEMORY_ALIVE_URL, wdog.FUSED_MEMORY_ALIVE_TIMEOUT_SECS)
+        is False
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4637,14 +4694,30 @@ def test_liveness_pass_revives_on_port_down(
 def test_liveness_pass_no_restart_when_healthy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """fused_memory_liveness_pass() must not restart when port is up and health succeeds."""
+    """fused_memory_liveness_pass() must not restart when port is up and /alive succeeds.
+
+    Also pins WHICH route the END-TO-END kill path asks for (task 3765
+    amendment). The pass-level stubs below must accept args (``lambda *a, **k``)
+    because the verdict now passes url+timeout, and a zero-arg stub's TypeError
+    is swallowed by fused_memory_liveness_pass()'s blanket try/except into a
+    silent "no restart" — but that same widening stops the stub OBSERVING the
+    url, so on its own it would let a regression repointing the verdict back at
+    FUSED_MEMORY_HEALTH_URL pass every pass-level test. Recording the request
+    here keeps the contract on the real kill path, not only on the verdict
+    helper that test_liveness_verdict_probes_alive_not_health exercises.
+    """
     wdog = _load_watchdog()
     restarted: list[str] = []
+    probed_urls: list[str] = []
+
+    def fake_probe_health(url, timeout=None, *a, **k):  # noqa: ANN001, ANN002, ANN003
+        probed_urls.append(url)
+        return True
 
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
     monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
-    monkeypatch.setattr(wdog, "probe_health", lambda *a, **k: True)
+    monkeypatch.setattr(wdog, "probe_health", fake_probe_health)
     monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
     monkeypatch.setattr(wdog, "log", lambda _m: None)
     # A healthy verdict CLEARS the streak file — point it at tmp so this test
@@ -4653,7 +4726,13 @@ def test_liveness_pass_no_restart_when_healthy(
 
     wdog.fused_memory_liveness_pass()
 
-    assert restarted == [], "No restart expected when port is up and health succeeds"
+    assert restarted == [], "No restart expected when port is up and /alive succeeds"
+    assert probed_urls == [wdog.FUSED_MEMORY_ALIVE_URL], (
+        "the end-to-end kill path must fetch the zero-I/O /alive route and "
+        f"nothing else; got {probed_urls!r}. Fetching FUSED_MEMORY_HEALTH_URL "
+        "here would put the two backing-store round-trips back inside the "
+        "liveness decision (task 3765)."
+    )
 
 
 def test_liveness_pass_restarts_when_wedged(
@@ -4913,26 +4992,22 @@ def test_print_fused_memory_liveness_row(
     ]
 
     for verdict_token, ss_stdout, health_outcome in scenarios:
-        recorded_calls: list[list[str]] = []
+        # Per-scenario `ss` stdout goes through the shared _fake_ss_run helper,
+        # which also hands back this iteration's own call log. Passing it as an
+        # ARGUMENT sidesteps B023 for free: the helper's closure captures its
+        # own parameter, not this loop's rebound name.
+        recorded_calls = _fake_ss_run(monkeypatch, ss_stdout)
 
-        # The loop variables are bound explicitly as KEYWORD-ONLY defaults (so no
-        # positional caller can ever reach them). A closure defined in a loop
+        # fake_urlopen still binds its loop variable as a KEYWORD-ONLY default
+        # (so no positional caller can reach it). A closure defined in a loop
         # otherwise reads whatever the name holds when it is CALLED, not when it
         # was defined (B023) — benign only while every call stays inside the same
-        # iteration, which nothing here enforces. `_recorded` is the same list
-        # object `recorded_calls` names, so the assertion below still sees the
-        # appends.
-        def fake_run(cmd, *, _recorded=recorded_calls, _ss=ss_stdout, **kwargs):  # noqa: ANN001
-            _recorded.append(list(cmd))
-            assert cmd[0] == "ss", f"unexpected subprocess.run call: {cmd}"
-            return subprocess.CompletedProcess(cmd, 0, stdout=_ss, stderr="")
-
+        # iteration, which nothing here enforces.
         def fake_urlopen(*args, _outcome=health_outcome, **kwargs):  # noqa: ANN001, ANN002, ANN003
             if isinstance(_outcome, Exception):
                 raise _outcome
             return _FakeHealthResponse(_outcome)
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
         monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
         monkeypatch.setattr(
             wdog, "restart_unit", lambda u: pytest.fail(f"must never restart {u}")
@@ -5238,14 +5313,7 @@ def test_print_fused_memory_liveness_row_enriched_stays_read_only(
     """
     wdog = _load_watchdog()
 
-    recorded_calls: list[list[str]] = []
-
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
-        recorded_calls.append(list(cmd))
-        assert cmd[0] == "ss", f"unexpected subprocess.run call: {cmd}"
-        return subprocess.CompletedProcess(cmd, 0, stdout=_SS_LISTEN_8002, stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    recorded_calls = _fake_ss_run(monkeypatch)
     monkeypatch.setattr(
         wdog.urllib.request, "urlopen", lambda *a, **k: _FakeHealthResponse(200)
     )
