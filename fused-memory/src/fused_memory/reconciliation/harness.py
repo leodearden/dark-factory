@@ -4562,6 +4562,7 @@ class ReconciliationHarness:
         *,
         scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
+        filtered_task_tree_fetched_at: datetime | None = None,
     ) -> None:
         """Extract Stage 3 findings from the parent run and trigger remediation if needed.
 
@@ -4573,6 +4574,12 @@ class ReconciliationHarness:
         the project is still in backlog mode, bounded by
         config.max_backlog_remediation_deferrals.  See the comment at the gate
         for why deferring is lossless and self-terminating.
+
+        filtered_task_tree_fetched_at must accompany filtered_task_tree: it is
+        the instant that tree was read (stamped by run_full_cycle right after
+        its fetch, task 4115). This method is a pure pass-through — it forwards
+        the pair verbatim to _run_remediation_pass without re-stamping or
+        defaulting either value.
         """
         try:
             s3_report = parent_run.stage_reports.get('integrity_check')
@@ -4787,6 +4794,7 @@ class ReconciliationHarness:
                 project_id, parent_run_id, to_remediate, tier,
                 scope=scope,
                 filtered_task_tree=filtered_task_tree,
+                filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
             )
         except Exception as e:
             logger.error(f'Remediation check failed for run {parent_run_id}: {e}')

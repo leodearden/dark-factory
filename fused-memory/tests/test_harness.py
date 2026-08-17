@@ -7111,7 +7111,7 @@ class TestHarnessFilteredTaskTreeWiring:
         tree = self._make_tree()
         fetch_state: dict = {}
 
-        async def _fetch(_root):
+        async def _fetch(project_root):
             fetch_state['fetched_returned_at'] = datetime.now(UTC)
             return tree
 
@@ -12485,7 +12485,7 @@ async def test_maybe_remediate_partial_suppression_remediates_only_uncovered(
 
     async def spy_remediate(
         project_id, parent_run_id, findings_arg, tier,
-        *, scope, filtered_task_tree=None,
+        *, scope, filtered_task_tree=None, filtered_task_tree_fetched_at=None,
     ):
         remediation_calls.append(list(findings_arg))
 
@@ -12551,7 +12551,7 @@ async def test_maybe_remediate_fail_open_when_queue_raises(
 
     async def spy_remediate(
         project_id, parent_run_id, findings_arg, tier,
-        *, scope, filtered_task_tree=None,
+        *, scope, filtered_task_tree=None, filtered_task_tree_fetched_at=None,
     ):
         remediation_calls.append(list(findings_arg))
 
