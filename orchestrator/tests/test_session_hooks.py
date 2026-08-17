@@ -1498,6 +1498,11 @@ def test_refresh_path_does_not_bind_a_still_launching_record(tmp_path: Path) -> 
     # read-modify-WRITE, so a guard sitting after it still left the nested
     # Stop advertising a still-launching spawn as `idle` in the cockpit.
     assert record.status == sr.Status.LAUNCHING
+    # Blast radius, stated explicitly: withholding is not forking. The probe
+    # ADOPTS an unbound record (that is the legacy-migration path), so the
+    # event lands on this slug and is then dropped -- it must not also mint a
+    # second, nested-owned row for the cockpit to show alongside the spawn.
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_refresh_path_withholds_a_question_during_the_unbound_launch_window(
@@ -1575,6 +1580,9 @@ def test_owning_session_start_still_wins_the_launching_record_after_a_nested_sto
     owner = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
 
     sh.run_stop(nested, env, root=tmp_path)
+    # Assert HERE, before run_session_start's unconditional `status = RUNNING`
+    # masks it: that reset is what hid the original defect from this test.
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
     sh.run_session_start(owner, env, root=tmp_path)
 
     parent = sr.read_record(slug, root=tmp_path)
