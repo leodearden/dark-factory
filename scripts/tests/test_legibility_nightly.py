@@ -918,6 +918,77 @@ def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
     assert launcher_calls == [1]
 
 
+def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplog):
+    """task 4148 (amendment): the decision line must reach the journal BEFORE
+    the census subprocess starts, and must survive a launcher that dies.
+
+    `launcher()` runs the census SYNCHRONOUSLY -- `_default_census_launcher`
+    subprocess-runs census.py, whose stages carry the 120/900/1800s timeouts
+    in config.py's Timeouts. So a line logged at run_nightly's call site, i.e.
+    after this function has returned, reaches the journal only once the whole
+    census has finished (tens of minutes later) and never at all if the unit
+    is killed, times out, or the box reboots mid-census -- exactly the FIRE
+    case the line exists to make visible. An operator tailing a RUNNING unit
+    would otherwise watch a census start with no logged reason for it.
+    """
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        return census_trigger.Decision(fire=True, reasons=[
+            'tasks-landed: 130 landed since last census (threshold 120) -> FIRE',
+        ])
+
+    # Snapshots the journal as the census subprocess would start, then dies
+    # the way a timed-out/killed census does.
+    logged_at_launch = []
+
+    def _dying_launcher():
+        logged_at_launch.extend(r.getMessage() for r in caplog.records)
+        raise subprocess.TimeoutExpired(cmd='census.py', timeout=1800)
+
+    with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+        line, fire = nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            entrypoint_exists=lambda: True, launcher=_dying_launcher,
+        )
+
+    assert fire is True
+
+    # The reason is on the journal BEFORE the launch, not after it.
+    assert any(
+        'legibility trickle: census trigger: FIRE' in m for m in logged_at_launch
+    ), logged_at_launch
+    assert any('tasks-landed: 130 landed' in m for m in logged_at_launch), logged_at_launch
+
+    # ...and a launcher that never returns cleanly cannot take it away.
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f'legibility trickle: {line}' == m for m in messages), messages
+    # Exactly once: run_nightly no longer logs its own copy at the call site.
+    assert len([m for m in messages if m.startswith('legibility trickle: census trigger:')]) == 1
+
+
+def test_evaluate_census_step_logs_a_failed_evaluation_too(tmp_path, caplog):
+    """task 4148 (amendment): ONE log site covers both paths, so the journal
+    line and the `census_line` returned on NightlyResult cannot drift -- a
+    failed evaluation reports its synthetic NO-FIRE line on the same channel
+    an operator greps for the healthy one."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
+
+    with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+        line, fire = nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            entrypoint_exists=lambda: True, launcher=lambda: None,
+        )
+
+    assert fire is False
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert [m for m in infos if m == f'legibility trickle: {line}'], infos
+    assert 'trigger evaluation failed' in line
+
+
 def test_evaluate_census_step_survives_a_raising_decide(tmp_path, caplog):
     """task 4085: the docstring's "this function never raises and never fails
     the run" must hold for the DECIDE call, not only for the launcher call.
@@ -3156,6 +3227,16 @@ def test_post_escalation_reports_false_on_a_tool_error_envelope(
 # only a test entering at main() can catch. The journal shows the resulting
 # fail-safe line on 2026-08-10, 2026-08-11 and 2026-08-12:
 # "tasks-landed: no status_fetcher configured -- condition (b) fails safe".
+#
+# HAZARD, now that the fetcher default is live (amendment): ANY run_nightly or
+# main() test that writes a valid non-negative `last_census_done_count` into
+# census-state.json and injects no `status_fetcher` will issue a REAL POST to
+# $FUSED_MEMORY_MCP_URL (default localhost:8002) -- and on a dev box where
+# fused-memory is actually up, a stale fixture baseline against the real
+# done-count can produce a genuine FIRE that subprocess-launches
+# scripts/legibility/census.py, i.e. real LLM spend and real git writes.
+# Such a test MUST both fake httpx (conftest's `install_fake_httpx`) AND stub
+# `nightly._default_census_launcher`. The two tests below are the pattern.
 # ---------------------------------------------------------------------------
 
 def test_main_run_fires_the_tasks_landed_condition_end_to_end(
@@ -3270,5 +3351,92 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
     # channel that diagnosed task 4148.
     assert any(
         'tasks-landed: 130 landed since last census (threshold 120) -> FIRE' in m
+        for m in messages
+    ), messages
+
+
+def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memory(
+    tmp_path, monkeypatch, caplog, install_fake_httpx,
+):
+    """The twin of the test above, on the FAILURE path (task 4148 amendment).
+
+    Now that `run_nightly` always BUILDS a real MCP-backed fetcher, "the
+    fused-memory server is down" is reachable on every production night --
+    not only when a caller injects a raising fake. The existing fail-safe
+    coverage injects at the `compute_tasks_landed` level, which is exactly
+    the shape of coverage that let the wiring gap survive three prior
+    repairs; this test instead enters at `main()` and lets the DEFAULTED
+    fetcher be the thing that fails. A transport error must degrade to a
+    NO-FIRE line plus warnings -- never a non-zero exit, and never a census
+    launch off an unobserved done-count.
+    """
+    config_path = _write_config(tmp_path, project_id='proj_a')
+    legibility_dir = tmp_path / 'docs' / 'legibility'
+
+    # The same 8-day, valid-int baseline as the happy-path twin: it clears
+    # task 4085's validity arm and (b)'s tasks_landed_min_days=7, so the fetch
+    # is genuinely REACHED and its failure is the only reason (b) goes N/A.
+    # 8d is also under max_interval_days=10, so no OTHER condition fires and
+    # the launcher assertion below cannot pass for the wrong reason.
+    (legibility_dir / 'census-state.json').write_text(
+        json.dumps({
+            'last_census_at': (datetime.now(UTC) - timedelta(days=8)).isoformat(),
+            'last_census_report': 'docs/legibility/census-2026-08-09.md',
+            'last_census_done_count': 1000,
+        }),
+        encoding='utf-8',
+    )
+    codebook.dump(
+        {'version': 2, 'entries': [], 'candidates': []},
+        legibility_dir / 'confusion-codebook.yaml',
+    )
+
+    # fused-memory down. `post_mcp_envelope` touches only `httpx.post` and
+    # `httpx.delete` (task 3376) and lets transport exceptions escape
+    # verbatim, so this reaches `default_status_fetcher`'s wrapper and comes
+    # out as StatusFetchUnavailable -- the real production shape.
+    posts = []
+
+    def _refusing_post(url, **kwargs):
+        posts.append((url, kwargs))
+        raise ConnectionError('[Errno 111] Connection refused')
+
+    install_fake_httpx(_refusing_post)
+
+    launcher_calls = []
+    monkeypatch.setattr(
+        nightly, '_default_census_launcher', lambda: launcher_calls.append(1),
+    )
+
+    projects_root = tmp_path / 'projects'
+    projects_root.mkdir()
+
+    with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+        exit_code = nightly.main([
+            'run', '--config', str(config_path),
+            '--projects-root', str(projects_root),
+            '--date', '2026-07-13',
+        ])
+
+    messages = [r.getMessage() for r in caplog.records]
+
+    # The nightly run is unaffected by a dead fused-memory...
+    assert exit_code == 0
+    assert launcher_calls == [], messages
+
+    # ...but the fetch really was attempted through the DEFAULTED seam, so
+    # this test cannot go green on a fetcher that was never built.
+    get_statuses_calls = [
+        kwargs for _url, kwargs in posts
+        if (kwargs.get('json') or {}).get('params', {}).get('name') == 'get_statuses'
+    ]
+    assert len(get_statuses_calls) == 1, posts
+
+    # The failure is legible on both channels an operator has: the specific
+    # WARNING naming the fetch, and the one-line NO-FIRE decision.
+    assert any('tasks-landed: status_fetcher failed' in m for m in messages), messages
+    assert any(
+        m.startswith('legibility trickle: census trigger: NO-FIRE')
+        and 'tasks-landed: delta unavailable (no baseline/fetcher) -> N/A' in m
         for m in messages
     ), messages

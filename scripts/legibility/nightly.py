@@ -582,15 +582,15 @@ def evaluate_census_step(
     ``census trigger: NO-FIRE -- ...`` grammar every consumer of
     ``NightlyResult.census_line`` reads, and returns before the
     entrypoint/launcher block so it can never start a census.
+
+    The decision line is also emitted to the journal at INFO from here --
+    exactly once per run, on every path, and BEFORE any launch (task 4148).
     """
     if entrypoint_exists is None:
         entrypoint_exists = _default_entrypoint_exists
     if launcher is None:
         launcher = _default_census_launcher
 
-    # Returns BEFORE the entrypoint/launcher block below, and that ordering is
-    # a safety property rather than a style choice: an evaluation that failed
-    # has established nothing, so it must never be able to start a census.
     try:
         decision = decide(cfg.project_root, now=now, status_fetcher=status_fetcher)
     except Exception as exc:  # noqa: BLE001 - the census trigger must never fail the run
@@ -607,13 +607,38 @@ def evaluate_census_step(
             'census trigger evaluation failed (%s) -- NO-FIRE; the nightly '
             'run is unaffected', detail,
         )
-        return f'census trigger: NO-FIRE -- trigger evaluation failed ({detail})', False
+        decision = None
+        line = f'census trigger: NO-FIRE -- trigger evaluation failed ({detail})'
+    else:
+        line = 'census trigger: {} -- {}'.format(
+            'FIRE' if decision.fire else 'NO-FIRE', '; '.join(decision.reasons),
+        )
 
-    line = 'census trigger: {} -- {}'.format(
-        'FIRE' if decision.fire else 'NO-FIRE', '; '.join(decision.reasons),
-    )
+    # Task 4148 (amendment). Emitted HERE -- inside this function, before the
+    # entrypoint/launcher block -- rather than at run_nightly's call site,
+    # because on the FIRE path `launcher()` runs the census SYNCHRONOUSLY
+    # (_default_census_launcher -> subprocess.run(census.py), whose stages
+    # carry the 120/900/1800s timeouts in config.py's Timeouts). Logging after
+    # this function returned would withhold the REASON for a running census
+    # until that subprocess finished -- tens of minutes later -- and lose it
+    # entirely if the unit is killed, times out, or the box reboots
+    # mid-census: precisely the FIRE case this line exists to make visible.
+    # An operator tailing `journalctl --user -u legibility-trickle@<project>`
+    # now sees a census start together with the reason it started.
+    #
+    # ONE log site covering both the decided and the failed-evaluation path,
+    # so the journal line and the `census_line` returned on NightlyResult can
+    # never drift. Always-on INFO in the module's established style (cf. the
+    # sampler summary and no-change-night lines in run_nightly); main()'s
+    # config.configure_logging() is what makes INFO visible in the journal at
+    # all (gap (b) of the trickle-legibility incident).
+    logger.info('legibility trickle: %s', line)
 
-    if not decision.fire:
+    # A failed evaluation has established NOTHING, so it must never be able to
+    # start a census -- hence `decision is None` returns here, BEFORE
+    # `entrypoint_exists` is even consulted. That ordering is a safety
+    # property rather than a style choice.
+    if decision is None or not decision.fire:
         return line, False
 
     if not entrypoint_exists():
@@ -1059,6 +1084,17 @@ def run_nightly(
     # Deliberately NOT wrapped in try/except: the construction does no I/O
     # (a resolve, an environ read, a returned closure), and every call-time
     # failure is already fail-safe inside compute_tasks_landed.
+    #
+    # HAZARD, for whoever writes the next run_nightly test (amendment): this
+    # default is LIVE, so a test that seeds census-state.json with a valid
+    # non-negative `last_census_done_count` and injects no `status_fetcher`
+    # issues a REAL POST to $FUSED_MEMORY_MCP_URL (default localhost:8002) --
+    # and on a dev box where fused-memory is actually up, a stale fixture
+    # baseline against the real done-count can produce a genuine FIRE that
+    # subprocess-launches scripts/legibility/census.py (real LLM spend, real
+    # git writes). Such a test MUST fake httpx (conftest's install_fake_httpx)
+    # AND stub `_default_census_launcher`; see the task-4148 block in
+    # scripts/tests/test_legibility_nightly.py for the worked pattern.
     status_fetcher = (
         status_fetcher if status_fetcher is not None
         else census_trigger.default_status_fetcher(cfg.project_root)
@@ -1290,7 +1326,6 @@ def run_nightly(
                 'legibility trickle: no-change night: nothing committed (applied=%d)', applied,
             )
 
-        census_line, census_fire = evaluate_census_step(cfg, now=now, status_fetcher=status_fetcher)
         # Task 4148. The decision was computed and returned on NightlyResult
         # below, but never LOGGED -- so only the census's failure modes
         # (census_trigger's own WARNINGs, FIRE-WITHOUT-LAUNCH, 4085's
@@ -1298,13 +1333,13 @@ def run_nightly(
         # now wired, a healthy evaluation would otherwise be indistinguishable
         # from the still-dead one in
         # `journalctl --user -u legibility-trickle@dark_factory` -- the same
-        # channel that diagnosed this task. Always-on INFO, like the sampler
-        # summary and no-change-night lines above; main()'s configure_logging()
-        # is what makes INFO visible there (gap (b) of the trickle-legibility
-        # incident). Safe to log unconditionally: evaluate_census_step never
-        # raises and always returns a fully-formed one-line reason string,
-        # even on a failed evaluation (task 4085).
-        logger.info('legibility trickle: %s', census_line)
+        # channel that diagnosed this task. Deliberately NOT logged here at
+        # the call site (amendment): `evaluate_census_step` LAUNCHES the
+        # census synchronously before returning, so a log line here would only
+        # reach the journal after the whole census subprocess finished -- see
+        # the log site inside that function for the full reasoning. Do not
+        # re-add one here; that would double the line, not advance it.
+        census_line, census_fire = evaluate_census_step(cfg, now=now, status_fetcher=status_fetcher)
 
         result = NightlyResult(
             exit_code=0,

@@ -715,10 +715,17 @@ def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
         return None
 
     # Checked BEFORE the status_fetcher guard on purpose: this is a state-side
-    # fault, and reporting the more specific one first is what makes a
-    # mis-seeded baseline visible on the default trickle wiring, where
-    # `run_nightly` passes `status_fetcher=None` and the fetcher guard would
-    # otherwise return first -- leaving a corrupt state file unreported.
+    # fault with a different owner (the operator's state file), and reporting
+    # the MORE SPECIFIC fault first is what keeps a mis-seeded baseline
+    # visible instead of being masked by the generic "no status_fetcher
+    # configured" line whenever a caller reaches here without one. Both public
+    # entrypoints (`decide_for_project`, this function) still default
+    # `status_fetcher=None`, so that arm stays live for any caller that
+    # supplies nothing -- it is just no longer the NIGHTLY TRICKLE, whose
+    # `run_nightly` has built `default_status_fetcher(cfg.project_root)` since
+    # task 4148 (before that it passed None on every real run, which is what
+    # made this ordering load-bearing in production rather than merely in
+    # principle).
     # `bool` is rejected explicitly because it is an `int` subclass, so a
     # hand-seeded JSON `true` would otherwise mean `baseline == 1` and arm
     # condition (b) with every done task ever, silently. A negative count is
