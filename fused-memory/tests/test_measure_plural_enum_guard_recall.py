@@ -48,6 +48,66 @@ def _load_module() -> types.ModuleType:
 _mod = _load_module()
 scan_corpus = _mod.scan_corpus
 triage_rejection = _mod.triage_rejection
+simulate_candidate = _mod.simulate_candidate
+extract_plural_ids = _mod.extract_plural_ids
+
+
+def _pinned_shapes(test_name: str) -> list:
+    """Pull a pinned shape list off the sweep suite's parametrize marker.
+
+    Read from the MARKER rather than copied into this file on purpose. Task
+    3949 requires each candidate tightening be re-validated 'against the
+    full precision-guard parametrization'. A hardcoded copy satisfies that
+    on the day it is written and silently stops covering the full set the
+    moment someone adds a shape — the same silent-loss failure mode the
+    sweep suite's own test_every_guarded_preposition_is_exercised_against_a
+    _plural_head exists to prevent for _ENUM_PREP_WORDS. Reading the marker
+    makes the gate mechanical: a shape added upstream automatically
+    re-validates both candidates here.
+    """
+    import inspect
+
+    import tests.reconciliation.test_stale_status_snapshot_edge_sweep as sweep_tests
+
+    for _cls_name, cls in inspect.getmembers(sweep_tests, inspect.isclass):
+        fn = getattr(cls, test_name, None)
+        if fn is None:
+            continue
+        for mark in getattr(fn, 'pytestmark', []):
+            if mark.name != 'parametrize':
+                continue
+            argnames, argvalues = mark.args[0], mark.args[1]
+            # 'fact'-only markers yield bare strings; ('fact', 'expected')
+            # markers yield tuples.
+            if isinstance(argnames, str):
+                return [(v, None) for v in argvalues]
+            return list(argvalues)
+    raise AssertionError(
+        f'{test_name} not found in the sweep test module — the re-validation '
+        f'gate has lost its corpus and would silently pass on nothing.'
+    )
+
+
+# Facts the shipped guard must keep suppressing. Any candidate that admits
+# one of these has re-opened over-selection, which is the unrecoverable
+# direction and disqualifies it outright.
+_PRECISION_SHAPES = [f for f, _ in _pinned_shapes(
+    'test_plural_enumeration_precision_guards')]
+_SUPPRESSION_SHAPES = [f for f, _ in _pinned_shapes(
+    'test_guard_rejected_enumeration_suppresses_ids_on_every_path')]
+# Facts the shipped guard extracts, and that no candidate may disturb.
+_POSITIVE_SHAPES = _pinned_shapes(
+    'test_plural_enumeration_subject_positives_survive_precision_guards')
+# The documented recall loss — what a tightening would be FOR.
+_PREAMBLE_SHAPES = [f for f, _ in _pinned_shapes(
+    'test_adverbial_preamble_is_a_documented_under_selection')]
+
+_ALL_GUARDED_SHAPES = _PRECISION_SHAPES + _SUPPRESSION_SHAPES + _PREAMBLE_SHAPES
+
+_DATE_STAMP_PREAMBLE = 'As of 2026-08-09, tasks 1020 and 1030 are pending.'
+_INTRA_CLAUSE_COMMA = (
+    'Blockers for down-stream, still-unmerged tasks 1020 and 1030 are pending.'
+)
 
 
 # The five synthetic facts below are the probe's own positive control: the
@@ -164,6 +224,86 @@ def test_triage_rejection_labels_prepositional_complement(fact):
     """
     match_start = fact.index('tasks 1020')
     assert triage_rejection(fact, match_start) == 'prepositional_complement'
+
+
+def test_pinned_shape_corpus_is_non_trivial():
+    """The re-validation gate must fail loudly if its corpus evaporates.
+
+    Marker introspection is the whole mechanism here. If the upstream test
+    names or marker shapes change, every candidate assertion below would
+    pass vacuously against an empty list — a gate that silently stops
+    gating. These floors are the tripwire; they are minima, not exact
+    counts, precisely so ADDING a shape upstream never breaks this file.
+    """
+    assert len(_PRECISION_SHAPES) >= 43
+    assert len(_SUPPRESSION_SHAPES) >= 4
+    assert len(_POSITIVE_SHAPES) >= 11
+    assert len(_PREAMBLE_SHAPES) >= 3
+    assert _DATE_STAMP_PREAMBLE in _PREAMBLE_SHAPES
+    assert _INTRA_CLAUSE_COMMA in _PRECISION_SHAPES
+
+
+def test_shipped_guard_baseline_over_selects_nothing():
+    """The baseline that makes the candidate deltas meaningful.
+
+    Simulating the shipped guard against itself must be a no-op. If this
+    ever reports a difference, the simulator disagrees with the shipped
+    extraction path and every candidate number below is measuring the
+    simulator's bug rather than the candidate.
+    """
+    result = simulate_candidate('shipped', _ALL_GUARDED_SHAPES)
+
+    assert result.over_selected == []
+    assert result.recovered == []
+    assert result.unchanged == _ALL_GUARDED_SHAPES
+
+
+def test_candidate_a_re_opens_nothing_but_misses_the_motivating_shape():
+    """Candidate (a): plural/capitalized head required before the preposition.
+
+    It clears the precision bar — no pinned over-selection re-opens — but
+    it does NOT recover 'As of <date>, ...', which is the finding's OWN
+    motivating shape, because 'of' there is preceded by the capitalized
+    sentence-initial 'As'. A tightening that cannot fix the case that
+    motivated it buys very little.
+    """
+    result = simulate_candidate('a', _ALL_GUARDED_SHAPES)
+
+    assert result.over_selected == []
+    assert _DATE_STAMP_PREAMBLE not in result.recovered
+    assert set(result.recovered) == set(_PREAMBLE_SHAPES) - {_DATE_STAMP_PREAMBLE}
+
+
+def test_candidate_b_recovers_every_preamble_but_re_opens_an_over_selection():
+    """Candidate (b): restart the backward scan after a preposition-free comma.
+
+    It recovers all three preamble shapes — and re-opens a pinned
+    over-selection, 'Blockers for down-stream, still-unmerged tasks ...',
+    where the comma is intra-clause rather than a preamble boundary. That
+    failure IS the disqualification: task 3949 requires each candidate be
+    re-validated against the full precision parametrization before
+    shipping, and this one does not pass it.
+    """
+    result = simulate_candidate('b', _ALL_GUARDED_SHAPES)
+
+    assert result.recovered == _PREAMBLE_SHAPES
+    assert result.over_selected == [_INTRA_CLAUSE_COMMA]
+
+
+@pytest.mark.parametrize('candidate', ['shipped', 'a', 'b'])
+def test_subject_position_positives_extract_unchanged_under_both_candidates(
+    candidate,
+):
+    """Neither candidate may cost a currently-extracted snapshot.
+
+    The candidates are evaluated on what they RE-OPEN and what they
+    RECOVER; this pins the third direction, that neither silently drops an
+    id the shipped guard already yields. Asserting the exact expected id
+    sets (not merely 'unchanged') means a candidate that yields a
+    DIFFERENT id set for the same fact is caught too.
+    """
+    for fact, expected in _POSITIVE_SHAPES:
+        assert extract_plural_ids(fact, candidate=candidate) == expected, fact
 
 
 def test_scan_corpus_of_empty_corpus_is_all_zeroes():
