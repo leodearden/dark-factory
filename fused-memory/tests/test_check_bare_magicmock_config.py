@@ -675,6 +675,107 @@ class TestHooksIntegration:
             )
 
 
+# ===========================================================================
+# Rule B — `bare-dataclass-double` (task 4016)
+#
+# A SECOND, independently-named rule carried by the same script: a
+# position-blind walk flagging unspecced MagicMocks shaped like a registered
+# stdlib dataclass (VerifyResult today).  Rule A (`bare-magicmock`, config-name,
+# Assign/AnnAssign-only) is unchanged; every test above this banner pins it.
+# ===========================================================================
+
+# The 16 real fields of orchestrator.verify.VerifyResult (verify.py:3216).
+# Duplicated here deliberately: this test is the thing that would notice if the
+# script's registry copy silently drifted from the real dataclass.
+_VERIFY_RESULT_FIELDS = frozenset({
+    'passed',
+    'test_output',
+    'lint_output',
+    'type_output',
+    'summary',
+    'timed_out',
+    'cause_hint',
+    'category',
+    'worktree_log_paths',
+    'archive_log_paths',
+    'contention',
+    'plan',
+    'failing_test_ids',
+    'failing_leg_categories',
+    'trivial',
+    'duration_secs',
+})
+
+
+class TestDataclassShapeRegistry:
+    """The `_DATACLASS_SHAPES` registry that drives Rule B's anchor+overlap match."""
+
+    def test_registry_exists_and_is_a_nonempty_tuple(self):
+        """_DATACLASS_SHAPES is a non-empty tuple (immutable — the rule's whole input)."""
+        shapes = _checker._DATACLASS_SHAPES
+        assert isinstance(shapes, tuple), (
+            f'_DATACLASS_SHAPES must be a tuple (immutable registry); got {type(shapes)}'
+        )
+        assert shapes, '_DATACLASS_SHAPES must not be empty — Rule B would match nothing'
+
+    def test_registry_holds_exactly_the_verify_result_entry_today(self):
+        """v1 registers exactly one shape: VerifyResult."""
+        names = [s.name for s in _checker._DATACLASS_SHAPES]
+        assert names == ['VerifyResult'], (
+            f'v1 registers exactly one shape (VerifyResult); got {names}. '
+            'Adding a shape is a deliberate widening — update this test with it.'
+        )
+
+    def test_verify_result_fields_match_the_real_dataclass(self):
+        """The registry's field literal equals VerifyResult's 16 real field names."""
+        shape = _checker._DATACLASS_SHAPES[0]
+        assert shape.fields == _VERIFY_RESULT_FIELDS, (
+            'Registry field set drifted from orchestrator/src/orchestrator/verify.py:3216.\n'
+            f'  missing from registry: {sorted(_VERIFY_RESULT_FIELDS - shape.fields)}\n'
+            f'  extra in registry:     {sorted(shape.fields - _VERIFY_RESULT_FIELDS)}'
+        )
+        assert isinstance(shape.fields, frozenset), (
+            f'fields must be a frozenset for cheap set algebra; got {type(shape.fields)}'
+        )
+
+    def test_verify_result_anchor_is_passed(self):
+        """anchors == {'passed'} — VerifyResult's first field and the census tell."""
+        shape = _checker._DATACLASS_SHAPES[0]
+        assert shape.anchors == frozenset({'passed'}), (
+            f"VerifyResult's anchor must be exactly {{'passed'}}; got {set(shape.anchors)}"
+        )
+
+    def test_verify_result_min_field_matches_is_two(self):
+        """min_field_matches == 2 — the overlap floor that rejects a lone MagicMock(passed=True)."""
+        shape = _checker._DATACLASS_SHAPES[0]
+        assert shape.min_field_matches == 2, (
+            f'min_field_matches must be 2 (measured overlap floor); got {shape.min_field_matches}'
+        )
+
+    def test_anchors_are_a_subset_of_fields_for_every_shape(self):
+        """An anchor outside its own field set could never be reached by the overlap floor.
+
+        anchors ⊄ fields would be a silently dead registry entry: the anchor gate
+        could pass while contributing nothing toward min_field_matches, making the
+        effective floor stricter than declared.  Asserted for EVERY shape so a
+        future registration cannot introduce the defect.
+        """
+        for shape in _checker._DATACLASS_SHAPES:
+            assert shape.anchors <= shape.fields, (
+                f'{shape.name}: anchors must be a subset of fields; '
+                f'stray anchors={sorted(shape.anchors - shape.fields)}'
+            )
+
+    def test_every_shape_names_its_module_and_factory_remedy(self):
+        """Each shape carries the provenance the violation message is built from."""
+        for shape in _checker._DATACLASS_SHAPES:
+            assert shape.module, f'{shape.name}: module must be set (message provenance)'
+            assert shape.factory, f'{shape.name}: factory must name the canonical remedy'
+        verify_result = _checker._DATACLASS_SHAPES[0]
+        assert verify_result.module == 'orchestrator.verify'
+        assert verify_result.factory == '_fake_verify_result'
+
+
 class TestFusedMemoryTestsDirectoryClean:
     """Regression guard: fused-memory/tests must have zero bare MagicMock() config sites.
 
