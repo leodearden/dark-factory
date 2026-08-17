@@ -3287,16 +3287,29 @@ def _build_parser() -> argparse.ArgumentParser:
     lease_release_p = sub.add_parser('lease-release', help='release a held lease')
     lease_release_p.add_argument('--name', required=True)
 
-    # Ownership (task 3994): both MUTATING verbs require the claiming slug.
-    # required=True is deliberate -- a silent no-slug fallback would preserve
-    # the "any caller may evict/refresh any lease" defect indefinitely, since
-    # nothing would ever force the call sites to change. A stale invocation
-    # now fails to ACT rather than succeeding at evicting a live holder.
+    # Ownership (task 3994): both MUTATING verbs act only for the lease's
+    # actual holder, identified by slug. AMENDED BY TASK 4248 -- the slug is
+    # now DERIVED (default_lease_slug, in main()) rather than required from the
+    # caller. That does NOT retract 3994's guard. The defect 3994 fixed was that
+    # both verbs mutated UNCONDITIONALLY, with no ownership check at all; the
+    # check still runs, and it now compares against a slug derived from THIS
+    # caller's own $CLAUDE_PID, so a stranger session derives a different slug
+    # and is still `result=refused` with the lease body untouched. What is
+    # retired is only the requirement that the token be SPELLED IN SHELL, which
+    # is exactly what let it drift: 3994 left three SKILL.md files assembling
+    # `<role>-<project>-${CLAUDE_PID:-$PPID}` by hand, and $PPID is measurably
+    # not stable across Claude Code tool calls. `required=True` was a forcing
+    # function to make the call sites pass a slug at all; the call sites have
+    # now been updated, and the derivation is the stronger guarantee -- a caller
+    # can no longer MIS-spell a token it never spells. An unresolvable
+    # $CLAUDE_PID still exits 2 (see main()); it never falls back silently.
     for _lease_mutation_p in (lease_heartbeat_p, lease_release_p):
         _lease_mutation_p.add_argument(
             '--slug',
-            required=True,
-            help='the slug you claimed this lease with; a mismatch is refused',
+            default=None,
+            help='the slug you claimed this lease with; a mismatch is refused. '
+            'Defaults to default_lease_slug(--name) (`<name>-$CLAUDE_PID`), the '
+            'same derivation lease-claim uses -- pass it only as an operator override',
         )
         _lease_mutation_p.add_argument(
             '--force',

@@ -3954,19 +3954,16 @@ def _claim_via_cli(slug: str = 'watcher-df-100', pid: int | None = None) -> None
     )
 
 
-@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
-def test_main_lease_mutating_verbs_require_slug(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, verb: str
-) -> None:
-    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    _claim_via_cli()
-
-    # A pre-3994 invocation must now FAIL LOUDLY rather than silently
-    # evicting/refreshing a lease it may not hold. argparse exits 2.
-    with pytest.raises(SystemExit) as excinfo:
-        sr.main([verb, '--name', 'watcher-df'])
-
-    assert excinfo.value.code == 2
+# `test_main_lease_mutating_verbs_require_slug` lived here until task 4248.
+# It asserted that OMITTING `--slug` exits 2 — true only while the token had
+# to be spelled in shell. It is superseded, not dropped: its surviving half
+# (an UNDERIVABLE slug exits 2 rather than defaulting to a colliding token) is
+# now pinned across all THREE lease verbs by
+# `test_main_lease_verbs_refuse_loudly_when_the_slug_cannot_be_derived`, and
+# the ownership guarantee it was really protecting is pinned directly by
+# `..._still_refuse_a_stranger_with_a_derived_slug` below. It was also quietly
+# env-dependent: it never unset `CLAUDE_PID`, so post-4248 it would pass or
+# fail on ambient environment rather than on behaviour.
 
 
 @pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
