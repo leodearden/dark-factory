@@ -84,7 +84,7 @@ from fused_memory.utils.referent_resolution import (
     resolve_referents,
 )
 from fused_memory.utils.task_naming import canonicalize_task_node_name
-from fused_memory.utils.validation import require_full_uuid
+from fused_memory.utils.validation import _safe_repr, require_full_uuid
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -1112,6 +1112,35 @@ def _encode_referents(resolution: ReferentResolution) -> dict[str, Any]:
     Emits PLAIN JSON SCALARS ONLY, never the frozen :class:`Referent` dataclass
     itself: the queue persists payloads as JSON TEXT in SQLite, so a
     non-serializable value here would surface only in production.
+
+    AMBIGUITY IS DELIBERATELY NOT THREADED — READ THIS BEFORE WRITING ZETA.
+    ``ReferentResolution.ambiguous`` (and ``.conflicts``) are dropped here; only
+    ``.source`` and ``.referents`` ride the wire.  That matters because gamma
+    excludes ambiguous referents from ``.referents`` on purpose ("recorded, not
+    guessed"), so a consumer that reads ONLY ``refs`` sees an ambiguous endpoint
+    as a plain non-member of the set — indistinguishable from a genuine
+    conflation.  Leaf zeta must therefore NOT treat "endpoint not in the decoded
+    set" as sufficient grounds for leaf eta to repoint the edge, or an ambiguous
+    reference gets destructively repaired instead of recorded and left alone
+    (PRD boundary-test table: "Ambiguous scan | ref routed to ``.ambiguous``;
+    treated as undeclared; recorded, not guessed").
+
+    Zeta re-derives it rather than reading it off the wire.  ``.ambiguous`` is
+    ``scan_content(content, group_id=group_id).ambiguous`` verbatim on EVERY
+    precedence path — a pure function of ``(content, group_id)``, independent of
+    ``declared``/``metadata`` (referent_resolution.py: "`.ambiguous` is the
+    scan's verbatim answer on every path").  ``_execute_graphiti_write`` holds
+    both ``payload['content']`` and ``payload['group_id']``, so zeta can recover
+    the producer's exact ambiguity set from data already on the payload.
+
+    That re-derivation is a SECOND SCAN SITE, which gamma's own comment flags as
+    the INV-5 lockstep duplication canonical_labels exists to prevent — so
+    carrying ``'ambiguous'`` as a third key is the better long-term shape and is
+    filed as follow-up work.  It is not done here because this leaf's frozen
+    contract is the two-key blob and widening it changes this function's return
+    arity and the wire shape every test in
+    tests/test_referent_queue_threading.py pins.  Extending it later is
+    additive and needs no migration, exactly as adding ``'referents'`` did.
     """
     return {
         'source': resolution.source,
@@ -1138,7 +1167,9 @@ def _decode_referents(payload: dict[str, Any]) -> tuple[ReferentSet, str]:
     kept as a bare dict, so the frozen type's kind-registry validation runs on
     untrusted wire data too — which is also what makes an unregistered ``kind``
     on the wire fall into the degradation path below instead of minting a bogus
-    referent.
+    referent.  That constructor validates ``kind`` ONLY, so ``number`` and
+    ``project_id`` are type-checked here before it runs; see the inline comment
+    in the decode loop for the three distinct ways an unchecked field escapes.
 
     DEGRADATION IS ALL-OR-NOTHING.  Any unreadable element — a non-dict blob, a
     ``source`` outside :data:`REFERENT_SOURCES`, a non-list ``refs``, or a
@@ -1169,10 +1200,16 @@ def _decode_referents(payload: dict[str, Any]) -> tuple[ReferentSet, str]:
         return (), 'none'
 
     def _degrade(reason: str) -> tuple[ReferentSet, str]:
+        # _safe_repr, not a bare %r: the blob is arbitrary decoded JSON from a
+        # queue row and this warning fires on EVERY retry attempt of that item,
+        # so an oversized corrupt value would otherwise dump its full repr into
+        # the log repeatedly. Matches how the sibling module this codec is
+        # written against (utils/referent_resolution.py) renders every one of
+        # its untrusted-value rejection messages.
         logger.warning(
             "Unreadable 'referents' payload key (%s); treating the write as "
-            'having no referents. Blob: %r',
-            reason, blob,
+            'having no referents. Blob: %s',
+            reason, _safe_repr(blob),
         )
         return (), 'none'
 
@@ -1188,15 +1225,41 @@ def _decode_referents(payload: dict[str, Any]) -> tuple[ReferentSet, str]:
     decoded: list[Referent] = []
     for entry in refs:
         if not isinstance(entry, dict):
-            return _degrade(f'entry {entry!r} is not a dict')
+            return _degrade(f'entry {_safe_repr(entry)} is not a dict')
+        # `Referent.__post_init__` validates `kind` against the kind registry
+        # but NOT `number`/`project_id` — those two fields accept any object at
+        # all, so the constructor alone does NOT harden this boundary. Each
+        # unchecked type is a distinct downstream failure:
+        #   - a non-str `number` (e.g. 3127) mints a Referent that compares
+        #     UNEQUAL to its string twin, so leaf zeta's set-membership check
+        #     would read a legitimate endpoint as a conflation and leaf eta
+        #     would repoint the edge destructively — the same false-conflation
+        #     failure the all-or-nothing rule above exists to prevent, arriving
+        #     through a mistyped field instead of a dropped one;
+        #   - a None `number`/`project_id` mints a referent whose `node_name`
+        #     is the literal string 'Task None';
+        #   - an UNHASHABLE `number` (a list) mints a Referent that raises
+        #     TypeError the moment a consumer puts it in a set — a raise inside
+        #     the queue executor, i.e. exactly the dead-letter-and-lose-the-
+        #     memory outcome degrade-rather-than-raise exists to prevent.
+        # `_encode_referents` only ever emits strings, so this is reachable
+        # today only from a corrupt or hand-edited SQLite row — but this
+        # function is the wire-hardening boundary, so it hardens the fields
+        # that matter rather than assuming its own encoder wrote the row.
+        number = entry.get('number')
+        project_id = entry.get('project_id', '')
+        if not isinstance(number, str) or not isinstance(project_id, str):
+            return _degrade(
+                f'entry {_safe_repr(entry)} has a non-string number/project_id'
+            )
         try:
             decoded.append(Referent(
                 kind=entry.get('kind', 'task'),
-                project_id=entry.get('project_id', ''),
-                number=entry['number'],
+                project_id=project_id,
+                number=number,
             ))
         except (KeyError, TypeError, ValueError) as e:
-            return _degrade(f'entry {entry!r} is not a valid Referent: {e}')
+            return _degrade(f'entry {_safe_repr(entry)} is not a valid Referent: {e}')
 
     return tuple(decoded), source
 
@@ -2645,7 +2708,24 @@ class MemoryService:
         return stats
 
     def referent_source_counts(self) -> dict[str, int]:
-        """How many Graphiti writes resolved to each referent source.
+        """How many Graphiti write ATTEMPTS resolved to each referent source.
+
+        ATTEMPTS, not completed writes, and the distinction is load-bearing for
+        anyone building an alert on the rate.  The increment sits at the TOP of
+        ``_execute_graphiti_write``, which ``DurableWriteQueue._process_item``
+        re-invokes on every RETRY of an item with a freshly parsed payload — so
+        a retry storm on one group inflates whichever bucket that item lands in,
+        and an item that eventually dead-letters is still counted.  Retries are
+        in the numerator AND the denominator; the skew is roughly uniform across
+        buckets in the common case (a row's source does not change between its
+        own attempts), so a "sustained 100% none" reading survives it, but a
+        per-bucket ABSOLUTE count must not be read as a count of memories.
+
+        The increment deliberately stays at the top rather than moving after the
+        successful backend call: counting only successes would make the escape
+        go dark during a backend outage — exactly when a referent-less write
+        storm is least likely to be noticed any other way — and would decouple
+        it from the single decode the journal stamp also reads.
 
         The INV-4 storm escape for the referent-set queue channel (task 3670,
         PRD leaf epsilon), and the read side of ``_referent_source_counts``.
@@ -3755,6 +3835,22 @@ class MemoryService:
         for mem in memories:
             content = mem.get('memory', '')
             if not content:
+                continue
+            if not isinstance(content, str):
+                # `resolve_referents` (task 3670) raises InputValidationError on
+                # a truthy non-str content, deliberately — but this call sits in
+                # a per-memory loop whose `enqueue_batch` only runs AFTER the
+                # loop completes, so letting it propagate would abort the WHOLE
+                # replay and enqueue nothing over ONE malformed Mem0 record.
+                # Skipping the record keeps the blast radius at one row, which
+                # is what it was before referents were threaded here. Loud
+                # rather than silent, unlike the empty-content skip above: an
+                # empty memory is ordinary, a non-str one is a Mem0 anomaly.
+                logger.warning(
+                    'Skipping replay of a Mem0 record whose memory is not a '
+                    'string (got %s): %s',
+                    type(content).__name__, _safe_repr(content),
+                )
                 continue
             meta = mem.get('metadata', {}) or {}
             category = meta.get('category', 'observations_and_summaries')

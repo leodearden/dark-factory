@@ -115,6 +115,35 @@ class TestReferentWireCodec:
             'source': 'none', 'refs': [],
         }
 
+    def test_ambiguity_is_deliberately_not_threaded(self):
+        """`.ambiguous` and `.conflicts` are DROPPED on the wire — a decision,
+        not an oversight, so it gets a named test rather than only a docstring.
+
+        Gamma excludes ambiguous referents from `.referents` on purpose
+        ("recorded, not guessed"), so a consumer reading only `refs` sees an
+        ambiguous endpoint as a plain non-member — indistinguishable from a
+        genuine conflation. Leaf zeta must NOT treat non-membership alone as
+        grounds for leaf eta to repoint the edge; it re-derives ambiguity from
+        `payload['content']`/`payload['group_id']`, which reproduce the
+        producer's set exactly because `.ambiguous` is `scan_content(...)`
+        verbatim on every precedence path.
+
+        When the follow-up that carries `'ambiguous'` as a third key lands, this
+        test is the thing that fails — which is the point: it routes that author
+        through `_encode_referents`' docstring instead of past it.
+        """
+        from fused_memory.services.memory_service import _encode_referents
+
+        blob = _encode_referents(ReferentResolution(
+            source='derived',
+            referents=(Referent(number='3127'),),
+            ambiguous=(Referent(number='9'),),
+            conflicts=(Referent(number='42'),),
+        ))
+
+        assert set(blob) == {'source', 'refs'}
+        assert blob['refs'] == [{'kind': 'task', 'project_id': '', 'number': '3127'}]
+
     def test_decode_rebuilds_the_exact_referent_tuple(self):
         from fused_memory.services.memory_service import (
             _decode_referents,
@@ -195,6 +224,46 @@ _UNREADABLE_PAYLOADS = [
     pytest.param(
         {'referents': {'source': 'derived', 'refs': [{'kind': 'task'}]}},
         id='entry-lacks-number',
+    ),
+    # `Referent.__post_init__` validates `kind` ONLY — `number`/`project_id`
+    # take any object at all, so the constructor alone does not harden them and
+    # each of these would otherwise mint a bogus referent rather than degrade.
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [
+            {'kind': 'task', 'number': 3127},
+        ]}},
+        id='int-number-compares-unequal-to-its-str-twin',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [
+            {'kind': 'task', 'number': None},
+        ]}},
+        id='none-number-would-name-the-node-Task-None',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [
+            {'kind': 'task', 'number': ['3127']},
+        ]}},
+        id='unhashable-number-would-raise-inside-a-consumer-set',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [
+            {'kind': 'task', 'number': '3127', 'project_id': None},
+        ]}},
+        id='none-project-id',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [
+            {'kind': 'task', 'number': '3127', 'project_id': 7},
+        ]}},
+        id='int-project-id',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [
+            {'kind': 'task', 'number': '3127'},
+            {'kind': 'task', 'number': 9},
+        ]}},
+        id='partially-mistyped-set',
     ),
     pytest.param(
         {'referents': {'source': 'derived', 'refs': [
@@ -284,6 +353,32 @@ class TestReferentWireCodecDegradation:
         assert referents == ()
         assert source == 'none'
         assert Referent(number='3127') not in referents
+
+    @pytest.mark.parametrize('payload', _UNREADABLE_PAYLOADS)
+    def test_no_decoded_referent_is_ever_unhashable(self, payload):
+        """`Referent` validates `kind` only, so an unhashable wire `number`
+        would mint a Referent that raises TypeError the moment leaf zeta puts
+        it in a set — a raise INSIDE the queue executor, i.e. the
+        dead-letter-and-lose-the-memory outcome the decoder's
+        degrade-rather-than-raise design exists to prevent."""
+        from fused_memory.services.memory_service import _decode_referents
+
+        referents, _ = _decode_referents(dict(payload))
+
+        assert set(referents) == set()
+
+    def test_a_mistyped_number_is_not_silently_coerced(self):
+        """An int `number` must NOT decode to `Referent(number='3127')` either:
+        coercing would hide a producer writing the wrong type, and the value it
+        would produce is indistinguishable from a correctly-encoded row."""
+        from fused_memory.services.memory_service import _decode_referents
+
+        referents, source = _decode_referents({'referents': {
+            'source': 'derived', 'refs': [{'kind': 'task', 'number': 3127}],
+        }})
+
+        assert referents == ()
+        assert source == 'none'
 
 
 class TestAddMemoryStampsReferents:
@@ -411,13 +506,27 @@ class TestAddEpisodeStampsReferents:
     async def test_never_reaches_the_metadata_source(self, service):
         """Documents the asymmetry with add_memory: this producer has no
         metadata parameter to bridge from, so 'metadata' is structurally
-        unreachable no matter what the prose says."""
-        for content in ('Task 3127 was merged', 'an ordinary note'):
+        unreachable no matter what the prose says.
+
+        Each content is paired with the ONE source it must reach, not asserted
+        against the set of both remaining values: 'declared' is structurally
+        impossible here (`declared=None` is hardcoded) and 'metadata' is what
+        this test rules out, so a membership assertion would admit both
+        surviving values for both inputs and would still pass if the derived
+        scan regressed and 'Task 3127 was merged' started resolving to 'none'.
+        """
+        for content, expected_source in (
+            ('Task 3127 was merged', 'derived'),
+            ('an ordinary note', 'none'),
+        ):
             service.durable_queue.enqueue.reset_mock()
             await service.add_episode(content=content, project_id='dark_factory')
 
             payload = service.durable_queue.enqueue.call_args[1]['payload']
-            assert payload['referents']['source'] in ('derived', 'none')
+            assert payload['referents']['source'] == expected_source, (
+                f'{content!r} resolved to {payload["referents"]["source"]!r}, '
+                f'expected {expected_source!r}'
+            )
 
     @pytest.mark.asyncio
     async def test_every_preexisting_payload_key_survives(self, service):
@@ -634,6 +743,30 @@ class TestReferentSourceCounter:
         assert counts['derived'] == 1
         assert counts['none'] == 1
 
+    @pytest.mark.asyncio
+    async def test_a_failed_write_is_still_counted(self, service):
+        """The buckets count write ATTEMPTS, not completed writes, and that is
+        deliberate: `DurableWriteQueue._process_item` re-invokes this executor
+        on every RETRY with a freshly parsed payload, so retries land in the
+        buckets and an item that eventually dead-letters is still counted.
+
+        Counting only successes would instead make the escape go dark during a
+        backend outage — exactly when a referent-less write storm is least
+        likely to be noticed any other way. Pinned here so nobody 'fixes' the
+        attempt-vs-write skew by moving the increment past the backend call
+        without re-reading `referent_source_counts`' docstring.
+        """
+        service.graphiti.add_episode = AsyncMock(side_effect=RuntimeError('backend down'))
+        payload = _graphiti_payload(
+            referents=_encoded('derived', Referent(number='3127')),
+        )
+
+        for _ in range(3):  # the same item, retried
+            with pytest.raises(RuntimeError):
+                await service._execute_graphiti_write('add_episode', dict(payload))
+
+        assert service.referent_source_counts()['derived'] == 3
+
 
 @pytest.fixture
 def journaling_service(service):
@@ -779,6 +912,32 @@ class TestReplayFromStoreStampsReferents:
             'source': 'metadata',
             'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
         }
+
+    @pytest.mark.asyncio
+    async def test_a_non_str_memory_is_skipped_not_fatal(self, service, caplog):
+        """`resolve_referents` raises InputValidationError on a truthy non-str
+        content, and this call sits in a loop whose `enqueue_batch` runs only
+        AFTER the loop completes — so an unguarded record would abort the WHOLE
+        replay and enqueue nothing. The blast radius must stay at one row."""
+        self._stub_memories(service, [
+            {'memory': 'Task 3127 landed', 'metadata': {'category': 'temporal_facts'}},
+            {'memory': {'not': 'a string'}, 'metadata': {}},
+            {'memory': ['also not a string'], 'metadata': {}},
+            {'memory': 'Task 2500 landed', 'metadata': {'category': 'temporal_facts'}},
+        ])
+
+        with caplog.at_level('WARNING'):
+            count = await service.replay_from_store('dark_factory')
+
+        assert count == 2
+        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        assert [item['payload']['content'] for item in batch] == [
+            'Task 3127 landed', 'Task 2500 landed',
+        ]
+        assert all(item['payload']['referents']['source'] == 'derived' for item in batch)
+        assert sum(
+            'not a string' in rec.getMessage() for rec in caplog.records
+        ) == 2, f'expected one WARNING per skipped record; got {[r.getMessage() for r in caplog.records]}'
 
     @pytest.mark.asyncio
     async def test_preexisting_batch_payload_keys_survive(self, service):
