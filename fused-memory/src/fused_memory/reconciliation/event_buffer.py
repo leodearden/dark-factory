@@ -1166,7 +1166,10 @@ class EventBuffer:
                    RETURNING project_id, timestamp, event_type""",
                 (cutoff,),
             ) as cursor:
-                deleted = await cursor.fetchall()
+                # Materialised eagerly: fetchall() is typed Iterable[Row], and
+                # these rows are both counted (len) and iterated below, AFTER
+                # the cursor context has exited.
+                deleted = list(await cursor.fetchall())
 
             counts: dict[tuple[str, str, str], int] = {}
             for row in deleted:
