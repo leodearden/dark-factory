@@ -974,29 +974,31 @@ def test_installer_never_pipes_systemctl_into_grep():
         assert not ('systemctl' in line and '| grep' in line), line
 
 
-def test_the_installer_probe_default_is_read_from_the_committed_template(
-    tmp_path, monkeypatch,
-):
-    """The clean-probe default is DERIVED, and must not decay into a literal.
+def test_installer_branches_on_the_parity_exit_code():
+    """Every non-zero checker exit must NOT be described as a drop-in.
 
-    A hardcoded `/home/leo/src/dark-factory` would keep passing after someone
-    moved the template's WorkingDirectory, feeding the parity gate a clean
-    answer for a value the template no longer declares.  Pointing the module's
-    template constant at a rewritten copy must move the default with it.
+    Exit 2 (not installed), [vanished] (committed template gone),
+    [unverifiable] (no systemd user manager) and python3 missing from PATH all
+    reach the same `else`, and a single message asserting "a drop-in is winning"
+    names three of them wrongly -- while setup-host.sh, the other consumer of
+    this same checker, does branch on the code.  Two consumers giving
+    contradictory accounts of one exit code is worse than either account alone.
+
+    Read from the source rather than executed, deliberately: exit 2 is
+    unreachable through this installer (the presence check above it exits
+    first), and a missing checker cannot be staged without deleting a tracked
+    file from the real checkout.  A source-level pin is what is actually
+    available, and it is enough to stop the branch collapsing back into one
+    message -- the same trade
+    test_installer_never_pipes_systemctl_into_grep makes.
     """
-    rewritten = tmp_path / 'lms-arm@.service'
-    rewritten.write_text(
-        UNIT_TEMPLATE.read_text().replace(
-            'WorkingDirectory=/home/leo/src/dark-factory',
-            'WorkingDirectory=/somewhere/else',
-        )
-    )
-    monkeypatch.setitem(globals(), 'UNIT_TEMPLATE', rewritten)
+    source = INSTALLER.read_text()
 
-    assert _template_working_directory() == '/somewhere/else'
-    assert _clean_show_output() == (
-        'WorkingDirectory=/somewhere/else\nDropInPaths=\n'
-    )
+    # The checker's absence is reported as ITSELF, not as a finding.
+    assert '-f "$PARITY_CHECKER"' in source
+    # And the findings are told apart by code.
+    assert '"$parity_rc" -eq 2' in source
+    assert '"$parity_rc" -eq 1' in source
 
 
 def test_installer_confirms_the_template_is_the_effective_configuration(

@@ -83,6 +83,24 @@ fi
 # check above still runs first and still exits first, so its observable
 # failure path is unchanged.
 #
+# The checker ships in this repo, so a missing one is a BROKEN CHECKOUT, not a
+# host with a drop-in.  Guarded separately (setup-host.sh guards the same way)
+# and reported as itself: folding it into the override text below would assert
+# a cause this run never established.  It still FAILS, unlike setup-host.sh's
+# report-only info: an install that could not verify the effective
+# configuration has established nothing, and printing success there is exactly
+# the bug this layer exists to close.
+if [ ! -f "$PARITY_CHECKER" ]; then
+    echo "ERROR: the parity checker is missing from this checkout" >&2
+    echo "       (expected at ${PARITY_CHECKER})." >&2
+    echo "       ${UNIT_TEMPLATE} WAS copied into ${UNIT_DIR} and the user" >&2
+    echo "       daemon reloaded, but nothing checked what systemd would" >&2
+    echo "       actually apply -- so a drop-in could be overriding it" >&2
+    echo "       unreported.  Verify by hand:" >&2
+    echo "           systemctl --user show -p WorkingDirectory -p DropInPaths lms-arm@<arm>.service" >&2
+    exit 1
+fi
+
 # Under `set -euo pipefail` a bare invocation would abort here with no
 # explanation at all, so the exit code is captured (the shape setup-host.sh
 # uses for the same checkers).
@@ -91,19 +109,54 @@ if python3 "$PARITY_CHECKER" --installed-dir "$UNIT_DIR" --repo-root "$REPO_ROOT
     :
 else
     parity_rc=$?
-    echo "ERROR: the install did NOT produce a clean effective configuration" >&2
-    echo "       (check_lms_unit_parity.py exited ${parity_rc}; see its" >&2
-    echo "       [lms_unit_parity] report above for the specific finding)." >&2
-    echo "" >&2
-    echo "  An [override] or [effective] finding means a drop-in or a resolved" >&2
-    echo "  WorkingDirectory is winning over ${UNIT_TEMPLATE}. A drop-in SURVIVES" >&2
-    echo "  reinstallation, and is deliberately NOT removed here: it can be" >&2
-    echo "  load-bearing, so deleting it blindly is the unsafe option." >&2
-    echo "" >&2
-    echo "  Inspect the merged result:" >&2
-    echo "      systemctl --user cat lms-arm@<arm>.service" >&2
-    echo "  Remove the known worktree drop-in, with its safety preconditions:" >&2
-    echo "      scripts/remove-lms-arm-worktree-dropin.sh" >&2
+    # BRANCH on the code, the way setup-host.sh does for the same checker.  A
+    # single message for every non-zero exit asserted "a drop-in or a resolved
+    # WorkingDirectory is winning" for exit 2 (not installed), for [vanished]
+    # (the committed template is gone), for [unverifiable] (no systemd user
+    # manager -- a container, a non-lingering SSH session) and for python3 not
+    # being on PATH alike: findings it names wrongly, and two consumers of one
+    # checker giving contradictory accounts of one exit code.
+    if [ "$parity_rc" -eq 2 ]; then
+        # Defense in depth rather than a reachable path today: the presence
+        # check above already exits on an absent unit, so reaching exit 2 here
+        # means the checker looked somewhere else than this script wrote.
+        echo "ERROR: ${UNIT_TEMPLATE} was copied but the checker reports it as" >&2
+        echo "       NOT INSTALLED -- it is not where this installer put it." >&2
+        echo "       UNIT_DIR=${UNIT_DIR}" >&2
+        echo "       Check XDG_CONFIG_HOME, and whether something removed the" >&2
+        echo "       unit between the copy above and this check." >&2
+    elif [ "$parity_rc" -eq 1 ]; then
+        echo "ERROR: the install did NOT produce a clean effective configuration" >&2
+        echo "       (check_lms_unit_parity.py exited 1; see its" >&2
+        echo "       [lms_unit_parity] report above for WHICH finding fired)." >&2
+        echo "" >&2
+        echo "  [override] / [effective] -- a drop-in, or a resolved" >&2
+        echo "  WorkingDirectory, is winning over ${UNIT_TEMPLATE}. A drop-in" >&2
+        echo "  SURVIVES reinstallation, and is deliberately NOT removed here:" >&2
+        echo "  it can be load-bearing, so deleting it blindly is the unsafe" >&2
+        echo "  option." >&2
+        echo "      Inspect the merged result:" >&2
+        echo "          systemctl --user cat lms-arm@<arm>.service" >&2
+        echo "      Remove the known worktree drop-in, with its preconditions:" >&2
+        echo "          scripts/remove-lms-arm-worktree-dropin.sh" >&2
+        echo "" >&2
+        echo "  [drift] -- the installed copy differs from this template. Not a" >&2
+        echo "  drop-in: re-run this installer, and if it persists something" >&2
+        echo "  else is writing ${UNIT_DIR}/${UNIT_TEMPLATE}." >&2
+        echo "  [vanished] -- the committed template was not found under" >&2
+        echo "  ${REPO_ROOT}; nothing was compared." >&2
+        echo "  [unverifiable] -- the probe could not answer, so NOTHING about" >&2
+        echo "  the effective configuration was established. Check that a" >&2
+        echo "  systemd user manager is running for this user:" >&2
+        echo "          systemctl --user is-system-running" >&2
+    else
+        # Not a finding at all: the checker never got to report one.
+        echo "ERROR: could not RUN the parity checker (exit ${parity_rc})" >&2
+        echo "       Nothing was established about the effective configuration." >&2
+        echo "       Exit 127 means python3 is not on PATH. Otherwise run it by" >&2
+        echo "       hand, exactly as this script does, to see what it says:" >&2
+        echo "           python3 ${PARITY_CHECKER} --installed-dir ${UNIT_DIR} --repo-root ${REPO_ROOT}" >&2
+    fi
     exit 1
 fi
 
