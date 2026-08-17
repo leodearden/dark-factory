@@ -1182,6 +1182,111 @@ test('barFractions: does not mutate its input array', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The ROW-PROJECTED composition — charts.jsx's HBarChart (task 3681)
+//
+// HBarChart is the one primitive whose input is rows of OBJECTS behind a
+// `valueKey`/`labelKey` indirection rather than a bare values array, so it
+// projects at the CALL SITE — `rows.map(r => r[valueKey])` — and then reuses
+// plottableMax + barFractions unchanged, with no key-projecting export of its
+// own. These cases execute that projection-then-helper composition, which the
+// Python source probes in test_charts_null_samples.py can only assert
+// structurally.
+//
+// GREEN ON ARRIVAL, deliberately. Both helpers already behaved correctly (task
+// 3489); everything 3681 changed lives in charts.jsx, which is CDN-Babel JSX
+// with no node_modules, so nothing in this repo can render it. 3681's RED
+// signal is therefore in test_charts_null_samples.py's source assertions. Do
+// not weaken spark_path.js to manufacture a failure here.
+//
+// Pre-fix, HBarChart folded `Math.max(...rows.map(r => r[valueKey]), 1)` over
+// the raw rows and scaled each with `(r[valueKey] / max) * 100`, and it handed
+// the raw value to the CALLER's formatter — both live call sites pass
+// `v => `$${v.toFixed(2)}``, so a row missing the key threw during render.
+// ---------------------------------------------------------------------------
+
+test('row projection: a row missing the key holes ONLY that row', () => {
+  // THE RED SIGNAL for this shape. Pre-fix `Math.max(...values, 1)` was NaN
+  // here, so EVERY row's width became "NaN%" — an invalid CSS length, which
+  // makes the browser drop the declaration, so ALL the bars vanished rather
+  // than just the missing one.
+  const rows = [{ total: 2 }, { label: 'x' }, { total: 4 }];
+  const values = rows.map(r => r.total);
+  const max = plottableMax(values, 1);
+  const { fractions } = barFractions(values, max);
+
+  assert.deepEqual(fractions, [0.5, null, 1]);
+  for (const [i, f] of fractions.entries()) {
+    if (f !== null) {
+      assert.ok(Number.isFinite(f), `row ${i} must keep a finite fraction despite the hole`);
+    }
+  }
+});
+
+test('row projection: plottableMax survives the projection the bare fold could not', () => {
+  const rows = [{ total: 2 }, { label: 'x' }, { total: 4 }];
+  const values = rows.map(r => r.total);
+
+  assert.equal(plottableMax(values, 1), 4);
+  // The frozen legacy comparison: the expression HBarChart actually used.
+  assert.ok(
+    Number.isNaN(Math.max(...values, 1)),
+    'the pre-fix fold really did go NaN on this input — without that this ' +
+      'case would not be testing the defect it names',
+  );
+});
+
+test('row projection: the fraction times 100 reproduces the legacy percentage', () => {
+  // HBarChart multiplies by 100 (percent) where BarChart multiplies by chartH
+  // (pixels), so on hole-free input the widths must be character-for-character
+  // what `(r[valueKey] / max) * 100` produced.
+  for (const rows of [[{ total: 0 }, { total: 1 }, { total: 4 }], [{ total: 5 }], [{ total: 3 }, { total: 3 }]]) {
+    const values = rows.map(r => r.total);
+    const max = Math.max(...values, 1);
+
+    assert.deepEqual(
+      barFractions(values, max).fractions.map(f => f * 100),
+      rows.map(r => (r.total / max) * 100),
+    );
+  }
+});
+
+test('row projection: a measured 0 row stays a real 0, distinct from a missing row', () => {
+  // The data-layer statement of "zero-width bar" vs "no bar at all": the row
+  // that measured zero keeps its honest 0%-width fill, the row that measured
+  // nothing gets no fill div and an em-dash in its value cell.
+  const rows = [{ total: 0 }, {}, { total: 8 }];
+  const values = rows.map(r => r.total);
+  const { fractions } = barFractions(values, plottableMax(values, 1));
+
+  assert.equal(fractions[0], 0, 'a measured zero is a real fraction');
+  assert.equal(fractions[1], null, 'an absent value is not a fraction at all');
+  assert.notEqual(fractions[0], fractions[1]);
+});
+
+test('row projection: segments hole only the keys their row lacks', () => {
+  // The live tabs.jsx case: model keys are unioned across ALL rows, so a
+  // project that never used a model simply lacks that key. Pre-fix
+  // `(r[s.key] || 0)` scrubbed that hole into a measured zero — the same
+  // conflation banned for StackedAreaChart.
+  const segments = [{ key: 'opus' }, { key: 'sonnet' }, { key: 'haiku' }];
+  const rows = [{ total: 10, opus: 6, sonnet: 4 }, { total: 5, haiku: 5 }];
+  const max = plottableMax(rows.map(r => r.total), 1);
+
+  assert.equal(max, 10);
+  assert.deepEqual(
+    barFractions(segments.map(s => rows[0][s.key]), max).fractions,
+    [0.6, 0.4, null],
+    'the present segments keep their true fraction of the SHARED max; the ' +
+      'unused model is absent, not zero',
+  );
+  assert.deepEqual(
+    barFractions(segments.map(s => rows[1][s.key]), max).fractions,
+    [null, null, 0.5],
+    'a second row holes a different set of keys, scaled against the same max',
+  );
+});
+
+// ---------------------------------------------------------------------------
 // stackedAreaPaths — banded areas with a PREFIX hole rule (task 3489)
 //
 // charts.jsx's StackedAreaChart scrubbed every sample with `(st.values[i] || 0)`
