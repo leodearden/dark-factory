@@ -17,7 +17,9 @@ scoped to Rule A and says nothing about Rule B.
       kwargs match a registered stdlib-dataclass shape (``_DATACLASS_SHAPES``;
       ``VerifyResult`` today).  The binding name is never consulted.  Remedies are
       dataclass-specific (``_fake_verify_result``, ``MagicMock(spec=VerifyResult)``).
-      Carries a shrink-only per-file debt baseline (``_DATACLASS_DOUBLE_DEBT``).
+      Carries a shrink-only per-file debt BUDGET (``_DATACLASS_DOUBLE_DEBT``): a
+      grandfathered file is silent while it carries at most its recorded number of
+      sites and reports the overrun as soon as it carries more.
 
 WIDEN-NOT-SIBLING RULING (task 4016): Rule B was added here rather than as a sibling
 script.  A sibling would have cost nine wiring edits (seven package ``orchestrator.yaml``
@@ -88,7 +90,8 @@ Rule B — ``bare-dataclass-double``
 Rule: any ``MagicMock(...)`` call, IN ANY POSITION, with no spec/spec_set and no
 positional argument, whose literal keyword names match a shape registered in
 ``_DATACLASS_SHAPES`` — unless the preceding non-blank line carries
-``# noqa: bare-dataclass-double — <reason>``, or the file is on the debt baseline.
+``# noqa: bare-dataclass-double — <reason>``, or the file is on the debt baseline
+and still within its recorded site budget.
 
 Matching is ANCHOR + OVERLAP, deliberately NOT "kwargs are a subset of the fields":
 every anchor must be present AND at least ``min_field_matches`` fields must match.
@@ -325,39 +328,49 @@ def _dataclass_violation_msg(shape: _DataclassShape, kwargs: set[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Rule B debt baseline — SHRINK-ONLY.
+# Rule B debt baseline — SHRINK-ONLY, and CHECKED.
 #
-# These 11 files carried 95 pre-existing dataclass-double sites when Rule B
-# landed (AST census over all seven scanned tests/ directories, task 4016).
-# Shipping the rule hot with no transition would have turned orchestrator/tests'
-# lint_command red on day one and stalled the merge lane repo-wide, so they are
-# grandfathered — Rule B ONLY; Rule A still applies in full to every file here.
+# path → the number of pre-existing dataclass-double sites that file carried when
+# Rule B landed (AST census over all seven scanned tests/ directories, task 4016;
+# 95 sites across 11 files).  Shipping the rule hot with no transition would have
+# turned orchestrator/tests' lint_command red on day one and stalled the merge lane
+# repo-wide, so these are grandfathered — Rule B ONLY; Rule A still applies in full
+# to every file here.
 #
-# DO NOT ADD ENTRIES.  The list may only shrink, as files are migrated onto
-# _fake_verify_result / MagicMock(spec=VerifyResult); that migration is filed as
-# a follow-up task. A NEW file with a bare dataclass double must fail the gate —
-# that is the entire reason the baseline is opt-OUT rather than opt-in.
+# The count is a BUDGET, not a comment.  A debt file is silent while it carries at
+# most its recorded number of sites and reports the overrun the moment it carries
+# more, so "shrink-only" is enforced on the same hot path the rule itself runs on
+# rather than trusted.  This matters most for
+# orchestrator/tests/test_merge_queue.py: 63 sites in an actively-developed hub,
+# where a wholesale grandfather would have made a brand-new bare double added
+# tomorrow invisible to the gate.
+#
+# DO NOT ADD ENTRIES, AND DO NOT RAISE A NUMBER.  Both may only shrink, as files
+# are migrated onto _fake_verify_result / MagicMock(spec=VerifyResult); that
+# migration is filed as a follow-up task.  A NEW file with a bare dataclass double
+# must fail the gate — that is the entire reason the baseline is opt-OUT rather
+# than opt-in.
 #
 # orchestrator/tests/test_merge_speculation.py is deliberately NOT here: task
-# 3980 just cleaned that module, and a blanket entry would silently un-cover it.
-# Its one deliberate double carries a per-site pragma instead.
-_DATACLASS_DOUBLE_DEBT: frozenset[str] = frozenset({
-    'orchestrator/tests/test_merge_queue.py',  # 63 sites
-    'orchestrator/tests/test_concurrent_verify_boundary.py',  # 9 sites
-    'orchestrator/tests/test_merge_queue_permit_conservation.py',  # 7 sites
-    'orchestrator/tests/test_merge_queue_resolve_release.py',  # 7 sites
-    'orchestrator/tests/test_merge_queue_request_liveness.py',  # 3 sites
-    'orchestrator/tests/test_coalesce_integration_gate.py',  # 1 site
-    'orchestrator/tests/test_merge_item_union.py',  # 1 site
-    'orchestrator/tests/test_merge_queue_equivalence.py',  # 1 site
-    'orchestrator/tests/test_merge_queue_lifecycle_registry.py',  # 1 site
-    'orchestrator/tests/test_merge_queue_metrics.py',  # 1 site
-    'orchestrator/tests/test_merge_queue_single_writer_asserts.py',  # 1 site
-})
+# 3980 just cleaned that module, and even a budgeted entry would let a new double
+# land there silently. Its one deliberate double carries a per-site pragma instead.
+_DATACLASS_DOUBLE_DEBT: dict[str, int] = {
+    'orchestrator/tests/test_merge_queue.py': 63,
+    'orchestrator/tests/test_concurrent_verify_boundary.py': 9,
+    'orchestrator/tests/test_merge_queue_permit_conservation.py': 7,
+    'orchestrator/tests/test_merge_queue_resolve_release.py': 7,
+    'orchestrator/tests/test_merge_queue_request_liveness.py': 3,
+    'orchestrator/tests/test_coalesce_integration_gate.py': 1,
+    'orchestrator/tests/test_merge_item_union.py': 1,
+    'orchestrator/tests/test_merge_queue_equivalence.py': 1,
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 1,
+    'orchestrator/tests/test_merge_queue_metrics.py': 1,
+    'orchestrator/tests/test_merge_queue_single_writer_asserts.py': 1,
+}
 
 
-def _is_debt_path(filename: str) -> bool:
-    """Return True if *filename* is a Rule B debt-baseline file.
+def _debt_budget(filename: str) -> int | None:
+    """Return *filename*'s Rule B debt budget, or None if it is not a debt file.
 
     Compares TRAILING PATH COMPONENTS, not substrings: ``a/b/c.py`` matches an
     entry ``b/c.py`` because its last two components are exactly ``b`` and ``c.py``.
@@ -367,13 +380,53 @@ def _is_debt_path(filename: str) -> bool:
     Trailing-component matching (rather than an exact string compare) is required
     because the nine call sites pass repo-relative paths while pytest passes
     absolutes; both must reach the same verdict.
+
+    Returns None (not 0) for a non-debt file so callers can distinguish "no budget
+    recorded — report every site" from "budget of zero".
     """
     parts = PurePosixPath(filename.replace('\\', '/')).parts
-    for entry in _DATACLASS_DOUBLE_DEBT:
+    for entry, allowed in _DATACLASS_DOUBLE_DEBT.items():
         entry_parts = PurePosixPath(entry).parts
         if len(parts) >= len(entry_parts) and parts[-len(entry_parts) :] == entry_parts:
-            return True
-    return False
+            return allowed
+    return None
+
+
+def _debt_overrun_msg(budget: int, found: int) -> str:
+    """Build the message for a debt file that has grown past its recorded budget."""
+    return (
+        'this file is on the SHRINK-ONLY bare-dataclass-double debt baseline with a'
+        f' recorded budget of {budget} site(s), but {found} were found —'
+        f' {found - budget} over budget. The baseline may only shrink.'
+        ' The reported sites are simply the LAST in source order: the anchor is'
+        ' positional and is NOT a claim that these exact sites are the new ones.'
+        ' Fix by migrating a site in this file onto _fake_verify_result(...) or'
+        ' MagicMock(spec=VerifyResult) seeded from dataclasses.fields, or by adding'
+        ' # noqa: bare-dataclass-double — <reason> above a deliberate one.'
+        ' Do NOT raise the recorded budget in check_bare_magicmock_config.py.'
+    )
+
+
+def _apply_debt_budget(doubles: list[Violation], budget: int | None) -> list[Violation]:
+    """Filter Rule B violations for a debt file down to just its budget overrun.
+
+    - Not a debt file (*budget* is None) → every violation is reported unchanged.
+    - At or under budget → silence: this is the grandfathering the baseline exists for.
+    - Over budget → report exactly ``found - budget`` violations, so the noise is
+      proportional to the overrun rather than dumping all 63 sites of
+      test_merge_queue.py on someone who added one.
+
+    The reported sites are the last in source order.  That choice is deterministic
+    rather than diagnostic — the checker cannot know which site is new — and the
+    message says so explicitly.
+    """
+    if budget is None:
+        return doubles
+    if len(doubles) <= budget:
+        return []
+    ordered = sorted(doubles, key=lambda v: (v.lineno, v.col_offset))
+    message = _debt_overrun_msg(budget, len(ordered))
+    return [v._replace(message=message) for v in ordered[budget:]]
 
 
 def _literal_kwarg_names(call: ast.Call) -> set[str]:
@@ -510,10 +563,11 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     lines = source.splitlines()
     violations: list[Violation] = []
 
-    # Hoisted out of the loop: a debt-baseline file is grandfathered for Rule B
-    # wholesale (Rule A still applies to it in full).  Computed once per file so the
-    # per-node Rule B branch below costs one boolean test.
-    rule_b_active = not _is_debt_path(filename)
+    # Rule B violations are collected separately so a debt file's budget can be
+    # applied to the COUNT after the walk (see _apply_debt_budget).  Looked up once
+    # per file, not per node.
+    dataclass_doubles: list[Violation] = []
+    debt_budget = _debt_budget(filename)
 
     # ONE walk, BOTH rules.  Rule B was originally a second full ast.walk over the same
     # tree, which cost ~43% of total checker runtime (20.8s → 30.7s over the seven
@@ -526,10 +580,9 @@ def find_violations(source: str, filename: str) -> list[Violation]:
         # An ast.Call is never an ast.Assign/ast.AnnAssign, so this branch and Rule A's
         # below are mutually exclusive and the `continue` cannot skip Rule A work.
         if isinstance(node, ast.Call):
-            if rule_b_active:
-                double = _dataclass_double_violation(node, lines, filename)
-                if double is not None:
-                    violations.append(double)
+            double = _dataclass_double_violation(node, lines, filename)
+            if double is not None:
+                dataclass_doubles.append(double)
             continue
 
         # ---- Rule A: bare-magicmock, ast.Assign/ast.AnnAssign only ----
@@ -584,6 +637,11 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                     message=_VIOLATION_MSG,
                 )
             )
+
+    # Rule B's per-file debt budget is applied to the collected COUNT, not to
+    # individual sites: a grandfathered file stays silent while it does not grow,
+    # and reports exactly its overrun once it does.
+    violations.extend(_apply_debt_budget(dataclass_doubles, debt_budget))
 
     return sorted(violations, key=lambda v: (v.lineno, v.col_offset))
 

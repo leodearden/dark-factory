@@ -8,6 +8,7 @@ See task 1372 (lint guard) and task 1339/1313/1064 (migration).
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import shutil
 import subprocess
@@ -1266,6 +1267,75 @@ class TestDataclassDoubleDebtBaseline:
             f'Debt baseline entries no longer exist in the repo: {missing}. '
             'A stale entry silently suppresses Rule B for a path nothing occupies — '
             'and would grandfather a NEW file created at that path. Remove them.'
+        )
+
+    def test_debt_file_is_silent_at_budget_and_reports_the_overrun_above_it(self):
+        """The budget is what makes 'shrink-only' checked rather than merely commented.
+
+        Without it a debt entry grandfathers its file WHOLESALE, so a brand-new bare
+        double added to test_merge_queue.py (63 sites, an actively-developed hub)
+        would be invisible to the gate forever.
+        """
+        entry = 'orchestrator/tests/test_merge_item_union.py'
+        budget = _checker._DATACLASS_DOUBLE_DEBT[entry]
+        assert budget == 1, f'this test is written against a budget of 1; got {budget}'
+
+        at_budget = find_violations(_RULE_B_SOURCE, entry)
+        assert at_budget == [], (
+            f'a debt file carrying exactly its recorded {budget} site(s) must stay '
+            f'silent — that is the grandfathering the baseline exists for; got {at_budget}'
+        )
+
+        over_budget = find_violations(_RULE_B_SOURCE * 3, entry)
+        assert len(over_budget) == 2, (
+            'a debt file that GROWS past its recorded budget must report exactly the '
+            f'overrun (3 sites - budget {budget} = 2); got {over_budget}'
+        )
+
+    def test_overrun_message_names_the_budget_and_forbids_raising_it(self):
+        """The overrun message must not read as a normal Rule B hit.
+
+        The remedy differs: a normal hit says "spec this double", an overrun says
+        "you added debt to a file that may only shrink". Conflating them invites the
+        reader to fix it by editing the number in the checker.
+        """
+        entry = 'orchestrator/tests/test_merge_item_union.py'
+        message = find_violations(_RULE_B_SOURCE * 2, entry)[0].message
+        for needle in ('debt baseline', 'budget of 1', '2 were found', 'Do NOT raise'):
+            assert needle in message, (
+                f'the overrun message must name {needle!r} so the reader fixes the debt '
+                f'rather than the baseline; got {message!r}'
+            )
+
+    def test_recorded_budgets_are_not_below_the_live_per_file_census(self):
+        """Every recorded budget still covers what its file actually carries.
+
+        This is the shrink-only invariant measured against the real repo rather than
+        asserted from a literal: it recounts each debt file with the checker's own
+        predicates. A budget that drifted BELOW its file would make that package's
+        lint_command red; one that drifted far above would be silent slack.
+        """
+        overruns = []
+        for entry, budget in _checker._DATACLASS_DOUBLE_DEBT.items():
+            path = _REPO_ROOT / entry
+            if not path.is_file():
+                continue  # covered by test_every_debt_entry_resolves_to_an_existing_file
+            source = path.read_text(encoding='utf-8')
+            lines = source.splitlines()
+            actual = sum(
+                1
+                for node in ast.walk(ast.parse(source, filename=str(path)))
+                if isinstance(node, ast.Call)
+                and _checker._dataclass_double_violation(node, lines, entry) is not None
+            )
+            if actual > budget:
+                overruns.append(f'{entry}: recorded {budget}, found {actual}')
+        assert overruns == [], (
+            'Debt budgets are below the live census, so these files are RED:\n  '
+            + '\n  '.join(overruns)
+            + '\nThe baseline is shrink-only: migrate the new site(s) onto '
+            '_fake_verify_result / MagicMock(spec=VerifyResult) rather than raising '
+            'the recorded number.'
         )
 
 
