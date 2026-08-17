@@ -342,6 +342,31 @@ _PYTEST = 'pytest'
 #                 while checking almost nothing. Both spellings are listed
 #                 because neither is a prefix of the other, and neither is a
 #                 prefix of pyright's `--python*` flags (those begin `--p`).
+#
+# `-p`/`--project` MUST STAY IN THIS SET, and the reason is worth stating
+# because task 4358 hit the collision that makes deleting it tempting. `uv run
+# --project <member> pyright <dir>` — the invocation shape every module config
+# in this repo now uses — contains the SAME CHARACTERS as pyright's own
+# config-redirect flag, naming a completely different thing: uv's selects the
+# ENVIRONMENT the checker binary is resolved from and narrows NOTHING, while
+# pyright's selects a CONFIG FILE that can relax typeCheckingMode wholesale.
+#
+# The two are told apart by POSITION, not by dropping the flag from this table:
+# uv's flags precede the checker anchor, pyright's follow it. That is why
+# `_narrowing_flag_args` scans `_post_anchor_tokens` rather than the whole
+# segment. Dropping `--project` here would silence the same false positive and
+# simultaneously un-guard the sharpest carve-out vector this file documents —
+# see test_narrowing_flag_detection_is_scoped_to_the_checkers_own_arguments,
+# whose assertion (b) exists specifically to fail on that shortcut.
+#
+# The property is not new: `_targets` has always sliced after the anchor, and
+# the `_PYTEST` comment above already records it ("the anchor placement is what
+# excludes the pre-anchor positional `shared` of `uv run --project shared
+# pytest ...`"). `_narrowing_flag_args` was simply the one helper it had never
+# been applied to — latent because ruff's three exclude spellings below happen
+# not to collide with any `uv run` flag, so the already-uv-fronted
+# lint_command never tripped it, and the type_check_command was `npx`-fronted
+# until 4358.
 _NARROWING_FLAGS = {
     _RUFF: ('--exclude', '--extend-exclude', '--force-exclude'),
     _PYRIGHT: ('--skip', '-p', '--project'),
@@ -370,6 +395,31 @@ def _segment(cmd: str, keyword: str) -> str:
     return matching[0]
 
 
+def _post_anchor_tokens(cmd: str, keyword: str) -> list[str]:
+    """*keyword*'s OWN arguments in *cmd* — the tokens after the checker anchor.
+
+    The ANCHOR is the last whitespace-separated token of *keyword* (see the
+    ``_RUFF``/``_PYRIGHT`` comment above). Everything before it belongs to the
+    WRAPPER, not the checker: in ``uv run --project shared pyright scripts/``
+    the pre-anchor tokens are uv's, and reading them as the checker's is a
+    category error.
+
+    Both callers need exactly this slice, for the same reason from opposite
+    directions — ``_targets`` must not count uv's positional ``shared`` as a
+    checked path, and ``_narrowing_flag_args`` must not count uv's
+    ``--project`` as pyright's config redirect. Sharing one implementation is
+    what keeps the two from drifting apart again (task 4358: ``_targets`` had
+    the slice from the start, ``_narrowing_flag_args`` never got it).
+    """
+    anchor = keyword.split()[-1]
+    tokens = shlex.split(_segment(cmd, keyword))
+    assert anchor in tokens, (
+        f'no `{anchor}` token in the `{keyword}` segment of {cmd!r}, so the '
+        "checker's own arguments cannot be located"
+    )
+    return tokens[tokens.index(anchor) + 1:]
+
+
 def _targets(cmd: str, keyword: str) -> list[str]:
     """The positional path arguments *keyword*'s segment of *cmd* checks.
 
@@ -380,23 +430,25 @@ def _targets(cmd: str, keyword: str) -> list[str]:
     LIST MEMBERSHIP (exact-element, so ``'tests/scripts/'`` does not match) is
     what makes those assertions real.
     """
-    anchor = keyword.split()[-1]
-    tokens = shlex.split(_segment(cmd, keyword))
-    assert anchor in tokens, (
-        f'no `{anchor}` token in the `{keyword}` segment of {cmd!r}, so the '
-        'positional targets cannot be located'
-    )
-    tail = tokens[tokens.index(anchor) + 1:]
-    return [t for t in tail if not t.startswith('-')]
+    return [t for t in _post_anchor_tokens(cmd, keyword) if not t.startswith('-')]
 
 
 def _narrowing_flag_args(cmd: str, keyword: str) -> list[str]:
     """Any flag in *keyword*'s segment that carves files back out of the target.
 
     Both spellings are caught: ``--exclude foo`` and ``--exclude=foo``.
+
+    Scoped to the checker's OWN arguments via ``_post_anchor_tokens``, not the
+    whole segment: uv's pre-anchor ``--project <member>`` names an ENVIRONMENT,
+    while pyright's post-anchor ``--project <file>`` names a CONFIG FILE, and
+    only position distinguishes them. See the ``_NARROWING_FLAGS`` comment for
+    why the flag stays in the table rather than being deleted to dodge that
+    collision, and
+    ``test_narrowing_flag_detection_is_scoped_to_the_checkers_own_arguments``
+    for the four cases that pin it.
     """
     prefixes = _NARROWING_FLAGS[keyword]
-    return [t for t in shlex.split(_segment(cmd, keyword)) if t.startswith(prefixes)]
+    return [t for t in _post_anchor_tokens(cmd, keyword) if t.startswith(prefixes)]
 
 
 # Thin ruff-spelling wrappers, kept so test_scripts_diff_is_lint_gated below is
