@@ -1,0 +1,226 @@
+"""Transcript reads inside ``_run_subprocess`` must never run on the event loop (task 3925).
+
+THE INVARIANT UNDER TEST
+────────────────────────
+Every on-disk transcript read reachable from ``_run_subprocess`` —
+``count_transcript_turns`` in the startup-regime poll, in the working-regime
+progress-extension poll, and in the post-kill ``except TimeoutError:`` re-read,
+plus ``read_transcript_records`` on the normal-exit path — must execute on a
+worker thread (``asyncio.to_thread``), NOT on the thread running the event loop.
+
+WHY IT MATTERS.  The orchestrator runs every role of every concurrent task on
+ONE event loop (``orchestrator/src/orchestrator/cli.py``, ``asyncio.run(_main())``).
+Each of these reads globs ``<config_dir>/projects/*/<session_id>.jsonl``, opens
+the whole file and ``json.loads`` every line — a 1.0-1.3 MB JSONL for a mature
+agent session.  Executed inline on the loop by up to ``max_concurrent_tasks``
+agents, that blocking work starves every other coroutine in the process.  The
+sibling rationale is stated at ``orchestrator/src/orchestrator/workflow.py:12399-12403``.
+
+HOW IT IS TESTED — thread identity, not wall clock
+──────────────────────────────────────────────────
+The primary assertion in every class below is categorical: the patched
+transcript function records ``threading.get_ident()`` on each call, and the test
+asserts none of the recorded idents equals the ident of the thread running the
+event loop.  This is load-independent and encodes the property directly.
+
+That choice is deliberate.  ``orchestrator/tests/test_liveness_boundary_gate.py:352-358``
+records a documented history of load-flakiness in exactly this code — "6.98s wall
+for a kill the watchdog itself measured at 0.1s — correct behaviour reported red
+by scheduling noise outside the code under test" — naming seven prior tasks
+(1836/1851/2320/2840/2921/2959/3491) burned by wall-clock proxies.  Exactly ONE
+supplementary responsiveness test lives here, and its bound is categorical rather
+than tuned; see its docstring.
+
+PATCH-TARGET DISCIPLINE.  Every patch below uses the module-global string target
+``'shared.cli_invoke.count_transcript_turns'`` / ``'...read_transcript_records'``.
+``asyncio.to_thread(count_transcript_turns, ...)`` resolves that global at CALL
+time, so the patches keep working.  A ``functools.partial`` or module-scope alias
+built at import time in ``cli_invoke.py`` would capture the REAL function and
+silently defeat these patches (and the 10 pre-existing ones in
+``test_cli_invoke.py``) — the tests would do real filesystem reads against empty
+tmp_path dirs instead of failing loudly.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+import time
+import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from shared.cli_invoke import _run_subprocess
+
+# ── Fake process builders ───────────────────────────────────────────────────
+# Copied in spirit from TestRunSubprocessWatchdog._make_hanging_proc
+# (shared/tests/test_cli_invoke.py:3783) so this file stands alone, matching how
+# test_cli_invoke_background.py / test_cli_invoke_sandbox_wrap.py each carry
+# their own fixtures rather than importing across test modules.
+
+
+def _make_hanging_proc():
+    """Return (proc, call_count) whose communicate() hangs on call 1 and raises
+    TimeoutError on call 2 (the post-SIGTERM retry) → SIGKILL branch."""
+    call_count = [0]
+
+    async def communicate_side_effect(input=None):  # noqa: A002
+        call_count[0] += 1
+        if call_count[0] == 1:
+            # Hang until the watchdog cancels comm_task — CancelledError lands here.
+            await asyncio.Event().wait()
+        raise TimeoutError
+
+    proc = MagicMock()
+    proc.communicate = communicate_side_effect
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+    proc.returncode = None
+    proc.pid = 12345
+    return proc, call_count
+
+
+def _fake_exec_returning(proc):
+    """An ``asyncio.create_subprocess_exec`` stand-in that yields *proc*."""
+
+    async def fake_exec(*args, **kwargs):
+        return proc
+
+    return fake_exec
+
+
+def _ident_recorder(recorded: list[int], return_value):
+    """A sync ``count_transcript_turns`` stand-in appending the CALLING thread's
+    ident to *recorded* and returning *return_value*.
+
+    Same closure shape as the existing side-effect idiom at
+    ``test_cli_invoke.py:4094`` (``_always_growing_turns``).  Under
+    ``asyncio.to_thread`` these list mutations happen on a worker thread; that
+    stays correct because at most one read is in flight per ``_run_subprocess``
+    and the ``await`` establishes happens-before on both sides.  A future test
+    firing CONCURRENT reads would need real synchronisation.
+    """
+
+    def _side_effect(config_dir, session_id):
+        recorded.append(threading.get_ident())
+        return return_value
+
+    return _side_effect
+
+
+class TestStartupRegimePollOffLoop:
+    """The startup-regime watchdog poll (``cli_invoke.py:2842``, inside
+    ``if not seen_turn and config_dir and session_id:``) must read off the loop."""
+
+    async def test_startup_poll_reads_transcript_off_the_loop_thread(self, tmp_path):
+        """Every startup-regime ``count_transcript_turns`` call runs on a worker thread.
+
+        The fake returns None, so the startup-wedge kill never fires (B7
+        conservative degrade) and the run polls at the patched 0.05s cadence
+        until the 0.4s absolute ceiling — giving several recorded idents.
+        """
+        loop_ident = threading.get_ident()
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = _make_hanging_proc()
+        recorded: list[int] = []
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                side_effect=_fake_exec_returning(proc),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', AsyncMock()),
+            patch(
+                'shared.cli_invoke.count_transcript_turns',
+                side_effect=_ident_recorder(recorded, None),
+            ),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.4, startup_grace_secs=0.05,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.timed_out is True, 'Expected the ceiling kill to fire'
+        assert recorded, 'Expected the startup-regime poll to read the transcript at least once'
+        assert loop_ident not in recorded, (
+            f'count_transcript_turns ran on the event-loop thread ({loop_ident}) — '
+            f'the startup-regime poll at cli_invoke.py:2842 blocks the shared loop. '
+            f'Recorded idents: {sorted(set(recorded))}'
+        )
+
+    async def test_startup_poll_does_not_block_the_event_loop(self, tmp_path):
+        """Supplementary responsiveness check: the loop keeps running coroutines
+        while a transcript read is in flight.
+
+        A ticker coroutine increments a counter every ``await asyncio.sleep(0.005)``.
+        The fake ``count_transcript_turns`` snapshots that counter, does a single
+        blocking ``time.sleep(0.5)`` on its FIRST call only, snapshots again, and
+        records the delta.
+
+        WHY ``>= 1`` IS THE RIGHT BOUND — DO NOT "TIGHTEN" IT.  This is a
+        categorical on-loop/off-loop discriminator, not a tuned wall-clock
+        threshold.  If the read runs ON the loop, the ticker provably gets
+        EXACTLY ZERO ticks during the 0.5s sleep — the loop cannot schedule
+        anything.  If it runs off-loop, ~100 ticks are expected at a 5ms cadence
+        over 0.5s, so ``>= 1`` carries roughly 50x headroom and is immune to the
+        scheduling noise that made the wall-clock proxies at
+        ``test_liveness_boundary_gate.py:407-415`` load-fragile.  Raising this
+        bound would trade that structural guarantee for a load-sensitive one.
+        """
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = _make_hanging_proc()
+        ticks = [0]
+        deltas: list[int] = []
+        slept = [False]
+
+        async def ticker():
+            while True:
+                await asyncio.sleep(0.005)
+                ticks[0] += 1
+
+        def blocking_read(config_dir, session_id):
+            if slept[0]:
+                return None
+            slept[0] = True
+            before = ticks[0]
+            time.sleep(0.5)
+            deltas.append(ticks[0] - before)
+            return None
+
+        ticker_task = asyncio.ensure_future(ticker())
+        try:
+            with (
+                patch(
+                    'shared.cli_invoke.asyncio.create_subprocess_exec',
+                    side_effect=_fake_exec_returning(proc),
+                ),
+                patch('shared.cli_invoke.terminate_process_group', AsyncMock()),
+                patch('shared.cli_invoke.count_transcript_turns', side_effect=blocking_read),
+                patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
+            ):
+                await _run_subprocess(
+                    ['fake'], cwd=tmp_path, env={}, model='opus',
+                    timeout_seconds=1.0, startup_grace_secs=0.05,
+                    session_id=sid, config_dir=cfg_dir,
+                )
+        finally:
+            ticker_task.cancel()
+            try:
+                await ticker_task
+            except asyncio.CancelledError:
+                pass
+
+        assert deltas, 'Expected the blocking transcript read to have run at least once'
+        assert deltas[0] >= 1, (
+            f'The event loop made ZERO progress during a 0.5s transcript read '
+            f'(ticker delta={deltas[0]}) — the read is executing inline on the loop. '
+            f'Off-loop, ~100 ticks are expected at a 5ms cadence.'
+        )
