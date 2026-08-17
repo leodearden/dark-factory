@@ -63,3 +63,31 @@ def test_repo_root_pytest_config_deselects_smoke_and_registers_marker() -> None:
     assert 'Unknown pytest.mark.smoke' not in combined, (
         f'the `smoke` marker is not registered under the root pytest config:\n{combined}'
     )
+
+
+def test_deselection_guard_rejects_a_run_where_collection_never_ran() -> None:
+    """Regression test for task 4060 (review finding recovered from task 2300).
+
+    The two substring assertions above are both satisfied by a run where
+    pytest never executed at all -- e.g. invoking an interpreter with no
+    pytest installed. Measured on this base: running the guard's own
+    subprocess command under `/usr/bin/python3` (no pytest installed) exits
+    1 with stderr `/usr/bin/python3: No module named pytest`, and BOTH
+    original assertions ('test_wm_focus_...' not in output, and no
+    PytestUnknownMarkWarning) PASS against that output -- a false green that
+    reports the X11 safety net as wired when collection never ran. This test
+    pins `_deselection_problems` (introduced to fix that hole) to REJECT
+    that exact stub.
+    """
+    never_ran = subprocess.CompletedProcess(
+        args=[],
+        returncode=1,
+        stdout='',
+        stderr='/usr/bin/python3: No module named pytest\n',
+    )
+
+    problems = _deselection_problems(never_ran)
+    assert problems, f'expected _deselection_problems to reject a run that never ran pytest, but it did not. Stub: {never_ran!r}'
+    assert any('exit' in p.lower() or 'returncode' in p.lower() for p in problems), (
+        f'expected a problem naming the exit/return code as the reason for rejection, got: {problems}'
+    )
