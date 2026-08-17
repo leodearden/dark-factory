@@ -1464,6 +1464,163 @@ class TestWorktreeStaleSignal:
         assert result.worktree_stale is False
 
 
+class TestWorktreeStaleBareBranchGuard:
+    """worktree_stale additionally requires POSITIVE evidence that the branch
+    carries its own task work (task 3947).
+
+    `last_commit_at` is the branch TIP timestamp. For a bare branch (created
+    from `base_branch`, zero own commits) that tip IS the base-branch commit,
+    so its age describes `main`, not this worktree. In a low-traffic repo an
+    old `main` tip would make a just-created worktree look instantly stale.
+    Only `git rev-list --count <base>..<branch> > 0` proves the age belongs
+    to this task's own work.
+    """
+
+    _NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=UTC)
+
+    def _side_effect(
+        self,
+        *,
+        worktree_stdout: str,
+        log_rc: int = 0,
+        log_stdout: str = '',
+        revlist_stdout: str = '3',
+        revlist_rc: int = 0,
+        revlist_raises: bool = False,
+    ):
+        """Same three-way dispatch as TestWorktreeStaleSignal, plus a `calls`
+        counter dict (mutated in place, key `'rev_list'`) recording each
+        rev-list invocation -- used to pin the memoization/deferred-call
+        invariants below. Returns `(side_effect, calls)`.
+        """
+        calls = {'rev_list': 0}
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=worktree_stdout, stderr='',
+                )
+            if 'rev-list' in args:
+                calls['rev_list'] += 1
+                if revlist_raises:
+                    raise subprocess.TimeoutExpired(cmd=args, timeout=10)
+                return subprocess.CompletedProcess(
+                    args=args, returncode=revlist_rc, stdout=revlist_stdout, stderr='',
+                )
+            # git log call
+            return subprocess.CompletedProcess(
+                args=args, returncode=log_rc, stdout=log_stdout, stderr='',
+            )
+        return side_effect, calls
+
+    def test_bare_branch_not_stale(self, tmp_path):
+        """A branch with zero own commits: the ancient tip is the base commit,
+        not task work -- worktree_stale stays False even at a 30-day-old tip."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts, revlist_stdout='0', revlist_rc=0,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+
+    def test_branch_with_own_commits_is_stale(self, tmp_path):
+        """A branch with own commits beyond base_branch: the old tip is genuine
+        task-work evidence -- worktree_stale fires."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts, revlist_stdout='3', revlist_rc=0,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is True
+
+    @pytest.mark.parametrize(
+        'revlist_rc, revlist_stdout, revlist_raises',
+        [
+            (1, '', False),  # rev-list error
+            (0, 'not-a-number', False),  # unparseable
+            (0, '', True),  # subprocess.TimeoutExpired
+        ],
+    )
+    def test_unknown_own_commit_count_fails_safe(
+        self, tmp_path, revlist_rc, revlist_stdout, revlist_raises
+    ):
+        """An unknown own-commit count (`_branch_own_commit_count` returns
+        None) is never positive evidence of staleness."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+            revlist_rc=revlist_rc, revlist_stdout=revlist_stdout,
+            revlist_raises=revlist_raises,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+
+    def test_at_most_one_revlist_call(self, tmp_path):
+        """The own-commit-count confirmation is memoized: at most one rev-list
+        subprocess call per detect_live_workflow invocation, guarding against
+        the memo being dropped and a second subprocess call being added to
+        the recon fan-out path."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, calls = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts, revlist_stdout='3', revlist_rc=0,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert calls['rev_list'] == 1
+
+    def test_revlist_skipped_when_threshold_disabled(self, tmp_path):
+        """The rev-list confirmation is deferred behind the cheap age test: with
+        max_worktree_age_hours=None disabling the check outright, rev-list is
+        never consulted at all -- even with a registered worktree and a
+        30-day tip that would otherwise be a stale candidate.
+
+        (Contrast: a FRESH 1-hour tip still triggers a rev-list call today,
+        via the pre-existing branch_bare short-circuit at lines 402-406 --
+        that call predates this task and is not exercised by this test.)
+        """
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, calls = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts, revlist_stdout='3', revlist_rc=0,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, max_worktree_age_hours=None,
+            )
+
+        assert result.worktree_stale is False
+        assert calls['rev_list'] == 0
+
+    def test_branch_bare_rule_unaffected_by_new_revlist_call(self, tmp_path):
+        """A registered LIVE worktree pins branch_bare False via the
+        pre-existing short-circuit (lines 402-403) regardless of what the new
+        worktree_stale rev-list confirmation finds -- _orchestrator_signal_
+        ineligible's rule 4 (which requires `not worktree_registered`) stays
+        inert, so the orchestrator_live signal is reported honestly."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect, _calls = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts, revlist_stdout='0', revlist_rc=0,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+
+
 # ---------------------------------------------------------------------------
 # Corroboration helpers (task 2963)
 # ---------------------------------------------------------------------------
