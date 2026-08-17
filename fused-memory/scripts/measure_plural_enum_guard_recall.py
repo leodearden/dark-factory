@@ -46,6 +46,10 @@ Regenerate:
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
+import json
+import logging
 import re
 import sys
 from collections.abc import Awaitable, Callable, Iterable, Sequence
@@ -78,6 +82,14 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (  # no
 _LEXICAL_PRECONDITION_RE: re.Pattern[str] = re.compile(
     r'\btasks\b\s*#?\s*\d', re.IGNORECASE,
 )
+
+logger = logging.getLogger('measure_plural_enum_guard_recall')
+
+# plans/ lives two levels above scripts/ — same derivation
+# census_memory_metadata.py uses for its committed artifact paths.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_JSON_OUT = str(_REPO_ROOT / 'plans' / 'plural-enum-guard-recall-report.json')
+DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'plural-enum-guard-recall-report.md')
 
 
 @dataclass(frozen=True)
@@ -464,3 +476,323 @@ async def enumerate_valid_edge_facts(
         skip += len(rows)
 
     return facts, True
+
+
+# ---------------------------------------------------------------------------
+# Report assembly
+# ---------------------------------------------------------------------------
+
+SCHEMA_VERSION = 1
+
+DEFAULT_PROJECT_IDS: tuple[str, ...] = (
+    'dark_factory', 'reify', 'solar_challenge_platform',
+)
+DEFAULT_MAX_SAMPLES = 20
+
+# The test that mechanically re-validates both candidates against the full
+# pinned precision parametrization. Named in the report so a reader can go
+# check the corroboration rather than take the verdict on faith. The script
+# deliberately does NOT import it: the shipped probe must not depend on a
+# test module.
+REVALIDATION_TEST = (
+    'tests/test_measure_plural_enum_guard_recall.py'
+    '::test_candidate_b_recovers_every_preamble_but_re_opens_an_over_selection'
+)
+
+_VERDICT_ZERO_MATCHES = (
+    'DO NOT TIGHTEN. No fact in any enumerated project graph matches '
+    'PLURAL_ENUM_SNAPSHOT_RE, so _enumeration_is_prepositional_complement '
+    'rejects nothing and its recall cost on this corpus is exactly zero '
+    'edges. A tightening can only change an outcome on a fact the regex '
+    'already matched; with none, both candidates have provably zero '
+    'measured benefit against nonzero unrecoverable over-selection risk.'
+)
+_VERDICT_PROVISIONAL = (
+    'PROVISIONAL — the corpus now contains facts that reach the guard, so '
+    'the zero-benefit argument no longer applies unexamined. Read the '
+    'triage breakdown below: rejections labelled adverbial_preamble are '
+    'genuine recall loss and are what a tightening would be for. No verdict '
+    'is asserted here; re-decide against these numbers.'
+)
+
+
+@dataclass(frozen=True)
+class ProjectReport:
+    """One project graph's measurement."""
+
+    project_id: str
+    valid_edges: int
+    complete: bool
+    scan: ScanResult
+    triage: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Report:
+    """The whole measurement, as committed to plans/."""
+
+    schema_version: int
+    measured_at: str
+    page_size: int
+    projects: list[ProjectReport]
+    totals: ScanResult
+    total_valid_edges: int
+    triage_totals: dict[str, int]
+    candidates: list[CandidateResult]
+    verdict: str
+    complete: bool
+    max_samples: int
+    revalidation_test: str = REVALIDATION_TEST
+
+
+def exit_code(report: Report) -> int:
+    """0 only for a COMPLETE measurement.
+
+    Fail-closed, copied from census_memory_metadata.py's rule: the artifact
+    still lands — the evidence of the shortfall is IN it — but the exit code
+    refuses to call an under-enumerated measurement a successful one.
+    """
+    return 0 if report.complete else 1
+
+
+def _sum_scans(scans: Iterable[ScanResult]) -> ScanResult:
+    """Totals derived FROM the per-project rows, never computed separately."""
+    totals = ScanResult()
+    for scan in scans:
+        totals = ScanResult(
+            facts_scanned=totals.facts_scanned + scan.facts_scanned,
+            lexical_precondition=(
+                totals.lexical_precondition + scan.lexical_precondition
+            ),
+            regex_matched=totals.regex_matched + scan.regex_matched,
+            guard_rejected=totals.guard_rejected + scan.guard_rejected,
+            selected=totals.selected + scan.selected,
+            rejections=[*totals.rejections, *scan.rejections],
+        )
+    return totals
+
+
+def _triage_counts(scan: ScanResult) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for rejection in scan.rejections:
+        label = triage_rejection(rejection.fact, rejection.match_start)
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+async def run(args: Any, *, edge_source: Any) -> Report:
+    """Measure every requested project through the injected *edge_source*.
+
+    ``edge_source(project_id, *, page_size) -> (facts_by_uuid, complete)`` is
+    the only corpus access, mirroring cleanup_count_snapshots.run(args, *,
+    memory): every test drives a fake through it, so the whole aggregation
+    band is checkable with no live backend.
+    """
+    projects: list[ProjectReport] = []
+    for project_id in args.project_id:
+        logger.info('enumerating project=%s', project_id)
+        facts_by_uuid, complete = await edge_source(
+            project_id, page_size=args.page_size,
+        )
+        scan = scan_corpus(facts_by_uuid.values())
+        projects.append(ProjectReport(
+            project_id=project_id,
+            valid_edges=len(facts_by_uuid),
+            complete=complete,
+            scan=scan,
+            triage=_triage_counts(scan),
+        ))
+        logger.info(
+            'project=%s edges=%d matched=%d rejected=%d selected=%d complete=%s',
+            project_id, len(facts_by_uuid), scan.regex_matched,
+            scan.guard_rejected, scan.selected, complete,
+        )
+
+    totals = _sum_scans(p.scan for p in projects)
+    triage_totals: dict[str, int] = {}
+    for project in projects:
+        for label, count in project.triage.items():
+            triage_totals[label] = triage_totals.get(label, 0) + count
+
+    # The candidates are simulated over the LIVE facts that actually reached
+    # the guard. With zero such facts this is empty — which is precisely the
+    # measurement: a tightening has nothing to act on.
+    live_facts = [r.fact for r in totals.rejections]
+    candidates = [
+        simulate_candidate(name, live_facts) for name in CANDIDATE_NAMES
+    ]
+
+    return Report(
+        schema_version=SCHEMA_VERSION,
+        measured_at=args.measured_at,
+        page_size=args.page_size,
+        projects=projects,
+        totals=totals,
+        total_valid_edges=sum(p.valid_edges for p in projects),
+        triage_totals=triage_totals,
+        candidates=candidates,
+        verdict=(
+            _VERDICT_ZERO_MATCHES if totals.regex_matched == 0
+            else _VERDICT_PROVISIONAL
+        ),
+        complete=all(p.complete for p in projects),
+        max_samples=args.max_samples,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI / main
+# ---------------------------------------------------------------------------
+
+class _AppendReplacingDefault(argparse.Action):
+    """``append`` that DISCARDS the default list on first use.
+
+    Plain ``action='append'`` with a list default extends it, so a single
+    ``--project-id reify`` would silently measure dark_factory too.
+    (Same shape as census_memory_metadata.py.)
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        current = getattr(namespace, self.dest, None)
+        if current is self.default or current is None:
+            current = []
+            setattr(namespace, self.dest, current)
+        current.append(values)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        '--project-id', dest='project_id', action=_AppendReplacingDefault,
+        default=list(DEFAULT_PROJECT_IDS),
+        help=(
+            'Project graph to measure; repeatable. '
+            f'Default: {" ".join(DEFAULT_PROJECT_IDS)}'
+        ),
+    )
+    parser.add_argument(
+        '--page-size', dest='page_size', type=int, default=DEFAULT_PAGE_SIZE,
+        help=(
+            f'SKIP/LIMIT page size (default: {DEFAULT_PAGE_SIZE}). Keep it '
+            f"well under FalkorDB's RESULTSET_SIZE (10000) — see "
+            f'enumerate_valid_edge_facts.'
+        ),
+    )
+    parser.add_argument(
+        '--max-samples', dest='max_samples', type=int,
+        default=DEFAULT_MAX_SAMPLES,
+        help=f'Max rejection samples per project in the MARKDOWN report '
+             f'(default: {DEFAULT_MAX_SAMPLES}). The JSON is never truncated.',
+    )
+    parser.add_argument(
+        '--json-out', dest='json_out', default=DEFAULT_JSON_OUT,
+        help=f'JSON artifact path (default: {DEFAULT_JSON_OUT})',
+    )
+    parser.add_argument(
+        '--md-out', dest='md_out', default=DEFAULT_MD_OUT,
+        help=f'Markdown artifact path (default: {DEFAULT_MD_OUT})',
+    )
+    parser.add_argument(
+        '--config', dest='config', default=None,
+        help='Optional CONFIG_PATH override for the live backend.',
+    )
+    parser.add_argument(
+        '--measured-at', dest='measured_at', default=None,
+        help=(
+            'Timestamp recorded in the artifacts. Injected rather than read '
+            'inside the renderers so rendering is deterministic and two '
+            'identical runs diff cleanly.'
+        ),
+    )
+    return parser
+
+
+def _build_live_edge_source(config: Any) -> Any:
+    """Read-only edge source over the live Graphiti graphs.
+
+    Deliberately NOT ``MemoryService(config)`` + ``initialize()``: that path
+    unconditionally runs the W6-epsilon startup identity scan and therefore
+    WRITES. A probe must not mutate the corpus it measures. Constructing
+    ``GraphitiBackend`` directly with ``skip_maintenance=True`` and going
+    straight to ``ro_query`` is the read-only idiom migrate_cross_graph_leak.py
+    and invalidate_fabricated_shipping_edges.py already established.
+    """
+    from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
+
+    backend = GraphitiBackend(config)
+    initialized = False
+
+    async def edge_source(project_id: str, *, page_size: int):
+        nonlocal initialized
+        if not initialized:
+            await backend.initialize(skip_maintenance=True)
+            initialized = True
+        graph = backend._graph_for(project_id)  # noqa: SLF001
+
+        async def query_fn(cypher: str):
+            result = await graph.ro_query(cypher)
+            return result.result_set or []
+
+        return await enumerate_valid_edge_facts(query_fn, page_size=page_size)
+
+    edge_source.backend = backend  # type: ignore[attr-defined]
+    return edge_source
+
+
+def _write_artifacts(report: Report, json_out: str, md_out: str) -> None:
+    json_path = Path(json_out)
+    md_path = Path(md_out)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(render_json(report))
+    md_path.write_text(render_markdown(report))
+
+
+async def _main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+    args = _build_parser().parse_args(argv)
+
+    import os  # noqa: PLC0415
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+    if not args.measured_at:
+        # Stamped ONCE here, at the CLI edge, and threaded through as data —
+        # never read from the clock inside a renderer.
+        args.measured_at = datetime.now(UTC).isoformat()
+
+    edge_source = _build_live_edge_source(FusedMemoryConfig())
+    try:
+        report = await run(args, edge_source=edge_source)
+        _write_artifacts(report, args.json_out, args.md_out)
+        logger.info(
+            'measured edges=%d matched=%d rejected=%d complete=%s json=%s md=%s',
+            report.total_valid_edges, report.totals.regex_matched,
+            report.totals.guard_rejected, report.complete,
+            args.json_out, args.md_out,
+        )
+        if not report.complete:
+            for project in report.projects:
+                if not project.complete:
+                    logger.error(
+                        'COVERAGE SHORTFALL: project=%s enumeration incomplete',
+                        project.project_id,
+                    )
+        return exit_code(report)
+    finally:
+        close = getattr(edge_source.backend, 'close', None)
+        if close is not None:
+            await close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    return asyncio.run(_main(argv))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
