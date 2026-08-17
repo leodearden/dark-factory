@@ -1327,27 +1327,17 @@ class TestRegistryCoverageGauge:
         # still pinned by identity.
         assert _mod.topic_registry_loader() is cached.load_topic_registry
 
-    def test_the_probe_is_not_loaded_at_import_time(self):
-        # The load must be reachable from load_registry_or_error's try block,
-        # which is only true if it has not already happened at import.
-        import ast
-        import inspect
-
-        src = inspect.getsource(_mod.topic_registry_loader)
-        assert '_load_probe_module()' in src
-        assert _mod.__file__ is not None
-        module_src = Path(_mod.__file__).read_text(encoding='utf-8')
-        tree = ast.parse(module_src)
-        top_level_calls = [
-            node
-            for stmt in tree.body
-            if not isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
-            for node in ast.walk(stmt)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == '_load_probe_module'
-        ]
-        assert top_level_calls == []
+    # DELIBERATELY NOT TESTED HERE (review of 2026-08-16): that the probe is
+    # not loaded AT IMPORT TIME, via `inspect.getsource` +
+    # `'_load_probe_module()' in src` and an AST sweep for top-level call
+    # nodes.  That test made a RUNTIME claim its own body never observed at
+    # runtime: a correct lazy rewrite reaching the helper through an alias or
+    # attribute failed it, while an eager load reached via `getattr` passed
+    # it.  The property that actually matters -- an unloadable probe degrades
+    # to `registry_error` instead of killing the census import -- is asserted
+    # behaviourally by the test directly below, and the loader's lazy binding
+    # and reuse are pinned by identity in the test directly above.  Do not
+    # reinstate this as a tightened regex or AST pin.
 
     def test_an_unloadable_probe_is_DISCLOSED_not_fatal(self, monkeypatch):
         # The registry gauge is one optional block. A probe that cannot be

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import os
-import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -402,20 +402,16 @@ def test_service_documents_where_the_normative_contract_lives():
     assert any(d.endswith('/memory-metadata-vocabulary.md') for d in docs), docs
 
 
-def test_no_cadence_knob_was_added_to_the_orchestrator_config():
-    """Guards the design decision the whole §12 family shares: the cadence is
-    the .timer's OnCalendar, NOT a dark-factory-orchestrator.yaml key. A knob
-    there would be misplaced (the orchestrator process is not what is being
-    scheduled) and would cost a fleet redeploy to change."""
-    config = REPO_ROOT / 'dark-factory-orchestrator.yaml'
-    if not config.is_file():
-        return
-    text = config.read_text()
-    for token in ('coverage_census', 'coverage-census', 'census_memory_metadata',
-                  'retro_stamp_topics'):
-        assert token not in text, (
-            f'{token!r} found in {config} — the cadence belongs in the .timer '
-            f'unit, not in orchestrator config')
+# DELIBERATELY NOT TESTED HERE (review of 2026-08-16): that no cadence knob
+# was added to `dark-factory-orchestrator.yaml`.  That test grepped another
+# file's raw TEXT for four tokens, which is not a behaviour this code can
+# regress on -- and worse, it opened with a bare `if not config.is_file():
+# return`, so any checkout layout that lacks the file (a worktree, a
+# differently-rooted run) reported it as a PASSING guard while it inspected
+# nothing.  A guard that cannot distinguish "verified" from "never looked" is
+# worse than no guard.  The design decision it meant to protect -- the cadence
+# lives in the .timer's `OnCalendar`, not in orchestrator config -- is asserted
+# directly and positively by the OnCalendar tests in this file.
 
 
 # ── the committed wrapper ───────────────────────────────────────────────────
@@ -458,8 +454,13 @@ sys.exit(int(os.environ.get(f"FAKE_EXIT_{who}", "0")))
 _SERVICE_ENV_KEYS = ('CONFIG_PATH', 'PROJECT_ROOT', 'FALKORDB_URI')
 
 
+def _git_argv_path(tmp_path):
+    """Where the recording `git` shim appends one JSON argv list per call."""
+    return tmp_path / 'git_argv.jsonl'
+
+
 def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
-                     default_prefix=False):
+                     default_prefix=False, record_git=False):
     """Point both wrapper seams at fake recorders. Returns (env, state_path).
 
     With `default_prefix=True` the two `*_CMD` seams are left UNSET instead, so
@@ -488,6 +489,27 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
         )
         shim.chmod(0o755)
     (bin_dir / 'recorder.py').write_text(_FAKE_RECORDER_SRC)
+
+    if record_git:
+        # A `git` shim that RECORDS the real argv and then delegates to the
+        # real binary, so the wrapper's git behaviour is unchanged and the
+        # commit half still genuinely commits. The real git is resolved
+        # ABSOLUTELY here -- while bin_dir is not yet on PATH -- so the shim
+        # can never re-enter itself.
+        real_git = shutil.which('git')
+        assert real_git, 'no real git on PATH to delegate to'
+        git_log = _git_argv_path(tmp_path)
+        git_log.write_text('')
+        shim = bin_dir / 'git'
+        shim.write_text(
+            '#!/usr/bin/env bash\n'
+            f'{sys.executable} -c '
+            '\'import json,sys; open(sys.argv[1],"a").write('
+            'json.dumps(sys.argv[2:])+"\\n")\' '
+            f'{git_log} "$@"\n'
+            f'exec {real_git} "$@"\n'
+        )
+        shim.chmod(0o755)
 
     repo = tmp_path / 'fake-repo'
     (repo / 'fused-memory' / 'scripts').mkdir(parents=True, exist_ok=True)
@@ -871,126 +893,117 @@ def test_wrapper_narrates_the_commit_outcome_alongside_the_other_two(tmp_path):
     assert 'commit=0' in combined, combined
 
 
-# Forbidden git shapes, matched on the SUBCOMMAND after normalising away any
-# number of `-C <dir>` options -- because EVERY git call in this wrapper is
-# spelled `git -C "$REPO" <verb>`. The guard this replaces scanned for bare
-# literals (`'git stash'`, `'git add -A'`, ...), so a real violation written in
-# the file's own idiom contained none of them and most of the pattern set was
-# unreachable: the scan passed regardless of what the wrapper did.
+
+# The forbidden-git-verb guard, asserted on the argv the wrapper ACTUALLY
+# invokes.
 #
-# Each entry pairs a pattern with synthetic violations, in the wrapper's own
-# idiom, that it MUST match. Those synthetics are the load-bearing half -- a
-# guard whose reachability is never exercised is what produced the finding, so
-# reachability is now itself a test (see the self-check below).
-_FORBIDDEN_GIT_PATTERNS = (
-    (
-        # `git stash` is banned in EVERY dark-factory checkout: refs/stash is a
-        # SINGLE ref shared by every worktree and the merge worker's advance
-        # path also consumes it (incident 13674d3c68). reset/checkout/clean in
-        # the machine-operated main checkout would likewise act on -- and
-        # destroy -- another process's state.
-        r'\bgit\b(?:\s+-C\s+\S+)*\s+(?:stash|reset|checkout|clean)\b',
-        (
-            'git stash',
-            'git -C "$REPO" stash',
-            'git -C "$REPO" reset --hard',
-            'git -C "$REPO" checkout main',
-            'git -C "$REPO" clean -fd',
-        ),
-    ),
-    (
-        # Wholesale staging sweeps a concurrent process's WIP into our commit.
-        r'\bgit\b(?:\s+-C\s+\S+)*\s+add\s+(?:-A|--all|\.)(?:\s|$)',
-        (
-            'git add -A',
-            'git add .',
-            'git -C "$REPO" add -A',
-            'git -C "$REPO" add --all',
-            'git -C "$REPO" add . && echo done',
-        ),
-    ),
-    (
-        # `commit -a`/`--all` is the un-scoped commit that `--only` exists to
-        # avoid; it stages every tracked modification, ours or not.
-        r'\bgit\b(?:\s+-C\s+\S+)*\s+commit\b[^\n]*\s(?:-a|--all)\b',
-        (
-            'git commit -a -m x',
-            'git -C "$REPO" commit -a -m x',
-            'git -C "$REPO" commit --all -m x',
-        ),
-    ),
-)
-
-# The wrapper's own legitimate git calls. None may match any pattern above --
-# notably the scoped `git -C "$REPO" add -- "${ARTIFACTS[@]}"`, whose `--` is
-# neither `-A`, `--all` nor `.`.
-_LEGITIMATE_GIT_CALLS = (
-    'git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1',
-    'git -C "$REPO" status --porcelain -- "${ARTIFACTS[@]}" 2>/dev/null',
-    'git -C "$REPO" commit --only "${ARTIFACTS[@]}" -m "$commit_msg"',
-    'git -C "$REPO" add -- "${ARTIFACTS[@]}"',
-)
+# HISTORY, so this is not re-litigated in either direction. The original guard
+# scanned the wrapper's raw TEXT for bare literals ('git stash', 'git add -A',
+# ...), but every git call here is spelled `git -C "$REPO" <verb>`, so 5 of 6
+# violations written in the file's own idiom were invisible and the scan passed
+# regardless of what the wrapper did. The review of 2026-08-16 then flagged the
+# hardened regex successor as a lint-rule-dressed-as-a-test: it stripped
+# comments with an admittedly unsound `\s#` split, carried an anti-vacuity
+# floor (`code.count('git ') >= 5`) that broke on benign refactors, and needed a
+# second test just to prove its own patterns could fire against literals defined
+# in this same file -- green by construction, and touching zero production code.
+#
+# Both problems are the same problem: a TEXT scan cannot tell code from prose.
+# Recording argv cannot be fooled by either, and needs no comment stripping, no
+# regex over source, and no hand-maintained copy of the wrapper's legitimate
+# calls. Every one of the wrapper's five git call sites (rev-parse, status
+# --porcelain, commit --only, the scoped `add --`, and the commit retry) is
+# reached by the scenarios below, so this observes the whole git surface.
+_FORBIDDEN_GIT_SUBCOMMANDS = frozenset({'stash', 'reset', 'checkout', 'clean'})
 
 
-def _wrapper_code() -> str:
-    r"""The wrapper's EXECUTABLE lines, with comments stripped.
+def _forbidden_reason(argv):
+    """The offending shape in one recorded git argv, or None.
 
-    BOTH full-line and TRAILING comments, and trailing matters in both
-    directions. The header documents precisely which verbs are forbidden and
-    why, so a check that could not tell prose from code would forbid the wrapper
-    from explaining itself -- but leaving trailing comments in lets a `# never
-    git stash here` note appended to a real command FALSE-POSITIVE the scan.
-
-    KNOWN LIMIT of `\s#`: a `#` preceded by whitespace INSIDE a double-quoted
-    string would truncate that line early. No such string exists in this wrapper
-    today (verified: no non-comment line matches `\s#` at all, so the trailing
-    strip is currently a no-op), and the anti-vacuity guard in the scan below
-    fails loudly if one is ever introduced and takes the scan body with it.
+    Operates on the ARGV LIST, so `-C <dir>` is skipped structurally rather
+    than normalised away with a regex, and an option value can never be
+    mistaken for a subcommand.
     """
-    return '\n'.join(
-        re.split(r'\s#', line, maxsplit=1)[0]
-        for line in WRAPPER.read_text().splitlines()
-        if not line.lstrip().startswith('#')
-    )
+    rest = list(argv)
+    while rest[:1] == ['-C'] and len(rest) >= 2:
+        rest = rest[2:]
+    if not rest:
+        return None
+    sub, opts = rest[0], rest[1:]
+    if sub in _FORBIDDEN_GIT_SUBCOMMANDS:
+        return f'`git {sub}` is forbidden in a machine-operated checkout'
+    if sub == 'add' and any(o in ('-A', '--all', '.') for o in opts):
+        return 'wholesale `git add` sweeps a concurrent process WIP into our commit'
+    if sub == 'commit' and any(o in ('-a', '--all') for o in opts):
+        return '`git commit -a` stages every tracked modification, ours or not'
+    return None
 
 
-def test_the_forbidden_git_patterns_can_actually_fire():
-    """The guard below is only worth its name if its patterns CAN match.
+def test_the_forbidden_reason_helper_actually_fires():
+    """The guard is only worth its name if it can fire on the wrapper's idiom.
 
-    This is the finding restated as a test: the previous guard's literals could
-    never fire against this wrapper's `git -C "$REPO" <verb>` idiom, so it was
-    green by construction. Every pattern must match a violation written the way
-    this file writes git, and none may match the wrapper's legitimate calls.
+    Unlike the self-referential predecessor this replaces, the synthetic
+    violations here are fed through the SAME `_forbidden_reason` the real test
+    applies to recorded argv -- so this pins the detector, and the test below
+    supplies the subject.
     """
-    for pattern, synthetics in _FORBIDDEN_GIT_PATTERNS:
-        for synthetic in synthetics:
-            assert re.search(pattern, synthetic), (
-                f'{pattern!r} does not match its own synthetic violation '
-                f'{synthetic!r} — the guard cannot fire')
-        for legitimate in _LEGITIMATE_GIT_CALLS:
-            assert not re.search(pattern, legitimate), (
-                f'{pattern!r} false-positives on the wrapper\'s legitimate '
-                f'{legitimate!r}')
+    for argv in (
+        ['stash'], ['-C', '/repo', 'stash'], ['-C', '/repo', 'reset', '--hard'],
+        ['-C', '/repo', 'checkout', 'main'], ['-C', '/repo', 'clean', '-fd'],
+        ['add', '-A'], ['-C', '/repo', 'add', '--all'], ['-C', '/repo', 'add', '.'],
+        ['commit', '-a', '-m', 'x'], ['-C', '/repo', 'commit', '--all', '-m', 'x'],
+    ):
+        assert _forbidden_reason(argv), f'{argv!r} must be caught'
+    # And the wrapper's real calls must never trip it -- notably the scoped
+    # `add --`, whose `--` is neither -A, --all nor `.`.
+    for argv in (
+        ['-C', '/repo', 'rev-parse', '--git-dir'],
+        ['-C', '/repo', 'status', '--porcelain', '--', 'a.json'],
+        ['-C', '/repo', 'commit', '--only', 'a.json', '-m', 'msg'],
+        ['-C', '/repo', 'add', '--', 'a.json'],
+    ):
+        assert _forbidden_reason(argv) is None, f'{argv!r} false-positived'
 
 
-def test_wrapper_never_reaches_for_the_forbidden_git_verbs():
-    """The guard on CLAUDE.md's hardest prohibition, applied to a script that
-    commits UNATTENDED into the machine-operated project_root checkout."""
-    code = _wrapper_code()
+def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
+    """CLAUDE.md's hardest prohibition, on a script that commits UNATTENDED
+    into the machine-operated project_root checkout.
 
-    # ANTI-VACUITY. An empty or over-trimmed scan body satisfies every
-    # "does not match" assertion below, so the guard would pass while checking
-    # nothing. Measured floor: 6 `git ` and 5 `git -C` invocations survive today.
-    assert code.count('git ') >= 5, (
-        f'only {code.count("git ")} `git ` invocations survived comment '
-        f'stripping — the scan body was over-trimmed and would pass vacuously')
-    assert 'commit --only' in code, (
-        'the scoped-commit form is the whole point; a bare `git commit` would '
-        'sweep up a concurrent process staged work')
+    `git stash` is the sharpest of these: refs/stash is a SINGLE ref shared by
+    every worktree, and the merge worker's advance path also consumes it
+    (incident 13674d3c68), so a stash here can be popped out from under an
+    unrelated process.
+    """
+    seen = []
+    for label, kwargs in (
+        ('already-tracked artifacts', {}),
+        ('first-ever run, untracked (exercises the add-- retry)', {'tracked': False}),
+        ('a quiet night with no drift', {'dirty': False}),
+    ):
+        repo = _git_repo_harness(tmp_path / label.split()[0], **kwargs)
+        env, _ = _wrapper_harness(tmp_path, record_git=True)
+        env['REPO'] = str(repo)
+        result = subprocess.run(
+            ['bash', str(WRAPPER)], env=env,
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, f'{label}: {result.stderr!r}'
+        recorded = [
+            json.loads(line)
+            for line in _git_argv_path(tmp_path).read_text().splitlines() if line
+        ]
+        # ANTI-VACUITY, asserted as OBSERVED BEHAVIOUR rather than as a text
+        # shape: if the shim recorded nothing the wrapper never reached git and
+        # every "no forbidden verb" assertion below would hold vacuously.
+        assert recorded, f'{label}: the wrapper invoked git zero times'
+        seen.extend(recorded)
+        for argv in recorded:
+            reason = _forbidden_reason(argv)
+            assert reason is None, f'{label}: `git {" ".join(argv)}` — {reason}'
 
-    for pattern, _ in _FORBIDDEN_GIT_PATTERNS:
-        found = re.search(pattern, code)
-        if found is not None:
-            raise AssertionError(
-                f'{found.group(0)!r} must never appear in a wrapper that runs '
-                f'unattended against the machine-operated main checkout')
+    # The scoped-commit form is the whole point, and the retry path really was
+    # reached -- so the clean run above is evidence about the git surface that
+    # matters, not about a wrapper that quietly did nothing.
+    flat = [' '.join(a) for a in seen]
+    assert any('commit --only' in c for c in flat), flat
+    assert any(' add -- ' in f'{c} ' for c in flat), flat
