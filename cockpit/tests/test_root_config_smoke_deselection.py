@@ -102,6 +102,23 @@ def _deselection_problems(result: subprocess.CompletedProcess[str]) -> list[str]
     return problems
 
 
+def _collection_problems(result: subprocess.CompletedProcess[str]) -> list[str]:
+    """Every reason `result` fails to prove the smoke tests EXIST and are collectible."""
+    combined = result.stdout + result.stderr
+    problems = []
+    if result.returncode != pytest.ExitCode.OK:
+        problems.append(
+            f'expected exit code {int(pytest.ExitCode.OK)} (OK), got '
+            f'{result.returncode} -- collection did not complete cleanly'
+        )
+    if SMOKE_TEST_NAME not in combined:
+        problems.append(
+            f'{SMOKE_TEST_NAME!r} was not collected even with the root addopts marker '
+            f'filter removed -- the smoke tests are MISSING, not merely deselected'
+        )
+    return problems
+
+
 def test_repo_root_pytest_config_deselects_smoke_and_registers_marker() -> None:
     result = _collect_only()
     problems = _deselection_problems(result)
@@ -177,4 +194,30 @@ def test_positive_control_guard_rejects_a_run_that_collected_nothing() -> None:
     )
     assert any(SMOKE_TEST_NAME in p for p in problems), (
         f'expected a problem naming the missing smoke test, got: {problems}'
+    )
+
+
+def test_smoke_tests_are_collectible_when_root_addopts_is_overridden() -> None:
+    """POSITIVE CONTROL for the deselection guard above.
+
+    The sibling guard proves the smoke tests are absent from a default
+    root-config collection -- but that alone is also satisfied by tests
+    that do not exist. Overriding `addopts` drops the root
+    `-m 'not smoke and not integration and not warm_lane_bash'` filter, so
+    the same target under the same config must now collect the tests --
+    which is what distinguishes "deselected" from "never present".
+
+    `-o` splits on the FIRST `=`, so the value keeps its own `=`.
+    `--import-mode=importlib` is re-supplied deliberately (see design
+    decision): the bare `-o addopts=` form also works but silently drops
+    import mode along with the marker filter, running the control under a
+    different collection semantics than every real root-bound run.
+
+    Still non-live: `--collect-only` runs no fixtures, so no Tk window and
+    no tmux session is created even though the tests are now SELECTED.
+    """
+    result = _collect_only('-o', 'addopts=--import-mode=importlib')
+    problems = _collection_problems(result)
+    assert not problems, (
+        '\n'.join(problems) + f'\n\nfull output:\n{result.stdout + result.stderr}'
     )
