@@ -219,7 +219,9 @@ class TestPagedRoQueryHappyPath:
             'WHERE e.invalid_at IS NULL '
             'RETURN n.uuid, e.uuid, e.fact, e.name'
         )
-        assert len(result.result_set) == _LIVE_RESULTSET_CAP
+        rows = result.result_set
+        assert rows is not None  # the fake answered at all
+        assert len(rows) == _LIVE_RESULTSET_CAP
         assert len(graph.corpus) == _LIVE_EDGE_ROWS
 
     @pytest.mark.asyncio
@@ -492,8 +494,10 @@ class TestGetAllValidEdgesPagination:
             'MATCH (n:Entity)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
             'RETURN n.uuid, e.uuid, e.fact, e.name'
         )
-        assert len(result.result_set) == _LIVE_RESULTSET_CAP
-        assert len({r[1] for r in result.result_set}) < _LIVE_DISTINCT_EDGES
+        rows = result.result_set
+        assert rows is not None  # the fake answered at all
+        assert len(rows) == _LIVE_RESULTSET_CAP
+        assert len({r[1] for r in rows}) < _LIVE_DISTINCT_EDGES
 
     @pytest.mark.asyncio
     async def test_all_distinct_edges_are_exposed(
@@ -740,7 +744,9 @@ class TestListEntityNodesPagination:
     async def test_control_unpaginated_read_is_truncated_by_the_cap(self):
         graph = FakeCappedGraph(make_entity_node_corpus())
         result = await graph.ro_query('MATCH (n:Entity) RETURN n.uuid, n.name, n.summary')
-        assert len(result.result_set) == _LIVE_RESULTSET_CAP
+        rows = result.result_set
+        assert rows is not None  # the fake answered at all
+        assert len(rows) == _LIVE_RESULTSET_CAP
         assert len(graph.corpus) == _LIVE_ENTITY_NODES
 
     @pytest.mark.asyncio
