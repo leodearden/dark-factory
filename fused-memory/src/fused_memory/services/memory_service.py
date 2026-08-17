@@ -5006,17 +5006,29 @@ class MemoryService:
         # EFFECTIVE post-patch custom subset is what gets judged; BEFORE
         # `scope` and every _journaled_backend_call below, so a rejection can
         # never leave a journal row or a half-applied patch behind.
-        await _apply_memory_metadata_validation(
-            new_custom,
-            project_id=project_id,
-            agent_id=agent_id,
-            config=self.config.memory_metadata,
-            storm_detector=self._metadata_storm_detector,
-            project_root=self._memory_metadata_project_root(),
-            parent_lookup=self.get_memory_by_id,
-            count_canonical=self.count_memories_by_metadata,
-            find_canonical=self.get_memories_by_metadata,
-        )
+        #
+        # GATED ON A METADATA DELTA EXISTING. A content-only amend leaves the
+        # record's metadata byte-identical, so this write is responsible for
+        # none of it; validating it anyway would be corpus re-validation by
+        # another name. Under `enforce` that would make a legacy record's TEXT
+        # uncorrectable because of unrelated legacy metadata — blocking the
+        # very repair sweeps (sweep_toolcall_xml_leak.py) that exist to fix
+        # those records — and would quietly restate `enforce` from "rejects
+        # WRITES" to "re-validates the corpus", the model task 3626's flip
+        # measurement depends on. It also keeps the seam's cost off the one
+        # arm that already pays for a re-embed.
+        if metadata_patch or metadata_delete_keys:
+            await _apply_memory_metadata_validation(
+                new_custom,
+                project_id=project_id,
+                agent_id=agent_id,
+                config=self.config.memory_metadata,
+                storm_detector=self._metadata_storm_detector,
+                project_root=self._memory_metadata_project_root(),
+                parent_lookup=self.get_memory_by_id,
+                count_canonical=self.count_memories_by_metadata,
+                find_canonical=self.get_memories_by_metadata,
+            )
 
         scope = Scope(project_id=project_id)
 
