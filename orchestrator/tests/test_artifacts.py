@@ -12,9 +12,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from shared import safe_io
 
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
+    ArtifactWriteError,
     TaskArtifacts,
     _normalize_plan,
 )
@@ -2659,3 +2661,143 @@ class TestWriteJsonPreservesMode:
             artifacts.write_plan({'task_id': 'task-1', 'steps': []})
 
         assert excinfo.value.errno == errno.EACCES
+
+
+class TestWriteJsonFollowsSymlinks:
+    """A write through the lane symlink reaches the REAL file, never eats it.
+
+    `ensure_lane_plan_symlink` makes `<worktree>/.task/plan.json` an absolute
+    symlink onto the meta-root plan, and `_artifacts_from_args` still supports
+    the legacy `meta_root=None` shape where `self.root` IS `<worktree>/.task`
+    (mcp_lifecycle's `meta_root` parameter defaults to None) — so
+    `self.root / 'plan.json'` can BE that symlink.
+
+    `Path.write_text` followed the link.  A bare `os.replace` onto the link
+    path would swap the LINK for a regular file, silently re-forking the lane
+    and meta-root copies: the esc-5205-9 stale-plan divergence the symlink
+    exists to make impossible.  So `_write_json` must resolve first — which
+    also puts the temp on the same filesystem as the real file, making the
+    replace an intra-filesystem rename rather than an EXDEV error.
+    """
+
+    @pytest.fixture
+    def lane_and_meta(self, worktree: Path) -> tuple[TaskArtifacts, Path, Path]:
+        """A legacy-mode `TaskArtifacts` whose plan path IS the lane symlink.
+
+        Returns ``(legacy_artifacts, lane_plan, real_plan)``.
+        """
+        worktree.mkdir()
+        meta_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+        meta = TaskArtifacts(worktree, meta_root)
+        meta.init('task-1', 'Test Task', 'Desc')
+        meta.ensure_lane_plan_symlink()
+
+        lane_plan = worktree / '.task' / 'plan.json'
+        assert lane_plan.is_symlink()
+
+        # The legacy view: self.root == <worktree>/.task, so write_plan's
+        # target is the symlink itself.
+        legacy = TaskArtifacts(worktree)
+        assert legacy.root == worktree / '.task'
+        return legacy, lane_plan, meta_root / 'plan.json'
+
+    def test_symlink_survives_and_the_real_file_receives_the_write(
+        self, lane_and_meta
+    ):
+        legacy, lane_plan, real_plan = lane_and_meta
+        link_target_before = os.readlink(lane_plan)
+
+        legacy.write_plan({'task_id': 'task-1', 'title': 'written', 'steps': []})
+
+        assert lane_plan.is_symlink(), 'the lane symlink was replaced by a file'
+        assert os.readlink(lane_plan) == link_target_before
+        assert json.loads(real_plan.read_text())['title'] == 'written'
+        # And the lane path still resolves to the same single source of truth.
+        assert json.loads(lane_plan.read_text())['title'] == 'written'
+
+    def test_the_replace_targets_the_real_file_not_the_link(
+        self, lane_and_meta, monkeypatch
+    ):
+        """The mechanism, not a side effect.
+
+        Resolving first is what keeps the rename intra-filesystem (the lane
+        and the meta root need not share a filesystem) AND what stops the
+        replace from eating the link.  Spying on `os.replace` proves the temp
+        was created beside the RESOLVED file rather than beside the symlink.
+        """
+        legacy, lane_plan, real_plan = lane_and_meta
+        seen: list[tuple[Path, Path]] = []
+        real_replace = safe_io.os.replace
+
+        def spy(src, dst, *args, **kwargs):
+            seen.append((Path(src), Path(dst)))
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(safe_io.os, 'replace', spy)
+
+        legacy.write_plan({'task_id': 'task-1', 'steps': []})
+
+        assert seen, 'no atomic replace was performed at all'
+        src, dst = seen[-1]
+        assert dst == real_plan, (
+            f'the replace targeted {dst} — it must target the resolved file, '
+            'not the lane symlink'
+        )
+        assert src.parent == real_plan.parent, (
+            f'the temp was created in {src.parent}, not beside the real file'
+        )
+
+    def test_no_temp_residue_in_either_directory(self, lane_and_meta):
+        legacy, lane_plan, real_plan = lane_and_meta
+
+        legacy.write_plan({'task_id': 'task-1', 'steps': []})
+
+        assert {p.name for p in lane_plan.parent.iterdir()} == {'plan.json'}
+        assert {p.name for p in real_plan.parent.iterdir()} == {
+            'plan.json', 'metadata.json', 'reviews', 'verdicts',
+        }
+
+    def test_dangling_symlink_fails_loudly_without_materialising_a_file(
+        self, worktree: Path
+    ):
+        """A broken link must NOT quietly become a stray regular file.
+
+        Materialising one at the link path IS the divergence, not a recovery
+        from it: the lane would hold a plan the meta root has never seen.
+        """
+        lane_task = worktree / '.task'
+        lane_task.mkdir(parents=True)
+        lane_plan = lane_task / 'plan.json'
+        missing = worktree.parent / 'gone' / 'plan.json'
+        os.symlink(missing, lane_plan)
+        assert lane_plan.is_symlink() and not lane_plan.exists()
+
+        legacy = TaskArtifacts(worktree)
+        with pytest.raises(ArtifactWriteError) as excinfo:
+            legacy.write_plan({'task_id': 'task-1', 'steps': []})
+
+        message = str(excinfo.value)
+        assert str(lane_plan) in message, 'the ORIGINAL path must be named'
+        assert str(missing) in message, 'the RESOLVED path must be named too'
+        assert lane_plan.is_symlink()
+        assert not lane_plan.exists(), 'a stray regular file was materialised'
+        assert {p.name for p in lane_task.iterdir()} == {'plan.json'}
+
+    def test_an_ordinary_path_with_a_missing_parent_is_still_created(
+        self, artifacts: TaskArtifacts
+    ):
+        """The dangling check must be gated on `is_symlink()`.
+
+        For an ordinary path a missing parent is NOT an error — `mkdir=True`
+        creates it, which is how `reviews/` and `verdicts/` come into being.
+        An unconditional parent check would break artifact creation outright.
+        """
+        import shutil
+        shutil.rmtree(artifacts.root / 'verdicts')
+
+        artifacts.write_verdict('judge', {
+            'role': 'judge', 'schema_version': 1, 'session_id': 's',
+            'emitted_at': 't', 'verdict': {'complete': True},
+        })
+
+        assert artifacts.read_verdict('judge') is not None
