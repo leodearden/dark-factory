@@ -187,7 +187,19 @@ persisted state and needs no running orchestrator.
 
 It is strictly read-only: it opens no debt, files no task, resolves
 nothing and escalates nothing. It will not create a ledger DB for a
-project that has none — it prints `NO LEDGER` and exits 0 instead.
+project that has none, and it will not add the flake tables to a
+`runs.db` that lacks them — it prints `NO LEDGER` / `NO FLAKE TABLES`
+and exits 0 instead.
+
+**Read the header line before the counters.** A report only measures
+anything when the ledger was actually readable. If the header says
+`NO LEDGER`, `NO FLAKE TABLES`, or `LEDGER UNREADABLE` (a corrupt,
+truncated, or locked `runs.db`), every counter below it reads
+`status: not measured` and none of the numbers are a reading — that is
+a broken or absent ledger to go fix, not a clean bill of health. A
+`WARNING: … TRUNCATED` line means the opposite problem: the window held
+more occurrences than one read returns, so the counters cover a partial
+window.
 
 ### Stopping gracefully
 
