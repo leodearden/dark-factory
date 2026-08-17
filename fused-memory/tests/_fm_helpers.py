@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import types
 import uuid
@@ -1346,3 +1347,62 @@ def load_script_module(
         _LOADED_SCRIPT_MODULE_NAMES.discard(name)
         raise
     return module
+
+
+def as_async_run_git(side_effect):
+    """Adapt a `subprocess.run` side_effect to a `shared.git_async.run_git` fake.
+
+    Task 3778 moved the detector's three git probes off blocking
+    `subprocess.run` and onto the async `run_git` helper, which invalidated the
+    `patch('subprocess.run', ...)` seam this suite was built on. Rather than
+    hand-rewrite ~90 canned git responses, every existing side_effect is passed
+    through this one adapter, so the *responses* stay byte-for-byte what they
+    were and only the seam changes.
+
+    It faithfully reproduces `run_git`'s contract, which differs from
+    `subprocess.run`'s in exactly two ways that matter here:
+
+    - stdout/stderr are `.strip()`ed by `run_git` itself, so the adapter strips
+      too (a fake that did not would let a test pass against behaviour the real
+      helper cannot produce).
+    - a TIMEOUT is RETURNED as `timed_out=True` with a non-zero returncode, not
+      raised. `subprocess.run` raises `TimeoutExpired`, so any side_effect that
+      raises it is converted here. Every other exception (notably `OSError`)
+      propagates, because `run_git` propagates it too.
+
+    Accepts the two shapes `unittest.mock` accepts for `side_effect`: a
+    callable, or an exception instance/class to raise.
+    """
+    from shared.git_async import TIMEOUT_RETURNCODE, GitResult
+
+    def _timed_out(timeout) -> GitResult:
+        return GitResult(
+            returncode=TIMEOUT_RETURNCODE,
+            stdout='',
+            stderr=f'timed out after {timeout}s',
+            timed_out=True,
+        )
+
+    async def fake_run_git(cmd, cwd=None, *, input_text=None, timeout=None):
+        # mock's own semantics: a bare exception instance/class means "raise".
+        if isinstance(side_effect, BaseException) or (
+            isinstance(side_effect, type) and issubclass(side_effect, BaseException)
+        ):
+            if isinstance(side_effect, subprocess.TimeoutExpired) or (
+                side_effect is subprocess.TimeoutExpired
+            ):
+                return _timed_out(timeout)
+            raise side_effect
+
+        try:
+            completed = side_effect(list(cmd), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return _timed_out(timeout)
+
+        return GitResult(
+            returncode=completed.returncode,
+            stdout=(completed.stdout or '').strip(),
+            stderr=(completed.stderr or '').strip(),
+        )
+
+    return fake_run_git
