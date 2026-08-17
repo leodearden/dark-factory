@@ -83,6 +83,16 @@ class AuthFailed(InvocationOutcome):
 
     status: int
 
+    # The first <=120 characters of the 401/403 response body (``result.output``,
+    # falling back to ``result.stderr``), stripped; ``''`` when neither carried
+    # text. It exists because the numeric status ALONE cannot distinguish OAuth
+    # *revocation* from *expiry* from an *org-policy block* in the multi-account
+    # rotation — the distinction the task-2134 refactor (b68eea415b) dropped when
+    # it replaced ``_handle_auth_failure(f'HTTP {status}: {output[:120]}')`` with
+    # ``slot.report(outcome)``. Optional-with-a-default on purpose: every existing
+    # bare ``AuthFailed(status=...)`` construction site keeps working.
+    body: str = ''
+
 
 @dataclass(frozen=True)
 class CliLocalError(InvocationOutcome):
