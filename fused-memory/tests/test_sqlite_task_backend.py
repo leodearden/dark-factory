@@ -18,7 +18,6 @@ from shared.task_metadata import SchemaWarning
 
 from fused_memory.backends.sqlite_task_backend import (
     SqliteTaskBackend,
-    _StatusWriteNotPersisted,
     _classify_residual_group,
     _emit_schema_warning,
     _format_task_id,
@@ -27,6 +26,7 @@ from fused_memory.backends.sqlite_task_backend import (
     _parse_qualified_dep,
     _parse_task_id,
     _resolve_metadata_mode,
+    _StatusWriteNotPersisted,
 )
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
