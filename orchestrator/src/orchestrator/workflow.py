@@ -41,6 +41,11 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
+from shared.mcp_post import (
+    MCP_POST_HEADERS,
+    check_mcp_post_response,
+    mcp_endpoint_url,
+)
 from shared.prompt_artifact import PromptArtifactStore, default_artifacts_root
 from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingState
@@ -16713,9 +16718,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return
         try:
             import httpx as httpx_mod
-            async with httpx_mod.AsyncClient() as client:
-                await client.post(
-                    f'{self.mcp.url}/mcp/',
+            async with httpx_mod.AsyncClient(follow_redirects=True) as client:
+                resp = await client.post(
+                    mcp_endpoint_url(self.mcp.url),
+                    headers=MCP_POST_HEADERS,
                     json={
                         'jsonrpc': '2.0',
                         'id': 1,
@@ -16742,6 +16748,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         },
                     },
                     timeout=10,
+                )
+                check_mcp_post_response(
+                    resp, context=f'completion memory write for task {self.task_id}',
                 )
         except Exception as e:
             logger.warning(f'Failed to write completion to memory: {e}')
