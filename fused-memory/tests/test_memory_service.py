@@ -1953,6 +1953,67 @@ class TestUpdateMemoryMetadataArm:
         buffer.push.assert_awaited_once()
 
 
+class TestFastPathPersistsSeamNormalizedValues:
+    """The set_payload fast path must write the VALIDATED value, not the raw patch.
+
+    Task 3523. The vocabulary seam's only in-place mutation is ``supersedes``
+    scalar→list (PRD D2), and it lands in ``new_custom`` — which the
+    ``overwrite_payload`` and content arms persist but the ``set_payload``
+    fast path historically did not, handing Qdrant ``dict(metadata_patch)``
+    raw. Left alone, wiring the seam in would persist a list on two routes
+    and the raw scalar on a third: a NEW split in exactly the semantics
+    ``TestMetadataFastPathEquivalence`` (below) exists to keep from drifting.
+    """
+
+    _SUPERSEDED = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
+
+    @pytest.mark.asyncio
+    async def test_scalar_supersedes_is_persisted_normalized(self, service):
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'supersedes': self._SUPERSEDED},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        payload = service.mem0.set_payload.await_args.args[1]
+        assert payload['supersedes'] == [self._SUPERSEDED], (
+            'the fast path must persist what the seam normalized, or the '
+            'legacy scalar shape survives on this route alone'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_overwrite_arm_persists_the_identical_value(self, service):
+        """The agreement this is really about — one shape, three routes."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'supersedes': self._SUPERSEDED},
+            metadata_mode='replace',
+        )
+
+        service.mem0.overwrite_payload.assert_awaited_once()
+        payload = service.mem0.overwrite_payload.await_args.args[1]
+        assert payload['supersedes'] == [self._SUPERSEDED]
+
+    @pytest.mark.asyncio
+    async def test_the_fast_path_still_writes_only_the_patch_keys(self, service):
+        """Reading the delta for VALUES must not turn this into a rebuild.
+
+        Qdrant merges server-side; that is the whole reason this route can
+        skip a read-modify-write. A payload that also carried the pre-image's
+        `kind` / `src_project` / `category` would be reconstructing the
+        record — costing nothing visible in a mock, but silently re-writing
+        keys the caller never named and clobbering any concurrent edit to
+        them.
+        """
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        payload = service.mem0.set_payload.await_args.args[1]
+        assert payload == {'topic': 'cgl-eta'}
+
+
 class TestMetadataFastPathEquivalence:
     """The two fast paths must agree with ``_apply_metadata_delta``.
 
