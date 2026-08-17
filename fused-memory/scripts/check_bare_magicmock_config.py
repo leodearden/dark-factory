@@ -78,6 +78,68 @@ _CONFIG_EXACT: frozenset[str] = frozenset({'config', 'cfg'})
 _CONFIG_SUFFIXES: tuple[str, ...] = ('_config', '_cfg')
 
 
+class _DataclassShape(NamedTuple):
+    """A dataclass whose *shape* Rule B recognises in unspecced MagicMock kwargs.
+
+    Matching is ANCHOR + OVERLAP, never "kwargs are a subset of fields":
+      - every name in ``anchors`` must appear among the call's literal kwarg names, AND
+      - at least ``min_field_matches`` of ``fields`` must be matched.
+
+    A kwarg that is NOT a field does not exempt the call — it is *additional drift
+    evidence* and gets named in the violation message.  This is load-bearing: all ten
+    sites behind task 3980 passed ``verify_skipped=``, a MergeOutcome field
+    (merge_types.py:945) that VerifyResult does not have, so a subset rule would have
+    missed precisely the defect this rule exists to catch.
+    """
+
+    name: str
+    module: str
+    fields: frozenset[str]
+    anchors: frozenset[str]
+    min_field_matches: int
+    factory: str
+
+
+# Registered shapes.  The field lists are LITERALS, not imports: this script is
+# stdlib-only by hard contract (see module docstring) so hooks/project-checks and
+# all seven package lint_commands can run it under bare ``python3`` with no venv
+# resolution.  ``import orchestrator.verify`` would need pydantic and break every caller.
+#
+# VerifyResult's field list mirrors orchestrator/src/orchestrator/verify.py:3216.
+# Drift is absorbed structurally rather than by keeping this list exhaustive:
+# matching keys on the ``passed`` anchor plus a 2-field overlap floor, so adding,
+# renaming or removing a peripheral field cannot silently disable detection.  Only
+# removing ``passed`` itself could, and that is a VerifyResult refactor that would
+# break the orchestrator far more loudly first.
+_DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
+    _DataclassShape(
+        name='VerifyResult',
+        module='orchestrator.verify',
+        fields=frozenset({
+            'passed',
+            'test_output',
+            'lint_output',
+            'type_output',
+            'summary',
+            'timed_out',
+            'cause_hint',
+            'category',
+            'worktree_log_paths',
+            'archive_log_paths',
+            'contention',
+            'plan',
+            'failing_test_ids',
+            'failing_leg_categories',
+            'trivial',
+            'duration_secs',
+        }),
+        anchors=frozenset({'passed'}),
+        min_field_matches=2,
+        factory='_fake_verify_result',
+    ),
+)
+
+
 def _is_config_name(name: str) -> bool:
     """Return True if *name* identifies a config-named variable."""
     if name in _CONFIG_EXACT:
