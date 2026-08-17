@@ -261,6 +261,20 @@ async def _producer_invoke(
     return result, captured['sid'], captured['src']
 
 
+def _identity(path: Path) -> tuple[bytes, int, int]:
+    """A file's ``(bytes, st_mtime_ns, st_ino)`` — the "was this rewritten?" oracle.
+
+    ``st_ino`` is what makes an unchanged-archive assertion real. ``_archive_one``
+    publishes by ``os.replace``-ing a fresh staging sibling onto the destination,
+    so ANY re-archive necessarily allocates a new inode — whereas bytes alone
+    would compare equal even after a full byte-identical rewrite, and mtime alone
+    is mirrored from the source and so is equal by construction. Used by E6's
+    stale-mtime control and by E3's producer/backstop idempotency row.
+    """
+    st = path.stat()
+    return path.read_bytes(), st.st_mtime_ns, st.st_ino
+
+
 def _archive_files(git_repo: Path) -> set[str]:
     """Every FILE under the archive root, as archive-root-relative posix paths."""
     root = _archive_root(git_repo)
@@ -444,3 +458,50 @@ class TestE6ResumeReArchives:
         # `.gz`, and no `.archive-tmp` staging debris left behind by the
         # os.replace publish.
         assert _archive_files(git_repo) == {f'{TASK_ID}/{ENC}/{sid}.jsonl'}
+
+    async def test_same_second_grow_is_deliberately_skipped(
+        self, monkeypatch, git_repo, git_ops, task_assignment
+    ):
+        """STALE-MTIME CONTROL for the row above — the skip is INTENTIONAL.
+
+        ``_archive_one``'s idempotency test is ``int(dest.st_mtime) ==
+        int(src.st_mtime)``, int-truncated to dodge filesystem mtime
+        granularity. A transcript grown and re-archived inside the same
+        wall-clock second therefore does NOT re-copy, by design. Pinning that
+        here does two things the row above cannot: it stops a future reader
+        "fixing" the truncation into a re-copy-every-time (which would make
+        every teardown backstop run rewrite the whole archive), and it proves
+        the row above's re-archive was caused by the mtime advance rather than
+        by the archiver copying unconditionally.
+
+        The equal-mtime condition is FORCED (the source's mtime is restored to
+        the archived copy's exact value after the append) rather than raced
+        against the clock, so the control is deterministic.
+        """
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = _config(git_repo)
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+
+        original = b'{"n":1}\n{"n":2}\n{"n":3}\n'
+        _result, sid, src = await _producer_invoke(workflow, cwd, payload=original)
+        archived = _archived(git_repo, sid)
+        before = _identity(archived)
+
+        with src.open('ab') as fh:
+            fh.write(b'{"n":4}\n')
+        st = archived.stat()
+        os.utime(src, (st.st_atime, st.st_mtime))
+        assert int(src.stat().st_mtime) == int(archived.stat().st_mtime)
+
+        workflow._pending_resume_session_id = sid
+        workflow._pending_resume_role = SIMPLE_TASK.name
+        await _producer_invoke(workflow, cwd, payload=None, session_id=sid)
+
+        # The source really did grow...
+        assert len(src.read_bytes().splitlines()) == 4
+        # ...and the archive was deliberately left alone. st_ino is the load-
+        # bearing assertion: _archive_one publishes via os.replace of a fresh
+        # staging sibling, so any re-archive necessarily allocates a NEW inode,
+        # while identical bytes would pass even on a full rewrite.
+        assert _identity(archived) == before
+        assert archived.read_bytes() == original
