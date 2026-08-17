@@ -1002,6 +1002,30 @@ def detect_resumable_progress(records: list[dict] | None) -> bool:
     return not (tool_use_count == 0 and assistant_count <= 1)
 
 
+def resumable_progress_for_session(
+    config_dir: Path,
+    session_id: str,
+) -> bool:
+    """Return True when *session_id*'s on-disk transcript holds work worth
+    CONTINUING — the second half of cap-hit resume eligibility, after
+    :func:`transcript_exists` answers "can I reach it at all?".
+
+    Mirrors ``ended_awaiting_background_for_session``' shape: delegate all I/O
+    to ``read_transcript_records`` (which already owns the version-robust
+    glob-by-session-id lookup, tolerant JSONL parsing that skips the truncated
+    final line a SIGKILL leaves, and a never-raises contract), then apply the
+    pure ``detect_resumable_progress`` detector.  Never raises.
+
+    Unlike its background sibling this wrapper passes ``None`` STRAIGHT THROUGH
+    to the predicate instead of short-circuiting, because the fail-safe
+    direction is INVERTED: the background detector fails safe to False to avoid
+    downgrading a genuine success, whereas this one fails safe to True to avoid
+    discarding real work.  An unreadable transcript therefore resumes.
+    """
+    records = read_transcript_records(config_dir, session_id)
+    return detect_resumable_progress(records)
+
+
 def ended_awaiting_background_for_session(
     config_dir: Path,
     session_id: str,
