@@ -893,6 +893,54 @@ def test_wait_subtree_live_skips_a_vanished_transient_and_returns_the_durable_se
     )
 
 
+def test_wait_subtree_live_falls_back_to_the_full_walk_when_children_unreadable():
+    """A probe that returns None degrades to today's exact per-tick full walk.
+
+    ``/proc/<pid>/task/<tid>/children`` requires CONFIG_PROC_CHILDREN, so the
+    probe is TRI-STATE and its third state is load-bearing:
+
+    * ``set()``  -- leader live, no children yet (cheap negative: skip the walk)
+    * ``{...}``  -- worth confirming with the production walker
+    * ``None``   -- CANNOT probe (no ``children`` file, or the ``/proc/<pid>``
+      entry is gone)
+
+    ``None`` must fall through to the full ``collect_descendants(pgid,
+    read_ppid_map())`` walk for that tick.  Conflating it with the cheap
+    negative would make the helper spin until timeout on a kernel where the
+    probe can never go positive -- trading a flake for a hard, universal
+    failure on that platform.
+
+    The second half pins the vanishing-pid case that makes ``None``
+    reachable at all on a normal kernel: the leader can exit mid-poll, and
+    that must yield ``None``, never turn this helper's timeout diagnostic
+    into an unhandled OSError.  A pid above ``pid_max`` cannot exist, so it
+    stands in deterministically with no process to spawn or reap.
+    """
+    ppid_map_calls = [0]
+
+    def fake_probe(_pid):
+        return None  # kernel without CONFIG_PROC_CHILDREN
+
+    def fake_ppid_map():
+        ppid_map_calls[0] += 1
+        return {5678: 1234} if ppid_map_calls[0] > 3 else {}
+
+    result = wait_subtree_live(
+        1234, interval=0, _probe_children=fake_probe, _ppid_map=fake_ppid_map,
+    )
+
+    assert result == {5678}, (
+        f'a None (unprobeable) tick must fall back to the full walk, exactly as '
+        f'this helper behaved before task 4014; got {result}'
+    )
+
+    pid_max = int(Path('/proc/sys/kernel/pid_max').read_text().strip())
+    assert _read_direct_children(pid_max + 1) is None, (
+        'a pid that does not exist must probe as None (cannot probe), not raise -- '
+        'a leader exiting mid-poll must not turn the timeout path into an OSError'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task 3369 -- in-child stopwatch for the flock GATE, replacing task 2921/2941's
 # outer wall-clock subtraction in test_flock_wait_env_override_speeds_up_
