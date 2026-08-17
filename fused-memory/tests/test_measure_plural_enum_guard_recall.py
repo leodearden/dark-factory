@@ -21,11 +21,20 @@ from pathlib import Path
 
 import pytest
 
+# Shared with tests/reconciliation/test_stale_status_snapshot_edge_sweep.py,
+# which parametrizes its guard tests off these same lists. ``tests/`` carries
+# no __init__.py while ``tests/reconciliation/`` does, so pytest puts
+# ``tests/`` on sys.path for modules in both directories and this package
+# import resolves identically from either.
+from reconciliation.plural_enum_shapes import (
+    ADVERBIAL_PREAMBLE_SHAPES,
+    GUARD_REJECTED_SUPPRESSION_SHAPES,
+    PRECISION_GUARD_SHAPES,
+    SUBJECT_POSITIVE_SHAPES,
+)
+
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'measure_plural_enum_guard_recall.py'
-)
-SWEEP_TEST_PATH = (
-    Path(__file__).parent / 'reconciliation' / 'test_stale_status_snapshot_edge_sweep.py'
 )
 
 
@@ -36,12 +45,9 @@ def _load_module(mod_name: str, path: Path) -> types.ModuleType:
     @dataclass and other reflection-based decorators work correctly
     (they call sys.modules.get(cls.__module__)).
 
-    Used for BOTH the script under test (not on PYTHONPATH) and the sweep
-    TEST module whose parametrize markers this file re-validates against:
-    ``tests/`` carries no __init__.py, so the sweep suite's importable name
-    depends on pytest's rootdir insertion and differs between a direct run
-    and a collected one. Loading by path sidesteps that entirely — the
-    re-validation gate must not be able to break on an import-path detail.
+    Used ONLY for the script under test, which lives in ``scripts/`` and is
+    not on PYTHONPATH. The pinned shape corpora are an ordinary package
+    import (see below) and need no such machinery.
     """
     spec = importlib.util.spec_from_file_location(mod_name, path)
     if spec is None or spec.loader is None:
@@ -69,57 +75,24 @@ simulate_candidate = _mod.simulate_candidate
 extract_plural_ids = _mod.extract_plural_ids
 
 
-def _pinned_shapes(test_name: str) -> list:
-    """Pull a pinned shape list off the sweep suite's parametrize marker.
-
-    Read from the MARKER rather than copied into this file on purpose. Task
-    3949 requires each candidate tightening be re-validated 'against the
-    full precision-guard parametrization'. A hardcoded copy satisfies that
-    on the day it is written and silently stops covering the full set the
-    moment someone adds a shape — the same silent-loss failure mode the
-    sweep suite's own test_every_guarded_preposition_is_exercised_against_a
-    _plural_head exists to prevent for _ENUM_PREP_WORDS. Reading the marker
-    makes the gate mechanical: a shape added upstream automatically
-    re-validates both candidates here.
-    """
-    import inspect
-
-    sweep_tests = _load_module(
-        '_sweep_tests_for_revalidation', SWEEP_TEST_PATH,
-    )
-
-    for _cls_name, cls in inspect.getmembers(sweep_tests, inspect.isclass):
-        fn = getattr(cls, test_name, None)
-        if fn is None:
-            continue
-        for mark in getattr(fn, 'pytestmark', []):
-            if mark.name != 'parametrize':
-                continue
-            argnames, argvalues = mark.args[0], mark.args[1]
-            # 'fact'-only markers yield bare strings; ('fact', 'expected')
-            # markers yield tuples.
-            if isinstance(argnames, str):
-                return [(v, None) for v in argvalues]
-            return list(argvalues)
-    raise AssertionError(
-        f'{test_name} not found in the sweep test module — the re-validation '
-        f'gate has lost its corpus and would silently pass on nothing.'
-    )
-
-
-# Facts the shipped guard must keep suppressing. Any candidate that admits
-# one of these has re-opened over-selection, which is the unrecoverable
-# direction and disqualifies it outright.
-_PRECISION_SHAPES = [f for f, _ in _pinned_shapes(
-    'test_plural_enumeration_precision_guards')]
-_SUPPRESSION_SHAPES = [f for f, _ in _pinned_shapes(
-    'test_guard_rejected_enumeration_suppresses_ids_on_every_path')]
+# The SAME lists the sweep suite parametrizes its guard tests off — imported,
+# never copied. Task 3949 requires each candidate tightening be re-validated
+# 'against the full precision-guard parametrization', and a second hardcoded
+# copy would satisfy that on the day it was written and silently stop covering
+# the full set the moment someone added a shape. Sharing the data module keeps
+# the gate mechanical: a shape appended in reconciliation/plural_enum_shapes.py
+# re-validates both candidates here automatically, with no dependency on the
+# other suite's test-function names or marker internals.
+#
+# Facts the shipped guard must keep suppressing. Any candidate that admits one
+# of these has re-opened over-selection, which is the unrecoverable direction
+# and disqualifies it outright.
+_PRECISION_SHAPES = PRECISION_GUARD_SHAPES
+_SUPPRESSION_SHAPES = GUARD_REJECTED_SUPPRESSION_SHAPES
 # Facts the shipped guard extracts, and that no candidate may disturb.
-_POSITIVE_SHAPES = _pinned_shapes(
-    'test_plural_enumeration_subject_positives_survive_precision_guards')
+_POSITIVE_SHAPES = SUBJECT_POSITIVE_SHAPES
 # The documented recall loss — what a tightening would be FOR.
-_PREAMBLE_SHAPES = [f for f, _ in _pinned_shapes(
-    'test_adverbial_preamble_is_a_documented_under_selection')]
+_PREAMBLE_SHAPES = ADVERBIAL_PREAMBLE_SHAPES
 
 _ALL_GUARDED_SHAPES = _PRECISION_SHAPES + _SUPPRESSION_SHAPES + _PREAMBLE_SHAPES
 
@@ -245,19 +218,21 @@ def test_triage_rejection_labels_prepositional_complement(fact):
     assert triage_rejection(fact, match_start) == 'prepositional_complement'
 
 
-def test_pinned_shape_corpus_is_non_trivial():
-    """The re-validation gate must fail loudly if its corpus evaporates.
+def test_the_two_shapes_the_candidate_verdicts_turn_on_are_present():
+    """The two named shapes below decide both candidate verdicts.
 
-    Marker introspection is the whole mechanism here. If the upstream test
-    names or marker shapes change, every candidate assertion below would
-    pass vacuously against an empty list — a gate that silently stops
-    gating. These floors are the tripwire; they are minima, not exact
-    counts, precisely so ADDING a shape upstream never breaks this file.
+    Not a size floor on the corpus — that was a meta-test guarding the old
+    marker-introspection mechanism, and the mechanism is gone: the shapes are
+    now an ordinary import, so an empty or missing corpus is an ImportError or
+    an obviously-failing assertion rather than a silent vacuous pass.
+
+    What still needs pinning is narrower and behavioural. Candidate (a) is
+    rejected specifically because it cannot recover _DATE_STAMP_PREAMBLE, and
+    candidate (b) specifically because it re-opens _INTRA_CLAUSE_COMMA. Both
+    verdicts are stated as set differences against the shared corpus, so if
+    either shape were dropped upstream those assertions would still pass while
+    silently no longer testing the thing they are named for.
     """
-    assert len(_PRECISION_SHAPES) >= 43
-    assert len(_SUPPRESSION_SHAPES) >= 4
-    assert len(_POSITIVE_SHAPES) >= 11
-    assert len(_PREAMBLE_SHAPES) >= 3
     assert _DATE_STAMP_PREAMBLE in _PREAMBLE_SHAPES
     assert _INTRA_CLAUSE_COMMA in _PRECISION_SHAPES
 
