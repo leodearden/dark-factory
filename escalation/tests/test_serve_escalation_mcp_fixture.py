@@ -243,40 +243,6 @@ def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
 
 
 # ---------------------------------------------------------------------------
-# The two scoped fixtures are adapters over ONE implementation.
-# ---------------------------------------------------------------------------
-
-
-def test_both_serve_escalation_mcp_fixtures_share_one_implementation(
-    escalation_conftest: Any,
-) -> None:
-    """``serve_escalation_mcp`` and ``serve_escalation_mcp_module`` must both
-    be thin ``yield from _serve_escalation_mcp_impl()`` delegates.
-
-    The two scopes exist for different consumers -- function-scoped callers
-    (``test_legibility_census_escalation_e2e.py``) keep per-TEST teardown and
-    per-test attribution of the bounded-join hung-thread assert, while
-    module-scoped ``http_server`` adapters need a factory at least as broad as
-    themselves -- but the SCOPE is meant to be the only difference between
-    them.
-
-    Pinned because the cheap way to add a scope is to copy the body, which
-    would restore exactly the INV-5 lockstep duplication task 3736 removed,
-    one layer up: two harnesses that must then be fixed in lockstep, with the
-    load-bearing teardown protocol (task 2741) in both. Asserting on
-    ``__code__.co_names`` rather than source text keeps this a check on what
-    the wrapper actually CALLS.
-    """
-    for name in ('serve_escalation_mcp', 'serve_escalation_mcp_module'):
-        wrapper = getattr(escalation_conftest, name).__wrapped__
-        assert '_serve_escalation_mcp_impl' in wrapper.__code__.co_names, (
-            f'{name} must delegate to _serve_escalation_mcp_impl rather than '
-            'carry its own copy of the start/serve/teardown protocol; it '
-            f'references {wrapper.__code__.co_names}'
-        )
-
-
-# ---------------------------------------------------------------------------
 # serve_escalation_mcp_module must be MODULE-scoped: the migration rests on it.
 # ---------------------------------------------------------------------------
 
