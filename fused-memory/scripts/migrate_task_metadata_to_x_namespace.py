@@ -58,7 +58,23 @@ corpus-wide sweep at a per-task re-run of this script with other ``--keys``:
 * ``--apply`` writes the FULL pre-write task row (metadata *and*
   description/details) to ``--backup-path`` and refuses to write if it
   cannot. Without it, a read-back failure leaves the only copy of a
-  one-of-a-kind row in a process that is about to exit.
+  one-of-a-kind row in a process that is about to exit. The default path is
+  STAMPED with the UTC instant of the run, so the per-task re-run above gets
+  a fresh artifact instead of overwriting the one holding the TRUE
+  pre-migration row, and an already-occupied path is never replaced: an
+  operator-named one is REFUSED, a machine-chosen one steps aside to the next
+  free name. A dry run advertises the SHAPE of that default rather than an
+  instant the later ``--apply`` will not reproduce.
+
+Once that write has been SENT, EVERY exit that leaves the stored row
+unverified names the snapshot: the exit that reports read-back drift, the exit
+where the read-back itself crashed, and the exit where the write call never
+returned at all (a transport timeout on a replace the server may well have
+applied). :func:`recovery_pointer` is the single source of that sentence. The
+one post-write exit that does NOT print it is an explicit server REJECTION —
+that is a reply, nothing committed, and nothing to recover. An unverified
+committed write is the situation the artifact exists for, so where to find it
+is the last thing an operator is told.
 
 Idempotent — safe to re-run; an already-migrated task is a no-op. Defaults to
 a dry run: a real write requires an explicit ``--apply``.
@@ -78,12 +94,33 @@ import importlib.util
 import json
 import os
 import sys
+import traceback
 import types
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 DEFAULT_SERVER = 'http://127.0.0.1:8002'
 DEFAULT_PROJECT_ROOT = '/home/leo/src/dark-factory'
+
+# Where an omitted --backup-path resolves. A named constant rather than a
+# literal inlined into `default_backup_path` so the end-to-end tests can point
+# the DEFAULT path at their own tmp dir, instead of racing each other writing
+# real files into a shared /tmp from parallel xdist workers.
+DEFAULT_BACKUP_DIR = Path('/tmp')
+# The UTC filename stamp the rest of this repo already agrees on
+# (`_STAMP_FORMAT` in shared/src/shared/memory_eval_metrics.py,
+# `_PARKING_STAMP_FORMAT` in scripts/reclaim_orphaned_worktrees.py,
+# orchestrator/src/orchestrator/verify.py, dashboard's `_RUN_STAMP_FORMAT`), so
+# the artifact this script drops sorts and reads like every other one.
+_BACKUP_STAMP_FORMAT = '%Y%m%dT%H%M%SZ'
+# One template behind both the resolved default path and the shape a dry run
+# advertises, so the filename a rehearsal promises and the one an apply writes
+# cannot drift apart.
+_BACKUP_NAME_TEMPLATE = 'task-{task_id}-metadata-before-{stamp}.json'
+# How many names `write_backup_at_a_free_path` will try. Bounded so a wedged
+# directory fails loudly (as a refusal, before any write) instead of spinning.
+_MAX_BACKUP_DISAMBIGUATIONS = 10
 
 # The six ad-hoc keys measured on task 3083's live blob (2026-08-06) that have
 # no code reader anywhere in the repo. `last_blocked_at` is deliberately NOT
@@ -287,9 +324,56 @@ def _sha256(text: str | None) -> str:
     return hashlib.sha256((text or '').encode()).hexdigest()
 
 
-def default_backup_path(task_id: str) -> Path:
-    """Where the pre-write snapshot lands when ``--backup-path`` is omitted."""
-    return Path(f'/tmp/task-{task_id}-metadata-before.json')
+def _utcnow() -> datetime:
+    """The single clock seam behind :func:`default_backup_path`.
+
+    Exists so a test driving ``main_async`` — which resolves the path
+    internally and cannot be handed a ``now`` — can pin "two runs, minutes
+    apart" without a ``sleep``.
+    """
+    return datetime.now(UTC)
+
+
+def default_backup_path(task_id: str, *, now: datetime | None = None) -> Path:
+    """Where the pre-write snapshot lands when ``--backup-path`` is omitted.
+
+    Stamped with the UTC instant of the run. Task-scoping alone is not
+    enough: ``docs/task-authoring.md`` §8 prescribes a per-task RE-RUN of this
+    script with different ``--keys``, so run 1 saves the TRUE pre-migration
+    row and — with one fixed path — run 2 writes its already-partially-migrated
+    row straight over it. That silently destroys the single artifact this
+    script's whole SAFETY section exists to produce, which on task 3083 is a
+    one-of-a-kind hand-curated evidence log. Every run now gets its own file.
+
+    ``%Y%m%dT%H%M%SZ`` is the stamp the rest of the repo already uses. Second
+    resolution (not microsecond) is deliberate: it stays readable to an
+    operator hunting for the file under pressure.
+
+    ``now`` is injectable for deterministic tests — the shape
+    ``scripts/reclaim_orphaned_worktrees.py`` already uses for its age-based
+    reclaim.
+    """
+    stamp = (now or _utcnow()).strftime(_BACKUP_STAMP_FORMAT)
+    return DEFAULT_BACKUP_DIR / _BACKUP_NAME_TEMPLATE.format(task_id=task_id, stamp=stamp)
+
+
+def default_backup_path_shape(task_id: str) -> str:
+    """What a DRY RUN advertises, since it cannot honestly resolve a path.
+
+    Rehearse-then-apply is the workflow this script is built around, and under
+    the old fixed default the printed ``Backup:`` line was authoritative: the
+    operator read it and knew which file the follow-up ``--apply`` would
+    produce. A per-run stamp makes that promise unkeepable — the apply runs in
+    a different second, so it writes a different name — and a machine-chosen
+    name that collides steps aside to a suffixed one besides. Printing the
+    SHAPE says exactly as much as is actually known at rehearsal time.
+
+    An explicit ``--backup-path`` is not routed through here: that one WAS
+    knowable, because the operator typed it.
+    """
+    return str(
+        DEFAULT_BACKUP_DIR / _BACKUP_NAME_TEMPLATE.format(task_id=task_id, stamp='<UTC-stamp>')
+    )
 
 
 def write_backup(path: Path, before_task: dict) -> Path:
@@ -305,10 +389,92 @@ def write_backup(path: Path, before_task: dict) -> Path:
     is built around, and it was the one step with no durable output. The caller
     treats a failure here as fatal and skips the write — no write without a
     recoverable snapshot.
+
+    REFUSES an occupied path. :func:`default_backup_path` stamps each run, but
+    an explicit ``--backup-path`` reused across runs (and a same-second stamp
+    collision) still lands on an existing file — which may hold the TRUE
+    pre-migration row from an earlier run against this same task, while THIS
+    run would replace it with an already-partially-migrated one. The write is
+    an exclusive create (``open('x')``), so the existence check and the create
+    are one atomic OS operation with no window for a concurrent run to slip
+    between them.
+
+    The refusal is a :class:`FileExistsError`, which is an :class:`OSError` —
+    so ``main_async``'s existing ``except OSError`` around this call already
+    turns it into "Refusing to write without a recoverable snapshot" and
+    returns 1 BEFORE ``update_task`` is reached. Deliberately not a bespoke
+    exception class: that would need its own ``except`` clause, and an edit
+    that forgot it would let the refusal escape as a traceback while the write
+    went ahead.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(before_task, indent=2, sort_keys=True, default=str))
+    payload = json.dumps(before_task, indent=2, sort_keys=True, default=str)
+    try:
+        with path.open('x', encoding='utf-8') as handle:
+            handle.write(payload)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f'{path} already exists. It may hold the TRUE pre-write row from an '
+            f'earlier run against this task, and this run would replace it with an '
+            f'already-partially-migrated one. Move it aside, or pass a different '
+            f'--backup-path.'
+        ) from exc
     return path
+
+
+def write_backup_at_a_free_path(
+    path: Path, before_task: dict, *, attempts: int = _MAX_BACKUP_DISAMBIGUATIONS,
+) -> Path:
+    """:func:`write_backup` for a MACHINE-chosen path: step aside, don't abort.
+
+    :func:`write_backup`'s refusal tells the operator to "move it aside, or
+    pass a different --backup-path". That is sound advice about a path they
+    chose and nonsense about one they never saw — and the abort is avoidable
+    here, because nothing constrains the name except that it be free. The only
+    way a stamped default collides is two ``--apply`` runs inside one second,
+    so this tries ``<name>-2``, ``<name>-3``, ... until one takes.
+
+    The safety property is untouched: every attempt is still the same exclusive
+    create, so an existing snapshot is never replaced — this only declines to
+    make a machine-owned naming detail the operator's problem. Bounded, and the
+    give-up is a :class:`FileExistsError` like any other refusal, so
+    ``main_async``'s ``except OSError`` still stops the run before the write.
+    """
+    candidates = [path] + [
+        path.with_name(f'{path.stem}-{n}{path.suffix}') for n in range(2, attempts + 1)
+    ]
+    for candidate in candidates:
+        try:
+            return write_backup(candidate, before_task)
+        except FileExistsError:
+            continue
+    raise FileExistsError(
+        f'{path} and {len(candidates) - 1} disambiguated names beside it are all '
+        f'taken. That is not a stamp collision — something is wrong with '
+        f'{path.parent}. Refusing to write without a recoverable snapshot.'
+    )
+
+
+def recovery_pointer(backup_path: Path) -> str:
+    """The one sentence telling an operator where the original row survives.
+
+    Deliberately the single source of that instruction: EVERY exit that
+    leaves an already-sent write unverified must print the same words — the
+    exit that reports read-back drift, the exit where the read-back itself
+    crashed, and the exit where the write call never returned. The defect this
+    closes was precisely that one of those exits knew about the snapshot and
+    the others did not, so a second hand-written copy of the sentence would
+    restore the asymmetry the moment either copy was edited.
+
+    Not printed on a server REJECTION (:class:`WriteRejectedError`): the server
+    replied and refused, so the stored row is the one just read and there is
+    nothing to recover. Printing it there would train an operator to skim past
+    the sentence on the exits where it is load-bearing.
+    """
+    return (
+        f'  The pre-write row (metadata AND description/details) is saved at '
+        f'{backup_path} — recover from there, do not re-derive by hand.'
+    )
 
 
 def _load_sibling_client() -> type:
@@ -441,10 +607,17 @@ async def main_async(args: argparse.Namespace) -> int:
     print(f'Task ID:      {args.task_id}')
     print(f'Keys:         {keys}')
     print(f'Mode:         {"APPLY" if args.apply else "dry-run"}')
-    backup_path = Path(args.backup_path) if args.backup_path else default_backup_path(
-        args.task_id
-    )
-    print(f'Backup:       {backup_path}')
+    # An explicit path is knowable now and printed as given; a machine-chosen
+    # one is NOT resolved until the write, so a rehearsal advertises its shape
+    # rather than an instant no later `--apply` will reproduce.
+    explicit_backup_path = Path(args.backup_path) if args.backup_path else None
+    if explicit_backup_path is not None:
+        print(f'Backup:       {explicit_backup_path}')
+    else:
+        print(
+            f'Backup:       {default_backup_path_shape(args.task_id)} '
+            f'(resolved at write time)'
+        )
     print()
 
     # Before ANY read or write: a bad --keys entry is a mangle the read-back
@@ -492,20 +665,54 @@ async def main_async(args: argparse.Namespace) -> int:
 
         # No write without a durable snapshot: once update_task lands, this
         # process's memory is otherwise the only copy of the original row.
+        # An occupied path is REFUSED when the operator named it (the name was
+        # a deliberate choice, and the file there may be an earlier run's TRUE
+        # pre-migration row) and STEPPED ASIDE from when the machine did.
+        intended_path = explicit_backup_path or default_backup_path(args.task_id)
         try:
-            write_backup(backup_path, before_task)
+            backup_path = (
+                write_backup(intended_path, before_task)
+                if explicit_backup_path is not None
+                else write_backup_at_a_free_path(intended_path, before_task)
+            )
         except OSError as exc:
             print(
-                f'  [error] could not write the pre-write backup to {backup_path}: {exc}. '
+                f'  [error] could not write the pre-write backup to {intended_path}: {exc}. '
                 f'Refusing to write without a recoverable snapshot.',
                 file=sys.stderr,
             )
             return 1
         print(f'  pre-write snapshot saved: {backup_path}')
 
-        write_result = await client.call_tool(
-            'update_task', build_update_payload(args.task_id, project_root, migrated),
-        )
+        # The write call itself is already past the point of no return: the
+        # sibling client is an `httpx.AsyncClient(timeout=30.0)` and this is a
+        # whole-blob replace of a row that runs to tens of KB, so a read
+        # timeout on a POST the server DID apply is the most plausible way to
+        # reach "committed but UNVERIFIED" at all — likelier than the
+        # malformed read-back payloads guarded below. No reply means no way to
+        # tell landed from lost, so this exit names the snapshot too.
+        # Built OUTSIDE the guard below: a payload-construction bug is not a
+        # lost reply, and reporting it as one would tell the operator a write
+        # may have landed when nothing was ever sent.
+        payload = build_update_payload(args.task_id, project_root, migrated)
+        try:
+            write_result = await client.call_tool('update_task', payload)
+        except Exception as exc:
+            traceback.print_exc()
+            print(
+                f'  [error] the write call did not RETURN: {exc!r}. No reply was '
+                f'received, so the write may or may not have committed — treat the '
+                f'stored row as UNVERIFIED and read it back by hand.',
+                file=sys.stderr,
+            )
+            print(recovery_pointer(backup_path), file=sys.stderr)
+            return 1
+
+        # Deliberately OUTSIDE that guard, and deliberately NOT given the
+        # pointer: a rejection is a reply. The server answered, refused, and
+        # left the stored row exactly as read — there is nothing to recover,
+        # and printing the sentence here would erode it on the exits where it
+        # is load-bearing.
         try:
             assert_write_accepted(write_result)
         except WriteRejectedError as exc:
@@ -513,25 +720,42 @@ async def main_async(args: argparse.Namespace) -> int:
             return 1
         print('  write accepted; verifying read-back...')
 
-        after_task = await _fetch_task(client, args.task_id, project_root)
-        problems, notes = _verify_read_back(
-            before_meta=before_meta,
-            expected_meta=migrated,
-            applied=applied,
-            before_task=before_task,
-            after_task=after_task,
-        )
+        # From here the write has ALREADY COMMITTED, so every exit has to name
+        # the snapshot. `_fetch_task` raises on an unexpected payload and
+        # `_verify_read_back` -> `_coerce_metadata` raises on a stored blob that
+        # is not a dict; unguarded, either unwinds out of `main_async` as a bare
+        # stack trace with the recovery instruction never printed — at the one
+        # moment the operator most needs it.
+        try:
+            after_task = await _fetch_task(client, args.task_id, project_root)
+            problems, notes = _verify_read_back(
+                before_meta=before_meta,
+                expected_meta=migrated,
+                applied=applied,
+                before_task=before_task,
+                after_task=after_task,
+            )
+        except Exception as exc:
+            # `Exception`, never `BaseException`: a Ctrl-C or a cancelled task
+            # must still propagate instead of being reported as a read-back
+            # failure. The traceback goes FIRST so the diagnosis is not lost,
+            # and the pointer LAST so it is the final line on screen.
+            traceback.print_exc()
+            print(
+                f'  [error] the post-write read-back could not COMPLETE: {exc!r}. '
+                f'The write has already committed, so the stored row is UNVERIFIED.',
+                file=sys.stderr,
+            )
+            print(recovery_pointer(backup_path), file=sys.stderr)
+            return 1
+
         for note in notes:
             print(f'    {note}')
         if problems:
             print('  [error] READ-BACK VERIFICATION FAILED:', file=sys.stderr)
             for problem in problems:
                 print(f'    - {problem}', file=sys.stderr)
-            print(
-                f'  The pre-write row (metadata AND description/details) is saved at '
-                f'{backup_path} — recover from there, do not re-derive by hand.',
-                file=sys.stderr,
-            )
+            print(recovery_pointer(backup_path), file=sys.stderr)
             return 1
 
         print('  read-back verified: x_ keys present, old spellings gone, '
@@ -564,8 +788,11 @@ def build_parser() -> argparse.ArgumentParser:
         '--backup-path', dest='backup_path', default=None,
         help=(
             'Where to save the FULL pre-write task row before applying '
-            '(default: /tmp/task-<task-id>-metadata-before.json). The write is '
-            'refused if this cannot be written.'
+            '(default: /tmp/task-<task-id>-metadata-before-<UTC-stamp>.json, '
+            'resolved at write time, so each run gets its own file and a re-run '
+            "cannot land on an earlier run's snapshot). Passing this explicitly "
+            'makes an already-existing file FATAL rather than stepped aside '
+            'from. The write is refused if the snapshot cannot be written.'
         ),
     )
     parser.add_argument(
