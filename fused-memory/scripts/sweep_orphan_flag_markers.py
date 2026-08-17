@@ -1122,6 +1122,18 @@ def _build_parser() -> argparse.ArgumentParser:
             'rationale and dated census: docs/flag-marker-sweep-recurring.md.'
         ),
     )
+    parser.add_argument(
+        '--no-fail-on-blind-spot', dest='fail_on_blind_spot',
+        action='store_false', default=None,
+        help=(
+            'REQUIRES --check (rejected at parse time without it). Opt OUT '
+            'of the blind-spot escalation, returning --check to a plain '
+            'backlog verdict. For an ad-hoc census where you want the '
+            'residual count without the vacuity veto. Relaxes ONLY the '
+            'vacuity check: a residual backlog over --max-backlog still '
+            'exits 1. Full rationale: docs/flag-marker-sweep-recurring.md.'
+        ),
+    )
     return parser
 
 
@@ -1159,15 +1171,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if args.fail_on_blind_spot and not args.check:
+    # `is not None` — not truthiness — so BOTH spellings are validated
+    # (task 3923). Keying on the value would silently accept
+    # --no-fail-on-blind-spot without --check, which is just as inert as
+    # the opt-in spelling: an operator would believe they had relaxed a
+    # gate that was never running.
+    if args.fail_on_blind_spot is not None and not args.check:
+        passed = (
+            '--fail-on-blind-spot' if args.fail_on_blind_spot
+            else '--no-fail-on-blind-spot'
+        )
         parser.error(
-            '--fail-on-blind-spot requires --check: it resolves an exit code '
-            'only through the --check verdict path, so on its own it would '
-            'silently exit 0 even on an observed blind spot — a gate that '
-            'cannot fail. Pass --check as well (the '
+            f'{passed} requires --check: --fail-on-blind-spot / '
+            '--no-fail-on-blind-spot resolve an exit code only through the '
+            '--check verdict path, so on its own either spelling would '
+            'silently no-op — exiting 0 even on an observed blind spot, a '
+            'gate that cannot fail. Pass --check as well (the '
             'scripts/fused-memory-flag-marker-check.sh wrapper already does), '
-            'or drop --fail-on-blind-spot: the blind spot is reported in the '
-            "log and in the JSON report's cross_check block either way."
+            f'or drop {passed}: the blind spot is reported in the log and in '
+            "the JSON report's cross_check block either way."
         )
     # Resolve the tri-state sentinel AFTER the validation above (task 3923).
     # Order is load-bearing: the rejection keys on the flag having been
