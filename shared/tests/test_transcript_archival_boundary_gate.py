@@ -21,6 +21,24 @@ backstop), γ (legibility archive mining) and δ (retention GC). See
 * ``scripts/tests/test_transcript_archival_boundary_gate.py`` — E5, E8 (the
   legibility-mining and retention-GC rows).
 
+VERDICT — ALL EIGHT ROWS GREEN over the integrated α/β/γ/δ paths, and NO
+production change was required by any of them. That is the gate's finding, not
+a formality: ε exists to answer whether four independently-merged leaves
+actually compose end to end, and the answer measured here is yes. Because the
+matrix is split three ways, NO SINGLE FILE CAN REPORT THAT VERDICT — each of
+the three states it and names the other two, so a reader who lands on any one
+of them can reach the whole result:
+
+* this file — E4 (1 row)
+* ``orchestrator/tests/...`` — E1, E6, E2, E3, E7 (7 rows incl. controls)
+* ``scripts/tests/...`` — E5, E8 (7 rows incl. controls)
+
+Provenance (a point-in-time measurement, NOT an invariant to keep updated):
+branch ``task/2732`` on base main ``7ef5ccdcf6``, each package's VERBATIM
+``test_command`` — shared 4212 passed / orchestrator 17104 passed / scripts
+3623 passed, all rc=0. Rows were additionally checked non-tautological by
+mutation (each deliberate production mutant fails its row; all reverted).
+
 The gate is three files rather than one because ``verify`` is directory-scoped:
 each package's ``orchestrator.yaml`` declares its own ``test_command``, so a
 single cross-package module would run in exactly one lane and a shared-only or

@@ -23,6 +23,24 @@ own the rest:
 * ``shared/tests/test_transcript_archival_boundary_gate.py`` — E4 (the
   credential-safety row, kept orchestrator-free so ``shared`` stays a leaf).
 
+VERDICT — ALL EIGHT ROWS GREEN over the integrated α/β/γ/δ paths, and NO
+production change was required by any of them. That is the gate's finding, not
+a formality: ε exists to answer whether four independently-merged leaves
+actually compose end to end, and the answer measured here is yes. Because the
+matrix is split three ways, NO SINGLE FILE CAN REPORT THAT VERDICT — each of
+the three states it and names the other two, so a reader who lands on any one
+of them can reach the whole result:
+
+* this file — E5, E8 (7 rows incl. controls)
+* ``orchestrator/tests/...`` — E1, E6, E2, E3, E7 (7 rows incl. controls)
+* ``shared/tests/...`` — E4 (1 row)
+
+Provenance (a point-in-time measurement, NOT an invariant to keep updated):
+branch ``task/2732`` on base main ``7ef5ccdcf6``, each package's VERBATIM
+``test_command`` — shared 4212 passed / orchestrator 17104 passed / scripts
+3623 passed, all rc=0. Rows were additionally checked non-tautological by
+mutation (each deliberate production mutant fails its row; all reverted).
+
 The gate is three files rather than one because ``verify`` is directory-scoped:
 each package's ``orchestrator.yaml`` declares its own ``test_command``, so a
 single cross-package module would run in exactly one lane and a shared-only or
@@ -384,6 +402,21 @@ class TestE8RetentionGcPrunesByCap:
         archive_root, archived = _archive_five_real_task_dirs(tmp_path)
         caplog.set_level(logging.INFO, logger='gc_agent_transcripts')
 
+        # δ's OWN pre-sweep view of the tree, so "the newest two" below is
+        # MEASURED off the archive's real mtimes rather than assumed from the
+        # order the fixture happened to build them in. Newest-first with
+        # select_prunable's exact tiebreak (-mtime, path); the five mtimes are
+        # a day apart, so the tiebreak never actually engages.
+        before = dict(gct.scan_task_dirs(archive_root))
+        newest_first = sorted(before, key=lambda path: (-before[path], str(path)))
+        expected_kept = set(newest_first[:GC_CAP])
+        expected_pruned = set(newest_first[GC_CAP:])
+        # The fixture's intent and the measured order agree — if they ever stop
+        # agreeing, that is the fixture lying, and it fails here rather than
+        # silently redefining what the rest of the row asserts.
+        assert expected_kept == {archive_root / t for t in GC_KEPT_IDS}
+        assert expected_pruned == {archive_root / t for t in GC_PRUNED_IDS}
+
         exit_code = gct.main([
             '--root', str(archive_root),
             '--max-task-dirs', str(GC_CAP),
@@ -391,6 +424,17 @@ class TestE8RetentionGcPrunesByCap:
         ])
 
         assert exit_code == 0
+
+        # The survivors are exactly the NEWEST GC_CAP dirs by mtime — not
+        # merely "two of them". A GC that kept the right COUNT but the wrong
+        # dirs (an inverted sort) would satisfy every count in the report and
+        # is caught only here.
+        surviving = {child for child in archive_root.iterdir() if child.is_dir()}
+        assert surviving == expected_kept
+        # ...and nothing was both kept and pruned: the two sets partition the
+        # scan, so a dir cannot be reported removed while still on disk.
+        assert surviving & expected_pruned == set()
+        assert surviving | expected_pruned == set(before)
 
         # The 2 newest survive INTACT — the dir is still there AND its archived
         # transcript is still readable and byte-correct, not an emptied husk.
@@ -410,9 +454,8 @@ class TestE8RetentionGcPrunesByCap:
         assert report['check'] is False
         # The age arm never fired: every drop is attributed to the count cap.
         assert report['reason_counts'] == {'count': 3}
-        assert sorted(report['removed_paths']) == sorted(
-            str(archive_root / task_id) for task_id in GC_PRUNED_IDS
-        )
+        # The report names the dirs that actually went, measured-newest-first.
+        assert {Path(p) for p in report['removed_paths']} == expected_pruned
 
         messages = _gc_log_messages(caplog)
 
