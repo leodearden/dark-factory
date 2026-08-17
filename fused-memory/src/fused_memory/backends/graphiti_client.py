@@ -432,11 +432,18 @@ exists to fix, moved one layer up.
 # ``n.summary``.  Corrupting, not merely under-reporting.
 #   - get_all_valid_edges  -> enumerate_all_valid_edges
 #   - list_entity_nodes    -> enumerate_entity_nodes
+# The old names survive as thin shims with UNCHANGED signatures that WARN on
+# an incomplete read; the completeness signal itself is a first-class return
+# value on the enumerate_* methods.  No consumer ACTS on it yet — the two
+# reconciliation sweeps and cleanup_count_snapshots still call the shims, so
+# they cannot yet distinguish "swept a complete corpus" from "swept what we
+# could fetch".  Filed as ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH.
 #
 # STILL UNPAGINATED and assessed AT RISK.  Left out of 4340 only because they
 # are separable — different call chains, no shared verdict, no write-back —
-# and folding them in would have doubled the diff.  Follow-up: see
-# FOLLOWUP-4340-1 below.
+# and folding them in would have doubled the diff.  Follow-up filed as ticket
+# tkt_0RSJP82N82SNKT2BHRT3HWK3DA (a TICKET id, not a task id — the curator
+# resolves it to a task asynchronously).
 #   - query_stale_node_embeddings: ~16083 rows on dark_factory.  A truncated
 #     read makes an embedding-dimension migration look COMPLETE when it is
 #     not — the worst shape of this bug, because the operator's evidence of

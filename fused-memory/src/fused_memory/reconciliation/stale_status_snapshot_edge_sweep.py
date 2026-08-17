@@ -121,8 +121,10 @@ rate; do not re-open them:
    as of task 4340 and the truncation is gone, but the RATE has not been
    recomputed: a re-measurement against the now-complete corpus is
    warranted, and the residuals list above is calibrated against the old
-   figure.  Filed as FOLLOWUP-4340-3.  Do not re-open the LEXICAL
-   hypothesis; do not treat the old rate as measured on a whole corpus.
+   figure.  Filed as ticket tkt_0RSJP92VQNATQB0FSR20YMXGW8 (a TICKET id,
+   not a task id — the curator resolves it to a task asynchronously).  Do
+   not re-open the LEXICAL hypothesis; do not treat the old rate as
+   measured on a whole corpus.
 2. A shared blind spot with ``task_count_verification``: that function is
    an aggregate census-vs-tree consistency check (``task_filter``), not a
    per-task edge sweep at all — its 'healthy' report was correct, not
