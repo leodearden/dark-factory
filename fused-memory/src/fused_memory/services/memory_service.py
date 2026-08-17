@@ -3758,6 +3758,25 @@ class MemoryService:
                 continue
             meta = mem.get('metadata', {}) or {}
             category = meta.get('category', 'observations_and_summaries')
+            # The THIRD and last producer of add_memory_graphiti rows (task
+            # 3670, PRD leaf epsilon). Threaded even though the PRD named only
+            # the two primary write-boundary sites: replayed rows carry real
+            # prose whose referents the derived scanner can see, so leaving
+            # them on the absent path would stamp them 'none' and inflate leaf
+            # iota's undeclared bucket with writes that were plainly derivable
+            # — a false regression signal in the very counter this task exists
+            # to make trustworthy. They also produce real graph edges leaf zeta
+            # will want to verify.
+            #
+            # Unlike add_episode, this loop DOES hold a metadata dict (the Mem0
+            # record's own), so the bridge is live here. declared=None: leaf
+            # delta's seam, as at the other two producers.
+            #
+            # add_system_record is deliberately NOT threaded — it is Mem0-only
+            # and never routes to Graphiti.
+            resolution = resolve_referents(
+                declared=None, metadata=meta, content=content, group_id=target,
+            )
             batch.append({
                 'group_id': target,
                 'operation': 'add_memory_graphiti',
@@ -3767,6 +3786,7 @@ class MemoryService:
                     'source': 'text',
                     'group_id': target,
                     'source_description': f'replay_from_mem0:{category}',
+                    'referents': _encode_referents(resolution),
                 },
                 'callback_type': 'refresh_entity_summaries',
             })
