@@ -1455,7 +1455,19 @@ class MemoryService:
                     success=True,
                 )
             return result
-        except Exception as e:
+        except BaseException as e:
+            # BaseException, not Exception: observe-and-reraise, never swallow
+            # (the `raise` below is unconditional), so structured cancellation
+            # is unaffected and only the journal gains a row. Previously a
+            # cancelled backend call hit NEITHER branch and vanished from
+            # Layer 2 entirely. This is the shared helper for every
+            # `_execute_*` path, so one edit makes backend_ops truthful for
+            # all of them at once.
+            #
+            # f'{type(e).__name__}: {e}' rather than bare str(e): a bare
+            # CancelledError's str() is empty, which would record a failure
+            # with no identifiable cause. Matches durable_queue's
+            # _handle_failure and _execute_mem0_write.
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -1464,7 +1476,7 @@ class MemoryService:
                     operation=operation,
                     payload=payload,
                     success=False,
-                    error=str(e),
+                    error=f'{type(e).__name__}: {e}',
                 )
             raise
 
