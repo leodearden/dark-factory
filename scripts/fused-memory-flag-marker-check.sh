@@ -3,21 +3,27 @@
 # fused-memory-flag-marker-sweep.sh, exposing sweep_orphan_flag_markers.py's
 # --check/backlog_verdict predicate mode (task 2596).
 #
-# THE WATCH GATE IS RETIRED (task 3923). This script was written as a
-# runnable before_done.script for task_kind='deterministic',
-# before_done.kind='predicate' watch tasks. Task 2902 -- the esc-2866-1 O2
-# watch -- was the only task ever wired to it, and it was a ONE-SHOT dated
-# milestone that fired 2026-07-29, exited 0, and is now status=done. A scan
-# of the live task store found no other before_done wiring anywhere in the
-# project, so this wrapper has ZERO consumers. Its remaining role is an
-# ad-hoc, read-only census run by hand.
+# THE WATCH GATE IS RETIRED (task 3923): task 2902, the only before_done
+# consumer this wrapper ever had, is done, so its remaining role is an
+# ad-hoc, read-only census run by hand. Ruling, dated census and the
+# remediation path if you trip the armed verdict below:
+# docs/flag-marker-sweep-recurring.md §"Decision (task 3923)" -- the single
+# copy, don't restate it here.
 #
 # Sets up the same service env as the nightly sweep wrapper (a fused-memory
 # maintenance action must run under the SERVICE env, not a bare shell, or the
 # census silently narrows), then passes caller args through -- e.g.
 # --project-id reify --max-backlog 0.
-# Exit code only: 0 = residual source-tagged backlog within --max-backlog,
-# 1 = violated. The VERDICT is the exit code; the orchestrator parses no
+# Exit code only: 0 = verdict holds; 1 = EITHER the residual source-tagged
+# backlog exceeds --max-backlog OR an OBSERVED enumeration blind spot vetoed
+# the verdict (see below). Both causes share rc=1 -- the emitted JSON's
+# cross_check block is what distinguishes them, so a consumer that needs to
+# tell them apart must read it rather than infer from the code alone. (A
+# distinct code for the veto was considered and declined: rc is
+# sweep_orphan_flag_markers.py's own, and the orchestrator's before_done
+# path renders any rc!=0 identically as a predicate violation, so a third
+# code would buy separability nowhere it is consumed.)
+# The VERDICT is the exit code; the orchestrator parses no
 # output to reach it. It does, however, READ the output: on rc=0 it extracts
 # a bounded structured summary (a trailing JSON block, else one clean final
 # line, log lines dropped) into done_provenance.note, and on rc!=0 it carries
@@ -39,29 +45,27 @@
 # blind spot is rc=1 BY DEFAULT. Because this script's exec line hardcodes
 # --check, that applies to every invocation here -- so re-wiring this
 # wrapper as a before_done predicate today FAILS LOUDLY ON DAY ONE rather
-# than passing silently forever, which is the point. Pass
-# --no-fail-on-blind-spot for an ad-hoc census where you want the plain
-# backlog verdict; it relaxes only the vacuity check, not the backlog
-# ceiling. --fail-on-blind-spot is still accepted as an explicit
-# affirmation of the default. A failed census probe never trips the
-# escalation, so a transient Qdrant blip cannot flap the verdict.
+# than passing silently forever, which is the point. The remedy is to fix
+# the source/kind enumeration so it sees the real marker population BEFORE
+# wiring a gate on it: --no-fail-on-blind-spot is census-only (it relaxes
+# the vacuity check, never the backlog ceiling) and must not be used as a
+# gate configuration, since silencing the veto restores the vacuous pass.
+# --fail-on-blind-spot is still accepted as an explicit affirmation of the
+# default. A failed census probe never trips the escalation, so a transient
+# Qdrant blip cannot flap the verdict.
 #
 # Do NOT re-point this at the adjacent flag_for_stage2 pool expecting it to
 # reach zero: that pool is a healthy rolling window, so a gate keyed on its
 # emptiness fails forever -- the same footgun as --max-backlog 0 against
-# undated markers, below. Dated census and full rationale live in
-# docs/flag-marker-sweep-recurring.md (the single copy -- don't restate the
-# numbers here).
+# undated markers, below.
 #
 # Unlike the nightly sweep wrapper this performs NO deletions (--check
 # without --apply is a dry-run census + verdict), so resolve/resume re-runs
 # are harmless. NOTE the sweep script's own caveat: undated markers can never
 # be drained by age, so a --max-backlog 0 predicate against a population
 # containing undated markers fails forever -- verify the census first or set
-# the ceiling accordingly. First and only consumer: the esc-2866-1 O2 watch
-# task (2902), now done and retired -- see
-# plans/reify-flag-marker-backlog-rca-2026-07-22.md and the task-3923
-# decision in docs/flag-marker-sweep-recurring.md.
+# the ceiling accordingly. Historical narrative for the retired 2902 watch:
+# plans/reify-flag-marker-backlog-rca-2026-07-22.md §6a.
 set -euo pipefail
 
 REPO="${REPO:-/home/leo/src/dark-factory}"

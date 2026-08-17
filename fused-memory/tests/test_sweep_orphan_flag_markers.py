@@ -1774,21 +1774,12 @@ class TestResolveCheckExitCode:
     def test_blind_spot_fails_the_check_verdict_by_default(self):
         """ARMED BY DEFAULT (task 3923), the load-bearing case.
 
-        This test previously asserted the OPPOSITE, on the premise that
-        scripts/fused-memory-flag-marker-check.sh "is ALREADY wired as a
-        before_done.script predicate for a deterministic watch task" and so
-        must not start failing. That premise is now false: the esc-2866-1 O2
-        watch (task 2902) was a ONE-SHOT dated milestone that fired
-        2026-07-29, exited 0, and is status=done. A scan of the live task
-        store found no other before_done wiring of the wrapper anywhere in
-        the project, so the gate has ZERO consumers.
-
-        With no consumer to protect, the permissive default is pure
-        downside: a verdict rendered from an enumeration that matched
-        NOTHING read as a pass, so anyone re-wiring this gate later would
-        get a silent pass forever instead of a signal. Nothing "fails
-        forever" here precisely because nothing runs it — arming the
-        default only means a future re-wire fails loudly on day one.
+        This test previously asserted the OPPOSITE, on the premise that the
+        check wrapper "is ALREADY wired as a before_done.script predicate
+        for a deterministic watch task" and so must not start failing. That
+        premise is now false — the gate's only consumer, task 2902, is done
+        — which is what licenses the inversion. Ruling:
+        docs/flag-marker-sweep-recurring.md §"Decision (task 3923)".
 
         The explicit keyword is still honoured (see
         test_blind_spot_fails_when_opted_in); what changes is that omitting
@@ -2166,9 +2157,9 @@ class TestMainExitCode:
         """END-TO-END proof the armed default reaches the exit code (3923).
 
         This previously asserted 0, citing "the already-wired esc-2866-1 O2
-        watch task's contract". That watch (task 2902) is done — a one-shot
-        dated milestone that fired 2026-07-29 and closed — so the gate has
-        no consumers and the contract it protected is discharged.
+        watch task's contract". That watch (task 2902) is done, so the
+        contract it protected is discharged — see
+        docs/flag-marker-sweep-recurring.md §"Decision (task 3923)".
 
         Bare `--check` on a report whose enumeration matched nothing while
         an adjacent population is non-empty must now be exit 1. Asserting

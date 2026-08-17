@@ -150,10 +150,11 @@ the ``is_protected_mirror_record`` guard nor the tombstone write that the in-cyc
 pool correctly.
 
 SINGLE SOURCE OF TRUTH for the dated census (which filter matched how many
-records, in which project, when) and for the full censused-never-deleted
-rationale: ``docs/flag-marker-sweep-recurring.md``. Those are point-in-time
-measurements of live data; they are deliberately NOT restated here, so there is
-only one copy to keep current.
+records, in which project, when), for the full censused-never-deleted
+rationale, and for the task-3923 retirement ruling plus what an operator must
+do if the armed verdict trips: ``docs/flag-marker-sweep-recurring.md``. Those
+are point-in-time measurements of live data; they are deliberately NOT restated
+here, so there is only one copy to keep current.
 
 Usage
 -----
@@ -779,8 +780,11 @@ async def run(
             '(task 2966, reconciliation/stages/task_knowledge_sync.py) on a '
             'rolling 14-day window — those records are not uncollected, and '
             'this script deliberately censuses them rather than deleting '
-            'them. Pass --fail-on-blind-spot to escalate this divergence to '
-            'a non-zero --check exit code.',
+            'them. Since task 3923 this divergence FAILS --check by default. '
+            'To remediate, fix the source/kind enumeration so it sees the '
+            'real marker population before wiring any gate on it; '
+            '--no-fail-on-blind-spot is census-only and must not be used as '
+            'a gate configuration. See docs/flag-marker-sweep-recurring.md.',
             MARKER_SOURCE, total_source, flag_for_stage2_total, project_id,
         )
     cross_check = {
@@ -942,17 +946,12 @@ def _resolve_check_exit_code(
     ``report['before']['total_source']`` otherwise (a dry-run/``--check``-only
     invocation, which never populates ``'after'``).
 
-    Task 3897 added the blind-spot escalation as opt-in, to preserve the
-    contract of the one predicate then wired to
-    ``scripts/fused-memory-flag-marker-check.sh``. Task 3923 ARMS it by
-    default: that consumer (the esc-2866-1 O2 watch, task 2902) was a
-    one-shot dated milestone that fired 2026-07-29 and is now ``done``, and
-    no other ``before_done`` wiring of the wrapper exists, so the
-    backward-compatibility obligation is discharged. A verdict rendered from
-    an enumeration that matched NOTHING must not read as a pass — with zero
-    consumers nothing fails forever, and a future re-wire fails loudly on
-    day one rather than passing silently. Rationale:
-    ``docs/flag-marker-sweep-recurring.md``.
+    The blind-spot escalation was opt-in when task 3897 added it and is
+    ARMED BY DEFAULT since task 3923 (the gate's only consumer, task 2902,
+    is done): a verdict rendered from an enumeration that matched NOTHING
+    must not read as a pass. Ruling, dated census and the remediation path
+    when it trips: ``docs/flag-marker-sweep-recurring.md`` §"Decision (task
+    3923)".
 
     Pure, sync, no I/O.
 
@@ -1131,9 +1130,10 @@ def _build_parser() -> argparse.ArgumentParser:
             'non-empty) to exit 1. This is the DEFAULT since task 3923; the '
             'flag remains accepted as an explicit affirmation of it. A '
             'failed census probe never trips it, so a transient backend blip '
-            'cannot flap the verdict. The blind spot is reported either way: '
-            "loudly in the log and in the JSON report's cross_check block. "
-            'Full rationale and dated census: docs/flag-marker-sweep-recurring.md.'
+            'cannot flap the verdict, and the blind spot is reported either '
+            "way (log WARNING + the JSON report's cross_check block). "
+            'Ruling, dated census and remediation: '
+            'docs/flag-marker-sweep-recurring.md.'
         ),
     )
     parser.add_argument(
@@ -1142,10 +1142,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             'REQUIRES --check (rejected at parse time without it). Opt OUT '
             'of the blind-spot escalation, returning --check to a plain '
-            'backlog verdict. For an ad-hoc census where you want the '
-            'residual count without the vacuity veto. Relaxes ONLY the '
-            'vacuity check: a residual backlog over --max-backlog still '
-            'exits 1. Full rationale: docs/flag-marker-sweep-recurring.md.'
+            'backlog verdict. CENSUS-ONLY, never a gate configuration: it '
+            'restores the vacuous pass task 3923 armed the default to '
+            'eliminate. Relaxes ONLY the vacuity check — a residual backlog '
+            'over --max-backlog still exits 1. Ruling and remediation: '
+            'docs/flag-marker-sweep-recurring.md.'
         ),
     )
     return parser
@@ -1176,12 +1177,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     Task 3923 makes the blind-spot policy a TRI-STATE: argparse leaves it
     ``None`` when neither spelling is passed, and this function resolves that
-    sentinel to ``True`` (armed) only AFTER the validation above. The
-    ordering is load-bearing — it keys the rejection on the flag having been
+    sentinel to ``True`` (armed) only AFTER the validation above. THE
+    ORDERING IS LOAD-BEARING — it keys the rejection on the flag having been
     passed EXPLICITLY, so the nightly ``--apply --terminal-drain`` service
     (which passes neither, and never reaches the verdict path) keeps parsing
     cleanly instead of failing with exit 2 under a default it never asked
-    for.
+    for. Pinned by
+    ``test_nightly_sweep_argv_still_parses_under_the_armed_default``.
 
     Args:
         argv: Argument list to parse; ``None`` reads ``sys.argv[1:]``.
@@ -1217,12 +1219,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             f'or drop {passed}: the blind spot is reported in the log and in '
             "the JSON report's cross_check block either way."
         )
-    # Resolve the tri-state sentinel AFTER the validation above (task 3923).
-    # Order is load-bearing: the rejection keys on the flag having been
-    # passed EXPLICITLY, so resolving first would make the nightly
-    # `--apply --terminal-drain` invocation (which passes neither spelling,
-    # and never reaches _resolve_check_exit_code anyway) fail parse with
-    # exit 2 under a default it never asked for.
+    # Resolve the tri-state sentinel AFTER the validation above — see the
+    # load-bearing-ordering paragraph in this function's docstring.
     if args.fail_on_blind_spot is None:
         args.fail_on_blind_spot = True
     return args
