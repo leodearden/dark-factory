@@ -331,6 +331,11 @@ def test_subject_position_positives_extract_unchanged_under_both_candidates(
 
 _PAGE_SIZE = 4
 
+# Sentinel: derive the census count from the fake's own rows. A plain None
+# default would be indistinguishable from 'the probe answered None', which
+# is one of the fail-closed cases under test.
+_DERIVE_COUNT = object()
+
 
 class _FakeCappedEdgeQuery:
     """A query_fn that truncates every response exactly as the server does.
@@ -345,17 +350,33 @@ class _FakeCappedEdgeQuery:
     to the page size, which is the worst case: a full page is
     indistinguishable from a truncated one by row count alone, so the
     enumerator cannot cheat by noticing a suspiciously round number.
+
+    It also answers the census ``count(DISTINCT e.uuid)`` probe, because the
+    enumerator cross-checks what it enumerated against it. That answer is
+    DERIVED from the same rows the paged query serves — never supplied
+    independently — so the fake cannot accidentally agree with a broken
+    enumerator. It is returned UNCAPPED, modelling the real property that
+    makes the probe a proof: a single-row result cannot be truncated by a
+    row cap. ``count_rows`` overrides it to model a probe that answers
+    nothing.
     """
 
-    def __init__(self, rows: list[list], cap: int) -> None:
+    def __init__(
+        self, rows: list[list], cap: int, *, count_rows: object = _DERIVE_COUNT,
+    ) -> None:
         self.rows = rows
         self.cap = cap
+        self.count_rows = count_rows
         self.cyphers: list[str] = []
 
     async def __call__(self, cypher: str) -> list[list]:
         import re as _re
 
         self.cyphers.append(cypher)
+        if 'count(' in cypher:
+            if self.count_rows is not _DERIVE_COUNT:
+                return self.count_rows  # type: ignore[return-value]
+            return [[len({row[0] for row in self.rows})]]
         window = _re.search(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', cypher)
         if window:
             skip, limit = int(window.group(1)), int(window.group(2))
@@ -403,8 +424,9 @@ async def test_edge_enumeration_paginates_past_the_resultset_cap():
     # ...and a NULL fact becomes '' rather than None
     assert facts['edge-03'] == ''
     # pagination actually happened: more than one page was requested
-    assert len(query_fn.cyphers) > 1
-    assert all('SKIP' in c and 'LIMIT' in c for c in query_fn.cyphers)
+    page_cyphers = [c for c in query_fn.cyphers if 'count(' not in c]
+    assert len(page_cyphers) > 1
+    assert all('SKIP' in c and 'LIMIT' in c for c in page_cyphers)
 
 
 @pytest.mark.asyncio
@@ -601,6 +623,129 @@ def test_build_parser_rejects_a_page_size_at_or_above_the_server_cap():
 
     ok = build_parser().parse_args(['--page-size', '5000'])
     assert ok.page_size == 5000
+
+
+# ---------------------------------------------------------------------------
+# The EMPIRICAL completeness proof
+# ---------------------------------------------------------------------------
+#
+# The structural checks above still only reason about a constant we guessed.
+# RESULTSET_SIZE is an ASSUMPTION about server configuration, while the
+# defect class is 'a short page was mistaken for end-of-data' — so any check
+# that reasons only from that constant inherits the guess.
+#
+# A `RETURN count(DISTINCT e.uuid)` probe returns exactly ONE row, so it can
+# never itself be truncated by the cap it is measuring. That is what makes
+# `len(facts) == expected` a PROOF rather than one more heuristic, and it
+# catches causes nobody enumerated in advance: a server configured below the
+# assumed constant, unstable DISTINCT+SKIP/LIMIT page boundaries, a dropped
+# page.
+
+
+@pytest.mark.asyncio
+async def test_enumeration_fails_closed_when_the_server_caps_below_the_assumed_constant():
+    """The residual hazard the constant check structurally CANNOT reach.
+
+    Here the fake caps at 10 rows, page_size is 20, and ``resultset_size`` is
+    left at its DEFAULT 10000 — so `20 < 10000` and the structural check
+    PROVABLY passes. The first page comes back with 10 rows, the short-page
+    break fires, and without a cross-check the function reports 10 of 50
+    edges as a complete enumeration: the identical silent truncation,
+    undetected.
+
+    This test is what proves the census cross-check is load-bearing rather
+    than redundant with the constant check.
+    """
+    query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=10)
+
+    facts, complete = await enumerate_valid_edge_facts(query_fn, page_size=20)
+
+    assert complete is False, (
+        'enumerated 10 against a census-reported 50 — a count mismatch is a '
+        'shortfall however it was caused'
+    )
+    assert len(facts) < 50
+
+
+@pytest.mark.asyncio
+async def test_enumeration_is_complete_when_the_enumerated_count_matches_the_census():
+    """The proof must be able to say YES.
+
+    The other half of the regression guard: a cross-check that always fails
+    closed is just a broken enumerator with better manners, and would make
+    the live run — and therefore this task's whole deliverable —
+    unpublishable.
+    """
+    query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)
+
+    facts, complete = await enumerate_valid_edge_facts(
+        query_fn, page_size=_PAGE_SIZE,
+    )
+
+    assert complete is True
+    assert len(facts) == 50
+
+
+@pytest.mark.asyncio
+async def test_count_probe_is_issued_once_and_is_not_paged():
+    """Unpaged and single is precisely what makes the probe a proof.
+
+    Adding SKIP/LIMIT to it would subject the proof to the very truncation it
+    exists to detect. Issuing it per page would scale its cost with the
+    corpus for no extra information — and, worse, invite a mid-enumeration
+    answer to be treated as the total.
+
+    It must also count the SAME population the paged query enumerates: the
+    same MATCH and WHERE, and DISTINCT on e.uuid so the undirected match's
+    double-attribution collapses exactly as the paged dict-dedup collapses
+    it. Two numbers derived from different populations are not comparable,
+    and comparing them would manufacture a mismatch on every run.
+    """
+    query_fn = _FakeCappedEdgeQuery(_fake_rows(20), cap=_PAGE_SIZE)
+
+    await enumerate_valid_edge_facts(query_fn, page_size=_PAGE_SIZE)
+
+    count_cyphers = [c for c in query_fn.cyphers if 'count(' in c]
+    assert len(count_cyphers) == 1, query_fn.cyphers
+    probe = count_cyphers[0]
+    assert 'SKIP' not in probe, probe
+    assert 'LIMIT' not in probe, probe
+    assert 'DISTINCT e.uuid' in probe, probe
+    assert '(n:Entity)-[e:RELATES_TO]-()' in probe, probe
+    assert 'e.invalid_at IS NULL' in probe, probe
+
+
+@pytest.mark.parametrize(
+    'count_rows',
+    [
+        pytest.param([], id='empty-result-set'),
+        pytest.param(None, id='null-result-set'),
+        pytest.param([[None]], id='null-count'),
+        pytest.param([[]], id='row-with-no-columns'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_enumeration_fails_closed_when_the_count_probe_returns_nothing(
+    count_rows,
+):
+    """A missing proof is not a passing proof.
+
+    When the census probe answers nothing there is no evidence either way,
+    and failing OPEN would publish an unverified `complete: true` under the
+    very mechanism whose purpose is to make that claim earned. Note the
+    enumeration itself SUCCEEDS in every case here — all 50 edges are
+    fetched — so nothing but the missing proof is driving the False.
+    """
+    query_fn = _FakeCappedEdgeQuery(
+        _fake_rows(50), cap=_PAGE_SIZE, count_rows=count_rows,
+    )
+
+    facts, complete = await enumerate_valid_edge_facts(
+        query_fn, page_size=_PAGE_SIZE,
+    )
+
+    assert complete is False
+    assert len(facts) == 50, 'the paging worked; only the proof was unavailable'
 
 
 # ---------------------------------------------------------------------------
