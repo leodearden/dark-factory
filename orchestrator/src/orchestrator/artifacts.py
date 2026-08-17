@@ -20,6 +20,26 @@ logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
 
+
+class ArtifactWriteError(OSError):
+    """An atomic artifact write was REFUSED; the target was left UNTOUCHED.
+
+    Names both the requested and the resolved path in its message so the
+    failure is actionable without log-scraping.
+
+    Reserved for the ONE refusal that has no natural ``OSError`` of its own:
+    declining to write through a DANGLING symlink is a decision this module
+    makes, not an error the kernel reported.  Ordinary write failures
+    (EACCES, ENOSPC, …) keep propagating as their own types — ``_write_json``
+    has ~13 callers whose observable contract is "whatever OSError the
+    filesystem raised", and blanket-wrapping them would change that for every
+    artifact writer in the orchestrator as a side effect of an atomicity fix.
+
+    Subclasses ``OSError`` so existing ``except OSError`` handlers keep
+    working, and is a DISTINCT type so ``_write_json``'s vanished-root
+    ``except FileNotFoundError`` tolerance cannot accidentally swallow it.
+    """
+
 # Matches one-or-more leading ``[COMMITTED <hex>]`` provenance tags (with any
 # trailing whitespace) at the START of a step description.  Used by
 # :meth:`TaskArtifacts.mark_step_committed` to strip a stale tag before
@@ -1571,6 +1591,18 @@ class TaskArtifacts:
         free by truncating rather than recreating; a new one lands with the
         umask-derived mode ``write_text`` would have given it.
 
+        A SYMLINKED target is written THROUGH, as ``write_text`` wrote through
+        it: *path* is resolved first and the real file is what gets replaced.
+        This is load-bearing, not hygiene — ``ensure_lane_plan_symlink`` makes
+        ``<worktree>/.task/plan.json`` a symlink onto the meta-root plan, and
+        a bare replace onto the link path would swap it for a regular file,
+        silently re-forking the lane and meta-root copies (the esc-5205-9
+        stale-plan divergence).  Resolving also guarantees the temp shares a
+        filesystem with the real file, so the replace is an intra-filesystem
+        rename rather than EXDEV.  A DANGLING link is REFUSED with
+        :class:`ArtifactWriteError` rather than materialising a stray regular
+        file at the link path — that stray file would BE the divergence.
+
         The tmp+rename itself is DELEGATED to ``shared.safe_io`` rather than
         re-implemented here: that helper is the repo's single blessed home for
         the pattern (its unique-per-writer O_CREAT|O_EXCL temp, fchmod on the
@@ -1588,14 +1620,25 @@ class TaskArtifacts:
         # opportunistic writes (reviews, iteration log) just want a no-op
         # when the worktree has been deleted out-of-band.
         try:
-            # Inside the try, so a NON-FileNotFoundError stat failure is
-            # reported through the same path as any other write failure, while
-            # a stat FileNotFoundError on a vanished root still lands in the
-            # tolerated no-op branch below.
+            # Resolve FIRST — write through a symlink, never onto it.  Order
+            # inside this block is deliberate: the refusal must precede any
+            # filesystem mutation, so dangling check → mode lookup → write.
+            target = Path(os.path.realpath(path))
+            if path.is_symlink() and not target.parent.is_dir():
+                raise ArtifactWriteError(
+                    f'atomic artifact write to {path} refused: its resolved '
+                    f'target {target} has no existing parent directory (a '
+                    'dangling symlink?) — refusing to materialise a stray '
+                    'file at the link path'
+                )
+            # ``_existing_mode`` is inside the try so a NON-FileNotFoundError
+            # stat failure is reported through the same path as any other
+            # write failure, while a stat FileNotFoundError on a vanished root
+            # still lands in the tolerated no-op branch below.
             safe_io.atomic_write_text(
-                path,
+                target,
                 json.dumps(data, indent=2) + '\n',  # byte format UNCHANGED
-                mode=_existing_mode(path),
+                mode=_existing_mode(target),
                 fsync=True,
                 mkdir=True,
             )
