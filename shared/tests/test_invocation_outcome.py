@@ -305,7 +305,9 @@ class TestClassifyInvocationAuthFailedPrecedence:
             api_error_status=401,
         )
         outcome = classify_invocation(result, strict_confirm=True)
-        assert outcome == AuthFailed(status=401)
+        assert outcome == AuthFailed(
+            status=401, body="You've hit your usage limit. Your plan resets in 3h."
+        )
 
     def test_429_with_cap_text_is_cap_hit_not_auth_failed(self):
         """429 is deliberately excluded from AuthFailed — it carries a real cap body."""
@@ -451,7 +453,9 @@ class TestClassifyInvocationCliLocalError:
             stderr='Error: Session ID abc-123 is already in use.',
         )
         outcome = classify_invocation(result, strict_confirm=True)
-        assert outcome == AuthFailed(status=401)
+        assert outcome == AuthFailed(
+            status=401, body='Error: Session ID abc-123 is already in use.'
+        )
 
     def test_success_true_outranks_incidental_cli_marker_text(self):
         """A successful invocation is authoritative even when its own output

@@ -445,7 +445,18 @@ def classify_invocation(
     # cap detection entirely and never trip AllAccountsCappedException
     # (mirrors cli_invoke.py:799-805).
     if result.api_error_status in (401, 403):
-        return AuthFailed(status=result.api_error_status)
+        # Capture the response-body snippet: the numeric status alone cannot
+        # distinguish OAuth revocation from expiry from an org-policy block.
+        # Restores the text dropped by b68eea415b (task 2134 step-4), which
+        # replaced `_handle_auth_failure(f'HTTP {status}: {output[:120]}')`
+        # with `slot.report(outcome)`. Cannot reuse the `combined` string
+        # built below (it is assembled AFTER this tier and interleaves
+        # stderr+output with a newline); output-preferred with a stderr
+        # fallback matches the pre-refactor `result.output[:120]`. Truncating
+        # AFTER the fallback choice spends the 120-char budget on whichever
+        # stream actually carried text.
+        snippet = (result.output or '').strip() or (result.stderr or '').strip()
+        return AuthFailed(status=result.api_error_status, body=snippet[:120])
 
     combined = f'{result.stderr or ""}\n{result.output or ""}'
     combined_lower = combined.lower()
