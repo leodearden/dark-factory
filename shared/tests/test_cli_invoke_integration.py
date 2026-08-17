@@ -40,7 +40,7 @@ healthy accounts, and a probe older than ~15 minutes is stale.
 Probe via ``invoke_claude_agent`` (what these tests call), e.g. by aiming
 account A at the letter under test and running the single-account case:
 
-    CROSS_ACCOUNT_RESUME_TOKENS='F,C' uv run --project shared --directory shared \\
+    CROSS_ACCOUNT_RESUME_TOKENS='F,C' uv run --directory shared \\
         pytest tests/test_cli_invoke_integration.py -m integration -q \\
         -k test_invoke_returns_session_id
 
@@ -104,7 +104,7 @@ CLI budget here. No ordinary run, from any directory, collects these; without
 looks green while having executed nothing.
 
 Run explicitly, from the repo root:
-    uv run --project shared --directory shared \\
+    uv run --directory shared \\
         pytest tests/test_cli_invoke_integration.py -xvs -m integration
 """
 
