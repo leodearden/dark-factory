@@ -56,6 +56,9 @@ def _load_module(mod_name: str, path: Path) -> types.ModuleType:
 
 _mod = _load_module('measure_plural_enum_guard_recall', SCRIPT_PATH)
 enumerate_valid_edge_facts = _mod.enumerate_valid_edge_facts
+run = _mod.run
+exit_code = _mod.exit_code
+build_parser = _mod._build_parser
 scan_corpus = _mod.scan_corpus
 triage_rejection = _mod.triage_rejection
 simulate_candidate = _mod.simulate_candidate
@@ -432,6 +435,147 @@ async def test_edge_enumeration_of_empty_graph_is_complete_and_empty():
 
     assert facts == {}
     assert complete is True
+
+
+# ---------------------------------------------------------------------------
+# run(): aggregation and the fail-closed rule
+# ---------------------------------------------------------------------------
+
+
+class _FakeEdgeSource:
+    """The ONLY corpus source these tests use — no live backend is reachable.
+
+    Records the project ids it was asked for, so a probe that silently
+    reached past the injected seam to a real graph would be caught by the
+    call log rather than by a mysteriously large number.
+    """
+
+    def __init__(self, corpora: dict[str, tuple[list[str], bool]]) -> None:
+        self.corpora = corpora
+        self.asked: list[str] = []
+
+    async def __call__(self, project_id: str, *, page_size: int):
+        self.asked.append(project_id)
+        facts, complete = self.corpora[project_id]
+        return {f'{project_id}-edge-{i}': f for i, f in enumerate(facts)}, complete
+
+
+_ALPHA_FACTS = [
+    'Tasks 1020 and 1030 are pending.',  # selected
+    'Reviews of tasks 1020 and 1030 are pending.',  # guard-rejected
+    'The merge worker restarted.',  # nothing
+]
+_BETA_FACTS = [
+    'As of 2026-08-09, tasks 1020 and 1030 are pending.',  # guard-rejected
+    'Tasks 1752 and 1753 are related to the uptime feed.',  # lexical near-miss
+]
+
+
+def _args(**overrides):
+    parsed = build_parser().parse_args([])
+    for key, value in overrides.items():
+        setattr(parsed, key, value)
+    return parsed
+
+
+@pytest.mark.asyncio
+async def test_run_aggregates_per_project_counts_into_the_totals():
+    """Totals must be the sum of the parts, not an independently-derived number.
+
+    The report is committed and cited; a totals row that can drift from its
+    own per-project rows is a report that can lie without anything failing.
+    """
+    source = _FakeEdgeSource({
+        'alpha': (_ALPHA_FACTS, True),
+        'beta': (_BETA_FACTS, True),
+    })
+
+    report = await run(
+        _args(project_id=['alpha', 'beta']), edge_source=source,
+    )
+
+    assert source.asked == ['alpha', 'beta']
+    assert [p.project_id for p in report.projects] == ['alpha', 'beta']
+
+    by_id = {p.project_id: p for p in report.projects}
+    assert by_id['alpha'].valid_edges == 3
+    assert by_id['alpha'].scan.selected == 1
+    assert by_id['alpha'].scan.guard_rejected == 1
+    assert by_id['beta'].valid_edges == 2
+    assert by_id['beta'].scan.guard_rejected == 1
+    assert by_id['beta'].scan.lexical_precondition == 2
+
+    for attr in (
+        'facts_scanned', 'lexical_precondition',
+        'regex_matched', 'guard_rejected', 'selected',
+    ):
+        assert getattr(report.totals, attr) == sum(
+            getattr(p.scan, attr) for p in report.projects
+        ), attr
+    assert report.total_valid_edges == 5
+
+
+@pytest.mark.asyncio
+async def test_run_carries_candidate_simulations_and_a_verdict():
+    """The report must stand alone: simulations and verdict live IN it."""
+    source = _FakeEdgeSource({'alpha': (_ALPHA_FACTS, True)})
+
+    report = await run(_args(project_id=['alpha']), edge_source=source)
+
+    assert [c.name for c in report.candidates] == list(_mod.CANDIDATE_NAMES)
+    assert report.verdict
+    assert report.complete is True
+    assert exit_code(report) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_fails_closed_when_any_project_enumeration_is_incomplete():
+    """An under-enumerated corpus is a FAILURE, not a smaller report.
+
+    This task's headline result is a zero. A zero measured over part of the
+    corpus is worthless and, worse, indistinguishable from a real one — so
+    the incompleteness has to reach the exit code, not just a log line.
+    """
+    source = _FakeEdgeSource({
+        'alpha': (_ALPHA_FACTS, True),
+        'beta': (_BETA_FACTS, False),  # truncated enumeration
+    })
+
+    report = await run(
+        _args(project_id=['alpha', 'beta']), edge_source=source,
+    )
+
+    assert report.complete is False
+    by_id = {p.project_id: p for p in report.projects}
+    assert by_id['alpha'].complete is True
+    assert by_id['beta'].complete is False
+    assert exit_code(report) != 0
+
+
+@pytest.mark.asyncio
+async def test_run_triages_every_rejection_it_reports():
+    """Rejection counts and their triage labels must agree.
+
+    A report whose triage breakdown does not add up to its rejection count
+    would understate recall loss silently — the one direction that matters,
+    since it is the number a future reader would use to decide whether to
+    tighten.
+    """
+    source = _FakeEdgeSource({
+        'alpha': (_ALPHA_FACTS, True),
+        'beta': (_BETA_FACTS, True),
+    })
+
+    report = await run(
+        _args(project_id=['alpha', 'beta']), edge_source=source,
+    )
+
+    by_id = {p.project_id: p for p in report.projects}
+    # 'Reviews of tasks ...' is a correct rejection
+    assert by_id['alpha'].triage == {'prepositional_complement': 1}
+    # 'As of <date>, tasks ...' is the documented recall loss
+    assert by_id['beta'].triage == {'adverbial_preamble': 1}
+    assert sum(report.triage_totals.values()) == report.totals.guard_rejected
 
 
 def test_scan_corpus_of_empty_corpus_is_all_zeroes():
