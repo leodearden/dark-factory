@@ -2893,6 +2893,24 @@ def _materialize_stdin(stdin_data: bytes) -> IO[bytes]:
     pressure, exhausted fds) where the loop is most likely to be stalled, and
     would do so invisibly — see the ``no-silent-fail-soft`` design invariant.
     On failure the file is closed before re-raising so no fd is leaked.
+
+    THE RETURNED FD IS READ-ONLY.  ``tempfile.TemporaryFile()`` opens ``'w+b'``
+    (``O_RDWR``), and fd 0 is inherited by the child's WHOLE subtree — bwrap,
+    the systemd-run scope, ``nice``, the CLI, and every tool the agent itself
+    spawns.  The shape this replaced handed the child the read end of a pipe,
+    so a writable stdin would have been a silent widening of what that subtree
+    can do to its own input.  The payload is therefore re-opened ``O_RDONLY``
+    through ``/proc/self/fd/N`` — same still-unlinked inode, no filesystem
+    name, fresh description already at offset 0 — and the read-write handle is
+    closed.
+
+    That narrowing is deliberately BEST-EFFORT and logs when it is skipped,
+    which is not the same fail-soft the paragraph above forbids: the
+    race-closing invariant (payload resident in the kernel before ``execve``)
+    holds identically either way, so a host without ``/proc`` degrades to
+    today's read-write fd rather than losing every spawn.  A ``stdin=PIPE``
+    fallback would instead give up the invariant itself, which is why that one
+    raises.
     """
     # noqa SIM115: a context manager is exactly wrong here — the fd must
     # OUTLIVE this call.  It is handed to create_subprocess_exec so the child
@@ -2902,11 +2920,22 @@ def _materialize_stdin(stdin_data: bytes) -> IO[bytes]:
     try:
         f.write(stdin_data)
         f.flush()
-        f.seek(0)
+        f.seek(0)  # only load-bearing on the read-write fallback arm below
     except BaseException:
         f.close()
         raise
-    return f
+
+    try:
+        ro = open(f'/proc/self/fd/{f.fileno()}', 'rb')  # noqa: SIM115 — see above
+    except OSError as e:
+        logger.warning(
+            f'stdin payload could not be narrowed to a read-only fd ({e}); '
+            f'handing the child the read-write handle instead. The task-3147 '
+            f'pre-materialization invariant is unaffected.'
+        )
+        return f
+    f.close()
+    return ro
 
 
 async def _run_subprocess(

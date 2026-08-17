@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import hashlib
 import itertools
 import json
 import logging
 import os
 import sys
+import tempfile
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +27,7 @@ from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
     _cpu_priority_prefix,
+    _materialize_stdin,
     _parse_claude_output,
     _run_subprocess,
     _SubprocessResult,
@@ -5036,3 +5039,142 @@ class TestStdinStarvationRace:
         child_env = captured_kwargs.get('env', {})
         assert 'DF_AGENT_CPU_GOVERN' not in child_env
         assert 'DF_AGENT_CPU_NICE' not in child_env
+
+    async def test_none_stdin_data_still_inherits_stdin(self, tmp_path):
+        """stdin_data=None must still spawn with stdin=None (inherited).
+
+        Pins the contract _run_subprocess's own docstring states — "``None``
+        leaves stdin inherited from the parent" — and mirrors the sibling
+        assertion on orchestrator's _run_subprocess_local.  Without it, a
+        refactor that unconditionally materialized (handing the child an EMPTY
+        temp file) would hand every stdin_data=None caller instant EOF on fd 0
+        instead of the parent's own stdin, and nothing here would notice:
+        test_proc_tree_populated_on_real_timeout spawns a real `sleep 30`,
+        which neither reads stdin nor cares what it is.
+        """
+        captured_kwargs: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(b'', b''))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await _run_subprocess(
+                ['true'],
+                tmp_path,
+                env={},
+                model='stub',
+                timeout_seconds=20.0,
+                stdin_data=None,
+            )
+
+        assert 'stdin' in captured_kwargs
+        assert captured_kwargs['stdin'] is None, (
+            f'stdin_data=None must inherit stdin; got {captured_kwargs["stdin"]!r}'
+        )
+
+
+class TestMaterializeStdin:
+    """The helper's two deliberate, load-bearing promises (task 3147).
+
+    Both are asserted in ``_materialize_stdin``'s docstring and neither was
+    otherwise executed by any test, so a refactor could have quietly dropped
+    either one with the whole suite still green.
+    """
+
+    def test_write_failure_propagates_and_closes_the_file(self):
+        """An OSError mid-write escapes, with the fd already closed.
+
+        "Raises rather than falling back to ``stdin=PIPE``" is grounded in the
+        ``no-silent-fail-soft`` design invariant: an ``except OSError: return
+        None`` fallback would reinstate the bare PIPE — and therefore the exact
+        task-3147 race — in precisely the degraded conditions (disk pressure,
+        exhausted fds) where the event loop is most likely to be stalled.
+
+        The fd-leak half is asserted on the REAL file object's ``.closed``
+        rather than by counting ``/proc/self/fd`` entries: it is the same fact,
+        stated directly, and immune to an unrelated fd opened by pytest between
+        the two counts.
+        """
+        # noqa SIM115: the whole point is a handle that outlives the `with` —
+        # it must still be inspectable (`.closed`) after the call under test.
+        real = tempfile.TemporaryFile()  # noqa: SIM115
+        try:
+            proxy = MagicMock(wraps=real)
+            proxy.write.side_effect = OSError(28, 'No space left on device')
+
+            with (
+                patch('shared.cli_invoke.tempfile.TemporaryFile', return_value=proxy),
+                pytest.raises(OSError),
+            ):
+                _materialize_stdin(b'payload')
+
+            proxy.close.assert_called_once()
+            assert real.closed, (
+                '_materialize_stdin leaked the fd on the write-failure path'
+            )
+        finally:
+            if not real.closed:
+                real.close()
+
+    def test_tempfile_creation_failure_propagates(self):
+        """Fd exhaustion at creation raises too — no fallback arm anywhere."""
+        with (
+            patch(
+                'shared.cli_invoke.tempfile.TemporaryFile',
+                side_effect=OSError(24, 'Too many open files'),
+            ),
+            pytest.raises(OSError),
+        ):
+            _materialize_stdin(b'payload')
+
+    def test_child_receives_a_read_only_unlinked_fd(self):
+        """The fd handed to the child is O_RDONLY, unlinked, and at offset 0.
+
+        ``tempfile.TemporaryFile()`` opens ``O_RDWR``, and fd 0 is inherited by
+        the child's whole subtree (bwrap, the systemd-run scope, nice, the CLI,
+        and every tool the agent spawns).  The pipe this replaced gave the child
+        a read-only end, so the narrowing keeps that capability unchanged.
+        """
+        f = _materialize_stdin(b'payload')
+        try:
+            accmode = fcntl.fcntl(f.fileno(), fcntl.F_GETFL) & os.O_ACCMODE
+            assert accmode == os.O_RDONLY, (
+                f'child stdin is writable (accmode={accmode}); the agent subtree '
+                f'can write to its own prompt'
+            )
+            # Still O_TMPFILE-unlinked: no name in the filesystem namespace.
+            assert os.readlink(f'/proc/self/fd/{f.fileno()}').endswith('(deleted)')
+            assert f.tell() == 0
+            assert f.read() == b'payload'
+        finally:
+            f.close()
+
+    def test_read_only_narrowing_is_best_effort(self, caplog):
+        """A failed narrowing degrades to the read-write fd, loudly.
+
+        The narrowing is defense-in-depth; the race-closing invariant (payload
+        resident in the kernel before execve) holds either way.  So a host
+        where ``/proc`` is unavailable must still spawn — it must NOT lose every
+        agent — and it must say so rather than degrade silently.
+        """
+        with (
+            caplog.at_level(logging.WARNING),
+            patch('shared.cli_invoke.open', side_effect=OSError(2, 'No such file')),
+        ):
+            f = _materialize_stdin(b'payload')
+        try:
+            assert f.tell() == 0, 'fallback handle is not rewound'
+            assert f.read() == b'payload', 'fallback handle lost the payload'
+        finally:
+            f.close()
+
+        assert any(
+            'read-only fd' in r.message for r in caplog.records
+        ), f'narrowing was skipped silently; records={[r.message for r in caplog.records]}'
