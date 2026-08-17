@@ -11748,6 +11748,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         register/deregister races; a persistent leak eventually trips once
         it outlives the window.
 
+        Each violation string carries its RECLAIM DISPOSITION (task 3622):
+        below :attr:`PERIODIC_REAP_MIN_AGE_SECS` the tree is annotated as
+        scheduled for automatic reclaim by
+        :meth:`_maybe_reap_orphaned_merge_worktrees` (and names the age at
+        which that comes due); at or above it, as overdue.  Since detection
+        fires well before escalation does, this is what lets an operator tell
+        a self-healing leak from a stuck one.  The string is the ONLY channel
+        for the distinction — it is the single value flowing to all three
+        consumers (the WARNING log in :meth:`_check_resource_audit`, the
+        ``snapshot()['resource_audit']`` census, and the escalation body), so
+        annotating it reaches every consumer without adding a snapshot
+        sub-key (``snapshot()`` is under an additive-only freeze and its
+        ``resource_audit`` value is pinned by exact dict equality).  The
+        disposition is computed against
+        :attr:`PERIODIC_REAP_MIN_AGE_SECS`, NOT against the resolved
+        *grace_secs* floor, so a raised-floor caller cannot misreport an
+        in-window tree as overdue.  The leading text is unchanged.
+
         Returns ``[]`` immediately when ``not self._running``: mirrors
         :meth:`speculation_accounting_violations` — ``stop()`` drains and
         cleans up owned worktrees, so auditing during/after shutdown would
@@ -11807,10 +11825,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     continue
                 age = effective_now - mtime
                 if age > grace:
+                    # Reclaim disposition (task 3622). Compared against the
+                    # DESTRUCTION floor, never against the resolved `grace`
+                    # above — `grace` may have been raised by a *grace_secs*
+                    # caller, which would misreport an in-window tree as
+                    # overdue.
+                    reap_age = self.PERIODIC_REAP_MIN_AGE_SECS
+                    disposition = (
+                        f' — reclaim overdue: already past the periodic '
+                        f'reaper\'s {reap_age:.0f}s destruction floor and '
+                        f'still on disk'
+                        if age >= reap_age
+                        else f' — scheduled for automatic reclaim by the '
+                             f'periodic reaper once it passes age '
+                             f'{reap_age:.0f}s'
+                    )
                     violations.append(
                         f'unregistered on-disk merge worktree {path} '
                         f'(age {age:.0f}s > grace {grace:.0f}s) absent from '
                         f'owned ledger — possible leak'
+                        + disposition
                     )
         except Exception as exc:  # pragma: no cover — defensive
             violations.append(f'worktree_ledger_violations: check raised: {exc}')
