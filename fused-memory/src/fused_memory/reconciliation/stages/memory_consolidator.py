@@ -19,6 +19,10 @@ from fused_memory.reconciliation.citation_verifier import verify_cited_memories
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE1_DISALLOWED,
 )
+from fused_memory.reconciliation.curator_gate_resolution_sweep import (
+    extract_open_gate_task_ids,
+    sweep_resolved_curator_gates,
+)
 from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
     sweep_degenerate_task_nodes,
@@ -246,6 +250,40 @@ class MemoryConsolidator(BaseStage):
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
             return report
+
+        # ── Resolved human-curator-gate sweep (task 3084) ──────────────────────
+        # Flag open ``operational_mode == 'gate'`` tasks for which the reify
+        # curator has ALREADY written its ruling to Mem0 (an entry stamped
+        # ``metadata.source == 'curator_gate_{task_id}'``).  Detection was an
+        # ad-hoc Stage-3 spot-check that missed ~25% of cases (run ec45eed0:
+        # gates 5561 and 5563 were resolved-but-stale and went undetected).
+        # Stage 1 runs under DISALLOW_TASK_WRITES, so this only FLAGS; Stage 2
+        # (which holds set_task_status) acts.
+        #
+        # Placement, deliberately unlike the three other Stage-1 sweeps below
+        # (degenerate_task_node / stale_status_snapshot / stale_priority_override,
+        # which all run well after the filter chain): those only mutate Graphiti
+        # and return int stats — none of them touch the flag channel.  This one
+        # EMITS flags, so it must sit ABOVE dedup_flags, for two reasons.
+        # (1) Each appended flag then gets a stage1_flag_marker ledger row keyed
+        #     on (task_id, flag_type), giving cross-cycle recurrence tracking and
+        #     honoring explicit suppression records.  Appending below dedup_flags
+        #     would bypass dedup entirely, so an un-actioned gate flag would
+        #     re-emit unmarked every cycle with no recurrence history and no way
+        #     for an operator to suppress it.  (dedup_flags never DROPS on a hit —
+        #     only filter_suppressed drops — so re-emission until Stage 2 closes
+        #     the gate is preserved, which is the desired behaviour.)
+        # (2) It lets the ``if report.items_flagged:`` guard below fire on a cycle
+        #     where the LLM emitted zero flags of its own but the sweep found a
+        #     resolved gate.
+        if self.filtered_task_tree is not None:
+            gate_ids = extract_open_gate_task_ids(self.filtered_task_tree.active_tasks)
+            gate_sweep = await sweep_resolved_curator_gates(
+                self.memory, self.project_id, gate_ids,
+            )
+            report.items_flagged = (report.items_flagged or []) + gate_sweep['flags']
+            report.stats['curator_gate_resolution_scanned'] = gate_sweep['scanned']
+            report.stats['curator_gate_resolution_flags_emitted'] = len(gate_sweep['flags'])
 
         # Always present (task-2029 amendment): downstream consumers that read this
         # stat symmetrically with stats['stage2_flag_markers_acknowledged'] (which is
