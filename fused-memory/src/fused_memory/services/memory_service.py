@@ -2474,6 +2474,10 @@ class MemoryService:
             # add_episode's, and log_write_op is an upsert, so the retries of a
             # single item converge on one row whose last attempt wins.
             #
+            # The row's `success` is now derived from POSITIVE EVIDENCE, so a
+            # write cancelled mid-flight reports success=False rather than
+            # inheriting a default. add_episode's mirror carries the same fix.
+            #
             # `succeeded` is belt-and-braces over the widened `except`: should
             # any future BaseException bypass the handler entirely, the row
             # still cannot claim a success. log_write_op is documented

@@ -261,6 +261,13 @@ TerminalHookFn = Callable[[str, str, str | None], Coroutine[Any, Any, None]]
 # means only "the queue exhausted its attempts"; it does NOT imply the write
 # never happened, and blind-replaying such an item DUPLICATES it. Reported so
 # the two cases are separable in whatever the hook writes them to.
+#
+# The underlying fact is PERSISTED on the row (write_queue.executed), not
+# recomputed per attempt, so it survives a retry into a later attempt that
+# never reached the backend, and is deliberately STICKY across replay_dead
+# (see that method). It is also surfaced structurally as
+# get_dead_items()['executed'], so a replay decision can read a boolean
+# instead of string-matching this prefix against error prose.
 POST_EXECUTE_DEAD_PREFIX = (
     'post-execute failure (the backend write LANDED; do not blind-replay): '
 )

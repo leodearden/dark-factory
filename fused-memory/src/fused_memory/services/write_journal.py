@@ -60,8 +60,14 @@ CREATE TABLE IF NOT EXISTS write_ops (
     --               when the failure happened after the backend call
     --               succeeded. Absent that prefix, terminal_error is the
     --               queue's own f'{type(exc).__name__}: {exc}' from a failed
-    --               execute. When in doubt, check backend_ops (joined on
-    --               write_op_id) before replaying.
+    --               execute. That fact is persisted on the queue row
+    --               (write_queue.executed), so it survives a retry into a
+    --               later attempt that never reached the backend and is
+    --               sticky across replay_dead. Before replaying, read
+    --               get_dead_items()['executed'] — the same fact as a
+    --               boolean, rather than matching the prefix on this text.
+    --               When still in doubt, check backend_ops (joined on
+    --               write_op_id).
     --
     -- LAST-WRITE-WINS: replay_dead resets a dead item to pending, so a
     -- dead-letter that is later replayed and lands correctly re-stamps
