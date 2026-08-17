@@ -575,7 +575,9 @@ class TestVocabularyRejectionIsNeverSwallowed:
         mock_service = _mock_service()
         manager = create_mcp_server(mock_service)._tool_manager
         for tool_name in ('add_memory', 'add_system_record', 'update_memory'):
-            handler = manager.get_tool(tool_name).fn
+            tool = manager.get_tool(tool_name)
+            assert tool is not None, f'{tool_name} is not registered on the MCP server'
+            handler = tool.fn
             assert getattr(handler, '__mcp_tool_errors__', False), (
                 f'{tool_name} lost @mcp_tool_errors(); a seam rejection would '
                 'then escape as a raw exception on that path only'
