@@ -4269,3 +4269,142 @@ class TestCuratorGateResolutionSweepWiring:
         assert [f.get('flag_type') for f in report.items_flagged] == [
             'task_completed_not_reflected',
         ], f'got {report.items_flagged!r}'
+
+
+# ---------------------------------------------------------------------------
+# task 3084 step-13 (RED) / step-14 (GREEN): curator-gate sweep wiring guards
+# ---------------------------------------------------------------------------
+
+
+class TestCuratorGateResolutionSweepGuards:
+    """Guard/robustness behaviour around the run() curator-gate sweep wiring:
+
+    (a) a sweep failure is swallowed (best-effort, mirroring the three existing
+        sweep call sites) — run() still returns a StageReport and
+        items_flagged is left untouched.
+    (b) both stat keys are present with value 0 on a REMEDIATION pass, proving
+        they are set ABOVE the early-return and never conditionally absent —
+        the file's established convention (cf.
+        stage1_completion_markers_self_deleted, stage1_cycle_summary_ledger_written),
+        which matters because Stage 1's whole report.stats blob is serialized
+        verbatim into Stage 2's prompt by _format_report.
+    (c) the sweep does NOT run on a remediation pass — that pass re-emits a
+        curated list and skips dedup_flags for the same reason.
+    (d) filtered_task_tree is None no-ops cleanly with the stats keys at 0.
+
+    RED until step-14 moves the stat pre-init above the early-return and wraps
+    the sweep call in a best-effort try/except.
+    """
+
+    def _base_report(self, items_flagged=None) -> StageReport:
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=items_flagged if items_flagged is not None else [],
+            stats={},
+        )
+
+    async def _run(self, stage, sweep_mock, run_id: str, *, base_report=None) -> StageReport:
+        with (
+            patch.object(
+                BaseStage, 'run',
+                new=AsyncMock(return_value=base_report or self._base_report()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=lambda **kw: kw['flags']),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.sweep_resolved_curator_gates',
+                new=sweep_mock,
+            ),
+        ):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id=run_id,
+            )
+
+    @pytest.mark.asyncio
+    async def test_sweep_failure_is_swallowed_and_leaves_flags_untouched(self):
+        """(a) a raising sweep must not abort the stage or corrupt items_flagged."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('5561')])
+
+        llm_flag = {
+            'description': 'an unrelated LLM finding',
+            'severity': 'minor',
+            'task_id': '999',
+            'flag_type': 'stale_metadata',
+            'category': 'memory_stale',
+        }
+        sweep_mock = AsyncMock(side_effect=RuntimeError('qdrant down'))
+
+        report = await self._run(
+            stage, sweep_mock, 'run-3084-step13a',
+            base_report=self._base_report(items_flagged=[llm_flag]),
+        )
+
+        assert isinstance(report, StageReport), (
+            'a sweep failure must never abort the stage. '
+            'RED: the sweep call site has no try/except.'
+        )
+        assert [f.get('flag_type') for f in report.items_flagged] == ['stale_metadata'], (
+            f'items_flagged must be unchanged by a failed sweep; got {report.items_flagged!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_pass_has_both_stat_keys_at_zero(self):
+        """(b) the keys are set above the early-return, so they are never absent."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.remediation_findings = [{'description': 'some finding'}]
+        stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('5561')])
+        sweep_mock = AsyncMock(return_value={
+            'flags': [], 'scanned': 0, 'resolved': 0, 'errors': 0,
+        })
+
+        report = await self._run(stage, sweep_mock, 'run-3084-step13b')
+
+        assert report.stats.get('curator_gate_resolution_scanned') == 0, (
+            'the stat must be present at 0 on a remediation pass — Stage 1 stats '
+            f'are serialized verbatim into Stage 2s prompt; got {report.stats!r}. '
+            'RED: the pre-init sits below the remediation early-return.'
+        )
+        assert report.stats.get('curator_gate_resolution_flags_emitted') == 0, (
+            f'the flags_emitted stat must likewise be present at 0; got {report.stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_pass_never_sweeps(self):
+        """(c) a remediation pass re-emits a curated list — it must not sweep."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.remediation_findings = [{'description': 'some finding'}]
+        stage.filtered_task_tree = FilteredTaskTree(active_tasks=[_open_gate_task('5561')])
+        sweep_mock = AsyncMock(return_value={
+            'flags': [], 'scanned': 0, 'resolved': 0, 'errors': 0,
+        })
+
+        await self._run(stage, sweep_mock, 'run-3084-step13c')
+
+        sweep_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_none_filtered_task_tree_noops_with_stats_at_zero(self):
+        """(d) no task tree -> no sweep, no raise, and both keys still present at 0."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.filtered_task_tree = None
+        sweep_mock = AsyncMock(return_value={
+            'flags': [], 'scanned': 0, 'resolved': 0, 'errors': 0,
+        })
+
+        report = await self._run(stage, sweep_mock, 'run-3084-step13d')
+
+        sweep_mock.assert_not_awaited()
+        assert report.stats.get('curator_gate_resolution_scanned') == 0, (
+            f'got stats={report.stats!r}'
+        )
+        assert report.stats.get('curator_gate_resolution_flags_emitted') == 0, (
+            f'got stats={report.stats!r}'
+        )
