@@ -30,11 +30,32 @@ import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
-import conftest
+import conftest as _conftest_module
 import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+
+# Deliberately re-bound through an ``Any`` alias, so the accesses below are not
+# type-checked against whichever ``conftest`` pyright happened to resolve. Two
+# things make a statically-checked ``conftest.<attr>`` unreliable HERE, and the
+# alias closes both:
+#
+# 1. WHICH conftest. ``escalation/pyproject.toml``'s ``[tool.pyright]`` carries
+#    BOTH ``tests`` and ``..`` on extraPaths, and each holds a ``conftest.py``
+#    (this suite's, and the repo-root sys.path shim). Measured: pyright resolves
+#    the bare name to a different one of the two depending on the directory it
+#    is invoked from, so the attributes below read as missing from "module
+#    conftest" in some invocations and resolve fine in others.
+# 2. ``__wrapped__``. ``@pytest.fixture`` types its result as
+#    ``FixtureFunctionDefinition``, which does not declare the ``__wrapped__``
+#    that pytest sets at runtime -- the undecorated generator this module needs
+#    (see the docstring) is reachable only through that undeclared attribute.
+#
+# Runtime is untouched: this is the same ``import conftest``, so the empirically
+# verified resolution to ``escalation/tests/conftest.py`` still applies.
+conftest: Any = _conftest_module
 
 # ---------------------------------------------------------------------------
 # A live TCP endpoint that is NOT an MCP server — the readiness discriminator.
@@ -150,7 +171,7 @@ def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
     with _listener_without_mcp_route() as port:
         monkeypatch.setattr(conftest, '_free_escalation_port', lambda: port)
 
-        gen = conftest.serve_escalation_mcp.__wrapped__()  # pyright: ignore[reportFunctionMemberAccess]
+        gen = conftest.serve_escalation_mcp.__wrapped__()
         try:
             start = next(gen)
             with pytest.raises(RuntimeError) as excinfo:
@@ -253,7 +274,7 @@ def test_the_fixture_stops_its_serving_thread_on_teardown(
     name identify exactly one thread, this test's.
     """
     before = set(threading.enumerate())
-    gen = conftest.serve_escalation_mcp.__wrapped__()  # pyright: ignore[reportFunctionMemberAccess]
+    gen = conftest.serve_escalation_mcp.__wrapped__()
     try:
         start = next(gen)
         _base_url, port, _queue = start(tmp_path_factory.mktemp('serve_teardown'))
