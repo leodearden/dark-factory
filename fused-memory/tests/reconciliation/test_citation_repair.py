@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock
 import pytest
 from _fm_helpers import FakeMemoryLookup, build_journal_with_closed_run
 
+from fused_memory.models.reconciliation import RunStatus
 from fused_memory.reconciliation import citation_repair
 
 RUN_ID = '06a4466d-cdc0-49ac-8e99-e6723be39392'
@@ -663,6 +664,130 @@ class TestRepairLiveRunRefusalAndDryRun:
             assert {k: v for k, v in dry.items() if k != 'status'} == {
                 k: v for k, v in applied.items() if k != 'status'
             }
+        finally:
+            await journal.close()
+
+
+# Every ``RunStatus`` member, classified explicitly. Declared here rather than
+# imported from the implementation's own allowlist, so this states an
+# INDEPENDENT expectation instead of restating the code under test, and
+# ``test_verdict_map_covers_every_run_status`` pins it to the enum EXACTLY: add a
+# seventh status later and this module fails until someone labels it, rather
+# than the new member silently defaulting to repairable — which is precisely how
+# ``interrupted`` slipped through the original single-value guard.
+_STATUS_VERDICTS: dict[RunStatus, str] = {
+    # In flight by its own row.
+    RunStatus.running: 'refused',
+    # RESUMABLE, not finished — the specifically dangerous one.
+    # ``journal.get_interrupted_runs()`` is literally
+    # ``SELECT * FROM runs WHERE status = 'interrupted'``, so this is the ONE
+    # status the startup adopt-and-resume pass re-claims. The resumed cycle sets
+    # ``status = running`` IN MEMORY ONLY (harness's own comment: "The row is
+    # 'interrupted' on disk") and then rewrites the whole ``stage_reports`` blob
+    # from its loaded copy at each stage boundary — so a repair applied after
+    # that load reports success and is then silently overwritten.
+    RunStatus.interrupted: 'refused',
+    # Genuinely terminal: the ``get_interrupted_runs`` query above never selects
+    # these, and nothing else re-adopts a run, so no writer can clobber a repair.
+    RunStatus.completed: 'repairable',
+    RunStatus.failed: 'repairable',
+    RunStatus.rolled_back: 'repairable',
+    RunStatus.circuit_breaker: 'repairable',
+}
+
+
+class TestRepairRunStatusGate:
+    """Which run statuses may be repaired — asserted over the WHOLE enum.
+
+    The defect this class closes was not "one status was missed" but "the
+    guard's shape let a status be missed silently": a single ``status ==
+    'running'`` check left four of the six members untested and all four
+    permitted. So the parametrization is derived from ``list(RunStatus)`` and
+    the verdict map is pinned to the enum, rather than a hand-copied subset that
+    can drift out of sync with the thing it describes.
+    """
+
+    def test_verdict_map_covers_every_run_status(self):
+        """Adding a ``RunStatus`` member must break this until it is classified."""
+        assert set(_STATUS_VERDICTS) == set(RunStatus)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('status', list(RunStatus), ids=lambda s: s.value)
+    async def test_only_terminal_statuses_are_repairable(self, tmp_path, status):
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            status=status.value,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            if _STATUS_VERDICTS[status] == 'refused':
+                assert outcome['error'] == 'run_still_live'
+                assert outcome['error_type'] == 'ReconCitationRunStillLive'
+                # The refusal reports the row's own status verbatim — the key
+                # ``scripts/repair_recon_citation.py`` reads for its exit code,
+                # which must stay a non-{repaired,dry_run} value.
+                assert outcome['status'] == status.value
+                # Refused BEFORE any corroboration read: a refusal has no side
+                # effects, not even a backend round-trip.
+                assert memory.calls == []
+                assert _dump(await journal.get_run(RUN_ID)) == before
+            else:
+                assert outcome['status'] == 'repaired'
+                after = _dump(await journal.get_run(RUN_ID))
+                repaired = after['memory_consolidator']['items_flagged'][0]
+                assert [c['memory_id'] for c in repaired['cited_memories']] == [
+                    SUCCESSOR
+                ]
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_interrupted_refusal_names_the_resume_hazard(self, tmp_path):
+        """The ``interrupted`` refusal must say the run is RESUMABLE.
+
+        "Still live" alone is not the operator-facing fact — an interrupted run
+        looks finished. What makes the refusal legible (and tells the operator
+        it is worth retrying later) is that the run is re-adopted and re-run.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            status=RunStatus.interrupted.value,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['error'] == 'run_still_live'
+            hint = outcome['hint']
+            assert 'interrupted' in hint
+            assert 'resum' in hint.lower()
         finally:
             await journal.close()
 
