@@ -53,6 +53,7 @@ Fixtures are kept module-local (no conftest.py additions), matching
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -352,3 +353,94 @@ class TestE1ArchivedAtCompletion:
         # ...and the hook really was the only thing that would have archived it.
         assert not _archive_root(git_repo).exists()
         assert not _archived(git_repo, sid).exists()
+
+
+# ---------------------------------------------------------------------------
+# E6 — a resumed session re-archives its grown transcript (last-write-wins)
+# ---------------------------------------------------------------------------
+
+# The int-truncated skip in _archive_one compares int(dest.st_mtime) ==
+# int(src.st_mtime), so a source grown and re-archived inside the SAME
+# wall-clock second is legitimately skipped. Every row that means to trigger a
+# re-archive must therefore advance the source mtime past that truncation
+# boundary; 2s is the smallest bump that is unambiguous for a 1s granularity.
+_MTIME_BUMP_SECONDS = 2
+
+
+def _grow_and_advance(src: Path, dest: Path, extra: bytes) -> None:
+    """Append *extra* to *src* and advance its mtime past *dest*'s.
+
+    The mtime advance is MANDATORY, not hygiene: without it a grow inside the
+    same wall-clock second leaves ``int(dest.st_mtime) == int(src.st_mtime)``
+    and ``_archive_one`` correctly SKIPS the file — the row would then report a
+    stale archive and read as a production bug. Derived from *dest*'s mtime
+    (which the archiver mirrored from the pre-growth source) so the bump is
+    relative to the exact value the skip compares against.
+    """
+    with src.open('ab') as fh:
+        fh.write(extra)
+    bumped = dest.stat().st_mtime + _MTIME_BUMP_SECONDS
+    os.utime(src, (bumped, bumped))
+
+
+@pytest.mark.asyncio
+class TestE6ResumeReArchives:
+    """E6 — a resumed session's GROWN transcript replaces its earlier archive.
+
+    Drives the production resume path (``_pending_resume_session_id`` +
+    ``_pending_resume_role``) so the second ``_invoke`` reuses the first
+    session id, rather than patching ``uuid.uuid4``. That reuse IS the
+    mechanism re-archival depends on: patching uuid would fake it and leave
+    the row green even if the resume path regressed.
+    """
+
+    async def test_grown_transcript_replaces_its_earlier_archive(
+        self, monkeypatch, git_repo, git_ops, task_assignment
+    ):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = _config(git_repo)
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+
+        first_lines = [b'{"n":1}\n', b'{"n":2}\n', b'{"n":3}\n']
+        result, sid, src = await _producer_invoke(
+            workflow, cwd, payload=b''.join(first_lines)
+        )
+        assert result.success is True
+
+        archived = _archived(git_repo, sid)
+        assert archived.exists()
+        assert archived.read_bytes().splitlines() == [
+            line.rstrip(b'\n') for line in first_lines
+        ]
+        assert len(archived.read_bytes().splitlines()) == len(first_lines)
+
+        # The resumed agent appends to the SAME transcript file.
+        extra_lines = [b'{"n":4}\n', b'{"n":5}\n']
+        _grow_and_advance(src, archived, b''.join(extra_lines))
+
+        # Drive the REAL resume path: _invoke reuses a pending session id only
+        # when the role name matches too, so both fields are set.
+        workflow._pending_resume_session_id = sid
+        workflow._pending_resume_role = SIMPLE_TASK.name
+
+        # payload=None: the transcript on disk (already grown above) IS this
+        # resumed session's output — the stand-in agent must not rewrite it.
+        # session_id=sid asserts _invoke really forwarded the resumed id.
+        result2, sid2, src2 = await _producer_invoke(
+            workflow, cwd, payload=None, session_id=sid
+        )
+
+        assert result2.success is True
+        assert sid2 == sid
+        assert src2 == src
+        assert workflow._last_invoke_session_id == sid
+
+        # LAST-WRITE-WINS at the SAME archive path — not the stale 3-line copy.
+        grown = src.read_bytes()
+        assert len(grown.splitlines()) == len(first_lines) + len(extra_lines)
+        assert _archived(git_repo, sid).read_bytes() == grown
+
+        # Exactly ONE archived artefact for this session: no `.1` rotation, no
+        # `.gz`, and no `.archive-tmp` staging debris left behind by the
+        # os.replace publish.
+        assert _archive_files(git_repo) == {f'{TASK_ID}/{ENC}/{sid}.jsonl'}
