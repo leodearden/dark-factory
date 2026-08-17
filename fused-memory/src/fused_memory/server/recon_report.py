@@ -2655,7 +2655,7 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
             category=category,
             description=description,
             suggested_action=suggested_action,
-            actionable=True,
+            actionable=actionable,
             task_id=task_id,
             flag_type=flag_type,
         )
