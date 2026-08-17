@@ -1043,6 +1043,123 @@ def test_default_census_launcher_quiet_on_zero_exit(monkeypatch, caplog):
 
 
 # ---------------------------------------------------------------------------
+# task 4148: run_nightly must DEFAULT the census status_fetcher seam
+#
+# The production path is the systemd `nightly.py run --project-id %i`
+# ExecStart -> main() -> run_nightly, and main() holds only --config /
+# --project-id -- no project_root to build a fetcher from. So NOTHING on that
+# path ever constructed one, `status_fetcher=None` reached
+# compute_tasks_landed on every real run, and its `status_fetcher is None`
+# fail-safe arm logged "tasks-landed: no status_fetcher configured" instead of
+# a delta: condition (b) could not fire AT ALL. Every OTHER seam in
+# run_nightly already resolves None to its real implementation (committer ->
+# _git_commit_docs_only, recorder -> trickle_state.record_run, poster ->
+# _default_poster); status_fetcher alone resolved to nothing, which is how
+# three prior repairs of this exact code (2953, 3291, 4085) each left the
+# wiring loop open.
+# ---------------------------------------------------------------------------
+
+class TestRunNightlyDefaultsTheCensusStatusFetcher:
+    """Pin run_nightly's status_fetcher seam: None means "build the real
+    MCP-backed fetcher for cfg.project_root", an explicit value is honoured.
+
+    The spy replaces ``evaluate_census_step`` ITSELF rather than the inner
+    ``decide`` seam. That is load-bearing: task 4085 wrapped the inner
+    ``decide`` call in a never-raises try/except (nightly.py:590-606) that
+    converts any failure into a synthetic ``NO-FIRE`` line, so a spy placed
+    inside it could turn a genuine wiring fault into a quiet pass.
+    """
+
+    @staticmethod
+    def _install_spies(monkeypatch):
+        """Record the factory's argument and what evaluate_census_step got.
+
+        Returns ``(sentinel, factory_calls, seen)`` where *sentinel* is the
+        object the stubbed factory hands back -- asserted by IDENTITY, so
+        "some fetcher got built" cannot pass for "the real factory's fetcher
+        got through".
+        """
+        sentinel = object()
+        factory_calls = []
+        seen = {}
+
+        def _recording_factory(project_root):
+            factory_calls.append(project_root)
+            return sentinel
+
+        def _spy_evaluate(cfg, *, now=None, status_fetcher=None):
+            seen['status_fetcher'] = status_fetcher
+            return 'census trigger: NO-FIRE -- stub', False
+
+        monkeypatch.setattr(
+            nightly.census_trigger, 'default_status_fetcher', _recording_factory,
+        )
+        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
+        return sentinel, factory_calls, seen
+
+    @staticmethod
+    def _run_quiet_night(tmp_path, **kwargs):
+        """Drive run_nightly over the light quiet-night path (empty
+        projects_root -> empty sample -> no LLM, no commit) and return the
+        loaded config, so a caller can assert against ``cfg.project_root``."""
+        config_path = _write_config(tmp_path, project_id='proj_a')
+        nightly.run_nightly(
+            config_path=config_path,
+            projects_root=tmp_path / 'projects',
+            target_date=date(2026, 7, 13),
+            invoke=lambda prompt, model: '{"proposals": []}',
+            poster=lambda url, envelope: None,
+            **kwargs,
+        )
+        return load_config(config_path)
+
+    def test_defaults_to_the_real_mcp_backed_fetcher(self, tmp_path, monkeypatch):
+        sentinel, _factory_calls, seen = self._install_spies(monkeypatch)
+
+        # No status_fetcher argument at all -- exactly what main() passes.
+        self._run_quiet_night(tmp_path)
+
+        assert seen['status_fetcher'] is sentinel, (
+            'run_nightly handed evaluate_census_step '
+            f'{seen["status_fetcher"]!r} instead of the fetcher built by '
+            'census_trigger.default_status_fetcher -- with None, '
+            'compute_tasks_landed fails safe and condition (b) can never fire'
+        )
+
+    def test_the_fetcher_is_built_for_the_configs_project_root(self, tmp_path, monkeypatch):
+        _sentinel, factory_calls, _seen = self._install_spies(monkeypatch)
+
+        cfg = self._run_quiet_night(tmp_path)
+
+        assert len(factory_calls) == 1, (
+            'default_status_fetcher must be called exactly once per run, '
+            f'got {len(factory_calls)} call(s)'
+        )
+        # The SAME project_root evaluate_census_step hands to decide()
+        # (nightly.py:591), so the fetcher and the decision can never disagree
+        # about which project they are for.
+        assert factory_calls[0] == cfg.project_root
+        # Absolute is the wire contract task 3291 fixed: fused-memory's
+        # _normalize_project_root hard-rejects any relative path.
+        assert Path(str(factory_calls[0])).is_absolute()
+
+    def test_an_injected_fetcher_is_not_overridden(self, tmp_path, monkeypatch):
+        """DI-seam regression guard: the default must not clobber an explicit
+        fetcher (every run_nightly test that injects one depends on this)."""
+        _sentinel, factory_calls, seen = self._install_spies(monkeypatch)
+
+        def my_fake():
+            return {'statuses': {}}
+
+        self._run_quiet_night(tmp_path, status_fetcher=my_fake)
+
+        assert seen['status_fetcher'] is my_fake
+        assert factory_calls == [], (
+            'an injected status_fetcher must short-circuit the default factory'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-1/2: resolve_config_path
 # ---------------------------------------------------------------------------
 
