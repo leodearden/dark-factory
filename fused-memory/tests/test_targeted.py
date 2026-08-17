@@ -2,7 +2,7 @@
 
 import logging
 import re
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -16,6 +16,7 @@ from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.backlog_policy import BacklogVerdict
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.targeted import TargetedReconciler
+from fused_memory.reconciliation.verify import CodebaseVerifier
 
 
 @pytest_asyncio.fixture
@@ -4194,3 +4195,119 @@ class TestVerificationFailureAudit:
         )
         # Containment preserved: the exception does not propagate.
         assert 'task_id' in result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('verdict', 'expected_operation'),
+        [
+            (VerificationVerdict.confirmed, 'confirmed'),
+            (VerificationVerdict.contradicted, 'contradicted'),
+            (VerificationVerdict.inconclusive, 'inconclusive'),
+        ],
+    )
+    async def test_every_verification_outcome_records_a_row(
+        self, reconciler, journal, caplog, verdict, expected_operation
+    ):
+        """Every verify invocation records exactly one row — including healthy ones.
+
+        Without a row on the healthy paths, "agent failed" vs "genuinely
+        inconclusive" is distinguished only by a row being PRESENT vs ABSENT —
+        and absence is exactly what the 20,371-of-20,490 runs that never opened
+        this branch also look like.  That conflates "healthy inconclusive" with
+        "never ran": a fresh silent-degradation mode replacing the one being
+        fixed.  One uniform row per invocation is what makes
+        `SELECT operation, COUNT(*) FROM run_actions WHERE action_type='verify'`
+        a truthful census by construction.
+        """
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=verdict,
+            confidence=0.8,
+            evidence=[{'file_path': 'test.py', 'snippet': 'def test()'}],
+            summary='checked the codebase',
+            agent_failed=False,
+            failure_token='',
+        ))
+
+        with caplog.at_level(logging.WARNING):
+            result = await _run_done_transition(reconciler)
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        actions = await journal.get_run_actions(runs[0].id)
+
+        rows = _verify_rows(actions)
+        assert len(rows) == 1, (
+            f'Expected exactly one verify/codebase row, got '
+            f'{[(a["action_type"], a["target"], a["operation"]) for a in actions]}'
+        )
+        assert rows[0]['operation'] == expected_operation, (
+            f'Expected operation={expected_operation!r} but got {rows[0]["operation"]!r}'
+        )
+        assert rows[0]['detail'].get('task_id') == '1', (
+            f'Expected task_id in detail, got {rows[0]["detail"]!r}'
+        )
+
+        if expected_operation in ('confirmed', 'contradicted'):
+            # The new row is ADDITIVE: it records "the verifier produced
+            # outcome X", a different fact from "a memory write happened",
+            # so the pre-existing write row must survive untouched.
+            writes = [
+                a for a in actions
+                if (a['action_type'], a['target'], a['operation']) == ('write', 'memory', 'add_memory')
+                and a['detail'].get('type') == 'verification'
+            ]
+            assert len(writes) == 1, (
+                f'Expected the pre-existing verification add_memory row to survive, got '
+                f'{[(a["action_type"], a["target"], a["operation"], a["detail"]) for a in actions]}'
+            )
+        else:
+            assert any(a['type'] == 'verification_inconclusive' for a in result.get('actions', [])), (
+                f'Expected a verification_inconclusive action, got {result.get("actions")}'
+            )
+            verification_warnings = [
+                r for r in caplog.records
+                if r.levelno == logging.WARNING and 'verif' in r.getMessage().lower()
+            ]
+            assert not verification_warnings, (
+                f'An honest inconclusive is not an error and must not warn, got '
+                f'{[r.getMessage() for r in verification_warnings]}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_cli_failure_token_survives_end_to_end_into_the_journal(
+        self, reconciler, journal, config
+    ):
+        """Anti-regression for the WHOLE chain, with no VerificationResult hand-built.
+
+        Uses a REAL CodebaseVerifier and patches only AgentLoop, so the token
+        must survive agent_loop -> extract_agent_verdict -> verify.py ->
+        targeted.py -> SQLite.  A future refactor that drops the signal at any
+        one of those joints fails loudly here instead of silently restoring the
+        outage this task closed.
+        """
+        reconciler.verifier = CodebaseVerifier(config.reconciliation)
+
+        with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
+            agent = AsyncMock()
+            agent.run = AsyncMock(return_value=(
+                {'warning': 'no_tool_calls', 'warning_origin': 'cli_output_unparseable', 'text': ''},
+                [],
+            ))
+            MockAgentLoop.return_value = agent
+
+            await _run_done_transition(reconciler)
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        actions = await journal.get_run_actions(runs[0].id)
+        rows = _verify_rows(actions)
+
+        assert len(rows) == 1, (
+            f'Expected exactly one verify/codebase row, got '
+            f'{[(a["action_type"], a["target"], a["operation"]) for a in actions]}'
+        )
+        assert rows[0]['operation'] == 'agent_failed', (
+            f'Expected operation=agent_failed but got {rows[0]["operation"]!r}'
+        )
+        assert rows[0]['detail'].get('failure_token') == 'cli_output_unparseable', (
+            f'Expected the specific CLI origin to survive into the journal, got '
+            f'{rows[0]["detail"]!r}'
+        )
