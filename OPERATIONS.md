@@ -171,6 +171,24 @@ the task tree directly. For status of a *running* orchestrator's live
 state, prefer the fused-memory/escalation MCP reads in [§4](#4-watching-a-run)
 or the dashboard.
 
+### Reading the flake ledger
+
+```bash
+cd <dark-factory-repo>
+uv run --project orchestrator orchestrator flake-ledger --config /path/to/target/dark-factory-orchestrator.yaml
+```
+
+Prints three things: **open flake debt** (each suppressed test with its
+owning task id and how long the debt has been open), **per-test recurrence
+chains** (how many times a test has been re-suppressed, and when and by
+which commit it was last resolved), and **three health counters** — gate
+blind, non-convergence, and systemic. Like `orchestrator status` it reads
+persisted state and needs no running orchestrator.
+
+It is strictly read-only: it opens no debt, files no task, resolves
+nothing and escalates nothing. It will not create a ledger DB for a
+project that has none — it prints `NO LEDGER` and exits 0 instead.
+
 ### Stopping gracefully
 
 Send `SIGTERM` to the **innermost `orchestrator` process**, not the shell
