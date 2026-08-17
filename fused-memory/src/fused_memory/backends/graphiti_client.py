@@ -11,6 +11,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, NamedTuple, TypedDict, cast
 from urllib.parse import urlparse
@@ -372,6 +373,154 @@ class AmbiguousEntityError(Exception):
     The error message includes all matching UUIDs so the caller can
     disambiguate and call refresh_entity_summary with a specific UUID.
     """
+
+
+# ---------------------------------------------------------------------------
+# Paginated whole-graph reads (task 4340)
+# ---------------------------------------------------------------------------
+
+_RESULTSET_SIZE = 10000
+"""FalkorDB's server-wide result-set ceiling: every query returns at most this
+many rows, silently truncated — no error, no marker.
+
+This is an ASSUMPTION about server configuration, not a fact this repo
+controls: nothing here sets ``RESULTSET_SIZE``, and a grep finds no override
+anywhere.  Measured 2026-08-17 against localhost:6379::
+
+    GRAPH.CONFIG GET RESULTSET_SIZE  ->  10000
+
+That it is an assumption is exactly why ``_paged_ro_query`` does not trust it
+alone and cross-checks against a server-side census (see the guards there).
+"""
+
+_DEFAULT_READ_PAGE_SIZE = 5000
+"""Rows per page: half the assumed cap, so a short page really is end-of-data.
+
+The page loop breaks on a page shorter than the requested size, reasoning
+"the data is exhausted".  That reasoning is sound only while the server
+cannot be what shortened the page — i.e. only while the page size stays
+strictly below the cap.  Half the cap buys a full page of margin.
+"""
+
+_MAX_READ_PAGES = 1000
+"""Hard bound on pages per enumeration, so a pathological corpus (or a store
+that never returns a short page) cannot spin forever.
+
+At the default page size that is 5,000,000 rows, against a live maximum near
+32,000 — normal use never approaches it.  Hitting it is REPORTED
+(``complete=False`` + a WARNING naming the numbers), never silently swallowed:
+a page cap that truncates in silence would just be the defect this module
+exists to fix, moved one layer up.
+"""
+
+
+@dataclass(frozen=True)
+class PagedRead:
+    """Result of a paginated read: the rows, plus whether they are all of them.
+
+    ``reason`` is None exactly when ``complete`` is True.  ``expected_rows`` is
+    None when the census probe could not produce a usable count — an
+    unavailable proof, which is itself a reason to report incomplete.
+    """
+
+    rows: list[list]
+    complete: bool
+    rows_seen: int
+    expected_rows: int | None
+    reason: str | None
+
+
+async def _census_count(graph, cypher: str, params: dict | None = None) -> int | None:
+    """Return the single integer a ``count(...)`` probe reports, or None.
+
+    EVERY "the store did not say" shape collapses to None — no rows, a null
+    result set, a row with no columns, a NULL value, a non-integer — because
+    the caller treats None as fail-closed and there is nothing to gain from
+    distinguishing flavours of missing evidence.
+
+    A single-row aggregate can never be truncated by the row cap it is being
+    used to detect, which is what makes this a proof rather than one more
+    heuristic.
+    """
+    result = await graph.ro_query(cypher, params)
+    rows = getattr(result, 'result_set', None) or []
+    if not rows:
+        return None
+    first = rows[0]
+    if first is None or len(first) == 0:
+        return None
+    try:
+        return int(first[0])
+    except (TypeError, ValueError):
+        return None
+
+
+async def _paged_ro_query(
+    graph,
+    page_template: str,
+    census_cypher: str,
+    *,
+    params: dict | None = None,
+    page_size: int = _DEFAULT_READ_PAGE_SIZE,
+    resultset_size: int = _RESULTSET_SIZE,
+    max_pages: int = _MAX_READ_PAGES,
+) -> PagedRead:
+    """Read every row a whole-graph query matches, past the server's row cap.
+
+    ``page_template`` must be a Cypher string with ``{skip}`` and ``{limit}``
+    placeholders and a TOTAL ``ORDER BY``; ``census_cypher`` must be the
+    identical MATCH/WHERE returning ``count(*)``, so the two numbers describe
+    the same population.
+
+    The ``ORDER BY`` is load-bearing, not cosmetic: every page is a SEPARATE
+    query, and SKIP/LIMIT with no total order gives the store no obligation to
+    return rows in the same order twice — so ``SKIP n`` on page 2 can skip rows
+    page 1 never returned (silently dropped, permanently) or re-return rows it
+    did (harmlessly deduped, which is what makes the drop so easy to miss).
+
+    SKIP/LIMIT bounds are formatted as validated ints rather than bound as
+    ``$`` parameters: parameterised SKIP/LIMIT is not portable across Cypher
+    implementations, and these are integers this module computes, never caller
+    data, so there is no injection surface.  They are coerced to int before
+    formatting so a non-int can never reach the template.
+
+    Args:
+        graph: FalkorDB graph handle exposing ``async ro_query(cypher, params)``.
+        page_template: Page query with ``{skip}``/``{limit}`` placeholders.
+        census_cypher: Single-row ``count(*)`` over the identical MATCH/WHERE.
+        params: Optional bound parameters, passed to every query.
+        page_size: Rows per page. Must stay strictly below ``resultset_size``.
+        resultset_size: Assumed server row cap (see ``_RESULTSET_SIZE``).
+        max_pages: Hard bound on pages fetched.
+
+    Returns:
+        PagedRead. See the guards in the body for when ``complete`` is False.
+    """
+    page_size = int(page_size)
+    resultset_size = int(resultset_size)
+    max_pages = int(max_pages)
+
+    expected = await _census_count(graph, census_cypher, params)
+
+    rows: list[list] = []
+    skip = 0
+    for _ in range(max_pages):
+        page_cypher = page_template.format(skip=int(skip), limit=int(page_size))
+        result = await graph.ro_query(page_cypher, params)
+        page = list(getattr(result, 'result_set', None) or [])
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        skip += len(page)
+
+    rows_seen = len(rows)
+    return PagedRead(
+        rows=rows,
+        complete=True,
+        rows_seen=rows_seen,
+        expected_rows=expected,
+        reason=None,
+    )
 
 
 def _as_sortable_utc(created_at: datetime | None) -> datetime:
