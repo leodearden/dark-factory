@@ -307,6 +307,24 @@ class TestMakeGraphMockCypherDispatch:
         assert result.result_set[0][0] == len(rows)
 
     @pytest.mark.asyncio
+    async def test_a_count_column_among_others_is_not_a_census(self, make_graph_mock):
+        """The census dispatch is NARROW: only a bare `RETURN count(*)` projection.
+
+        A loose `'count(' in cypher` test also captures ordinary queries that
+        return a count as one column among several — find_duplicate_entity_nodes
+        issues `RETURN n.uuid, ..., count(e)` — and handing those a
+        single-column [[n]] row raises IndexError deep inside the method under
+        test, nowhere near the fixture.
+        """
+        rows = [['dup-uuid-1', 200, 2]]
+        graph = make_graph_mock(rows)
+        result = await graph.ro_query(
+            'MATCH (n:Entity {name: $name})-[e:RELATES_TO]-() '
+            'RETURN n.uuid, n.created_at, count(e) AS edge_count'
+        )
+        assert result.result_set == rows
+
+    @pytest.mark.asyncio
     async def test_paged_query_answers_with_the_requested_slice(self, make_graph_mock):
         rows = [[f'n{i}'] for i in range(10)]
         graph = make_graph_mock(rows)

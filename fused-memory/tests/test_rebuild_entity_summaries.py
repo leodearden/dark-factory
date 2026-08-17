@@ -270,7 +270,11 @@ class TestListEntityNodes:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.list_entity_nodes(group_id='test')
-        graph.ro_query.assert_awaited_once()
+        # Paginated (task 4340): a census probe plus N pages, so "exactly one
+        # query" no longer describes the shape. The load-bearing half of the
+        # original assertion — every query stays on the read-only path — is
+        # what this test is named for and is kept.
+        assert graph.ro_query.await_count >= 1
         graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio

@@ -203,6 +203,13 @@ def make_graph_mock():
     failure mode directly.
     """
     skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
+    # Deliberately NARROW: only a query whose entire projection is a bare row
+    # count is a census probe. A loose `'count(' in cypher` test also captures
+    # ordinary queries that return a count as one column among several — e.g.
+    # find_duplicate_entity_nodes' `RETURN n.uuid, ..., count(e)` — and would
+    # hand them a single-column [[n]] row, raising IndexError deep inside the
+    # method under test rather than anywhere near the fixture.
+    census_re = re.compile(r'RETURN\s+count\(\*\)\s*$', re.IGNORECASE)
 
     def _factory(
         rows: list[list] | None = None,
@@ -223,7 +230,7 @@ def make_graph_mock():
         def _make_side_effect(row_data: list[list]):
             def _respond(cypher='', params=None, *args, **kwargs) -> MagicMock:
                 text = cypher if isinstance(cypher, str) else ''
-                if 'count(' in text:
+                if census_re.search(text.strip()):
                     # A single-row aggregate: never truncated by the row cap,
                     # and it agrees with the pages by construction.
                     result_set = [[len(row_data)]]

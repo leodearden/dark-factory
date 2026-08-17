@@ -501,7 +501,7 @@ class TestGetAllValidEdgesPagination:
     ):
         """Every one of the 12506 distinct edge uuids reaches the caller."""
         backend = make_backend(mock_config)
-        graph = _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
+        _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
         grouped = await backend.get_all_valid_edges(group_id='test')
         assert len(distinct_edge_uuids(grouped)) == _LIVE_DISTINCT_EDGES
         assert total_attributions(grouped) == _LIVE_EDGE_ROWS
@@ -511,7 +511,7 @@ class TestGetAllValidEdgesPagination:
         self, mock_config, make_backend
     ):
         backend = make_backend(mock_config)
-        graph = _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
+        _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
         grouped, paged = await backend.enumerate_all_valid_edges(group_id='test')
         assert paged.complete is True
         assert paged.reason is None
@@ -525,7 +525,7 @@ class TestGetAllValidEdgesPagination:
     ):
         """A disagreeing census flips completeness without withholding the data."""
         backend = make_backend(mock_config)
-        graph = _wire(
+        _wire(
             backend,
             FakeCappedGraph(
                 make_live_shaped_edge_corpus(),
@@ -544,7 +544,7 @@ class TestGetAllValidEdgesPagination:
     ):
         """No longer a silently short dict: the shim says so, and still returns it."""
         backend = make_backend(mock_config)
-        graph = _wire(
+        _wire(
             backend,
             FakeCappedGraph(
                 make_live_shaped_edge_corpus(),
@@ -564,7 +564,7 @@ class TestGetAllValidEdgesPagination:
         self, mock_config, make_backend, caplog
     ):
         backend = make_backend(mock_config)
-        graph = _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
+        _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
             await backend.get_all_valid_edges(group_id='test')
         assert _warnings(caplog) == []
