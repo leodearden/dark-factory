@@ -1809,16 +1809,19 @@ class TestSplitChainTail:
         assert prefix + tail == raw
 
     def test_accepts_fused_memory_lint_chain_and_preserves_both_checkers(self):
-        """The task's headline case: fused-memory/orchestrator.yaml:11.
+        """The task's headline case: fused-memory/orchestrator.yaml::lint_command.
 
         The ruff clause is segment 0 (the caller will scope it); both
         `python3 .../check_*.py` sibling clauses live in the preserved tail,
         byte-identical to their slice of the config string.
+
+        Labelled by yaml KEY, not line number — the old `:11` label is the
+        rot `_verify_config_corpus.py`'s own provenance convention exists to
+        avoid, and FM_LINT_COMMAND is pinned against the live yaml by
+        `test_verify_config_corpus.py` anyway.
         """
         prefix, tail = split_chain_tail(FM_LINT_COMMAND, 'ruff check')
-        assert prefix == (
-            'uv run --project fused-memory --directory fused-memory ruff check src/ tests/ '
-        )
+        assert prefix == ('uv run --directory fused-memory ruff check src/ tests/ ')
         assert tail == (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
             ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
