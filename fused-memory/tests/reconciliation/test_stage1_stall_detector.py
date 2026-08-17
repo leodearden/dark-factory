@@ -1078,13 +1078,66 @@ class TestMaybeEscalateStalledGateBacklog:
         assert pending['B'].dedupe_count == 0
 
     @pytest.mark.asyncio
+    async def test_same_task_id_in_two_projects_does_not_fold(self, tmp_path):
+        """(c2) The headline fix over the old skip: dedup is scoped BY PROJECT.
+
+        The queue is shared across projects and task ids are small per-project
+        integers, so gate 166 exists in more than one project at once.  The
+        categorized ``has_open_l1(task_id, category=...)`` skip this replaced
+        keyed on task_id ALONE, so project B's stalled gate 166 was silently
+        suppressed whenever project A's gate 166 already had a pending L1 —
+        losing an escalation a human was waiting on.
+
+        Asserted end-to-end through the emitter against a real queue, not only
+        at the pure-key level (``TestGateBacklogFingerprintKey``): the key being
+        distinct is worth nothing if the emitter does not thread ``project_id``
+        into it.
+        """
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        task_by_id = {'166': _gate_task_record('166', hours_ago=50)}
+
+        async def _cycle(project_id, run_id):
+            return await maybe_escalate_stalled_gate_backlog(
+                escalation_queue=queue,
+                project_id=project_id,
+                run_id=run_id,
+                stalled_task_ids=['166'],
+                task_by_id=task_by_id,
+                now=_GATE_NOW,
+            )
+
+        assert await _cycle('dark_factory', 'run-df') == ['166']
+        assert await _cycle('reify', 'run-reify') == ['166'], (
+            'the same task_id in a DIFFERENT project is a different gate and must '
+            'still file — under the old has_open_l1(task_id) skip it vanished'
+        )
+
+        pending = queue.get_pending()
+        assert len(pending) == 2, (
+            'two projects\' gate 166 are two distinct escalations; got '
+            f'{len(pending)}: {[(e.id, e.summary) for e in pending]}'
+        )
+        assert {e.dedupe_count for e in pending} == {0}, (
+            'neither record folded into the other, so both stay at dedupe_count 0; '
+            f'got {[(e.id, e.dedupe_count) for e in pending]}'
+        )
+        assert len({e.id for e in pending}) == 2
+        # Each record names its own project, so a steward can tell them apart.
+        details = sorted(e.detail.split('\n', 1)[0] for e in pending)
+        assert details == ['project_id: dark_factory', 'project_id: reify']
+
+    @pytest.mark.asyncio
     async def test_folds_into_legacy_fingerprintless_parent(self, tmp_path):
         """MIGRATION: a pre-stamp parent (dedupe_fingerprint=None) is still a fold target.
 
         Every gate-backlog record filed before the fingerprint stamp landed
-        carries ``dedupe_fingerprint: None`` — 78 such records measured on the
-        live queue (``data/reconciliation/escalations/``), 100% of the pending
-        backlog.  If those cannot be folded into, the FIRST cycle after this
+        carries ``dedupe_fingerprint: None`` — see
+        ``escalation.dedupe.gate_backlog_fingerprint_key`` for the live-queue
+        measurement of how much of the pending backlog that covers (kept in one
+        place, since a point-in-time census goes stale as records fold and
+        resolve).  If those cannot be folded into, the FIRST cycle after this
         change mints a second pending record per stalled gate at
         ``dedupe_count 0``, and the legacy record — whose key stays falsy
         forever — never becomes a fold target again.  That is the exact defect
@@ -1178,6 +1231,44 @@ class TestMaybeEscalateStalledGateBacklog:
         assert result == []
         queue.has_open_l1.assert_not_called()
         queue.submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_fingerprint_is_not_filed(self, monkeypatch, caplog):
+        """(e2) A falsy fingerprint fails CLOSED — nothing is filed, task excluded.
+
+        Not reachable through the real callee (``compute_content_fingerprint``
+        returns a sha256 hexdigest, never empty), so it is driven by patching
+        that callee: the guard's whole purpose is to survive a future change to
+        it.  Without the guard, a falsy key would sail past
+        ``find_dedupe_parent``'s "never fold" short-circuit and mint a SECOND
+        visible pending record for a gate that already has one — the exact
+        single-record invariant this task exists to establish.
+
+        Dropping the task_id is safe because the gate is still stalled on the
+        next Stage-1 cycle, so the detector retries.
+        """
+        import fused_memory.reconciliation.stage1_stall_detector as _s1sd
+
+        queue = self._make_queue(has_open_l1_return=False)
+        monkeypatch.setattr(_s1sd, 'compute_content_fingerprint', lambda *a, **kw: '')
+
+        with caplog.at_level('WARNING'):
+            result = await maybe_escalate_stalled_gate_backlog(
+                escalation_queue=queue,
+                project_id='autopilot_video',
+                run_id='run-xyz',
+                stalled_task_ids=['645'],
+                task_by_id={'645': _gate_task_record(645, hours_ago=49)},
+                now=_GATE_NOW,
+            )
+
+        assert result == [], 'a gate whose fold key could not be built is not reported'
+        queue.submit.assert_not_called()
+        queue.attach_dedupe_child.assert_not_called()
+        assert 'empty dedupe_fingerprint' in caplog.text, (
+            f'the drop must be loud, not silent; got: {caplog.text!r}'
+        )
+        assert '645' in caplog.text, 'the warning must name the affected task_id'
 
     @pytest.mark.asyncio
     async def test_submit_failure_logs_warning_and_excludes(self):

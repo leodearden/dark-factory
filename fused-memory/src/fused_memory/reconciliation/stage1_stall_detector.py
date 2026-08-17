@@ -592,12 +592,13 @@ async def maybe_escalate_stalled_gate_backlog(
             fingerprint = compute_content_fingerprint(
                 _GATE_BACKLOG_ESCALATION_CATEGORY, '', [f'{project_id}:{task_id}'], ''
             )
-            # Raise (not assert — stripped under ``python -O``) so an empty key
-            # can never reach the queue: find_dedupe_parent treats a falsy key as
-            # "never fold", so filing anyway would mint a second visible record
-            # for this gate.  The existing handler below logs WARNING and
-            # excludes the task_id; the gate is still stalled next cycle, so this
-            # self-heals on retry.
+            # Fail closed on a falsy key rather than filing anyway: find_dedupe_parent
+            # treats one as "never fold", so the record would silently become a
+            # second visible pending record for this gate.  `raise`, not `assert`
+            # (stripped under `python -O`); the handler below logs WARNING and drops
+            # the task_id, and the still-stalled gate retries next cycle.  Unreachable
+            # via today's sha256-hexdigest callee — it guards a future change to it,
+            # and is covered by test_empty_fingerprint_is_not_filed.
             if not fingerprint:
                 raise ValueError(
                     f'empty dedupe_fingerprint for gate-backlog task_id={task_id}'
