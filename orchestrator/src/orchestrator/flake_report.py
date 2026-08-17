@@ -181,11 +181,37 @@ def format_age(delta: timedelta | None) -> str:
 
     ``None`` must NOT render as ``'0d 0h'``: those two states mean opposite things to
     an operator (a brand-new row vs. a row whose clock could not be read at all).
+
+    A NEGATIVE age — a row stamped in the future — gets its own marker for the same
+    reason, and this is not hypothetical: α accepts wire-supplied ``observed_at`` /
+    ``opened_at`` stamps from remote discriminator hosts, so any clock skew between such
+    a host and the dispatcher lands here.  Python's floor semantics on ``//`` and ``%``
+    would otherwise render an hour in the future as ``'-1d 23h'`` and a day-and-an-hour
+    as ``'-2d 23h'`` — values wrong in the specific way that invites an operator to try
+    to interpret them.
     """
     if delta is None:
         return '(unknown age)'
+    if delta < timedelta(0):
+        return '(future-dated)'
     total_hours = int(delta.total_seconds() // 3600)
     return f'{total_hours // 24}d {total_hours % 24}h'
+
+
+def _is_over_age(age: timedelta | None, age_days: int) -> bool:
+    """The §5.6 class-2 age BACKSTOP predicate — the ONE site this comparison is spelled.
+
+    Both the ``over_age=N`` summary and the per-row ``OVER-AGE`` marker on the same page
+    come from here.  They previously compared independently, which is INV-5's failure
+    mode in miniature: they agreed only by coincidence, and a single later change (an
+    inclusive bound, a per-test threshold from θ's config) would have desynchronised a
+    row's marker from the count of marked rows in the same render.
+
+    Strictly greater: a row opened exactly *age_days* ago has not yet EXCEEDED the bound.
+    An unknown age is NOT over age — see :func:`_parse_stamp` on why degrading to unknown
+    beats degrading to a number.
+    """
+    return age is not None and age > timedelta(days=age_days)
 
 
 # --- §5.6 class 1: the gate has gone blind ----------------------------------
@@ -273,6 +299,11 @@ class NonConvergenceCounter:
     unparseable_opened_at: int
     oldest_age: timedelta | None
     age_threshold_days: int
+    # A row stamped in the FUTURE — the same fact as an unparseable stamp (this row's
+    # clock cannot be trusted), reached by a different route: α accepts wire-supplied
+    # stamps from remote hosts, so skew between such a host and the dispatcher lands
+    # here.  Counted separately because the two have different fixes.
+    future_dated: int = 0
 
 
 def compute_non_convergence(
@@ -300,11 +331,11 @@ def compute_non_convergence(
     ``over_age_tests`` nor ``oldest_age``, so a row whose clock cannot be read is
     visibly unknown rather than silently brand-new.
     """
-    threshold = timedelta(days=age_days)
     recurrent = 0
     over_age = 0
     unowned = 0
     unparseable = 0
+    future_dated = 0
     oldest: timedelta | None = None
     for row in open_debt_rows:
         if row.open_count > 1:
@@ -316,9 +347,11 @@ def compute_non_convergence(
             unparseable += 1
             continue
         age = now - opened
-        # Strictly greater: a row opened exactly `age_days` ago has not yet EXCEEDED
-        # the bound.
-        if age > threshold:
+        if age < timedelta(0):
+            future_dated += 1
+        # Shared with the renderer's per-row marker, so the count and the marked rows
+        # can never disagree — see :func:`_is_over_age`.
+        if _is_over_age(age, age_days):
             over_age += 1
         if oldest is None or age > oldest:
             oldest = age
@@ -330,6 +363,7 @@ def compute_non_convergence(
         unparseable_opened_at=unparseable,
         oldest_age=oldest,
         age_threshold_days=age_days,
+        future_dated=future_dated,
     )
 
 
@@ -791,7 +825,9 @@ def render_report(report: FlakeLedgerReport) -> str:
         # no longer blocking anything and nobody owns fixing it.  Naming it loudly is a
         # READ of the ledger — ι files nothing.
         owner = f'owner={d.owner_task_id}' if d.owner_task_id else '*** NO OWNER (invariant breach) ***'
-        over = ' OVER-AGE' if (row.age is not None and row.age > timedelta(days=nc.age_threshold_days)) else ''
+        # Same predicate the `over_age=N` summary below counts with — never a second
+        # spelling of the comparison (INV-5).
+        over = ' OVER-AGE' if _is_over_age(row.age, nc.age_threshold_days) else ''
         lines.append(
             f'  {d.test_id}  age={format_age(row.age)}  {owner}  '
             f'open_count={d.open_count}{over}'
@@ -858,6 +894,13 @@ def render_report(report: FlakeLedgerReport) -> str:
         lines.append(
             f'      WARNING: {nc.unparseable_opened_at} row(s) have an unreadable '
             'opened_at and are excluded from the age figures above'
+        )
+    if nc.future_dated:
+        # Not cosmetic: a future-dated row can never trip the age backstop, so its debt
+        # is invisible to the one trigger that would otherwise catch it eventually.
+        lines.append(
+            f'      WARNING: {nc.future_dated} row(s) are FUTURE-DATED (opened_at is '
+            'ahead of now — clock skew) and can never reach the age backstop'
         )
 
     lines.append(f'  systemic (class 3, {sy.window_minutes}m window):')

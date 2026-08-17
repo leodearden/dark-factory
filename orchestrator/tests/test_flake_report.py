@@ -210,6 +210,17 @@ class TestStampAndAge:
     def test_format_age_renders_zero_days_explicitly(self):
         assert format_age(timedelta(hours=5)) == '0d 5h'
 
+    def test_format_age_of_a_future_stamp_is_marked_not_rendered_negative(self):
+        # Python's floor semantics on // and % render timedelta(hours=-1) as '-1d 23h'
+        # and timedelta(hours=-25) as '-2d 23h' — wrong in exactly the way that invites
+        # an operator to interpret them.  α accepts wire-supplied stamps from remote
+        # discriminator hosts, so host/dispatcher clock skew reaches this function.
+        assert format_age(timedelta(hours=-1)) == '(future-dated)'
+        assert format_age(timedelta(hours=-25)) == '(future-dated)'
+        assert '-1d' not in format_age(timedelta(hours=-1))
+        # The boundary is still a real age, not a marker.
+        assert format_age(timedelta(0)) == '0d 0h'
+
     def test_format_age_of_none_says_unknown_not_zero(self):
         # The dangerous direction: an unparseable opened_at rendered as '0d 0h' makes a
         # stale debt row look brand new and suppresses it from the age backstop.
@@ -342,6 +353,19 @@ class TestNonConvergenceCounter:
             _debt(test_id='new', opened_at='2026-08-09T12:00:00+00:00'),
         ]
         assert compute_non_convergence(rows, _NOW).oldest_age == timedelta(days=4)
+
+    def test_a_future_dated_row_is_counted_and_is_never_over_age(self):
+        # Same fact as an unparseable stamp — this row's clock cannot be trusted — via a
+        # different route, and with a real consequence: a future-dated row can never trip
+        # the age backstop, so nothing else in class 2 would ever surface it.
+        rows = [_debt(test_id='skewed', opened_at='2026-08-11T12:00:00+00:00')]
+        counter = compute_non_convergence(rows, _NOW)
+        assert counter.future_dated == 1
+        assert counter.over_age_tests == 0
+        assert counter.unparseable_opened_at == 0
+
+    def test_a_normal_row_is_not_counted_as_future_dated(self):
+        assert compute_non_convergence([_debt()], _NOW).future_dated == 0
 
     def test_oldest_age_is_none_when_nothing_parses(self):
         rows = [_debt(test_id='bad', opened_at='not-a-date')]
@@ -1073,6 +1097,44 @@ class TestRenderReport:
                 if 'badclock' in ln][0]
         assert 'unknown' in line, line
         assert '0d 0h' not in line, line
+
+    def test_the_over_age_marker_and_the_summary_never_disagree(self):
+        # One predicate, two renderings on the SAME page: the per-row OVER-AGE marker and
+        # the over_age=N summary.  Pinned against a NON-DEFAULT threshold, which is the
+        # case that used to be able to drift — the renderer compared independently, so it
+        # agreed with the counter only by coincidence.
+        rows = [_debt(test_id='old', open_count=1), _debt(test_id='young', open_count=1)]
+        nc = compute_non_convergence(
+            [_debt(test_id='old', opened_at='2026-08-01T12:00:00+00:00'),
+             _debt(test_id='young', opened_at='2026-08-06T12:00:00+00:00')],
+            _NOW,
+            age_days=5,
+        )
+        rendered = render_report(_report(
+            open_debt=[DebtReportRow(debt=rows[0], age=timedelta(days=9)),
+                       DebtReportRow(debt=rows[1], age=timedelta(days=4))],
+            non_convergence=nc,
+        ))
+        marked = [ln for ln in rendered.splitlines() if 'OVER-AGE' in ln]
+        assert nc.over_age_tests == 1
+        assert len(marked) == nc.over_age_tests, rendered
+        assert 'old' in marked[0], marked
+        assert 'over_age=1' in rendered, rendered
+
+    def test_a_future_dated_row_warns_and_never_renders_a_negative_age(self):
+        nc = compute_non_convergence(
+            [_debt(test_id='skewed', opened_at='2026-08-11T12:00:00+00:00')], _NOW
+        )
+        rendered = render_report(_report(
+            open_debt=[DebtReportRow(debt=_debt(test_id='skewed'), age=timedelta(hours=-24))],
+            non_convergence=nc,
+        ))
+        row_line = [ln for ln in rendered.splitlines() if 'skewed' in ln][0]
+        assert 'future-dated' in row_line, row_line
+        assert '-1d' not in row_line and '-2d' not in row_line, row_line
+        # And the counter says it out loud, because a future-dated row can never reach
+        # the age backstop.
+        assert 'FUTURE-DATED' in rendered, rendered
 
     def test_a_chain_shows_its_cycle_fields_and_call_site_split(self):
         chain = build_chains(
