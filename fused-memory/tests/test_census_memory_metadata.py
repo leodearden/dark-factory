@@ -1335,6 +1335,7 @@ class TestRegistryCoverageGauge:
 
         src = inspect.getsource(_mod.topic_registry_loader)
         assert '_load_probe_module()' in src
+        assert _mod.__file__ is not None
         module_src = Path(_mod.__file__).read_text(encoding='utf-8')
         tree = ast.parse(module_src)
         top_level_calls = [
