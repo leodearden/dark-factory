@@ -1278,6 +1278,58 @@ async def test_set_status_and_stamp_audit_reports_explicit_error_when_write_not_
 
 
 @pytest.mark.asyncio
+async def test_set_status_and_stamp_audit_routes_through_write_status_and_verify(tmp_path):
+    """set_status_and_stamp_audit must route through the shared
+    `_write_status_and_verify` tail (task 4057), and a suppressed write via
+    that seam must still roll back the metadata merge — both-or-neither."""
+    project_root = str(tmp_path / 'proj')
+    setup = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await setup.start()
+    await setup.add_task(project_root=project_root, title='x')
+    await setup.set_task_status('1', 'done', project_root=project_root)
+    await setup.close()
+
+    spy = _WriteStatusSeamSpyBackend(TaskmasterConfig(project_root=project_root))
+    await spy.start()
+    try:
+        result = await spy.set_status_and_stamp_audit(  # type: ignore[attr-defined]
+            '1', 'pending', project_root=project_root,
+            audit_fields={
+                'reopen_reason': 'regression found',
+                'reopen_from': 'done',
+            },
+        )
+    finally:
+        await spy.close()
+
+    assert len(spy.seam_calls) == 1
+    call = spy.seam_calls[0]
+    assert call['caller_name'] == 'set_status_and_stamp_audit'
+    assert call['write_desc'] == 'status+metadata'
+    assert call['set_columns'] == ['status = ?', 'metadata = ?', 'updated_at = ?']
+    assert result == {
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '1',
+        'requested_status': 'pending',
+        'actual_status': 'seam-suppressed',
+    }
+
+    # Both-or-neither: reopen the DB with a fresh backend (bypassing the seam
+    # entirely) and confirm the suppressed write rolled back the metadata
+    # merge too, not just the status column.
+    verify = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await verify.start()
+    try:
+        task = await verify.get_task('1', project_root=project_root)
+    finally:
+        await verify.close()
+    assert task['status'] == 'done'
+    assert 'reopen_reason' not in (task['metadata'] or {})
+    assert 'reopen_from' not in (task['metadata'] or {})
+
+
+@pytest.mark.asyncio
 async def test_set_task_status_newstatus_is_grounded_in_readback(backend, project_root):
     """Happy-path: newStatus reflects an actual read-back, not a fabricated echo."""
     await backend.add_task(project_root=project_root, title='x')
