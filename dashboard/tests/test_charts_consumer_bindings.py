@@ -170,3 +170,109 @@ def test_the_sweep_actually_found_the_destructure_shaped_consumers() -> None:
         f'and it would make the assertions in this file vacuously green. '
         f'Found: { {k: len(v) for k, v in sorted(bindings.items())} }'
     )
+
+
+# ---------------------------------------------------------------------------
+# Negative control — the detector, run against the defect it was written for
+#
+# The vacuity guard above proves the sweep MATCHED something.  It does not
+# prove ``_unused_bindings`` can still SEE a dead binding, and that is a
+# separate failure: widen the excised span by one character, drop the
+# ``\b`` word boundary, or let ``_local_names`` return the canonical name where
+# an alias is bound, and every consumer reads as clean forever.  The sweep is a
+# pure absence assertion, so it would go permanently green rather than red.
+#
+# So the detector is pinned against the real pre-fix sources, frozen verbatim
+# from the commit before task 3681 deleted them (15889b4777^) — the same
+# frozen-pre-fix-body shape test_charts_null_samples.py uses for its arithmetic
+# probes.  Both directions are asserted: the six dead names ARE reported, and
+# nothing that the body actually references is.
+# ---------------------------------------------------------------------------
+
+# tab_overview.jsx:2, verbatim.  Nine bindings, five of them dead.
+_PRE_FIX_TAB_OVERVIEW = """\
+/* Overview tab — command-center grid */
+const { Sparkline, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, HistBar, PALETTE: P } = window.DF_CHARTS;
+const { Glyph, LiveFeed } = window.DF_SHELL;
+
+function Overview() {
+  return (
+    <div>
+      <StatTile label="tasks" />
+      <Sparkline values={[1, 2]} color={P.accent} />
+      <LineChart series={[]} />
+      <Glyph name="dot" />
+    </div>
+  );
+}
+"""
+
+# tabs.jsx:2, verbatim.  Thirteen bindings, one dead (``HistBar: HB`` — the
+# ALIAS is the live name, which is exactly what a canonical-vs-alias slip in
+# ``_local_names`` would get wrong in both directions at once).
+_PRE_FIX_TABS = """\
+/* Remaining tabs: orchestrators, performance, memory, recon, merge, costs, burndown */
+const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, HistBar: HB, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS } = window.DF_CHARTS;
+
+function CostsTab() {
+  const series = deriveVelocitySeries([]);
+  const smoothing = defaultSmoothingForWindow(SMOOTHING_OPTIONS[0]);
+  return (
+    <div>
+      <SP values={series} /><LC series={[]} /><SA stacks={[]} /><BC values={[]} />
+      <HBC rows={[]} /><DN data={[]} /><ST label="spend" />
+      <span style={{ color: CP.fg2 }}>{smoothingLabelToSeconds(smoothing)}</span>
+    </div>
+  );
+}
+"""
+
+_PRE_FIX_SOURCES: dict[str, tuple[str, list[str]]] = {
+    'tab_overview.jsx': (
+        _PRE_FIX_TAB_OVERVIEW,
+        ['StackedAreaChart', 'BarChart', 'HBarChart', 'Donut', 'HistBar'],
+    ),
+    'tabs.jsx': (_PRE_FIX_TABS, ['HB']),
+}
+
+
+def test_the_detector_reports_the_dead_bindings_it_was_written_to_find() -> None:
+    """``_unused_bindings`` finds the exact bindings task 3681 deleted.
+
+    Without this, the sweep above could be satisfied by a detector that
+    reports nothing at all — the permanent-false-GREEN failure mode.
+    """
+    for filename, (src, expected_dead) in _PRE_FIX_SOURCES.items():
+        found = _unused_bindings(src)
+
+        assert found == expected_dead, (
+            f'the pre-fix {filename} bound {len(expected_dead)} DF_CHARTS '
+            f'name(s) it never rendered — {", ".join(expected_dead)} — but '
+            f'the detector reported {found or "nothing"}. Whatever the sweep '
+            f'above is doing, it is no longer what deleting these was proven '
+            f'to require, so its green is not evidence of anything.'
+        )
+
+
+def test_the_detector_does_not_report_a_binding_the_file_actually_renders() -> None:
+    """The other direction: a rendered name must never be reported.
+
+    Acting on a false positive means deleting an import a tab renders
+    through, which is why ``_unused_bindings`` is deliberately biased toward
+    missing a dead binding over flagging a live one.  Asserted on the same
+    frozen sources so both directions are pinned by one pair of fixtures.
+    """
+    for filename, (src, expected_dead) in _PRE_FIX_SOURCES.items():
+        live = [
+            n
+            for m in _DF_CHARTS_DESTRUCTURE_RE.finditer(src)
+            for n in _local_names(m.group(1))
+            if n not in expected_dead
+        ]
+        falsely_flagged = sorted(set(_unused_bindings(src)) & set(live))
+
+        assert not falsely_flagged, (
+            f'the detector flagged {", ".join(falsely_flagged)} in the frozen '
+            f'{filename}, but that source renders through those names. A false '
+            f'positive here gets a live import deleted.'
+        )
