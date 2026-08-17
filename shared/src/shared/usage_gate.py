@@ -38,6 +38,7 @@ from shared.invocation_outcome import (
     CapHit,
     InvocationOutcome,
     NearCap,
+    auth_failure_reason,
     classify_invocation,
 )
 from shared.proc_group import terminate_process_group
@@ -492,7 +493,13 @@ class InvokeSlot:
           it) and the account is left AVAILABLE.
         - AuthFailed -> ``_handle_auth_failure`` (-> AUTH_FAILED; a no-op if
           already CAPPED — CAPPED takes precedence, per that handler's own
-          guard). Scope-blind.
+          guard). Scope-blind. The reason string is rendered by the
+          single-sourced ``invocation_outcome.auth_failure_reason``: it carries
+          the 401/403 response-body snippet when the classifier captured one
+          (``HTTP 401: <snippet>``), and stays the bare ``HTTP {status}`` when
+          it did not. That reason is both logged at WARNING and persisted into
+          the ``auth_failed`` cost event, so the snippet is what distinguishes
+          OAuth revocation from expiry from an org-policy block after the fact.
         - NearCap -> ``_handle_near_cap_warning`` (annotation only, forwarding
           ``self.scope``), then ``release_probe_slot``.
         - Anything else (ZeroOutputWedge/CliLocalError/Failure) ->
@@ -546,7 +553,7 @@ class InvokeSlot:
                 # by before_invoke's predicate forever.
                 self._gate.release_probe_slot(token)
             elif isinstance(outcome, AuthFailed):
-                self._gate._handle_auth_failure(f'HTTP {outcome.status}', token)
+                self._gate._handle_auth_failure(auth_failure_reason(outcome), token)
             elif isinstance(outcome, NearCap):
                 self._gate._handle_near_cap_warning(outcome.reason, token, scope=self.scope)
                 self._gate.release_probe_slot(token)
