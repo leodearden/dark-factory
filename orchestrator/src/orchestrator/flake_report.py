@@ -300,11 +300,15 @@ def compute_systemic(
     NULL specifically so it never becomes ``0.0``; rendering ``0.0`` here would say "the
     host was idle" when the truth is "the host was not measured".
 
-    COMPLEXITY: this is a quadratic scan over the occurrence list, which is acceptable
-    ONLY because the caller passes a ``since``-filtered, ``limit``-capped read (see
-    :func:`build_report`).  Do not "optimise" it into an unbounded streaming form
-    without first re-establishing that bound — and do not remove the bound on the
-    grounds that the scan got cheaper.
+    COMPLEXITY: O(n log n) — one sort, then a TWO-POINTER sweep in which each of the two
+    indices only ever advances, so the window scan itself is O(n).  It was previously a
+    per-event re-scan of the whole list, i.e. O(n²), justified by the caller's
+    ``since``/``limit`` bound; that justification did not hold, because the module's own
+    cap (:data:`DEFAULT_OCCURRENCE_READ_LIMIT`, 20000) admits a list large enough to
+    stall an interactive CLI for tens of seconds with no output.  The ``since``/``limit``
+    bound is still required — a count over an unbounded read is a count over an unknown
+    window — but it is a HONESTY bound on the counters, never a licence for a quadratic
+    scan.
     """
     window = timedelta(minutes=window_minutes)
     events: list[tuple[datetime, str, float | None]] = []
@@ -317,18 +321,45 @@ def compute_systemic(
         events.append((stamp, row.test_id, row.psi_cpu_some10))
     events.sort(key=lambda e: (e[0], e[1]))
 
+    # `lo` is the first event at or after the candidate window start, `hi` one past the
+    # last event at or before its (INCLUSIVE) end.  Candidate starts are taken in sorted
+    # order, so both bounds are monotonically non-decreasing and neither pointer ever
+    # rewinds.  `counts` is the live multiset of test_ids inside [lo, hi), maintained
+    # incrementally, so `distinct` is available in O(1) per candidate window.
+    counts: dict[str, int] = {}
+    distinct = 0
+    lo = 0
+    hi = 0
     peak_count = 0
     peak_start: str | None = None
-    peak_psi: float | None = None
-    for start, _, _ in events:
+    peak_slice = (0, 0)
+    for i in range(len(events)):
+        start = events[i][0]
         end = start + window
-        in_window = [e for e in events if start <= e[0] <= end]
-        distinct = {e[1] for e in in_window}
-        if len(distinct) > peak_count:
-            peak_count = len(distinct)
+        while hi < len(events) and events[hi][0] <= end:
+            tid = events[hi][1]
+            counts[tid] = counts.get(tid, 0) + 1
+            if counts[tid] == 1:
+                distinct += 1
+            hi += 1
+        # Strictly `<`, so events sharing this exact start stamp stay INSIDE the window —
+        # the same inclusive-both-ends bound the per-event re-scan had.
+        while lo < i and events[lo][0] < start:
+            tid = events[lo][1]
+            counts[tid] -= 1
+            if counts[tid] == 0:
+                del counts[tid]
+                distinct -= 1
+            lo += 1
+        if distinct > peak_count:
+            peak_count = distinct
             peak_start = start.isoformat()
-            psis = [e[2] for e in in_window if e[2] is not None]
-            peak_psi = max(psis) if psis else None
+            peak_slice = (lo, hi)
+
+    # Deferred to here rather than maintained incrementally: a max is not removable from
+    # a sliding window in O(1), and the peak window is needed exactly once.
+    psis = [e[2] for e in events[peak_slice[0]:peak_slice[1]] if e[2] is not None]
+    peak_psi = max(psis) if psis else None
 
     return SystemicCounter(
         peak_distinct_tests=peak_count,
@@ -385,13 +416,22 @@ def build_chains(
 
     Ordering is deterministic — highest ``open_count`` first, then ``test_id`` — because
     the rendered report must be byte-stable.
+
+    COMPLEXITY: occurrences are grouped by ``test_id`` in ONE pass and then indexed.  The
+    earlier form re-filtered the whole occurrence list once per test in the universe,
+    which is O(tests × occurrences) — quietly the dominant cost on exactly the ledger
+    this report is for, since a chronically flaky suite grows in BOTH factors at once.
     """
+    by_test: dict[str, list[FlakeOccurrenceRow]] = {}
+    for row in occurrences:
+        by_test.setdefault(row.test_id, []).append(row)
+
     universe: set[str] = {row.test_id for row in open_debt_rows}
-    universe |= {row.test_id for row in occurrences if row.test_id != UNKNOWN_TEST_ID}
+    universe |= {test_id for test_id in by_test if test_id != UNKNOWN_TEST_ID}
 
     chains: list[ChainRow] = []
     for test_id in universe:
-        mine = [row for row in occurrences if row.test_id == test_id]
+        mine = by_test.get(test_id, ())
         counts: dict[str, int] = {}
         for row in mine:
             # Bucket on the enum's value where the string is a known member, so an
@@ -509,6 +549,22 @@ def build_report(
     occurrences = read_occurrences(db_path, since=since, limit=occurrence_limit)
     truncated = len(occurrences) >= occurrence_limit
 
+    # Every OPEN debt row is already in hand from the single `list_open_debt` scan above,
+    # so the chain build must not re-read it per test: each `read_debt` goes through α's
+    # `_open`, which opens a fresh connection, applies the durability pragmas (including
+    # a `journal_mode=WAL` switch) and runs `executescript(_SCHEMA)` against the LIVE
+    # runs.db the merge lane is also using.  N+1 of those turns a nominally read-only
+    # report into N schema executions contending on that database.  What remains is only
+    # the BETWEEN-CYCLES remainder — a test with occurrences whose debt is currently
+    # RESOLVED, and so absent from `list_open_debt` — which is the case the chain exists
+    # to show and which α exposes no batched reader for (a `read_debt_many` belongs in α,
+    # not here; ι writes no SQL of its own).
+    open_by_test = {row.test_id: row for row in open_rows}
+
+    def _debt_lookup(test_id: str) -> DebtRow | None:
+        hit = open_by_test.get(test_id)
+        return hit if hit is not None else read_debt(db_path, test_id)
+
     # `list_open_debt`'s `opened_at, test_id` ordering is contractual (its docstring
     # names ι as the reason), so it is relied on directly and never re-sorted here.
     open_debt = [
@@ -525,7 +581,7 @@ def build_report(
         generated_at=now,
         window_since=since,
         open_debt=open_debt,
-        chains=build_chains(occurrences, open_rows, lambda t: read_debt(db_path, t)),
+        chains=build_chains(occurrences, open_rows, _debt_lookup),
         gate_blind=compute_gate_blind(
             occurrences,
             threshold=gate_blind_threshold,

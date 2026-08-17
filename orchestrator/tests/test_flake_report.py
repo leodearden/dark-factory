@@ -416,6 +416,122 @@ class TestSystemicCounter:
         assert counter.exceeds_threshold is False
 
 
+class TestSystemicWindowEquivalence:
+    """The two-pointer sweep must agree with the naive per-event re-scan, exactly.
+
+    ``compute_systemic`` was a quadratic scan (one full re-filter of the event list per
+    event) and is now a single sorted sweep with two monotonically-advancing indices.
+    That is a behaviour-preserving rewrite, so it is pinned against the ORIGINAL form
+    rather than against a handful of hand-picked expectations: the inclusive end bound,
+    the tie handling at a shared start stamp, the first-window-wins rule for equal peaks,
+    and the max-non-null-psi rule are all properties the naive form defines, and any one
+    of them can be broken without breaking a spot check.
+    """
+
+    @staticmethod
+    def _naive(rows, *, window_minutes: int) -> tuple[int, str | None, float | None]:
+        """The pre-amendment O(n^2) implementation, kept ONLY as a test oracle."""
+        window = timedelta(minutes=window_minutes)
+        events = []
+        for row in rows:
+            if row.verdict != FlakeVerdict.passes_in_isolation:
+                continue
+            stamp = _parse_stamp(row.observed_at)
+            if stamp is None:
+                continue
+            events.append((stamp, row.test_id, row.psi_cpu_some10))
+        events.sort(key=lambda e: (e[0], e[1]))
+        peak_count, peak_start, peak_psi = 0, None, None
+        for start, _, _ in events:
+            end = start + window
+            in_window = [e for e in events if start <= e[0] <= end]
+            distinct = {e[1] for e in in_window}
+            if len(distinct) > peak_count:
+                peak_count = len(distinct)
+                peak_start = start.isoformat()
+                psis = [e[2] for e in in_window if e[2] is not None]
+                peak_psi = max(psis) if psis else None
+        return peak_count, peak_start, peak_psi
+
+    @staticmethod
+    def _corpus(seed: int, n: int) -> list[FlakeOccurrenceRow]:
+        """A deterministic pseudo-random occurrence list (fixed seed — never wall-clock).
+
+        Deliberately dense in the things that break a sliding window: repeated identical
+        stamps, out-of-order input, rows that fall out of the window, unparseable stamps,
+        non-``passes_in_isolation`` verdicts, and missing PSI readings.
+        """
+        import random
+
+        rnd = random.Random(seed)
+        base = datetime(2026, 8, 8, 12, 0, 0, tzinfo=UTC)
+        rows = []
+        for i in range(n):
+            # Minute granularity over a ~3h span with only 8 distinct tests, so windows
+            # genuinely overlap and stamps genuinely collide.
+            stamp = base + timedelta(minutes=rnd.randrange(0, 180))
+            verdict = rnd.choice([
+                FlakeVerdict.passes_in_isolation,
+                FlakeVerdict.passes_in_isolation,
+                FlakeVerdict.fails_in_isolation,
+                FlakeVerdict.unconfirmable,
+            ])
+            rows.append(_occ(
+                test_id=f'tests/test_{rnd.randrange(0, 8)}.py::test_x',
+                observed_at=stamp.isoformat(),
+                verdict=verdict,
+                psi=rnd.choice([None, 12.5, 88.0, 40.0]),
+                row_id=i,
+            ))
+        # One row whose clock cannot be read: the sweep must drop it, not position it.
+        rows.append(_occ(test_id='tests/test_bad.py::test_x', observed_at='not-a-date', row_id=n))
+        return rows
+
+    @pytest.mark.parametrize('seed', [1, 2, 3, 4, 5])
+    @pytest.mark.parametrize('window_minutes', [1, 15, 60])
+    def test_agrees_with_the_naive_scan(self, seed, window_minutes):
+        rows = self._corpus(seed, 120)
+        counter = compute_systemic(rows, window_minutes=window_minutes)
+        assert (
+            counter.peak_distinct_tests,
+            counter.peak_window_start,
+            counter.peak_window_psi,
+        ) == self._naive(rows, window_minutes=window_minutes)
+
+    def test_identical_stamps_stay_inside_their_own_window(self):
+        # Four tests sharing one instant: the window anchored at that instant must
+        # contain all four, which is precisely what a `lo` pointer that advanced past
+        # ties would silently lose.
+        rows = [
+            _occ(test_id=f'tests/test_{i}.py::test_x', observed_at='2026-08-08T12:00:00+00:00',
+                 row_id=i)
+            for i in range(4)
+        ]
+        assert compute_systemic(rows, window_minutes=60).peak_distinct_tests == 4
+
+    def test_a_test_leaving_the_window_is_decremented_from_the_distinct_count(self):
+        # test_0 at 12:00 and test_1 at 12:30 fall out before test_2/test_3 arrive, so no
+        # 60m window holds more than two: a multiset that never decremented would report
+        # four.
+        rows = [
+            _occ(test_id='tests/test_0.py::test_x', observed_at='2026-08-08T12:00:00+00:00', row_id=0),
+            _occ(test_id='tests/test_1.py::test_x', observed_at='2026-08-08T12:30:00+00:00', row_id=1),
+            _occ(test_id='tests/test_2.py::test_x', observed_at='2026-08-08T14:00:00+00:00', row_id=2),
+            _occ(test_id='tests/test_3.py::test_x', observed_at='2026-08-08T14:30:00+00:00', row_id=3),
+        ]
+        assert compute_systemic(rows, window_minutes=60).peak_distinct_tests == 2
+
+    def test_a_repeated_test_in_the_window_is_counted_once(self):
+        # The multiset must be a multiset: three sightings of one test inside the window
+        # are one DISTINCT test, and its count must survive until the third drops out.
+        rows = [
+            _occ(test_id='tests/test_0.py::test_x',
+                 observed_at=f'2026-08-08T12:{i:02d}:00+00:00', row_id=i)
+            for i in range(3)
+        ] + [_occ(test_id='tests/test_1.py::test_x', observed_at='2026-08-08T12:05:00+00:00', row_id=9)]
+        assert compute_systemic(rows, window_minutes=60).peak_distinct_tests == 2
+
+
 class TestChains:
     """Per-test recurrence chains — the union of open debt and windowed occurrences."""
 
@@ -595,6 +711,80 @@ class TestBuildReport:
         assert [c.test_id for c in report.chains] == ['tests/test_old.py::test_x']
         assert report.chains[0].debt is not None
         assert report.chains[0].occurrence_count == 0
+
+
+class TestReadAmplification:
+    """One report must not fan out into one ledger connection per test.
+
+    Every ``read_debt`` goes through α's ``_open``, which opens a fresh connection,
+    applies the durability pragmas (including a ``journal_mode=WAL`` switch) and runs
+    ``executescript(_SCHEMA)`` — against the same live ``runs.db`` the merge lane holds
+    a 5s busy timeout on.  A per-test lookup therefore costs far more than a SELECT, and
+    the open rows it would re-fetch are already in hand from ``list_open_debt``.
+    """
+
+    def _seeded(self, tmp_path: Path) -> Path:
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        for name in ('a', 'b', 'c'):
+            _seed_debt(db_path, test_id=f'tests/test_{name}.py::test_x',
+                       opened_at='2026-08-09T12:00:00+00:00', owner_task_id='4000')
+            _seed_occurrence(db_path, test_id=f'tests/test_{name}.py::test_x',
+                             observed_at='2026-08-09T13:00:00+00:00')
+        # BETWEEN CYCLES: resolved, so absent from list_open_debt — the one case that
+        # genuinely still needs a per-test read.
+        _seed_debt(db_path, test_id='tests/test_resolved.py::test_x',
+                   opened_at='2026-08-07T12:00:00+00:00',
+                   resolved_at='2026-08-08T12:00:00+00:00', open_count=2)
+        _seed_occurrence(db_path, test_id='tests/test_resolved.py::test_x',
+                         observed_at='2026-08-09T14:00:00+00:00')
+        return db_path
+
+    def test_open_debt_rows_are_not_re_read_per_test(self, tmp_path, monkeypatch):
+        import orchestrator.flake_report as report_module
+
+        seen: list[str] = []
+        real = report_module.read_debt
+
+        def _counting(db_path, test_id):
+            seen.append(test_id)
+            return real(db_path, test_id)
+
+        # Patched on flake_report, not flake_ledger: this module binds read_debt at
+        # import time, so patching the source module would not intercept the call.
+        monkeypatch.setattr(report_module, 'read_debt', _counting)
+
+        build_report(self._seeded(tmp_path), now=_NOW)
+
+        assert seen == ['tests/test_resolved.py::test_x'], seen
+
+    def test_the_between_cycles_chain_is_still_complete(self, tmp_path):
+        # The reuse must not cost the resolved-row lookup that makes a chain readable
+        # across cycles — the PRD's motivating case is a test between de-flake tasks.
+        report = build_report(self._seeded(tmp_path), now=_NOW)
+        by_id = {c.test_id: c for c in report.chains}
+        resolved = by_id['tests/test_resolved.py::test_x']
+        assert resolved.debt is not None
+        assert resolved.debt.resolved_at == '2026-08-08T12:00:00+00:00'
+        assert resolved.debt.open_count == 2
+        # ...and the open rows still resolve to their own debt, from the list already read.
+        assert by_id['tests/test_a.py::test_x'].debt is not None
+        assert by_id['tests/test_a.py::test_x'].debt.resolved_at is None
+
+    def test_chains_group_occurrences_once_rather_than_re_scanning_per_test(self):
+        # Grouping is a single pass, so a test's occurrences must still land under that
+        # test and nowhere else even when the input is interleaved and out of order.
+        rows = [
+            _occ(test_id=f'tests/test_{i % 3}.py::test_x',
+                 observed_at=f'2026-08-08T12:{i:02d}:00+00:00', row_id=i)
+            for i in range(9)
+        ]
+        chains = build_chains(list(reversed(rows)), [], lambda t: None)
+        assert {c.test_id: c.occurrence_count for c in chains} == {
+            'tests/test_0.py::test_x': 3,
+            'tests/test_1.py::test_x': 3,
+            'tests/test_2.py::test_x': 3,
+        }
 
 
 class TestReadOnlyContract:
