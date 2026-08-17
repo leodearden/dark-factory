@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -31,6 +32,7 @@ _LOGGER_NAME = 'fused_memory.backends.graphiti_client'
 # Measured live row counts (dark_factory, 2026-08-17). Used as the fixture
 # corpus size so the tests exercise the real shape rather than a toy.
 _LIVE_EDGE_ROWS = 24938
+_LIVE_DISTINCT_EDGES = 12506
 _LIVE_ENTITY_NODES = 16038
 _LIVE_RESULTSET_CAP = 10000
 
@@ -137,6 +139,41 @@ def make_edge_corpus(rows: int) -> list[list]:
             f'name-{edge_index}',
         ])
     return corpus
+
+
+def make_live_shaped_edge_corpus(
+    rows: int = _LIVE_EDGE_ROWS, distinct_edges: int = _LIVE_DISTINCT_EDGES
+) -> list[list]:
+    """Build the MEASURED live edge corpus shape: N rows over M distinct edges.
+
+    Measured on dark_factory 2026-08-17: 24938 valid-edge rows over 12506
+    distinct edge uuids, and — importantly — 24938 distinct ``(n.uuid,
+    e.uuid)`` pairs.  Every row is a distinct attribution, so a plain row
+    census is an exact yardstick and the Python dedup collapses nothing here.
+
+    Most edges are double-attributed (both endpoints); the remainder are
+    single-attributed, which is what makes ``rows`` less than ``2 *
+    distinct_edges``.
+    """
+    doubled = rows - distinct_edges
+    corpus: list[list] = []
+    for i in range(distinct_edges):
+        edge_uuid = f'edge-{i:07d}'
+        corpus.append([f'node-{i}-a', edge_uuid, f'fact-{i}', f'name-{i}'])
+        if i < doubled:
+            corpus.append([f'node-{i}-b', edge_uuid, f'fact-{i}', f'name-{i}'])
+    assert len(corpus) == rows
+    assert len({(r[0], r[1]) for r in corpus}) == rows
+    assert len({r[1] for r in corpus}) == distinct_edges
+    return corpus
+
+
+def distinct_edge_uuids(grouped: dict[str, list[dict]]) -> set[str]:
+    return {edge['uuid'] for edges in grouped.values() for edge in edges}
+
+
+def total_attributions(grouped: dict[str, list[dict]]) -> int:
+    return sum(len(edges) for edges in grouped.values())
 
 
 # ---------------------------------------------------------------------------
@@ -420,3 +457,245 @@ class TestPagedReadReasonInvariant:
             assert paged.reason is None
         else:
             assert isinstance(paged.reason, str) and paged.reason
+
+
+# ---------------------------------------------------------------------------
+# step-5: enumerate_all_valid_edges, and get_all_valid_edges as its shim
+# ---------------------------------------------------------------------------
+
+
+def _wire(backend, graph):
+    backend._driver._get_graph = MagicMock(return_value=graph)
+    return graph
+
+
+class TestGetAllValidEdgesPagination:
+    """THE HEADLINE REGRESSION: the bulk edge read no longer stops at the cap."""
+
+    @pytest.mark.asyncio
+    async def test_control_unpaginated_read_of_this_corpus_is_short(self):
+        """CONTROL: the same fake truncates a single unpaginated read.
+
+        Makes the assertion below a real before/after rather than a tautology.
+        """
+        graph = FakeCappedGraph(make_live_shaped_edge_corpus())
+        result = await graph.ro_query(
+            'MATCH (n:Entity)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
+            'RETURN n.uuid, e.uuid, e.fact, e.name'
+        )
+        assert len(result.result_set) == _LIVE_RESULTSET_CAP
+        assert len({r[1] for r in result.result_set}) < _LIVE_DISTINCT_EDGES
+
+    @pytest.mark.asyncio
+    async def test_all_distinct_edges_are_exposed(
+        self, mock_config, make_backend
+    ):
+        """Every one of the 12506 distinct edge uuids reaches the caller."""
+        backend = make_backend(mock_config)
+        graph = _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
+        grouped = await backend.get_all_valid_edges(group_id='test')
+        assert len(distinct_edge_uuids(grouped)) == _LIVE_DISTINCT_EDGES
+        assert total_attributions(grouped) == _LIVE_EDGE_ROWS
+
+    @pytest.mark.asyncio
+    async def test_enumerate_reports_complete_on_a_full_corpus(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        graph = _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
+        grouped, paged = await backend.enumerate_all_valid_edges(group_id='test')
+        assert paged.complete is True
+        assert paged.reason is None
+        assert paged.rows_seen == _LIVE_EDGE_ROWS
+        assert paged.expected_rows == _LIVE_EDGE_ROWS
+        assert len(distinct_edge_uuids(grouped)) == _LIVE_DISTINCT_EDGES
+
+    @pytest.mark.asyncio
+    async def test_enumerate_reports_incomplete_but_still_returns_the_collection(
+        self, mock_config, make_backend
+    ):
+        """A disagreeing census flips completeness without withholding the data."""
+        backend = make_backend(mock_config)
+        graph = _wire(
+            backend,
+            FakeCappedGraph(
+                make_live_shaped_edge_corpus(),
+                census_override=_LIVE_EDGE_ROWS + 5000,
+            ),
+        )
+        grouped, paged = await backend.enumerate_all_valid_edges(group_id='test')
+        assert paged.complete is False
+        assert isinstance(paged.reason, str) and paged.reason
+        assert grouped
+        assert len(distinct_edge_uuids(grouped)) == _LIVE_DISTINCT_EDGES
+
+    @pytest.mark.asyncio
+    async def test_shim_warns_when_the_enumeration_is_incomplete(
+        self, mock_config, make_backend, caplog
+    ):
+        """No longer a silently short dict: the shim says so, and still returns it."""
+        backend = make_backend(mock_config)
+        graph = _wire(
+            backend,
+            FakeCappedGraph(
+                make_live_shaped_edge_corpus(),
+                census_override=_LIVE_EDGE_ROWS + 5000,
+            ),
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            grouped = await backend.get_all_valid_edges(group_id='test')
+        assert grouped
+        messages = _warnings(caplog)
+        assert messages
+        assert any('get_all_valid_edges' in m for m in messages)
+        assert any(str(_LIVE_EDGE_ROWS) in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_shim_is_silent_on_a_complete_enumeration(
+        self, mock_config, make_backend, caplog
+    ):
+        backend = make_backend(mock_config)
+        graph = _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            await backend.get_all_valid_edges(group_id='test')
+        assert _warnings(caplog) == []
+
+
+class TestGetAllValidEdgesEmittedCypher:
+    """The paginated query keeps the semantics the docstring documents."""
+
+    @pytest.fixture
+    def emitted(self, mock_config, make_backend):
+        async def _run():
+            backend = make_backend(mock_config)
+            graph = _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
+            await backend.get_all_valid_edges(group_id='test')
+            return graph
+
+        return _run
+
+    @pytest.mark.asyncio
+    async def test_page_query_keeps_the_match_return_shape(self, emitted):
+        graph = await emitted()
+        page = graph.page_queries[0]
+        assert 'MATCH (n:Entity)-[e:RELATES_TO]-()' in page
+        assert 'e.invalid_at IS NULL' in page
+        assert 'RETURN n.uuid, e.uuid, e.fact, e.name' in page
+        assert 'WITH DISTINCT' not in page
+        assert 'RETURN DISTINCT' not in page
+
+    @pytest.mark.asyncio
+    async def test_page_query_orders_by_a_total_order(self, emitted):
+        """ORDER BY must be TOTAL over ROWS, not just over edges.
+
+        The undirected MATCH yields two rows per edge, so ``e.uuid`` alone
+        leaves that pair free to reshuffle across a page boundary — and a
+        reshuffle at a boundary silently drops rows permanently.
+        """
+        graph = await emitted()
+        page = graph.page_queries[0]
+        assert 'ORDER BY' in page
+        order_by = page.split('ORDER BY', 1)[1]
+        assert 'e.uuid' in order_by
+        assert 'n.uuid' in order_by
+
+    @pytest.mark.asyncio
+    async def test_census_matches_the_page_population(self, emitted):
+        """Same MATCH/WHERE => the two numbers describe the same population."""
+        graph = await emitted()
+        census = graph.census_queries[0]
+        assert 'MATCH (n:Entity)-[e:RELATES_TO]-()' in census
+        assert 'e.invalid_at IS NULL' in census
+        assert 'count(*)' in census
+        assert 'SKIP' not in census.upper()
+
+    @pytest.mark.asyncio
+    async def test_reads_use_ro_query_only(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        # FakeCappedGraph.query raises outright, so reaching it fails loudly;
+        # only ro_query appends to .queries, so a non-empty log proves the
+        # whole read went through the read-only path.
+        graph = _wire(backend, FakeCappedGraph(make_live_shaped_edge_corpus()))
+        await backend.get_all_valid_edges(group_id='test')
+        assert graph.queries
+        assert len(graph.queries) == len(graph.census_queries) + len(graph.page_queries)
+
+
+class TestGetAllValidEdgesBehaviourPreserved:
+    """Pagination must not quietly change the dedup contract (tasks 2207/2210/2213)."""
+
+    @pytest.mark.asyncio
+    async def test_double_attribution_preserved(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph([['A', 'e1', 'f', 'n'], ['B', 'e1', 'f', 'n']]))
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert set(result.keys()) == {'A', 'B'}
+        assert result['A'] == [{'uuid': 'e1', 'fact': 'f', 'name': 'n'}]
+        assert result['B'] == [{'uuid': 'e1', 'fact': 'f', 'name': 'n'}]
+
+    @pytest.mark.asyncio
+    async def test_self_loop_double_match_collapsed(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph([['A', 'e1', 'f', 'n'], ['A', 'e1', 'f', 'n']]))
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['A'] == [{'uuid': 'e1', 'fact': 'f', 'name': 'n'}]
+
+    @pytest.mark.asyncio
+    async def test_distinct_edges_same_entity_preserved(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        _wire(
+            backend,
+            FakeCappedGraph([['A', 'e1', 'f1', 'n1'], ['A', 'e2', 'f2', 'n2']]),
+        )
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['A'] == [
+            {'uuid': 'e1', 'fact': 'f1', 'name': 'n1'},
+            {'uuid': 'e2', 'fact': 'f2', 'name': 'n2'},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_shared_pair_differing_content_keeps_first_and_logs(
+        self, mock_config, make_backend, caplog
+    ):
+        backend = make_backend(mock_config)
+        _wire(
+            backend,
+            FakeCappedGraph([
+                ['A', 'e1', 'first-fact', 'first-name'],
+                ['A', 'e1', 'second-fact', 'second-name'],
+            ]),
+        )
+        with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+            result = await backend.get_all_valid_edges(group_id='test')
+        assert result['A'] == [{'uuid': 'e1', 'fact': 'first-fact', 'name': 'first-name'}]
+        assert any('e1' in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_null_fact_and_name_coerced(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph([['A', 'e1', None, None]]))
+        result = await backend.get_all_valid_edges(group_id='test')
+        assert result['A'] == [{'uuid': 'e1', 'fact': '', 'name': ''}]
+
+    @pytest.mark.asyncio
+    async def test_dedup_map_spans_pages(self, mock_config, make_backend):
+        """The case pagination newly makes possible: a repeated pair across a page break.
+
+        The ``seen`` map must be built ONCE over all pages. A per-page map
+        would let the second occurrence through and double-count the edge.
+        """
+        backend = make_backend(mock_config)
+        corpus = [
+            ['A', 'e1', 'f', 'n'],
+            ['B', 'e1', 'f', 'n'],
+            ['A', 'e1', 'f', 'n'],  # page 2 — same pair as row 0
+            ['C', 'e2', 'f2', 'n2'],
+        ]
+        _wire(backend, FakeCappedGraph(corpus))
+        grouped, paged = await backend.enumerate_all_valid_edges(
+            group_id='test', page_size=2
+        )
+        assert len(paged.rows) == 4  # every row really was fetched...
+        assert grouped['A'] == [{'uuid': 'e1', 'fact': 'f', 'name': 'n'}]
+        assert total_attributions(grouped) == 3  # ...and the repeat collapsed
+        assert paged.complete is True
