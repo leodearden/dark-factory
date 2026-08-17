@@ -377,6 +377,102 @@ _RECON_REPORT_PLACEHOLDERS = {
 }
 
 
+
+# The curated NARRATIVE order the guidance renders KNOWN tools in — deliberately
+# NOT registration order (``signatures.keys()`` yields start_report /
+# add_finding / set_stat / inc_stat / complete / delete_finding / cite_*),
+# because the prose tells a story: file a finding -> attach typed citations ->
+# record stats -> terminal complete.
+#
+# This tuple governs PLACEMENT and prose richness ONLY — never PRESENCE (task
+# 3878). :func:`_render_recon_report_tool_guidance` renders every key of the
+# mapping it is handed, appending a generic call-shape bullet for any tool not
+# named here, so a newly-registered tool cannot be silently omitted from the
+# guidance; the worst that can happen is that it lands in the trailing "Also
+# registered on this server" list with no curated annotation until someone
+# writes one. A name here that is ABSENT from the mapping is skipped rather
+# than raising, so this tuple going stale in the other direction (a tool
+# deregistered upstream) cannot break rendering either.
+_GUIDANCE_TOOL_ORDER = (
+    'add_finding',
+    'cite_entity',
+    'cite_edge',
+    'cite_task',
+    'cite_memory',
+    'cite_run',
+    'set_stat',
+    'inc_stat',
+    'complete',
+)
+
+# set_stat and inc_stat share ONE sentence because they are ALTERNATIVES ("use
+# X or Y"), not successive steps like the rest of the narrative. They render as
+# a group, at the position of whichever of them comes first in
+# _GUIDANCE_TOOL_ORDER, with whichever are present joined by ' or ' — splitting
+# them into two independent sentences would change the shipped wording.
+_GUIDANCE_STATS_GROUP = ('set_stat', 'inc_stat')
+
+# Opening prose. Unconditional, and deliberately NOT derived from *signatures*:
+# start_report's mention here is the sentence that tells the agent the harness
+# already called it, so it must survive even though no start_report CALL SHAPE
+# is rendered (the caller filters it out — see HARNESS_CALLED_REPORT_TOOLS in
+# server/recon_report.py).
+_GUIDANCE_PREAMBLE = (
+    'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
+    ' — do NOT call it yourself. '
+)
+
+# Curated per-tool prose. The `{call}` marker is substituted with the rendered
+# call shape via ``str.replace`` (NOT ``str.format``), so prose containing
+# literal braces needs no escaping.
+#
+# This prose is LOAD-BEARING, not decoration: the cite_task dedup-anchor
+# paragraph, the cite_edge/cite_memory verbatim-UUID rules, cite_run's
+# never-paraphrase rule and complete's terminal-action rule are all behavioural
+# contracts the stages depend on. Edit the wording here and it propagates to
+# every stage prompt at once; delete it and a stage silently loses the rule.
+_GUIDANCE_TOOL_PROSE: dict[str, str] = {
+    'add_finding': (
+        'For each finding, call `{call}` and capture the `finding_id` from the response.'
+        ' Then attach typed citations:\n'
+    ),
+    'cite_entity': (
+        '- `{call}` — pass the ENTITY NAME (not a UUID); the server resolves the UUID'
+        ' internally.\n'
+    ),
+    'cite_edge': (
+        '- `{call}` — copy the UUID verbatim from the `id` field of a fresh tool result'
+        ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
+    ),
+    'cite_task': (
+        '- `{call}` — both project_id and task_id are required. **Dedup anchor**:'
+        ' `_derive_affected_ids` reads `cited_tasks` (not the top-level `task_id` field of'
+        ' `add_finding`) when building the fingerprint for `compute_content_fingerprint`.'
+        ' Always call `cite_task` for the primary subject task so the fingerprint is stable.'
+        ' For multi-task findings, the cited_tasks signature shifts as citations grow or'
+        ' shrink — also pass `task_id=<primary>` at the top level of `add_finding` as a'
+        ' supplementary stable anchor when one clear primary subject exists. Exception:'
+        ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
+        ' sole dedup anchor there.\n'
+    ),
+    'cite_memory': (
+        '- `{call}` — `memory_id` must be the full 36-char UUID from the `id` field of a'
+        ' fresh tool result.\n'
+    ),
+    'cite_run': (
+        '- `{call}` — whenever a finding\'s description or suggested_action references'
+        " another reconciliation run's run_id, call this to confirm it exists and attach"
+        ' it. Copy `cited_run_id` verbatim from the `run_id` or `metadata.run_id` field of'
+        ' a fresh tool result — never re-type or paraphrase a run_id from memory.\n'
+    ),
+    'complete': (
+        'When all findings are recorded and all work is done, call `{call}` as your'
+        ' terminal action — do NOT produce a structured JSON response; the assembled'
+        ' recon_report state is the authoritative output channel for this stage.'
+    ),
+}
+
+
 def _render_recon_report_tool_guidance(
     signatures: Mapping[str, tuple[tuple[str, bool], ...]],
 ) -> str:
@@ -417,6 +513,21 @@ def _render_recon_report_tool_guidance(
 
     start_report is harness-called (agents never call it themselves) and is
     intentionally excluded from generation — its mention below stays prose.
+
+    PRESENCE is derived, PLACEMENT is curated (task 3878). Every key of
+    *signatures* is rendered: :data:`_GUIDANCE_TOOL_ORDER` +
+    :data:`_GUIDANCE_TOOL_PROSE` decide only WHERE a known tool appears and how
+    richly it is annotated, and any tool NOT named there still renders as a
+    generic call-shape bullet under a trailing "Also registered on this server"
+    lead-in. So a newly-registered tool can never be silently absent from the
+    guidance — which is what the previous design, nine hard-coded
+    ``render_call('...')`` calls that ignored the mapping's other keys, allowed.
+    Conversely a curated name MISSING from *signatures* is skipped rather than
+    raising ``KeyError``, so this function renders whatever it is handed and
+    never depends on the caller supplying a particular tool. Filtering which
+    tools an agent should be told about at all is the CALLER's job (see
+    :func:`render_recon_report_tool_guidance` and the classification constants
+    in ``server/recon_report.py``), not this function's.
     """
 
     def render_call(tool_name: str) -> str:
@@ -427,49 +538,31 @@ def _render_recon_report_tool_guidance(
             parts.append(kwarg if required else f'[{kwarg}]')
         return f'mcp__recon-report__{tool_name}({", ".join(parts)})'
 
-    add_finding_call = render_call('add_finding')
-    cite_entity_call = render_call('cite_entity')
-    cite_edge_call = render_call('cite_edge')
-    cite_task_call = render_call('cite_task')
-    cite_memory_call = render_call('cite_memory')
-    cite_run_call = render_call('cite_run')
-    set_stat_call = render_call('set_stat')
-    inc_stat_call = render_call('inc_stat')
-    complete_call = render_call('complete')
+    stats_present = [tool for tool in _GUIDANCE_STATS_GROUP if tool in signatures]
+    sections = [_GUIDANCE_PREAMBLE]
+    for tool in _GUIDANCE_TOOL_ORDER:
+        if tool not in signatures:
+            # A curated name that is no longer registered: skip its prose rather
+            # than raising, so a tool removed upstream degrades to a missing
+            # paragraph instead of a bare KeyError for every prompt consumer.
+            continue
+        if tool in _GUIDANCE_STATS_GROUP:
+            if tool != stats_present[0]:
+                continue  # already covered by the shared stats sentence below
+            joined = ' or '.join(f'`{render_call(name)}`' for name in stats_present)
+            sections.append(f'For stats counters use {joined}. ')
+            continue
+        sections.append(_GUIDANCE_TOOL_PROSE[tool].replace('{call}', render_call(tool)))
 
-    return (
-        'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
-        f' — do NOT call it yourself. For each finding, call `{add_finding_call}`'
-        ' and capture the `finding_id` from the response. Then attach typed citations:\n'
-        f'- `{cite_entity_call}` —'
-        ' pass the ENTITY NAME (not a UUID); the server resolves the UUID internally.\n'
-        f'- `{cite_edge_call}` —'
-        ' copy the UUID verbatim from the `id` field of a fresh tool result'
-        ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
-        f'- `{cite_task_call}`'
-        ' — both project_id and task_id are required. **Dedup anchor**:'
-        ' `_derive_affected_ids` reads `cited_tasks` (not the top-level `task_id` field of'
-        ' `add_finding`) when building the fingerprint for `compute_content_fingerprint`.'
-        ' Always call `cite_task` for the primary subject task so the fingerprint is stable.'
-        ' For multi-task findings, the cited_tasks signature shifts as citations grow or'
-        ' shrink — also pass `task_id=<primary>` at the top level of `add_finding` as a'
-        ' supplementary stable anchor when one clear primary subject exists. Exception:'
-        ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
-        ' sole dedup anchor there.\n'
-        f'- `{cite_memory_call}` — `memory_id` must be the full 36-char UUID from the'
-        ' `id` field of a fresh tool result.\n'
-        f'- `{cite_run_call}` — whenever a finding\'s description or'
-        ' suggested_action references another reconciliation run\'s run_id, call this'
-        ' to confirm it exists and attach it. Copy `cited_run_id` verbatim from the'
-        ' `run_id` or `metadata.run_id` field of a fresh tool result — never re-type'
-        ' or paraphrase a run_id from memory.\n'
-        f'For stats counters use `{set_stat_call}` or'
-        f' `{inc_stat_call}`. When all findings are recorded'
-        ' and all work is done, call'
-        f' `{complete_call}` as your'
-        ' terminal action — do NOT produce a structured JSON response; the assembled'
-        ' recon_report state is the authoritative output channel for this stage.'
-    )
+    extra = [tool for tool in signatures if tool not in _GUIDANCE_TOOL_ORDER]
+    if extra:
+        bullets = '\n'.join(f'- `{render_call(tool)}`' for tool in extra)
+        sections.append(
+            '\nAlso registered on this server (see the server instructions for full'
+            f' semantics):\n{bullets}'
+        )
+
+    return ''.join(sections)
 
 
 def render_recon_report_tool_guidance() -> str:
