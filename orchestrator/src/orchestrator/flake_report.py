@@ -672,7 +672,20 @@ def build_report(
     unpruned by design).  α's docstring is explicit that a count over a ``limit``-capped
     read is a count over an unknown window and dividing by it is meaningless, so a read
     that fills the limit is surfaced rather than silently yielding a rate.
+
+    Raises:
+        ValueError: if *occurrence_limit* is not positive.  α clamps a negative limit to
+            ``max(0, limit)`` and returns ``[]``, which would sail straight past the
+            truncation check (``0 >= 0``) and render "no occurrences in window" and
+            "TRUNCATED … PARTIAL window" on the same page — two statements that cannot
+            both be acted on.  A zero-row cap is not a small window, it is no measurement
+            at all, and the caller that asked for one has a bug worth hearing about.
     """
+    if occurrence_limit <= 0:
+        raise ValueError(
+            f'occurrence_limit must be positive, got {occurrence_limit}: a report over a '
+            'zero-row cap is not a measurement'
+        )
     now = now or datetime.now(UTC)
 
     # Shared by both not-a-measurement exits below, so the thresholds an operator is

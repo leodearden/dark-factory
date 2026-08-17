@@ -742,6 +742,175 @@ class TestBuildReport:
         assert report.chains[0].occurrence_count == 0
 
 
+class TestThresholdPlumbing:
+    """Every threshold must actually be a PARAMETER, and must actually reach its counter.
+
+    The module's headline design claim is that θ's ``FlakeLedgerConfig`` will pass its
+    configured values through these same keyword arguments rather than re-deriving any
+    counter at a second site (INV-5).  That claim is only worth anything if the keywords
+    are wired: a dropped or swapped forward in ``build_report`` would pin every counter
+    silently to its default while leaving the rest of this suite green, and silently
+    pinning a configured threshold to a default is precisely the failure θ exists to
+    avoid.  Every value below is distinct so a SWAP is caught, not just a drop.
+    """
+
+    def test_gate_blind_threshold_is_a_parameter(self):
+        # 2 unconfirmable of 8 == 0.25, which the DEFAULT threshold (0.25, strict >) does
+        # not exceed.  A lower configured threshold must flip it.
+        rows = [_occ(verdict=FlakeVerdict.unconfirmable, row_id=i) for i in range(2)]
+        rows += [_occ(row_id=10 + i) for i in range(6)]
+        assert compute_gate_blind(rows).exceeds_threshold is False
+        flipped = compute_gate_blind(rows, threshold=0.2)
+        assert flipped.exceeds_threshold is True
+        assert flipped.threshold == 0.2
+
+    def test_gate_blind_min_observations_is_a_parameter(self):
+        rows = [_occ(verdict=FlakeVerdict.unconfirmable, row_id=i) for i in range(8)]
+        assert compute_gate_blind(rows).sufficient is True
+        raised = compute_gate_blind(rows, min_observations=9)
+        assert raised.sufficient is False
+        assert raised.min_observations == 9
+        # ...and an insufficient window cannot be OVER THRESHOLD, whatever the rate.
+        assert raised.exceeds_threshold is False
+
+    def test_gate_blind_window_hours_is_carried_for_the_render(self):
+        assert compute_gate_blind([], window_hours=42).window_hours == 42
+
+    def test_non_convergence_age_days_is_a_parameter(self):
+        rows = [_debt(test_id='aged', opened_at='2026-08-06T12:00:00+00:00')]  # 4d at _NOW
+        assert compute_non_convergence(rows, _NOW).over_age_tests == 1
+        relaxed = compute_non_convergence(rows, _NOW, age_days=10)
+        assert relaxed.over_age_tests == 0
+        assert relaxed.age_threshold_days == 10
+
+    def test_systemic_distinct_tests_is_a_parameter(self):
+        rows = [
+            _occ(test_id=f'tests/test_{i}.py::test_x',
+                 observed_at=f'2026-08-08T12:{i:02d}:00+00:00', row_id=i)
+            for i in range(3)
+        ]
+        assert compute_systemic(rows).exceeds_threshold is False
+        tightened = compute_systemic(rows, distinct_tests=3)
+        assert tightened.exceeds_threshold is True
+        assert tightened.threshold == 3
+
+    def test_systemic_window_minutes_is_a_parameter(self):
+        # Three tests 45m apart: a 60m window holds two, a 120m window holds all three.
+        rows = [
+            _occ(test_id=f'tests/test_{i}.py::test_x',
+                 observed_at=(datetime(2026, 8, 8, 12, tzinfo=UTC)
+                              + timedelta(minutes=45 * i)).isoformat(), row_id=i)
+            for i in range(3)
+        ]
+        assert compute_systemic(rows, window_minutes=60).peak_distinct_tests == 2
+        wider = compute_systemic(rows, window_minutes=120)
+        assert wider.peak_distinct_tests == 3
+        assert wider.window_minutes == 120
+
+    def _seeded(self, tmp_path: Path) -> Path:
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        _seed_debt(db_path, test_id='tests/test_a.py::test_one',
+                   opened_at='2026-08-06T12:00:00+00:00')
+        _seed_occurrence(db_path, test_id='tests/test_a.py::test_one',
+                         observed_at='2026-08-09T12:00:00+00:00')
+        return db_path
+
+    @staticmethod
+    def _custom_report(db_path: Path) -> FlakeLedgerReport:
+        """build_report with every threshold configured — all values distinct on purpose,
+        so a SWAPPED forward shows up and not just a dropped one.  Spelled out rather
+        than splatted from a dict so the keyword types stay checkable."""
+        return build_report(
+            db_path,
+            now=_NOW,
+            window_hours=23,
+            age_days=11,
+            gate_blind_threshold=0.77,
+            gate_blind_min_observations=13,
+            systemic_distinct_tests=17,
+            systemic_window_minutes=19,
+        )
+
+    def _assert_forwarded(self, report: FlakeLedgerReport) -> None:
+        assert report.gate_blind.window_hours == 23
+        assert report.gate_blind.threshold == 0.77
+        assert report.gate_blind.min_observations == 13
+        assert report.non_convergence.age_threshold_days == 11
+        assert report.systemic.threshold == 17
+        assert report.systemic.window_minutes == 19
+
+    def test_build_report_forwards_every_threshold(self, tmp_path):
+        self._assert_forwarded(self._custom_report(self._seeded(tmp_path)))
+
+    def test_the_forward_survives_the_not_measured_paths(self, tmp_path):
+        # The absent/unreadable exits build their counters separately, so an operator
+        # must still be shown the thresholds they are being measured against — and θ
+        # must not see a default it never configured.
+        self._assert_forwarded(self._custom_report(tmp_path / 'nope' / 'runs.db'))
+        corrupt = tmp_path / 'runs.db'
+        corrupt.write_bytes(b'not a database')
+        self._assert_forwarded(self._custom_report(corrupt))
+
+    def test_a_forwarded_threshold_changes_the_verdict_not_just_the_label(self, tmp_path):
+        # The seeded debt row is 4 days old: over the default 3d backstop, under a
+        # configured 11d one.  A forward that dropped age_days would leave this at 1.
+        db_path = self._seeded(tmp_path)
+        assert build_report(db_path, now=_NOW).non_convergence.over_age_tests == 1
+        assert self._custom_report(db_path).non_convergence.over_age_tests == 0
+
+
+class TestDegradeBranches:
+    """The documented "this should be unreachable" paths — pinned, not assumed."""
+
+    def test_an_unrecognised_verdict_inflates_neither_bucket_nor_the_denominator(self):
+        # record_flake_occurrence coerces on the way in, so this should be unreachable —
+        # but a row of unknown meaning in the DENOMINATOR would understate the rate,
+        # which is the dangerous direction for a blindness counter.
+        rows = [
+            _occ(verdict=FlakeVerdict.unconfirmable, row_id=1),
+            _occ(verdict=FlakeVerdict.passes_in_isolation, row_id=2),
+            _occ(verdict='wat', row_id=3),
+        ]
+        counter = compute_gate_blind(rows)
+        assert counter.unconfirmable == 1
+        assert counter.confirmed == 1
+        assert counter.total == 2, 'an unknown verdict must not reach the denominator'
+        assert counter.rate == pytest.approx(0.5)
+
+    def test_an_unrecognised_verdict_is_not_systemic_either(self):
+        assert compute_systemic([_occ(verdict='wat', row_id=1)]).peak_distinct_tests == 0
+
+    def test_an_unrecognised_call_site_stays_visible_under_its_own_key(self):
+        # 'merge-gate' is not 'merge_gate'.  Folding it into a neighbour would silently
+        # move counts between sites; dropping it would delete an observation.
+        chains = build_chains(
+            [_occ(test_id='t', call_site='merge-gate', row_id=1),
+             _occ(test_id='t', call_site=FlakeCallSite.merge_gate, row_id=2)],
+            [],
+            lambda t: None,
+        )
+        assert chains[0].call_site_counts == {'merge-gate': 1, 'merge_gate': 1}
+        assert chains[0].occurrence_count == 2
+        rendered = render_report(_report(chains=chains))
+        assert 'merge-gate=1' in rendered, rendered
+
+    def test_a_non_positive_occurrence_limit_is_rejected_not_silently_truncated(self, tmp_path):
+        # α clamps to max(0, limit) and returns [], so `0 >= 0` used to mark the report
+        # TRUNCATED — rendering "no occurrences in window" and "PARTIAL window" on the
+        # same page.  A zero-row cap is no measurement at all, so it is refused.
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        for limit in (0, -1):
+            with pytest.raises(ValueError, match='occurrence_limit must be positive'):
+                build_report(db_path, now=_NOW, occurrence_limit=limit)
+
+    def test_the_limit_is_validated_before_the_absent_db_guard(self, tmp_path):
+        # Otherwise the bug is invisible for exactly the projects with no ledger yet.
+        with pytest.raises(ValueError):
+            build_report(tmp_path / 'nope' / 'runs.db', now=_NOW, occurrence_limit=0)
+
+
 class TestReadAmplification:
     """One report must not fan out into one ledger connection per test.
 
