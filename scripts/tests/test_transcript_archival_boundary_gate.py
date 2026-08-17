@@ -50,7 +50,12 @@ sys.path wiring is what makes ``import gc_agent_transcripts`` and
 from __future__ import annotations
 
 import os
+from datetime import date
 from pathlib import Path
+
+from legibility import config as legibility_config
+from legibility import inventory, sampling
+from shared.transcript_archive import archive_task_transcripts
 
 # scripts/tests/../../ = the repo root, where docs/legibility/legibility.yaml
 # (the SHIPPED config E5 reads its roots/prefixes from) lives.
@@ -65,3 +70,142 @@ def _touch(path: Path, mtime: float) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b'x')
     os.utime(path, (mtime, mtime))
+
+
+# ---------------------------------------------------------------------------
+# E5 — legibility mining enumerates the archived transcript
+# ---------------------------------------------------------------------------
+
+# The SHIPPED per-project config the miner actually reads. E5 loads THIS file,
+# not a fixture: γ's stated signal has two halves — the enumerate change works,
+# AND the shipped config turns it on with no operator flip — and only reading
+# the real YAML can assert the second.
+SHIPPED_LEGIBILITY_YAML = REPO_ROOT / 'docs' / 'legibility' / 'legibility.yaml'
+
+# A real orchestrated-task worktree cwd. Its encoding contains '--worktrees-',
+# which is what makes sampling.classify_agent_class return 'orchestrated-task'
+# and what inventory._enumerate's cheap <enc> pre-filter matches on.
+WORKTREE_CWD = '/home/leo/src/dark-factory/.worktrees/2732'
+SESSION_DATE = date(2026, 8, 17)
+SESSION_SID = 'a1b2c3d4-0000-4000-8000-abcdefabcdef'
+
+
+def _archive_a_real_session(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Produce an archive by running the REAL archiver, never by hand.
+
+    Returns ``(project_root, archive_root, archived_transcript)``. The source
+    is a per-task config dir whose encoded dir is ``encode_cwd(WORKTREE_CWD)``
+    and whose transcript carries that same absolute path as its ``cwd`` line
+    plus an explicit ISO-8601 ``timestamp`` — so the row pins a FIXED session
+    date rather than depending on what "today" happens to be.
+
+    Hand-writing the archive layout would make E5 assert only that the miner
+    reads a shape the TEST invented; running α's writer is what makes it assert
+    the miner reads the shape α actually produces.
+    """
+    project_root = tmp_path / 'fake-project-root'
+    config_dir = project_root / '.task' / 'claude-config-2732'
+    enc = inventory.encode_cwd(WORKTREE_CWD)
+    src = config_dir / 'projects' / enc / f'{SESSION_SID}.jsonl'
+    src.parent.mkdir(parents=True)
+    src.write_text(
+        f'{{"type":"user","cwd":"{WORKTREE_CWD}",'
+        f'"timestamp":"{SESSION_DATE}T09:15:00+00:00",'
+        f'"message":{{"role":"user","content":"run the gate"}}}}\n'
+        f'{{"type":"assistant","cwd":"{WORKTREE_CWD}",'
+        f'"timestamp":"{SESSION_DATE}T09:15:30+00:00"}}\n',
+        encoding='utf-8',
+    )
+
+    archive_root = project_root / 'data' / 'orchestrator' / 'agent-transcripts'
+    written = archive_task_transcripts(
+        config_dir, '2732', SESSION_SID, archive_root=archive_root
+    )
+    assert written == 1
+    archived = archive_root / '2732' / enc / f'{SESSION_SID}.jsonl'
+    assert archived.exists()
+    return project_root, archive_root, archived
+
+
+class TestE5MiningEnumeratesTheArchive:
+    """E5 — the orchestrator→legibility cross-tool seam, integrated.
+
+    The archive is written by the REAL ``archive_task_transcripts`` and read by
+    the REAL ``enumerate_sessions``, through the roots and prefixes the SHIPPED
+    ``docs/legibility/legibility.yaml`` actually carries. The relative root is
+    resolved against a TMP project root via the production
+    ``resolve_agent_transcript_roots``, so the live (git-ignored,
+    concurrently-written) ``data/orchestrator/agent-transcripts`` tree is never
+    touched.
+    """
+
+    def test_shipped_config_turns_archive_mining_on_with_no_operator_flip(self):
+        cfg = legibility_config.load_config(SHIPPED_LEGIBILITY_YAML)
+        assert cfg.agent_transcript_roots == ['data/orchestrator/agent-transcripts']
+        assert cfg.cwd_prefixes == ['/home/leo/src/dark-factory']
+
+    def test_real_archive_is_enumerated_and_classified(self, tmp_path):
+        project_root, _archive_root, archived = _archive_a_real_session(tmp_path)
+        cfg = legibility_config.load_config(SHIPPED_LEGIBILITY_YAML)
+
+        # Production resolution of the project_root-relative root, against the
+        # TMP root — never the live tree.
+        resolved = inventory.resolve_agent_transcript_roots(
+            project_root, cfg.agent_transcript_roots
+        )
+        assert resolved == [project_root / 'data/orchestrator/agent-transcripts']
+
+        # An empty stand-in for ~/.claude/projects, so everything enumerated
+        # below came from the ARCHIVE root.
+        fake_projects_root = tmp_path / 'claude-projects'
+        fake_projects_root.mkdir()
+
+        records = inventory.enumerate_sessions(
+            fake_projects_root,
+            cfg.cwd_prefixes,
+            SESSION_DATE,
+            agent_transcript_roots=resolved,
+        )
+
+        assert len(records) == 1
+        record = records[0]
+        assert record.path == archived
+        assert record.cwd == WORKTREE_CWD
+        assert record.encoded_dir == inventory.encode_cwd(WORKTREE_CWD)
+        assert record.date == SESSION_DATE
+
+        # Membership is decided on the REAL decoded cwd, not the encoded dir.
+        assert inventory.is_member(record.cwd, cfg.cwd_prefixes)
+
+        # ...and the session lands in the orchestrated-task stratum, which is
+        # the whole point of mining the fleet archive.
+        first_turn = sampling._find_first_user_turn(record.path)
+        assert sampling.classify_agent_class(first_turn, record.path) == 'orchestrated-task'
+
+    def test_empty_roots_default_is_byte_parity_with_today(self, tmp_path):
+        """PARITY — the archive is opt-in. With the empty code default the walk
+        is byte-identical to the projects-only path it always was, so nothing
+        that does not pass roots can start seeing fleet transcripts."""
+        project_root, _archive_root, _archived = _archive_a_real_session(tmp_path)
+        cfg = legibility_config.load_config(SHIPPED_LEGIBILITY_YAML)
+        fake_projects_root = tmp_path / 'claude-projects'
+        fake_projects_root.mkdir()
+
+        assert inventory.enumerate_sessions(
+            fake_projects_root, cfg.cwd_prefixes, SESSION_DATE
+        ) == []
+        assert inventory.enumerate_sessions(
+            fake_projects_root,
+            cfg.cwd_prefixes,
+            SESSION_DATE,
+            agent_transcript_roots=(),
+        ) == []
+        # The archive really is non-empty — the parity above is not vacuous.
+        assert inventory.enumerate_sessions(
+            fake_projects_root,
+            cfg.cwd_prefixes,
+            SESSION_DATE,
+            agent_transcript_roots=inventory.resolve_agent_transcript_roots(
+                project_root, cfg.agent_transcript_roots
+            ),
+        )
