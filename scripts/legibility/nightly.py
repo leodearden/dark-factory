@@ -8,10 +8,14 @@ decisions 7/8 (fail-loud contract, liveness probes git history never),
 boundary test §8.8.
 
 Every stage is reached behind a dependency-injection seam (``invoke`` for
-the LLM, ``status_fetcher`` for the census, ``poster`` for escalation,
-``committer`` for git) plus module-level functions a caller can monkeypatch
--- mirrors the established seam convention (coder.py's ``invoke`` override,
-census_trigger.py's injected ``status_fetcher``). This is what the
+the LLM, ``status_fetcher`` for the census -- defaulting to the real
+MCP-backed ``get_statuses`` fetcher for ``cfg.project_root``, ``poster``
+for escalation, ``committer`` for git) plus module-level functions a caller
+can monkeypatch -- mirrors the established seam convention (coder.py's
+``invoke`` override, census_trigger.py's injected ``status_fetcher``).
+Each seam resolves ``None`` to its real implementation, so a production
+entrypoint that injects nothing still gets the real thing rather than
+nothing at all (task 4148). This is what the
 systemd ``legibility-trickle@.service`` template runs nightly, and what
 ``install-trickle-timer.sh``/``check_trickle_liveness.sh`` install and probe.
 """
@@ -996,6 +1000,14 @@ def run_nightly(
     *now* threads through to :func:`evaluate_census_step`'s clock seam and
     to the run-state recorder's ``recorded_at``.
 
+    *status_fetcher* defaults to the real MCP-backed ``get_statuses``
+    fetcher for ``cfg.project_root``
+    (:func:`census_trigger.default_status_fetcher`) -- inject to override.
+    ``None`` means "build the real one", NOT "no fetcher": that asymmetry
+    with every other seam here is what kept the census's tasks-landed
+    condition dead on the production path (task 4148). A test wanting the
+    fail-safe path injects a raising/empty fake instead.
+
     *recorder* (default :func:`trickle_state.record_run`) is the run-state
     seam, alongside the existing ``invoke``/``status_fetcher``/``poster``/
     ``committer`` ones. Called exactly once per run from a ``finally``
@@ -1026,6 +1038,31 @@ def run_nightly(
     if projects_root is None:
         projects_root = DEFAULT_PROJECTS_ROOT
     commit_fn = committer if committer is not None else _git_commit_docs_only
+    # Task 4148. The systemd path is `nightly.py run --project-id %i` ->
+    # main() -> run_nightly, and main() never built a fetcher -- so
+    # `status_fetcher=None` reached `compute_tasks_landed` on every real run
+    # and hit its `status_fetcher is None` arm (census_trigger.py:735-739;
+    # journal 2026-08-10/11/12), leaving condition (b) tasks-landed unable to
+    # fire at all. Every OTHER seam here already resolves None to its real
+    # implementation (committer -> _git_commit_docs_only above, recorder ->
+    # trickle_state.record_run, poster -> _default_poster); status_fetcher
+    # alone resolved to nothing, and that asymmetry is how three prior repairs
+    # of this same code (2953's 406 fix, 3291's baseline fix, 4085's fail-safe
+    # arms) each left the wiring loop open.
+    #
+    # Defaulted HERE rather than in main() because `cfg.project_root` is the
+    # first point in the chain where the ABSOLUTE root is known (config.py's
+    # validator guarantees absolute -- exactly what the MCP wire requires
+    # post-3291) while main() holds only --config/--project-id; and it is the
+    # identical value `evaluate_census_step` hands to `decide`, so the fetcher
+    # and the decision can never disagree about which project they are for.
+    # Deliberately NOT wrapped in try/except: the construction does no I/O
+    # (a resolve, an environ read, a returned closure), and every call-time
+    # failure is already fail-safe inside compute_tasks_landed.
+    status_fetcher = (
+        status_fetcher if status_fetcher is not None
+        else census_trigger.default_status_fetcher(cfg.project_root)
+    )
 
     # One render cache for the whole run: select_digest_sessions renders each
     # candidate to CHARGE it against the byte budget, and build_digests reuses
