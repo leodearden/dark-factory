@@ -1224,3 +1224,110 @@ class TestSpeculationLedgerWiring:
         asyncio.run(worker._speculation_controller.acquire_for_lookahead())
 
         assert worker.speculation_accounting_violations() == []
+
+
+# ---------------------------------------------------------------------------
+# task 3622 step-1 RED / step-2 GREEN: the derived ESCALATION age floor
+# (_resource_audit_escalation_age_secs) — the age past which a leaked worktree
+# has outlived its scheduled automatic reclaim and is therefore genuinely
+# escalation-worthy.
+# ---------------------------------------------------------------------------
+
+
+class TestResourceAuditEscalationFloor:
+    """Unit tests for ``SpeculativeMergeWorker._resource_audit_escalation_age_secs()``
+    and the ``RESOURCE_AUDIT_REAP_GRACE_SWEEPS`` tuning constant (task 3622).
+
+    The floor is DERIVED at runtime from the reaper it waits on rather than
+    being a fourth hand-picked seconds constant: the periodic sweep
+    (``_maybe_reap_orphaned_merge_worktrees``) destroys any unowned
+    ``_merge-*`` past ``PERIODIC_REAP_MIN_AGE_SECS`` on its next firing, so
+    ONE ``_reap_interval_s`` is the guaranteed-opportunity bound and the
+    SECOND covers a single fail-open ``cleanup_merge_worktree`` failure and
+    retry.  It must be a METHOD, not a class constant, because
+    ``_reap_interval_s`` is an instance attribute set in ``__init__``.
+
+    RED until step-2 GREEN adds the constant + method to merge_queue.py.
+    """
+
+    def test_floor_is_the_reap_age_plus_grace_sweeps_times_the_reap_interval(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+        assert worker._resource_audit_escalation_age_secs() == (
+            worker.PERIODIC_REAP_MIN_AGE_SECS
+            + worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS * worker._reap_interval_s
+        )
+
+    def test_at_shipped_defaults_the_floor_exceeds_both_existing_floors(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The ordering that makes the reclaim band a real band.
+
+        detection floor < destruction floor < escalation floor — so there is
+        a non-empty age range in which a leak is DETECTED (and logged, and
+        censused in ``snapshot()``) but not yet ESCALATED, because the reaper
+        is still scheduled to clear it.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        floor = worker._resource_audit_escalation_age_secs()
+
+        assert floor > worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+        assert floor > worker.PERIODIC_REAP_MIN_AGE_SECS
+        # The band the suppression lives in is bounded by the reaper's own
+        # cadence, not by an arbitrary constant.
+        assert worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS >= 1.0
+        assert worker._reap_interval_s > 0.0
+
+    def test_floor_tracks_a_per_instance_monkeypatch_of_the_reap_age(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.PERIODIC_REAP_MIN_AGE_SECS = 200.0
+        worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS = 2.0
+        worker._reap_interval_s = 10.0
+
+        assert worker._resource_audit_escalation_age_secs() == 220.0
+
+    def test_floor_tracks_a_per_instance_monkeypatch_of_the_reap_interval(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Recomputed on every call — the floor never caches a stale interval."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.PERIODIC_REAP_MIN_AGE_SECS = 200.0
+        worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS = 1.0
+        worker._reap_interval_s = 10.0
+        assert worker._resource_audit_escalation_age_secs() == 210.0
+
+        worker._reap_interval_s = 50.0
+        assert worker._resource_audit_escalation_age_secs() == 250.0
+
+    def test_grace_sweeps_is_a_monkeypatchable_class_attribute(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Declared on the class (per the RESOURCE_AUDIT_*/MAX_* convention) so
+        a test can shrink it per-instance without a monkeypatch fixture.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        assert isinstance(
+            SpeculativeMergeWorker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS, (int, float),
+        )
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.PERIODIC_REAP_MIN_AGE_SECS = 100.0
+        worker._reap_interval_s = 5.0
+        worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS = 3.0
+
+        assert worker._resource_audit_escalation_age_secs() == 115.0
+        # Per-instance only — the class default is untouched for other tests.
+        assert SpeculativeMergeWorker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS != 3.0
