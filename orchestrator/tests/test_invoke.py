@@ -10,8 +10,6 @@ import os
 import signal
 import subprocess
 import sys
-import textwrap
-import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,6 +17,7 @@ import pytest
 from _orch_helpers import make_gate_yielding as _make_gate_yielding  # centralized (task 1458)
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
+from shared.testing_stdin import STDIN_STARVATION_STUB, make_starving_exec
 from shared.usage_gate import AccountLease, InvokeSlot
 
 from orchestrator.agents.invoke import (
@@ -1997,37 +1996,14 @@ class TestSandboxPathRejectsBlankPrompt:
 # execve.  Fixing only the shared runner would have left a live instance of
 # exactly the bug this task exists to close.
 
-# Ported verbatim from shared/tests/test_cli_invoke.py (_STDIN_STARVATION_STUB
-# / _make_starving_exec), which is the source of truth.  Duplicated rather than
-# imported because `shared.tests` is not an importable package under the
-# orchestrator pytest rootdir — the same reason, and the same convention, as
-# tests/test_liveness_boundary_gate.py::_make_hanging_proc.
-_STDIN_STARVATION_STUB = textwrap.dedent(
-    """
-    import sys, select
-
-    r, _, _ = select.select([sys.stdin], [], [], 0.3)
-    if not r:
-        sys.stderr.write('Warning: no stdin data received in 3s, proceeding without it.\\n')
-        sys.stderr.write('Error: Input must be provided either through stdin or as a '
-                         'prompt argument when using --print\\n')
-        sys.exit(1)
-    data = sys.stdin.buffer.read()
-    sys.stdout.write('GOT:%d' % len(data))
-    """
-)
-
-
-def _make_starving_exec(block_secs: float):
-    """Return a create_subprocess_exec fake that starves the loop after spawn."""
-    real_exec = asyncio.create_subprocess_exec  # capture BEFORE patching
-
-    async def starving_exec(*args, **kwargs):
-        proc = await real_exec(*args, **kwargs)
-        time.sleep(block_secs)  # SYNCHRONOUS — blocks the event loop on purpose
-        return proc
-
-    return starving_exec
+# The stub CLI and the loop-starving exec fake are IMPORTED from
+# shared.testing_stdin (see this module's imports), not re-declared here.  They
+# were briefly duplicated from shared/tests/test_cli_invoke.py because
+# `shared.tests` is not an importable package under the orchestrator pytest
+# rootdir; the fix was to move the single definition into the shipped `shared`
+# package — which orchestrator already depends on — alongside shared.testing.
+# One copy means an edit to the stub's rejection signature cannot land in one
+# suite and silently miss the other.
 
 
 @pytest.mark.asyncio
@@ -2038,13 +2014,13 @@ class TestStdinStarvationRaceLocal:
     async def test_local_runner_delivers_stdin_when_loop_starved(self, tmp_path):
         """A 1.0s post-spawn loop stall must not cost the codex child its payload."""
         stub = tmp_path / 'stub_cli.py'
-        stub.write_text(_STDIN_STARVATION_STUB)
+        stub.write_text(STDIN_STARVATION_STUB)
 
         payload = b'Y' * 4242
 
         with patch(
             'orchestrator.agents.invoke.asyncio.create_subprocess_exec',
-            side_effect=_make_starving_exec(1.0),
+            side_effect=make_starving_exec(1.0),
         ):
             result = await _run_subprocess_local(
                 [sys.executable, str(stub)],

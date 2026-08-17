@@ -10,8 +10,6 @@ import json
 import logging
 import os
 import sys
-import textwrap
-import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,6 +40,11 @@ from shared.cli_invoke import (
 )
 from shared.invocation_outcome import classify_invocation
 from shared.testing import make_gate_mock
+from shared.testing_stdin import (
+    STDIN_DIGEST_STUB,
+    STDIN_STARVATION_STUB,
+    make_starving_exec,
+)
 
 
 class TestToTokenCount:
@@ -4872,65 +4875,10 @@ class TestUnreadableTranscriptEscapeWiring:
 # is not "load" per se, it is ">=3s of wall clock between child exec and the
 # parent's stdin write", so the tests inject exactly that gap.
 
-_STDIN_STARVATION_STUB = textwrap.dedent(
-    """
-    import sys, select
-
-    # Mimics the claude CLI's stdin deadline, shortened so the test is fast.
-    # The stderr text below reproduces CLI_INPUT_REQUIRED_MARKERS
-    # (shared/src/shared/invocation_outcome.py) VERBATIM, so these tests pin
-    # the exact production rejection signature rather than a lookalike.
-    r, _, _ = select.select([sys.stdin], [], [], 0.3)
-    if not r:
-        sys.stderr.write('Warning: no stdin data received in 3s, proceeding without it.\\n')
-        sys.stderr.write('Error: Input must be provided either through stdin or as a '
-                         'prompt argument when using --print\\n')
-        sys.exit(1)
-    data = sys.stdin.buffer.read()
-    sys.stdout.write('GOT:%d' % len(data))
-    """
-)
-
-
-_STDIN_DIGEST_STUB = textwrap.dedent(
-    """
-    import sys, select, hashlib
-
-    r, _, _ = select.select([sys.stdin], [], [], 0.3)
-    if not r:
-        sys.stderr.write('Warning: no stdin data received in 3s, proceeding without it.\\n')
-        sys.stderr.write('Error: Input must be provided either through stdin or as a '
-                         'prompt argument when using --print\\n')
-        sys.exit(1)
-    data = sys.stdin.buffer.read()
-    # Length AND digest, so a concurrent result can be matched back to its own
-    # invocation and cross-wiring cannot hide behind an equal length.
-    sys.stdout.write('GOT:%d:%s' % (len(data), hashlib.sha256(data).hexdigest()[:16]))
-    """
-)
-
-
-def _make_starving_exec(block_secs: float):
-    """Return a create_subprocess_exec fake that starves the loop after spawn.
-
-    Delegates to the REAL ``asyncio.create_subprocess_exec`` — a genuine child
-    is required to observe stdin delivery at the OS level — then blocks the
-    event loop with a SYNCHRONOUS ``time.sleep`` before returning the proc.
-
-    That blocking sleep is the whole point: it stalls the loop in exactly the
-    production window (between the child's exec and the parent's pipe write),
-    making the race deterministic instead of probabilistic.  In production the
-    same stall is produced by 48 concurrent agents sharing one event loop plus
-    multi-MB synchronous transcript parsing and fsync-per-commit SQLite writes.
-    """
-    real_exec = asyncio.create_subprocess_exec  # capture BEFORE patching
-
-    async def starving_exec(*args, **kwargs):
-        proc = await real_exec(*args, **kwargs)
-        time.sleep(block_secs)  # SYNCHRONOUS — blocks the event loop on purpose
-        return proc
-
-    return starving_exec
+# The stubs and the loop-starving exec fake live in shared.testing_stdin —
+# ONE definition, imported by this suite and by orchestrator's sibling suite
+# for _run_subprocess_local.  Their stderr is coupled to
+# CLI_INPUT_REQUIRED_MARKERS by an import-time check in that module.
 
 
 @pytest.mark.asyncio
@@ -4946,13 +4894,13 @@ class TestStdinStarvationRace:
         deadline and the child exited on argument validation with empty stdout.
         """
         stub = tmp_path / 'stub_cli.py'
-        stub.write_text(_STDIN_STARVATION_STUB)
+        stub.write_text(STDIN_STARVATION_STUB)
 
         payload = b'X' * 4242
 
         with patch(
             'shared.cli_invoke.asyncio.create_subprocess_exec',
-            side_effect=_make_starving_exec(1.0),
+            side_effect=make_starving_exec(1.0),
         ):
             result = await _run_subprocess(
                 [sys.executable, str(stub)],
@@ -4990,14 +4938,14 @@ class TestStdinStarvationRace:
             back to its own invocation by digest.
         """
         stub = tmp_path / 'digest_cli.py'
-        stub.write_text(_STDIN_DIGEST_STUB)
+        stub.write_text(STDIN_DIGEST_STUB)
 
         # Distinct length AND distinct fill byte; every one >65536.
         payloads = [bytes([65 + i]) * (70_000 + i * 1_000) for i in range(8)]
 
         with patch(
             'shared.cli_invoke.asyncio.create_subprocess_exec',
-            side_effect=_make_starving_exec(0.5),
+            side_effect=make_starving_exec(0.5),
         ):
             results = await asyncio.gather(*[
                 _run_subprocess(
@@ -5036,7 +4984,7 @@ class TestStdinStarvationRace:
         contract stays pinned next to the stdin one.
         """
         stub = tmp_path / 'stub_cli.py'
-        stub.write_text(_STDIN_STARVATION_STUB)
+        stub.write_text(STDIN_STARVATION_STUB)
 
         govern = tmp_path / 'cpu-governed-exec.sh'
         govern.write_text('#!/bin/sh\n# consume the `--role <role> --` contract, then exec in place\nshift 3\nexec "$@"\n')
@@ -5045,7 +4993,7 @@ class TestStdinStarvationRace:
         payload = b'Z' * 4242
         captured_args: list = []
         captured_kwargs: dict = {}
-        starving = _make_starving_exec(1.0)
+        starving = make_starving_exec(1.0)
 
         async def capturing_starving_exec(*args, **kwargs):
             captured_args.extend(args)
