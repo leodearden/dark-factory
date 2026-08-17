@@ -32,6 +32,21 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
 )
 
 
+def _async_is_live(result: bool):
+    """Async stand-in for the now-coroutine ``is_workflow_live_for_task``.
+
+    Task 3778 moved the live-workflow detector's three git probes onto
+    ``shared.git_async.run_git``, so the name ``harness_module`` imports is a
+    coroutine function and the integrity gate awaits it. A sync
+    ``lambda _tid, _pr, **kw: <bool>`` fake would still be CALLED, but awaiting
+    its bool return raises — so every patch of this seam must be async.
+    """
+    async def _fake(_tid, _pr, **kw):
+        return result
+
+    return _fake
+
+
 def _scope(project_id: str, project_root: str) -> ProjectScope:
     """Build a ProjectScope from raw strings — DRYs the many test call sites."""
     return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
@@ -12108,7 +12123,7 @@ async def test_live_workflow_gate_suppresses_escalation_when_task_is_live(
     monkeypatch.setattr(
         harness_module,
         'is_workflow_live_for_task',
-        lambda _tid, _pr, **kw: True,
+        _async_is_live(True),
     )
 
     # Seed N-2 prior completed runs containing the finding so persistence reaches threshold.
@@ -12211,7 +12226,7 @@ async def test_live_workflow_gate_allows_escalation_when_task_is_not_live(
     monkeypatch.setattr(
         harness_module,
         'is_workflow_live_for_task',
-        lambda _tid, _pr, **kw: False,
+        _async_is_live(False),
     )
 
     # Seed N-2 prior runs to reach threshold
@@ -12318,7 +12333,7 @@ async def test_live_workflow_gate_threads_task_status_for_deferred_cited_task(
     # and fail this test, proving the harness must forward the real status.
     received_statuses: list[str | None] = []
 
-    def _fake_is_live(_tid, _pr, **kw):
+    async def _fake_is_live(_tid, _pr, **kw):
         received_statuses.append(kw.get('status'))
         return kw.get('status') not in ('deferred', 'done', 'cancelled')
 
@@ -12456,7 +12471,7 @@ async def test_live_workflow_gate_threads_task_kind_for_blocked_deterministic_ci
     # task_kind.
     received_task_kinds: list[str | None] = []
 
-    def _fake_is_live(_tid, _pr, **kw):
+    async def _fake_is_live(_tid, _pr, **kw):
         received_task_kinds.append(kw.get('task_kind'))
         return not (kw.get('status') == 'blocked' and kw.get('task_kind') == 'deterministic')
 
@@ -12726,7 +12741,7 @@ class TestIntegrityGateInputParityWithRenderer:
         """
         received: list[bool | None] = []
 
-        def _fake_is_live(_tid, _pr, **kw):
+        async def _fake_is_live(_tid, _pr, **kw):
             received.append(kw.get('corroborated'))
             return kw.get('corroborated') is not False
 
@@ -12758,7 +12773,7 @@ class TestIntegrityGateInputParityWithRenderer:
         difference from the case above is heartbeat freshness."""
         received: list[bool | None] = []
 
-        def _fake_is_live(_tid, _pr, **kw):
+        async def _fake_is_live(_tid, _pr, **kw):
             received.append(kw.get('corroborated'))
             return kw.get('corroborated') is not False
 
@@ -12791,7 +12806,7 @@ class TestIntegrityGateInputParityWithRenderer:
         lock is: suppressed."""
         received: list[bool | None] = []
 
-        def _fake_is_live(_tid, _pr, **kw):
+        async def _fake_is_live(_tid, _pr, **kw):
             received.append(kw.get('corroborated'))
             return kw.get('corroborated') is not False
 
@@ -12848,7 +12863,7 @@ class TestIntegrityGateInputParityWithRenderer:
         """
         received: list[tuple] = []
 
-        def _fake_is_live(_tid, _pr, **kw):
+        async def _fake_is_live(_tid, _pr, **kw):
             received.append((kw.get('task_kind'), kw.get('pure_gate')))
             return not (
                 kw.get('task_kind') == 'deterministic' and kw.get('pure_gate') is True
@@ -12881,7 +12896,7 @@ class TestIntegrityGateInputParityWithRenderer:
         'pending' throughout)."""
         received: list[tuple] = []
 
-        def _fake_is_live(_tid, _pr, **kw):
+        async def _fake_is_live(_tid, _pr, **kw):
             received.append((kw.get('task_kind'), kw.get('pure_gate')))
             return not (
                 kw.get('task_kind') == 'deterministic' and kw.get('pure_gate') is True
@@ -12922,7 +12937,7 @@ class TestIntegrityGateInputParityWithRenderer:
         """
         received: list[tuple] = []
 
-        def _fake_is_live(_tid, _pr, **kw):
+        async def _fake_is_live(_tid, _pr, **kw):
             received.append((kw.get('task_kind'), kw.get('pure_gate')))
             return True
 
@@ -12938,6 +12953,215 @@ class TestIntegrityGateInputParityWithRenderer:
             f'Expected task_kind=None, pure_gate=False for metadata={metadata!r}; '
             f'got {received!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# The integrity gate is async and does not block the loop (task 3778)
+# ---------------------------------------------------------------------------
+
+
+class TestIntegrityGateIsAsyncAndNonBlocking:
+    """The gate awaits the detector, short-circuits, fails open, and yields.
+
+    The gate sits inside a DOUBLY-nested loop (`for finding in
+    actionable_remaining:` -> `for tid in cited_task_ids:`) of the already-async
+    `_run_remediation_pass`, so before task 3778 it was O(findings x cited_tasks)
+    BLOCKING git I/O on the event loop. Awaiting the now-coroutine
+    `is_workflow_live_for_task` is a one-word change at the call site; these
+    tests pin that the three surrounding properties survive it.
+
+    Reuses TestIntegrityGateInputParityWithRenderer's `_run_gate` verbatim so
+    the setup is identical to the parity cases (which pin that all three
+    detector consumers forward the same status/task_kind/pure_gate/corroborated
+    tuple — the task-2964 invariant this task must not disturb).
+    """
+
+    _run_gate = TestIntegrityGateInputParityWithRenderer._run_gate
+    _cited_task = TestIntegrityGateInputParityWithRenderer._cited_task
+
+    def test_gate_seam_is_a_coroutine_function(self):
+        """The name harness imports IS the async detector, so a sync fake
+        patched over it would be a fake of a contract that no longer exists."""
+        import inspect
+
+        import fused_memory.reconciliation.harness as harness_module
+
+        assert inspect.iscoroutinefunction(harness_module.is_workflow_live_for_task)
+
+    @pytest.mark.asyncio
+    async def test_first_live_cited_task_short_circuits_the_probe_loop(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """`break`-on-first-live still holds: once one cited task reports live,
+        no further task is probed. The finding below cites three tasks and the
+        fake reports the FIRST live, so exactly one probe must be issued —
+        awaiting in a loop must not turn a short-circuit into a full sweep."""
+        probed: list[str] = []
+
+        async def _fake_is_live(_tid, _pr, **kw):
+            probed.append(_tid)
+            return True
+
+        cited = self._cited_task()
+
+        def _finding_citing_three(task_id: str) -> dict:
+            finding = _make_finding_with_cited_task(task_id)
+            finding['cited_tasks'] = [
+                {'project_id': 'test-project', 'task_id': task_id},
+                {'project_id': 'test-project', 'task_id': '8001'},
+                {'project_id': 'test-project', 'task_id': '8002'},
+            ]
+            return finding
+
+        # _run_gate builds its finding through this module-level helper, so
+        # patching it here is how a multi-cited-task finding reaches the gate.
+        monkeypatch.setitem(
+            globals(), '_make_finding_with_cited_task', _finding_citing_three,
+        )
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=cited, fake_is_live=_fake_is_live,
+        )
+
+        assert probed == [str(cited['id'])], (
+            f'Expected exactly one probe (break on first live); got {probed!r}'
+        )
+        assert len(suppressed) >= 1
+        assert stranded == []
+
+    @pytest.mark.asyncio
+    async def test_raising_detector_is_treated_as_not_live(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """FAIL-OPEN — a detector that raises leaves the task not-live, so the
+        escalation FIRES (this consumer fails toward escalating, the opposite
+        outcome from recon_write_policy Gate 2's fail-safe-toward-live) and the
+        existing debug log is emitted. An `await` on a raising coroutine raises
+        at the same point a sync call did, so the surrounding try/except must
+        stay exactly where it is."""
+        async def _fake_is_live(_tid, _pr, **kw):
+            raise RuntimeError('git exploded')
+
+        with caplog.at_level(logging.DEBUG, logger='fused_memory.reconciliation.harness'):
+            stranded, suppressed = await self._run_gate(
+                journal=journal, event_buffer=event_buffer,
+                mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+                monkeypatch=monkeypatch, caplog=caplog,
+                cited_task=self._cited_task(), fake_is_live=_fake_is_live,
+            )
+
+        assert len(stranded) >= 1, 'a raising detector must not silence the escalation'
+        assert suppressed == []
+        assert any(
+            'live_workflow_detector error for task' in r.getMessage()
+            for r in caplog.records
+        ), 'the fail-open path must stay loud at DEBUG'
+
+    @pytest.mark.asyncio
+    async def test_gate_does_not_block_the_event_loop(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """A slow detector must not stall the loop the remediation pass runs on.
+
+        The fake awaits a real 200 ms sleep; a ticker coroutine advancing every
+        10 ms must keep advancing across it. A blocking implementation pins the
+        ticker at ~0.
+        """
+        ticks = 0
+
+        async def _ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        async def _fake_is_live(_tid, _pr, **kw):
+            await asyncio.sleep(0.2)
+            return True
+
+        ticker = asyncio.create_task(_ticker())
+        try:
+            await self._run_gate(
+                journal=journal, event_buffer=event_buffer,
+                mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+                monkeypatch=monkeypatch, caplog=caplog,
+                cited_task=self._cited_task(), fake_is_live=_fake_is_live,
+            )
+        finally:
+            ticker.cancel()
+
+        assert ticks >= 5
+
+    @pytest.mark.asyncio
+    async def test_gate_hoists_the_worktree_index_across_the_cited_task_fan_out(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """The whole-repo `git worktree list` is invariant across the pass, so
+        the harness hoists it exactly as `_render_live_workflow_section` does
+        and threads it to every probe — one worktree list per pass, not one per
+        cited task. `worktree_index_for`'s None means *unknown*: the kwarg is
+        then omitted and each probe falls back to its own list, so the fallback
+        is asserted separately from the hoist."""
+        received: list[object] = []
+
+        async def _fake_is_live(_tid, _pr, **kw):
+            received.append(kw.get('worktree_index'))
+            return False
+
+        import fused_memory.reconciliation.harness as harness_module
+
+        calls: list[str] = []
+
+        async def _fake_index(project_root):
+            calls.append(project_root)
+            return {'refs/heads/task/599': False}
+
+        monkeypatch.setattr(harness_module, 'worktree_index_for', _fake_index)
+
+        await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(), fake_is_live=_fake_is_live,
+        )
+
+        assert len(calls) == 1, (
+            f'Expected ONE hoisted worktree list per remediation pass; got {calls!r}'
+        )
+        assert received == [{'refs/heads/task/599': False}]
+
+    @pytest.mark.asyncio
+    async def test_worktree_index_hoist_failure_falls_back_to_per_task_probe(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """FAIL-SAFE — a raising/None hoist omits the kwarg entirely rather than
+        passing an empty index, which would report every cited task as
+        worktree_registered=False from a hoisted ERROR and let a stranded
+        escalation fire for a genuinely live task."""
+        received: list[object] = []
+
+        async def _fake_is_live(_tid, _pr, **kw):
+            received.append('worktree_index' in kw)
+            return False
+
+        import fused_memory.reconciliation.harness as harness_module
+
+        async def _boom(project_root):
+            raise OSError('git worktree list exploded')
+
+        monkeypatch.setattr(harness_module, 'worktree_index_for', _boom)
+
+        await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(), fake_is_live=_fake_is_live,
+        )
+
+        assert received == [False]
 
 
 @pytest.mark.asyncio
@@ -12968,6 +13192,7 @@ async def test_live_workflow_gate_drops_bare_orchestrator_signal_for_blocked_nor
     import subprocess
     import uuid as _uuid
 
+    from _fm_helpers import as_async_run_git
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
     import fused_memory.services.live_workflow_detector as detector_module
@@ -13046,7 +13271,9 @@ async def test_live_workflow_gate_drops_bare_orchestrator_signal_for_blocked_nor
     _mock_stage_run(harness.stages[1])
     harness.stages[2].run = s3_returns_finding
 
-    with patch('subprocess.run', side_effect=_no_git_signals), caplog.at_level(
+    with patch.object(
+        detector_module, 'run_git', side_effect=as_async_run_git(_no_git_signals),
+    ), caplog.at_level(
         logging.INFO, logger='fused_memory.reconciliation.harness'
     ):
         await harness.run_full_cycle('test-project', 'buffer_size:1')
@@ -16377,7 +16604,7 @@ async def test_perpetually_fresh_thread_escalates_within_bounded_cycles(
     esc_queue = EscalationQueue(tmp_path / 'esc')
     harness._escalation_queue = esc_queue
 
-    monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', lambda *a, **kw: False)
+    monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', _async_is_live(False))
 
     finding = _make_finding_with_cited_task('9999')
 
