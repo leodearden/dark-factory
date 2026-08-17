@@ -1017,6 +1017,13 @@ class CockpitApp(App):
         Never touches sessions/ or decisions/. Reads self._selected_slug
         (not the DataTable) so this is safe to call from on_unmount, after
         the table has already been torn down.
+
+        poll_interval is persisted for completeness but is never read back
+        -- on_mount takes it from the constructor kwarg, and nothing in the
+        app mutates self.poll_interval (no action, no binding, no main()
+        CLI flag), so the stored value is inert by design (task 4054); do
+        not add a restore path for it without first adding a way to change
+        it.
         """
         cfg = CockpitUIConfig(selected_slug=self._selected_slug, poll_interval=self.poll_interval)
         save_ui_config(cfg, self.fleet_root)
