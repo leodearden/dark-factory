@@ -32,6 +32,39 @@ own module surface (and its test suite) stays intact, and
 ``tests/scripts/test_check_orchestrator_unit_parity.py`` asserts the re-export
 is the SAME function object rather than a look-alike.
 
+What is NOT here yet: the COMPARISON core (read this before assuming it is)
+--------------------------------------------------------------------------
+Two lifts have happened, and this module deliberately does not yet read as the
+home for everything shared.  Still duplicated across the consumers, and NOT
+because nobody noticed:
+
+- ``Drift`` — the frozen six-field record — is code-identical in all three
+  checkers (``check_dashboard_unit_parity.py``, ``check_orchestrator_unit_parity.py``,
+  ``check_lms_unit_parity.py``).
+- ``UnitSpec``'s ``compared``/``present_only`` core and ``compare_unit`` are
+  duplicated between the dashboard and lms checkers only.  The orchestrator
+  checker deliberately has NEITHER: it compares by full symmetric equality over
+  the union of sections and keys, with no curated registry, and its own
+  docstring argues for that.
+
+What stopped the third lift is not tidiness but a real decision: the two copies
+already RENDER differently — the dashboard and orchestrator share a ``_render``
+helper (single-value shortcut, then ``" | ".join``), while the lms checker joins
+with ``", "`` inline — so one shared ``compare_unit`` changes the report text of
+whichever side loses, and both sides' suites assert on report content.  The
+dashboard's ``UnitSpec`` also carries four extra fields and a ``__post_init__``
+validator, so the shared part is a CORE the dashboard extends, not the class.
+That is a design step, and task 3775 — which wrote the lms copy — held only an
+amendment-pass mandate for focused edits.  It is filed as a follow-up (ticket
+``tkt_0RSJTASQDQAFHYWCK5VW8BFGC3``, "Lift Drift / UnitSpec / compare_unit into
+scripts/systemd_unit_parity.py"), which carries the obstacle above so the work
+starts from it.
+
+Recorded here rather than left implicit because the alternative is worse than
+the duplication: a module that looks like the shared home while a third pasted
+copy of the comparison sits in the consumers invites the next author to assume
+the lift is complete and paste a fourth.
+
 Why ``check_fused_memory_unit_parity.parse_unit_sections`` is NOT here
 ----------------------------------------------------------------------
 That third parser stays where it is, deliberately.  It returns

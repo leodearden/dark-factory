@@ -82,6 +82,14 @@ from collections.abc import Sequence
 # under CLI (scripts/ lands at sys.path[0]), under pytest (tests/scripts/
 # conftest.py inserts scripts/ explicitly, load-bearing because pyproject sets
 # --import-mode=importlib) and under pyright ([tool.pyright] extraPaths).
+#
+# What is NOT shared yet: Drift, UnitSpec's compared/present_only core and
+# compare_unit below are still duplicated with check_dashboard_unit_parity.py.
+# That is KNOWN, and the obstacle is recorded in systemd_unit_parity.py's own
+# docstring next to this rationale (the two copies already render Drift values
+# differently, so one shared compare_unit would change a report text both
+# suites assert on) with a filed follow-up. Do not read the import above as
+# evidence the lift is finished.
 from systemd_unit_parity import find_dropins, parse_unit_directives
 
 # ---------------------------------------------------------------------------
