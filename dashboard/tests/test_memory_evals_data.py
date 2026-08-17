@@ -3467,6 +3467,85 @@ class TestRootScanCacheability:
         assert root_scan_succeeded({'root_present': True}) is True
 
 
+class TestInternalErrorScopeConvention:
+    """The ``eval_id`` convention ``root_scan_succeeded`` now depends on.
+
+    Cache correctness rests on a rule nothing structurally enforces: the
+    per-eval ``internal_error`` emitter sets ``eval_id``, the top-level one
+    never does.  Both emitters honour it today, but a future third one that
+    forgot the kwarg would be read as build-aborting and would silently
+    re-introduce the every-3s-poll stampede this predicate exists to prevent —
+    with no other test failing, because the payload it produces is otherwise
+    indistinguishable.
+
+    Asserted over the AST rather than a text grep, for the same reason
+    ``test_the_reader_never_touches_the_producer`` chose it: a grep for
+    ``internal_error`` matches prose as readily as code, and the module
+    docstring, the ``_UNCACHEABLE_ISSUE_KINDS`` comment and several
+    ``root_scan_succeeded`` docstring lines all have to NAME the kind in order
+    to explain it.  Matching ``ast.Call`` nodes counts emitters and only
+    emitters.  The assertion is over code structure — call sites and keyword
+    arguments — never over prose.
+    """
+
+    def test_internal_error_emitters_set_eval_id_iff_per_eval(self) -> None:
+        import ast
+
+        import dashboard.data.memory_evals as memory_evals_module
+
+        def issue_kind(call: ast.Call) -> str | None:
+            """The KIND literal this ``_issue(...)`` call passes, however it passes it.
+
+            Positional at both sites today (``_issue(issues, 'internal_error',
+            ...)``), but the keyword form is read too: a future
+            ``kind='internal_error'`` emitter must be COUNTED by this guard, not
+            silently skipped by it.
+            """
+            if len(call.args) >= 2 and isinstance(call.args[1], ast.Constant):
+                return call.args[1].value if isinstance(call.args[1].value, str) else None
+            for keyword in call.keywords:
+                if keyword.arg == 'kind' and isinstance(keyword.value, ast.Constant):
+                    return keyword.value.value if isinstance(keyword.value.value, str) else None
+            return None
+
+        source_path = Path(memory_evals_module.__file__)
+        emitters = [
+            node
+            for node in ast.walk(ast.parse(source_path.read_text()))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == '_issue'
+            and issue_kind(node) == 'internal_error'
+        ]
+
+        convention = (
+            "`internal_error` is emitted at exactly TWO scopes, and "
+            "`root_scan_succeeded` reads `eval_id` to tell them apart: the "
+            "PER-EVAL emitter (in `_build_payload`'s loop) MUST pass "
+            "`eval_id=`, and the TOP-LEVEL one (in `build_memory_evals`' "
+            "outermost guard) MUST NOT — its `None` is what means 'the build "
+            "aborted, do not cache this payload'. A new emitter that omits the "
+            "kwarg is read as build-aborting and defeats the route's TTL cache "
+            "forever, re-walking the whole artifact tree on every ~3s poll. If "
+            "you are adding one deliberately, update `root_scan_succeeded` and "
+            "this guard together."
+        )
+
+        assert len(emitters) == 2, (
+            f'expected 2 `internal_error` emitters in {source_path.name}, '
+            f'found {len(emitters)} (lines {[n.lineno for n in emitters]}). {convention}'
+        )
+        # The PARTITION, not line numbers, which drift: exactly one scoped, one not.
+        scoped = sorted(
+            any(keyword.arg == 'eval_id' for keyword in node.keywords) for node in emitters
+        )
+        assert scoped == [False, True], (
+            f'`internal_error` emitters in {source_path.name} at lines '
+            f'{[n.lineno for n in emitters]} do not partition one-scoped/one-not. '
+            f'{convention}'
+        )
+
+
 class TestMemoryEvalsEndpoint:
     """``GET /api/v2/dashboard/memory-evals`` end-to-end through the real route.
 
