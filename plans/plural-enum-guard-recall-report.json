@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "measured_at": "2026-08-17T05:08:13.997381+00:00",
+  "generated_by": "fused-memory/scripts/measure_plural_enum_guard_recall.py",
+  "regenerate": "cd fused-memory && uv run python scripts/measure_plural_enum_guard_recall.py",
+  "page_size": 5000,
+  "complete": true,
+  "verdict": "DO NOT TIGHTEN. No fact in any enumerated project graph matches PLURAL_ENUM_SNAPSHOT_RE, so _enumeration_is_prepositional_complement rejects nothing and its recall cost on this corpus is exactly zero edges. A tightening can only change an outcome on a fact the regex already matched; with none, both candidates have provably zero measured benefit against nonzero unrecoverable over-selection risk.",
+  "revalidation_test": "tests/test_measure_plural_enum_guard_recall.py::test_candidate_b_recovers_every_preamble_but_re_opens_an_over_selection",
+  "total_valid_edges": 29415,
+  "totals": {
+    "facts_scanned": 29415,
+    "lexical_precondition": 346,
+    "regex_matched": 0,
+    "guard_rejected": 0,
+    "selected": 0
+  },
+  "triage_totals": {},
+  "projects": [
+    {
+      "project_id": "dark_factory",
+      "valid_edges": 12488,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 12488,
+        "lexical_precondition": 169,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "reify",
+      "valid_edges": 15871,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 15871,
+        "lexical_precondition": 168,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    },
+    {
+      "project_id": "solar_challenge_platform",
+      "valid_edges": 1056,
+      "complete": true,
+      "scan": {
+        "facts_scanned": 1056,
+        "lexical_precondition": 9,
+        "regex_matched": 0,
+        "guard_rejected": 0,
+        "selected": 0
+      },
+      "triage": {},
+      "rejections": []
+    }
+  ],
+  "candidates": [
+    {
+      "name": "shipped",
+      "over_selected": [],
+      "recovered": [],
+      "unchanged_count": 0
+    },
+    {
+      "name": "a",
+      "over_selected": [],
+      "recovered": [],
+      "unchanged_count": 0
+    },
+    {
+      "name": "b",
+      "over_selected": [],
+      "recovered": [],
+      "unchanged_count": 0
+    }
+  ]
+}
