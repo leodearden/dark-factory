@@ -43,6 +43,7 @@ Design decisions (captured in plan.json):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
@@ -254,6 +255,21 @@ async def sweep_resolved_curator_gates(
         ``report.items_flagged``) and int counts ``scanned`` (gates checked),
         ``resolved`` (gates with >= 1 curator entry), ``errors``.
 
+    Best-effort, and fail-SAFE in one specific direction: a backend failure at
+    EITHER the count or the citation-fetch step is caught, logged, tallied into
+    ``stats['errors']``, and skips flag emission for that gate — it never
+    aborts the sweep for the remaining gates, and an errored read is NEVER
+    treated as evidence of resolution.  That asymmetry is deliberate and
+    mirrors ``sweep_degenerate_task_nodes``' "uncertain is never treated as
+    degenerate" invariant: a false "resolved" flag could get a still-open
+    human decision gate closed, which is strictly worse than missing one
+    cycle's detection (the next cycle re-checks).  Note that a Qdrant
+    read-timeout PROPAGATES out of ``count_memories_by_metadata`` /
+    ``get_memories_by_metadata`` rather than returning empty, so it arrives
+    here as an exception and is tallied — never silently seen as "no curator
+    entry".  ``asyncio.CancelledError``/``KeyboardInterrupt``/``SystemExit``
+    are re-raised unchanged (never swallowed as best-effort).
+
     The per-task loop is sequential rather than an ``asyncio.gather``: the open
     gate population is small, and a serial loop keeps per-task error
     attribution exact.  Empty *task_ids* short-circuits to all-zero stats with
@@ -268,15 +284,44 @@ async def sweep_resolved_curator_gates(
         stats['scanned'] += 1
         source = curator_gate_source(task_id)
 
-        count = await memory_service.count_memories_by_metadata(
-            project_id=project_id, filters={'source': source},
-        )
+        try:
+            count = await memory_service.count_memories_by_metadata(
+                project_id=project_id, filters={'source': source},
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            # Includes a propagated Qdrant read-timeout.  Uncertain is never
+            # "no curator entry" and never "resolved" — tally and move on.
+            log.exception(
+                'curator_gate_resolution_sweep: count_memories_by_metadata failed '
+                'for source=%s project_id=%s',
+                source, project_id,
+            )
+            stats['errors'] += 1
+            continue
+
         if not count:
             continue
 
-        memories = await memory_service.get_memories_by_metadata(
-            project_id=project_id, filters={'source': source},
-        )
+        try:
+            memories = await memory_service.get_memories_by_metadata(
+                project_id=project_id, filters={'source': source},
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            # The count says evidence exists but we could not read it.  Emitting
+            # a flag we cannot cite would let Stage 2 close a gate on unverified
+            # evidence — skip this gate and re-check next cycle.
+            log.exception(
+                'curator_gate_resolution_sweep: get_memories_by_metadata failed '
+                'for source=%s project_id=%s',
+                source, project_id,
+            )
+            stats['errors'] += 1
+            continue
+
         stats['resolved'] += 1
         stats['flags'].append(build_gate_resolution_flag(task_id, memories))
 
