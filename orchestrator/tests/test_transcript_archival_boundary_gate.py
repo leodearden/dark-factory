@@ -55,11 +55,14 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from shared.config_dir import TaskConfigDir
 
+from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.roles import SIMPLE_TASK
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
@@ -195,3 +198,80 @@ async def _make_workflow(config, git_ops, task_assignment):
     workflow.artifacts = None
     workflow._config_dir = TaskConfigDir(task_assignment.task_id, base_dir=cwd / '.task')
     return workflow, cwd
+
+
+# ---------------------------------------------------------------------------
+# E1 — a completed session's transcript is archived at completion
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestE1ArchivedAtCompletion:
+    """E1 — running a role to completion archives its transcript to the durable
+    root OUTSIDE the worktree, byte-verbatim, with no credential alongside.
+
+    Drives the REAL producer hook in ``TaskWorkflow._invoke``'s ``finally`` and
+    the REAL ``archive_task_transcripts``. ONLY ``invoke_with_cap_retry`` is
+    patched, and its side effect writes the transcript at the path the session
+    id ``_invoke`` forwards implies — so the row proves the producer located and
+    archived the file, rather than that a fixture put one where it was expected.
+    """
+
+    async def test_completed_session_lands_in_the_durable_archive(
+        self, monkeypatch, git_repo, git_ops, task_assignment
+    ):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = _config(git_repo)  # transcript_archive enabled by default
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        config_dir = workflow._config_dir
+        assert config_dir is not None
+        transcript_bytes = b'{"type":"user","cwd":"/tmp/x"}\n{"type":"assistant"}\n'
+        written: dict[str, Path] = {}
+
+        def _side_effect(**kwargs):
+            # The session id _invoke minted is forwarded as session_id=; write
+            # the transcript where THAT id says it belongs, plus the per-task
+            # OAuth credential file that lives beside projects/ in a live
+            # config dir (the integrated half of E4).
+            sid = kwargs['session_id']
+            p = config_dir.path / 'projects' / ENC / f'{sid}.jsonl'
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(transcript_bytes)
+            (config_dir.path / '.credentials.json').write_bytes(
+                b'{"claudeAiOauth":{"accessToken":"sk-ant-oat01-E1-CANARY"}}'
+            )
+            written['source'] = p
+            return AgentResult(success=True, output='')
+
+        with patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            side_effect=_side_effect,
+        ):
+            result = await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+
+        assert result.success is True
+
+        sid = workflow._last_invoke_session_id
+        archive_root = _archive_root(git_repo)
+        archived = _archived(git_repo, sid)
+
+        # Archived, at the layout the durable root defines, plain .jsonl.
+        assert archived.exists()
+        assert archived.read_bytes() == written['source'].read_bytes()
+        assert archived.read_bytes() == transcript_bytes
+
+        # Plain .jsonl everywhere: task 3618 dropped gzip, so no `.gz` artefact
+        # may appear anywhere under the archive root.
+        assert not list(archive_root.rglob('*.gz'))
+
+        # DURABLE means outside the worktree — the whole point of the producer
+        # hook. A project_root that WAS the worktree would make this vacuous,
+        # so assert the containment directly rather than trusting the fixture.
+        assert not archived.is_relative_to(cwd)
+        assert not archive_root.is_relative_to(cwd)
+
+        # Integrated half of E4: the credential written beside projects/ did
+        # not follow the transcript into the archive.
+        archived_names = {p.name for p in archive_root.rglob('*') if p.is_file()}
+        assert '.credentials.json' not in archived_names
+        assert (config_dir.path / '.credentials.json').exists()
