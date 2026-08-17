@@ -213,3 +213,71 @@ def build_gate_resolution_flag(task_id, memories, *, task: dict | None = None) -
         ),
         'cited_memories': cited_memories,
     }
+
+
+# ── Async I/O helpers ────────────────────────────────────────────────────────
+
+
+async def sweep_resolved_curator_gates(
+    memory_service,
+    project_id: str,
+    task_ids: list[str],
+    *,
+    log: logging.Logger = logger,
+) -> dict:
+    """Flag every open gate in *task_ids* that already has a curator ruling.
+
+    For each ``task_id``, counts Mem0 entries stamped
+    ``metadata.source == curator_gate_source(task_id)`` via
+    ``MemoryService.count_memories_by_metadata`` — Qdrant's count API with an
+    exact payload filter, NOT semantic search, so a resolved gate can never be
+    lost to top-N truncation.  On a positive count the matching memories are
+    enumerated with ``get_memories_by_metadata`` (Qdrant's scroll API, same
+    filter) purely to cite them, and one flag is built per resolved gate.
+
+    The payload filter carries ONLY the ``source`` key.  Qdrant ANDs filter
+    conditions, so adding a ``task_id`` condition would silently miss any
+    curator entry whose writer omitted that field — and the source key already
+    encodes the id, so the extra condition buys nothing and can only lose
+    recall.
+
+    Args:
+        memory_service: Object exposing ``count_memories_by_metadata`` and
+            ``get_memories_by_metadata``.
+        project_id: Project scope for both reads.
+        task_ids: Str gate task ids (typically from
+            ``extract_open_gate_task_ids``).
+        log: Logger to use (default: this module's logger).
+
+    Returns:
+        dict with ``flags`` (the Stage-1 flag dicts to append to
+        ``report.items_flagged``) and int counts ``scanned`` (gates checked),
+        ``resolved`` (gates with >= 1 curator entry), ``errors``.
+
+    The per-task loop is sequential rather than an ``asyncio.gather``: the open
+    gate population is small, and a serial loop keeps per-task error
+    attribution exact.  Empty *task_ids* short-circuits to all-zero stats with
+    no backend calls.
+    """
+    stats: dict = {'flags': [], 'scanned': 0, 'resolved': 0, 'errors': 0}
+
+    if not task_ids:
+        return stats
+
+    for task_id in task_ids:
+        stats['scanned'] += 1
+        source = curator_gate_source(task_id)
+
+        count = await memory_service.count_memories_by_metadata(
+            project_id=project_id, filters={'source': source},
+        )
+        if not count:
+            continue
+
+        memories = await memory_service.get_memories_by_metadata(
+            project_id=project_id, filters={'source': source},
+        )
+        stats['resolved'] += 1
+        stats['flags'].append(build_gate_resolution_flag(task_id, memories))
+
+    return stats
