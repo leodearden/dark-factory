@@ -924,18 +924,28 @@ class TaskInterceptor:
             # (stale-snapshot) is reachable only via update_task in
             # practice, even though check()'s gate 3 itself is op-agnostic.
             #
-            # check() is dispatched via asyncio.to_thread because gate 2
-            # (live workflow) calls is_workflow_live_for_task, which shells
-            # out to git synchronously (up to _GIT_TIMEOUT seconds per git
-            # call). This whole branch runs under _write_lock, so an inline
-            # call would both block the event loop and hold this project's
-            # write lock for however long git takes — stalling every other
-            # write to the project. to_thread keeps the lock's ordering
-            # guarantee (the awaiting coroutine still holds it across the
-            # call) while freeing the event loop to service other work
-            # meanwhile — the same pattern curator_escalator.py's
-            # _persist_state uses to offload a blocking write while holding
-            # _persist_lock.
+            # check() is a coroutine function and is awaited DIRECTLY (task
+            # 3778). It used to be dispatched via asyncio.to_thread, because
+            # gate 2 (live workflow) called is_workflow_live_for_task, which
+            # shelled out to git synchronously (up to _GIT_TIMEOUT seconds per
+            # git call); this whole branch runs under _write_lock, so an inline
+            # call would have both blocked the event loop and held this
+            # project's write lock for however long git took — stalling every
+            # other write to the project. That offload is now INTRINSIC rather
+            # than bolted on here: the detector's git probes await
+            # shared.git_async.run_git, and check() offloads its one remaining
+            # blocking call (the corroboration verdict's two on-disk reads) via
+            # its own asyncio.to_thread. The lock's ordering guarantee is
+            # unchanged — this coroutine still holds it across the await — and
+            # the event loop is free to service other work meanwhile.
+            #
+            # Wrapping a coroutine function in asyncio.to_thread would now be a
+            # BUG, not merely redundant: the worker thread would return an
+            # un-awaited coroutine object, `verdict.is_rejection` would raise
+            # AttributeError, and every gate would stop rejecting. The sibling
+            # call site in update_task (further down this module) was already
+            # inline and is likewise a plain await now, so the two are
+            # symmetric for the first time.
             #
             # task_metadata (task 3751) comes off the SAME `before` snapshot
             # as old_status, so the metadata and live_status the gate sees can
@@ -966,10 +976,9 @@ class TaskInterceptor:
             # fields live at the task's top level, not inside `metadata` — see
             # check()'s Gate 2 docstring. The corroboration assembly performs
             # two more blocking on-disk reads (scheduler_state.json and
-            # orchestrator.lock); they ride the asyncio.to_thread hop that
-            # already exists for gate 2's blocking git I/O rather than needing
-            # a second hop or re-blocking the event loop, which is why the
-            # verdict is computed inside check() rather than here. What it
+            # orchestrator.lock); check() owns their asyncio.to_thread offload
+            # (task 3778) rather than re-blocking the event loop, which is why
+            # the verdict is computed inside check() rather than here. What it
             # unlocks is the detector's in-progress corroboration gate (task
             # 2963): an in-progress task killed by a fleet redeploy, whose
             # lingering worktree registration and freshly re-acquired
@@ -990,8 +999,7 @@ class TaskInterceptor:
                 # boolean, matching the recon_write_policy.check(agent_id: str)
                 # signature below.
                 assert isinstance(agent_id, str)
-                verdict = await asyncio.to_thread(
-                    recon_write_policy.check,
+                verdict = await recon_write_policy.check(
                     'set_task_status',
                     task_id=task_id,
                     project_root=project_root,
@@ -4481,7 +4489,16 @@ class TaskInterceptor:
                 # signature below.
                 assert isinstance(agent_id, str)
                 before = await tm.get_task(task_id, project_root)
-                verdict = recon_write_policy.check(
+                # Awaited, not inline (task 3778): check() is a coroutine
+                # function now, so an un-awaited call would evaluate
+                # `.is_rejection` on a coroutine object — never a rejection —
+                # and silently disable Gates 1 and 3 on this path. This was
+                # also the latent sibling of _apply_status_transition's
+                # to_thread hop: gate 2 fires only for op == 'set_task_status',
+                # so this call site never paid for the blocking git I/O, but
+                # any widening of that scope would have put it on the event
+                # loop under _write_lock. Both call sites are plain awaits now.
+                verdict = await recon_write_policy.check(
                     'update_task',
                     task_id=task_id,
                     project_root=project_root,
