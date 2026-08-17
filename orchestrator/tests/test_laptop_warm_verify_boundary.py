@@ -573,7 +573,9 @@ def wait_subtree_live(
     raise AssertionError(message)
 
 
-def wait_for_marker(path: Path, *, timeout: float = 20.0, interval: float = 0.05) -> None:
+def wait_for_marker(
+    path: Path, *, timeout: float | None = None, interval: float = 0.05
+) -> None:
     """Poll for a build-produced marker file to appear; raise AssertionError on timeout.
 
     Unlike :func:`wait_subtree_live` (which only proves the CLI has forked
@@ -581,7 +583,14 @@ def wait_for_marker(path: Path, *, timeout: float = 20.0, interval: float = 0.05
     proves the build's shell command has actually executed its
     ``touch <marker>`` step, which is the real precondition tests need before
     reading the marker's mtime or asserting on its retention.
+
+    *timeout* defaults to :data:`ROW_MARKER_CEILING_SECS`, resolved in the
+    BODY rather than as a default expression because that constant is defined
+    with the other row ceilings further down (same shape as
+    :func:`wait_for_pgid_file`), so the value a row budgets for and the value
+    this helper actually spends cannot drift apart.
     """
+    timeout = ROW_MARKER_CEILING_SECS if timeout is None else timeout
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
@@ -593,7 +602,7 @@ def wait_for_marker(path: Path, *, timeout: float = 20.0, interval: float = 0.05
 def wait_for_marker_stable(
     path: Path,
     *,
-    timeout: float = 20.0,
+    timeout: float | None = None,
     interval: float = 0.02,
     stable_reads: int = 6,
     _read_mtime_ns=None,
@@ -614,7 +623,13 @@ def wait_for_marker_stable(
     a real ``path.stat().st_mtime_ns`` read) until it is unchanged across
     *stable_reads* consecutive reads, and returns that settled value.
     Raises AssertionError if it never stabilizes within *timeout* seconds.
+
+    *timeout* defaults to :data:`ROW_MARKER_CEILING_SECS` and is spent TWICE
+    in the worst case -- once on the existence gate, then a FRESH deadline on
+    the settle loop -- which is why callers budgeting for this helper must
+    count that ceiling twice (see ``_ROW5_WORST_CASE_FIXED_SECS``).
     """
+    timeout = ROW_MARKER_CEILING_SECS if timeout is None else timeout
     wait_for_marker(path, timeout=timeout, interval=interval)
     read = _read_mtime_ns or (lambda p: p.stat().st_mtime_ns)
     deadline = time.monotonic() + timeout
@@ -721,6 +736,15 @@ ROW_WATCHDOG_ENV: dict[str, str] = {
 #: path a wider ceiling costs zero wall-clock and is paid only when the test
 #: is already failing.
 ROW_TREE_KILL_CEILING_SECS: float = ROW_WATCHDOG_WINDOW_SECS + 15.0  # 30.0
+
+#: Ceiling for the marker waits (:func:`wait_for_marker` /
+#: :func:`wait_for_marker_stable`, whose bare defaults resolve to it).  Value
+#: unchanged from the literal it replaces; the point of naming it is that
+#: Row 5's budget below references the SAME symbol those helpers spend, so the
+#: two cannot drift.  NOT load-scaled: unlike descendant discovery, this waits
+#: on a single already-forked build shell reaching one ``touch``, and no
+#: measurement in this repo implicates it in a load flake.
+ROW_MARKER_CEILING_SECS: float = 20.0
 
 #: Base ceiling for the two DISCOVERY waits every row runs BEFORE the
 #: watchdog is even armed -- wait_for_pgid_file and wait_subtree_live.  Rows
@@ -861,6 +885,39 @@ _ROW_WORST_CASE_FIXED_SECS: float = (
 ROW_PER_TEST_TIMEOUT_SECS: int = int(
     2 * _ROW_WORST_CASE_FIXED_SECS + 2 * ROW_DISCOVERY_CEILING_MAX_SECS
 )  # 390
+
+#: Row 5's own bounded terms.  It does not share Rows 1-4's shape -- no
+#: watchdog window, no wait_subtree_gone kill confirmation -- so it cannot
+#: share their constant, only their DERIVATION.  Named here (rather than
+#: passed as literals at the call sites) so the budget below and the waits it
+#: is supposed to cover move together.
+ROW5_WAITER_COMPLETION_CEILING_SECS: float = 60.0
+ROW5_HOLDER_TEARDOWN_CEILING_SECS: float = 5.0
+
+#: Worst-case FIXED (non-load-scaled) work in Row 5: the marker wait, the
+#: waiter subprocess's completion ceiling, and the finally block's holder
+#: teardown.  The marker term is counted TWICE because
+#: :func:`wait_for_marker_stable` spends its timeout on the existence gate and
+#: then a FRESH deadline on the settle loop -- worst case 40s, not 20s, a term
+#: the literal mark this replaced hid entirely.  (Deliberately excludes
+#: _setup_verify_repo's real git work and the in-process consumer half -- both
+#: small next to the headroom below, exactly as for Rows 1-4.)
+_ROW5_WORST_CASE_FIXED_SECS: float = (
+    2 * ROW_MARKER_CEILING_SECS
+    + ROW5_WAITER_COMPLETION_CEILING_SECS
+    + ROW5_HOLDER_TEARDOWN_CEILING_SECS
+)  # 105.0
+
+#: Row 5's per-test opt-out from the inherited `timeout = 60`, in the same
+#: shape as ROW_PER_TEST_TIMEOUT_SECS above: 2x the FIXED terms (they do not
+#: track load, and this module records ~15x elasticity on the child's
+#: `from orchestrator.cli import main` under a full-suite storm), plus the two
+#: discovery waits counted ONCE at MAX and exempted from that 2x -- they now
+#: scale with loadavg-per-core themselves, so applying the storm factor to
+#: them as well would double-count the same elasticity.
+ROW5_PER_TEST_TIMEOUT_SECS: int = int(
+    2 * _ROW5_WORST_CASE_FIXED_SECS + 2 * ROW_DISCOVERY_CEILING_MAX_SECS
+)  # 450
 # ---------------------------------------------------------------------------
 
 
@@ -2244,7 +2301,12 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(120)  # task 2921: two real verify-merge subprocesses (holder + waiter) under full-suite load
+# task 2921: two real verify-merge subprocesses (holder + waiter) under
+# full-suite load -- the module's most storm-exposed row.  Now DERIVED rather
+# than the literal 120 task 2921 wrote: task 4014 made this row's two
+# discovery waits load-scaled (up to ROW_DISCOVERY_CEILING_MAX_SECS each), and
+# a literal cannot track that -- which is exactly what the review caught.
+@pytest.mark.timeout(ROW5_PER_TEST_TIMEOUT_SECS)
 def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     """SS9 Row 5: producer discriminant -> real consumer -> born-at-L2 + blocked.
 
@@ -2321,7 +2383,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         # is NO timing assertion on the waiter here -- the test asserts on the
         # returned FLOCK_CONTENTION_CATEGORY discriminant, not on duration -- so
         # widening the completion ceiling has zero discrimination cost.
-        stdout, stderr = waiter.communicate(timeout=60)
+        stdout, stderr = waiter.communicate(timeout=ROW5_WAITER_COMPLETION_CEILING_SECS)
 
         assert waiter.returncode == 0, (
             f'expected exit 0 (contention result on stdout), got '
@@ -2360,7 +2422,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         heartbeat_holder.stop_heartbeats()
         if holder.poll() is None:
             holder.kill()
-            holder.wait(timeout=5)
+            holder.wait(timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
     # --- Consumer side: feed #2's real discriminant through the real beta
     # consumer (_run_post_merge_verify) with a real EscalationQueue. ---
