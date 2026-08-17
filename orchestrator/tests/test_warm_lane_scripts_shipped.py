@@ -769,6 +769,14 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
     #: ``TestThinSelfClobberGuardDoesNotDependOnPath``'s three-assertion shape.
     USAGE_MARKER = 'Usage:'
 
+    #: Positive control for the ``--reseed`` case, which takes no ``--help`` and
+    #: so cannot use ``USAGE_MARKER``.  ``thin-warm-lane.sh`` emits this via
+    #: ``info`` (to stderr, which that case captures) on the line IMMEDIATELY
+    #: BEFORE it executes ``$SEED_SCRIPT``, i.e. after seed-script resolution has
+    #: already happened.  Seeing it proves the run reached the resolution the
+    #: case names; the script needs no change to provide it.
+    RESEED_MARKER = 'Re-seeding thin base clone via '
+
     @staticmethod
     def _help_under_a_hidden_dirname(
         name: str, *, cwd: Path, tmp_path: Path,
@@ -886,6 +894,14 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
         )
         combined = proc.stdout + proc.stderr
 
+        assert self.RESEED_MARKER in combined, (
+            f'thin-warm-lane.sh never printed {self.RESEED_MARKER!r}, so it '
+            f'never reached seed-script resolution and the absence assertion '
+            f'below would hold vacuously — this run proves nothing about '
+            f'sibling resolution.  Any earlier exit (a rejected flag, a '
+            f'missing lane dir, a failed thinning) lands here.\n'
+            f'rc={proc.returncode}\noutput:\n{combined}'
+        )
         assert _DECOY_MARKER not in combined, (
             'thin-warm-lane.sh --reseed EXECUTED a seed script from the '
             f'CALLER\'S CWD instead of resolving one beside itself in '

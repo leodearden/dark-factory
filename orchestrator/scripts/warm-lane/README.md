@@ -611,10 +611,15 @@ All in `orchestrator/tests/test_warm_lane_scripts_shipped.py`:
 * `TestSiblingResolutionIgnoresTheCallersCwd` — asserts on **which file was
   resolved** (a decoy-CWD marker), not on the exit code, for the reason above:
   the exit code is a function of the caller's CWD, not of the defect. Each of
-  its absence assertions is paired with a `Usage:` **positive control**: an
+  its absence assertions is paired with a **positive control**, because an
   absence assertion alone is satisfied by a script that died at line 1 for an
-  unrelated reason, so without it the case could go green having never reached
-  the resolution it names.
+  unrelated reason — without one the case could go green having never reached
+  the resolution it names. The control differs by case, since it has to be a
+  line the run only reaches *after* resolving: the two `--help` cases use the
+  `Usage:` heredoc all three scripts print, and the `--reseed` case (which
+  takes no `--help`) uses `thin-warm-lane.sh`'s own
+  `Re-seeding thin base clone via ...` `info` line, emitted to stderr on the
+  line immediately before it executes the resolved `$SEED_SCRIPT`.
 * `TestLeafExtractionBehaviourWithoutBasename` — the **behavioural** half for
   the two converted leaf extractions, which the static gate below cannot
   reach: it catches the fork reappearing, not a conversion that changed what
