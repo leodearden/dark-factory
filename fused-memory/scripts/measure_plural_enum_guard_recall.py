@@ -532,12 +532,26 @@ async def enumerate_valid_edge_facts(
        it anyway.
     2. The ``max_pages`` bound is reached while the last page was still full
        — a suspected shortfall, reported rather than swallowed.
-    3. The census probe did not answer with a usable count. An unavailable
+    3. Either census probe did not answer with a usable count. An unavailable
        proof is not a passing proof.
-    4. The census count and the number enumerated disagree.
+    4. The corpus MOVED during enumeration — the census answers a different
+       number before and after paging.
+    5. A STABLE census count and the number enumerated disagree.
 
-    (1) and (2) are STRUCTURAL; (3) and (4) are EMPIRICAL, and the two kinds
-    are deliberately independent rather than redundant.
+    (1) and (2) are STRUCTURAL; (3), (4) and (5) are EMPIRICAL, and the two
+    kinds are deliberately independent rather than redundant.
+
+    THE CORPUS IS LIVE AND IS BEING WRITTEN WHILE THIS RUNS. The graphs
+    measured here are the orchestrator's and the reconciler's working memory,
+    so an add or an invalidate can land between the census probe and the last
+    page. That makes ``len(facts) != expected`` a genuinely ambiguous
+    observation, which is why the census is probed TWICE — once before paging
+    and once after. A shortfall against a count that MOVED is a benign,
+    retryable race; a shortfall against a count that held still is evidence of
+    truncation or of dropped rows. Both fail closed, but they are reported as
+    different things, because handing an operator 'suspected server cap' for
+    what is actually a concurrent write sends them to configuration they do
+    not need to change.
 
     The structural check is ``>=`` and not ``>``: equality is arithmetically
     safe on a server configured at exactly ``RESULTSET_SIZE``, but that
@@ -606,6 +620,16 @@ async def enumerate_valid_edge_facts(
             break
         skip += len(rows)
 
+    # Re-probed AFTER paging. The pre-count alone cannot tell a truncated
+    # enumeration from one that raced a concurrent write, and those two want
+    # opposite responses from the operator (fix the config vs just re-run).
+    post_expected = None if expected is None else await _census_count(query_fn)
+    corpus_moved = (
+        expected is not None
+        and post_expected is not None
+        and post_expected != expected
+    )
+
     if not paged_to_the_end:
         logger.warning(
             'enumerate_valid_edge_facts: hit the %d-page cap (page_size=%d, '
@@ -613,10 +637,28 @@ async def enumerate_valid_edge_facts(
             'is incomplete. Re-run with a larger --page-size.',
             max_pages, page_size, len(facts),
         )
+    elif expected is not None and post_expected is None:
+        logger.warning(
+            'enumerate_valid_edge_facts: the post-enumeration census probe '
+            'returned no usable count, so a shortfall could not be told apart '
+            'from a concurrent write. Reporting INCOMPLETE — an unavailable '
+            'proof is not a passing one.',
+        )
+    elif corpus_moved:
+        logger.warning(
+            'enumerate_valid_edge_facts: the corpus CHANGED MID-ENUMERATION — '
+            'the census reported %d distinct edges before paging and %d after '
+            '(enumerated=%d, page_size=%d). These graphs are written live by '
+            'the orchestrator and the reconciler, so this is an ordinary '
+            'race, NOT a truncation: nothing is misconfigured. Reporting '
+            'INCOMPLETE — re-run.',
+            expected, post_expected, len(facts), page_size,
+        )
     elif expected is not None and len(facts) != expected:
         logger.warning(
             'enumerate_valid_edge_facts: enumerated %d distinct edges but the '
-            'census reports %d (page_size=%d) — the enumeration is SHORT. '
+            'census reports %d, stable across the whole run (page_size=%d) — '
+            'the enumeration is SHORT and the corpus did not move under it. '
             'The most likely cause is a server result-set cap below the '
             'assumed %d; unstable page boundaries would do it too. Reporting '
             'INCOMPLETE.',
@@ -624,7 +666,11 @@ async def enumerate_valid_edge_facts(
         )
 
     complete = (
-        paged_to_the_end and expected is not None and len(facts) == expected
+        paged_to_the_end
+        and expected is not None
+        and post_expected is not None
+        and not corpus_moved
+        and len(facts) == expected
     )
     return facts, complete
 

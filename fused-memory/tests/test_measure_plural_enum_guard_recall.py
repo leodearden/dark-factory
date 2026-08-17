@@ -671,16 +671,21 @@ async def test_enumeration_is_complete_when_the_enumerated_count_matches_the_cen
 
 
 @pytest.mark.asyncio
-async def test_count_probe_is_issued_once_and_is_not_paged():
-    """Unpaged and single is precisely what makes the probe a proof.
+async def test_count_probe_brackets_the_enumeration_and_is_never_paged():
+    """Unpaged is what makes the probe a proof; twice is what dates it.
 
     Adding SKIP/LIMIT to it would subject the proof to the very truncation it
-    exists to detect. Issuing it per page would scale its cost with the
-    corpus for no extra information — and, worse, invite a mid-enumeration
-    answer to be treated as the total.
+    exists to detect. Issuing it PER PAGE would scale its cost with the corpus
+    for no extra information — and, worse, invite a mid-enumeration answer to
+    be treated as the total.
 
-    It must also count the SAME population the paged query enumerates: the
-    same MATCH and WHERE, and DISTINCT on e.uuid so the undirected match's
+    Exactly two, bracketing the paging, is the minimum that can date the
+    proof. These graphs are written live, so one probe cannot tell a
+    truncated enumeration from one that raced a concurrent write; a second
+    probe after the last page can (see the mid-enumeration test below).
+
+    Both must count the SAME population the paged query enumerates: the same
+    MATCH and WHERE, and DISTINCT on e.uuid so the undirected match's
     double-attribution collapses exactly as the paged dict-dedup collapses
     it. Two numbers derived from different populations are not comparable,
     and comparing them would manufacture a mismatch on every run.
@@ -690,13 +695,96 @@ async def test_count_probe_is_issued_once_and_is_not_paged():
     await enumerate_valid_edge_facts(query_fn, page_size=_PAGE_SIZE)
 
     count_cyphers = [c for c in query_fn.cyphers if 'count(' in c]
-    assert len(count_cyphers) == 1, query_fn.cyphers
-    probe = count_cyphers[0]
-    assert 'SKIP' not in probe, probe
-    assert 'LIMIT' not in probe, probe
-    assert 'DISTINCT e.uuid' in probe, probe
-    assert '(n:Entity)-[e:RELATES_TO]-()' in probe, probe
-    assert 'e.invalid_at IS NULL' in probe, probe
+    assert len(count_cyphers) == 2, query_fn.cyphers
+    # ...and they BRACKET the paging rather than both landing at one end: a
+    # post-probe issued before the last page would date nothing.
+    assert 'count(' in query_fn.cyphers[0], query_fn.cyphers
+    assert 'count(' in query_fn.cyphers[-1], query_fn.cyphers
+    assert all('SKIP' in c for c in query_fn.cyphers[1:-1]), query_fn.cyphers
+    for probe in count_cyphers:
+        assert 'SKIP' not in probe, probe
+        assert 'LIMIT' not in probe, probe
+        assert 'DISTINCT e.uuid' in probe, probe
+        assert '(n:Entity)-[e:RELATES_TO]-()' in probe, probe
+        assert 'e.invalid_at IS NULL' in probe, probe
+
+
+class _FakeMovingCorpusQuery(_FakeCappedEdgeQuery):
+    """A LIVE corpus: a write lands between the two census probes.
+
+    Not a defensive hypothetical. The graphs this probe measures are the
+    orchestrator's and the reconciler's working memory, being added to and
+    invalidated continuously, and a full run pages ~30k edges across several
+    queries — so a count that moves under the enumeration is the ordinary
+    case, not the exotic one.
+    """
+
+    def __init__(self, rows: list[list], cap: int, *, counts: list[int]) -> None:
+        super().__init__(rows, cap)
+        self.counts = list(counts)
+
+    async def __call__(self, cypher: str) -> list[list]:
+        if 'count(' in cypher:
+            self.cyphers.append(cypher)
+            return [[self.counts.pop(0)]]
+        return await super().__call__(cypher)
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_that_moves_mid_enumeration_is_reported_as_a_race(caplog):
+    """A concurrent write must not be diagnosed as a server misconfiguration.
+
+    With one census probe, ANY write landing during the run makes
+    ``len(facts) != expected`` and the operator is told the most likely cause
+    is 'a server result-set cap below the assumed 10000'. On a busy graph that
+    is the LEAST likely cause, and it sends them to configuration they do not
+    need to change — while the actual remedy is simply to re-run.
+
+    Fail-closed either way (an enumeration that raced a write is not a proven
+    one); what this pins is that the two are reported as DIFFERENT things.
+    """
+    query_fn = _FakeMovingCorpusQuery(
+        _fake_rows(50), cap=_PAGE_SIZE, counts=[50, 51],
+    )
+
+    with caplog.at_level('WARNING'):
+        facts, complete = await enumerate_valid_edge_facts(
+            query_fn, page_size=_PAGE_SIZE,
+        )
+
+    # The enumeration itself was fine — 50 fetched against a pre-count of 50.
+    assert len(facts) == 50
+    assert complete is False, 'a raced enumeration is not a proven one'
+
+    warnings = '\n'.join(r.getMessage() for r in caplog.records)
+    assert 'CHANGED MID-ENUMERATION' in warnings
+    assert 're-run' in warnings.lower()
+    assert 'result-set cap' not in warnings, (
+        'a concurrent write must not be reported as a suspected truncation'
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_stable_count_that_disagrees_is_still_a_suspected_shortfall(caplog):
+    """The other side of the same fork — the race check must not swallow it.
+
+    Only a count that held STILL across the whole run makes a shortfall
+    evidence of truncation. This is the regression guard that stops the
+    mid-enumeration branch above from becoming the answer to every mismatch.
+    """
+    query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=10)
+
+    with caplog.at_level('WARNING'):
+        facts, complete = await enumerate_valid_edge_facts(
+            query_fn, page_size=20,
+        )
+
+    assert complete is False
+    assert len(facts) < 50
+
+    warnings = '\n'.join(r.getMessage() for r in caplog.records)
+    assert 'result-set cap' in warnings
+    assert 'CHANGED MID-ENUMERATION' not in warnings
 
 
 @pytest.mark.parametrize(
