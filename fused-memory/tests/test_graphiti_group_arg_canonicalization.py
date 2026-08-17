@@ -275,8 +275,8 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('retrieve_episodes', (), {'group_ids': [_PATH_SHAPED]}),
 ]
 
-assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 37, (
-    'Sweep must cover exactly the 37 public group-arg GraphitiBackend methods '
+assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 39, (
+    'Sweep must cover exactly the 39 public group-arg GraphitiBackend methods '
     'not already covered by the step-1/3/5 positive-path tests — update this '
     'table if the decorated surface ever changes.'
 )
