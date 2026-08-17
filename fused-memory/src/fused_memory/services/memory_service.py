@@ -78,6 +78,7 @@ from fused_memory.services.memory_metadata_census import (
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_resolution import (
+    REFERENT_SOURCES,
     ReferentResolution,
     ReferentSet,
 )
@@ -1134,22 +1135,69 @@ def _decode_referents(payload: dict[str, Any]) -> tuple[ReferentSet, str]:
 
     Each entry is rebuilt through the ``Referent(...)`` constructor rather than
     kept as a bare dict, so the frozen type's kind-registry validation runs on
-    untrusted wire data too.
+    untrusted wire data too — which is also what makes an unregistered ``kind``
+    on the wire fall into the degradation path below instead of minting a bogus
+    referent.
+
+    DEGRADATION IS ALL-OR-NOTHING.  Any unreadable element — a non-dict blob, a
+    ``source`` outside :data:`REFERENT_SOURCES`, a non-list ``refs``, or a
+    SINGLE malformed entry — degrades the WHOLE blob to ``((), 'none')``, never
+    a partial set.  A partial set is worse than no set for the consumer this
+    exists to serve: leaf zeta's set-membership check reads "endpoint not in
+    the referent set" as a conflation and leaf eta repairs it by repointing the
+    edge, so a referent silently dropped by a lenient decoder would manufacture
+    a false conflation and drive destructive edge surgery onto the wrong node.
+    Referents are therefore accumulated into a local list and only frozen into
+    a tuple on FULL success, so a partial set cannot escape by construction.
+
+    DEGRADES RATHER THAN RAISES, deliberately.  This runs inside the queue
+    executor: raising would route the item to ``_handle_failure`` and
+    eventually dead-letter it, LOSING the memory over a telemetry field.
+    Degrading is safe here only BECAUSE the anomaly lands in the 'none' bucket
+    that ``_execute_graphiti_write``'s counter makes loud — the INV-4 escape,
+    not a silent fallthrough.  The ABSENT key is the one case that does NOT
+    warn: it is the load-bearing back-compat path (every row written before
+    task 3670), not an anomaly, and warning on it would drown the log during a
+    drain of a pre-feature queue.  It is still COUNTED, in the same bucket.
+
+    Loud-and-degrade mirrors the invalid-``reference_time`` arm already in
+    ``_execute_graphiti_write``, so this file has one idiom, not two.
     """
     blob = payload.pop('referents', None)
     if blob is None:
         return (), 'none'
-    return (
-        tuple(
-            Referent(
-                kind=entry['kind'],
-                project_id=entry['project_id'],
+
+    def _degrade(reason: str) -> tuple[ReferentSet, str]:
+        logger.warning(
+            "Unreadable 'referents' payload key (%s); treating the write as "
+            'having no referents. Blob: %r',
+            reason, blob,
+        )
+        return (), 'none'
+
+    if not isinstance(blob, dict):
+        return _degrade(f'expected a dict, got {type(blob).__name__}')
+    source = blob.get('source')
+    if source not in REFERENT_SOURCES:
+        return _degrade(f'source {source!r} is not one of {list(REFERENT_SOURCES)}')
+    refs = blob.get('refs')
+    if not isinstance(refs, list):
+        return _degrade(f"'refs' must be a list, got {type(refs).__name__}")
+
+    decoded: list[Referent] = []
+    for entry in refs:
+        if not isinstance(entry, dict):
+            return _degrade(f'entry {entry!r} is not a dict')
+        try:
+            decoded.append(Referent(
+                kind=entry.get('kind', 'task'),
+                project_id=entry.get('project_id', ''),
                 number=entry['number'],
-            )
-            for entry in blob['refs']
-        ),
-        blob['source'],
-    )
+            ))
+        except (KeyError, TypeError, ValueError) as e:
+            return _degrade(f'entry {entry!r} is not a valid Referent: {e}')
+
+    return tuple(decoded), source
 
 
 def _created_at_to_utc_iso(created_at: datetime | None) -> str | None:
