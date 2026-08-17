@@ -113,6 +113,26 @@ def _fake_exec_returning(proc):
     return fake_exec
 
 
+def _ident_recorder_growing(recorded: list[int]):
+    """A sync ``count_transcript_turns`` stand-in appending the calling thread's
+    ident and returning a MONOTONICALLY GROWING count (1, 2, 3, ...).
+
+    Mirrors ``TestRunSubprocessWorkingRegimeProgressExtension._always_growing_turns``
+    (test_cli_invoke.py:4094).  Growing counts latch ``seen_turn`` on call 1 and
+    keep refreshing ``last_progress_monotonic`` on every later call, so every
+    call after the first takes the ``elif extension_engaged`` branch and the run
+    is never idle-killed.
+    """
+    counter = [0]
+
+    def _side_effect(config_dir, session_id):
+        recorded.append(threading.get_ident())
+        counter[0] += 1
+        return counter[0]
+
+    return _side_effect
+
+
 def _ident_recorder(recorded: list[int], return_value):
     """A sync ``count_transcript_turns`` stand-in appending the CALLING thread's
     ident to *recorded* and returning *return_value*.
@@ -257,4 +277,89 @@ class TestStartupRegimePollOffLoop:
             f'The event loop made ZERO progress during a 0.5s transcript read '
             f'(ticker delta={deltas[0]}) — the read is executing inline on the loop. '
             f'Off-loop, ~100 ticks are expected at a 5ms cadence.'
+        )
+
+
+class TestWorkingRegimeExtensionPollOffLoop:
+    """The working-regime progress-extension poll (``cli_invoke.py:2850``, inside
+    ``elif extension_engaged and config_dir and session_id:``) must read off the loop.
+
+    THIS IS THE HIGHEST-VALUE SITE IN PRODUCTION.
+    ``orchestrator/src/orchestrator/workflow.py`` passes BOTH ``working_idle_secs``
+    and ``absolute_cap_secs`` for every role, so ``extension_engaged`` latches for
+    every agent and this branch fires every ``_WATCHDOG_WORKING_POLL_SECS`` (60s)
+    for the entire multi-minute-to-multi-hour working lifetime of every concurrent
+    agent — unlike the startup-regime branch, which stops firing the moment
+    ``seen_turn`` latches.
+    """
+
+    async def test_extension_poll_reads_transcript_off_the_loop_thread(self, tmp_path):
+        """Every progress-extension ``count_transcript_turns`` call runs on a worker thread.
+
+        Turn counts grow monotonically, so ``seen_turn`` latches on call 1 and
+        every later call takes the ``elif extension_engaged`` branch under test.
+        Call index 0 is therefore the pre-latch ``if not seen_turn`` branch
+        (already covered by TestStartupRegimePollOffLoop); indices >= 1 are the
+        branch this test exists for, which is why ``len(recorded) >= 2`` is
+        asserted rather than merely ``recorded``.
+
+        BOTH ``working_idle_secs`` and ``absolute_cap_secs`` are passed — the live
+        orchestrator configuration, and the precondition for ``extension_engaged``.
+        That the run survives well past ``timeout_seconds=0.1`` and exits normally
+        is itself proof the extension regime engaged: without it, the flat 0.1s
+        ceiling would have killed the 0.3s process.
+
+        The process COMPLETES rather than hanging, for the same reason as the
+        startup-poll test: a cap/idle kill would route through the
+        ``except TimeoutError:`` handler whose own re-read (cli_invoke.py:2970) is
+        step-5/step-6's site, and its ident would land in ``recorded`` and make
+        this test assert two sites at once.
+        """
+        loop_ident = threading.get_ident()
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc = _make_delayed_success_proc(0.3)
+        recorded: list[int] = []
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                side_effect=_fake_exec_returning(proc),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', AsyncMock()),
+            patch(
+                'shared.cli_invoke.count_transcript_turns',
+                side_effect=_ident_recorder_growing(recorded),
+            ),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
+            patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.1, startup_grace_secs=0.02,
+                session_id=sid, config_dir=cfg_dir,
+                working_idle_secs=10.0, absolute_cap_secs=5.0,
+            )
+
+        assert result.timed_out is False, (
+            'Expected the productive run to survive the 0.1s flat ceiling and exit '
+            'normally — if it was killed, extension_engaged never latched and the '
+            'elif branch under test never ran.'
+        )
+        assert result.duration_ms >= 100, (
+            f'Expected the run to outlive the old 0.1s ceiling (proving the extension '
+            f'regime engaged), got duration_ms={result.duration_ms}'
+        )
+        assert len(recorded) >= 2, (
+            f'Expected at least one read through the elif extension branch (call index '
+            f'>= 1); only {len(recorded)} read(s) happened, so index 0 (the pre-latch '
+            f'if-branch) may be all that ran.'
+        )
+        assert loop_ident not in recorded, (
+            f'count_transcript_turns ran on the event-loop thread ({loop_ident}) — '
+            f'the working-regime progress-extension poll at cli_invoke.py:2850 blocks '
+            f'the shared loop for every agent, for its entire working lifetime. '
+            f'Recorded idents: {sorted(set(recorded))}'
         )
