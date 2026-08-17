@@ -63,8 +63,10 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (  # noqa: E402
+    _ENUM_PREP_WORD_RE,
     PLURAL_ENUM_SNAPSHOT_RE,
     _enumeration_is_prepositional_complement,
+    _last_clause_break,
 )
 
 # The necessary lexical prefix of PLURAL_ENUM_SNAPSHOT_RE, spelled here on
@@ -147,3 +149,98 @@ def scan_corpus(facts: Iterable[str]) -> ScanResult:
         selected=selected,
         rejections=rejections,
     )
+
+
+# ---------------------------------------------------------------------------
+# Rejection triage (REPORT-ONLY)
+# ---------------------------------------------------------------------------
+
+# Closed-class tokens that may open an adverbial preamble WITHOUT being the
+# head noun that governs a following preposition. Deliberately tiny: 'as'
+# is here for the finding's own motivating shape ('As of <date>, ...'), the
+# rest are coordinators and sentence adverbs that can precede a preamble.
+# Anything NOT listed reads as a content word — i.e. a possible governing
+# head — and pushes the label to 'prepositional_complement', which is the
+# fail-safe direction for this heuristic (see triage_rejection).
+_PREAMBLE_OPENER_WORDS: frozenset[str] = frozenset({
+    'as', 'and', 'but', 'or', 'so', 'yet',
+    'then', 'now', 'also', 'however', 'meanwhile',
+})
+
+_WORD_TOKEN_RE: re.Pattern[str] = re.compile(r"[^\W\d_][\w'-]*")
+
+ADVERBIAL_PREAMBLE = 'adverbial_preamble'
+PREPOSITIONAL_COMPLEMENT = 'prepositional_complement'
+
+
+def triage_rejection(fact: str, match_start: int) -> str:
+    """Classify one guard rejection: recall loss, or a correct rejection?
+
+    Returns ``'adverbial_preamble'`` (the enumeration really is the copula's
+    SUBJECT and the guard fired on a scene-setting preamble in front of it —
+    genuine recall loss) or ``'prepositional_complement'`` (the copula's real
+    subject is an outer head noun and the rejection is correct).
+
+    THIS IS A TRIAGE HEURISTIC FOR REPORTING ONLY. It never feeds extraction,
+    so its errors cost report accuracy, not corpus correctness. When in doubt
+    it MUST answer ``'prepositional_complement'``: over-reporting recall loss
+    is what would wrongly justify tightening the guard, and a tightening
+    trades back toward the unrecoverable over-selection direction. Every
+    inconclusive branch below therefore falls through to that label.
+
+    The discriminator is structural. A genuine adverbial preamble is
+    preposition-INITIAL within its clause (modulo a closed-class opener like
+    'as') and is closed off by a comma before the enumeration. A
+    prepositional complement has a governing HEAD NOUN in front of the
+    preposition — which is what separates
+
+        'As of 2026-08-09, tasks 1020 and 1030 are pending.'   -> preamble
+        'Blockers for down-stream, still-unmerged tasks ...'   -> complement
+
+    even though both carry a comma between the preposition and the
+    enumeration. That second shape is load-bearing: keying on comma presence
+    alone mislabels it, and it is exactly the case candidate tightening (b)
+    was measured to get wrong.
+
+    Scoped to the same clause the shipped guard sees — ``_last_clause_break``
+    is reused rather than re-derived, so the triage cannot disagree with the
+    guard about where the clause starts.
+    """
+    prefix = fact[:match_start]
+    clause = prefix[_last_clause_break(prefix) + 1:]
+
+    # No comma => no preamble boundary at all; the preposition governs
+    # straight through to the enumeration.
+    last_comma = clause.rfind(',')
+    if last_comma < 0:
+        return PREPOSITIONAL_COMPLEMENT
+
+    # A listed preposition AFTER the comma governs the enumeration directly,
+    # whatever came before it.
+    tail = clause[last_comma + 1:]
+    if _ENUM_PREP_WORD_RE.search(tail):
+        return PREPOSITIONAL_COMPLEMENT
+
+    # A plural head noun between the comma and the enumeration could itself
+    # be what the copula agrees with ('..., statuses tasks 1020 and 1030
+    # are pending'), so the enumeration is not unambiguously the subject.
+    for token in _WORD_TOKEN_RE.findall(tail):
+        if token.lower().endswith('s') and token.lower() not in _PREAMBLE_OPENER_WORDS:
+            return PREPOSITIONAL_COMPLEMENT
+
+    # The clause's FIRST listed preposition decides it: anything open-class
+    # in front of that preposition is a candidate governing head, which makes
+    # this a complement rather than a preamble.
+    first_prep = _ENUM_PREP_WORD_RE.search(clause)
+    if first_prep is None:
+        # The guard fired, so a listed preposition exists somewhere in the
+        # scanned span; not finding one here means the two disagree about
+        # scope. Report conservatively rather than claiming recall loss.
+        return PREPOSITIONAL_COMPLEMENT
+
+    before_prep = clause[: first_prep.start()]
+    for token in _WORD_TOKEN_RE.findall(before_prep):
+        if token.lower() not in _PREAMBLE_OPENER_WORDS:
+            return PREPOSITIONAL_COMPLEMENT
+
+    return ADVERBIAL_PREAMBLE
