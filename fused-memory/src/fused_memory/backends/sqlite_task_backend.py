@@ -2159,49 +2159,11 @@ class SqliteTaskBackend:
 
                 set_columns = ['status = ?', 'metadata = ?', 'updated_at = ?']
                 set_values: list[Any] = [status, new_metadata, _now()]
-                if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
-                    if self._claimant_columns_cache.get(project_root, False):
-                        if claimant_run_id is not _UNSET:
-                            set_columns.append('claimant_run_id = ?')
-                            set_values.append(claimant_run_id)
-                        if heartbeat_at is not _UNSET:
-                            set_columns.append('heartbeat_at = ?')
-                            set_values.append(heartbeat_at)
-                    else:
-                        logger.warning(
-                            'set_status_and_stamp_audit: claimant_run_id/heartbeat_at '
-                            'columns absent (pre-migration connection) — writing '
-                            'status+metadata only for task_id=%s project_root=%s',
-                            task_id, project_root,
-                        )
-
-                try:
-                    await self._apply_status_row_update(
-                        conn, set_columns, set_values, tag, tid,
-                    )
-                except sqlite3.IntegrityError as exc:
-                    if row_candidate_key is None or 'candidate_key' not in str(exc):
-                        raise
-                    survivor_cursor = await conn.execute(
-                        "SELECT id, status FROM tasks WHERE tag = ? AND candidate_key = ? "
-                        "AND status != 'cancelled' ORDER BY id LIMIT 1",
-                        (tag, row_candidate_key),
-                    )
-                    survivor = await survivor_cursor.fetchone()
-                    raise DuplicateCandidateKeyError(
-                        existing_id=survivor['id'] if survivor is not None else None,
-                        existing_status=survivor['status'] if survivor is not None else None,
-                        tag=tag,
-                        candidate_key=row_candidate_key,
-                    ) from exc
-
-                verify_cursor = await conn.execute(
-                    'SELECT status FROM tasks WHERE tag = ? AND id = ?', (tag, tid),
+                persisted_status = await self._write_status_and_verify(
+                    conn, set_columns, set_values, tag, tid, task_id, status,
+                    row_candidate_key, claimant_run_id, heartbeat_at, project_root,
+                    caller_name='set_status_and_stamp_audit', write_desc='status+metadata',
                 )
-                verify_row = await verify_cursor.fetchone()
-                persisted_status = verify_row['status'] if verify_row is not None else None
-                if persisted_status != status:
-                    raise _StatusWriteNotPersisted(task_id, status, persisted_status)
         except _StatusWriteNotPersisted as exc:
             return exc.to_error_dict()
         return {
