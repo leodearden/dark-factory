@@ -265,8 +265,8 @@ def _resolve_hook_slug(
     where the true spawner IS known -- it is precisely the slug just
     rejected -- and equally the only place where every OTHER inherited
     ``CLAUDE_SPAWN_*`` value in scope describes the SPAWNER rather than this
-    session, so it must not be copied onto the new record wholesale (see
-    to tell the two apart (see ``run_session_start``).
+    session, so it must not be copied onto the new record wholesale --
+    ``run_session_start`` uses this bit to tell the two apart.
 
     *allow_remint* is forwarded to ``_env_slug_is_owned``; SessionStart is
     the only caller that sets it.
