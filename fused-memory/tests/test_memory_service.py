@@ -11281,6 +11281,119 @@ class TestMemoryMetadataValidationAtSeam:
             await _mm_write(service, 'add_memory', metadata={'topic': 'bad_slug'})
 
 
+#: A pre-image that is FATAL-invalid under the vocabulary as it sits.
+#:
+#: `eval_worktree_plan_tools_missing` is not invented — it is the snake_case
+#: topic the live `dark_factory` canonical record carried, and
+#: `sweep_toolcall_xml_leak.py` enumerates the classes of legacy record that
+#: are fatal-invalid today (unknown `kind`, malformed `supersedes`, non-bool
+#: `canonical`). Records like this exist; the update seam has to be able to
+#: re-tag them.
+_MM_LEGACY_INVALID_PRE_IMAGE = {
+    **DEFAULT_POINT_PAYLOAD,
+    'topic': 'eval_worktree_plan_tools_missing',
+}
+
+
+class TestUpdateMemoryValidatesTheDeltaNotTheCorpus:
+    """A patch is judged on what it CHANGES, never on the record at rest.
+
+    Task 3523. Wiring the seam into `update_memory` without this rule would
+    make `enforce` start re-validating records at rest on every patch —
+    silently contradicting a model the codebase both states in prose and
+    MEASURES against. `_check_canonical_uniqueness`'s docstring and PRD §9
+    leaf ε's 2026-08-04 amendment both say "`enforce` rejects WRITES and
+    never re-validates the corpus", and quantify the flip's blast radius
+    (~20 → ~19 false rejections/week) on exactly that basis; task 3626's
+    flip decision rests on that number.
+
+    The three cases below draw the line from both sides, which is the point:
+    a pre-existing violation the patch did not cause is not this write's
+    problem, but a violation the patch DOES cause is — including one that
+    emerges from the combination and appears in neither the pre-image nor the
+    patch keys alone.
+    """
+
+    _POINT = 'point-1'
+
+    @staticmethod
+    def _stage(service, payload):
+        service.mem0.get_point_by_id = AsyncMock(return_value=dict(payload))
+
+    @pytest.mark.asyncio
+    async def test_patching_an_unrelated_key_is_not_judged_on_the_pre_image(
+        self, service, caplog
+    ):
+        """The load-bearing case: routine re-tagging of a legacy record.
+
+        Without delta scoping this raises, and `enforce` becomes an outage
+        for exactly the records the repair sweeps exist to fix.
+        """
+        service.config.memory_metadata.enforce = True
+        self._stage(service, _MM_LEGACY_INVALID_PRE_IMAGE)
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'x_note': 'hi'},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        # Empty, not merely "no invalid_topic_slug": re-censusing a
+        # pre-existing violation on every patch would inflate the census
+        # stream the flip is measured from, and would trip false unknown-key
+        # storms on a record whose long-tail keys were already counted once.
+        assert _mm_census_codes(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_a_violation_the_patch_itself_introduces_is_rejected(self, service):
+        """The other side of the line — delta scoping is not a blanket pass."""
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, _MM_LEGACY_INVALID_PRE_IMAGE)
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'topic': 'Not A Slug'},
+            )
+
+        assert 'invalid_topic_slug' in {v.code for v in excinfo.value.violations}
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_violation_that_emerges_from_the_combination_is_rejected(
+        self, service
+    ):
+        """NEW is judged on the effective post-image, not on the patch keys.
+
+        Neither half shows this violation alone: the pre-image is clean
+        (`canonical` with a valid `topic`) and the delta names only `topic`.
+        `canonical_without_topic` exists only in the record the write would
+        leave behind — so a rule that diffed the PATCH against the vocabulary
+        instead of the post-image against the pre-image would admit it.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {
+            **DEFAULT_POINT_PAYLOAD, 'topic': 'a-good-slug', 'canonical': True,
+        })
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_delete_keys=['topic'],
+            )
+
+        assert 'canonical_without_topic' in {v.code for v in excinfo.value.violations}
+        service.mem0.delete_payload.assert_not_called()
+
+
 class TestCanonicalUniquenessAtSeam:
     """<=1 canonical memory per (project, topic) — the live INV-3 re-check.
 
