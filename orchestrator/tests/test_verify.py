@@ -2312,6 +2312,31 @@ class TestExtractCauseHint:
             f'Unexpected hint: {hint!r}'
         )
 
+    def test_pytest_undecorated_failure_summary_returned(self):
+        """task 4066: an UNDECORATED ``N failed, ...`` tally is a rung-3 match.
+
+        pytest omits the ``=`` bars when an ``INTERNALERROR`` aborts the
+        session (verify-log 2829's tally, transcribed verbatim below) and
+        under ``-q``. Before the summary regex was widened, rung 3 missed
+        those lines entirely and the hint fell through to the
+        last-non-blank-line fallback rung.
+
+        The trailing wrapper line is deliberate: without a non-progress line
+        AFTER the tally, the fallback rung would return the tally anyway and
+        this test would pass without rung 3 ever matching — proving nothing.
+        """
+        output = (
+            'orchestrator/tests/test_verify.py ...F..                          [ 73%]\n'
+            'orchestrator/tests/test_scheduler.py ....                         [ 99%]\n'
+            '\n'
+            '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)\n'
+            'make: *** [Makefile:12: test] Error 1\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)', (
+            f'Unexpected hint: {hint!r}'
+        )
+
     def test_pytest_traceback_E_line_returns_last(self):
         """When only traceback E-lines exist (no FAILED/INTERNALERROR), the LAST E-line wins."""
         # No FAILED lines, no INTERNALERROR, no failure summary, no
