@@ -60,6 +60,9 @@ fi
 echo "install-flag-marker-sweep-timer.sh: ${TIMER_NAME} installed and enabled (verified in list-timers)"
 
 echo "install-flag-marker-sweep-timer.sh: kicking immediate one-time drain via $SERVICE_NAME"
-systemctl --user start "$SERVICE_NAME"
+if ! systemctl --user start "$SERVICE_NAME"; then
+    echo "ERROR: ${SERVICE_NAME} one-time drain kick failed (the timer IS installed and enabled; the nightly 03:30 run is armed). Inspect with: journalctl --user -u ${SERVICE_NAME}" >&2
+    exit 1
+fi
 
 echo "install-flag-marker-sweep-timer.sh: ${SERVICE_NAME} one-time drain kick complete."
