@@ -841,11 +841,20 @@ user_observable_signal, consumer_ref, substrate_confirmed,
 human_decomposed, grammar_confirmed, invariants, optimistic_path,
 capability_manifest, curator_action, curator_justification, combined_at,
 gate_escalated_at, before_done_ran_at, before_done_verified_at,
-before_done_verified_pid, files_tagged_at, origin_finding_id,
-spawned_from, program, program_stream, stream, cross_repo,
-cross_repo_project, human_curator_gate,
-human_curator_adjudicated_at, last_blocked_at
+before_done_verified_pid, files_tagged_at, source_finding_id,
+stage1_finding_id, origin_finding_id, spawned_from, program,
+program_stream, stream, cross_repo, cross_repo_project,
+human_curator_gate, human_curator_adjudicated_at, last_blocked_at
 ```
+
+The finding-provenance trio (`source_finding_id`, `stage1_finding_id`,
+`origin_finding_id`) is the one Tier-A family that does **not** meet the
+"already relied on by real writers" criterion stated above: it has no code
+reader and no code writer, and is a pure LLM prose convention. It was
+blessed by `esc-3796-1` (2026-08-17) on corpus-dominance grounds instead —
+120 / 33 / 30 tasks respectively — because leaving the dominant spellings
+unblessed is what manufactures the census noise the scan exists to surface.
+See Tier-B below for which spelling to use in new writes.
 
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
 (§3.2.1): auto-set by the fused-memory submit path when a task's
