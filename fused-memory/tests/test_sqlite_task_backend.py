@@ -18,6 +18,7 @@ from shared.task_metadata import SchemaWarning
 
 from fused_memory.backends.sqlite_task_backend import (
     SqliteTaskBackend,
+    _StatusWriteNotPersisted,
     _classify_residual_group,
     _emit_schema_warning,
     _format_task_id,
@@ -1161,6 +1162,29 @@ class _RowUpdateSuppressedBackend(SqliteTaskBackend):
         return
 
 
+class _WriteStatusSeamSpyBackend(SqliteTaskBackend):
+    """Test double: records every ``_write_status_and_verify`` call and
+    suppresses the write, so a caller that does NOT route through the
+    shared tail is detectable through the public API."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.seam_calls: list[dict] = []
+
+    async def _write_status_and_verify(
+        self, conn, set_columns, set_values, tag, tid,
+        task_id, status, row_candidate_key, claimant_run_id,
+        heartbeat_at, project_root, caller_name, write_desc,
+    ):
+        self.seam_calls.append({
+            'caller_name': caller_name,
+            'write_desc': write_desc,
+            'set_columns': list(set_columns),  # copy: the real helper mutates in place
+            'status': status,
+        })
+        raise _StatusWriteNotPersisted(task_id, status, 'seam-suppressed')
+
+
 @pytest.mark.asyncio
 async def test_set_task_status_reports_explicit_error_when_write_not_persisted(tmp_path):
     """Plain set_task_status: a suppressed UPDATE must not report success."""
@@ -1180,6 +1204,36 @@ async def test_set_task_status_reports_explicit_error_when_write_not_persisted(t
         'task_id': '1',
         'requested_status': 'done',
         'actual_status': 'pending',
+    }
+    assert task['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_set_task_status_routes_through_write_status_and_verify(tmp_path):
+    """set_task_status must route through the shared `_write_status_and_verify`
+    tail (task 4057) instead of inlining its own copy of the claimant/
+    collision/read-back logic."""
+    project_root = str(tmp_path / 'proj')
+    spy = _WriteStatusSeamSpyBackend(TaskmasterConfig(project_root=project_root))
+    await spy.start()
+    try:
+        await spy.add_task(project_root=project_root, title='x')
+        result = await spy.set_task_status('1', 'done', project_root=project_root)
+        task = await spy.get_task('1', project_root=project_root)
+    finally:
+        await spy.close()
+
+    assert len(spy.seam_calls) == 1
+    call = spy.seam_calls[0]
+    assert call['caller_name'] == 'set_task_status'
+    assert call['write_desc'] == 'status'
+    assert call['set_columns'] == ['status = ?', 'updated_at = ?']
+    assert result == {
+        'success': False,
+        'error': 'status_write_not_persisted',
+        'task_id': '1',
+        'requested_status': 'done',
+        'actual_status': 'seam-suppressed',
     }
     assert task['status'] == 'pending'
 
