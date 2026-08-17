@@ -1208,3 +1208,95 @@ class TestMergeStatusGitAuthorityIntegration:
         assert result['merge_sha'] != branch_tip, (
             'merge_sha must be the merge commit on main, not the branch tip'
         )
+
+    async def test_landed_then_file_edited_on_main_returns_unknown(
+        self, tmp_path: Path, git_ops: GitOps, orch_config: OrchestratorConfig  # type: ignore[reportInvalidTypeForm]
+    ) -> None:
+        """Measures the citation gate's FALSE-NEGATIVE class, end to end.
+
+        The task genuinely landed — merged with ``--no-ff``, cited on main,
+        never reverted — and merge_status still answers ``unknown``, because a
+        LATER unrelated commit edited a file the landing touched.
+
+        Why: the gate's third guard is ``commit_effect_present_in_main``, which
+        for a merge commit diffs the merged parent against current main HEAD
+        over every path that parent introduced (git_ops.py) and requires them
+        byte-identical.  That is strictly stronger than "was not reverted" —
+        ANY subsequent edit to a touched path reads as effect-absent.  Tier 3.5
+        fires only once the durable tiers have aged out, i.e. for OLD landings,
+        which are exactly the ones most likely to have been edited since, so
+        this class is plausibly common rather than exceptional.
+
+        The trade-off, deliberately taken (task 3103): the tier is a
+        last-resort probe on a path where a confident WRONG ``done`` fabricates
+        provenance and closes a task that never landed, while a conservative
+        ``unknown`` costs only a deterministic manual confirmation — both
+        runbooks state in terms that ``unknown`` does NOT mean "not landed"
+        and route the reader to the canonical ancestry/citation check.
+
+        This test exists to keep the class MEASURED: paired with
+        ``test_cited_ancestor_branch_effect_absent_returns_unknown`` (a genuine
+        revert, same answer), it pins that the tier cannot today tell the two
+        apart.  A future change that narrows the anchor selection — e.g.
+        checking only paths still attributable to the task — should flip THIS
+        test to ``done`` while leaving the revert test at ``unknown``, which is
+        precisely the signal that the tightening worked.
+        """
+        tid = '772'
+
+        # --- Land the task for real: commit, --no-ff merge, advance main ---
+        wt_info = await git_ops.create_worktree(tid)
+        assert wt_info is not None
+        (wt_info.path / f'{tid}.py').write_text(f'{tid} = True\n')
+        await git_ops.commit(wt_info.path, f'Add {tid}')
+
+        merge_result = await git_ops.merge_to_main(wt_info.path, tid)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        assert merge_result.merge_commit is not None
+        adv = await git_ops.advance_main(merge_result.merge_commit)
+        assert adv.result == 'advanced'
+
+        # --- Branch stays alive → the live-branch (ancestor) arm fires ---
+
+        # --- A LATER, unrelated commit edits the same file on main ---
+        # The subject deliberately does not cite the task, so the citation
+        # discovered below is still the merge commit.
+        (git_ops.project_root / f'{tid}.py').write_text(
+            f'{tid} = True\nLATER = "an unrelated task extended this module"\n'
+        )
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        rc, _, err = await _run(
+            ['git', 'commit', '-m', 'chore: extend a shared module'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, f'later edit failed: {err!r}'
+
+        # --- Preconditions: this is a GENUINE landing, not a degenerate or
+        # uncited branch — so `unknown` below can only come from the
+        # effect-present half of the citation gate. ---
+        assert await git_ops.is_ancestor(f'task/{tid}', 'main'), (
+            'precondition: the landed branch must be an ancestor of main'
+        )
+        citation = await git_ops.find_task_citation_commit(tid)
+        assert citation == merge_result.merge_commit, (
+            f'precondition: main must still cite the task via the merge '
+            f'commit, got citation={citation!r}'
+        )
+        assert not await git_ops.commit_effect_present_in_main(
+            merge_result.merge_commit
+        ), 'precondition: the later edit must make the effect read as absent'
+
+        stub_harness = types.SimpleNamespace(
+            _merge_worker=None,
+            _terminal_retention=None,
+            git_ops=git_ops,
+        )
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(esc_queue, harness=stub_harness, orch_config=orch_config)
+
+        result = await _call_merge_status(server, task_id=tid)
+
+        assert result.get('state') == 'unknown', (
+            f'A landed-then-edited task currently reads as unknown (the '
+            f'conservative false negative this test measures), got: {result}'
+        )
