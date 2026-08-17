@@ -437,8 +437,12 @@ def serve_escalation_mcp_module():
     ``serve_escalation_mcp`` instead.
 
     Body: the SAME ``_serve_escalation_mcp_impl`` generator -- the scope is the
-    only difference, and the two must never grow separate bodies (pinned by
-    ``test_both_serve_escalation_mcp_fixtures_share_one_implementation``).
+    only difference, and the two must never grow separate bodies. That is a
+    review-time invariant, deliberately NOT pinned by a test: the only checks
+    available are on the helper's name and the wrapper's bytecode shape, which
+    go red on a pure rename while still passing a wrapper that both delegates
+    AND carries a duplicated copy (task 3736 review). Keep both fixture bodies
+    one-line ``yield from`` delegates.
     """
     yield from _serve_escalation_mcp_impl()
 
