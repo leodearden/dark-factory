@@ -693,6 +693,55 @@ The server runs the same checks as a backstop, in this order:
 """
 
 
+# The Scope Boundary section shared verbatim by IMPLEMENTER and DEBUGGER
+# (task 4370): the sandbox enforces WORKTREE containment, not per-file plan
+# scope, so every file inside the worktree is writable and staying within
+# the plan's assigned files is the agent's own responsibility, self-reported
+# via `escalate_blocker(category='scope_violation')`. Hoisted into a named
+# constant and spliced the same way as BACKGROUND_WAIT_GUIDANCE above, so the
+# two sites cannot silently drift apart and test_roles_scope_boundary.py can
+# guard the splice structurally (`SCOPE_BOUNDARY_GUIDANCE in
+# role.system_prompt`) instead of pinning prose.
+SCOPE_BOUNDARY_GUIDANCE = """
+## Scope Boundary
+
+The sandbox enforces worktree containment, not per-file plan scope. Writes
+outside this worktree — the main checkout, sibling task worktrees, other
+tasks' `.task-meta/` directories, `git update-ref refs/heads/main`,
+`~/.claude` — fail with EACCES or EROFS. But every file inside this
+worktree is writable, including files never listed in the plan's assigned
+scope. Nothing in the sandbox stops you from editing outside scope, and
+nothing else detects it either.
+
+Staying within the plan's assigned files is therefore your responsibility,
+not the sandbox's. If you genuinely need to modify files outside your
+assigned scope, that is the ONLY mechanism to request it: call
+`escalate_blocker` with `category='scope_violation'` BEFORE making the
+edit, rather than widening scope on your own.
+"""
+
+
+# SIMPLE_TASK's deliberately different, shorter variant: it routes an
+# out-of-scope write back to the architect rather than just naming the
+# escalation call, since SIMPLE_TASK has no separate architect phase of its
+# own to fall back on mid-session -- stopping and letting the full
+# architect+implementer path pick the task back up IS its recourse.
+SCOPE_BOUNDARY_GUIDANCE_SIMPLE = """
+## Scope Boundary
+
+The sandbox enforces worktree containment, not per-file plan scope: writes
+outside this worktree fail with EACCES or EROFS, but every file INSIDE
+it is writable, including files never listed in the plan's assigned scope.
+Nothing stops you from editing outside scope, and nothing else detects it
+either — staying within the plan's assigned files is your responsibility.
+
+If you need to modify files outside scope, that's a signal the task does
+not fit the simple path. Call `escalate_blocker` with
+`category='scope_violation'` — it is the only mechanism to request scope
+expansion — then stop and let the architect take over.
+"""
+
+
 ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
@@ -852,23 +901,7 @@ The workflow for each step is:
 2. Run tests to verify
 3. Stage and commit ONLY the code: `git add -- .`
 4. Call `mark_step_done(step_id, commit_sha)` to record the step as complete
-
-## Scope Boundary
-
-The sandbox enforces worktree containment, not per-file plan scope. Writes
-outside this worktree — the main checkout, sibling task worktrees, other
-tasks' `.task-meta/` directories, `git update-ref refs/heads/main`,
-`~/.claude` — fail with EACCES or EROFS. But every file inside this
-worktree is writable, including files never listed in the plan's assigned
-scope. Nothing in the sandbox stops you from editing outside scope, and
-nothing else detects it either.
-
-Staying within the plan's assigned files is therefore your responsibility,
-not the sandbox's. If you genuinely need to modify files outside your
-assigned scope, that is the ONLY mechanism to request it: call
-`escalate_blocker` with `category='scope_violation'` BEFORE making the
-edit, rather than widening scope on your own.
-
+""" + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
 - Run tests frequently to verify your work.
@@ -923,23 +956,7 @@ git add -- .
 
 As a backstop, a pre-commit hook silently strips any `.task/` path that
 still ends up staged.
-
-## Scope Boundary
-
-The sandbox enforces worktree containment, not per-file plan scope. Writes
-outside this worktree — the main checkout, sibling task worktrees, other
-tasks' `.task-meta/` directories, `git update-ref refs/heads/main`,
-`~/.claude` — fail with EACCES or EROFS. But every file inside this
-worktree is writable, including files never listed in the plan's assigned
-scope. Nothing in the sandbox stops you from editing outside scope, and
-nothing else detects it either.
-
-Staying within the plan's assigned files is therefore your responsibility,
-not the sandbox's. If you genuinely need to modify files outside your
-assigned scope, that is the ONLY mechanism to request it: call
-`escalate_blocker` with `category='scope_violation'` BEFORE making the
-edit, rather than widening scope on your own.
-
+""" + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
 - Read the failing test/code carefully before making changes.
@@ -1927,20 +1944,7 @@ git add -- .
 # WRONG — force-adds .task/ past the gitignore (never do this):
 # git add -f .task/plan.json
 ```
-
-## Scope Boundary
-
-The sandbox enforces worktree containment, not per-file plan scope: writes
-outside this worktree fail with EACCES or EROFS, but every file INSIDE
-it is writable, including files never listed in the plan's assigned scope.
-Nothing stops you from editing outside scope, and nothing else detects it
-either — staying within the plan's assigned files is your responsibility.
-
-If you need to modify files outside scope, that's a signal the task does
-not fit the simple path. Call `escalate_blocker` with
-`category='scope_violation'` — it is the only mechanism to request scope
-expansion — then stop and let the architect take over.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash',
         *_ESCALATION_TOOLS,
