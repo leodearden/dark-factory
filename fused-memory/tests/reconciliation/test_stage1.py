@@ -4219,6 +4219,7 @@ class TestCuratorGateResolutionSweepWiring:
             )
 
         dedup_mock.assert_awaited_once()
+        assert dedup_mock.await_args is not None
         dedup_flags_arg = dedup_mock.await_args.kwargs['flags']
         assert any(
             f.get('flag_type') == 'task_completed_not_reflected'
@@ -4262,10 +4263,9 @@ class TestCuratorGateResolutionSweepWiring:
                 run_id='run-3084-step11c',
             )
 
-        dedup_mock.assert_awaited_once(), (
-            'the `if report.items_flagged:` guard must fire on the appended flag '
-            'even when the LLM emitted none of its own'
-        )
+        # Guards that the `if report.items_flagged:` chain fires on the appended
+        # flag even when the LLM emitted none of its own.
+        dedup_mock.assert_awaited_once()
         assert [f.get('flag_type') for f in report.items_flagged] == [
             'task_completed_not_reflected',
         ], f'got {report.items_flagged!r}'
