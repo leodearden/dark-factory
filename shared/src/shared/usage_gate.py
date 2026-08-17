@@ -41,6 +41,13 @@ from shared.invocation_outcome import (
     auth_failure_reason,
     classify_invocation,
 )
+
+# Aliased on import: this module defines its own _parse_resets_at below, and a
+# same-name import would shadow it — breaking the
+# orchestrator/src/orchestrator/usage_gate.py re-export and its tests. The two
+# differ deliberately: the strict copy returns None on parse failure, the local
+# fork fabricates `now + 1h` (see the note at its definition).
+from shared.invocation_outcome import _parse_resets_at as _parse_resets_at_strict
 from shared.proc_group import terminate_process_group
 
 if TYPE_CHECKING:
@@ -1457,12 +1464,25 @@ class UsageGate:
 
         logger.warning(f'Account {acct.name} AUTH-FAILED: {reason}')
         if acct.phase not in (AccountPhase.AUTH_FAILED, AccountPhase.CAPPED):
-            # In production, HTTP 429 with "out of extra usage" carries a
-            # "resets ..." phrase in the body — parse and persist it so the
-            # dashboard can surface a reset ETA without re-parsing reason
-            # strings downstream. Skip the 1h fallback when there's no
-            # "resets" hint at all (true 401/403 token revocation).
-            resets_at = _parse_resets_at(reason) if 'resets' in reason.lower() else None
+            # Serves a 401/403 whose restored response-body snippet (task 4042)
+            # carries a genuine "resets ..." phrase — parse and persist it so
+            # the dashboard can surface a reset ETA without re-parsing reason
+            # strings downstream. Skip entirely when there's no "resets" hint at
+            # all (true 401/403 token revocation).
+            #
+            # Uses the STRICT parser deliberately: the module-local
+            # _parse_resets_at fork fabricates `now + 1h` on parse failure,
+            # which dashboard/data/costs.py::_extract_resets_at would then
+            # surface verbatim as a real recovery ETA on a revoked token. The
+            # strict copy returns None instead, so an unparseable hint is
+            # reported as explicitly UNKNOWN rather than invented (PRD 7.1.a —
+            # the invariant stated at invocation_outcome.py's _parse_resets_at).
+            # Both copies agree exactly on every parseable phrase.
+            #
+            # (The old comment here justified the branch by "HTTP 429 ... routed
+            # through _handle_auth_failure", which was stale: classify_invocation
+            # narrows AuthFailed to {401, 403} and routes 429 to CapHit.)
+            resets_at = _parse_resets_at_strict(reason) if 'resets' in reason.lower() else None
             # _transition owns: the phase write, near_cap clear, the
             # centralized _open recompute, cancelling/starting the
             # opposite/matching background task, the auth_failed cost event,
