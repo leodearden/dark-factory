@@ -207,6 +207,63 @@ _VIOLATION_MSG = (
 )
 
 
+_DATACLASS_VIOLATION_MSG = (
+    'unspecced MagicMock shaped like a registered dataclass.'
+    ' To suppress: add # noqa: bare-dataclass-double — <reason> on the preceding non-blank line.'
+)
+
+
+def _matching_shape(call: ast.Call) -> _DataclassShape | None:
+    """Return the first registered shape *call*'s literal kwarg names match, else None.
+
+    Only the FIRST match is returned: a call must never produce one violation per
+    registered shape.
+    """
+    kwargs = {kw.arg for kw in call.keywords if kw.arg is not None}
+    for shape in _DATACLASS_SHAPES:
+        if shape.anchors <= kwargs:
+            return shape
+    return None
+
+
+def _find_dataclass_double_violations(
+    tree: ast.AST, lines: list[str], filename: str
+) -> list[Violation]:
+    """Rule B: flag unspecced MagicMocks shaped like a registered dataclass, in ANY position.
+
+    Deliberately POSITION-BLIND — a plain ``ast.walk`` over every ``ast.Call`` rather
+    than Rule A's ``ast.Assign``/``ast.AnnAssign`` pipeline.  All ten sites behind task
+    3980 were ``return MagicMock(...)``, which Rule A cannot see; the binding name is
+    not consulted either, so Rule A's config-name gate does not apply here.
+
+    Reuses ``_is_magicmock_call`` and ``_is_specced`` unchanged, so the two rules can
+    never disagree about what "a MagicMock" or "specced" means.
+
+    Violations carry ``call.col_offset`` (the ``MagicMock(`` token), so a node that
+    trips both rules yields two deterministically-ordered entries rather than a collision.
+    """
+    violations: list[Violation] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not _is_magicmock_call(node):
+            continue
+        if _is_specced(node):
+            continue
+        shape = _matching_shape(node)
+        if shape is None:
+            continue
+        violations.append(
+            Violation(
+                filename=filename,
+                lineno=node.lineno,
+                col_offset=node.col_offset,
+                message=_DATACLASS_VIOLATION_MSG,
+            )
+        )
+    return violations
+
+
 def _is_exempted(lines: list[str], lineno: int) -> bool:
     """Return True if the assignment at *lineno* (1-based) is preceded by a valid exemption comment.
 
@@ -308,6 +365,11 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                     message=_VIOLATION_MSG,
                 )
             )
+
+    # Rule B runs as an independent pass over the same tree and merges into the
+    # same sorted output, so main()'s reporting and the exit-code contract are
+    # untouched.  Rule A's loop above is not modified by the widening.
+    violations.extend(_find_dataclass_double_violations(tree, lines, filename))
 
     return sorted(violations, key=lambda v: (v.lineno, v.col_offset))
 
