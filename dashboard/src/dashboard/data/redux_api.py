@@ -693,6 +693,20 @@ def shape_escalations(
                         use the literal ``'reconciliation'`` key which is never in
                         ``task_maps``.
 
+    Each shaped subsection carries, alongside its ``escalations`` rows:
+
+    - ``skipped`` — list of ``{'path': str, 'error': str}`` records for the
+      queue ``*.json`` files ``load_queue_escalations`` could not parse.  Always
+      a list (a missing or ``None`` upstream value shapes to ``[]``), so the
+      client can iterate unconditionally.
+    - ``summary.skipped_count`` — ``len(skipped)`` for that subsection; the
+      top-level ``summary.skipped_count`` is the sum across all of them.  It
+      says how short the ``by_level``/``by_status`` counts beside it may be.
+
+    Both are the payload's statement that a queue holds escalations it could not
+    read — without them the loss is only a server-side WARNING line, and the tab
+    renders short with nothing saying so (INV-2, ``structured-facts-at-failure``).
+
     Returns:
         ``{'ESCALATIONS': {'subsections': [...], 'summary': {...}}}``
     """
@@ -762,6 +776,12 @@ def shape_escalations(
             'label': sub_label,
             'kind': sub_kind,
             'summary': dict(sub.get('summary') or {}),
+            # Degraded-state facts sit beside the counts they qualify.  `or []`
+            # handles both a missing key and an explicit None (a stale or partial
+            # upstream dict) so the JSX can iterate unconditionally; the per-entry
+            # dict(e) copy matches how `summary` is copied and keeps the shaped
+            # payload from aliasing the caller's list.
+            'skipped': [dict(e) for e in sub.get('skipped') or []],
             'escalations': rows,
         })
     return {
@@ -832,6 +852,31 @@ def shape_burndown(
     ``BURNDOWN`` is the sum across projects, aligned by label.
     ``BURNDOWN_BY_PROJECT`` is keyed by project basename.  Both blocks
     carry ``forecast_low`` / ``forecast_high`` (None when <7 days history).
+
+    Consumer contract — the two label rows are NOT interchangeable:
+
+    * ``BURNDOWN['labels']`` is the sorted UNION of every project's snapshot
+      timestamps, and the four aggregate series are densified onto it by
+      ``index_map`` below, so each is always ``len(labels)``.
+    * Each ``BURNDOWN_BY_PROJECT[p]`` block carries that project's OWN
+      snapshot row, generally SHORTER than the union row.  Its four series are
+      copied verbatim, so they are co-length with that row exactly as far as
+      the caller made them so — :func:`~dashboard.data.burndown.get_burndown_series`
+      appends one value per key per snapshot row, which is what establishes
+      the invariant; this function preserves it but does not enforce it (a
+      ragged input is passed through unnormalized, with ``completed`` /
+      ``velocity`` zeroed by the length guard in ``compute_window_completion``).
+
+    So a consumer must pair per-project values with per-project ``labels``.
+    Pairing them with ``BURNDOWN['labels']`` both overruns the values and
+    index-shifts them onto the wrong timestamps — the defect fixed at the
+    per-project status-mix chart in ``static/redux/tabs.jsx``.
+
+    Per-project rows are deliberately not densified onto the union row: a
+    0-fill would assert a measurement that was never taken, and a null-fill
+    would first require every downstream consumer (``deriveVelocitySeries``,
+    the summary-table last-value reads, ``compute_window_completion``) to be
+    made hole-aware.
     """
     # Local import avoids circular import: burndown.py imports stats and
     # this module imports config/no-burndown.

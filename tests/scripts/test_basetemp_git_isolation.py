@@ -419,6 +419,7 @@ _WIRING_SNIPPET = (
     'if str(REPO_ROOT) not in sys.path:\n'
     '    sys.path.append(str(REPO_ROOT))   # APPEND — never insert(0, ...)\n'
     'from df_pytest_isolation import (\n'
+    '    _df_deploy_clocks_unwritten,  # noqa: F401\n'
     '    _df_git_ceiling_at_basetemp,  # noqa: F401\n'
     '    reject_unsafe_basetemp,\n'
     ')\n'
@@ -521,6 +522,14 @@ def _wiring_defects(source: str, conftest: Path) -> list[str]:
             '(pytest only collects fixtures bound into the conftest namespace, so '
             'the import IS the wiring)'
         )
+    if '_df_deploy_clocks_unwritten' not in imported:
+        defects.append(
+            'does not import _df_deploy_clocks_unwritten from df_pytest_isolation '
+            '(pytest only collects fixtures bound into the conftest namespace, so '
+            'the import IS the wiring) — without it this suite can stamp a REAL '
+            'deploy clock and suppress the watchdog staleness backstop for 8h '
+            '(task 3797)'
+        )
     if 'reject_unsafe_basetemp' not in imported:
         defects.append('does not import reject_unsafe_basetemp from df_pytest_isolation')
 
@@ -567,8 +576,10 @@ class TestEveryTestRootConftestIsWired:
             'Unwired test-root conftest(s). The verify lane runs '
             '`cd <subproject> && uv run pytest tests/`, so rootdir is the '
             'SUBPROJECT and the repo-root conftest.py is never loaded — a '
-            'conftest missing this wiring runs its whole suite with no basetemp '
-            'git ceiling (esc-3072-3).\n'
+            'conftest missing this wiring runs its whole suite with NEITHER '
+            'suite-wide defence: no basetemp git ceiling (esc-3072-3), and no '
+            'deploy-clock guard, so it can stamp a REAL deploy clock and '
+            'suppress the watchdog staleness backstop for 8h (task 3797).\n'
             f'Offenders: {offenders}\n'
             f'Add:\n{_WIRING_SNIPPET}'
         )
@@ -612,6 +623,7 @@ class TestEveryTestRootConftestIsWired:
             'if str(REPO_ROOT) not in sys.path:\n'
             '    sys.path.append(str(REPO_ROOT))\n'
             'from df_pytest_isolation import (\n'
+            '    _df_deploy_clocks_unwritten,\n'
             '    _df_git_ceiling_at_basetemp,\n'
             '    reject_unsafe_basetemp,\n'
             ')\n'
@@ -620,6 +632,33 @@ class TestEveryTestRootConftestIsWired:
         )
 
         assert _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py') == []
+
+    def test_the_detector_flags_a_conftest_missing_only_the_deploy_clock_guard(self) -> None:
+        """Self-test: the NEW rule is not vacuous on its own.
+
+        A conftest correctly wired for everything else must still be flagged
+        for the deploy-clock guard alone — otherwise the rule would only ever
+        fire alongside another defect and could be deleted without any test
+        noticing (task 3797).
+        """
+        sample = (
+            'import sys\n'
+            'from pathlib import Path\n'
+            'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
+            'if str(REPO_ROOT) not in sys.path:\n'
+            '    sys.path.append(str(REPO_ROOT))\n'
+            'from df_pytest_isolation import (\n'
+            '    _df_git_ceiling_at_basetemp,\n'
+            '    reject_unsafe_basetemp,\n'
+            ')\n'
+            'def pytest_configure(config):\n'
+            '    reject_unsafe_basetemp(config)\n'
+        )
+
+        defects = _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
+
+        assert [d for d in defects if '_df_deploy_clocks_unwritten' in d], defects
+        assert len(defects) == 1, f'only the deploy-clock rule should fire: {defects}'
 
     def test_the_detector_flags_an_insert_of_the_repo_root(self) -> None:
         """Self-test: the namespace-package hazard is pinned STRUCTURALLY.
@@ -633,6 +672,7 @@ class TestEveryTestRootConftestIsWired:
             'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
             'sys.path.insert(0, str(REPO_ROOT))\n'
             'from df_pytest_isolation import (\n'
+            '    _df_deploy_clocks_unwritten,\n'
             '    _df_git_ceiling_at_basetemp,\n'
             '    reject_unsafe_basetemp,\n'
             ')\n'
@@ -652,6 +692,7 @@ class TestEveryTestRootConftestIsWired:
             'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
             'sys.path.append(str(REPO_ROOT))\n'
             'from df_pytest_isolation import (\n'
+            '    _df_deploy_clocks_unwritten,\n'
             '    _df_git_ceiling_at_basetemp,\n'
             '    reject_unsafe_basetemp,\n'
             ')\n'

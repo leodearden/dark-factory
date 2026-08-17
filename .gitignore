@@ -58,7 +58,17 @@ coverage.xml
 # OverrideStore creates an SQLite DB at config.overrides_db_path; when
 # tests pass an unpatched MagicMock as config the stringified mock name
 # becomes the path, producing files like "<MagicMock name='...' id='...'>".
+# That is the str(mock)/repr shape, which always carries a leading "<".
+# A MagicMock is ALSO a valid os.PathLike[str]: os.fspath(mock) returns a
+# repr-derived string whose first component is a plain "MagicMock", with
+# no angle bracket, so code that coerces one with Path() and then calls
+# mkdir() materialises a real directory tree named MagicMock/ under the
+# CWD.  The pattern below cannot match that second shape, so it needs its
+# own entry.  Both are containment only — the real fix is to give the
+# test a genuine path (see orchestrator/tests/conftest.py's autouse
+# stray-artifact guard, which fails loudly on the directory shape).
 <MagicMock*
+MagicMock/
 
 # ── pytest scratch debris — `--basetemp` inside a checkout ───────────
 # An agent passing `pytest --basetemp=.pytest-tmp` (legal and expected —

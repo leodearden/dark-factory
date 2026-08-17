@@ -888,6 +888,14 @@ function MergeTab({ projectFilter }) {
             <HaltPill halt={d.halt} />
             <span className="pip"><span className="pip-dot" style={{ background: CP.accent }}></span>{d.latency.count} attempts</span>
             <span className="pip"><span className="pip-dot" style={{ background: CP.warn }}></span>{d.active.length} queued</span>
+            {/* The approximate-data warning belongs on the SUMMARY STRIP, not
+                inside the "Currently queued" panel: the strip renders whether
+                or not the group is collapsed AND regardless of
+                d.active.length, so the warning is now visible in exactly the
+                case that matters — orchestrator unreachable and the
+                event-derived fallback empty, where "0 queued" previously read
+                as a confident zero. */}
+            {d.active_approximate && <span className="badge warn">approx · event-derived</span>}
             <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{fmtMs(d.latency.p50)} p50</span>
             <span style={{ color: 'var(--fg-3)' }}>· {hitPct}% spec hit</span>
           </>
@@ -965,7 +973,9 @@ function MergeTab({ projectFilter }) {
                   <div className="col-span-6 panel">
                     <div className="panel-head">
                       <span className="title">Currently queued</span>
-                      {d.active_approximate && <span className="meta" style={{ color: 'var(--warn,#fbbf24)' }}>approx · event-derived</span>}
+                      {/* The approx · event-derived badge moved to the summary
+                          strip above — rendering it here too would double up
+                          the same warning whenever this panel is shown. */}
                     </div>
                     <div className="panel-body flush">
                       <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>State</th><th>Branch</th><th className="num">Age</th><th className="num">Pos</th><th>Waiter</th><th className="num">When</th></tr></thead>
@@ -1316,7 +1326,10 @@ function BurnTab({ projectFilter, displayWindow }) {
                         <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
                       ))}
                     </div>
-                    <SA labels={b.labels} stacks={[
+                    {/* Bands must be indexed by THIS project's own snapshot row: b.labels is
+                        the sorted union across all projects (redux_api.py shape_burndown), so
+                        pairing it with pb.* both overruns and index-shifts them. */}
+                    <SA labels={pb.labels} stacks={[
                       { key: 'done',        color: CP.ok,     values: pb.done },
                       { key: 'in_progress', color: CP.accent, values: pb.in_progress },
                       { key: 'blocked',     color: CP.bad,    values: pb.blocked },

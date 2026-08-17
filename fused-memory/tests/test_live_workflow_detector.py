@@ -22,6 +22,7 @@ from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     detect_live_workflow,
     has_live_workflow_corroboration,
+    is_pure_gate_metadata,
     is_workflow_live_for_task,
 )
 
@@ -754,6 +755,237 @@ class TestBlockedNormalOrchestratorSuppression:
             live = is_workflow_live_for_task(
                 _TASK_ID, str(tmp_path),
                 status='blocked', task_kind='normal', _orchestrator_live=True,
+            )
+
+        assert live is False
+
+
+# ---------------------------------------------------------------------------
+# Pure-gate metadata classifier (task 3751)
+# ---------------------------------------------------------------------------
+
+
+class TestIsPureGateMetadata:
+    """is_pure_gate_metadata identifies the DeterministicRunner PURE-GATE shape.
+
+    A pure gate is `always_escalates` truthy AND `before_done` absent/falsy — the
+    same two metadata fields DeterministicRunner itself branches on. Its whole
+    execution is "file one born-at-L2 escalation, stamp metadata.gate_escalated_at,
+    set status blocked": no script, no systemd, no git_ops. A truthy `before_done`
+    DISQUALIFIES the shape because that path runs a blocking deploy/predicate
+    script while the task's status is still 'pending'.
+
+    Fail-safe direction: only POSITIVE evidence of the shape returns True. Any
+    non-Mapping input (None, a string, an int, a list) returns False, so an
+    absent/unparseable metadata blob leaves the task live.
+    """
+
+    def test_always_escalates_alone_is_a_pure_gate(self):
+        """`always_escalates` truthy with `before_done` absent entirely => True.
+
+        This is dark_factory task 3845's exact metadata shape (verified by a
+        direct get_task read): no `before_done` key at all.
+        """
+        assert is_pure_gate_metadata({'always_escalates': True}) is True
+
+    def test_explicit_none_before_done_is_a_pure_gate(self):
+        """An explicit `before_done: None` is equivalent to the key being absent."""
+        assert is_pure_gate_metadata({'always_escalates': True, 'before_done': None}) is True
+
+    def test_truthy_before_done_disqualifies(self):
+        """A before_done deploy/predicate task is NOT a pure gate.
+
+        `Harness._run_deterministic_slot` never flips the task to 'in-progress',
+        so such a task stays 'pending' for the entire duration of a blocking
+        script run — recon must not treat it as provably-idle.
+        """
+        metadata = {
+            'always_escalates': True,
+            'before_done': {'kind': 'predicate', 'script': 'x.sh'},
+        }
+        assert is_pure_gate_metadata(metadata) is False
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            {'always_escalates': False},
+            {},
+            {'task_kind': 'deterministic'},
+        ],
+        ids=['always_escalates_false', 'empty', 'task_kind_only'],
+    )
+    def test_missing_or_falsy_always_escalates_is_not_a_pure_gate(self, metadata):
+        """Without truthy `always_escalates` there is no positive evidence of the shape."""
+        assert is_pure_gate_metadata(metadata) is False
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [None, 'not-a-dict', 42, []],
+        ids=['none', 'str', 'int', 'list'],
+    )
+    def test_non_mapping_input_is_not_a_pure_gate(self, metadata):
+        """Fail-safe toward live: anything that is not a Mapping returns False."""
+        assert is_pure_gate_metadata(metadata) is False
+
+    def test_truthiness_not_identity(self):
+        """A truthy-but-not-`True` value still qualifies.
+
+        Task metadata round-trips through JSON, so the classifier must use
+        truthiness rather than `is True`.
+        """
+        assert is_pure_gate_metadata({'always_escalates': 'true'}) is True
+
+
+# ---------------------------------------------------------------------------
+# Pending-deterministic pure-gate orchestrator_live suppression (task 3751)
+# ---------------------------------------------------------------------------
+
+
+class TestPendingDeterministicPureGateOrchestratorSuppression:
+    """detect_live_workflow(status='pending', task_kind='deterministic', pure_gate=True)
+    suppresses the project-wide orchestrator_live signal — rule 5, task 3751.
+
+    A PURE GATE (`always_escalates` truthy, `before_done` absent) never acquires a
+    worktree/branch and its whole DeterministicRunner run is "file escalation, stamp
+    gate_escalated_at, set blocked" — no script, no systemd, no git_ops. So the bare
+    project-wide orchestrator lock is not task-specific evidence for it while pending.
+
+    This is the direct sibling of TestBlockedDeterministicOrchestratorSuppression
+    (task 2067's blocked case) and is deliberately NARROWER than adding 'pending' to
+    ORCH_LIVE_INELIGIBLE_STATUSES: a pending deterministic task WITH `before_done`
+    may be mid-deploy inside DeterministicRunner (Harness._run_deterministic_slot
+    never flips it to 'in-progress'), and it has no git evidence to reveal that.
+    """
+
+    def _no_worktree_no_commit_side_effect(self):
+        """subprocess.run side_effect driving both git signals False."""
+        def side_effect(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout=_worktree_porcelain_no_branch(), stderr=''
+            )
+        return side_effect
+
+    def test_pending_deterministic_pure_gate_suppresses_orchestrator_signal(self, tmp_path):
+        """THE REGRESSION — status='pending' + deterministic + pure_gate forces
+        orchestrator_live False.
+
+        This is dark_factory task 3845's exact shape (verified first-hand:
+        `always_escalates=True` with no `before_done`), which stalled 3+ consecutive
+        reconciliation cycles showing ONLY the bare `orchestrator` signal. Both git
+        signals are False, so is_live=False proves the project-wide lock is not being
+        consulted at all for this combination.
+        """
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='pending', task_kind='deterministic', pure_gate=True,
+                _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is False
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+        assert result.is_live is False
+
+    def test_pending_deterministic_without_pure_gate_preserves_signal(self, tmp_path):
+        """NARROWING — pure_gate=False keeps the orchestrator signal for a pending
+        deterministic task.
+
+        Such a task carries a `before_done` deploy/predicate and may be mid-run inside
+        DeterministicRunner with zero git evidence to reveal it; recon must not race it.
+        """
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='pending', task_kind='deterministic', pure_gate=False,
+                _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    @pytest.mark.parametrize('task_kind', ['normal', None], ids=['normal', 'absent'])
+    def test_non_deterministic_task_kind_preserves_signal(self, tmp_path, task_kind):
+        """task_kind guard — rule 5 requires task_kind == 'deterministic'.
+
+        An ordinary pending task is dispatch-eligible, so the project-wide lock stays
+        real evidence for it regardless of any pure_gate value.
+        """
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='pending', task_kind=task_kind, pure_gate=True,
+                _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    @pytest.mark.parametrize('status', ['in-progress', 'review', 'merge-deferred'])
+    def test_non_pending_status_preserves_signal(self, tmp_path, status):
+        """status guard — only 'pending' joins 'blocked' for the deterministic rules."""
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status=status, task_kind='deterministic', pure_gate=True,
+                _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    def test_pure_gate_omitted_is_inert(self, tmp_path):
+        """DEFAULT INERTNESS — omitting pure_gate entirely preserves today's behavior.
+
+        Byte-for-byte backward compatibility for every existing caller that does not
+        pass the new kwarg.
+        """
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='pending', task_kind='deterministic', _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    def test_pure_gate_does_not_suppress_worktree_signal(self, tmp_path):
+        """PER-TASK EVIDENCE WINS — a pending pure gate with a REGISTERED worktree is
+        still live, even though the bare orchestrator signal is suppressed.
+
+        Mirrors task 2067's test_blocked_deterministic_does_not_suppress_worktree_signal.
+        This is also what satisfies the "never dispatched / no worktree ever created"
+        framing without needing a separate branch-absence condition.
+        """
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0,
+                    stdout=_worktree_porcelain_with_branch(_BRANCH), stderr=''
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout='', stderr=''
+            )
+
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path),
+                status='pending', task_kind='deterministic', pure_gate=True,
+                _orchestrator_live=True,
+            )
+
+        assert result.orchestrator_live is False
+        assert result.worktree_registered is True
+        assert result.is_live is True
+
+    def test_is_workflow_live_for_task_forwards_pure_gate(self, tmp_path):
+        """is_workflow_live_for_task forwards pure_gate through **kwargs."""
+        with patch('subprocess.run', side_effect=self._no_worktree_no_commit_side_effect()):
+            live = is_workflow_live_for_task(
+                _TASK_ID, str(tmp_path),
+                status='pending', task_kind='deterministic', pure_gate=True,
+                _orchestrator_live=True,
             )
 
         assert live is False

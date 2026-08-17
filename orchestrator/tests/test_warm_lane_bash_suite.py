@@ -133,12 +133,20 @@ SCRIPT_COVERAGE = {
 #: satisfies ``REQUIRED_HOST_TOOLS``: X-degrade reaches the bridge's degrade
 #: branch by RELOCATING a copy of gc.sh (its resolved repo root then carries no
 #: dark-factory checkout), which needs no python3 and no network.
+#:
+#: Dark-factory task 3655 then added the gc-SWEEP suite's Block Y — the first
+#: assertions anywhere to inspect the protect glob that 3292's bridge-cost pin
+#: short-circuits — so that floor moved 86 → 90.  RE-MEASURED against the suite
+#: (``Results: 90 passed, 0 failed``), not raised to absorb a red.  Block Y needs
+#: no python3: its whole point is that the pin prevents the render, and it is
+#: NON-VACUOUS by construction — removing the pin from ``run_sweep`` flips Y2/Y3
+#: to ``88 passed, 2 failed`` (task 3655's negative control).
 ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 62,
     'test_warm_lane_degenerate_ref.sh': 70,
     'test_thin_warm_lane.sh': 45,
     'test_warm_lane_gc.sh': 214,  # 198 + 16 (Block X: X-band 7 + X-degrade 9)
-    'test_warm_lane_gc_sweep.sh': 86,
+    'test_warm_lane_gc_sweep.sh': 90,  # 86 + 4 (Block Y: bridge-cost seam contract)
     'test_warm_lane_audit.sh': 225,  # 228 measured − 3 (L9, root-guarded)
     'test_warm_lane_sizing_lifecycle.sh': 65,
     'test_provision_warm_lane_fs.sh': 106,  # 111 measured − 5 (Block I, xfsprogs)

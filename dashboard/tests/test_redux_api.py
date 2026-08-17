@@ -798,6 +798,155 @@ def test_shape_burndown_completed_ignores_snapshot_frequency():
     assert body['BURNDOWN']['velocity'] == 0.0
 
 
+# --- divergent per-project label rows -------------------------------------
+#
+# The three tests above all give every project an IDENTICAL label row (or use a
+# single project), which is exactly why the tabs.jsx mispairing of the aggregate
+# union row with per-project values was invisible to the suite.  These pin the
+# shape contract the consumer-side fix rests on, using divergent rows.
+
+_DIVERGENT_SERIES = {
+    'p1': {
+        'labels': ['2026-05-20T00:00:00', '2026-05-22T00:00:00'],
+        'done': [3, 7], 'in_progress': [1, 2], 'blocked': [0, 1], 'pending': [10, 6],
+    },
+    'p2': {
+        'labels': ['2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00'],
+        'done': [100, 200, 300], 'in_progress': [10, 20, 30],
+        'blocked': [1, 2, 3], 'pending': [50, 40, 30],
+    },
+}
+
+_BURNDOWN_SERIES_KEYS = ('done', 'in_progress', 'blocked', 'pending')
+
+
+def test_shape_burndown_per_project_labels_are_that_projects_own_row():
+    """Each per-project block keeps its OWN snapshot row, not the union.
+
+    Passes against current server code — this is a regression pin, not a RED
+    step.  It fires if a future change densifies per-project rows onto the
+    union row, which would silently re-break the tabs.jsx consumer.
+    """
+    body = redux_api.shape_burndown(_DIVERGENT_SERIES)
+
+    assert body['BURNDOWN_BY_PROJECT']['p1']['labels'] == [
+        '2026-05-20T00:00:00', '2026-05-22T00:00:00',
+    ]
+    assert body['BURNDOWN_BY_PROJECT']['p2']['labels'] == [
+        '2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00',
+    ]
+    # The aggregate carries the sorted union — strictly longer than p1's row.
+    assert body['BURNDOWN']['labels'] == [
+        '2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00',
+    ]
+    assert len(body['BURNDOWN']['labels']) > len(body['BURNDOWN_BY_PROJECT']['p1']['labels'])
+
+
+def test_shape_burndown_per_project_series_are_co_length_with_own_labels():
+    """shape_burndown PRESERVES the co-length of each project's own row.
+
+    Passes against current server code — a regression pin.  Note what it does
+    and does not say: co-length is established UPSTREAM by get_burndown_series,
+    which appends one value per key per snapshot row, and shape_burndown copies
+    each block verbatim rather than normalizing it.  So this pins that the copy
+    does not re-align or truncate anything, not that shape_burndown would
+    repair a ragged input — see
+    test_shape_burndown_ragged_input_is_passed_through_unnormalized for the
+    contract on that.
+
+    Given a co-length input, this is the invariant that makes `labels={pb.labels}`
+    sound at the tabs.jsx consumer: a per-project block is internally co-indexed,
+    so it needs no hole semantics.  Densifying these onto the union row would
+    require making deriveVelocitySeries, the summary-table last-value reads, and
+    compute_window_completion hole-aware first.
+    """
+    body = redux_api.shape_burndown(_DIVERGENT_SERIES)
+
+    for pid, block in body['BURNDOWN_BY_PROJECT'].items():
+        for key in _BURNDOWN_SERIES_KEYS:
+            assert len(block[key]) == len(block['labels']), (
+                f'{pid}.{key} has {len(block[key])} values for '
+                f'{len(block["labels"])} labels'
+            )
+
+
+def test_shape_burndown_aggregate_series_are_co_length_with_union_labels():
+    """Aggregate series are densified onto the union row by label, not position.
+
+    Passes against current server code — a regression pin.  The spot-check on
+    2026-05-21 (reported only by p2) is what distinguishes label-indexed
+    densification from a positional sum, which would fold p1's 05-22 values
+    into the 05-21 slot.
+    """
+    body = redux_api.shape_burndown(_DIVERGENT_SERIES)
+    agg = body['BURNDOWN']
+    n = len(agg['labels'])
+
+    for key in _BURNDOWN_SERIES_KEYS:
+        assert len(agg[key]) == n, f'aggregate {key} has {len(agg[key])} values for {n} labels'
+
+    mid = agg['labels'].index('2026-05-21T00:00:00')
+    # Only p2 reported this timestamp, so the aggregate is p2's value alone.
+    assert agg['done'][mid] == 200
+    assert agg['pending'][mid] == 40
+    # Timestamps both projects reported sum across them.
+    assert agg['done'][agg['labels'].index('2026-05-20T00:00:00')] == 103   # 3 + 100
+    assert agg['done'][agg['labels'].index('2026-05-22T00:00:00')] == 307   # 7 + 300
+
+
+def test_shape_burndown_ragged_input_is_passed_through_unnormalized():
+    """A ragged upstream row survives into BURNDOWN_BY_PROJECT unchanged.
+
+    shape_burndown neither normalizes nor rejects a block whose series are not
+    co-length with its labels — it copies them verbatim.  Ragged input is
+    reachable in principle (compute_window_completion and
+    compute_forecast_confidence both treat a length mismatch as a bail-out
+    condition rather than an impossibility), so this pins what actually
+    happens today rather than leaving it to be rediscovered:
+
+      * the per-project block stays ragged (labels 3, done 2), so the co-length
+        property the tabs.jsx `labels={pb.labels}` pairing relies on comes from
+        get_burndown_series upstream, NOT from this function;
+      * completed / velocity / window_days are zeroed and the forecast is None,
+        because both helpers bail out on the mismatch;
+      * the aggregate densification, which zips labels against values with
+        strict=False, silently reads the missing tail as 0 — indistinguishable
+        from a genuine 0 measurement.
+
+    If a future change makes shape_burndown normalize (pad/truncate) or raise
+    on ragged input, that is a deliberate contract change and this test should
+    be updated to the new behaviour, not deleted.
+    """
+    body = redux_api.shape_burndown({
+        'p1': {
+            'labels': [
+                '2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00',
+            ],
+            'done': [3, 7],  # ragged: one short of its own label row
+            'in_progress': [1, 2, 3], 'blocked': [0, 0, 0], 'pending': [10, 9, 8],
+        },
+    })
+
+    block = body['BURNDOWN_BY_PROJECT']['p1']
+    assert len(block['labels']) == 3
+    assert block['done'] == [3, 7]          # verbatim — not padded, not truncated
+    assert block['in_progress'] == [1, 2, 3]
+    assert block['completed'] == 0
+    assert block['velocity'] == 0.0
+    assert block['window_days'] == 0
+    assert block['forecast_low'] is None
+    assert block['forecast_high'] is None
+
+    agg = body['BURNDOWN']
+    assert agg['labels'] == [
+        '2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00',
+    ]
+    # The unreported third slot reads as 0, not as a hole.
+    assert agg['done'] == [3, 7, 0]
+    assert agg['in_progress'] == [1, 2, 3]
+    assert agg['completed'] == 0            # sum of per-project completeds
+
+
 # ---------------------------------------------------------------------------
 # shape_escalations
 # ---------------------------------------------------------------------------
@@ -1007,6 +1156,110 @@ class TestShapeEscalations:
         queues = {'subsections': [], 'summary': top_summary}
         body = redux_api.shape_escalations(queues=queues, task_maps={})
         assert body['ESCALATIONS']['summary'] == top_summary
+
+    def test_shape_escalations_carries_subsection_skipped(self):
+        """The per-subsection ``skipped`` list reaches the shaped payload.
+
+        The out_subsections loop rebuilds each subsection field-by-field, so a
+        new key on build_escalation_queues' output is dropped unless the loop
+        names it.  Without this the corruption facts stop at the data layer and
+        the tab renders one escalation short with nothing saying so (INV-2).
+        """
+        skipped = [{
+            'path': '/p/projA/data/escalations/esc-bad.json',
+            'error': 'Expecting value: line 1 column 1',
+        }]
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [],
+            'skipped': skipped,
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+        out = body['ESCALATIONS']['subsections'][0]
+
+        assert 'skipped' in out, (
+            "shape_escalations must carry `skipped` into the shaped subsection — "
+            'add it to the out_subsections dict beside `summary`'
+        )
+        assert out['skipped'] == skipped
+        assert len(out['skipped']) == 1
+        assert set(out['skipped'][0].keys()) == {'path', 'error'}
+
+    def test_shape_escalations_skipped_defaults_to_empty_list(self):
+        """A subsection with no ``skipped`` key shapes to ``[]``, never None.
+
+        Defensive against a stale or partial upstream dict: the JSX iterates the
+        list unconditionally, so a missing key must not become ``undefined``.
+        """
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [],
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+        out = body['ESCALATIONS']['subsections'][0]
+        assert out['skipped'] == []
+
+        # An explicit None must degrade the same way.
+        subsection_none = {**subsection, 'skipped': None}
+        queues_none = {'subsections': [subsection_none], 'summary': _EMPTY_SUMMARY}
+        body_none = redux_api.shape_escalations(queues=queues_none, task_maps={})
+        assert body_none['ESCALATIONS']['subsections'][0]['skipped'] == []
+
+    def test_shape_escalations_carries_skipped_count_both_levels(self):
+        """``summary.skipped_count`` survives at BOTH nesting levels.
+
+        Regression pin: the summary blocks pass through by ``dict(...)`` copy
+        today, so this already holds — it exists so a future field-by-field
+        rewrite of a summary block cannot silently drop the count the way the
+        subsection loop drops ``skipped``.
+        """
+        sub_summary = {**_EMPTY_SUMMARY, 'skipped_count': 2}
+        top_summary = {**_EMPTY_SUMMARY, 'skipped_count': 3}
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [],
+            'skipped': [],
+            'summary': sub_summary,
+        }
+        queues = {'subsections': [subsection], 'summary': top_summary}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+
+        assert body['ESCALATIONS']['subsections'][0]['summary']['skipped_count'] == 2
+        assert body['ESCALATIONS']['summary']['skipped_count'] == 3
+
+    def test_shape_escalations_skipped_does_not_alias_input(self):
+        """The shaped ``skipped`` list and its records are copies, not aliases.
+
+        Matches the shaper's existing no-alias discipline: mutating the shaped
+        payload must not reach back into build_escalation_queues' output.
+        """
+        entry = {'path': '/p/projA/data/escalations/esc-bad.json', 'error': 'boom'}
+        skipped = [entry]
+        subsection = {
+            'id': '/p/projA',
+            'label': 'projA',
+            'kind': 'orchestrator',
+            'escalations': [],
+            'skipped': skipped,
+            'summary': _EMPTY_SUMMARY,
+        }
+        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
+        body = redux_api.shape_escalations(queues=queues, task_maps={})
+        out_skipped = body['ESCALATIONS']['subsections'][0]['skipped']
+
+        assert out_skipped is not skipped, 'shaped list must be a distinct object'
+        assert out_skipped[0] is not entry, 'each shaped record must be a copy'
+        assert out_skipped[0] == entry
 
 
 # ---------------------------------------------------------------------------

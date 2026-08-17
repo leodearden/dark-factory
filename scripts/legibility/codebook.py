@@ -11,6 +11,7 @@ append-only, never-delete.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
 import os
@@ -533,7 +534,7 @@ def validate_coding_record(record: dict) -> list[str]:
 
 def load(path: str | os.PathLike) -> dict:
     """Load a codebook YAML file into a plain dict via yaml.safe_load."""
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -574,10 +575,8 @@ def dump(codebook: dict, path: str | os.PathLike) -> None:
             f.write(body)
         os.replace(tmp_file, path)
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(tmp_file)
-        except OSError:
-            pass
         raise
 
 
@@ -684,7 +683,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         "malformed_json": 0,
     }
 
-    with open(args.records, "r", encoding="utf-8") as f:
+    with open(args.records, encoding="utf-8") as f:
         for lineno, raw_line in enumerate(f, start=1):
             line = raw_line.strip()
             if not line:

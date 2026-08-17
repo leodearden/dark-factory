@@ -1125,3 +1125,116 @@ class TestEscalationDedupeFingerprint:
         assert esc_b.dedupe_fingerprint is None, (
             'Setting dedupe_fingerprint on one instance must not affect another'
         )
+
+
+class TestCrossLevelDedupeIsolation:
+    """find_dedupe_parent never folds a candidate into a parent at a DIFFERENT level.
+
+    Task 3236: once ``escalate_blocker(level=1)`` became filable, a steward's
+    level-1 re-escalation of an ``infra_issue`` — the single category in
+    ``DedupeConfig.infra_dedupe_categories`` — would otherwise fold straight
+    back into the pending level-0 record it was handling, and be swallowed
+    again by a new mechanism.  An L1 carries ``severity='blocking'``, so it
+    does NOT take the born-at-L2 dedupe bypass in ``server._submit_or_dedupe``
+    and does route through this matcher.
+
+    Cross-level folding is never correct regardless of this task: the levels
+    have different consumers by contract (models.py module header), so
+    collapsing an L1 into an L0 parent hands the record to the wrong consumer.
+    """
+
+    def _make_infra_esc(self, esc_id: str, level: int = 0, task_id: str = '42'):
+        from escalation.models import Escalation
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+            level=level,
+        )
+
+    def test_l1_candidate_does_not_fold_into_l0_parent(self, tmp_path):
+        """Same category + same summary key, different level -> no parent match."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-42-1', level=0))
+
+        candidate = self._make_infra_esc('esc-42-2', level=1)
+        now = datetime.now(UTC) + timedelta(seconds=5)
+
+        assert find_dedupe_parent(queue, candidate, DedupeConfig(), now=now) is None
+
+    def test_l0_candidate_does_not_fold_into_l1_parent(self, tmp_path):
+        """The converse direction is equally isolated (L0 candidate, L1 parent)."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-42-1', level=1))
+
+        candidate = self._make_infra_esc('esc-42-2', level=0)
+        now = datetime.now(UTC) + timedelta(seconds=5)
+
+        assert find_dedupe_parent(queue, candidate, DedupeConfig(), now=now) is None
+
+    def test_submit_or_dedupe_queues_l1_beside_pending_l0(self, tmp_path):
+        """End-to-end: the L1 gets its OWN record, not a dedup_skipped fold.
+
+        This is the swallow the level=1 fix would otherwise open.
+        """
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-42-1', level=0)
+        queue.submit(parent)
+
+        candidate = self._make_infra_esc('esc-42-2', level=1)
+        result = submit_or_dedupe(queue, candidate, DedupeConfig())
+
+        assert result['status'] == 'queued', f'Expected a fresh record, got: {result}'
+        assert result['id'] == 'esc-42-2', f'Expected a fresh id, got: {result}'
+        persisted = queue.get('esc-42-2')
+        assert persisted is not None
+        assert persisted.level == 1
+        # The L0 parent must be untouched — no child attached to it.
+        l0 = queue.get('esc-42-1')
+        assert l0 is not None
+        assert l0.dedupe_count == 0, f'L0 parent absorbed the L1: {l0.dedupe_children}'
+
+    def test_same_level_infra_candidates_still_fold(self, tmp_path):
+        """CONTROL: existing same-level dedupe behaviour is provably unbroken."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-42-1', level=0))
+
+        candidate = self._make_infra_esc('esc-42-2', level=0)
+        result = submit_or_dedupe(queue, candidate, DedupeConfig())
+
+        assert result['status'] == 'dedup_skipped', f'Expected a fold, got: {result}'
+        assert result['parent_id'] == 'esc-42-1'
+        assert result['child_id'] == 'esc-42-2'
+
+    def test_same_level_l1_candidates_still_fold(self, tmp_path):
+        """CONTROL: the new condition is level EQUALITY, not 'level 0 only'."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-42-1', level=1))
+
+        candidate = self._make_infra_esc('esc-42-2', level=1)
+        result = submit_or_dedupe(queue, candidate, DedupeConfig())
+
+        assert result['status'] == 'dedup_skipped', f'Expected a fold, got: {result}'
+        assert result['parent_id'] == 'esc-42-1'

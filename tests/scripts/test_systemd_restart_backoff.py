@@ -20,7 +20,6 @@ import pathlib
 import subprocess
 
 import pytest
-
 from systemd_unit_invariants import (
     assert_restart_backoff_effective,
     restart_directive,
@@ -82,6 +81,7 @@ _EXPECTED_SWEPT_PATHS = frozenset(
         "scripts/orchestrator-dark-factory.service",
         "scripts/orchestrator-know-live.service",
         "scripts/orchestrator-my-solar-challenge.service",
+        "scripts/orchestrator-pump-web-ui.service",
         "scripts/orchestrator-reify.service",
         "scripts/orchestrator-solar-challenge-platform.service",
     }

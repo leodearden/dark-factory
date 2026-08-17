@@ -146,9 +146,23 @@ class TestEnvTransientNonMisattributionWiring:
         """env_transient is non-deterministic to re-probe on main (like infra_timeout)."""
         assert 'env_transient' in verify.PREEXISTING_BREAK_SKIP_CATEGORIES
 
-    def test_env_transient_not_archived(self):
-        """env_transient is infra, not human-triage-worthy — must not be archived."""
-        assert verify._should_archive_category('env_transient') is False
+    def test_env_transient_archived_for_human_triage(self):
+        """env_transient IS archived, since task 3683.
+
+        This test previously asserted False on "env_transient is infra, not
+        human-triage-worthy". The audit found infra and human-triage-worthy
+        are not exclusive here: the ENV_SERIAL retry is a SINGLE bounded
+        re-run (verify.py:5221-5233) that per task 3367 fires only when the
+        TEST leg failed, so a lint/type env_transient gets no retry at all —
+        and past it, workflow.py:9020's default-5-attempt window stamps
+        escalate_to_human=True / category='infra_issue' on exhaustion
+        (:9060-9067) and files a blocking level-1 escalation (:14791).
+        Archival is decided per attempt from the category alone
+        (verify.py:1902), so archive=False discarded the log on the attempt
+        that hands the incident to a human too. See
+        TestEnvTransientArchivesForHumanTriage in test_verify_categories.py.
+        """
+        assert verify._should_archive_category('env_transient') is True
 
     def test_env_transient_ranked_above_test_failure_in_category_priority(self):
         """env_transient must outrank test_failure in the severity list."""

@@ -45,11 +45,11 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any
 
 from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
 from fused_memory.reconciliation.task_filter import INACTIVE_TASK_STATUSES
+from fused_memory.utils.validation import is_full_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -58,14 +58,6 @@ logger = logging.getLogger(__name__)
 # `task_interceptor.update_task`'s `is_recon_stage_write` predicate. (Symbol
 # names, not file:line refs, on purpose: line numbers rot within a release.)
 REPOINT_AGENT_ID = 'recon-stage-memory_consolidator'
-
-# Canonical 36-char UUID, the ONLY shape accepted as a forwarding pointer.
-# Anchored end-to-end so a uuid embedded in prose does not qualify: a
-# replacement value must BE an id, not merely mention one.
-_CANONICAL_UUID_RE = re.compile(
-    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
-    r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-)
 
 # Tier-C (``x_``) metadata key holding the old->new forwarding records. The
 # ``x_`` namespace is silently admitted by ``shared.task_metadata.parse_metadata``
@@ -430,7 +422,11 @@ def is_concrete_memory_id(value: Any) -> bool:
     hazard the Stage-1 prompt already warns about: an 8-char prefix is not a
     valid delete id and is not a valid forwarding pointer either.
     """
-    return isinstance(value, str) and bool(_CANONICAL_UUID_RE.match(value))
+    # Shape comes from the ONE shared predicate (task 3132, INV-5); the
+    # isinstance check folds in, since is_full_uuid already rejects non-str.
+    # It also rejects a value that merely mentions a uuid in prose, and — unlike
+    # the anchored regex this replaced — one with a trailing newline.
+    return is_full_uuid(value)
 
 
 def build_citation_tombstone(

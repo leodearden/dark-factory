@@ -3520,6 +3520,91 @@ class TestMarkBlockedStewardOutcomeRouting:
             "'steward failed')"
         )
 
+    async def test_steward_l1_reescalation_survives_the_wip_l0_sweep(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Task 3236 SIGNAL, end-to-end against a REAL EscalationQueue.
+
+        A steward that cannot resolve an L0 itself re-escalates with
+        ``escalate_blocker(level=1)``.  That filing must survive the task-2060
+        resume-plan sweep, which dismisses every pending level-0 record —
+        including the one ``_mark_blocked`` files itself.  The L1 survives BY
+        CONSTRUCTION (the sweep is level=0-scoped), with no ``agent_role``
+        predicate to defeat.
+
+        Also pins the two properties that make the L1 the CORRECT durable
+        destination rather than merely a surviving one:
+        ``_is_gating_escalation`` is False for it (so the resumed run is handed
+        off without being gated), and ``classify_pins`` routes it to
+        QUEUE_HANDOFF (so it pins the task independently of the filer's
+        liveness — the durability the incident lacked).
+        """
+        from escalation.pins import PinClass, classify_pins
+        from escalation.server import create_server
+        from fastmcp.tools.function_tool import FunctionTool
+
+        from orchestrator.workflow import _is_gating_escalation
+
+        workflow, scheduler, queue = await self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        task_id = task_assignment.task_id
+
+        # The steward re-escalates through the real MCP tool, as it would.
+        # ``get_tool`` is typed ``Tool | None`` and the base ``Tool`` declares
+        # no ``.fn``, so narrow to ``FunctionTool`` before the standard
+        # ``tool.fn`` unit-test call (test_merge_queue.py:11854's convention).
+        server = create_server(queue)
+        blocker = await server.get_tool('escalate_blocker')
+        assert isinstance(blocker, FunctionTool)
+        filed = await blocker.fn(
+            task_id=task_id,
+            agent_role='steward',
+            category='infra_issue',
+            summary='cannot resolve L0 myself — handing to a human',
+            severity='blocking',
+            level=1,
+        )
+        assert 'error' not in filed, f'level=1 filing rejected: {filed}'
+        assert filed['level'] == 1, f'Requested level did not land: {filed}'
+        l1_id = filed['id']
+
+        workflow._await_steward_completion = AsyncMock(
+            return_value=StewardInterrupted(
+                reason='timeout', wip_commits_present=True,
+            ),
+        )
+
+        outcome = await workflow._mark_blocked('synthetic failure')
+
+        assert outcome == WorkflowOutcome.REQUEUED, (
+            f'Expected REQUEUED (resume-plan) when wip is present, got {outcome!r}'
+        )
+        # The level-0 record _mark_blocked filed itself IS swept ...
+        assert not queue.get_by_task(task_id, status='pending', level=0), (
+            'The L0 _mark_blocked submitted must be dismissed, not left pending'
+        )
+        # ... while the steward's level-1 re-escalation survives.
+        surviving = queue.get(l1_id)
+        assert surviving is not None, f'{l1_id} vanished from the queue'
+        assert surviving.status == 'pending', (
+            f'The steward L1 re-escalation was swallowed: status='
+            f'{surviving.status!r}, resolution={surviving.resolution!r}'
+        )
+        assert surviving.level == 1
+
+        # Non-gating: the resumed run is handed off, not gated.
+        assert not _is_gating_escalation(surviving), (
+            'A plain blocking L1 must not gate the resumed run'
+        )
+        # Pinning: durable regardless of the filer's liveness.
+        report = classify_pins(task_id, [surviving], live_claimant=False)
+        assert l1_id in report.queue_handoff, (
+            f'L1 must pin via QUEUE_HANDOFF, got {report!r}'
+        )
+        assert report.pins, 'A live handoff must pin the task'
+        assert PinClass.QUEUE_HANDOFF.value == 'queue_handoff'
+
     async def test_interrupted_without_wip_blocks_with_l1(
         self, config, git_ops, task_assignment, tmp_path,
     ):
@@ -5766,10 +5851,22 @@ class TestAmendmentUncommittedWorkGuard:
 
 
 @pytest.mark.asyncio
+# Task 3536 (γ₁): the merge-entry gate now parks the row through
+# _mark_blocked instead of returning a steward-less ESCALATED, so this class
+# drives the workflow to BLOCKED and must opt into the dry-run-unblock mock.
+@pytest.mark.mocks_dry_run_unblock
 class TestMergePhaseEscalationGate:
     """Fix 3: Defense-in-depth gate at MERGE entry.  A blocking L0 escalation
     queued during execute/verify/review (from any code path — including
     future ones not currently checked) must gate the merge.
+
+    Task 3536 (γ₁, PRD boundary #1/#2) changed what happens AFTER the gate
+    fires: rather than a bare ``return WorkflowOutcome.ESCALATED`` with no
+    steward, no wait and no task-status write (the spec-E1 strand), the gate
+    now enters the shared bounded ESCALATED machinery.  A blocking L0 is
+    steward-resolvable, so this test wires a steward and pins the disposition
+    that machinery produces — the merge is still never attempted, which is
+    this class's whole point.
     """
 
     async def test_pending_l0_blocks_merge(
@@ -5778,9 +5875,20 @@ class TestMergePhaseEscalationGate:
         from escalation.models import Escalation
 
         stub = AgentStub()
-        workflow, _, queue = _build_workflow_with_escalation(
+        workflow, scheduler, queue = _build_workflow_with_escalation(
             config, git_ops, task_assignment, stub, tmp_path,
         )
+
+        # Shrink the ESCALATED-wait window BEFORE run().  BOTH terms must be
+        # shrunk: the wait is bounded by the DERIVED
+        # ``timeouts.steward + steward_completion_timeout`` sum, so leaving
+        # timeouts.steward at its stock 1800s would give this test a 2100s
+        # window (see test_workflow_escalated_steward_stall.py:91-118).  The
+        # steward below clears the L0 before the wait loop ever blocks, so the
+        # window is not expected to be ridden at all — this is the belt to the
+        # asyncio.wait_for braces below, not the mechanism under test.
+        config.steward_completion_timeout = 0.5
+        config.timeouts.steward = 0.5
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
@@ -5809,15 +5917,29 @@ class TestMergePhaseEscalationGate:
             return WorkflowOutcome.DONE
         workflow._execute_verify_review_loop = _exec_and_escalate  # type: ignore[method-assign]
 
-        outcome = (await workflow.run()).outcome
+        # A steward that handles the L0 and hands off to a human — the real
+        # ``TaskSteward._auto_escalate_to_human`` shape.  It clears the L0 and
+        # leaves an L1 open, so _wait_for_resolution's tail raises
+        # _StewardReescalated and the gate parks the row instead of merging.
+        workflow._steward_factory = _make_resolve_then_dismiss_chained_steward(
+            queue, task_assignment.task_id,
+        )
 
-        # MERGE-phase gate must intercept before submitting to the queue.
-        assert outcome == WorkflowOutcome.ESCALATED
-        # The escalation is still pending (not consumed by the gate).
+        # Guard: a regression to an unbounded merge-entry wait must fail
+        # loudly here rather than hang CI.
+        outcome = (await asyncio.wait_for(workflow.run(), 60)).outcome
+
+        # MERGE-phase gate must intercept before submitting to the queue, and
+        # write the row before returning (spec S1 — no strand).
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses.get(task_assignment.task_id, [])[-1:] == ['blocked']
+        # The gating L0 was adjudicated, not left orphaned: nothing pending at
+        # level 0 survives to re-strand the next entry on the same record.
         pending = queue.get_by_task(
             task_assignment.task_id, status='pending', level=0,
         )
-        assert len(pending) == 1
+        assert pending == []
+        assert queue.has_open_l1(task_assignment.task_id)
 
 
 @pytest.mark.asyncio
@@ -6087,13 +6209,24 @@ class TestBornAtL2GatesPostDebugger:
 
 
 @pytest.mark.asyncio
+# Task 3536 (γ₁): see TestMergePhaseEscalationGate — the merge-entry gate now
+# reaches BLOCKED via _mark_blocked, so this class opts in too.
+@pytest.mark.mocks_dry_run_unblock
 class TestBornAtL2GatesMergeEntry:
     """task γ / C7: A born-at-L2 escalation (critical, level=2) pending at
-    MERGE entry must cause ``run()`` to return ESCALATED before merge starts.
+    MERGE entry must stop ``run()`` before merge starts.
 
     RED pre-impl: the old inline predicate (severity=='blocking' and level==0)
     ignores critical/level-2, so run() proceeds past the gate and the stubbed
     _execute_verify_review_loop returns DONE.
+
+    Task 3536 (γ₁, PRD boundary #2) changed the gate's DISPOSITION, not what
+    gates: instead of a bare ``return WorkflowOutcome.ESCALATED`` with no
+    steward and no task-status write (the spec-E1 strand — the harness slot
+    then nulled the claimant while the row stayed ``in-progress``), the gate
+    enters the shared bounded ESCALATED machinery.  A born-at-L2 record trips
+    ``_wait_for_resolution``'s stop-the-line short-circuit before the wait
+    loop, so the outcome is BLOCKED with the row written first.
     """
 
     async def test_critical_l2_blocks_merge_entry(
@@ -6102,7 +6235,7 @@ class TestBornAtL2GatesMergeEntry:
         from escalation.models import Escalation
 
         stub = AgentStub()
-        workflow, _, queue = _build_workflow_with_escalation(
+        workflow, scheduler, queue = _build_workflow_with_escalation(
             config, git_ops, task_assignment, stub, tmp_path,
         )
 
@@ -6132,10 +6265,16 @@ class TestBornAtL2GatesMergeEntry:
             return WorkflowOutcome.DONE
         workflow._execute_verify_review_loop = _exec_and_escalate  # type: ignore[method-assign]
 
-        outcome = (await workflow.run()).outcome
+        # The stop-the-line short-circuit fires BEFORE _wait_for_resolution's
+        # wait loop, so no steward window is ridden; the guard makes a
+        # regression that DOES wait fail loudly instead of hanging CI on this
+        # module's stock (unshrunk) timeouts.steward.
+        outcome = (await asyncio.wait_for(workflow.run(), 60)).outcome
 
-        # MERGE-phase gate must intercept before merge is attempted.
-        assert outcome == WorkflowOutcome.ESCALATED
+        # MERGE-phase gate must intercept before merge is attempted, and park
+        # the row before returning (spec S1 — no strand).
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses.get(task_assignment.task_id, [])[-1:] == ['blocked']
         # The escalation is still pending — the gate does not consume it.
         pending = queue.get_by_task(
             task_assignment.task_id, status='pending', level=2,

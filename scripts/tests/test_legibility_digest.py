@@ -21,17 +21,16 @@ no package __init__ needed).
 """
 from __future__ import annotations
 
-import gzip
-import io
 import json
 import logging
 import re
-import zlib
 
 import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
+from orchestrator.agents.briefing import MEMORY_CONTEXT_CAVEAT
+from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT
 
 
 def _assistant(*blocks):
@@ -116,12 +115,12 @@ def _write_jsonl(tmp_path, records):
     return path
 
 
-def _write_jsonl_gz(tmp_path, records, name='transcript.jsonl.gz'):
-    """Serialize *records* gzip-compressed to ``<tmp_path>/<name>``; return its
-    Path. Mirrors the on-disk form of an archived fleet session produced by
-    ``shared.transcript_archive`` (``<sid>.jsonl.gz``)."""
+def _write_archived_jsonl(tmp_path, records, name='archived.jsonl'):
+    """Serialize *records* to ``<tmp_path>/<name>``; return its Path.
+    Mirrors the on-disk form of an archived fleet session produced by
+    ``shared.transcript_archive`` (``<sid>.jsonl``, a verbatim copy)."""
     path = tmp_path / name
-    with gzip.open(path, 'wt', encoding='utf-8') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         for r in records:
             f.write(json.dumps(r))
             f.write('\n')
@@ -130,82 +129,26 @@ def _write_jsonl_gz(tmp_path, records, name='transcript.jsonl.gz'):
 
 # ---------------------------------------------------------------------------
 # Corruption scaffolding for the file-level contract tests below. A near-copy
-# of the pair in test_legibility_inventory.py, deliberately: pytest runs here
+# of the helper in test_legibility_inventory.py, deliberately: pytest runs here
 # under --import-mode=importlib (pyproject.toml), which does not make sibling
 # test modules importable by bare name, and scripts/tests/conftest.py is a
 # sys.path bootstrap with no fixtures. The coupling that matters — that both
 # readers answer the same way — is asserted directly by
-# TestLoadTranscriptCorruptionShapes.test_both_readers_agree_on_a_truncated_file
+# TestLoadTranscriptCorruptionShapes.test_both_readers_agree_on_an_undecodable_file
 # rather than implied by a shared helper.
 # ---------------------------------------------------------------------------
-
-def _gz_payload(n_records: int = 200) -> bytes:
-    """Serialize a multi-record JSONL body — the payload the helpers below
-    compress and then damage. Many padded records so a cut at the halfway
-    mark lands mid-stream rather than inside the 10-byte header."""
-    return ''.join(
-        json.dumps({'type': 'user', 'seq': i, 'pad': 'x' * 200}) + '\n'
-        for i in range(n_records)
-    ).encode('utf-8')
-
-
-def _write_truncated_gz(path):
-    """Write the first half of a valid gz stream — the interrupted-write
-    shape, which decompresses to ``EOFError`` (NOT an ``OSError``)."""
-    blob = gzip.compress(_gz_payload())
-    path.write_bytes(blob[: len(blob) // 2])
-    return path
-
-
-def _write_corrupt_body_gz(path):
-    """Write a gz whose DEFLATE body is damaged, so decompression raises
-    ``zlib.error`` (also NOT an ``OSError``).
-
-    Where a flipped byte lands decides which failure gzip reports — most
-    flips still decode and only trip the trailing checksum
-    (``gzip.BadGzipFile``, already an ``OSError``), a few truncate the bit
-    stream (``EOFError``), and only a flip that makes the DEFLATE stream
-    itself unparseable raises ``zlib.error``. So probe for the first flip
-    position producing that shape rather than assuming a byte. The probe runs
-    against STDLIB ``gzip``, never a reader under test, so it stays valid on
-    both sides of the normalization.
-    """
-    blob = gzip.compress(_gz_payload())
-    for index in range(10, len(blob)):
-        candidate = bytearray(blob)
-        candidate[index] ^= 0xFF
-        try:
-            gzip.GzipFile(fileobj=io.BytesIO(bytes(candidate))).read()
-        except zlib.error:
-            path.write_bytes(bytes(candidate))
-            return path
-        except Exception:
-            continue  # a different corruption shape — keep probing
-    raise AssertionError('no single-byte flip produced a zlib.error body')
-
 
 _UNDECODABLE_BODY = b'{"type": "user", "seq": 0}\n{"type": "user", "t": "\xff\xfe"}\n'
 """A JSONL body whose SECOND line carries a raw 0xFF — invalid UTF-8."""
 
 
-def _write_undecodable_gz(path):
-    """A structurally VALID gz whose payload is not valid UTF-8.
-
-    The fourth shape, unreachable by the two helpers above: they damage the
-    gzip container, and the ``_write_corrupt_body_gz`` probe decompresses in
-    BINARY mode, so neither can surface a decode fault. This file
-    decompresses cleanly and fails one layer up, at the reader's
-    ``encoding='utf-8'`` text wrapper, as ``UnicodeDecodeError`` — a
-    ``ValueError``, so it escapes ``except OSError`` however the gzip shapes
-    are handled.
-    """
-    path.write_bytes(gzip.compress(_UNDECODABLE_BODY))
-    return path
-
-
 def _write_undecodable_plain(path):
-    """The same bad byte with no gzip layer — the plain branch opens with the
-    same strict encoding, so the shape is reachable on ``.jsonl`` too."""
+    """The one file-level corruption shape a plain ``.jsonl`` archive still has.
+
+    The reader opens under strict ``encoding='utf-8'``, so a single bad byte
+    raises ``UnicodeDecodeError`` — a ``ValueError``, not an ``OSError`` —
+    and would escape every consumer's documented ``except OSError`` degrade
+    path unless the reader normalizes it."""
     path.write_bytes(_UNDECODABLE_BODY)
     return path
 
@@ -240,27 +183,16 @@ class TestLoadTranscript:
 
 
 # ---------------------------------------------------------------------------
-# load_transcript — gz transparency. Archived fleet sessions land on disk as
-# ``<sid>.jsonl.gz`` (shared.transcript_archive); load_transcript must read
-# them identically to a plain .jsonl so census/nightly RENDER their digests
-# rather than enumerate-then-drop the whole archive at build_digest time.
+# load_transcript — plain-corpus read. Archived fleet sessions land on disk as
+# ``<sid>.jsonl`` (shared.transcript_archive), a verbatim copy with no added
+# suffix, so load_transcript reads them with the same plain open it uses for a
+# live transcript — census/nightly RENDER their digests rather than
+# enumerate-then-drop the whole archive at build_digest time.
 # ---------------------------------------------------------------------------
 
-class TestLoadTranscriptGzAware:
-    def test_gz_transcript_parses_identically_to_plain_jsonl(self, tmp_path):
-        records = [_user_text('first'), _assistant(_text('second')), _user_text('third')]
-        gz_path = _write_jsonl_gz(tmp_path, records)
-        plain_path = _write_jsonl(tmp_path, records)
-
-        loaded_gz = mod.load_transcript(gz_path)
-
-        assert loaded_gz == mod.load_transcript(plain_path)
-        assert [r['message']['content'] for r in loaded_gz] == [
-            'first', [{'type': 'text', 'text': 'second'}], 'third',
-        ]
-
+class TestLoadTranscriptPlain:
     def test_plain_jsonl_still_parses_as_before(self, tmp_path):
-        # Byte-parity: the non-gz branch keeps the exact pre-existing read.
+        # Byte-parity: the reader keeps the exact pre-existing read.
         records = [_user_text('one'), _user_text('two')]
         path = _write_jsonl(tmp_path, records)
 
@@ -271,14 +203,14 @@ class TestLoadTranscriptGzAware:
 
 # ---------------------------------------------------------------------------
 # load_transcript — the FILE-level half of the degrade contract. This slurping
-# reader has the byte-identical gzip.open + iterate body as its streaming
+# reader has the byte-identical open + iterate body as its streaming
 # sibling inventory.iter_json_lines, so it has the identical hole: an
-# unreadable file surfaces as four different exception types, and only bad
-# magic (gzip.BadGzipFile) is already an OSError. A truncated stream raises
-# EOFError, a corrupt body raises zlib.error, and a non-UTF-8 byte raises
-# UnicodeDecodeError — none of which any consumer's documented
-# `except OSError` degrade path catches. The last is reachable on a plain
-# `.jsonl` as well, since both branches open under strict encoding='utf-8'.
+# unreadable file surfaces as the identical shape. With the archive stored
+# plain (task 3618) exactly one file-level shape survives: a non-UTF-8 byte
+# raises UnicodeDecodeError, which no consumer's documented `except OSError`
+# degrade path catches, since it is a ValueError subclass. It was always
+# reachable on a plain `.jsonl` — the reader opens under strict
+# encoding='utf-8' either way — which is why it outlives the gzip shapes.
 #
 # The corpus extractor's `--transcript` operator mode reads through THIS
 # function under `except OSError`, so an archived transcript whose write was
@@ -286,52 +218,6 @@ class TestLoadTranscriptGzAware:
 # ---------------------------------------------------------------------------
 
 class TestLoadTranscriptCorruptionShapes:
-    def test_truncated_gz_raises_oserror(self, tmp_path):
-        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
-        with pytest.raises(OSError):
-            mod.load_transcript(truncated)
-
-    def test_corrupt_body_gz_raises_oserror(self, tmp_path):
-        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
-        with pytest.raises(OSError):
-            mod.load_transcript(corrupt)
-
-    def test_bad_magic_gz_raises_oserror(self, tmp_path):
-        # Already true (BadGzipFile subclasses OSError) — pinned here so the
-        # three shapes are asserted as one contract at this reader, and so a
-        # regression in the newly-added wrap cannot quietly change it.
-        corrupt = tmp_path / 'not-gzip.jsonl.gz'
-        corrupt.write_bytes(b'this is not gzip at all\n')
-        with pytest.raises(OSError):
-            mod.load_transcript(corrupt)
-
-    def test_the_two_shapes_are_distinguishable_in_the_message(self, tmp_path):
-        # Normalizing to one TYPE must not flatten them to one MESSAGE: the
-        # reason string is what a coverage-reporting caller discloses, and an
-        # operator has to tell a half-written transcript from a corrupted one
-        # without re-reading the file.
-        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
-        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
-
-        with pytest.raises(OSError) as truncated_exc:
-            mod.load_transcript(truncated)
-        with pytest.raises(OSError) as corrupt_exc:
-            mod.load_transcript(corrupt)
-
-        assert str(truncated_exc.value) != str(corrupt_exc.value)
-        assert 'end-of-stream' in str(truncated_exc.value)
-        assert 'decompressing' in str(corrupt_exc.value)
-
-    def test_undecodable_gz_raises_oserror(self, tmp_path):
-        # The FOURTH shape. The gz container is intact — the payload simply is
-        # not UTF-8 — so this arrives as UnicodeDecodeError, a ValueError
-        # subclass that no `except (EOFError, zlib.error)` tuple catches and no
-        # `except OSError` consumer sees. Un-normalized, one flipped byte in
-        # one archived transcript aborts the corpus extractor's whole run.
-        undecodable = _write_undecodable_gz(tmp_path / 'undecodable.jsonl.gz')
-        with pytest.raises(OSError):
-            mod.load_transcript(undecodable)
-
     def test_undecodable_plain_jsonl_raises_oserror(self, tmp_path):
         # Same byte, no gzip layer: this reader's plain branch opens with the
         # same strict encoding, so the shape is reachable there too.
@@ -339,28 +225,22 @@ class TestLoadTranscriptCorruptionShapes:
         with pytest.raises(OSError):
             mod.load_transcript(undecodable)
 
-    def test_the_decode_shape_is_distinguishable_from_the_gzip_shapes(self, tmp_path):
-        # Same rule as the two-shape test above, extended to the fourth: an
-        # encoding fault must not be disclosed as a gzip-stream fault, which
-        # would send an operator to audit the compressor instead of the bytes.
-        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
-        undecodable = _write_undecodable_gz(tmp_path / 'undecodable.jsonl.gz')
+    def test_the_decode_shape_names_the_offending_byte(self, tmp_path):
+        # One file-level shape survives, so the reason can no longer be
+        # triaged by contrast — the actionable detail is the offending byte.
+        undecodable = _write_undecodable_plain(tmp_path / 'undecodable.jsonl')
 
-        with pytest.raises(OSError) as truncated_exc:
-            mod.load_transcript(truncated)
-        with pytest.raises(OSError) as undecodable_exc:
+        with pytest.raises(OSError) as exc:
             mod.load_transcript(undecodable)
 
-        message = str(undecodable_exc.value)
-        assert message != str(truncated_exc.value)
-        assert 'gzip' not in message
-        assert '0xff' in message.lower()
+        assert 'gzip' not in str(exc.value)
+        assert '0xff' in str(exc.value).lower()
 
     def test_both_readers_agree_on_an_undecodable_file(self, tmp_path):
         # The two-readers-one-contract property, asserted for the shape that
         # was leaking: whichever mode an operator reaches for, the same bad
         # byte must be reported the same way.
-        undecodable = _write_undecodable_gz(tmp_path / 'undecodable.jsonl.gz')
+        undecodable = _write_undecodable_plain(tmp_path / 'undecodable.jsonl')
 
         with pytest.raises(OSError) as slurped:
             mod.load_transcript(undecodable)
@@ -370,31 +250,14 @@ class TestLoadTranscriptCorruptionShapes:
         assert type(slurped.value) is type(streamed.value)
         assert str(slurped.value) == str(streamed.value)
 
-    def test_both_readers_agree_on_a_truncated_file(self, tmp_path):
-        # The property the corpus extractor's design rests on: two readers,
-        # one core, ONE failure contract. Its scan mode reads via
-        # inventory.iter_json_lines and its --transcript mode via
-        # load_transcript; if the two disagreed here, the same corrupt archive
-        # would be reported differently depending on which mode an operator
-        # reached for.
-        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
-
-        with pytest.raises(OSError) as slurped:
-            mod.load_transcript(truncated)
-        with pytest.raises(OSError) as streamed:
-            list(inventory_mod.iter_json_lines(truncated))
-
-        assert type(slurped.value) is type(streamed.value)
-        assert str(slurped.value) == str(streamed.value)
-
-    def test_corrupt_line_in_a_valid_gz_still_degrades_silently(self, tmp_path):
-        # The line-level half, unchanged: a well-formed gz whose LAST line is
-        # a half-written record still yields every parseable record and still
-        # does not raise. A fix that wrapped the parse loop too broadly would
-        # collapse this into the file-level path and inflate a caller's
+    def test_corrupt_line_in_a_valid_file_still_degrades_silently(self, tmp_path):
+        # The line-level half, unchanged: a well-formed transcript whose LAST
+        # line is a half-written record still yields every parseable record and
+        # still does not raise. A fix that wrapped the parse loop too broadly
+        # would collapse this into the file-level path and inflate a caller's
         # unreadable-file count with ordinary trailing debris.
-        path = tmp_path / 'trailing-partial.jsonl.gz'
-        with gzip.open(path, 'wt', encoding='utf-8') as f:
+        path = tmp_path / 'trailing-partial.jsonl'
+        with open(path, 'w', encoding='utf-8') as f:
             f.write(json.dumps(_user_text('one')) + '\n')
             f.write('\n')
             f.write('{not valid json,,,\n')
@@ -421,14 +284,6 @@ class TestLoadTranscriptCorruptionShapes:
 class TestAsUnreadableFileError:
     """The one place that answers 'which exceptions mean an unreadable file'."""
 
-    def test_normalizes_the_gzip_stream_shapes(self):
-        for exc in (EOFError('ended early'), zlib.error('bad block')):
-            normalized = inventory_mod.as_unreadable_file_error(exc)
-
-            assert isinstance(normalized, OSError)
-            assert 'corrupt or truncated gzip stream' in str(normalized)
-            assert str(exc) in str(normalized)
-
     def test_decode_shape_gets_its_own_wording(self):
         # Not a "gzip stream" failure: this shape is reachable on a plain
         # .jsonl path too, so that label would misdirect an operator reading
@@ -439,22 +294,22 @@ class TestAsUnreadableFileError:
 
         assert isinstance(normalized, OSError)
         assert 'undecodable transcript bytes' in str(normalized)
-        assert 'gzip stream' not in str(normalized)
+        assert 'gzip' not in str(normalized)
 
     def test_an_oserror_passes_through_unwrapped(self):
-        # gzip.BadGzipFile is ALREADY an OSError, so it needs no
+        # An OSError is ALREADY the target type, so it needs no
         # normalization. Returning it unchanged keeps the helper idempotent —
         # a caller can hand it anything it caught without first classifying
         # it, and a bad-magic message never acquires a misleading second
         # "corrupt or truncated gzip stream" prefix.
-        original = gzip.BadGzipFile('Not a gzipped file')
+        original = OSError('Not a readable file')
 
         assert inventory_mod.as_unreadable_file_error(original) is original
 
     def test_the_catch_tuple_omits_oserror_shapes(self):
         # UNREADABLE_FILE_ERRORS is exactly the set that is NOT already an
         # OSError. A shape wrongly added here would be caught and re-wrapped
-        # rather than propagating, and gzip.BadGzipFile in particular must
+        # rather than propagating, and an OSError in particular must
         # keep reaching callers by its own inheritance.
         #
         # Being a tuple is itself load-bearing and asserted separately: it
@@ -465,8 +320,7 @@ class TestAsUnreadableFileError:
         # below wraps in tuple() to satisfy ruff SIM300, which would
         # otherwise let a list-valued constant pass unnoticed.
         assert isinstance(inventory_mod.UNREADABLE_FILE_ERRORS, tuple)
-        expected_shapes = (EOFError, zlib.error, UnicodeDecodeError)
-        assert tuple(inventory_mod.UNREADABLE_FILE_ERRORS) == expected_shapes
+        assert tuple(inventory_mod.UNREADABLE_FILE_ERRORS) == (UnicodeDecodeError,)
         assert not any(
             issubclass(exc_type, OSError)
             for exc_type in inventory_mod.UNREADABLE_FILE_ERRORS
@@ -554,6 +408,8 @@ class TestIterErrorNeighborhoods:
         assert n['attempt_input_summary'] == json.dumps({'command': 'false'}, sort_keys=True)
         assert n['error_content'] == 'Exit code 1'
         assert n['index'] == 1
+        assert n['exit_code'] == 1
+        assert n['designed_outcome'] is None
 
     def test_ignores_non_error_result(self):
         records = [
@@ -589,6 +445,343 @@ class TestIterErrorNeighborhoods:
         assert neighborhoods[0]['attempt_tool'] is None
         assert neighborhoods[0]['attempt_input_summary'] is None
         assert neighborhoods[0]['error_content'] == 'boom'
+        assert neighborhoods[0]['exit_code'] is None
+        assert neighborhoods[0]['designed_outcome'] is None
+
+    def test_every_neighborhood_carries_the_two_classification_keys(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
+            _tool_result('tu-1', 'boom, no code here', is_error=True),
+            _assistant(_tool_use('Bash', {'command': 'watcher'}, id='tu-2')),
+            _tool_result('tu-2', _CEILING_DECLARATION, is_error=True),
+        ]
+
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        # Asserted BEFORE the loop: an empty return would otherwise skip
+        # the body and pass, which is the very regression this guards.
+        assert len(neighborhoods) == 2
+        for n in neighborhoods:
+            assert set(n) == {
+                'index', 'attempt_tool', 'attempt_input_summary',
+                'error_content', 'exit_code', 'designed_outcome',
+            }
+
+    def test_ceiling_result_is_enriched_with_code_and_label(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'watcher-rearm.sh'}, id='tu-c')),
+            _tool_result('tu-c', _CEILING_DECLARATION, is_error=True),
+        ]
+
+        n = mod.iter_error_neighborhoods(records)[0]
+
+        assert n['exit_code'] == 124
+        assert n['designed_outcome'] is not None
+
+    def test_plain_error_without_a_code_is_unclassified(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-p')),
+            _tool_result('tu-p', 'something broke', is_error=True),
+        ]
+
+        n = mod.iter_error_neighborhoods(records)[0]
+
+        assert n['exit_code'] is None
+        assert n['designed_outcome'] is None
+
+
+# ---------------------------------------------------------------------------
+# iter_genuine_errors / iter_designed_outcomes — a TOTAL, LOSSLESS partition
+# of iter_error_neighborhoods on `designed_outcome is None`. The scan itself
+# stays single-source-of-truth; only the split is new.
+# ---------------------------------------------------------------------------
+
+def _mixed_error_records():
+    """2 declared CEILINGs + 1 bare exit-124 + 1 genuine exit-2 failure."""
+    return [
+        _assistant(_tool_use('Bash', {'command': 'w1'}, id='tu-c1')),
+        _tool_result('tu-c1', _CEILING_DECLARATION, is_error=True),
+        _assistant(_tool_use('Bash', {'command': 'w2'}, id='tu-c2')),
+        _tool_result('tu-c2', _CEILING_DECLARATION, is_error=True),
+        _assistant(_tool_use('Bash', {'command': 'poll'}, id='tu-t')),
+        _tool_result('tu-t', 'timed out after 600s, exit=124', is_error=True),
+        _assistant(_tool_use('Bash', {'command': 'real'}, id='tu-g')),
+        _tool_result('tu-g', 'DARK_FACTORY_ROOT unset, exit code 2', is_error=True),
+    ]
+
+
+class TestErrorNeighborhoodPartition:
+    def test_genuine_errors_are_exactly_the_undesigned_ones(self):
+        genuine = mod.iter_genuine_errors(_mixed_error_records())
+
+        assert len(genuine) == 1
+        assert genuine[0]['exit_code'] == 2
+        assert genuine[0]['designed_outcome'] is None
+
+    def test_designed_outcomes_are_exactly_the_rest(self):
+        designed = mod.iter_designed_outcomes(_mixed_error_records())
+
+        assert len(designed) == 3
+        assert all(d['designed_outcome'] is not None for d in designed)
+
+    def test_partition_is_disjoint(self):
+        records = _mixed_error_records()
+
+        genuine = mod.iter_genuine_errors(records)
+        designed = mod.iter_designed_outcomes(records)
+
+        # By record index, not object identity: separate calls build
+        # separate dicts, so an id()-based check can never intersect and
+        # would pass regardless of correctness.
+        assert genuine and designed
+        assert not ({n['index'] for n in genuine} & {n['index'] for n in designed})
+
+    def test_partition_accepts_a_precomputed_scan(self):
+        # The efficiency contract: a caller holding a scan partitions it
+        # in place instead of paying for a fresh one per half.
+        records = _mixed_error_records()
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        genuine = mod.iter_genuine_errors(neighborhoods=neighborhoods)
+        designed = mod.iter_designed_outcomes(neighborhoods=neighborhoods)
+
+        assert genuine == mod.iter_genuine_errors(records)
+        assert designed == mod.iter_designed_outcomes(records)
+
+    def test_partition_without_records_or_neighborhoods_raises(self):
+        # Loud over silently returning an empty partition, which would read
+        # downstream as "this session had no errors".
+        with pytest.raises(TypeError):
+            mod.iter_genuine_errors()
+        with pytest.raises(TypeError):
+            mod.iter_designed_outcomes()
+
+    def test_render_digest_scans_error_neighborhoods_at_most_twice(
+        self, monkeypatch,
+    ):
+        # iter_error_neighborhoods rebuilds the tool_use index over every
+        # record and re-runs the classifier over every error body, so each
+        # extra call is a full rescan. signal_counts and _build_sections
+        # each need BOTH halves of the partition; feeding them one shared
+        # scan is what keeps a digest at the pre-3610 cost of two.
+        calls = []
+        original = mod.iter_error_neighborhoods
+
+        def counting(records):
+            calls.append(len(records))
+            return original(records)
+
+        monkeypatch.setattr(mod, 'iter_error_neighborhoods', counting)
+        mod.render_digest(_mixed_error_records(), agent_class='interactive')
+
+        assert len(calls) <= 2
+
+    def test_partition_is_total_and_lossless(self):
+        records = _mixed_error_records()
+
+        recombined = (
+            mod.iter_designed_outcomes(records) + mod.iter_genuine_errors(records)
+        )
+        all_neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert sorted(recombined, key=lambda n: n['index']) == all_neighborhoods
+
+
+# ---------------------------------------------------------------------------
+# _extract_exit_code / classify_designed_outcome — the 07-31 census cluster
+# 1.3 finding (plans/confusion-census-2026-07-31.md:97): watcher-rearm.sh's
+# bounded-wait CEILING is a DESIGNED loop-continuation outcome that the
+# extractor counted as a tool_error, inflating session a189558e's error
+# signal 4x and burying the one genuine failure among false positives.
+# Recognition is two-tier: the machine-readable self-declaration first
+# (scripts/watcher-rearm.sh:228-237), the bare exit code second.
+# ---------------------------------------------------------------------------
+
+_CEILING_DECLARATION = 'WATCHER_REARM_OUTCOME: CEILING exit=124'
+"""The sighted line verbatim (plans/confusion-census-2026-07-31.md:97)."""
+
+
+class TestDesignedOutcomeRecognition:
+    def test_extracts_exit_equals_form(self):
+        assert mod._extract_exit_code(_CEILING_DECLARATION) == 124
+
+    def test_extracts_exit_code_prose_form(self):
+        assert mod._extract_exit_code('command failed with exit code 2') == 2
+
+    def test_extracts_exit_status_prose_form(self):
+        assert mod._extract_exit_code('exit status 137') == 137
+
+    def test_extraction_is_case_insensitive(self):
+        assert mod._extract_exit_code('Exit Code 2') == 2
+
+    def test_returns_none_when_no_code_present(self):
+        assert mod._extract_exit_code('something went wrong') is None
+
+    def test_first_match_wins_when_several_appear(self):
+        text = 'exit=124\nlater the retry gave exit code 2\n'
+
+        assert mod._extract_exit_code(text) == 124
+
+    def test_declared_ceiling_is_designed(self):
+        exit_code, label = mod.classify_error_content(_CEILING_DECLARATION)
+
+        assert exit_code == 124
+        assert label is not None
+
+    def test_declared_fired_is_designed(self):
+        _, label = mod.classify_error_content('WATCHER_REARM_OUTCOME: FIRED exit=0')
+
+        assert label is not None
+
+    def test_declared_fired_reports_its_own_zero_exit_code(self):
+        # exit=0 is falsy: the deciding-marker code must be selected with an
+        # explicit None check, never a truthiness fallback.
+        exit_code, _ = mod.classify_error_content('WATCHER_REARM_OUTCOME: FIRED exit=0')
+
+        assert exit_code == 0
+
+    def test_declared_killed_is_a_genuine_failure(self):
+        # scripts/watcher-rearm.sh:234 classes 137|143|144 as KILLED -- a
+        # REAL failure the census should still see, not a designed outcome.
+        assert mod.classify_error_content(
+            'WATCHER_REARM_OUTCOME: KILLED exit=137',
+        ) == (137, None)
+
+    def test_declared_error_is_a_genuine_failure(self):
+        # scripts/watcher-rearm.sh:237's catch-all ERROR branch.
+        assert mod.classify_error_content(
+            'WATCHER_REARM_OUTCOME: ERROR exit=2',
+        ) == (2, None)
+
+    def test_bare_exit_124_is_a_designed_bounded_wait(self):
+        _, label = mod.classify_error_content('command timed out after 600s, exit=124')
+
+        assert label is not None
+
+    def test_ordinary_failure_is_not_designed(self):
+        assert mod.classify_error_content('boom, exit code 2') == (2, None)
+
+    def test_empty_content_with_no_exit_code_is_not_designed(self):
+        assert mod.classify_error_content('') == (None, None)
+
+    def test_declaration_and_bare_124_labels_are_distinct(self):
+        # Which rule fired must stay legible to a digest reader.
+        _, declared = mod.classify_error_content(_CEILING_DECLARATION)
+        _, bare = mod.classify_error_content('timed out, exit=124')
+
+        assert declared != bare
+
+    def test_accepts_a_raw_block_list_content_field(self):
+        # The public entry point takes a tool_result 'content' field as-is
+        # (str OR list of blocks), so no caller -- in this module or in
+        # sampling.py -- needs digest's private text flattener.
+        blocks = [{'type': 'text', 'text': _CEILING_DECLARATION}]
+
+        assert (
+            mod.classify_error_content(blocks)
+            == mod.classify_error_content(_CEILING_DECLARATION)
+        )
+
+    def test_bounded_wait_exit_code_constant_is_timeout_ceiling(self):
+        assert mod.BOUNDED_WAIT_EXIT_CODE == 124
+
+
+class TestCoMingledDesignedAndGenuineContent:
+    """A designed classification must hold for the WHOLE content.
+
+    One tool_result can carry both a designed declaration and a real
+    failure: a Bash call that loops scripts/watcher-rearm.sh, or that
+    tails its log beside a failing command. The script writes its marker
+    to STDERR (:228-237), so it co-mingles with any other stderr in the
+    same result. Classifying on the first designed marker alone deletes
+    the genuine failure from BOTH ``signal_counts['tool_error']`` and the
+    Error Neighborhoods section, and renders it under Designed Outcomes
+    with the wrong exit code -- exactly the under-count that
+    DESIGNED_OUTCOME_PATTERNS' own docstring refuses to trade for.
+    """
+
+    def test_ceiling_followed_by_an_error_marker_is_genuine(self):
+        text = (
+            'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+            'WATCHER_REARM_OUTCOME: ERROR exit=2'
+        )
+
+        assert mod.classify_error_content(text) == (2, None)
+
+    def test_fired_followed_by_a_killed_marker_is_genuine(self):
+        text = (
+            'WATCHER_REARM_OUTCOME: FIRED exit=0\n'
+            'WATCHER_REARM_OUTCOME: KILLED exit=137'
+        )
+
+        assert mod.classify_error_content(text) == (137, None)
+
+    def test_a_dissenting_marker_decides_even_when_it_comes_first(self):
+        text = (
+            'WATCHER_REARM_OUTCOME: ERROR exit=2\n'
+            'WATCHER_REARM_OUTCOME: CEILING exit=124'
+        )
+
+        assert mod.classify_error_content(text) == (2, None)
+
+    def test_repeated_designed_markers_stay_designed(self):
+        text = _CEILING_DECLARATION + '\nWATCHER_REARM_OUTCOME: CEILING exit=124'
+
+        exit_code, label = mod.classify_error_content(text)
+
+        assert exit_code == 124
+        assert label is not None
+
+    def test_unaccounted_failure_code_beside_a_ceiling_is_genuine(self):
+        # A declaration speaks only for its OWN invocation: a fatal code
+        # that no declaration accounts for outvotes it.
+        text = (
+            'tail of watcher.log: WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+            'fatal: repo corrupt, exit code 128'
+        )
+
+        assert mod.classify_error_content(text) == (128, None)
+
+    def test_bare_ceiling_code_beside_a_failure_code_is_genuine(self):
+        # The same rule one tier down: a bare 124 classifies only when it
+        # is the ONLY outcome code in the content.
+        text = 'poll timed out, exit=124\nthe retry then died, exit code 2'
+
+        assert mod.classify_error_content(text) == (2, None)
+
+    def test_co_mingled_result_counts_as_a_tool_error(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'rearm-loop'}, id='tu-m')),
+            _tool_result(
+                'tu-m',
+                'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+                'WATCHER_REARM_OUTCOME: ERROR exit=2',
+                is_error=True,
+            ),
+        ]
+
+        counts = mod.signal_counts(records)
+
+        assert counts['tool_error'] == 1
+        assert counts['designed_outcome'] == 0
+
+    def test_co_mingled_result_renders_with_the_deciding_exit_code(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'rearm-loop'}, id='tu-m')),
+            _tool_result(
+                'tu-m',
+                'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+                'WATCHER_REARM_OUTCOME: ERROR exit=2',
+                is_error=True,
+            ),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+        _, body = _split_frontmatter(digest)
+
+        assert '## Designed Outcomes' not in body
+        error_block = body.split('## Error Neighborhoods', 1)[1].split('\n##', 1)[0]
+        assert '[exit 2]' in error_block
 
 
 # ---------------------------------------------------------------------------
@@ -925,7 +1118,7 @@ class TestDecoyFailSuppressionContract:
 # ---------------------------------------------------------------------------
 
 class TestSignalCountsAndScore:
-    def test_signal_counts_returns_exact_five_key_dict_for_mixed_fixture(self):
+    def test_signal_counts_returns_exact_key_dict_for_mixed_fixture(self):
         records = [
             _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
             _tool_result('tu-1', 'Exit code 1', is_error=True),
@@ -943,6 +1136,7 @@ class TestSignalCountsAndScore:
             'not_found': 1,
             'df_guard': 1,
             'interrupt': 1,
+            'designed_outcome': 0,
         }
 
     def test_signal_counts_reports_zero_for_absent_classes(self):
@@ -956,7 +1150,56 @@ class TestSignalCountsAndScore:
             'not_found': 0,
             'df_guard': 0,
             'interrupt': 0,
+            'designed_outcome': 0,
         }
+
+    def test_ceiling_only_session_reports_zero_tool_errors(self):
+        # The 07-31 census cluster 1.3 headline: session a189558e's watcher
+        # ceilings were each counted as a tool_error. A session whose ONLY
+        # structured errors are declared CEILINGs has no errors at all.
+        records = []
+        for i in range(13):
+            records.append(
+                _assistant(_tool_use('Bash', {'command': f'w{i}'}, id=f'tu-{i}'))
+            )
+            records.append(_tool_result(f'tu-{i}', _CEILING_DECLARATION, is_error=True))
+
+        counts = mod.signal_counts(records)
+
+        assert counts['tool_error'] == 0
+        assert counts['designed_outcome'] == 13
+
+    def test_mixed_session_surfaces_the_one_genuine_failure(self):
+        # census :97 verbatim: 3 benign ceilings burying 1 real exit-2 bug.
+        records = []
+        for i in range(3):
+            records.append(
+                _assistant(_tool_use('Bash', {'command': f'w{i}'}, id=f'tu-c{i}'))
+            )
+            records.append(_tool_result(f'tu-c{i}', _CEILING_DECLARATION, is_error=True))
+        records.append(_assistant(_tool_use('Bash', {'command': 'real'}, id='tu-g')))
+        records.append(
+            _tool_result('tu-g', 'DARK_FACTORY_ROOT unset, exit code 2', is_error=True)
+        )
+
+        counts = mod.signal_counts(records)
+
+        assert counts['tool_error'] == 1
+        assert counts['designed_outcome'] == 3
+
+    def test_designed_outcome_has_no_signal_weight(self):
+        # Deliberate: score_signals iterates SIGNAL_WEIGHTS, so omitting the
+        # entry reports the count without perturbing the sampler's ranking.
+        assert 'designed_outcome' not in mod.SIGNAL_WEIGHTS
+
+    def test_score_is_bit_identical_across_designed_outcome_counts(self):
+        base = {
+            'tool_error': 2, 'self_correct': 1, 'not_found': 0,
+            'df_guard': 1, 'interrupt': 0, 'designed_outcome': 0,
+        }
+        noisy = dict(base, designed_outcome=13)
+
+        assert mod.score_signals(noisy, 3) == mod.score_signals(base, 3)
 
     def test_score_signals_is_monotonic_when_adding_a_signal(self):
         zero = {
@@ -1098,7 +1341,9 @@ def _frontmatter_meta():
             'not_found': 3,
             'df_guard': 4,
             'interrupt': 5,
+            'designed_outcome': 6,
         },
+        'instrument_version': 2,
     }
 
 
@@ -1122,7 +1367,7 @@ class TestRenderFrontmatter:
         assert top_level_keys == [
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
             'size_bytes', 'score', 'n_user_turns', 'truncated_items',
-            'signal_counts',
+            'instrument_version', 'signal_counts',
         ]
 
     def test_signal_counts_nested_in_contract_order(self):
@@ -1135,6 +1380,7 @@ class TestRenderFrontmatter:
 
         assert nested_keys == [
             'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
+            'designed_outcome',
         ]
 
     def test_round_trips_via_yaml_safe_load(self):
@@ -1171,6 +1417,48 @@ class TestRenderFrontmatter:
 
         assert loaded['truncated_items'] == 0
         assert isinstance(loaded['truncated_items'], int)
+
+    def test_instrument_version_constant_is_an_int_at_or_past_two(self):
+        # 1 is the implicit pre-3610 baseline (never emitted); this change
+        # is generation 2.
+        assert isinstance(mod.DIGEST_INSTRUMENT_VERSION, int)
+        assert mod.DIGEST_INSTRUMENT_VERSION >= 2
+
+    def test_instrument_version_is_appended_last_to_the_key_tuple(self):
+        # Appended, never inserted: a generation marker belongs after the
+        # measurements it describes, so downstream frontmatter diffs stay
+        # stable as the contract grows. Task 3614's n_user_turns /
+        # truncated_items were themselves appended ahead of it (see
+        # TestFrontmatterKeyOrder), which lengthens the prefix without
+        # displacing this key from last.
+        assert mod.FRONTMATTER_KEYS[-1] == 'instrument_version'
+        assert mod.FRONTMATTER_KEYS[:-1] == (
+            'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
+            'size_bytes', 'score', 'n_user_turns', 'truncated_items',
+        )
+
+    def test_instrument_version_emits_as_a_bare_numeric_scalar(self):
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        assert 'instrument_version: 2' in block
+        assert 'instrument_version: "2"' not in block
+
+    def test_instrument_version_round_trips_as_an_int(self):
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        inner = '\n'.join(block.splitlines()[1:-1])
+        loaded = yaml.safe_load(inner)
+
+        assert loaded['instrument_version'] == 2
+        assert isinstance(loaded['instrument_version'], int)
+
+    # The "absent key == predates task 3610" discriminator (07-31 :151, §6)
+    # is documented in PRD §7.2.2 and has no consumer-side code in this
+    # repo to exercise: a test of it could only hand-write a YAML literal
+    # the renderer never touches and assert PyYAML omits a key the input
+    # omitted. That test existed here and was deleted in the 3610 amendment
+    # pass; what the renderer actually guarantees is pinned above and
+    # end-to-end by TestEmitConsistencyGuard.
 
     def test_date_round_trips_as_string_not_a_yaml_date_object(self):
         # A bare unquoted 2026-07-14 is resolved by PyYAML's implicit
@@ -1247,17 +1535,21 @@ def _split_frontmatter(digest):
 
 # ---------------------------------------------------------------------------
 # is_harness_injected_turn / iter_user_turns exclusion -- R1 (confusion
-# census 2026-07-24 Sec 4): a harness-injected briefing turn (the
-# orchestrator's '# Context' + '## Agent Identity' + '# Task' preamble, or
-# the trickle coder's system-prompt preamble) is typed into the transcript
-# as ordinary user-role text (isMeta=False -- it really is the first "user"
-# turn Claude Code sees), so it was previously indistinguishable from a
-# genuine human correction: it inflated both the gold user_corrections
-# section and score's n_user_turns component. Exclusion is by CONTENT (all
-# three headings must co-occur, line-anchored, mirroring
+# census 2026-07-24 Sec 4): a harness-injected turn -- the orchestrator's
+# '# Context' + '## Agent Identity' + '# Task' briefing preamble, the
+# trickle coder's system-prompt preamble, or the harness's
+# post-interruption resume prompt (e.g. after a usage-limit cap) -- is
+# typed into the transcript as ordinary user-role text (isMeta=False -- it
+# really is the first "user" turn Claude Code sees), so it was previously
+# indistinguishable from a genuine human correction: it inflated both the
+# gold user_corrections section and score's n_user_turns component. Three
+# shapes are covered, not two: the briefing preamble is excluded by CONTENT
+# co-occurrence (all three headings must co-occur, line-anchored, mirroring
 # ORCHESTRATED_TASK_MARKERS' all() guard) so an ordinary human turn that
 # merely mentions one heading, or quotes one mid-sentence, is never
-# over-excluded.
+# over-excluded; the trickle-coder preamble and the resume prompt are each
+# excluded by a plain case-insensitive substring match
+# (HARNESS_PROMPT_MARKERS).
 # ---------------------------------------------------------------------------
 
 def _briefing_text(body_filler='Project overview and recent decisions go here.'):
@@ -1280,6 +1572,18 @@ def _briefing_text(body_filler='Project overview and recent decisions go here.')
     )
 
 
+_CENSUS_MEMORY_CONTEXT_TURN = (
+    '# Context\n\n'
+    '## Project Context\n\n'
+    '{ "results": [ { "id": "ccf73ca4-8240-4f9a-8abf-32b210e5b35b", '
+    '"content": "Task 1470 wired /audit into /review Phase-2 Architectural '
+    'Coherence." } ] }\n'
+)
+"""The 07-31 census cluster 1.1(b) sighting verbatim
+(plans/confusion-census-2026-07-31.md:85): a context-ONLY briefing injection
+that the all-three-headings rule admitted into the gold section."""
+
+
 _TRICKLE_CODER_PREAMBLE = (
     'You are the trickle coder for the dark-factory agent-confusion '
     'codebook (plans/confusion-reduction-prd.md §7.3). Read the '
@@ -1288,6 +1592,81 @@ _TRICKLE_CODER_PREAMBLE = (
 )
 """Literal prefix of scripts/legibility/coder.py:174 build_prompt's
 harness-authored preamble."""
+
+
+def _memory_context_block(body='## Project Context\n\n{...}'):
+    """Build the real shape of a LONE '# Context' memory-context block --
+    ``_get_memory_context``'s recalled-sections return path
+    (orchestrator/src/orchestrator/agents/briefing.py) WITHOUT its
+    '## Agent Identity' / '# Task' siblings. This is exactly the shape
+    HARNESS_BRIEFING_HEADINGS' all()-co-occurrence guard admits today:
+    only one of its three headings is present."""
+    return '# Context\n\n' + MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory') + '\n\n' + body
+
+
+_DROP_NOTE_EXAMPLE = (
+    '2 memory result slot(s) across 1 query were tagged to another project '
+    'and filtered out'
+)
+"""Representative drop_note text -- the shape
+``_get_memory_context`` builds it in
+(``f'{foreign_dropped} memory result slot(s) across {queries_fired} '
+f'{query_word} were tagged to another project and filtered out'``)."""
+
+_NO_RECALLED_SECTIONS_VARIANTS = (
+    '# Context\n\n_Memory unavailable — proceed with codebase exploration._',
+    (
+        '# Context\n\n_Memory unavailable — proceed with codebase '
+        f'exploration. Note: {_DROP_NOTE_EXAMPLE} before the failure._'
+    ),
+    '# Context\n\n_No memory context available._',
+    f'# Context\n\n_No memory context available ({_DROP_NOTE_EXAMPLE})._',
+)
+"""The four literal shapes ``_get_memory_context`` returns when
+``recalled_sections`` is empty
+(orchestrator/src/orchestrator/agents/briefing.py:1321-1331) -- two
+literal families (memory-unavailable / no-memory-context available), each
+with a plain and a drop_note-bearing variant. Not lockstep-importable
+like MEMORY_CONTEXT_CAVEAT: these are inlined string literals in
+``_get_memory_context``'s body, not a module-level constant."""
+
+
+def _recalled_sections_with_trailing_unavailable_note():
+    """The recalled-sections return path's fullest composite shape
+    (orchestrator/src/orchestrator/agents/briefing.py:1339-1350) -- the
+    fifth of ``_get_memory_context``'s five return paths, distinct from
+    the four ``_NO_RECALLED_SECTIONS_VARIANTS`` shapes above (those all
+    have recalled_sections EMPTY; this one has it non-empty). Builds a
+    caveat carrying its own drop_note suffix (a foreign-tagged result was
+    filtered from an earlier query), a genuinely recalled section, AND
+    the trailing "_Memory unavailable for the remaining queries..._"
+    note appended when a LATER query then fails. LOCKSTEP via
+    MEMORY_CONTEXT_CAVEAT -- pins that HARNESS_CONTEXT_BLOCK_MARKERS'
+    caveat-prefix marker alone still covers this composite, not just the
+    plain caveat-only shape _memory_context_block() builds."""
+    caveat = MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory')
+    caveat += f'\n\n_In total, {_DROP_NOTE_EXAMPLE}._'
+    return (
+        '# Context\n\n' + caveat + '\n\n## Project Context\n\nSome overview.'
+        '\n\n---\n\n_Memory unavailable for the remaining queries — proceed '
+        'with codebase exploration for anything not covered above._'
+    )
+
+
+def _resume_and_context_block_records():
+    """The confusion-census sighting shape (session b976febe), minus its
+    one genuine correction: a turn-0 lone '# Context' memory block,
+    followed by the usage-limit resume prompt at two separate later
+    turns, and nothing else -- no tool_use/tool_result/assistant record
+    at all, so every one of the five signal detectors reports zero hits
+    regardless of the R1 exclusion filter. Used to pin that once R1
+    excludes all three turns, a session like this no longer presents as
+    gold-bearing."""
+    return [
+        _with_session_meta(_user_text(_memory_context_block())),
+        _with_session_meta(_user_text(CAP_HIT_RESUME_PROMPT)),
+        _with_session_meta(_user_text(CAP_HIT_RESUME_PROMPT)),
+    ]
 
 
 class TestHarnessInjectedTurnFilter:
@@ -1311,6 +1690,106 @@ class TestHarnessInjectedTurnFilter:
 
         assert [t['text'] for t in turns] == ['This is wrong, please redo it.']
         assert [t['index'] for t in turns] == [1]
+
+    def test_census_sighted_memory_context_turn_is_excluded(self):
+        # The 07-31 census cluster 1.1(b) sighting, verbatim
+        # (plans/confusion-census-2026-07-31.md:85): a context-ONLY briefing
+        # injection -- '# Context' + '## Project Context' + the memory-search
+        # JSON dump. It carries NEITHER '## Agent Identity' NOR '# Task', so
+        # the old all-three rule let it through into the gold section.
+        text = _CENSUS_MEMORY_CONTEXT_TURN
+
+        assert mod.is_harness_injected_turn(text) is True
+        assert mod.iter_user_turns([_user_text(text)]) == []
+
+    def test_context_plus_conventions_subheading_is_excluded(self):
+        # briefing.py:1096 emits '## Conventions' under the same '# Context'.
+        records = [_user_text(
+            '# Context\n\n## Conventions\n\n{"results": []}\n'
+        )]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_memory_unavailable_context_variant_is_excluded(self):
+        # The REAL memory-unavailable shape, as it actually reaches a user
+        # turn. ``_get_memory_context``'s exception and no-context early
+        # returns emit '# Context' with a SINGLE hash (briefing.py:1325,
+        # :1328, :1330, :1331) -- the literal '## Context' is emitted
+        # nowhere in briefing.py. build_architect_prompt (:355-375) then
+        # composes that block as
+        # '{context}\n\n{identity}\n\n# Task\n\n...\n\n# Action\n\n...',
+        # so the injected turn carries 3 anchors plus 1 corroborator.
+        records = [_user_text(
+            '# Context\n\n_Memory unavailable — proceed with codebase '
+            'exploration._\n\n'
+            '## Agent Identity\n\n'
+            '- **agent_id:** `claude-task-3610-implementer`\n\n'
+            '# Task\n\ndo the thing\n\n'
+            '# Action\n\ngo\n'
+        )]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_human_double_hash_context_plus_conventions_is_retained(self):
+        # '## Context' is NOT a briefing anchor: briefing.py emits only the
+        # single-hash '# Context' (:1325/:1328/:1330/:1331/:1350), while
+        # '## Context' + '## Conventions' is a common human-authored
+        # markdown shape in this repo's own plans/ and docs/ prose. Treating
+        # it as an anchor silently drops a genuine human correction from the
+        # gold user_corrections section -- the exact pathology the
+        # instrument exists to prevent.
+        text = (
+            '## Context\n\nWe are debugging the merge worker.\n\n'
+            '## Conventions\n\nplease stop using tabs, this is wrong'
+        )
+
+        assert mod.is_harness_injected_turn(text) is False
+        assert len(mod.iter_user_turns([_user_text(text)])) == 1
+
+    def test_human_task_plus_action_prose_turn_is_retained(self):
+        # Two SINGLE-hash top-level headings is a human spec-writing shape,
+        # not a briefing shape. Every role prompt template composes
+        # '{context}\n\n{identity}\n\n# Task ... # Action ...'
+        # (briefing.py:357-367/430-435/501-506/584-589/661-670/1193-1212),
+        # so a real briefing always carries the '# Context' anchor and
+        # almost always '## Agent Identity' too -- it is never just these
+        # two. Corroborators are therefore '##'-level sub-blocks only; see
+        # HARNESS_BRIEFING_SUBHEADINGS for the recall corner this declines.
+        text = (
+            '# Task\n\nRewrite the retry loop so it backs off.\n\n'
+            '# Action\n\nStart with the tests, then the loop itself.\n'
+        )
+
+        assert mod.is_harness_injected_turn(text) is False
+        assert len(mod.iter_user_turns([_user_text(text)])) == 1
+
+    def test_every_corroborator_is_a_double_hash_subblock(self):
+        # Structural guard, so a future agent does not re-add a top-level
+        # heading to the corroborator tuple: a '# '-level corroborator pairs
+        # with the '# task' anchor to clear the >=2 threshold on its own,
+        # which is exactly the human shape above.
+        assert all(
+            heading.startswith('## ') for heading in mod.HARNESS_BRIEFING_SUBHEADINGS
+        )
+
+    def test_lone_context_anchor_with_prose_is_retained(self):
+        # The relaxation's boundary: ONE anchor and NO corroborating
+        # briefing heading is not enough to classify as injected.
+        records = [_user_text('# Context\n\nsome prose about the problem')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == '# Context\n\nsome prose about the problem'
+
+    def test_lone_subheading_without_an_anchor_is_retained(self):
+        # A corroborator alone never classifies -- at least one ANCHOR is
+        # required, so a human turn headed '## Conventions' stays gold.
+        records = [_user_text('## Conventions\n\nwe always use tabs, fix this')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
 
     def test_single_heading_alone_is_not_excluded(self):
         # Only ONE of the three co-occurring headings -- must not alone
@@ -1375,6 +1854,191 @@ class TestHarnessInjectedTurnFilter:
         with_briefing = [_user_text(_briefing_text())] + base
 
         assert mod.signal_counts(with_briefing) == mod.signal_counts(base)
+
+    @pytest.mark.parametrize(
+        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
+        ids=['usage_limit', 'crash_recovery'],
+    )
+    def test_resume_prompt_is_excluded_lockstep(self, resume_prompt):
+        # LOCKSTEP: asserted against each canonical constant, not a
+        # restated literal, so a harness rewording of either resume prompt
+        # turns this suite red instead of silently drifting out of
+        # coverage. One parametrize row per resume prompt -- a future
+        # resume prompt is covered by adding one more row.
+        assert mod.is_harness_injected_turn(resume_prompt) is True
+
+    def test_crash_recovery_resume_prompt_excluded_from_iter_user_turns(self):
+        # The sibling of the usage-limit resume prompt: same defect class
+        # (harness-injected continuation boilerplate typed into the
+        # transcript as an ordinary user turn), different cause
+        # (orchestrator restart, not a usage-cap interrupt).
+        records = [_user_text(CRASH_RECOVERY_RESUME_PROMPT)]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_usage_limit_resume_prompt_excluded_from_iter_user_turns(self):
+        # Reproduces the sighting verbatim: the resume prompt appears both
+        # before and after a genuine correction. Neither occurrence must
+        # surface, while the genuine correction survives with its original
+        # record index preserved.
+        records = [
+            _user_text(CAP_HIT_RESUME_PROMPT),
+            _user_text('please fix the bug'),
+            _user_text(CAP_HIT_RESUME_PROMPT),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [t['text'] for t in turns] == ['please fix the bug']
+        assert [t['index'] for t in turns] == [1]
+
+    def test_usage_limit_mentioned_in_passing_is_not_excluded(self):
+        # Must NOT regress: a genuine human turn that merely MENTIONS a
+        # usage limit in passing -- not the harness's exact resume prompt
+        # -- stays in the gold bucket.
+        records = [_user_text('we keep hitting a usage limit, can you shorten the run?')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == 'we keep hitting a usage limit, can you shorten the run?'
+
+    def test_lone_memory_context_block_is_excluded(self):
+        # LOCKSTEP: built from the imported MEMORY_CONTEXT_CAVEAT constant,
+        # not a restated copy, so a caveat rewording turns this suite red.
+        records = [_user_text(_memory_context_block())]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_bare_context_heading_over_human_prose_is_not_excluded(self):
+        # Pins that the co-occurrence guard is NOT being weakened by the
+        # new arm: a genuine human turn that merely opens with a
+        # '# Context' heading, with none of the memory-context body
+        # markers, stays in the gold bucket.
+        records = [_user_text('# Context\n\nwe discussed this yesterday; please redo it')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+
+    def test_caveat_mid_prose_without_heading_is_not_excluded(self):
+        # Pins that the new arm is still a CONJUNCTION with the
+        # line-anchored heading: quoting the caveat mid-prose, with no
+        # '# Context' heading of its own, must not trigger exclusion.
+        records = [_user_text(
+            'Someone pasted this: ' + MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory')
+        )]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+
+    @pytest.mark.parametrize(
+        'text', _NO_RECALLED_SECTIONS_VARIANTS,
+        ids=[
+            'memory_unavailable', 'memory_unavailable_with_drop_note',
+            'no_memory_context', 'no_memory_context_with_drop_note',
+        ],
+    )
+    def test_no_recalled_sections_variant_is_excluded(self, text):
+        # Exhaustive over _get_memory_context's four no-recalled-sections
+        # return paths, not just the caveat-bearing happy path covered
+        # above -- the marker set must cover every output of that
+        # function, not merely its most common case.
+        records = [_user_text(text)]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_recalled_sections_with_trailing_unavailable_note_is_excluded(self):
+        # The fifth _get_memory_context return path (recalled_sections
+        # non-empty), at its fullest composite: a drop_note folded into
+        # the caveat PLUS a trailing memory-unavailable note from a later
+        # failed query. Both suffixes are appended AFTER the caveat
+        # prefix HARNESS_CONTEXT_BLOCK_MARKERS matches on, so the caveat
+        # marker alone must still cover this shape -- not just the plain
+        # caveat-only shape _memory_context_block() builds.
+        records = [_user_text(_recalled_sections_with_trailing_unavailable_note())]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_render_digest_zero_signal_session_has_no_gold_section(self):
+        # Acceptance test at the render_digest level, reproducing the
+        # sighting verbatim (session b976febe) minus its one genuine
+        # correction: a zero-signal session that used to present as
+        # gold-bearing (3 harness-injected turns, every signal_counts
+        # bucket 0) must no longer do so once R1's exclusion covers all
+        # three shapes. Asserted as "every bucket is 0" rather than
+        # against a hardcoded key set: the bucket vocabulary grows
+        # independently of this filter (task 4027 added
+        # 'designed_outcome'), and pinning the key set here would turn
+        # every such addition into a spurious failure of an R1 test.
+        records = _resume_and_context_block_records()
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert set(meta['signal_counts']) >= {
+            'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
+        }
+        assert all(count == 0 for count in meta['signal_counts'].values())
+        assert '## User Corrections' not in digest
+        # n_user_turns inflation is gone: score_signals(all-zero counts, 0).
+        assert meta['score'] == 0.0
+        assert 'previous run was interrupted' not in body
+        assert '# Context' not in body
+
+    def test_render_digest_retains_only_genuine_correction_alongside_excluded_turns(self):
+        # Non-regression half of the acceptance test: a genuine human
+        # correction added to the same zero-signal session must still
+        # surface, and ONLY it -- the excluded turns contribute nothing to
+        # either the gold section or the score.
+        records = _resume_and_context_block_records() + [
+            _with_session_meta(_user_text('This is wrong, please redo it.')),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Corrections' in digest
+        correction_lines = [line for line in body.splitlines() if line.startswith('- (turn')]
+        assert correction_lines == ['- (turn 3) This is wrong, please redo it.']
+        assert 'previous run was interrupted' not in body
+        assert '# Context' not in body
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 1)
+
+    def test_signal_counts_unaffected_by_resume_and_context_block_turns(self):
+        # Mirrors test_signal_counts_unaffected_by_signal_free_briefing_turn,
+        # but for the two NEW exclusion arms this task adds (resume prompt,
+        # lone context block): prepending both to a records list that
+        # already trips every detector must not perturb any of the five
+        # signal_counts -- the filter must not leak into
+        # _signal_text_sources.
+        base = _all_signals_records()
+        augmented = [
+            _user_text(CAP_HIT_RESUME_PROMPT),
+            _user_text(_memory_context_block()),
+        ] + base
+
+        assert mod.signal_counts(augmented) == mod.signal_counts(base)
+
+    def test_classify_agent_class_still_detects_markers_inside_resume_turn(self):
+        # Sibling of test_classify_agent_class_still_detects_markers_inside_
+        # excluded_turn, for the resume-prompt exclusion arm specifically:
+        # classify_agent_class reads _signal_text_sources, a carrier never
+        # filtered by iter_user_turns, so orchestrated-task markers living
+        # inside an otherwise-excluded resume turn must still be found.
+        text = (
+            CAP_HIT_RESUME_PROMPT
+            + '\nTask ID: 4275\nWorktree: /home/leo/src/dark-factory/.worktrees/4275\n'
+        )
+        records = [_user_text(text)]
+
+        assert mod.iter_user_turns(records) == []
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
 
 
 # ---------------------------------------------------------------------------
@@ -1573,8 +2237,8 @@ class TestRenderDigest:
         assert meta['cwd'] == _DIGEST_CWD
         assert meta['date'] == '2026-07-11'
         assert meta['agent_class'] == 'interactive'
-        # No transcript path given -> encoded_dir falls back to the
-        # cwd.replace('/','-').replace('.','-') mirror encoding.
+        # No transcript path given -> encoded_dir falls back to the mirror of
+        # session_registry.encode_cwd (every '/', '.' and '_' maps to '-').
         assert meta['encoded_dir'] == '-home-leo-src-dark-factory'
 
     def test_encoded_dir_prefers_transcript_path_parent_dir_name(self, tmp_path):
@@ -1947,6 +2611,139 @@ class TestTruncatedItemsFrontmatter:
 
 
 # ---------------------------------------------------------------------------
+# Designed Outcomes section -- 07-31 census cluster 1.3 / R3. A declared
+# bounded-poll ceiling is reported, but in its OWN section: it must never
+# masquerade as an error neighborhood, and the error section must surface
+# exit codes so a bare 124 stays distinguishable to a human reader.
+# ---------------------------------------------------------------------------
+
+def _mixed_designed_and_genuine_records():
+    """3 declared CEILINGs plus 1 genuine exit-2 failure -- census :97."""
+    records = [_with_session_meta(_user_text('kick off the bounded poll'))]
+    for i in range(3):
+        records.append(_assistant(_tool_use('Bash', {'command': f'poll{i}'}, id=f'tu-c{i}')))
+        records.append(_tool_result(f'tu-c{i}', _CEILING_DECLARATION, is_error=True))
+    records.append(_assistant(_tool_use('Bash', {'command': 'real'}, id='tu-g')))
+    records.append(
+        _tool_result('tu-g', 'DARK_FACTORY_ROOT unset, exit code 2', is_error=True)
+    )
+    return records
+
+
+def _designed_outcomes_only_records():
+    """A session whose ONLY nonzero signal class is designed outcomes."""
+    records = []
+    for i in range(3):
+        records.append(_assistant(_tool_use('Bash', {'command': f'poll{i}'}, id=f'tu-{i}')))
+        records.append(_tool_result(f'tu-{i}', _CEILING_DECLARATION, is_error=True))
+    return records
+
+
+class TestDesignedOutcomesSection:
+    def test_registered_in_all_three_section_registries(self):
+        # All three or none: _SECTION_RENDERERS alone would leave
+        # _render_body/_truncate_sections unable to find the heading.
+        assert 'designed_outcomes' in mod.SECTION_HEADINGS
+        assert 'designed_outcomes' in mod.SECTION_PRIORITY
+        assert 'designed_outcomes' in mod._SECTION_RENDERERS
+
+    def test_ranks_lowest_in_section_priority(self):
+        # Index 0 == trimmed FIRST under the soft cap, below retry_loops:
+        # a designed outcome is explicitly NOT confusion.
+        assert mod.SECTION_PRIORITY[0] == 'designed_outcomes'
+
+    def test_genuine_error_alone_under_error_neighborhoods(self):
+        digest = mod.render_digest(
+            _mixed_designed_and_genuine_records(), agent_class='interactive',
+        )
+        _, body = _split_frontmatter(digest)
+
+        error_block = body.split('## Error Neighborhoods', 1)[1].split('\n##', 1)[0]
+
+        assert 'exit code 2' in error_block
+        assert 'CEILING' not in error_block
+
+    def test_designed_outcomes_render_under_their_own_heading(self):
+        digest = mod.render_digest(
+            _mixed_designed_and_genuine_records(), agent_class='interactive',
+        )
+        _, body = _split_frontmatter(digest)
+
+        assert '## Designed Outcomes' in body
+        designed_block = body.split('## Designed Outcomes', 1)[1].split('\n##', 1)[0]
+        assert designed_block.count('CEILING') == 3
+
+    def test_ceiling_text_is_never_rendered_in_both_sections(self):
+        digest = mod.render_digest(
+            _mixed_designed_and_genuine_records(), agent_class='interactive',
+        )
+        _, body = _split_frontmatter(digest)
+
+        # 3 ceilings, each rendered exactly once -- the partition is
+        # lossless, so the total must not double.
+        assert body.count(_CEILING_DECLARATION) == 3
+
+    def test_error_neighborhood_line_surfaces_the_exit_code(self):
+        # 07-31 R3's "record exit codes" ask: the code is promoted to a
+        # STRUCTURED marker on the line, not merely left buried in
+        # whatever prose the tool happened to echo -- and the error
+        # content can be byte-truncated away by the per-item cap.
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'boom'}, id='tu-1')),
+            _tool_result('tu-1', 'fatal: bad thing, exit status 137', is_error=True),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+        _, body = _split_frontmatter(digest)
+
+        error_block = body.split('## Error Neighborhoods', 1)[1].split('\n##', 1)[0]
+        assert '[exit 137]' in error_block
+
+    def test_error_neighborhood_line_omits_the_marker_when_no_code(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'boom'}, id='tu-1')),
+            _tool_result('tu-1', 'something went wrong', is_error=True),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+        _, body = _split_frontmatter(digest)
+
+        error_block = body.split('## Error Neighborhoods', 1)[1].split('\n##', 1)[0]
+        assert '[exit' not in error_block
+
+    def test_designed_outcome_line_names_the_rule_that_fired(self):
+        # Distinct labels per rule keep which-rule-fired legible: a
+        # self-declared CEILING must not read the same as a bare 124.
+        _, declared = mod.classify_error_content(_CEILING_DECLARATION)
+        assert declared is not None
+
+        digest = mod.render_digest(
+            _designed_outcomes_only_records(), agent_class='interactive',
+        )
+        _, body = _split_frontmatter(digest)
+
+        designed_block = body.split('## Designed Outcomes', 1)[1].split('\n##', 1)[0]
+        assert declared in designed_block
+        assert '[exit 124]' in designed_block
+
+    def test_designed_outcome_only_session_renders_a_body_without_warning(self, caplog):
+        # The registration regression: signal_counts is now nonzero for a
+        # ceiling-only session, so an unregistered section would leave the
+        # body empty and trip _warn_if_body_evicted on EVERY such session.
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+        records = _designed_outcomes_only_records()
+
+        assert mod.signal_counts(records)['designed_outcome'] == 3
+
+        digest = mod.render_digest(records, agent_class='interactive')
+        _, body = _split_frontmatter(digest)
+
+        assert body.strip() != ''
+        assert '## Designed Outcomes' in body
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+# ---------------------------------------------------------------------------
 # _warn_if_body_evicted / render_digest emit-time guard -- R2 part 2
 # (confusion census 2026-07-24 Sec 4): belt-and-braces backstop for the
 # invariant step-4's per-item cap makes structurally unreachable at any
@@ -2036,9 +2833,9 @@ class TestEmitConsistencyGuard:
         assert body.strip() != ''
         assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
-    def test_build_digest_end_to_end_on_gz_orchestrated_session(self, tmp_path):
+    def test_build_digest_end_to_end_on_archived_orchestrated_session(self, tmp_path):
         # Already green off steps 2/4 -- the end-to-end acceptance check:
-        # a real orchestrated-looking gz transcript (briefing turn +
+        # a real orchestrated-looking archived transcript (briefing turn +
         # genuine human correction + tool_error + not_found) yields a
         # non-empty, briefing-free digest with an intact frontmatter
         # contract.
@@ -2049,7 +2846,7 @@ class TestEmitConsistencyGuard:
             _with_session_meta(_tool_result('tu-err', 'Exit code 1', is_error=True)),
             _with_session_meta(_tool_result('tu-nf', 'bash: foo: command not found', is_error=False)),
         ]
-        path = _write_jsonl_gz(tmp_path, records)
+        path = _write_archived_jsonl(tmp_path, records)
 
         digest = mod.build_digest(path)
 
@@ -2066,6 +2863,9 @@ class TestEmitConsistencyGuard:
         parsed = yaml.safe_load(frontmatter_yaml)
         assert set(parsed) == set(mod.FRONTMATTER_KEYS) | {'signal_counts'}
         assert set(parsed['signal_counts']) == set(mod.SIGNAL_COUNT_KEYS)
+        # Per-digest provenance travels with every rendered digest, so a
+        # census can tell which generation of the instrument produced it.
+        assert parsed['instrument_version'] == mod.DIGEST_INSTRUMENT_VERSION
 
         lines = frontmatter_yaml.splitlines()
         top_level_keys = [line.split(':', 1)[0] for line in lines if not line.startswith(' ')]

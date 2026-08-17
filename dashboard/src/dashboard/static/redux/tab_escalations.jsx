@@ -131,6 +131,64 @@ function sevClass(sev) {
   return 'esc-sev-low';
 }
 
+// ── Unreadable-queue-file notice ──
+//
+// Modelled on tab_memory_evals.jsx::IssuesNotice.  Expanded by default, on
+// purpose: collapsing a degraded-state notice reproduces the silent degradation
+// it exists to prevent (INV-2/INV-4, the 2658 parse_failures precedent).  Each
+// entry names its path and the parse error — a bare count tells the operator
+// something is wrong but not what.
+//
+// These records are deliberately NOT filtered by the level/status chips: a file
+// that could not be parsed has neither a `level` nor a `status`, so there is
+// nothing for matchesFilter to test, and routing them through the chips would
+// let an arbitrary default decide whether the operator is told about corruption.
+//
+// At most SKIPPED_ROW_CAP paths are listed, with an overflow line for the rest.
+// The normal case is one or two files, but a truncated write, a permission
+// fault, or a half-synced mount degrades a whole directory at once — hundreds of
+// always-expanded rows would push the actual escalation table far below the fold
+// and degrade the same operator view this notice exists to serve.  The headline
+// and the collapsed-group badge always state the TRUE total, so the cap shortens
+// the list without ever understating the loss.
+const SKIPPED_ROW_CAP = 20;
+
+function SkippedNotice({ skipped }) {
+  const rows = skipped || [];
+  if (!(rows.length > 0)) return null;
+  const shown = rows.slice(0, SKIPPED_ROW_CAP);
+  const hidden = rows.length - shown.length;
+  return (
+    <div
+      data-testid="escalation-skipped"
+      style={{
+        padding: '8px 12px',
+        marginBottom: 8,
+        border: '1px solid var(--line)',
+        borderRadius: 4,
+        background: 'var(--bg-2)',
+        color: 'var(--fg-2)',
+        fontFamily: 'var(--mono)',
+        fontSize: 11,
+      }}
+    >
+      <div style={{ color: 'var(--warn)', marginBottom: 4 }}>
+        {rows.length} queue file(s) unreadable — the counts for this queue are short by that many
+      </div>
+      {shown.map((s, i) => (
+        <div key={`${s.path}-${i}`} style={{ color: 'var(--fg-3)' }}>
+          {s.path || '—'} — {s.error || '—'}
+        </div>
+      ))}
+      {hidden > 0 && (
+        <div style={{ color: 'var(--fg-3)', marginTop: 4 }}>
+          …and {hidden} more (listing the first {SKIPPED_ROW_CAP})
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Window slicing (trailing 7d, anchored to the payload's own generated_at
 //    clock — never Date.now(), so the window stays consistent with the
 //    server's clock and immune to browser-clock skew; same discipline as
@@ -469,6 +527,19 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
         {/* Summary pills */}
         <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)' }}>
           {byStatus.pending || 0} pending · {byLevel[1] || 0} L1 · {byLevel[2] || 0} L2
+          {/* Global, like the pips beside it: read from the unfiltered top-level
+              summary, so with a project filter active this can count files in
+              queues that are not rendered below.  Titled rather than re-derived
+              from the filtered subsections — a corruption signal that shrinks
+              when you narrow the view would understate the fleet's actual
+              degraded state, which is the failure this whole notice exists to
+              prevent.  The title states the mismatch instead of leaving the
+              operator to infer it from a count with no visible source. */}
+          {(gs.skipped_count || 0) > 0 && (
+            <span title="Across all queues, including any hidden by the project filter">
+              {' '}· {gs.skipped_count} unreadable
+            </span>
+          )}
         </span>
       </div>
 
@@ -489,6 +560,10 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
           return true;
         }));
 
+        // Queue files the reader could not parse.  Read unfiltered — see the
+        // SkippedNotice comment: a corrupt file has no level or status to chip-filter on.
+        const skipped = sec.skipped || [];
+
         const summary = (
           <>
             <span className="pip" style={{ fontSize: 10 }}>{secByStatus.pending || 0} pending</span>
@@ -497,6 +572,9 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
             )}
             {(secByLevel[2] || 0) > 0 && (
               <span className="pip"><span className="badge bad" style={{ fontSize: 9 }}>L2 · {secByLevel[2]}</span></span>
+            )}
+            {skipped.length > 0 && (
+              <span className="pip"><span className="badge bad" style={{ fontSize: 9 }}>{skipped.length} unreadable</span></span>
             )}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{sec.kind}</span>
           </>
@@ -511,6 +589,10 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
               onToggle={() => toggle(sec.id)}
               summary={summary}
             >
+              {/* Above and outside the empty-state ternary on purpose: a group
+                  rendering "No escalations match current filters" while holding an
+                  unreadable file is precisely the looks-empty-but-isn't case. */}
+              <SkippedNotice skipped={skipped} />
               {filteredRows.length === 0 ? (
                 <div style={{ fontSize: 12, color: 'var(--fg-3)', padding: '8px 0' }}>
                   No escalations match current filters.

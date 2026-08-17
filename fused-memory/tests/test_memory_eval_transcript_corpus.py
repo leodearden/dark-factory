@@ -15,13 +15,11 @@ the script only reads transcripts off disk.
 """
 from __future__ import annotations
 
-import gzip
 import importlib.util
-import io
 import json
+import os
 import sys
 import types
-import zlib
 from pathlib import Path
 from typing import Any
 
@@ -230,8 +228,8 @@ class TestExtractSearches:
         assert [r['query'] for r in records] == ['first query', 'second query']
 
     def test_source_is_stamped(self):
-        records = _mod.extract_searches(self.RECORDS, source='some/relative/path.jsonl.gz')
-        assert records[0]['transcript'] == 'some/relative/path.jsonl.gz'
+        records = _mod.extract_searches(self.RECORDS, source='some/relative/path.jsonl')
+        assert records[0]['transcript'] == 'some/relative/path.jsonl'
 
     def test_tool_names_is_overridable(self):
         records = _mod.extract_searches(
@@ -474,10 +472,10 @@ class TestResultStatus:
 # step-9 — archive-path provenance
 # ===========================================================================
 
-MAIN_REL = '2280/-home-leo-src-dark-factory--worktrees-2280/775be5c7-539a-4071-ad3c-89422cf3317a.jsonl.gz'
+MAIN_REL = '2280/-home-leo-src-dark-factory--worktrees-2280/775be5c7-539a-4071-ad3c-89422cf3317a.jsonl'
 SUB_REL = (
     '3006/-home-leo-src-dark-factory--worktrees-3006/'
-    '2f747640-1111-2222-3333-444444444444/subagents/agent-a2af78e35bd434081.jsonl.gz'
+    '2f747640-1111-2222-3333-444444444444/subagents/agent-a2af78e35bd434081.jsonl'
 )
 
 
@@ -512,13 +510,13 @@ class TestParseArchivePath:
         assert parsed['session_id'] == 'session-abc'
 
     def test_too_shallow_path_degrades_without_raising(self):
-        assert _mod.parse_archive_path('loose-file.jsonl.gz') == {
+        assert _mod.parse_archive_path('loose-file.jsonl') == {
             'task_id': None, 'session_id': None,
             'is_subagent': False, 'subagent_id': None,
         }
 
     def test_unexpected_shape_degrades_without_raising(self):
-        parsed = _mod.parse_archive_path('a/b/c/d/e/f.jsonl.gz')
+        parsed = _mod.parse_archive_path('a/b/c/d/e/f.jsonl')
         assert parsed['task_id'] == 'a'
         assert parsed['session_id'] is None
         assert parsed['is_subagent'] is False
@@ -566,83 +564,43 @@ class TestProvenanceThreadedIntoRecords:
 
 
 def _write_transcript(root: Path, rel: str, records: list[dict]) -> Path:
-    """Write a gzipped transcript at *rel* under *root*."""
+    """Write a plain-.jsonl transcript at *rel* under *root*."""
     path = root / rel
     path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(path, 'wt', encoding='utf-8') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(json.dumps(r) for r in records) + '\n')
     return path
 
 
-def _write_corrupt(root: Path, rel: str) -> Path:
-    """A file under a .jsonl.gz name that is not gzip at all."""
-    path = root / rel
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b'this is not gzip\n')
-    return path
+_UNDECODABLE_BODY = b'{"type": "user", "seq": 0}\n{"type": "user", "t": "\xff\xfe"}\n'
+"""A JSONL body whose SECOND line carries a raw 0xFF — invalid UTF-8.
 
-
-def _gz_payload(n_records: int = 200) -> bytes:
-    """A multi-record JSONL body for the two damaged-archive helpers below.
-    Padded to many records so a cut at the halfway mark lands mid-stream."""
-    return ''.join(
-        json.dumps({'type': 'user', 'seq': i, 'pad': 'x' * 200}) + '\n'
-        for i in range(n_records)
-    ).encode('utf-8')
-
-
-def _write_truncated(root: Path, rel: str) -> Path:
-    """Half a valid gz stream — an archive write interrupted by a killed unit.
-
-    Raw ``gzip`` signals this with ``EOFError``, which is not an ``OSError``;
-    the readers normalize it so this script's ``except OSError`` counts it.
-    """
-    path = root / rel
-    path.parent.mkdir(parents=True, exist_ok=True)
-    blob = gzip.compress(_gz_payload())
-    path.write_bytes(blob[: len(blob) // 2])
-    return path
-
-
-def _write_corrupt_body(root: Path, rel: str) -> Path:
-    """A gz whose DEFLATE body is damaged — raw ``gzip`` raises ``zlib.error``.
-
-    Probes for the first single-byte flip producing that shape (most flips
-    only trip the trailing checksum, which is already an ``OSError``), using
-    stdlib gzip directly so the helper is independent of the readers.
-    """
-    path = root / rel
-    path.parent.mkdir(parents=True, exist_ok=True)
-    blob = gzip.compress(_gz_payload())
-    for index in range(10, len(blob)):
-        candidate = bytearray(blob)
-        candidate[index] ^= 0xFF
-        try:
-            gzip.GzipFile(fileobj=io.BytesIO(bytes(candidate))).read()
-        except zlib.error:
-            path.write_bytes(bytes(candidate))
-            return path
-        except Exception:
-            continue  # a different corruption shape — keep probing
-    raise AssertionError('no single-byte flip produced a zlib.error body')
+The first line is well-formed on purpose: a reader that degraded this
+per-LINE rather than per-FILE would be visibly distinguishable here (it would
+yield record 0 and skip record 1) instead of silently passing.
+"""
 
 
 def _write_undecodable(root: Path, rel: str) -> Path:
-    """A structurally VALID gz whose payload is not valid UTF-8.
+    """A ``.jsonl`` whose payload is not valid UTF-8.
 
-    A fourth shape, and the one the helpers above structurally cannot reach:
-    they damage the gzip CONTAINER, and the ``_write_corrupt_body`` probe
-    decompresses in binary mode, so none of them exercises the text layer.
-    This file decompresses cleanly and fails one level up, where the readers'
-    ``encoding='utf-8'`` wrapper meets byte 0xFF — ``UnicodeDecodeError``,
-    a ``ValueError`` subclass, so it escapes ``except OSError`` unless the
-    readers normalize it too. A flipped byte in stored archive data or a
-    ``.jsonl`` half-written by a killed unit produces it.
+    The gzip wrapper this fixture once carried was always incidental — the
+    fault is at the TEXT layer, where the readers' ``encoding='utf-8'``
+    wrapper meets byte 0xFF and raises ``UnicodeDecodeError``. That is a
+    ``ValueError`` subclass, so it escapes ``except OSError`` unless the
+    readers normalize it, and it is reachable on a plain ``.jsonl`` exactly as
+    it was on a ``.gz``. A flipped byte in stored archive data, or a file
+    half-written by a killed unit, produces it.
+
+    THE fixture for an unreadable transcript body, deliberately singular: with
+    the archive stored plain this is the only damage shape that makes a whole
+    file unreadable by its CONTENT. "Not gzip" is not a failure at all any
+    more — those bytes are simply ordinary text. (A file can still be
+    unreadable for reasons outside its bytes; see ``_write_unopenable``.)
     """
     path = root / rel
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(gzip.compress(
-        b'{"type": "user", "seq": 0}\n{"type": "user", "t": "\xff\xfe"}\n'))
+    path.write_bytes(_UNDECODABLE_BODY)
     return path
 
 
@@ -654,9 +612,9 @@ class TestScanArchive:
     it says what it skipped.
     """
 
-    GOOD_REL = '2280/-enc-a/aaaa-1111.jsonl.gz'
-    EMPTY_REL = '2280/-enc-a/bbbb-2222.jsonl.gz'
-    BAD_REL = '3006/-enc-b/cccc-3333.jsonl.gz'
+    GOOD_REL = '2280/-enc-a/aaaa-1111.jsonl'
+    EMPTY_REL = '2280/-enc-a/bbbb-2222.jsonl'
+    BAD_REL = '3006/-enc-b/cccc-3333.jsonl'
 
     def _tree(self, tmp_path: Path) -> Path:
         root = tmp_path / 'archive'
@@ -669,7 +627,7 @@ class TestScanArchive:
         ])
         # Parses fine, holds no searches — must count as READ, not as failed.
         _write_transcript(root, self.EMPTY_REL, [{'type': 'queue-operation'}])
-        _write_corrupt(root, self.BAD_REL)
+        _write_undecodable(root, self.BAD_REL)
         return root
 
     def test_returns_the_good_files_records(self, tmp_path):
@@ -716,7 +674,7 @@ class TestScanArchive:
 
     def test_subagent_transcripts_are_scanned(self, tmp_path):
         root = tmp_path / 'archive'
-        _write_transcript(root, '3006/-enc-b/sess-1/subagents/agent-ff00.jsonl.gz', [
+        _write_transcript(root, '3006/-enc-b/sess-1/subagents/agent-ff00.jsonl', [
             _tool_use('toolu_1', 'from a subagent'),
             _tool_result('toolu_1', {'results': []}),
         ])
@@ -765,8 +723,8 @@ class TestFailureExamplesAreCapped:
 
     def _two_failures(self, tmp_path: Path) -> Path:
         root = tmp_path / 'archive'
-        _write_corrupt(root, '1/-enc/a.jsonl.gz')
-        _write_corrupt(root, '2/-enc/b.jsonl.gz')
+        _write_undecodable(root, '1/-enc/a.jsonl')
+        _write_undecodable(root, '2/-enc/b.jsonl')
         return root
 
     def test_count_is_never_capped(self, tmp_path):
@@ -900,9 +858,9 @@ class TestWriteCorpus:
 
     RECORDS = [
         {'schema_version': _mod.SCHEMA_VERSION, 'query': 'first', 'result_status': 'ok',
-         'results': [{'id': 'a', 'score': 0.9, 'rank': 1}], 'transcript': 'x/y/z.jsonl.gz'},
+         'results': [{'id': 'a', 'score': 0.9, 'rank': 1}], 'transcript': 'x/y/z.jsonl'},
         {'schema_version': _mod.SCHEMA_VERSION, 'query': 'secönd', 'result_status': 'missing',
-         'results': [], 'transcript': 'x/y/z.jsonl.gz'},
+         'results': [], 'transcript': 'x/y/z.jsonl'},
     ]
 
     def _write(self, out_root: Path, coverage=None):
@@ -1010,11 +968,11 @@ class TestRenderReport:
     def test_names_the_failure_examples(self):
         coverage = _coverage(found=2, read=1, failed=1)
         coverage['parse_failures']['examples'] = [
-            {'transcript': '3006/-enc/bad.jsonl.gz', 'reason': 'BadGzipFile: nope'}
+            {'transcript': '3006/-enc/bad.jsonl', 'reason': 'undecodable transcript bytes: 0xff'}
         ]
         text = self._report(coverage)
-        assert '3006/-enc/bad.jsonl.gz' in text
-        assert 'BadGzipFile' in text
+        assert '3006/-enc/bad.jsonl' in text
+        assert 'undecodable' in text
 
     def test_discloses_example_truncation_in_words(self):
         coverage = _coverage(found=100, read=0, failed=100)
@@ -1152,8 +1110,8 @@ class TestZeroSearchCasesAreDistinguishableEndToEnd:
 
     def _all_corrupt(self, tmp_path) -> Path:
         root = tmp_path / 'corrupt-archive'
-        for rel in ('1/-enc/a.jsonl.gz', '2/-enc/b.jsonl.gz', '3/-enc/c.jsonl.gz'):
-            _write_corrupt(root, rel)
+        for rel in ('1/-enc/a.jsonl', '2/-enc/b.jsonl', '3/-enc/c.jsonl'):
+            _write_undecodable(root, rel)
         return root
 
     def test_all_unparseable_exits_three(self, tmp_path):
@@ -1238,6 +1196,63 @@ class TestReaderBindings:
         import legibility.inventory  # type: ignore[reportMissingImports]
         assert _mod.iter_json_lines is legibility.inventory.iter_json_lines
 
+    def test_residual_gz_count_is_the_imported_function(self):
+        # Same rule for "what counts as residual": one answer, in the module
+        # that owns the archive walk, not a second glob written here.
+        import legibility.inventory  # type: ignore[reportMissingImports]
+        assert _mod.count_residual_gz is legibility.inventory.count_residual_gz
+
+
+class TestResidualGzIsDisclosed:
+    """A transcript still gzipped is not enumerated at all, so it cannot show
+    up as a parse failure — it shows up as nothing.
+
+    Between this merge and the human-operated migration sweep the archive can
+    hold thousands of them, and a corpus short by that many would otherwise be
+    indistinguishable from a complete scan of a smaller archive. The coverage
+    says how many it could not see; the report says it in words.
+    """
+
+    GOOD_REL = '2280/-enc-a/readable.jsonl'
+
+    def _tree(self, tmp_path: Path, *, residual: int) -> Path:
+        root = tmp_path / 'archive'
+        _write_transcript(root, self.GOOD_REL, [
+            _tool_use('toolu_1', 'a search that is visible'),
+            _tool_result('toolu_1', {'results': [_result('a', 0.9)]}),
+        ])
+        for i in range(residual):
+            # Not valid gzip: the count must never open these.
+            (root / '2280' / '-enc-a' / f'stale-{i}.jsonl.gz').write_bytes(b'nope')
+        return root
+
+    def test_coverage_names_what_the_walk_could_not_see(self, tmp_path):
+        _, coverage, records, _ = _run_cli(
+            self._tree(tmp_path, residual=2), tmp_path / 'out')
+
+        assert coverage['residual_gz'] == 2
+        # Not conflated with either counter it could be mistaken for: the
+        # residue was never found, and never failed to parse.
+        assert coverage['transcripts_found'] == 1
+        assert coverage['parse_failures']['count'] == 0
+        assert [r['query'] for r in records] == ['a search that is visible']
+
+    def test_the_report_says_it_in_words(self, tmp_path):
+        _, _, _, report = _run_cli(
+            self._tree(tmp_path, residual=2), tmp_path / 'out')
+
+        assert 'gzipped' in report
+        assert 'migrate_transcript_archive_gunzip.py' in report
+
+    def test_a_migrated_archive_reports_zero_and_says_nothing(self, tmp_path):
+        # Always present, even at zero — an absent counter reads as "not
+        # measured", a different claim. But the prose is self-clearing.
+        _, coverage, _, report = _run_cli(
+            self._tree(tmp_path, residual=0), tmp_path / 'out')
+
+        assert coverage['residual_gz'] == 0
+        assert 'gzipped' not in report
+
 
 class TestSingleTranscriptMode:
     """``--transcript`` drives the SAME core through the OTHER reader."""
@@ -1308,9 +1323,9 @@ class TestSingleTranscriptMode:
         # file that is genuinely not in an archive tree. Inventing provenance
         # from whatever directories happen to be above it would be worse than
         # the null it replaces.
-        loose = tmp_path / 'scratch' / 'somewhere' / 'session.jsonl.gz'
+        loose = tmp_path / 'scratch' / 'somewhere' / 'session.jsonl'
         loose.parent.mkdir(parents=True)
-        with gzip.open(loose, 'wt', encoding='utf-8') as f:
+        with open(loose, 'w', encoding='utf-8') as f:
             f.write(json.dumps(_briefing('claude-task-9001-implementer')) + '\n')
             f.write(json.dumps(_tool_use('toolu_loose', 'a loose search')) + '\n')
 
@@ -1319,15 +1334,14 @@ class TestSingleTranscriptMode:
         assert [r['task_id'] for r in records] == [None]
         assert records[0]['session_id'] is None
         assert records[0]['is_subagent'] is False
-        assert records[0]['transcript'] == 'session.jsonl.gz'
+        assert records[0]['transcript'] == 'session.jsonl'
         assert coverage['tasks_scanned'] == 0
         # The caller identity read from the briefing is unaffected — it comes
         # from the record bodies, not the path.
         assert records[0]['caller']['task_id'] == '9001'
 
     def test_unreadable_file_is_total_failure_not_a_traceback(self, tmp_path):
-        bad = tmp_path / 'broken.jsonl.gz'
-        bad.write_bytes(b'not gzip at all\n')
+        bad = _write_undecodable(tmp_path, 'broken.jsonl')
         code, coverage, records = self._cli(bad, tmp_path / 'out')
         assert code == 3
         assert coverage['status'] == 'total_failure'
@@ -1335,7 +1349,7 @@ class TestSingleTranscriptMode:
         assert records == []
 
     def test_absent_file_is_total_failure(self, tmp_path):
-        code, coverage, _ = self._cli(tmp_path / 'nope.jsonl.gz', tmp_path / 'out')
+        code, coverage, _ = self._cli(tmp_path / 'nope.jsonl', tmp_path / 'out')
         assert code == 3
         assert coverage['status'] == 'total_failure'
 
@@ -1344,40 +1358,48 @@ class TestSingleTranscriptMode:
 # step-27 — a PARTIALLY-WRITTEN archived transcript is counted, not fatal
 #
 # The `except OSError` handlers in this script are only as good as the
-# contract the readers keep. Measured, an unreadable archived transcript
-# arrives as FOUR different types, and only bad magic is already an OSError:
+# contract the readers keep. With the archive stored PLAIN (task 3618), the
+# three gzip container shapes — bad magic, truncated stream, corrupt body —
+# cease to exist, and exactly one file-level failure remains that is not
+# ALREADY an OSError:
 #
-#     bad magic         -> gzip.BadGzipFile     (an OSError subclass)
-#     truncated stream  -> EOFError             (not an OSError)
-#     corrupt body      -> zlib.error           (not an OSError)
 #     undecodable byte  -> UnicodeDecodeError   (a ValueError, not an OSError)
 #
-# The last is the one that survives a fix aimed only at the gzip layer: the
-# container decompresses fine and the fault is at the readers' strict
-# `encoding='utf-8'` text wrapper, so it is reachable on a plain `.jsonl`
-# too, and being a ValueError it escapes `except OSError` however the three
-# gzip shapes are handled.
+# (A transcript can still be unreadable for reasons outside its bytes — EACCES,
+# EIO — but those arrive as OSError and only need passing through. Both routes
+# to the counted path are exercised below, because a normalization that
+# flattened the two into one indistinguishable reason would misdirect the
+# operator reading it.)
 #
-# Before the readers normalized them, ONE truncated file among the live
-# archive's ~2814 aborted the entire run with a traceback: no corpus, no
+# It is the shape that never depended on compression in the first place: the
+# fault is at the readers' strict `encoding='utf-8'` text wrapper, so it was
+# always reachable on a plain `.jsonl`. Being a ValueError it escapes
+# `except OSError` unless the readers normalize it, which is why the
+# normalization survives this change even though the gzip shapes do not.
+#
+# Before the readers normalized it, ONE undecodable file among the live
+# archive's thousands aborted the entire run with a traceback: no corpus, no
 # coverage file, no report, and an exit status outside the documented
 # ok/degraded/no_input/total_failure vocabulary. That is precisely the
 # ambiguity this module exists to make impossible, so it is pinned here at
 # the CLI boundary rather than only at the reader.
 #
 # The archive is fire-and-forget runtime state written by the running fleet:
-# a unit killed mid-write and a file read while still being compressed both
-# produce exactly these shapes. No handler in the script changes — these
-# tests are what prove `except OSError` is now sufficient rather than
-# assuming it.
+# a unit killed mid-write, or a single flipped byte in stored data, produces
+# exactly this shape. No handler in the script changes — these tests are what
+# prove `except OSError` is now sufficient rather than assuming it.
 # ===========================================================================
 
 
 class TestPartiallyWrittenTranscriptsAreCounted:
-    GOOD_REL = '5150/-enc-a/good-session.jsonl.gz'
-    TRUNCATED_REL = '5150/-enc-a/truncated-session.jsonl.gz'
-    CORRUPT_BODY_REL = '5151/-enc-b/corrupt-body-session.jsonl.gz'
-    UNDECODABLE_REL = '5152/-enc-c/undecodable-session.jsonl.gz'
+    GOOD_REL = '5150/-enc-a/good-session.jsonl'
+    UNDECODABLE_REL = '5152/-enc-c/undecodable-session.jsonl'
+    UNOPENABLE_REL = '5153/-enc-d/unopenable-session.jsonl'
+    ALL_BAD_RELS = (
+        '5150/-enc-a/undecodable-a.jsonl',
+        '5151/-enc-b/undecodable-b.jsonl',
+        '5152/-enc-c/undecodable-c.jsonl',
+    )
 
     def _good(self, root: Path) -> Path:
         _write_transcript(root, self.GOOD_REL, [
@@ -1387,46 +1409,47 @@ class TestPartiallyWrittenTranscriptsAreCounted:
         ])
         return root
 
-    def _one_bad_one_good(self, tmp_path: Path) -> Path:
-        root = self._good(tmp_path / 'archive')
-        _write_truncated(root, self.TRUNCATED_REL)
-        return root
-
     def _one_undecodable_one_good(self, tmp_path: Path) -> Path:
         root = self._good(tmp_path / 'undecodable-archive')
         _write_undecodable(root, self.UNDECODABLE_REL)
         return root
 
     def _all_bad(self, tmp_path: Path) -> Path:
+        """Three transcripts, not one of them readable.
+
+        The files are deliberately IDENTICAL in kind: this fixture exists only
+        to prove the wholesale-failure verdict (every file found, none read),
+        and reading a distinction into three same-shaped files was exactly the
+        false discrimination this class used to claim. Genuinely different
+        causes are exercised by ``_two_distinct_causes`` below.
+        """
         root = tmp_path / 'all-bad-archive'
-        _write_truncated(root, self.TRUNCATED_REL)
-        _write_corrupt_body(root, self.CORRUPT_BODY_REL)
-        _write_undecodable(root, self.UNDECODABLE_REL)
+        for rel in self.ALL_BAD_RELS:
+            _write_undecodable(root, rel)
         return root
 
-    # -- (a) partial corruption: degraded, and the run survives -------------
+    def _two_distinct_causes(self, tmp_path: Path) -> Path:
+        """One file unreadable by its BYTES, one by its PERMISSIONS.
 
-    def test_one_truncated_file_does_not_cost_the_others(self, tmp_path):
-        # The whole point. One bad file among many must cost exactly one
-        # counted failure, not the entire corpus.
-        code, coverage, records, _ = _run_cli(
-            self._one_bad_one_good(tmp_path), tmp_path / 'out')
+        The two causes that actually remain once the archive is plain, and they
+        travel different routes to the same counted path: the undecodable body
+        raises ``UnicodeDecodeError`` (a ``ValueError``) and reaches
+        ``except OSError`` only because ``as_unreadable_file_error`` normalizes
+        it, while ``EACCES`` is already an ``OSError`` and passes through
+        unwrapped. A disclosed reason that could not tell them apart would send
+        an operator looking for a flipped byte in a file they simply cannot
+        open.
 
-        assert code == 0
-        assert coverage['status'] == 'degraded'
-        assert [r['query'] for r in records] == ['the search that must survive']
-        assert records[0]['results'][0]['id'] == 'mem-1'
-
-    def test_the_truncated_file_is_named_in_the_disclosed_failures(self, tmp_path):
-        _, coverage, _, report = _run_cli(
-            self._one_bad_one_good(tmp_path), tmp_path / 'out')
-
-        failures = coverage['parse_failures']
-        assert failures['count'] == 1
-        assert coverage['transcripts_found'] == 2
-        assert coverage['transcripts_read'] == 1
-        assert [ex['transcript'] for ex in failures['examples']] == [self.TRUNCATED_REL]
-        assert self.TRUNCATED_REL in report
+        The unopenable file's BODY is well-formed on purpose, so its only
+        defect is the mode — which is what makes the two reasons comparable.
+        """
+        root = tmp_path / 'two-cause-archive'
+        _write_undecodable(root, self.UNDECODABLE_REL)
+        unopenable = _write_transcript(root, self.UNOPENABLE_REL, [
+            _tool_use('toolu_locked', 'a search nobody can reach'),
+        ])
+        unopenable.chmod(0o000)
+        return root
 
     # -- (b) wholesale corruption: total_failure, said in words -------------
 
@@ -1435,7 +1458,7 @@ class TestPartiallyWrittenTranscriptsAreCounted:
 
         assert code == 3
         assert coverage['status'] == 'total_failure'
-        assert coverage['parse_failures']['count'] == 3
+        assert coverage['parse_failures']['count'] == len(self.ALL_BAD_RELS)
         assert records == []
 
     def test_every_file_unreadable_report_says_so_in_words(self, tmp_path):
@@ -1446,24 +1469,47 @@ class TestPartiallyWrittenTranscriptsAreCounted:
         assert 'total_failure' in report
         assert 'none could be read' in report.lower()
 
-    # -- (c) both shapes reach the counted path, distinguishably ------------
+    # -- (c) both causes reach the counted path, distinguishably ------------
 
-    def test_the_three_corruption_shapes_report_different_reasons(self, tmp_path):
-        # All are normalized to OSError so one handler catches them, but the
-        # disclosed reason must still say WHICH — an operator triaging the
-        # archive writer needs to tell a half-written file from a damaged one
-        # from one whose bytes are not text, since those are three different
-        # things to go and fix.
-        _, coverage, _, _ = _run_cli(self._all_bad(tmp_path), tmp_path / 'out')
+    def test_the_undecodable_reason_names_the_offending_byte(self, tmp_path):
+        # The reason is normalized to OSError so one handler catches it, but it
+        # must still say WHAT went wrong. With the gzip container gone the
+        # discriminating detail is no longer "which of three container shapes"
+        # but the offending byte itself — the thing an operator needs to go and
+        # find in the file.
+        _, coverage, _, _ = _run_cli(
+            self._one_undecodable_one_good(tmp_path), tmp_path / 'out')
 
         reasons = {ex['transcript']: ex['reason'] for ex in
                    coverage['parse_failures']['examples']}
-        assert set(reasons) == {
-            self.TRUNCATED_REL, self.CORRUPT_BODY_REL, self.UNDECODABLE_REL}
-        assert len(set(reasons.values())) == 3
-        assert 'end-of-stream' in reasons[self.TRUNCATED_REL]
-        assert 'decompressing' in reasons[self.CORRUPT_BODY_REL]
+        assert set(reasons) == {self.UNDECODABLE_REL}
         assert '0xff' in reasons[self.UNDECODABLE_REL].lower()
+
+    @pytest.mark.skipif(
+        os.geteuid() == 0,
+        reason='root bypasses file read permissions, so EACCES is unreachable',
+    )
+    def test_the_two_unreadable_causes_report_different_reasons(self, tmp_path):
+        # Both files are counted, and the disclosed reasons DISCRIMINATE: same
+        # normalized type, different text. Normalizing the decode shape into
+        # `except OSError` is only safe because it does not flatten what the
+        # operator is told — one reason names the byte, the other names the
+        # permission failure.
+        code, coverage, records, _ = _run_cli(
+            self._two_distinct_causes(tmp_path), tmp_path / 'out')
+
+        assert code == 3
+        assert coverage['status'] == 'total_failure'
+        assert records == []
+        assert coverage['parse_failures']['count'] == 2
+
+        reasons = {ex['transcript']: ex['reason'] for ex in
+                   coverage['parse_failures']['examples']}
+        assert set(reasons) == {self.UNDECODABLE_REL, self.UNOPENABLE_REL}
+        assert reasons[self.UNDECODABLE_REL] != reasons[self.UNOPENABLE_REL]
+        assert '0xff' in reasons[self.UNDECODABLE_REL].lower()
+        assert '0xff' not in reasons[self.UNOPENABLE_REL].lower()
+        assert 'permission' in reasons[self.UNOPENABLE_REL].lower()
 
     # -- (b2) the decode shape, on its own, at the archive boundary ---------
 
@@ -1492,10 +1538,10 @@ class TestPartiallyWrittenTranscriptsAreCounted:
 
     # -- (d) the other reader, via --transcript ----------------------------
 
-    def test_single_transcript_mode_on_a_truncated_file(self, tmp_path):
+    def test_single_transcript_mode_on_an_unreadable_file(self, tmp_path):
         # --transcript reads through load_transcript, the OTHER reader, and
         # must answer the same way rather than raising through main().
-        truncated = _write_truncated(tmp_path, 'lone/truncated.jsonl.gz')
+        truncated = _write_undecodable(tmp_path, 'lone/undecodable.jsonl')
         out_root = tmp_path / 'out'
 
         code = _mod.main([
@@ -1548,21 +1594,21 @@ class TestArchiveRelativeSlice:
     ENC = '-home-leo-src-dark-factory'
 
     def test_recovers_a_main_session_slice_from_an_absolute_path(self):
-        absolute = f'/home/leo/src/df/data/orchestrator/agent-transcripts/3214/{self.ENC}/sess.jsonl.gz'
+        absolute = f'/home/leo/src/df/data/orchestrator/agent-transcripts/3214/{self.ENC}/sess.jsonl'
 
-        assert _mod.archive_relative_slice(absolute) == f'3214/{self.ENC}/sess.jsonl.gz'
+        assert _mod.archive_relative_slice(absolute) == f'3214/{self.ENC}/sess.jsonl'
 
     def test_recovers_a_subagent_slice(self):
         absolute = (
-            f'/var/archive/3214/{self.ENC}/sess/subagents/agent-ab12.jsonl.gz'
+            f'/var/archive/3214/{self.ENC}/sess/subagents/agent-ab12.jsonl'
         )
 
         assert _mod.archive_relative_slice(absolute) == (
-            f'3214/{self.ENC}/sess/subagents/agent-ab12.jsonl.gz'
+            f'3214/{self.ENC}/sess/subagents/agent-ab12.jsonl'
         )
 
     def test_an_already_relative_slice_is_returned_unchanged(self):
-        rel = f'3214/{self.ENC}/sess.jsonl.gz'
+        rel = f'3214/{self.ENC}/sess.jsonl'
 
         assert _mod.archive_relative_slice(rel) == rel
 
@@ -1570,7 +1616,7 @@ class TestArchiveRelativeSlice:
         # Measured on the live archive: 4 of the 409 task dirs are
         # `df_task_12`-style eval-run ids, not numbers. A digits-only guard on
         # the task component would silently drop them.
-        rel = f'df_task_12/{self.ENC}/sess.jsonl.gz'
+        rel = f'df_task_12/{self.ENC}/sess.jsonl'
 
         assert _mod.archive_relative_slice(rel) == rel
 
@@ -1580,23 +1626,23 @@ class TestArchiveRelativeSlice:
         # archive slice and its grandparent directory reported as a task id —
         # a confidently wrong answer, which is worse than the null it would
         # replace.
-        assert _mod.archive_relative_slice('/tmp/pytest-42/scratch/sess.jsonl.gz') == (
-            'sess.jsonl.gz'
+        assert _mod.archive_relative_slice('/tmp/pytest-42/scratch/sess.jsonl') == (
+            'sess.jsonl'
         )
 
     def test_a_subagents_dir_without_an_encoded_cwd_is_not_relabelled(self):
         assert _mod.archive_relative_slice(
-            '/tmp/a/b/c/subagents/agent-ab12.jsonl.gz'
-        ) == 'agent-ab12.jsonl.gz'
+            '/tmp/a/b/c/subagents/agent-ab12.jsonl'
+        ) == 'agent-ab12.jsonl'
 
     def test_a_bare_file_name_is_returned_as_is(self):
-        assert _mod.archive_relative_slice('sess.jsonl.gz') == 'sess.jsonl.gz'
+        assert _mod.archive_relative_slice('sess.jsonl') == 'sess.jsonl'
 
     def test_the_recovered_slice_round_trips_through_parse_archive_path(self):
         # The property that makes the whole fix work: what this returns is
         # exactly what the scan path would have passed, so both modes reach
         # parse_archive_path with the same string.
-        absolute = f'/var/archive/3214/{self.ENC}/sess/subagents/agent-ab12.jsonl.gz'
+        absolute = f'/var/archive/3214/{self.ENC}/sess/subagents/agent-ab12.jsonl'
 
         parsed = _mod.parse_archive_path(_mod.archive_relative_slice(absolute))
 
@@ -1623,7 +1669,7 @@ class TestStampIsValidated:
 
     def _archive(self, tmp_path: Path) -> Path:
         root = tmp_path / 'archive'
-        _write_transcript(root, f'7000/-enc/{"s" * 4}.jsonl.gz', [
+        _write_transcript(root, f'7000/-enc/{"s" * 4}.jsonl', [
             _briefing('claude-task-7000-implementer'),
             _tool_use('toolu_a', 'a search'),
             _tool_result('toolu_a', {'results': [_result('mem-1', 0.9)]}),
@@ -1730,7 +1776,7 @@ class TestDefaultArchiveRoot:
         # Wiring, not just the helper: with no --archive-root, main() must
         # actually scan what default_archive_root returns.
         archive = tmp_path / 'main' / _mod.ARCHIVE_RELPATH
-        _write_transcript(archive, '8100/-enc/sess.jsonl.gz', [
+        _write_transcript(archive, '8100/-enc/sess.jsonl', [
             _briefing('claude-task-8100-implementer'),
             _tool_use('toolu_d', 'found via the default root'),
             _tool_result('toolu_d', {'results': [_result('mem-9', 0.5)]}),
@@ -1772,7 +1818,7 @@ class TestFlagWiring:
 
     def _archive(self, tmp_path: Path) -> Path:
         root = tmp_path / 'archive'
-        _write_transcript(root, '8200/-enc/sess.jsonl.gz', [
+        _write_transcript(root, '8200/-enc/sess.jsonl', [
             _briefing('claude-task-8200-implementer'),
             _tool_use('toolu_new', 'current name'),
             _tool_result('toolu_new', {'results': [_result('mem-1', 0.9)]}),
@@ -1805,9 +1851,7 @@ class TestFlagWiring:
     def test_max_failure_examples_flag_caps_the_disclosed_list(self, tmp_path):
         root = tmp_path / 'archive'
         for i in range(3):
-            path = root / '8300' / '-enc' / f'bad-{i}.jsonl.gz'
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b'not gzip at all\n')
+            _write_undecodable(root, f'8300/-enc/bad-{i}.jsonl')
 
         _, coverage, _, report = _run_cli(
             root, tmp_path / 'out', '--max-failure-examples', '1')

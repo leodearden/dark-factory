@@ -1,0 +1,51 @@
+{
+  "id": "reify_task_3834",
+  "name": "Shell-extract bridge \u03b3 \u2014 shell-extract::extract ComputeNode target + trampoline + registration",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "7c7972863038f4dd47cc8db4d15d83d4427f8dd5",
+  "post_task_commit": "d8cbc8f156d0f8e1e69e49ce180c8e3c9ec96a03",
+  "task_definition": {
+    "title": "Shell-extract bridge \u03b3 \u2014 shell-extract::extract ComputeNode target + trampoline + registration",
+    "description": "PRD: docs/prds/v0_4/shell-extract-engine-bridge.md task \u03b3 (\u00a79 Phase 2 \u2014 ComputeNode trampoline slice, no FEA yet).\n\nRegister the \"shell-extract::extract\" ComputeNode target with its Rust trampoline, so a ComputeNode on a synthetic slab geometry materializes a ShellExtractionResult in the output ValueCell (and re-runs hit the in-memory ComputeNode cache).\n\nUser-observable signal: Engine integration test in crates/reify-eval/tests/ pins \u2014 (a) registering the trampoline; (b) inserting a ComputeNode with target \"shell-extract::extract\" on a synthetic slab geometry, observing a ShellExtractionResult materialize in the output ValueCell; (c) a second run hits the in-memory ComputeNode cache (dispatch-count instrumentation per compute-node-contract \u00a77.2); (d) failure-mapping test injecting an invalid threshold asserts ComputeOutcome::Failed with E_SHELL_BAD_THRESHOLD.\n\nConsumer: PRD task \u03b4 (FEA auto-classification dispatch \u2014 note: \u03b4 was filed as task 3551 then CANCELLED; its work folds into \u03b6=3596 / \u03b8=3598) reads the extracted mid-surface mesh + segmentation through this ComputeNode upstream of solver::elastic_static. PRD task \u03b6=3596 (TopologyAttributeTable fold-in) depends on this. PRD task \u03b1=3592 (ShellExtractionResult type, done) names this \u03b3 trampoline as its downstream ComputeNode consumer.\n\nCrates touched: reify-eval (engine_compute.rs::register_compute_fns gains a register_shell_extract_compute_fns(engine) call; new file crates/reify-eval/src/shell_extract_compute.rs holding shell_extract_compute_fn), reify-shell-extract (consumed engine-side: compute_medial_mask \u2192 extract_mid_surface \u2192 prune_branches \u2192 mesh_mid_surface \u2192 segment_regions \u2192 populate_mid_surface_attributes pipeline; no new deps), reify-types (Diagnostic variants if not already present).\n\nTrampoline contract (PRD \u00a75): signature per compute-node-contract \u00a74 \u2014 value_inputs=[options: ElasticOptions], realization_inputs=[body_geom], unused options/prior_warm_state, cancellation handle. Polls cancellation between phases (medial-mask, mid-surface, pruning, segmentation, naming). On any *Error variant returns ComputeOutcome::Failed { diagnostics } mapped per \u00a77. On success returns Completed { result: shell_extraction_result.to_value(), new_warm_state: None, cost_per_byte: derived, diagnostics: [] }. No warm state (one-shot per (geometry, options)). Cache key = (target, value_inputs_hash, realization_inputs_hash, options_value_hash). Wires producer-side reify-shell-extract symbols that G-tool flags as Type-A orphans (scripts/audit-orphan-producers.sh baseline 2026-05-12); once landed, no // G-allow: markers required.\n\nPrereqs (per PRD \u00a79): \u03b1=3592 (done \u2014 ShellExtractionResult type). Cross-PRD: compute-node-contract \u00a78 task \u03b3 = task 3422 (per-Engine dispatch registry, DONE) provides register_compute_fns. Note \u03b4=3551 cancelled \u2014 its FEA dispatch consumption is no longer the immediate downstream; \u03b3 stands on its own producer-side ComputeNode slice.\n\nGrammar: existing \u2014 no new Reify-level syntax (grammar_confirmed=true).\n\nPRD: docs/prds/v0_4/shell-extract-engine-bridge.md task \u03b3\nUser-observable signal: ComputeNode integration test materializes ShellExtractionResult in output ValueCell on synthetic slab; second run hits in-memory cache; invalid-threshold injection yields ComputeOutcome::Failed E_SHELL_BAD_THRESHOLD.\nConsumer: FEA dispatch (ex-\u03b4=3551, cancelled; folds into \u03b6=3596/\u03b8=3598) + \u03b6=3596 fold-in; \u03b1=3592 names \u03b3 as its downstream ComputeNode.\nCrates touched: reify-eval, reify-shell-extract, reify-types\n\n---\nRe-filed 2026-05-26 as a genuinely-MISSING task from docs/prds/v0_4/shell-extract-engine-bridge.md \u00a79 (\u03b3 had no surviving live task; original lost in 2026-05-13 SIGABRT, never re-filed in this batch). Sibling batch: \u03b1=3592(done) \u03b2=3534(done) \u03b4=3551(cancelled) \u03b6=3596 \u03b7=3597(done) \u03b8=3598 \u03b9=3599 \u03ba=3600(done) \u03bb=3601(done) \u03bc=3602(done)."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "d8cbc8f156d0f8e1e69e49ce180c8e3c9ec96a03",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "merge_first_parent",
+    "task_status": "done",
+    "eval_branch_pinned": false,
+    "eval_branch_pin_error": "pin_eval_branch(evals/reify_task_3834) failed: Command git update-ref refs/heads/evals/reify_task_3834 d8cbc8f156d0f8e1e69e49ce180c8e3c9ec96a03 failed (rc=128): fatal: update_ref failed for ref 'refs/heads/evals/reify_task_3834': cannot lock ref 'refs/heads/evals/reify_task_3834': Unable to create '/home/leo/src/reify/.git/refs/heads/evals/reify_task_3834.lock': Permission denied",
+    "eval_branch_pin_impact": "None for retrievability. The reference block carries the post SHA directly and materialize_reference_diff works off the pre/post SHAs, not the branch; the pin only holds the commit off the GC path. post_task_commit IS an ancestor of main in this checkout, so it is reachable and not GC-eligible regardless. Re-run --mint from a checkout with write access to restore the belt-and-braces ref."
+  },
+  "reference": {
+    "post_task_commit": "d8cbc8f156d0f8e1e69e49ce180c8e3c9ec96a03",
+    "diff_stat": {
+      "files": 12,
+      "insertions": 1026,
+      "deletions": 73
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

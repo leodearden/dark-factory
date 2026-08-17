@@ -61,8 +61,25 @@ LIVE_TEST_NAMES = (
     'test_env_var_auth_succeeds',
     'test_config_dir_plus_env_var_auth_succeeds',
 )
-# A TestLooksLikeCapacityFailure unit test: NOT integration-marked, pure
-# in-process assertions, and it must KEEP running in ordinary CI.
+# The non-integration canary module for assertion (b), collected in the SAME
+# root-bound subprocess as TARGET_MODULE (one `-c` run, two path args) rather
+# than in a second one: (a)/(b)/(c) then still share a single cached collect,
+# and an arg set spanning two modules is itself one of the root-bound shapes
+# this guard exists for.
+#
+# It HAS to be a separate module: TARGET_MODULE is now 100% integration-marked.
+# Task 3483 deduplicated the capacity-skip helper and moved that module's
+# TestLooksLikeCapacityFailure unit class out to tests/test_capacity_skip.py,
+# leaving nothing non-integration inside TARGET_MODULE to anchor (b) on.
+UNIT_TEST_MODULE = REPO_ROOT / 'shared' / 'tests' / 'test_capacity_skip.py'
+
+# A test_capacity_skip.py unit test: NOT integration-marked, pure in-process
+# assertions, and it must KEEP running in ordinary CI.
+#
+# Unlike LIVE_TEST_NAMES this pointer cannot go stale silently: a rename or a
+# move makes the name vanish from the collect output, which is the very thing
+# (b) asserts against, so it fails LOUDLY. That is exactly how task 3483's move
+# of this test out of TARGET_MODULE was caught.
 UNIT_TEST_NAME = 'test_capacity_output_returns_true'
 
 # The only exit codes a `--collect-only` run legitimately produces: 0 (OK) and
@@ -73,8 +90,11 @@ UNIT_TEST_NAME = 'test_capacity_output_returns_true'
 _OK_COLLECT_EXIT_CODES = frozenset({0, 5})
 
 
-def _collect(*extra_args: str) -> str:
-    """Run `pytest --collect-only` on the target module bound to the ROOT pyproject.
+def _collect(
+    *extra_args: str,
+    targets: tuple[Path, ...] = (TARGET_MODULE, UNIT_TEST_MODULE),
+) -> str:
+    """Run `pytest --collect-only` on `targets` bound to the ROOT pyproject.
 
     Returns combined stdout+stderr. No `-n` is passed: the root config declares
     no xdist addopts, so adding one would be a behaviour the real root-bound
@@ -86,7 +106,7 @@ def _collect(*extra_args: str) -> str:
         'pytest',
         '-c',
         str(ROOT_PYPROJECT),
-        str(TARGET_MODULE),
+        *(str(target) for target in targets),
         '--collect-only',
         '-q',
         '-p',
@@ -121,6 +141,10 @@ def default_collect() -> str:
     Those three assert against a byte-identical run, and each `_collect()` spawns
     a full pytest whose root-conftest import reaches across all seven
     subprojects. Module scope pays that once instead of three times.
+
+    Covers BOTH modules -- the all-integration TARGET_MODULE that (a) needs and
+    the non-integration UNIT_TEST_MODULE that (b) needs -- so the two-sided
+    check still costs exactly one subprocess.
     """
     return _collect()
 
@@ -163,10 +187,10 @@ class TestRootConfigIntegrationDeselection:
     ) -> None:
         """(b) Guard the other side: the deselect must not be over-broad.
 
-        TestLooksLikeCapacityFailure carries no `integration` marker and is
-        pure in-process assertion. A deselect that swallowed it would make
-        every "not collected" assertion above pass while silently deleting
-        real coverage from CI.
+        UNIT_TEST_MODULE carries no `integration` marker and is pure
+        in-process assertion. A deselect that swallowed it would make every
+        "not collected" assertion above pass while silently deleting real
+        coverage from CI.
         """
         combined = default_collect
 
@@ -205,7 +229,9 @@ class TestRootConfigIntegrationDeselection:
         test_cli_invoke_integration.py makes (a) pass vacuously -- the old name
         is absent from the collect output either way -- and fails LOUDLY here.
         """
-        combined = _collect('-m', 'integration')
+        # TARGET_MODULE only: this assertion is about re-selecting the live
+        # tests, and its failure message names that module specifically.
+        combined = _collect('-m', 'integration', targets=(TARGET_MODULE,))
 
         missing = [name for name in LIVE_TEST_NAMES if name not in combined]
         assert not missing, (

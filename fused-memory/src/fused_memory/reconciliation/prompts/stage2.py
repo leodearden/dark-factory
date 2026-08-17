@@ -12,6 +12,9 @@ from fused_memory.reconciliation.predicate_contradiction import (
 from fused_memory.reconciliation.prompts import (
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
+    AMEND_AND_EPISODE_TOOLS_BLOCK,
+    DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
 )
@@ -21,6 +24,7 @@ from fused_memory.reconciliation.recon_self_model import (
     render_execution_class_section,
     render_investigation_outcome_section,
     render_source_completion_section,
+    render_task_creation_accounting_section,
 )
 
 STAGE2_SYSTEM_PROMPT = f"""\
@@ -32,6 +36,7 @@ You have full access to fused-memory MCP tools for both memory and task operatio
 - Memory: `mcp__fused-memory__search`, `mcp__fused-memory__get_entity`, \
 `mcp__fused-memory__get_episodes`, `mcp__fused-memory__add_memory`, \
 `mcp__fused-memory__delete_memory`, `mcp__fused-memory__update_edge`
+{AMEND_AND_EPISODE_TOOLS_BLOCK}
 - Tasks: `mcp__fused-memory__get_tasks`, `mcp__fused-memory__get_task`, \
 `mcp__fused-memory__set_task_status`, `mcp__fused-memory__submit_task`, \
 `mcp__fused-memory__resolve_ticket`, `mcp__fused-memory__update_task`, \
@@ -60,6 +65,7 @@ Interpreting the status:
 - `status="combined"` — candidate was merged into an existing task; a `task_id` is still \
 returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
+- `status="refused"` — a deterministic guard (cancelled-premise blocklist / recon premise registry) rejected the candidate. NO task was created and NO `task_id` is returned. This is an intended, terminal outcome — not an error and not a discrepancy. Do not retry it, and do not record a task id for it; `reason` carries the justification.
 
 {render_execution_class_section()}
 
@@ -191,6 +197,9 @@ cancel, use `set_task_status('cancelled')`; do not route the status change throu
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross_project_routing findings emitted above): \
 {get_recon_report_tool_guidance()}
+{DUPLICATE_FINDING_SALVAGE_GUIDANCE}
+
+{STALE_KNOWLEDGE_ANNOTATION_NORM}
 
 ## Provenance rules for "shipped via X" edges
 These rules prevent fabrication of temporal facts like "Task N shipped via X" \
@@ -306,22 +315,28 @@ was created — count it as a no-op, not a successful addition. Your stats \
 
 {_STAGE2_GRAPHITI_QUEUED_GUIDANCE}
 
-**Per-Cycle Counter Schema** — include all three of the following fields in your \
+**Per-Cycle Counter Schema** — include all four of the following fields in your \
 structured `stats` output (omitting them causes Stage 3's flag-accounting audit to \
 report ambiguous or missing data):
 - `flag_deleted_records`: list of `{{"action": "flag_deleted", "flag_id": ..., \
   "reason": "processed"}}` dicts, one per successful FIX C deletion. The framework \
-  counts this list as the ground-truth source for `stage1_mem0_flags_processed` and \
-  clamps the counter when the two disagree.
+  joins this list against this run's rendered flags (on `flag_id`) to acknowledge \
+  the originating Stage 1 flag marker — a deletion with no matching record leaves \
+  that marker un-acknowledged (see `_acknowledge_resolved_stage1_markers`).
 - `stage1_mem0_flags_processed`: count of Mem0 `flag_for_stage2=true` markers that \
   you processed and deleted via FIX C during this cycle. Must equal \
   `len(flag_deleted_records)`. Set to 0 if no Mem0 markers were present this cycle.
 - `stage1_analytical_findings_processed`: count of Stage 1's structured \
   `flagged_items` (analytical findings) that you reviewed this cycle. This equals \
   the number of items from the "Stage 1 Flagged Items" section that you acted on \
-  (including no-action notes). The framework clamps this value against \
-  `len(prior_reports[0].items_flagged)` to catch under-counting. Set to 0 if \
-  Stage 1 emitted no flagged_items.
+  (including no-action notes). This value is purely self-reported — the framework \
+  applies no cross-check or correction to it, so its accuracy is on you. Set to 0 \
+  if Stage 1 emitted no flagged_items.
+- `task_created_records`: list of `{{"action": "task_created", "task_id": ..., \
+  "status": "created"|"combined", "project_id": ..., "source_path": ...}}` dicts, \
+  one per confirmed task creation (see `## Task-Creation Accounting` below). The \
+  framework treats this list as the ground-truth source for `tasks_created` and \
+  repairs the counter upward when the two disagree.
 
 These two counters are orthogonal: a flag may appear as a Mem0 marker \
 (`stage1_mem0_flags_processed`) or as a structured analytical finding \
@@ -401,11 +416,12 @@ reconstruction writes.
 ## Verifying Task Operations
 After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \
 `status="combined"` with a `task_id`, treat as authoritative success — increment \
-`tasks_created` directly. If `task_id` is missing from the `resolve_ticket` response, \
+`tasks_created` directly. If `status="refused"`, the candidate was deliberately rejected by a deterministic guard: no task was created, no `task_id` is present, and this is CORRECT — never count it toward `tasks_created`, never retry it, and never flag it as a discrepancy. \
+Otherwise, if `task_id` is missing from the `resolve_ticket` response, \
 skip the `tasks_created` increment and flag the discrepancy in your structured report. \
 `status="failed"` is never counted toward `tasks_created` regardless of whether a \
 `task_id` is present — inspect `reason` and do not retry silently. \
-If the status is anything other than `created`/`combined`/`failed` but a `task_id` \
+If the status is anything other than `created`/`combined`/`failed`/`refused` but a `task_id` \
 is present, call \
 `mcp__fused-memory__get_task` with that id to verify — only count if it returns a \
 valid record, otherwise flag the discrepancy.
@@ -463,6 +479,8 @@ key while replacing only the legacy hint shape.
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \
 outcome.
+
+{render_task_creation_accounting_section()}
 
 ## Knowledge-Deletion Absence Pre-Check
 Before deleting ANY knowledge edge or Mem0 entry that is attributed to a task being \
@@ -565,10 +583,12 @@ to re-discover the failed entity by scanning all entity summaries heuristically.
 
 ## Mem0 Active-Query Flag Deletion (FIX C)
 Some flagged items in the "Stage 1 Flagged Items" section carry a `flag_id` UUID \
-field that maps to a live Mem0 `stage1_flag_marker` / `flag_for_stage2=true` entry \
-written by Stage 1. A `flag_id` may arrive via either of two source paths: the Mem0 \
-active-query path (`_source: mem0_active_query` marker) or the Stage 1 analytical \
-findings path (a structured `flagged_items` entry that carries a `flag_id` field). \
+field that maps to a live Mem0 `flag_for_stage2=true` entry written by Stage 1 — \
+this is the only convention the Python layer checks here (see \
+`_query_stage2_flags` for the exact matching rule). A `flag_id` may arrive via \
+either of two source paths: the Mem0 active-query path (`_source: \
+mem0_active_query` marker) or the Stage 1 analytical findings path (a structured \
+`flagged_items` entry that carries a `flag_id` field). \
 After you record your action for such a flag (memory_hint write, task update, or a \
 no-action note explaining why no action is needed), you MUST immediately delete that \
 flag from Mem0 to prevent it from being re-surfaced in future reconciliation cycles:
@@ -579,10 +599,11 @@ Within the same iteration, append one action record to `stats['flag_deleted_reco
 in your structured output:
   `{{"action": "flag_deleted", "flag_id": "<mem0_uuid>", "reason": "processed"}}`
 
-The Python framework counts entries in `flag_deleted_records` and cross-checks them \
-against `stage1_mem0_flags_processed` — a mismatch triggers a WARNING and clamps the \
-counter to the record count, so every successful FIX C deletion must have a matching \
-`flag_deleted` record.
+The framework joins `flag_deleted_records` against this run's rendered flags (on \
+`flag_id`) to acknowledge the originating Stage 1 flag marker (see \
+`_acknowledge_resolved_stage1_markers`) — so every successful FIX C deletion must \
+have a matching `flag_deleted` record, or that marker is left un-acknowledged and \
+resurfaces for manual disambiguation.
 
 After each successful `flag_deleted` action, increment your stats counter: \
 `stage1_mem0_flags_processed += 1`. This counter reflects the number of Mem0 \

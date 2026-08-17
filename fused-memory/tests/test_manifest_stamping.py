@@ -9,6 +9,7 @@ commit_planning integration tests in test_task_tools.py).
 """
 
 import json
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,6 +17,11 @@ import yaml
 
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
 
+# Hand-written rather than built from _mechanical_sidecar_yaml below: this
+# fixture mixes grep + script + manual capabilities on a single label, and
+# test_happy_path_stamps_file_and_copies_mechanical_checks asserts exact
+# values (script args/timeout, grep pattern/paths) the helper's
+# single-grep-capability shape doesn't produce.
 _HAPPY_PATH_SIDECAR_YAML = """\
 prd: plans/foo-prd.md
 schema_version: 1
@@ -49,6 +55,9 @@ tasks:
           reason: 'no automated check available'
 """
 
+# Hand-written and deliberately INVALID (missing the grep check's required
+# `expect` field) — not a duplicate of the helper's always-valid output, so
+# not a helper candidate.
 _MALFORMED_SIDECAR_YAML = """\
 prd: plans/bad-prd.md
 schema_version: 1
@@ -65,34 +74,61 @@ tasks:
           pattern: 'something'
 """
 
-_MISSING_LABEL_AND_MANUAL_SIDECAR_YAML = """\
-prd: plans/bar-prd.md
-schema_version: 1
-tasks:
-  - label: alpha
-    task_id: null
-    title: Mechanical task
-    capabilities:
-      - name: grep_check
-        binding: 'grep for the marker'
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: 'TODO(alpha)'
-          expect: absent
-          paths:
-            - src/foo.py
-  - label: beta
-    task_id: null
-    title: Manual-only task
-    capabilities:
-      - name: manual_check
-        binding: 'eyeball the UI'
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: 'no automated check available'
-"""
+
+def _mechanical_sidecar_yaml(
+    prd_stem: str, labels: list[str], manual_labels: list[str] | None = None
+) -> str:
+    """Render a valid capability-manifest sidecar YAML string for tests.
+
+    One task entry per label in ``labels``, in order, each with
+    ``task_id: null`` and a single MECHANICAL (``grep``) ``delivered_check``,
+    plus one task entry per label in ``manual_labels`` (if given) with a
+    single ``manual`` ``delivered_check`` instead. Every generated fixture
+    parses against ``shared.capability_manifest.parse_capability_manifest``;
+    an invalid one would silently divert a test that's supposed to exercise
+    the containment guard / multi-sidecar tie-break / rejected-write branch
+    into the already-covered malformed-sidecar branch instead.
+    """
+    task_blocks = []
+    for label in labels:
+        task_blocks.append(
+            f'  - label: {label}\n'
+            f'    task_id: null\n'
+            f'    title: Mechanical task {label}\n'
+            f'    capabilities:\n'
+            f'      - name: grep_check_{label}\n'
+            f"        binding: 'grep for the {label} marker'\n"
+            f'        verdict: PASS\n'
+            f'        delivered_check:\n'
+            f'          kind: grep\n'
+            f"          pattern: 'TODO({label})'\n"
+            f'          expect: absent\n'
+            f'          paths:\n'
+            f'            - src/{label}.py\n'
+        )
+    for label in manual_labels or []:
+        task_blocks.append(
+            f'  - label: {label}\n'
+            f'    task_id: null\n'
+            f'    title: Manual-only task {label}\n'
+            f'    capabilities:\n'
+            f'      - name: manual_check_{label}\n'
+            f"        binding: 'eyeball the UI'\n"
+            f'        verdict: PASS\n'
+            f'        delivered_check:\n'
+            f'          kind: manual\n'
+            f"          reason: 'no automated check available'\n"
+        )
+    return f'prd: plans/{prd_stem}-prd.md\nschema_version: 1\ntasks:\n' + ''.join(task_blocks)
+
+
+# Built from the helper above — it's a near-duplicate of the helper's
+# default one-mechanical-label shape plus one manual-only label.
+# _HAPPY_PATH_SIDECAR_YAML and _MALFORMED_SIDECAR_YAML above stay
+# hand-written since they aren't (see the comments there).
+_MISSING_LABEL_AND_MANUAL_SIDECAR_YAML = _mechanical_sidecar_yaml(
+    'bar', ['alpha'], manual_labels=['beta']
+)
 
 
 @pytest.mark.asyncio
@@ -350,3 +386,322 @@ async def test_write_failure_mid_stamp_leaves_original_sidecar_intact(tmp_path, 
     assert leftovers == []
 
     task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('traversal_style', ['relative_dotdot', 'absolute'])
+async def test_containment_refuses_traversal_prd_path(tmp_path, caplog, traversal_style):
+    """A derived sidecar path that resolves outside project_root must be
+    refused by the containment guard — both a relative '../' escape and an
+    absolute prd_path reach the guard (via different pathlib routes) and
+    must both be blocked. With no safe candidate surviving, the call
+    returns None (the documented no-sidecar no-op contract), the escaping
+    file is never read or written, and the ONLY observable is a server-side
+    WARNING log — there is no report to attach the refusal to."""
+    project_root = tmp_path / 'proj'
+    (project_root / 'plans').mkdir(parents=True)
+    outside_dir = tmp_path / 'outside'
+    outside_dir.mkdir()
+    evil_path = outside_dir / 'evil-prd.capability-manifest.yaml'
+    evil_text = _mechanical_sidecar_yaml('evil', ['alpha'])
+    evil_path.write_text(evil_text, encoding='utf-8')
+
+    if traversal_style == 'relative_dotdot':
+        prd_path = '../outside/evil-prd.md'
+    else:
+        prd_path = str(outside_dir / 'evil-prd.md')
+
+    task_interceptor = AsyncMock()
+    ids = ['1']
+    tasks_data = [
+        {
+            'id': '1',
+            'metadata': {'prd_path': prd_path, 'prd_task_label': 'alpha'},
+        },
+    ]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.server.manifest_stamping'):
+        result = await stamp_capability_manifests(
+            project_root=str(project_root),
+            ids=ids,
+            tasks_data=tasks_data,
+            task_interceptor=task_interceptor,
+        )
+
+    assert result is None
+    task_interceptor.update_task.assert_not_called()
+
+    # Load-bearing security assertion: the escaping file was never read or
+    # written back.
+    assert evil_path.read_text(encoding='utf-8') == evil_text
+
+    warning_records = [
+        r
+        for r in caplog.records
+        if r.levelname == 'WARNING' and r.name == 'fused_memory.server.manifest_stamping'
+    ]
+    assert len(warning_records) == 1, (
+        f'Expected exactly 1 WARNING; got {len(warning_records)}: '
+        f'{[r.getMessage() for r in warning_records]}'
+    )
+    message = warning_records[0].getMessage()
+    assert 'resolve outside project_root' in message
+    assert 'evil-prd.capability-manifest.yaml' in message
+
+
+@pytest.mark.asyncio
+async def test_containment_refusal_is_reported_when_a_safe_sidecar_also_exists(tmp_path):
+    """The *other* half of the containment guard (the errors-entry exit in
+    `_stamp_capability_manifests_impl` step 2): when at least one in-root
+    sidecar survives, there IS a report to attach the refusal to, so it
+    surfaces as a report['errors'] entry instead of only a log line.
+    Neither this test nor test_containment_refuses_traversal_prd_path
+    substitutes for the other — they exercise the guard's two structurally
+    distinct exits."""
+    project_root = tmp_path / 'proj'
+    (project_root / 'plans').mkdir(parents=True)
+    outside_dir = tmp_path / 'outside'
+    outside_dir.mkdir()
+    evil_path = outside_dir / 'evil-prd.capability-manifest.yaml'
+    evil_text = _mechanical_sidecar_yaml('evil', ['alpha'])
+    evil_path.write_text(evil_text, encoding='utf-8')
+
+    good_path = project_root / 'plans' / 'good-prd.capability-manifest.yaml'
+    good_path.write_text(_mechanical_sidecar_yaml('good', ['beta']), encoding='utf-8')
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+    ids = ['1', '2']
+    tasks_data = [
+        {
+            'id': '1',
+            'metadata': {'prd_path': '../outside/evil-prd.md', 'prd_task_label': 'alpha'},
+        },
+        {
+            'id': '2',
+            'metadata': {'prd_path': 'plans/good-prd.md', 'prd_task_label': 'beta'},
+        },
+    ]
+
+    report = await stamp_capability_manifests(
+        project_root=str(project_root),
+        ids=ids,
+        tasks_data=tasks_data,
+        task_interceptor=task_interceptor,
+    )
+
+    assert report is not None
+    assert report['path'] == 'plans/good-prd.capability-manifest.yaml'
+    assert report['stamped'] == ['beta']
+    assert report['missing_labels'] == []
+
+    assert len(report['errors']) == 1
+    error_entry = report['errors'][0]
+    assert 'resolved outside project_root, refused' in error_entry
+    assert '../outside/evil-prd.capability-manifest.yaml' in error_entry
+
+    # The escaping file was never read or written back...
+    assert evil_path.read_text(encoding='utf-8') == evil_text
+    # ...while the safe sidecar was stamped.
+    reloaded = yaml.safe_load(good_path.read_text(encoding='utf-8'))
+    assert reloaded['tasks'][0]['task_id'] == 2
+
+    # The escaping task's label was excluded from label_to_task_id
+    # entirely, not merely skipped at write time.
+    task_interceptor.update_task.assert_called_once()
+    assert task_interceptor.update_task.call_args.args[0] == '2'
+
+
+@pytest.mark.asyncio
+async def test_multiple_sidecars_processes_lexicographically_first(tmp_path):
+    """An unexpected second distinct sidecar in the same batch (the
+    multi-sidecar tie-break in `_stamp_capability_manifests_impl` step 2)
+    is processed deterministically: the lexicographically-first rel path
+    wins, not the batch-first one. The batch here deliberately lists the
+    lexicographically-LAST sidecar first — if it listed them in
+    lexicographic order, the test would pass on insertion order alone and
+    would not pin existing_rel_paths.sort() at all."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    alpha_path = plans_dir / 'alpha-prd.capability-manifest.yaml'
+    alpha_text = _mechanical_sidecar_yaml('alpha', ['alabel'])
+    alpha_path.write_text(alpha_text, encoding='utf-8')
+    zeta_path = plans_dir / 'zeta-prd.capability-manifest.yaml'
+    zeta_text = _mechanical_sidecar_yaml('zeta', ['zlabel'])
+    zeta_path.write_text(zeta_text, encoding='utf-8')
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+    # Batch order is REVERSED vs lexicographic order: zeta first, alpha second.
+    ids = ['9', '8']
+    tasks_data = [
+        {
+            'id': '9',
+            'metadata': {'prd_path': 'plans/zeta-prd.md', 'prd_task_label': 'zlabel'},
+        },
+        {
+            'id': '8',
+            'metadata': {'prd_path': 'plans/alpha-prd.md', 'prd_task_label': 'alabel'},
+        },
+    ]
+
+    report = await stamp_capability_manifests(
+        project_root=str(tmp_path),
+        ids=ids,
+        tasks_data=tasks_data,
+        task_interceptor=task_interceptor,
+    )
+
+    assert report is not None
+    assert report['path'] == 'plans/alpha-prd.capability-manifest.yaml'
+    assert report['stamped'] == ['alabel']
+    assert report['missing_labels'] == []
+
+    assert len(report['errors']) == 1
+    error_entry = report['errors'][0]
+    assert 'multiple capability-manifest sidecars matched this batch' in error_entry
+    assert 'plans/zeta-prd.capability-manifest.yaml' in error_entry
+
+    reloaded = yaml.safe_load(alpha_path.read_text(encoding='utf-8'))
+    assert reloaded['tasks'][0]['task_id'] == 8
+
+    # The ignored sidecar is never mutated.
+    assert zeta_path.read_text(encoding='utf-8') == zeta_text
+
+    task_interceptor.update_task.assert_called_once()
+    assert task_interceptor.update_task.call_args.args[0] == '8'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'rejection_resp',
+    [
+        {'success': False, 'error': 'status_via_update_task', 'task_id': '2'},
+        {'error': 'backlog exceeded', 'error_type': 'ReconciliationBacklogExceeded'},
+        {},
+    ],
+    ids=['write_authority', 'backlog_no_success_key', 'bare_empty_dict'],
+)
+async def test_rejected_update_task_write_is_recorded_not_silently_dropped(
+    tmp_path, caplog, rejection_resp
+):
+    """The interceptor_write_succeeded(resp) rejection branch (the last
+    check in `_stamp_capability_manifests_impl` step 5's per-label loop),
+    parametrized over the three rejection shapes documented in
+    `interceptor_write_succeeded`'s own docstring in
+    `fused_memory.middleware.task_interceptor` — each defeats a different
+    clause of its boolean expression: the write-authority shape defeats
+    `resp.get('success', True)`, the no-success-key backlog shape defeats
+    `not resp.get('error')`, and the bare {} defeats `bool(resp)`. A
+    rejected write must be recorded loudly, not silently dropped — but it
+    must NOT roll back the sidecar stamp already committed to disk (that
+    asymmetry is itself worth pinning: the two writes — sidecar stamp,
+    task metadata — can diverge)."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'good-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_mechanical_sidecar_yaml('good', ['beta']), encoding='utf-8')
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value=rejection_resp)
+    ids = ['2']
+    tasks_data = [
+        {
+            'id': '2',
+            'metadata': {'prd_path': 'plans/good-prd.md', 'prd_task_label': 'beta'},
+        },
+    ]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.server.manifest_stamping'):
+        report = await stamp_capability_manifests(
+            project_root=str(tmp_path),
+            ids=ids,
+            tasks_data=tasks_data,
+            task_interceptor=task_interceptor,
+        )
+
+    assert report is not None
+    assert report['path'] == 'plans/good-prd.capability-manifest.yaml'
+    # The rejection must NOT retroactively empty stamped.
+    assert report['stamped'] == ['beta']
+    assert report['missing_labels'] == []
+
+    # A rejected metadata write does NOT roll back the already-committed
+    # sidecar stamp.
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+    assert reloaded['tasks'][0]['task_id'] == 2
+
+    assert len(report['errors']) == 1
+    error_entry = report['errors'][0]
+    assert 'update_task rejected delivered_checks write' in error_entry
+    assert "'beta'" in error_entry
+    assert 'task 2' in error_entry
+
+    warning_records = [
+        r
+        for r in caplog.records
+        if r.levelname == 'WARNING' and r.name == 'fused_memory.server.manifest_stamping'
+    ]
+    assert any('rejected delivered_checks write' in r.getMessage() for r in warning_records)
+
+
+@pytest.mark.asyncio
+async def test_rejected_write_does_not_block_sibling_labels(tmp_path):
+    """A rejection is per-label and must not abort the remaining
+    `for task in doc.tasks` iterations. The rejection branch is the last
+    statement in the loop body, so continuation holds by construction today
+    — which is exactly why an accidental `return report` / `break` added
+    there would go unnoticed without this test. Complements step-4 (which
+    pins that a rejection is *recorded*) by pinning that it is
+    *contained*."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'multi-prd.capability-manifest.yaml'
+    sidecar_path.write_text(
+        _mechanical_sidecar_yaml('multi', ['first', 'second']), encoding='utf-8'
+    )
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(
+        side_effect=[
+            {'success': False, 'error': 'status_via_update_task', 'task_id': '11'},
+            {'success': True},
+        ]
+    )
+    ids = ['11', '12']
+    tasks_data = [
+        {
+            'id': '11',
+            'metadata': {'prd_path': 'plans/multi-prd.md', 'prd_task_label': 'first'},
+        },
+        {
+            'id': '12',
+            'metadata': {'prd_path': 'plans/multi-prd.md', 'prd_task_label': 'second'},
+        },
+    ]
+
+    report = await stamp_capability_manifests(
+        project_root=str(tmp_path),
+        ids=ids,
+        tasks_data=tasks_data,
+        task_interceptor=task_interceptor,
+    )
+
+    # The second label was still attempted after the first was rejected.
+    assert task_interceptor.update_task.call_count == 2
+    assert [
+        c.args[0] for c in task_interceptor.update_task.call_args_list
+    ] == ['11', '12']
+
+    assert report is not None
+    assert report['stamped'] == ['first', 'second']
+    assert report['missing_labels'] == []
+
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+    by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
+    assert by_label == {'first': 11, 'second': 12}
+
+    # The successful sibling must not be tarred by its neighbour's failure.
+    assert len(report['errors']) == 1
+    assert 'first' in report['errors'][0]
+    assert 'second' not in report['errors'][0]

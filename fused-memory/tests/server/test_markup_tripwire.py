@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from shared import toolcall_markup
 
 from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
@@ -246,17 +247,26 @@ class TestBuildMarkupBlock:
         assert block['content_excerpt'] == text[:200]
         assert len(block['content_excerpt']) == 200
 
-    def test_hint_names_df_3083_and_the_override_key(self):
-        """Both the escalation pointer and the escape hatch are discoverable here.
+    def test_hint_routes_to_the_live_owner_and_names_the_override_key(self):
+        """Both the reporting pointer and the escape hatch are discoverable here.
 
-        DF 3083 owns the root cause and the corpus sweep, so the rejection points
-        at it; MARKUP_OVERRIDE_KEY is how a caller quoting the markup on purpose
-        (as 3083's own description does) gets its write through.
+        The pointer must name the LIVE owner. DF 3083 delivered the root cause
+        but is done and closed to appends -- its metadata is structurally
+        unwritable, since update_task refuses any metadata payload on a task
+        carrying done_provenance -- so recurrences reported there are inert.
+        Asserting merely that '3083' appears is too weak: the old hint said
+        "report a recurrence there" and the new one says the opposite, and both
+        contain the string. Pin the successor PRD path instead, and require the
+        hint to say 3083 is closed. MARKUP_OVERRIDE_KEY is how a caller quoting
+        the markup on purpose gets its write through.
         """
         block = build_markup_block('a', 'content', '</invoke>', 'a </invoke> b')
         hint = block['hint']
         assert hint
-        assert '3083' in hint, f'hint must name DF 3083: {hint!r}'
+        assert 'toolcall-markup-containment-prd.md' in hint, (
+            f'hint must route recurrences at the live successor PRD: {hint!r}'
+        )
+        assert 'CLOSED' in hint, f'hint must say 3083 is closed to appends: {hint!r}'
         assert MARKUP_OVERRIDE_KEY in hint, f'hint must name the override key: {hint!r}'
 
     def test_storm_key_is_absent_when_no_storm_fired(self):
@@ -316,14 +326,21 @@ class TestMarkupStormCounter:
         assert storm['threshold'] == 3
         assert storm['window_seconds'] == 100.0
 
-    def test_storm_hint_names_df_3083(self):
-        """The burst summary points at the owner of the root cause, not at itself."""
+    def test_storm_hint_routes_to_the_live_owner(self):
+        """The burst summary points at the LIVE owner of the leak, not at itself.
+
+        Not at DF 3083 either: it is done and closed to appends, so a burst
+        attached there is inert. See the sibling hint test for why asserting
+        only that '3083' appears cannot tell the two routings apart.
+        """
         clock = _FakeClock()
         counter = MarkupStormCounter(threshold=1, window_seconds=100.0, time_provider=clock)
         storm = counter.record()
         assert storm is not None
         assert storm['hint']
-        assert '3083' in storm['hint'], f"storm hint must name DF 3083: {storm['hint']!r}"
+        assert 'toolcall-markup-containment-prd.md' in storm['hint'], (
+            f"storm hint must route at the live successor PRD: {storm['hint']!r}"
+        )
 
     def test_reports_the_distinct_projects_seen_in_the_window(self):
         """The burst is ATTRIBUTED, not pinned on whichever write crossed the line.
@@ -623,7 +640,9 @@ class TestEmitMarkupStormEscalation:
         """
         assert emit_markup_storm_escalation(None, _STORM) is None
 
-    def test_files_one_escalation_naming_3083_and_the_storm_numbers(self, tmp_path):
+    def test_files_one_escalation_routing_at_the_live_owner_and_the_storm_numbers(
+        self, tmp_path
+    ):
         esc_id = emit_markup_storm_escalation(str(tmp_path), _STORM)
         if not markup_tripwire.HAS_ESCALATION:
             assert esc_id is None
@@ -646,7 +665,13 @@ class TestEmitMarkupStormEscalation:
         # tmp_path (`/tmp/pytest-of-leo/pytest-124/...`), i.e. it would pass with
         # the count dropped entirely.
         detail = payload['detail']
-        assert '3083' in f'{payload["summary"]}\n{detail}', f'must name DF 3083: {payload!r}'
+        routing_text = f'{payload["summary"]}\n{detail}'
+        assert 'toolcall-markup-containment-prd.md' in routing_text, (
+            f'must route the burst at the live successor PRD: {payload!r}'
+        )
+        assert '3083' in routing_text, (
+            f'must still name DF 3083, as the closed predecessor: {payload!r}'
+        )
         assert 'rejected_writes_in_window=4' in detail, f'must state the count: {detail!r}'
         assert 'window_seconds=3600.0' in detail, f'must state the window: {detail!r}'
         assert "projects_in_window=['/project-a', '/project-b']" in detail, (
@@ -748,4 +773,32 @@ class TestEmitMarkupStormEscalation:
         assert payload['category'] == 'mcp_markup_write_storm'
         assert payload['task_id'] == 'markup-tripwire'
         assert payload['detail'], f'a detail is still required: {payload!r}'
-        assert '3083' in payload['detail'], f'must still route to DF 3083: {payload!r}'
+        assert 'toolcall-markup-containment-prd.md' in payload['detail'], (
+            f'must still route at the live successor PRD: {payload!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# INV-5: the envelope literals are enumerated ONCE, in shared.toolcall_markup.
+#
+# Kept at END OF FILE deliberately: an INV-5 block spliced into the middle of a
+# test class silently adopts every method below the splice point, which is how
+# the escalation cases above briefly became methods of TestSingleSourceOfTruth.
+# Append new blocks here rather than inserting them.
+# ---------------------------------------------------------------------------
+
+
+class TestSingleSourceOfTruth:
+    """INV-5, enforced from the consumer side."""
+
+    def test_mcp_markup_patterns_is_the_shared_object(self):
+        """IDENTITY, not equality — a copied tuple would re-open the drift.
+
+        ``==`` is satisfied by a tuple re-spelled here with the same value,
+        which is precisely the state this task exists to end: this write-time
+        list and ``toolcall_xml_leak``'s read-time list drifted apart while both
+        were documented as the single source of truth. Object identity is the
+        one assertion a duplicate cannot pass.
+        """
+        assert markup_tripwire.MCP_MARKUP_PATTERNS is toolcall_markup.MCP_MARKUP_PATTERNS
+

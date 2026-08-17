@@ -989,6 +989,66 @@ class TestRenderMarkdownDisclosure:
         assert '80' in md
         assert 'carry a category outside the censused set' in md
 
+
+def _both_default_projects_report(*, top_n: int = 50, page_size: int = 1000) -> dict:
+    """A report covering BOTH default project ids (dark_factory + reify) --
+    the only shape whose params match a fully-bare-default CLI invocation.
+    """
+    cells = {
+        'dark_factory': {OBS: _census([{'kind': 'gotcha'}])},
+        'reify': {OBS: _census([{'kind': 'gotcha'}])},
+    }
+    cov = {
+        'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)}),
+        'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+    }
+    return _mod.build_report(cells, cov, top_n=top_n, page_size=page_size)
+
+
+class TestRegenCommand:
+    """The header's regen command must always reproduce the artifact it is
+    embedded in (task 3507): a bare-default invocation silently truncated
+    the markdown ~4,800 rows shorter than an artifact generated with
+    --top-n 400, while both runs exited 0 and reported coverage.complete.
+    """
+
+    def test_all_default_params_render_the_bare_command(self):
+        md = _mod.render_markdown(_both_default_projects_report())
+        assert (
+            'Regenerate with `uv run python scripts/census_memory_metadata.py`.'
+            in md
+        )
+
+    def test_non_default_top_n_is_named_in_the_regen_command(self):
+        md = _mod.render_markdown(_both_default_projects_report(top_n=400))
+        assert (
+            'Regenerate with `uv run python scripts/census_memory_metadata.py '
+            '--top-n 400`.' in md
+        )
+        # And the bare command -- which would silently under-render -- must
+        # NOT be what's documented.
+        assert (
+            'Regenerate with `uv run python scripts/census_memory_metadata.py`.'
+            not in md
+        )
+
+    def test_non_default_page_size_is_named_in_the_regen_command(self):
+        md = _mod.render_markdown(_both_default_projects_report(page_size=250))
+        assert '--page-size 250' in md
+
+    def test_non_default_project_ids_are_named_in_the_regen_command(self):
+        cells = {'reify': {OBS: _census([{'kind': 'gotcha'}])}}
+        cov = {'reify': _coverage('fused_reify', 1, {OBS: (1, 1)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        md = _mod.render_markdown(report)
+        assert '--project-id reify' in md
+        # Both default project ids together never render an explicit
+        # --project-id flag.
+        assert (
+            '--project-id'
+            not in _mod.render_markdown(_both_default_projects_report())
+        )
+
     def test_surplus_counted_residue_is_not_rendered_as_uncovered_points(self):
         # The collection holds FEWER points than the categories counted:
         # deletions or double-counting. Rendering that through the

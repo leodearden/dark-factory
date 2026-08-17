@@ -547,6 +547,28 @@ class TestConcreteReplacementPointer:
         """(c) Prefixes, empties, None, non-strs and malformed UUIDs are rejected."""
         assert is_concrete_memory_id(value) is False
 
+    def test_trailing_newline_is_not_concrete(self):
+        """(c') A canonical UUID with a trailing newline is NOT a pointer.
+
+        The anchored `^...$` regex this predicate used to apply with `.match()`
+        ACCEPTED it, because Python's `$` matches immediately before a trailing
+        newline. That mattered here more than anywhere: this is the delete-side
+        guard on `replacement_memory_id`, so such a value would be written into
+        every repointed citation and then resolve to nothing — stranding exactly
+        the citations the repoint gate exists to protect (task 3132).
+        """
+        assert is_concrete_memory_id(_SURVIVOR + '\n') is False
+
+    def test_tombstone_refuses_a_trailing_newline_replacement(self):
+        """(e') ...and the tombstone builder refuses it too."""
+        with pytest.raises(ValueError):
+            build_citation_tombstone(
+                superseded_id=_DOOMED,
+                replacement_id=_SURVIVOR + '\n',
+                paths=['mem0_canonical_entry'],
+                run_id='run-abc',
+            )
+
     def test_tombstone_names_both_ids_paths_and_run(self):
         """(d) The tombstone record preserves the old->new mapping explicitly."""
         record = build_citation_tombstone(

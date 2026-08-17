@@ -30,6 +30,10 @@ required filename: it's what the dashboard's escalation-URL discovery
 a discovery fallback for not-yet-migrated projects, not a supported choice
 for new ones.
 
+This repo uses `ruff check` only; `ruff format` is deliberately NOT adopted
+and most files are not format-clean. Do not file or perform
+formatting-cleanup work — see `CONTRIBUTING.md` section 3 (task 3441).
+
 ## Prerequisites
 
 ```bash
@@ -216,4 +220,4 @@ directly, not just interactive agents.
   stage/judge prompt sources), `RECONCILIATION_PLAN.md`
 - **Memory skill**: `/memory` — detailed reference for memory operations, categories, search patterns
 - **Config**: `fused-memory/config/config.yaml`, `.mcp.json`
-- **Design invariants**: `docs/legibility/design-invariants.md` — five checkable invariants gating `/prd` decompose (G7) and `/review` phase 2
+- **Design invariants**: `docs/legibility/design-invariants.md` — checkable invariants gating `/prd` decompose (G7) and `/review` phase 2

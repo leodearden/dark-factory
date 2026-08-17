@@ -38,7 +38,7 @@ the trap this script exists to close.
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # The deterministic runner EXECs a bound predicate directly
@@ -120,8 +120,8 @@ def main(argv: list[str]) -> int:
         return 1
 
     if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=timezone.utc)
-    age_hours = (datetime.now(timezone.utc) - stamp).total_seconds() / 3600.0
+        stamp = stamp.replace(tzinfo=UTC)
+    age_hours = (datetime.now(UTC) - stamp).total_seconds() / 3600.0
 
     if age_hours > max_age_hours:
         print(

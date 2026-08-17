@@ -300,16 +300,40 @@ def cancel_request(
         remove_pgid_file(path)
         return 0
 
-    # NOTE — stale-file / PID-reuse window:
-    # If verify-merge dies without running its finally-block (hard crash, OOM,
-    # host reset) the pgid file is left on disk.  After the original process is
-    # gone the OS may recycle that pid/pgid for an unrelated process; a later
-    # cancel_request call would then SIGKILL the wrong process.
-    # The window is bounded: modern kernels recycle pids slowly (default
-    # pid_max = 32768), and the stale file is cleaned up by the next successful
-    # cancel-verify or on host reboot.  A future β hardening: stamp a boot-id
-    # alongside the pgid (e.g. /proc/sys/kernel/random/boot_id) and validate
-    # it here before killing.
+    # NOTE — stale-file / PID-reuse window.  Both of this note's original
+    # "the window is bounded" premises were MEASURED FALSE on 2026-08-12; the
+    # corrected picture is below.
+    #
+    # If verify-merge dies without running its finally-block the pgid file is
+    # left on disk.  The dominant cause is not a crash: it is
+    # ``fire_watchdog_kill``'s ``os._exit(1)`` (below), which by design skips
+    # every finally — 64 leftover files accumulated on the reify laptop in the
+    # 21 days after that host first ran the watchdog, ~54% of its dispatches.
+    #
+    # (a) pid recycling is NOT slow.  pid_max is 4194304 — not the 32768
+    #     default this note assumed — on BOTH the workstation and the laptop,
+    #     and the laptop's counter demonstrably wrapped on 2026-08-11.
+    # (b) Stale files are NOT cleaned on host reboot.  PGID_DIR_NAME lives
+    #     under worktree_base, a persistent repo path deliberately outside any
+    #     registered worktree (see the module docstring) — nothing prunes it.
+    #     Nine files dated 2026-07-22/23 survived the laptop's 2026-07-25 boot.
+    #
+    # What that does NOT mean: the per-request files are near-harmless for
+    # cancel_request specifically, for a reason the original note missed —
+    # request_ids are ``uuid4().hex`` (verify_runner.py), so a stale file's id
+    # is never revisited and this function never re-reads one.
+    #
+    # The real exposure is the FIXED-key holder file (LOCK_HOLDER_PGID_KEY),
+    # which every run overwrites and which ``_merge_verify_lease_active``
+    # (git_ops.py) probes with ``os.killpg(pgid, 0)``.  A recycled pid there
+    # reads as a LIVE holder and fails CLOSED: reset_persistent_merge_worktree
+    # raises MergeVerifyLeaseHeld and remove_merge_worktree_guarded skips
+    # removal — i.e. a wedged warm lane, not a mis-aimed SIGKILL.  Bounded only
+    # by the next run that acquires the build lane lock and overwrites it.
+    #
+    # Hardening (unchanged, now better motivated): stamp a boot-id alongside
+    # the pgid (e.g. /proc/sys/kernel/random/boot_id) and validate it before
+    # trusting the value, plus a GC for the leaked per-request files.
 
     # Step 2: snapshot PPID map BEFORE any kills (invariant: snapshot precedes kill).
     # Killing the root reparents its survivors to init, severing the /proc parent
@@ -443,7 +467,7 @@ def release_merge_verify_flock(fd: int) -> None:
 PROC_LOCKS_PATH: Path = Path('/proc/locks')
 
 
-def lane_lock_holder_pids(
+def lane_lock_holder_pids_strict(
     path: Path,
     *,
     locks_path: Path = PROC_LOCKS_PATH,
@@ -488,24 +512,29 @@ def lane_lock_holder_pids(
     ``FLOCK ADVISORY WRITE 588232 07:1d:4300647613`` against
     ``_merge-verify.lock`` by hand.
 
-    Fail-safe, mirroring :func:`read_lock_holder_pgid`: a missing lock file, a
-    missing or unreadable lock table (a non-Linux host has no ``/proc/locks``),
-    and any unparseable row all yield "no known holders" rather than raising.
-    Callers invoke this from inside acquire-timeout paths, where an exception
-    would convert a diagnosable stall into a broken merge.
+    STRICT about "I could not tell" (task 3604).  A missing lock file and a
+    missing or unreadable lock table both raise their ``OSError`` (errno and
+    filename intact) rather than yielding ``[]``: in both, NO rows were
+    examined at all, so an empty result carries no information whatsoever
+    about the target inode and must not be rendered as "nobody holds it".
+    Use this variant wherever confusing those two would be unsafe — canonically
+    when asserting a NEGATIVE ("the lane is free"), where a fail-safe ``[]`` is
+    the very answer that silently satisfies the caller.  Callers that would
+    rather degrade than raise want :func:`lane_lock_holder_pids` instead.
+
+    Per-ROW tolerance is deliberately UNCHANGED: ``/proc/locks`` is a
+    system-wide table, so a row this parser cannot understand belonging to some
+    unrelated process does not make THIS caller's answer about THIS inode
+    unknown.  Raising on it would couple every lane-lock check to arbitrary
+    system state.  The line drawn here is between "this ROW is odd" (skip) and
+    "the whole ANSWER is unknown" (raise).
 
     Returns the matching pids de-duplicated, in first-seen order.
     """
-    try:
-        st = os.stat(path)
-    except OSError:
-        return []
+    st = os.stat(path)
     target = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
 
-    try:
-        raw = locks_path.read_text()
-    except OSError:
-        return []
+    raw = locks_path.read_text()
 
     pids: list[int] = []
     seen: set[int] = set()
@@ -528,6 +557,39 @@ def lane_lock_holder_pids(
             seen.add(pid)
             pids.append(pid)
     return pids
+
+
+def lane_lock_holder_pids(
+    path: Path,
+    *,
+    locks_path: Path = PROC_LOCKS_PATH,
+) -> list[int]:
+    """Fail-safe :func:`lane_lock_holder_pids_strict`: an unreadable answer is ``[]``.
+
+    Identical parse — this is a thin wrapper, deliberately not a second copy,
+    so the two can never drift.  What it adds is one named FAIL-SAFE POLICY,
+    mirroring :func:`read_lock_holder_pgid`: a missing lock file and a missing
+    or unreadable lock table (a non-Linux host has no ``/proc/locks``) yield
+    "no known holders" rather than raising.  Per-row parse tolerance lives in
+    the core and applies to both variants.
+
+    Why swallow: the production callers in :mod:`orchestrator.git_ops` invoke
+    this from inside acquire-timeout paths, where an exception would convert a
+    diagnosable stall into a broken merge.  Degrading to "no known holders"
+    costs at most a less specific diagnostic message.
+
+    The cost of that policy, and when NOT to pay it (task 3604): ``[]`` here
+    means "nobody holds it" OR "the lock file is gone" OR "I could not read the
+    lock table", indistinguishably.  A caller asserting a NEGATIVE — that a
+    lane is FREE — is satisfied by all three, so for it a bad read produces a
+    silent pass rather than a diagnosable failure.  Such a caller must use
+    :func:`lane_lock_holder_pids_strict` and decide for itself what an unknown
+    answer means.
+    """
+    try:
+        return lane_lock_holder_pids_strict(path, locks_path=locks_path)
+    except OSError:
+        return []
 
 
 # ---------------------------------------------------------------------------

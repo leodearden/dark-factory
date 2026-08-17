@@ -11,6 +11,115 @@ wired it into anything that actually runs it, so the backlog only grew
 script into an automated, recurring systemd-timer drain so the backlog
 stays non-growing without any human running it by hand.
 
+### Scope: which pool this timer actually drains (task 3897)
+
+> **This section is the single home for the task-3897 rationale and its
+> measurements.** The sweep script's module docstring, its `--fail-on-blind-spot`
+> help text, `scripts/fused-memory-flag-marker-check.sh`'s header and the
+> `TestFlagForStage2IsNeverDeleted` docstring all carry a one-line summary
+> and point here rather than restating the numbers — these are point-in-time
+> measurements of live data, and five drifting copies would leave a reader
+> unable to tell which is current. Update the counts here, not there.
+
+This timer's scope is the **legacy `source`-tagged pool** —
+`{'source': 'stage1_flag_marker'}` — and nothing else. As measured on
+2026-08-09 that filter matches **0 records in both `dark_factory` and
+`reify`**, so the nightly run is currently a no-op by construction. The
+`{'kind': 'stage1_flag_marker'}` predicate measures 0 in `dark_factory`
+too. Those predicates are deliberately **retained, not retired**: they are
+still the script's delete-set contract, still reachable via `--delete-ids`,
+still the only collector for any project not yet probed, and the blind-spot
+cross-check below is *defined* as the comparison between that `source`
+enumeration and the adjacent population.
+
+It is **not** the collector for the live Stage-1 → Stage-2 relay pool
+(`{'flag_for_stage2': True}`, 61 records in `dark_factory` and 80 in
+`reify` at the same measurement). That pool is drained in-cycle by
+`_sweep_stale_mem0_flag_for_stage2_markers` (task 2966,
+`fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py`),
+which runs unconditionally per-project every reconciliation cycle and
+age-GCs on a rolling 14-day window. Those records are **not** uncollected,
+and this script deliberately counts them without ever deleting them — see
+"Why the relay pool is censused, never deleted" below.
+
+### Why the relay pool is censused, never deleted
+
+The cross-check counts the `flag_for_stage2` pool and stops there. It never
+enumerates it, never runs a predicate over it, and never adds it to the
+delete set — a boundary enforced by `TestFlagForStage2IsNeverDeleted` in
+`fused-memory/tests/test_sweep_orphan_flag_markers.py`. Three reasons, two
+of them measured on 2026-08-09:
+
+1. **23 of the 61 live records carry no usable `task_id`**, so the script's
+   existing `find_taskless_markers` predicate would delete all 23 on the
+   very next nightly `--apply` run. They are live Stage-1 → Stage-2 relay
+   markers, not dead weight — and the nightly timer's `--terminal-drain`
+   would additionally reap markers citing already-done tasks.
+2. **The script has no protected-mirror guard and writes no tombstone.**
+   `delete_orphan_markers` has neither the `is_protected_mirror_record`
+   check nor the `record_mem0_deletion_tombstones` write that the shared
+   in-cycle `_sweep_stale_mem0_pool` applies. `flag_for_stage2` is an
+   LLM-supplied key any writer can stamp on any record — `mem0_tombstone.py`'s
+   module docstring names this exact filter as its motivating over-breadth
+   case. (Measured: 0 `cycle_summary`/`ledger_stamp` records in the pool
+   today, so the risk is latent rather than active — but this script is the
+   wrong place to take it.)
+3. **The pool is already drained correctly** by task 2966's in-cycle
+   collector, on a rolling 14-day window. A second collector here would race
+   a correct one, producing duplicate deletes and duplicate tombstones for
+   the same records.
+
+Whether those records should *ultimately* be deleted is a separate question,
+now adjudicable because the sweep can finally see them. Making them visible
+is this script's job; deleting them is not.
+
+## Reading the output: `0 swept` is not automatically a clean bill
+
+Because the enumeration filter above matches nothing, the nightly run
+prints `orphan_count: 0` every night, and `--check`'s `backlog_verdict(0,
+N)` holds unconditionally. Neither is evidence of health on its own: both
+are counts taken against a pool the filter cannot see.
+
+Task 3897 makes that legible. Every run now emits a `cross_check` block in
+its JSON report:
+
+```json
+"cross_check": {
+  "source_total": 0,
+  "flag_for_stage2_total": 61,
+  "blind_spot": true,
+  "probe_failed": false
+}
+```
+
+- **`blind_spot: true`** — this sweep matched 0 records while a non-empty
+  adjacent `flag_for_stage2` population exists. Read `orphan_count: 0` as
+  "saw nothing", not "there was nothing". A matching WARNING naming both
+  counts is logged, so it also lands in
+  `journalctl --user -u fused-memory-flag-marker-sweep.service`.
+- **`blind_spot: false` with both totals 0** — a genuine no-op.
+- **`probe_failed: true`** (with `flag_for_stage2_total: null`) — the census
+  probe itself failed; `blind_spot` is then always `false`, because an
+  unobserved population is never reported as an observed blind spot. The
+  sweep is unaffected: the probe is count-only and can never alter the
+  delete set or abort a run.
+
+`--fail-on-blind-spot` (opt-in, default off) escalates an observed blind
+spot to exit 1 so a `before_done` predicate can gate on it. It is off by
+default for the same reason `--check` is absent from the recurring service
+(see below): the `flag_for_stage2` pool is a healthy rolling window that is
+legitimately never empty, so a gate keyed on its non-emptiness would fail
+forever and teach operators to ignore it. A failed probe never trips it.
+
+**`--fail-on-blind-spot` requires `--check`.** The flag resolves an exit
+code only through the `--check` verdict path, so on its own it would exit 0
+even on an observed blind spot — a gate that cannot fail, which is the very
+defect this task exists to eliminate. The sweep therefore rejects the
+combination at parse time (exit 2) rather than honouring it as a no-op.
+`scripts/fused-memory-flag-marker-check.sh` already hardcodes `--check` in
+its `exec` line, so passing the flag through that wrapper is all a
+`before_done.script` predicate needs.
+
 ## Install / enable
 
 Run on the host (not from a task worktree — see "Why this is an
@@ -115,3 +224,22 @@ healthy; a count that isn't shrinking at all across multiple nightly runs
 means the timer isn't actually firing — check `systemctl --user
 list-timers` and `journalctl --user -u fused-memory-flag-marker-sweep.service`
 on the host.
+
+**Caveat (task 3897): as of 2026-08-09 this probe returns 0**, and a 0 here
+does not distinguish "the drain worked" from "the timer never fired" —
+both render identically against an already-empty pool. To confirm the timer
+is actually firing, check `systemctl --user list-timers` and the journal
+directly rather than inferring it from this count. To see the adjacent
+relay pool the timer does **not** drain (and must not), probe it
+explicitly:
+
+```python
+mcp__fused-memory__count_memories_by_metadata(
+    project_id="dark_factory", filters={"flag_for_stage2": True},
+)
+```
+
+A non-zero result there is expected and healthy — it is the in-cycle
+collector's rolling 14-day window, not a backlog. Note the boolean `True`
+is load-bearing: Qdrant payload filters are type-sensitive, and the string
+variant `{"flag_for_stage2": "true"}` matches 0.

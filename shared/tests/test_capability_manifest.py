@@ -851,6 +851,14 @@ class TestMetadataRegistration:
     def test_registered_under_delivered_checks_key(self):
         assert task_metadata_module._SUBMODEL_REGISTRY['delivered_checks'] is DeliveredCheckMeta
 
+    def test_registered_with_list_cardinality(self):
+        # delivered_checks is the ONE genuinely list-valued metadata slice
+        # (orchestrator/delivered_checks.py reads it and
+        # verify_delivered_checks_on_main iterates it). The declaration is
+        # what keeps parse_metadata's enforced shape gate from rejecting a
+        # well-formed list — 'dict' is the fail-closed default (task 4142).
+        assert task_metadata_module._SUBMODEL_CARDINALITY['delivered_checks'] == 'list'
+
     def test_parse_metadata_write_enforce_accepts_typed_list_and_round_trips(self):
         grep_entry = {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}
         script_entry = {
@@ -917,6 +925,38 @@ class TestMetadataRegistration:
         with pytest.raises(ValidationError):
             parse_metadata(
                 {'delivered_checks': [{'name': 'cap-one', 'kind': 'manual'}]},
+                direction='write',
+                enforce=True,
+            )
+
+    def test_dict_shaped_slice_warns_wrong_cardinality(self):
+        # The mirror direction (task 4142): a bare mapping for the
+        # list-declared slice used to validate silently into a SINGLE
+        # DeliveredCheckMeta. verify_delivered_checks_on_main ITERATES this
+        # value, so a dict would iterate its string keys and yield garbage
+        # checks against a mark-done gate.
+        grep_entry = {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}
+        model, warnings = parse_metadata(
+            {'delivered_checks': dict(grep_entry)}, direction='write', enforce=False
+        )
+        assert len(warnings) == 1
+        assert warnings[0].field == 'delivered_checks'
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model.model_dump()['delivered_checks'] == grep_entry
+
+    def test_dict_shaped_slice_write_enforce_raises(self):
+        # A perfectly VALID single entry — the shape is the only defect, so
+        # this cannot pass for an element-validation reason.
+        with pytest.raises(TypeError):
+            parse_metadata(
+                {
+                    'delivered_checks': {
+                        'name': 'cap-one',
+                        'kind': 'grep',
+                        'pattern': 'foo',
+                        'expect': 'present',
+                    }
+                },
                 direction='write',
                 enforce=True,
             )

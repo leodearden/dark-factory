@@ -26,11 +26,10 @@ from __future__ import annotations
 
 import json
 import tempfile
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
-
 from legibility import trickle_state
 from legibility.trickle_state import (
     OUTCOME_BARREN,
@@ -342,8 +341,8 @@ class TestLoadState:
     def test_well_formed_is_ok(self, tmp_path):
         path = tmp_path / 'trickle-state.json'
         path.write_text(
-            '{"schema_version": %d, "project_id": "dark_factory", '
-            '"outcome": "quiet"}' % trickle_state.STATE_SCHEMA_VERSION
+            f'{{"schema_version": {trickle_state.STATE_SCHEMA_VERSION}, '
+            f'"project_id": "dark_factory", "outcome": "quiet"}}'
         )
 
         status, data = trickle_state.load_state(path)
@@ -371,7 +370,7 @@ def _record(project_id='dark_factory', *, day=1, hour=3, exit_code=0,
     """Call record_run with a derived-total counter set and an injected
     clock (the module is deliberately clock-injectable — no time faking)."""
     kw = _counters(**counters)
-    recorded_at = datetime(2026, 7, day, hour, 0, 0, tzinfo=timezone.utc)
+    recorded_at = datetime(2026, 7, day, hour, 0, 0, tzinfo=UTC)
     return trickle_state.record_run(
         project_id,
         target_date=date(2026, 7, day),

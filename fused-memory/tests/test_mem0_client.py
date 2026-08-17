@@ -858,3 +858,767 @@ class TestMem0BackendAddSystemRecordIntegration:
             assert await backend.count_by_metadata(_asr_scope, {'run_id': run_id}) == n
         finally:
             await backend.close()
+
+
+# ---------------------------------------------------------------------------
+# scan_payload_text — literal substring scan over Qdrant payload TEXT
+# (task 3083, WORK b).
+#
+# The capability gap this closes: Mem0Backend could search SEMANTICALLY
+# (`search`), match METADATA equality (`count_by_metadata`/`scroll_by_metadata`),
+# and fetch a POINT BY ID (`get_point_by_id`) — but nothing could match payload
+# TEXT. A leaked tool-call fragment carries almost no semantic signal, so the
+# corpus was structurally unsweepable for it.
+#
+# Sentinel literals use the \x3c escape for "<" (task 3083 plan pre-1).
+# ---------------------------------------------------------------------------
+
+_SCAN_CLOSE_CONTENT = '\x3c/content>'
+_SCAN_CLOSE_INVOKE = '\x3c/invoke>'
+_SCAN_OPEN_CONTENT = '\x3cparameter name="content">'
+
+_SCAN_BODY = 'A memory about the reconciliation grace window.'
+# The c759c53b shape: body, closing content tag, real newline, bare closing
+# invoke tag.
+_SCAN_LEAK_FRAGMENT = _SCAN_CLOSE_CONTENT + '\n' + _SCAN_CLOSE_INVOKE
+_SCAN_LEAK_TEXT = _SCAN_BODY + _SCAN_LEAK_FRAGMENT
+# The 9f2d2ae6 shape: body, tag, newline, an opening content parameter, then a
+# verbatim duplicate of the body.
+_SCAN_DUP_TEXT = _SCAN_BODY + _SCAN_CLOSE_CONTENT + '\n' + _SCAN_OPEN_CONTENT + _SCAN_BODY
+
+
+def _scan_point(point_id: str, payload: dict):
+    """Create a MagicMock that mimics a Qdrant Record."""
+    point = MagicMock()
+    point.id = point_id
+    point.payload = payload
+    return point
+
+
+class TestMem0BackendScanPayloadText:
+    """Literal payload-text scan: prefilter, mandatory re-verify, pagination."""
+
+    @pytest.mark.asyncio
+    async def test_prefilter_builds_should_matchtext_conditions(self, backend):
+        """One FieldCondition per needle, OR-combined via `should`.
+
+        MatchText (not MatchValue) is load-bearing: MatchValue is exact
+        equality on the whole field, which can never find a fragment embedded
+        in a longer memory.
+        """
+        from qdrant_client.http import models as qmodels
+
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            await backend.scan_payload_text(
+                scope=Scope(project_id='dark_factory'),
+                needles=[_SCAN_CLOSE_CONTENT, _SCAN_CLOSE_INVOKE],
+            )
+
+        call_kwargs = mock_client.scroll.call_args.kwargs
+        collection_prefix = backend.config.mem0.collection_prefix
+        assert call_kwargs.get('collection_name') == f'{collection_prefix}_dark_factory'
+        scroll_filter = call_kwargs.get('scroll_filter')
+        assert isinstance(scroll_filter, qmodels.Filter)
+        assert isinstance(scroll_filter.should, list)
+        assert len(scroll_filter.should) == 2
+        for cond, needle in zip(
+            scroll_filter.should, [_SCAN_CLOSE_CONTENT, _SCAN_CLOSE_INVOKE], strict=True
+        ):
+            assert isinstance(cond, qmodels.FieldCondition)
+            assert cond.key == 'data'
+            assert isinstance(cond.match, qmodels.MatchText)
+            assert cond.match.text == needle
+
+    @pytest.mark.asyncio
+    async def test_metadata_filters_are_anded_in_via_must(self, backend):
+        """An optional `filters` dict narrows the scan, using the same `must`
+        key-equality list count_by_metadata builds."""
+        from qdrant_client.http import models as qmodels
+
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            await backend.scan_payload_text(
+                scope=Scope(project_id='p'),
+                needles=[_SCAN_CLOSE_CONTENT],
+                filters={'category': 'procedural_knowledge'},
+            )
+
+        scroll_filter = mock_client.scroll.call_args.kwargs.get('scroll_filter')
+        assert isinstance(scroll_filter.must, list)
+        assert len(scroll_filter.must) == 1
+        cond = scroll_filter.must[0]
+        assert isinstance(cond, qmodels.FieldCondition)
+        assert cond.key == 'category'
+        assert isinstance(cond.match, qmodels.MatchValue)
+        assert cond.match.value == 'procedural_knowledge'
+        # The needle prefilter is still OR-ed inside the same filter.
+        assert scroll_filter.should and len(scroll_filter.should) == 1
+
+    @pytest.mark.asyncio
+    async def test_exhaustive_mode_passes_no_scroll_filter(self, backend):
+        """exhaustive=True skips the prefilter entirely so the answer rests on
+        nothing but the shared Python detector — the mode for establishing the
+        true incidence rate."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            await backend.scan_payload_text(scope=Scope(project_id='p'), exhaustive=True)
+
+        assert mock_client.scroll.call_args.kwargs.get('scroll_filter') is None
+
+    @pytest.mark.asyncio
+    async def test_metadata_filters_still_apply_in_exhaustive_mode(self, backend):
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            await backend.scan_payload_text(
+                scope=Scope(project_id='p'), exhaustive=True, filters={'category': 'x'}
+            )
+
+        scroll_filter = mock_client.scroll.call_args.kwargs.get('scroll_filter')
+        assert scroll_filter is not None
+        assert len(scroll_filter.must) == 1
+        assert not scroll_filter.should
+
+    @pytest.mark.asyncio
+    async def test_paginates_until_next_page_offset_is_exhausted(self, backend):
+        """Mandatory in both modes: the point of this capability is the TRUE
+        incidence rate, and a silently-capped scan answers that wrongly — the
+        same silent-wrong-value class this whole task is about.
+
+        scroll_by_metadata discards next_page_offset and caps at limit=1000;
+        that single-shot behaviour is deliberately NOT reused here.
+        """
+        page1 = [_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})]
+        page2 = [_scan_point('id-2', {'data': _SCAN_DUP_TEXT})]
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(side_effect=[(page1, 'cursor1'), (page2, None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        assert mock_client.scroll.await_count == 2
+        first, second = mock_client.scroll.call_args_list
+        assert first.kwargs.get('offset') is None
+        assert second.kwargs.get('offset') == 'cursor1'
+        assert [m['id'] for m in result['matches']] == ['id-1', 'id-2']
+        assert result['scanned'] == 2
+        assert result['truncated'] is False
+
+    @pytest.mark.asyncio
+    async def test_page_size_is_forwarded_as_scroll_limit(self, backend):
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            await backend.scan_payload_text(scope=Scope(project_id='p'), page_size=64)
+
+        assert mock_client.scroll.call_args.kwargs.get('limit') == 64
+
+    @pytest.mark.asyncio
+    async def test_always_requests_payload_without_vectors(self, backend):
+        """Vectors are dead weight for a text scan over ~19k points."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        call_kwargs = mock_client.scroll.call_args.kwargs
+        assert call_kwargs.get('with_payload') is True
+        assert call_kwargs.get('with_vectors') is False
+
+    @pytest.mark.asyncio
+    async def test_prefilter_hits_are_re_verified_by_the_python_detector(self, backend):
+        """THE authoritative verdict is the shared detector, never the prefilter.
+
+        This fails SAFE if a text payload index is ever created on `data` and
+        MatchText flips from substring to tokenized matching: tokenized is
+        strictly MORE permissive for these needles, so the prefilter stays a
+        superset and this re-verify still yields the exact answer.
+        """
+        genuine = _scan_point('real', {'data': _SCAN_LEAK_TEXT})
+        # Contains the word "content" and even the bare closing tag, but no
+        # leak: no continuation after real whitespace.
+        decoy = _scan_point('decoy', {'data': 'Talking about content' + _SCAN_CLOSE_CONTENT})
+        # The tasks 2938/2939 shape: quotes the leak with an ESCAPED newline.
+        prose = _scan_point(
+            'prose', {'data': 'Quoted: `' + _SCAN_CLOSE_CONTENT + '\\n' + _SCAN_CLOSE_INVOKE + '`.'}
+        )
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([genuine, decoy, prose], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        assert [m['id'] for m in result['matches']] == ['real']
+        # `scanned` counts everything walked, so the incidence rate has a
+        # correct denominator even though only one record matched.
+        assert result['scanned'] == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('key', ['data', 'memory', 'content'])
+    async def test_content_is_read_via_the_canonical_key_order(self, backend, key):
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([_scan_point('p1', {key: _SCAN_LEAK_TEXT})], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        assert [m['id'] for m in result['matches']] == ['p1']
+
+    @pytest.mark.asyncio
+    async def test_data_wins_over_memory_and_content(self, backend):
+        """`data` is the canonical Qdrant payload key for memory text
+        (memory_service._MEM0_CONTENT_KEYS)."""
+        point = _scan_point('p1', {'data': 'clean text', 'memory': _SCAN_LEAK_TEXT})
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([point], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        assert result['matches'] == []
+
+    @pytest.mark.asyncio
+    async def test_hit_shape_carries_id_created_at_fragments_excerpt_metadata(self, backend):
+        payload = {
+            'data': _SCAN_LEAK_TEXT,
+            'created_at': '2026-07-27T00:00:00+00:00',
+            'category': 'observations_and_summaries',
+            'agent_id': 'claude-interactive',
+        }
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([_scan_point('id-9', payload)], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        hit = result['matches'][0]
+        assert hit['id'] == 'id-9'
+        assert hit['created_at'] == '2026-07-27T00:00:00+00:00'
+        assert hit['matched_fragments'] == [_SCAN_LEAK_FRAGMENT]
+        assert _SCAN_BODY[:20] in hit['excerpt']
+        assert hit['metadata']['category'] == 'observations_and_summaries'
+        assert hit['metadata']['agent_id'] == 'claude-interactive'
+
+    @pytest.mark.asyncio
+    async def test_payloadless_point_does_not_raise(self, backend):
+        point = MagicMock()
+        point.id = 'no-payload'
+        point.payload = None
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([point], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        assert result['matches'] == []
+        assert result['scanned'] == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('needles', [None, []])
+    async def test_absent_needles_default_to_the_shared_sentinels(self, backend, needles):
+        """Defaulting to an empty needle list would scan for nothing and report
+        a clean corpus — a silent false negative."""
+        from qdrant_client.http import models as qmodels
+
+        from fused_memory.utils.toolcall_xml_leak import PREFILTER_NEEDLES
+
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            await backend.scan_payload_text(scope=Scope(project_id='p'), needles=needles)
+
+        scroll_filter = mock_client.scroll.call_args.kwargs.get('scroll_filter')
+        assert isinstance(scroll_filter, qmodels.Filter)
+        assert isinstance(scroll_filter.should, list)
+        assert len(scroll_filter.should) == len(PREFILTER_NEEDLES)
+        for cond, needle in zip(scroll_filter.should, PREFILTER_NEEDLES, strict=True):
+            assert isinstance(cond, qmodels.FieldCondition)
+            assert isinstance(cond.match, qmodels.MatchText)
+            assert cond.match.text == needle
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates_not_swallowed(self, backend):
+        """The load-bearing raw-Qdrant invariant: no try/except around
+        asyncio.wait_for, so a timed-out scan is never mistaken for a clean
+        corpus (which is exactly the wrong answer for an incidence sweep)."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(TimeoutError),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+    @pytest.mark.asyncio
+    async def test_timeout_on_a_later_page_also_propagates(self, backend):
+        page1 = [_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})]
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(side_effect=[(page1, 'cursor1'), TimeoutError('too slow')])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(TimeoutError),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+    @pytest.mark.asyncio
+    async def test_explicit_limit_truncates_loudly(self, backend, caplog):
+        """No silent caps: a truncated walk must be self-disclosed in the
+        result AND logged, because a silently-capped scan produces a
+        plausible-looking undercount of the true incidence rate."""
+        page1 = [_scan_point(f'id-{i}', {'data': _SCAN_LEAK_TEXT}) for i in range(3)]
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(side_effect=[(page1, 'cursor1'), (page1, None)])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'), limit=3)
+
+        assert result['truncated'] is True
+        assert result['scanned'] == 3
+        assert mock_client.scroll.await_count == 1
+        assert any('truncat' in r.message.lower() for r in caplog.records), caplog.text
+
+    @pytest.mark.asyncio
+    async def test_untruncated_walk_reports_truncated_false_and_logs_nothing(self, backend, caplog):
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(
+            return_value=([_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})], None)
+        )
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'), limit=1000)
+
+        assert result['truncated'] is False
+        assert not [r for r in caplog.records if 'truncat' in r.message.lower()]
+
+    @pytest.mark.asyncio
+    async def test_empty_corpus_is_a_clean_result_not_an_error(self, backend):
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'))
+
+        assert result == {'matches': [], 'scanned': 0, 'truncated': False}
+
+    @pytest.mark.parametrize('limit', [0, -1])
+    @pytest.mark.asyncio
+    async def test_a_non_positive_limit_raises_rather_than_walking_nothing(
+        self, backend, limit
+    ):
+        """``limit=0`` would make ``min(page_size, limit - scanned)`` request 0
+        points, so the walk returns ``{'matches': [], 'scanned': 0,
+        'truncated': False}`` — INDISTINGUISHABLE from a genuinely clean
+        corpus, and read by a caller's exit-code predicate as a complete,
+        successful sweep. Same no-silent-wrong-value rule that makes a scan
+        timeout propagate rather than collapse into an empty list.
+        """
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(ValueError, match='strictly positive'),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'), limit=limit)
+
+        mock_client.scroll.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_limit_of_one_still_scans(self, backend):
+        """The boundary is rejected BELOW 1, not at it — a 1-record probe is a
+        legitimate call and must not be caught by the guard."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(
+            return_value=([_scan_point('id-1', {'data': _SCAN_LEAK_TEXT})], None)
+        )
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'), limit=1)
+
+        assert result['scanned'] == 1
+        assert len(result['matches']) == 1
+
+
+# ---------------------------------------------------------------------------
+# TRIPWIRE: the un-indexed-field MatchText semantics the prefilter relies on.
+#
+# A read-only live probe (qdrant 1.17.1, 19,321 points) measured that on an
+# UN-INDEXED payload field, MatchText performs a LITERAL, case-sensitive,
+# ORDER-PRESERVING substring match. Nothing in this repo calls
+# create_payload_index today — but if a text index is ever added to `data`,
+# MatchText SILENTLY flips to tokenized word-matching. A silent semantic flip
+# is precisely the failure class this task exists to kill, so it must fail
+# LOUDLY here rather than quietly narrowing the sweep.
+#
+# Correctness does not depend on this test passing: the mandatory Python
+# re-verify keeps the result exact either way, because tokenized matching is
+# strictly MORE permissive for these needles. Only speed would degrade.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _spt_scope(worker_id) -> Scope:
+    return Scope(project_id=f'_test_scan_payload_text_{worker_id}')
+
+
+@pytest.fixture
+def _spt_clean_collection(_spt_scope, mock_config):
+    collection = _spt_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
+        client.delete_collection(collection)
+    yield collection
+    with contextlib.suppress(Exception):
+        client.delete_collection(collection)
+    client.close()
+
+
+class TestMem0BackendScanPayloadTextIntegration:
+    """Pins the un-indexed MatchText substring semantics against live Qdrant."""
+
+    pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]
+
+    @pytest.mark.asyncio
+    async def test_matchtext_prefilter_is_a_literal_substring_match(
+        self, mock_config, _spt_scope, _spt_clean_collection, monkeypatch,
+    ):
+        backend = await _build_asr_backend(mock_config, _spt_scope, monkeypatch)
+        try:
+            await backend.add_system_record(
+                content='The reconciliation stage two judge halts on an empty backlog.',
+                scope=_spt_scope,
+                metadata={'kind': 'scan_payload_text_probe'},
+            )
+
+            # Mid-word substring: proves `contains`, not tokenization.
+            midword = await backend.scan_payload_text(
+                scope=_spt_scope, needles=['econciliatio'], exhaustive=False
+            )
+            assert midword['scanned'] == 1, (
+                'un-indexed MatchText must substring-match mid-word; a text '
+                'payload index on `data` would flip it to tokenized matching'
+            )
+
+            # Reversed word order must NOT match a substring engine.
+            reversed_order = await backend.scan_payload_text(
+                scope=_spt_scope, needles=['judge reconciliation'], exhaustive=False
+            )
+            assert reversed_order['scanned'] == 0, (
+                'reversed word order matched — MatchText is tokenized here, so '
+                'the prefilter semantics assumed by scan_payload_text changed'
+            )
+
+            # Sanity: exhaustive mode ignores the prefilter entirely, so it
+            # still walks the record regardless of MatchText semantics.
+            assert (await backend.scan_payload_text(
+                scope=_spt_scope, exhaustive=True
+            ))['scanned'] == 1
+        finally:
+            await backend.close()
+
+
+class TestBuildConfigDictEndpointPlumbing:
+    """_build_config_dict is a pure function of config — no Qdrant, no
+    AsyncMemory, no _get_instance. Greenfield: nothing tested this dict before.
+    """
+
+    # --- default (shipped-config) behaviour: must stay byte-identical ---
+
+    def test_default_omits_embedding_dims_entirely(self, backend):
+        """The load-bearing byte-identical assertion.
+
+        mem0/embeddings/openai.py sets
+        ``_pass_dimensions_to_api = self.config.embedding_dims is not None``.
+        We omit the key today, so ``dimensions`` is NEVER sent on an
+        embeddings request. Emitting the key at all — even as 1536 — would
+        start sending it on every request under the shipped config. Hence the
+        emit-only-when-non-default rule; do not "simplify" it away.
+        """
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert backend.config.embedder.dimensions == 1536
+        assert 'embedding_dims' not in config_dict['embedder']['config']
+
+    def test_default_emits_incumbent_base_urls(self, backend):
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert config_dict['llm']['config']['openai_base_url'] == 'https://api.openai.com/v1'
+        assert (
+            config_dict['embedder']['config']['openai_base_url']
+            == 'https://api.openai.com/v1'
+        )
+
+    def test_default_vector_store_dims_match_mem0s_own_default(self, backend):
+        """Emitting this key is a no-op at the shipped config — mem0's Qdrant
+        default is already 1536 — but it is required for a collection to be
+        CREATED at a non-default dimensionality."""
+        from mem0.configs.vector_stores.qdrant import QdrantConfig
+
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert config_dict['vector_store']['config']['embedding_model_dims'] == 1536
+        assert (
+            QdrantConfig.model_fields['embedding_model_dims'].default == 1536
+        ), 'mem0 changed its Qdrant dims default — the no-op claim above no longer holds'
+
+    def test_preexisting_keys_are_unchanged(self, backend):
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert config_dict['version'] == 'v1.1'
+        assert config_dict['vector_store']['provider'] == 'qdrant'
+        assert config_dict['vector_store']['config']['url'] == backend.config.mem0.qdrant_url
+        assert config_dict['vector_store']['config']['collection_name'] == 'some_collection'
+
+        llm = config_dict['llm']['config']
+        assert config_dict['llm']['provider'] == 'openai'
+        assert llm['model'] == 'gpt-4o-mini'
+        assert llm['temperature'] == 0.1
+        assert llm['max_tokens'] == 4096
+        assert llm['api_key'] == 'test-key'
+
+        embedder = config_dict['embedder']['config']
+        assert config_dict['embedder']['provider'] == 'openai'
+        assert embedder['model'] == 'text-embedding-3-small'
+        assert embedder['api_key'] == 'test-key'
+
+    # --- local-endpoint behaviour ---
+
+    def test_llm_and_embedder_endpoints_are_independent(self, mock_config):
+        """The two provider blocks are read SEPARATELY — one is not reused for
+        both, which is what makes independent LLM/embedder endpoints possible.
+        """
+        mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:1234/v1'
+        mock_config.embedder.providers.openai.api_url = 'http://127.0.0.1:5678/v1'
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert config_dict['llm']['config']['openai_base_url'] == 'http://127.0.0.1:1234/v1'
+        assert (
+            config_dict['embedder']['config']['openai_base_url']
+            == 'http://127.0.0.1:5678/v1'
+        )
+
+    def test_non_default_dims_emitted_under_both_key_names(self, mock_config):
+        """BOTH keys are required for a non-1536 arm, and they are NOT the same
+        key: the embedder key controls what dimensionality is requested from
+        the API, the vector-store key controls what Qdrant creates the
+        collection with. Setting only one silently yields a mismatch.
+        """
+        mock_config.embedder.dimensions = 768
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert config_dict['embedder']['config']['embedding_dims'] == 768
+        assert config_dict['vector_store']['config']['embedding_model_dims'] == 768
+
+    def test_anthropic_llm_block_carries_no_openai_base_url(self, mock_config):
+        """openai_base_url is an OpenAIConfig-only parameter; passing it to the
+        anthropic config class would TypeError out of mem0's factory."""
+        from fused_memory.config.schema import AnthropicProviderConfig
+
+        mock_config.llm.provider = 'anthropic'
+        mock_config.llm.providers.anthropic = AnthropicProviderConfig(api_key='ak')
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert config_dict['llm']['provider'] == 'anthropic'
+        assert 'openai_base_url' not in config_dict['llm']['config']
+
+    # --- key-name guard ---
+
+    def test_every_emitted_key_is_accepted_by_the_installed_mem0(self, mock_config):
+        """The highest-value assertion here.
+
+        An unknown key raises TypeError from mem0/utils/factory.py, and
+        AsyncMemory.from_config only catches pydantic ValidationError — so a
+        misspelling escapes uncaught at instance construction, in production,
+        not here. The names are easy to get wrong: the EMBEDDER takes
+        `embedding_dims`, while `embedding_model_dims` is the VECTOR STORE's
+        key. Validate what we emit against the installed signatures.
+        """
+        import inspect
+
+        from mem0.configs.embeddings.base import BaseEmbedderConfig
+        from mem0.configs.llms.openai import OpenAIConfig
+        from mem0.configs.vector_stores.qdrant import QdrantConfig
+
+        # Non-default dims so every optional key is actually emitted.
+        mock_config.embedder.dimensions = 768
+        mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:1234/v1'
+        mock_config.embedder.providers.openai.api_url = 'http://127.0.0.1:5678/v1'
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        embedder_params = set(inspect.signature(BaseEmbedderConfig.__init__).parameters)
+        llm_params = set(inspect.signature(OpenAIConfig.__init__).parameters)
+        vector_store_params = set(QdrantConfig.model_fields)
+
+        for key in config_dict['embedder']['config']:
+            assert key in embedder_params, (
+                f'embedder key {key!r} is not a BaseEmbedderConfig parameter — '
+                f'mem0 would TypeError. Did you mean one of {sorted(embedder_params)}?'
+            )
+        for key in config_dict['llm']['config']:
+            assert key in llm_params, f'llm key {key!r} is not an OpenAIConfig parameter'
+        for key in config_dict['vector_store']['config']:
+            assert key in vector_store_params, (
+                f'vector_store key {key!r} is not a QdrantConfig field'
+            )
+
+        # And pin the two easily-confused spellings explicitly.
+        assert 'embedding_dims' in embedder_params
+        assert 'embedding_model_dims' not in embedder_params
+        assert 'embedding_model_dims' in vector_store_params
+
+
+class TestNonDefaultDimsAgainstAnExistingCollection:
+    """The migration hazard behind plumbing embedder.dimensions at all.
+
+    Neither dims key was plumbed before, so a deployment already configured
+    with ``embedder.dimensions != 1536`` was running INERT: mem0 created its
+    Qdrant collection at its own 1536 default and requested 1536-wide vectors.
+    Both now follow the config — but only for a collection that does not exist
+    yet. Changing the knob on a live deployment therefore requires recreating
+    and re-embedding the collection; it is not live-migratable.
+    """
+
+    @staticmethod
+    def _fake_qdrant_client(existing: list[str]):
+        collections = MagicMock()
+        collections.collections = [MagicMock(name=n) for n in existing]
+        # MagicMock(name=...) sets the mock's repr name, not a .name attribute.
+        for mock_col, real_name in zip(collections.collections, existing, strict=True):
+            mock_col.name = real_name
+
+        client = MagicMock()
+        client.get_collections.return_value = collections
+        return client
+
+    def test_existing_collection_is_left_at_its_old_dimensionality(self):
+        """Upstream short-circuits, so the new dims never reach Qdrant.
+
+        Measured against the installed mem0: ``Qdrant.create_col`` returns
+        early when the collection is already listed ('Collection ... already
+        exists. Skipping creation.'). The embedder meanwhile DOES start
+        requesting N-wide vectors, so every subsequent upsert fails on a
+        dimension mismatch at runtime. Pinning it here means a future mem0 that
+        learns to migrate — or to fail loudly — turns this red instead of
+        leaving a stale operator note in place.
+        """
+        from mem0.vector_stores.qdrant import Qdrant
+
+        client = self._fake_qdrant_client(['fused_dark_factory'])
+
+        Qdrant(
+            collection_name='fused_dark_factory',
+            embedding_model_dims=768,
+            client=client,
+        )
+
+        client.create_collection.assert_not_called()
+
+    def test_a_fresh_collection_is_created_at_the_configured_dimensionality(self):
+        """Control: the plumbing does work — on a collection that does not yet
+        exist, which is the only case where changing dimensions is safe."""
+        from mem0.vector_stores.qdrant import Qdrant
+
+        client = self._fake_qdrant_client([])
+
+        Qdrant(collection_name='brand_new', embedding_model_dims=768, client=client)
+
+        client.create_collection.assert_called_once()
+        vectors_config = client.create_collection.call_args.kwargs['vectors_config']
+        assert vectors_config.size == 768
+
+
+class TestAmbientBaseUrlPrecedenceIsReported:
+    """Config is now authoritative over OPENAI_BASE_URL / OPENAI_API_BASE.
+
+    That is intended — a written-down endpoint should beat an inherited env
+    var — but for a site that routed OpenAI traffic through a gateway by
+    exporting OPENAI_BASE_URL without OPENAI_API_URL, it silently sends that
+    traffic back to api.openai.com. An egress and billing change must be
+    announced (docs/legibility/design-invariants.md, no-silent-fail-soft).
+    """
+
+    #: Every ambient var ``warn_if_ambient_base_url_is_overridden`` inspects.
+    #: Both are live in the wild (mem0 still honours the deprecated
+    #: ``OPENAI_API_BASE`` spelling), so a test that sets only one is at the
+    #: mercy of whatever the host/CI runner exports for the other.
+    AMBIENT_VARS = ('OPENAI_BASE_URL', 'OPENAI_API_BASE')
+
+    @pytest.fixture(autouse=True)
+    def _clear_warn_cache(self, monkeypatch):
+        """Reset the once-per-process warn cache AND the ambient environment.
+
+        Clearing both vars here (rather than per-test) means every test in
+        this class starts from a known-empty ambient environment and then
+        sets only the var it means to exercise — otherwise an inherited
+        ``OPENAI_API_BASE`` on the runner adds a second pair of warnings and
+        flips the count assertions red.
+        """
+        from fused_memory.config.env_precedence import reset_warning_cache
+
+        for var in self.AMBIENT_VARS:
+            monkeypatch.delenv(var, raising=False)
+        reset_warning_cache()
+        yield
+        reset_warning_cache()
+
+    @pytest.mark.parametrize('var', ['OPENAI_BASE_URL', 'OPENAI_API_BASE'])
+    def test_disagreeing_env_var_is_reported(self, mock_config, monkeypatch, caplog, var):
+        monkeypatch.setenv(var, 'https://gateway.example.invalid/v1')
+
+        with caplog.at_level(logging.WARNING):
+            Mem0Backend(mock_config)._build_config_dict('c')
+
+        messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            var in m and 'https://api.openai.com/v1' in m for m in messages
+        ), f'expected a warning naming {var} and the configured endpoint, got {messages}'
+
+    def test_agreeing_env_var_is_silent(self, mock_config, monkeypatch, caplog):
+        """No warning when the environment and the config already agree —
+        otherwise the signal is noise on a correctly-configured deployment."""
+        monkeypatch.setenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
+
+        with caplog.at_level(logging.WARNING):
+            Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert not [r for r in caplog.records if 'OPENAI_BASE_URL' in r.message]
+
+    def test_unset_env_is_silent(self, mock_config, caplog):
+        # Both ambient vars are already cleared by the autouse fixture.
+        with caplog.at_level(logging.WARNING):
+            Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert not [r for r in caplog.records if 'takes precedence' in r.message]
+
+    def test_repeated_builds_warn_only_once(self, mock_config, monkeypatch, caplog):
+        """_build_config_dict runs once per project instance; an unguarded
+        warning would repeat per project and read as a fresh incident."""
+        monkeypatch.setenv('OPENAI_BASE_URL', 'https://gateway.example.invalid/v1')
+        backend = Mem0Backend(mock_config)
+
+        with caplog.at_level(logging.WARNING):
+            backend._build_config_dict('c1')
+            backend._build_config_dict('c2')
+
+        hits = [r for r in caplog.records if 'takes precedence' in r.message]
+        # One for the llm block, one for the embedder block — not four.
+        assert len(hits) == 2, [r.message for r in hits]

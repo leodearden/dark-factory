@@ -282,8 +282,27 @@ class ProjectPrefixRegistry:
         component there). When more than one registered prefix matches, the
         LONGEST one wins.
 
-        A leading ``'./'`` is stripped before matching. Returns ``None`` for
-        an empty/falsy *file_path*.
+        A leading ``'./'`` is stripped, then — task 4156 — the candidate is
+        normalised LEXICALLY with ``os.path.normpath``, by the SAME call and
+        for the SAME reason the ABSOLUTE regime uses (see
+        :meth:`_owner_for_absolute_path`): the scan below compares just as
+        lexically, so an unnormalised spelling defeats it in both directions.
+        ``'orchestrator/../crates/foo.rs'`` would match the prefix
+        ``'orchestrator/'`` by bare ``startswith`` and produce a FALSE
+        ownership of a file that is not under ``orchestrator/`` at all, while
+        ``'foo/../orchestrator/x.py'`` would match nothing and silently disarm
+        the guard.  Still NO filesystem access — ``normpath`` is a string
+        operation, so ownership neither resolves symlinks nor depends on the
+        file existing yet, and deliberately NOT ``abspath``/``realpath``/
+        ``Path.resolve()``, which would splice in the process CWD and make the
+        verdict depend on where the interceptor happens to be running.
+
+        A candidate that normalises to a leading ``'..'`` (or to ``'.'``) is
+        UNOWNED by design: this regime is given no base directory to resolve it
+        against, so ``'../other-repo/x.py'`` is genuinely unclassifiable. That
+        fails OPEN — a missed rejection, never a false one — matching the
+        residue documented at :meth:`_owner_for_absolute_path`. Returns
+        ``None`` for an empty/falsy *file_path*.
 
         This is the CERTAIN/structured counterpart to the heuristic prose
         scanners in :mod:`fused_memory.middleware.path_scope_guard` — used by
@@ -311,10 +330,14 @@ class ProjectPrefixRegistry:
             # regimes are disjoint by construction — a registered prefix is
             # always a top-level dir name, so it can never lead an absolute
             # path, and roots are always absolute, so they can never match a
-            # relative candidate. This early return is therefore a
-            # short-circuit, not a semantic change for relative input, which
-            # keeps the prefix scan below byte-identical.
+            # relative candidate. That disjointness is what made ADDING this
+            # early return in 3109 a pure short-circuit, leaving the relative
+            # verdicts of the day untouched — a fact about that change, not a
+            # standing claim about the scan below, which has since grown its
+            # own normalisation (task 4156). This is a regime selector.
             return self._owner_for_absolute_path(path)
+
+        path = os.path.normpath(path)
 
         best_prefix = ''
         best_owner: str | None = None

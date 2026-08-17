@@ -25,7 +25,7 @@ import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
@@ -38,9 +38,19 @@ if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from legibility import (  # noqa: E402
-    census_trigger, codebook, coder, digest, inventory, sampling, trickle_state,
+    census_trigger,
+    codebook,
+    coder,
+    digest,
+    inventory,
+    sampling,
+    trickle_state,
 )
-from legibility.config import LegibilityConfig, configure_logging, load_config  # noqa: E402
+from legibility.config import (  # noqa: E402
+    LegibilityConfig,
+    configure_logging,
+    load_config,
+)
 
 logger = logging.getLogger('legibility.nightly')
 
@@ -440,30 +450,29 @@ def _build_escalation_arguments(cfg: LegibilityConfig, summary: str, detail: str
 
 
 def _default_poster(url: str, envelope: dict) -> None:
-    """Post *envelope* to *url* via a real (lazily-imported) httpx POST.
+    """Post *envelope* to *url* over the MCP streamable-HTTP transport.
 
-    ``httpx`` is imported lazily so that importing this module -- for its
-    unit-tested pure core -- never needs it, and so the tests can substitute
-    a stub for the real POST. It is NOT lazy for availability: httpx is a
-    direct dependency of ``shared`` (``shared/pyproject.toml``,
-    ``httpx>=0.27``, task 2965), and the systemd unit runs this script under
-    ``uv run --frozen --project shared``, so it is always importable in
-    production. Mirrors ``census_trigger.default_status_fetcher``. Raises on
-    any network/HTTP failure; :func:`post_escalation` wraps this
-    best-effort.
+    Delegates to ``census_trigger.post_mcp_envelope``, which single-sources
+    the whole transport contract for this subsystem: the required
+    Accept/Content-Type pair, the session handshake, and response-body
+    decoding. Raises on any network/HTTP failure; :func:`post_escalation`
+    wraps this best-effort.
+
+    Why this is not a bare POST any more (task 3644): the escalation server
+    is a STATEFUL streamable-HTTP server. A session-less ``tools/call`` is
+    rejected at the transport layer, before the tool ever runs, with
+    ``400 Bad Request`` / ``"Missing session ID"`` -- and with
+    :func:`post_escalation` swallowing that best-effort, EVERY trickle
+    fail-loud escalation (extractor crash, coder storm, commit failure) was
+    silently dropped. ``post_mcp_envelope`` performs the
+    ``initialize`` -> ``notifications/initialized`` handshake on that 400 and
+    retries once, and decodes the SSE-framed reply that server then sends.
+
+    Keeps returning None and discarding the decoded body: the caller only
+    needs "did it land", and preserving the ``(url, envelope) -> None`` seam
+    signature keeps every injected ``poster=`` in the test suite working.
     """
-    import httpx
-
-    response = httpx.post(
-        url,
-        json=envelope,
-        # Required by the streamable-HTTP MCP transport -- single-sourced
-        # in census_trigger (already imported here) so a transport change is
-        # a one-line edit, not four lockstep edits with a silent-406 risk.
-        headers=census_trigger.MCP_STREAMABLE_HTTP_HEADERS,
-        timeout=10.0,
-    )
-    response.raise_for_status()
+    census_trigger.post_mcp_envelope(url, envelope, timeout=10.0)
 
 
 def post_escalation(
@@ -550,23 +559,52 @@ def evaluate_census_step(
     """Evaluate the periodic-census trigger (ζ) at the end of a nightly
     run, returning ``(one_line_decision, fire)``.
 
-    *decide* (default ``census_trigger.decide_for_project``, never raises
-    -- fail-safe) makes the FIRE/NO-FIRE call. On NO-FIRE, *launcher* is
-    never called. On FIRE: if *entrypoint_exists* (default: does
-    ``scripts/legibility/census.py`` -- task η -- exist) is False, this
-    logs a LOUD "FIRE-WITHOUT-LAUNCH" warning and returns without calling
-    *launcher* -- η is NOT a dependency of ε, so a fired trigger before η
-    lands must never crash or fail the nightly run. If the entrypoint is
-    present, *launcher* (default: best-effort subprocess launch) is called
-    once; any launcher failure is caught and logged, never propagated --
-    this function never raises and never fails the run.
+    *decide* (default ``census_trigger.decide_for_project``) makes the
+    FIRE/NO-FIRE call. On NO-FIRE, *launcher* is never called. On FIRE: if
+    *entrypoint_exists* (default: does ``scripts/legibility/census.py`` --
+    task η -- exist) is False, this logs a LOUD "FIRE-WITHOUT-LAUNCH"
+    warning and returns without calling *launcher* -- η is NOT a dependency
+    of ε, so a fired trigger before η lands must never crash or fail the
+    nightly run. If the entrypoint is present, *launcher* (default:
+    best-effort subprocess launch) is called once.
+
+    This function never raises and never fails the run, and that guarantee is
+    its OWN: both the *decide* call and the *launcher* call are guarded here,
+    each degrading to one WARNING. It is deliberately not delegated to
+    ``decide_for_project``'s own never-raises contract -- *decide* is an
+    injected seam any caller can replace, so a promise about the default
+    callee could not hold for an arbitrary one (task 4085). A failed
+    evaluation returns a synthetic line keeping the
+    ``census trigger: NO-FIRE -- ...`` grammar every consumer of
+    ``NightlyResult.census_line`` reads, and returns before the
+    entrypoint/launcher block so it can never start a census.
     """
     if entrypoint_exists is None:
         entrypoint_exists = _default_entrypoint_exists
     if launcher is None:
         launcher = _default_census_launcher
 
-    decision = decide(cfg.project_root, now=now, status_fetcher=status_fetcher)
+    # Returns BEFORE the entrypoint/launcher block below, and that ordering is
+    # a safety property rather than a style choice: an evaluation that failed
+    # has established nothing, so it must never be able to start a census.
+    try:
+        decision = decide(cfg.project_root, now=now, status_fetcher=status_fetcher)
+    except Exception as exc:  # noqa: BLE001 - the census trigger must never fail the run
+        # The exception text is BOUNDED before it reaches either sink, and both
+        # sinks are single-line: the WARNING becomes one nightly journal line,
+        # and `census_line` is a one-line field on `NightlyResult`. An escaping
+        # exception's message is arbitrary -- a `StatusFetchUnavailable`
+        # chained from a large get_statuses payload, or a multi-line YAML /
+        # pydantic error -- so it is truncated (and its newlines escaped) by
+        # census_trigger's own log-hygiene helper rather than a second copy of
+        # that logic here. Formatted once, so the two sinks cannot drift.
+        detail = f'{type(exc).__name__}: {census_trigger._bounded_repr(str(exc))}'
+        logger.warning(
+            'census trigger evaluation failed (%s) -- NO-FIRE; the nightly '
+            'run is unaffected', detail,
+        )
+        return f'census trigger: NO-FIRE -- trigger evaluation failed ({detail})', False
+
     line = 'census trigger: {} -- {}'.format(
         'FIRE' if decision.fire else 'NO-FIRE', '; '.join(decision.reasons),
     )
@@ -805,7 +843,7 @@ def _record_trickle_progress(
     mode.
     """
     record = recorder if recorder is not None else trickle_state.record_run
-    recorded_at = now if now is not None else datetime.now(timezone.utc)
+    recorded_at = now if now is not None else datetime.now(UTC)
     try:
         doc = record(
             cfg.project_id,
@@ -974,7 +1012,7 @@ def run_nightly(
     cfg = load_config(resolved_config_path)
 
     if target_date is None:
-        target_date = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        target_date = (datetime.now(UTC) - timedelta(days=1)).date()
     if projects_root is None:
         projects_root = DEFAULT_PROJECTS_ROOT
     commit_fn = committer if committer is not None else _git_commit_docs_only

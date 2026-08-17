@@ -24,6 +24,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 __all__ = [
+    'HUMAN_CURATOR_GATE_KEY',
     'KNOWN_ROLE_NAMES',
     'BeforeDone',
     'DoneProvenance',
@@ -35,6 +36,7 @@ __all__ = [
     'RoutingDecisionMirror',
     'RoutingState',
     'SchemaWarning',
+    'SubmodelCardinality',
     'TaskMetadata',
     'apply_migrations',
     'parse_metadata',
@@ -83,6 +85,23 @@ KNOWN_ROLE_NAMES: frozenset[str] = frozenset(
         'simple_task',
     }
 )
+
+
+# The human-curator-gate marker (task 3341), read by
+# TaskMetadata._deterministic_invariants below and blessed in
+# _BLESSED_METADATA_KEYS. It is an ``extra='allow'`` metadata key, NOT a typed
+# TaskMetadata field, and is deliberately kept that way (task 3369): a typed
+# ``bool`` would COERCE the fail-closed string 'true' to True in pydantic's
+# non-strict mode -- silently rewriting an author's value in the one direction
+# that makes it look intentional, breaking I1 -- and a concrete default would
+# add ``human_curator_gate: false`` noise to every task's model_dump(), the
+# same objection already documented for merge_retry_pending.
+#
+# This is the key's SINGLE definition codebase-wide (exported via __all__):
+# orchestrator.deterministic_runner — the only other module that acts on the
+# key — imports it from here rather than restating the literal, so the write
+# boundary's rejection and the runner's dispatch-time guard cannot drift apart.
+HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
 
 
 def validate_model_overrides(value: object) -> None:
@@ -144,6 +163,26 @@ class DoneProvenance(BaseModel):
     ``kind`` is the *only* place the valid-kinds vocabulary is declared;
     fused-memory's ``_VALID_PROVENANCE_KINDS`` is retired in favour of
     importing this model (see PRD §5, I2).
+
+    ``stamped_at`` (task 3576) is the dedicated stamp-*write* timestamp
+    (ISO-8601 UTC) for ``kind='found_on_main'``. It is written SERVER-SIDE
+    by fused-memory's ``_validate_done_provenance`` chokepoint and is never
+    supplied by a caller — a caller-supplied value is discarded with a
+    warning. It exists because ``updatedAt`` is bumped by *any* later write
+    to the task (a re-tag, an audit annotation, a dependency edit), so it
+    cannot answer "when was this attribution asserted?"; the found_on_main
+    soak-gate predicate needs that question answered to distinguish a
+    genuinely new spurious stamp from legacy backlog.
+
+    It is deliberately OPTIONAL rather than conditionally-required for
+    ``found_on_main`` (i.e. ``_check_conditional_requirements`` is
+    deliberately NOT extended) for two reasons: ~193 historical stamps
+    predate the field and must keep validating at read time, and — more
+    importantly — its ABSENCE is itself load-bearing signal. Because every
+    write after task 3576 lands populates it at the chokepoint, a blob
+    lacking it provably predates that landing, which is exactly how
+    ``fused-memory/scripts/check_found_on_main_spurious_rate.py`` separates
+    legacy backlog from new stamps.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -163,6 +202,9 @@ class DoneProvenance(BaseModel):
     unit: str | None = None
     active_enter_timestamp: str | None = None
     escalation_id: str | None = None
+    # Server-written; see the class docstring. Optional by design — absence
+    # means "predates task 3576", which the soak-gate predicate relies on.
+    stamped_at: str | None = None
 
     @model_validator(mode='after')
     def _check_conditional_requirements(self) -> DoneProvenance:
@@ -469,6 +511,14 @@ class TaskMetadata(BaseModel):
     key this schema does not yet know about — a newer writer's field, a
     caller-private ``x_``-namespaced value — survives untouched through
     :func:`parse_metadata` rather than being silently dropped.
+
+    :meth:`_deterministic_invariants`' curator-gate clause is the *write-time*
+    counterpart to ``DeterministicRunner``'s dispatch WARNING (task 3341):
+    that WARNING fires when a record carrying both markers has already reached
+    the runner, whereas this rejects the record at the ``submit_task`` /
+    ``update_task`` boundary so it never lands (task 3369). The runner's
+    WARNING is deliberately retained as a defence-in-depth backstop for
+    records that did not pass through that boundary.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -513,6 +563,32 @@ class TaskMetadata(BaseModel):
             raise ValueError('deterministic task requires before_done or always_escalates')
         if self.before_done is not None and self.task_kind != 'deterministic':
             raise ValueError('before_done is only valid on deterministic tasks')
+        # Read the marker from model_extra, NOT getattr: it is an extra='allow'
+        # key (see HUMAN_CURATOR_GATE_KEY), and pydantic v2 populates
+        # __pydantic_extra__ before mode='after' validators run. `or {}` keeps
+        # the clause total if model_extra is ever None.
+        #
+        # LAST clause deliberately: pydantic stops at the first raise, so a
+        # blob that is also malformed more fundamentally (e.g. task_kind
+        # 'normal' with a before_done) still reports that error instead of
+        # this narrower one.
+        #
+        # Plain TRUTHINESS, not `is True` — same fail-CLOSED posture as
+        # orchestrator.deterministic_runner._is_human_curator_gate, and for the
+        # same reason: this is a SAFETY marker whose false NEGATIVE is the
+        # expensive direction. A truthy-but-not-True value (the string 'true'
+        # from a hand edit or a JSON round-trip) must still be rejected here,
+        # because the runner's own guard structurally cannot catch it on the
+        # act-then-ask path.
+        # Pinned by test_truthy_but_not_true_curator_marker_still_rejected.
+        if self.before_done is not None and (self.model_extra or {}).get(HUMAN_CURATOR_GATE_KEY):
+            raise ValueError(
+                'human_curator_gate is only valid on a pure gate: a curator gate '
+                'declares that only a human content judgement closes this task, '
+                'while before_done is a machine step that closes it. Drop '
+                'before_done to make this a real curator gate, or drop the marker '
+                'if the machine step is what closes the task.'
+            )
         return self
 
 
@@ -521,14 +597,60 @@ class TaskMetadata(BaseModel):
 # to know about it in advance. Keyed by the top-level metadata field name.
 _SUBMODEL_REGISTRY: dict[str, type[BaseModel]] = {}
 
+# The declared SHAPE of a registered slice's value: a single mapping
+# (``'dict'``) or a list of mappings (``'list'``).
+SubmodelCardinality = Literal['dict', 'list']
 
-def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
+# Cardinality lives in a PARALLEL dict rather than widening
+# _SUBMODEL_REGISTRY's value to a (model, cardinality) pair: six assertions
+# across four packages do `_SUBMODEL_REGISTRY[key] is SomeModel` identity
+# checks, and widening the value type would break all of them for zero
+# functional gain. The two dicts have exactly ONE writer
+# (register_metadata_submodel) so they cannot drift in normal use, and they
+# degrade in the SAFE direction if they ever do — see the read note in
+# register_metadata_submodel's docstring.
+_SUBMODEL_CARDINALITY: dict[str, SubmodelCardinality] = {}
+
+
+def register_metadata_submodel(
+    key: str,
+    model: type[BaseModel],
+    *,
+    cardinality: SubmodelCardinality = 'dict',
+) -> None:
     """Register ``model`` as the typed shape for ``metadata[key]``.
 
-    Idempotent when re-registering the *same* model object under the same
-    key (e.g. a module reloaded/imported twice). Raises ``ValueError`` when a
-    *different* model is registered for a key that already has one — this is
-    a loud, fail-fast conflict intended to surface at import time.
+    ``cardinality`` declares the shape of the slice's VALUE: ``'dict'`` means
+    it must be a single mapping, ``'list'`` a list of mappings. It is enforced
+    by :func:`parse_metadata`, which emits a ``wrong_cardinality``
+    :class:`SchemaWarning` (fatal under ``write``+``enforce``) for a value of
+    the other shape.
+
+    ``'dict'`` is the DEFAULT because it is fail-closed: it restores the
+    behavior that held before parse_metadata grew its list branch, so an
+    existing or future dict-shaped registrant needs no change and only a
+    genuinely list-valued slice (currently just ``delivered_checks``) opts in.
+    An undeclared key therefore gets the STRICT shape, whose failure mode is a
+    spurious warning on a genuinely list-valued slice — loud and immediately
+    fixed — rather than a silently-accepted malformed one (task 4142).
+
+    A key present in ``_SUBMODEL_REGISTRY`` but missing from
+    ``_SUBMODEL_CARDINALITY`` reads as ``'dict'``: the two dicts have one
+    writer, so they only desync if something reaches past this function, and
+    that desync degrades safely (parse_metadata iterates the registry, so a
+    stale cardinality entry for an absent key is never read).
+
+    Idempotent when re-registering under the same key, provided the repeat
+    agrees on BOTH the model object and the cardinality (e.g. a module
+    reloaded/imported twice). Raises ``ValueError`` when a *different* model,
+    or a different cardinality, is registered for a key that already has one
+    — a loud, fail-fast conflict intended to surface at import time. Both
+    checks run BEFORE either dict is written, so a rejected call leaves the
+    registry and the cardinality map untouched (a partial write is the one
+    way the parallel-dict design could genuinely desync). Cardinality is
+    immutable for the same reason the model is: registration is a per-process,
+    import-order-driven side effect, so a silent last-writer-wins would make
+    the enforced shape depend on which module imported first.
 
     Registry keys are OWNED by the module that registers them. Tests must
     register test-only keys (``<name>_stub``) — never a key a production
@@ -539,21 +661,45 @@ def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
     ``_stub``.
     """
 
+    # Read both dicts and run every check before either assignment: a raise
+    # partway through would leave the registry and the cardinality map
+    # desynced, which is precisely the failure the parallel-dict design has
+    # to avoid.
     existing = _SUBMODEL_REGISTRY.get(key)
+    # Same fail-closed default the READ path uses (parse_metadata's
+    # `.get(key, 'dict')`), so this check agrees with the docstring's
+    # "missing from _SUBMODEL_CARDINALITY reads as 'dict'" invariant: were the
+    # two dicts ever to desync, a re-registration that AGREES with the
+    # documented default stays idempotent instead of raising over a `None`.
+    existing_cardinality = _SUBMODEL_CARDINALITY.get(key, 'dict')
     if existing is not None and existing is not model:
         raise ValueError(f'metadata sub-model already registered for {key!r}')
+    if existing is not None and existing_cardinality != cardinality:
+        raise ValueError(
+            f'metadata sub-model for {key!r} is already registered with '
+            f'cardinality {existing_cardinality!r}; cannot re-register it as '
+            f'{cardinality!r} (a key\'s declared shape is immutable — '
+            'registration is import-order-driven, so a silent overwrite would '
+            'make the enforced shape depend on which module imported first)'
+        )
     _SUBMODEL_REGISTRY[key] = model
+    _SUBMODEL_CARDINALITY[key] = cardinality
 
 
 # Milestone is the first real W10 registrant: registering at module-import
 # time (rather than lazily) guarantees the 'milestone' slice is validated
 # and typed before any of parse_metadata's many callers across packages run.
-register_metadata_submodel('milestone', Milestone)
+#
+# cardinality='dict' is stated explicitly on all three registrations below
+# even though it is the default: these are the load-bearing declarations the
+# task-4142 shape gate exists to make legible, and an explicit call site is
+# immune to a future flip of the default.
+register_metadata_submodel('milestone', Milestone, cardinality='dict')
 
 # routing (PRD γ, task 2533): registered the same way so 'routing' lands in
 # known_fields (no unknown_key census warning) and every parse_metadata
 # caller gets a validated, typed RoutingState slice.
-register_metadata_submodel('routing', RoutingState)
+register_metadata_submodel('routing', RoutingState, cardinality='dict')
 
 # merge_retry_pending (task 2795): registered like milestone/routing so the
 # orchestrator's durable merge-phase-resume stamp lands in known_fields (no
@@ -561,7 +707,7 @@ register_metadata_submodel('routing', RoutingState)
 # write boundary — while, as a registered sub-model rather than an optional
 # `| None = None` field, staying absent from model_dump() when unset (no
 # None-noise on every task).
-register_metadata_submodel('merge_retry_pending', MergeRetryPending)
+register_metadata_submodel('merge_retry_pending', MergeRetryPending, cardinality='dict')
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
@@ -778,10 +924,35 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # carries the `human_curator_` prefix rather than the bare `curator_`
         # one above precisely so the human content curator is not conflated
         # with the automated task curator.
-        'human_curator_gate',
+        HUMAN_CURATOR_GATE_KEY,
         'human_curator_adjudicated_at',
+        # Orchestrator block-stamp (task 3697): written by workflow.py
+        # `_mark_blocked` on every block, read by agents/briefing.py for the
+        # stale-briefing check; 78 tasks carry it (census 2026-08-06). The
+        # writer symbol is named because that is what a future reader greps
+        # for when deciding whether the key is still machine-written.
+        # Promoted rather than x_-renamed because it is machine-written
+        # against a live reader — renaming it on one task would fork the
+        # vocabulary and be re-added on the next block.
+        'last_blocked_at',
     }
 )
+
+
+def _cardinality_mismatch_message(
+    key: str, cardinality: SubmodelCardinality, raw: object
+) -> str:
+    """Describe a registered slice whose value is the wrong SHAPE (task 4142).
+
+    Built once and used for both the ``TypeError`` raised under
+    ``write``+``enforce`` and the ``wrong_cardinality`` :class:`SchemaWarning`
+    otherwise, so the two can never drift.
+    """
+    expected = 'a single JSON object' if cardinality == 'dict' else 'a list of JSON objects'
+    return (
+        f'metadata.{key} is registered with cardinality {cardinality!r}, so its '
+        f'value must be {expected}; got {type(raw).__name__}'
+    )
 
 
 def parse_metadata(
@@ -802,7 +973,13 @@ def parse_metadata(
     * ``blob`` is a dict -> migrated (:func:`apply_migrations`), any
       registered sub-model slice (:data:`_SUBMODEL_REGISTRY`) present in it
       is validated and swapped in as a typed instance, then the whole thing
-      is validated as :class:`TaskMetadata`.
+      is validated as :class:`TaskMetadata`. A slice's value must match the
+      shape its registration declared (``cardinality``, see
+      :func:`register_metadata_submodel`): a list for a ``'dict'`` slice, or
+      a non-list for a ``'list'`` slice, is a ``wrong_cardinality`` finding
+      rather than a validated value — reported under the same failure policy
+      as any other malformed slice, and distinct from ``invalid_submodel``
+      (which means the shape was right but an element/field failed).
 
     Failure policy (never the old silent-``{}`` discard — I4): ``write`` with
     ``enforce=True`` raises (``ValueError``/``ValidationError``) on malformed
@@ -858,16 +1035,53 @@ def parse_metadata(
         if key not in parsed:
             continue
         raw = parsed[key]
+        # The slice's DECLARED shape, fail-closed for a key that never
+        # declared one (register_metadata_submodel's 'dict' default).
+        cardinality = _SUBMODEL_CARDINALITY.get(key, 'dict')
+        if isinstance(raw, list) != (cardinality == 'list'):
+            # Task 4142: the slice's value is the wrong SHAPE for what its
+            # registration declared. Deliberately SYMMETRIC — both directions
+            # are the same silent-acceptance defect:
+            #
+            #  * a LIST for a 'dict' slice: the list arm below used to run for
+            #    EVERY registered key, so it validated element-wise into a
+            #    typed list and emitted NO warning — invisible to both the
+            #    `task_metadata.schema_warning` census and the enforce=True
+            #    write gate. The resulting non-dict metadata.milestone then
+            #    made scheduler._milestone_time_gated fail-safe-withhold the
+            #    task from dispatch indefinitely, with no escalation path.
+            #  * a NON-LIST for a 'list' slice: it validated quietly into a
+            #    SINGLE model instance, and delivered_checks' consumer
+            #    (verify_delivered_checks_on_main) ITERATES the value — so an
+            #    accepted dict iterates its string KEYS and yields garbage
+            #    checks against a mark-done gate.
+            #
+            # A shape violation is not an element failure, so it gets its own
+            # code rather than 'invalid_submodel'.
+            if direction == 'write' and enforce:
+                raise TypeError(_cardinality_mismatch_message(key, cardinality, raw))
+            warnings.append(
+                SchemaWarning(
+                    field=key,
+                    code='wrong_cardinality',
+                    message=_cardinality_mismatch_message(key, cardinality, raw),
+                )
+            )
+            # No reassignment of `parsed`: the raw value survives into
+            # model_extra so model_dump() re-emits it verbatim (I1) — the
+            # same retain-on-warn shape the invalid_submodel arm uses.
+            continue
         try:
             if isinstance(raw, list):
-                # A registered slice may itself be list-valued (e.g. a
-                # future metadata.delivered_checks) rather than a single
-                # mapping — validate each element independently and swap in
-                # the typed list. The comprehension raises on the first bad
-                # element (TypeError for a non-mapping item, ValidationError
-                # for a mapping that fails the model), which aborts before
-                # `parsed` is reassigned below, so a malformed list is
-                # retained wholesale — same as the dict path.
+                # A slice declared cardinality='list' (currently only
+                # capability_manifest's delivered_checks) is a list of
+                # mappings rather than a single mapping — validate each
+                # element independently and swap in the typed list. The
+                # comprehension raises on the first bad element (TypeError
+                # for a non-mapping item, ValidationError for a mapping that
+                # fails the model), which aborts before `parsed` is
+                # reassigned below, so a malformed list is retained
+                # wholesale — same as the dict path.
                 parsed = {**parsed, key: [submodel(**item) for item in raw]}
             else:
                 # `submodel(**raw)` raises TypeError (not ValidationError)

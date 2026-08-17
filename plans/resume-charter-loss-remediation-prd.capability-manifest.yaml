@@ -1,0 +1,279 @@
+# Machine-readable twin of plans/resume-charter-loss-remediation-prd.capability-manifest.md
+#
+# INSTALL PATH (strictly derived — never rename, decompose-mode.md Step 2.5):
+#   plans/resume-charter-loss-remediation-prd.capability-manifest.yaml
+#   = re.sub(r'\.md$', '', prd_path) + '.capability-manifest.yaml'
+#
+# Schema + validating loader: shared/src/shared/capability_manifest.py
+# (CapabilityManifestDoc, schema_version 1).  Full field reference:
+# plans/capability-delivered-checks-prd.md §Contract.
+#
+# REVISION 2026-08-11 — anchors strengthened, task_ids preserved.
+# The first version of this file anchored 8 of its 10 mechanical checks on
+# `def test_…` names, which go GREEN the moment a test FUNCTION EXISTS — even
+# skipped, even empty — so they proved a test had been named, not that the
+# capability had been delivered.  This revision re-anchors on PRODUCTION
+# symbols wherever the PRD's contracts fix them: 14 of 17 mechanical checks now
+# point at production code or the production entry-path document, and only 3
+# remain test-anchored (α's fold preservation, δ's guard retention, η's
+# writable-set) because in those three the production shape is genuinely left
+# open by the PRD — C2's storage shape, a RETAINED negative behaviour that
+# emits no new symbol, and open question #5's schema-default-vs-relocation
+# split which touches different files.
+#
+# task_id values are those stamped by commit_planning on 2026-08-11
+# (commit 728aa04d33) and are PRESERVED verbatim here — this revision changes
+# only anchors, never identity.  Producer metadata.delivered_checks were
+# re-synchronised to this file by hand in the same session.
+#
+# RED-TODAY DISCIPLINE.  Every mechanical check below was executed as
+# `git grep -E -c '<pattern>' -- <paths>` against main and is RED today: an
+# `expect: present` check MISSES (0 hits); an `expect: absent` check HITS.
+# Measured counts are recorded per check.  Never file:line — line anchors rot.
+#
+# ε, θ and ι carry no mechanical check — out-of-tree fleet state, live-DB
+# runtime evidence, and a decision recorded on OTHER tasks respectively.
+# Manual checks are sidecar-only and excluded from the dispatch gate, so those
+# three producers correctly carry no metadata.delivered_checks.
+prd: plans/resume-charter-loss-remediation-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: 3997
+    title: "Escalation drain durability: compact projection carries root_cause + member_ids; add_members_to_l2 stops discarding authored framing"
+    capabilities:
+      - name: "compact-drain-projection-carries-root-cause"
+        binding: "capability→producer (wired) — `_COMPACT_ESCALATION_FIELDS` in escalation/src/escalation/server.py, applied at the two get_pending_escalations / get_task_escalations projection sites; the tuple OMITS root_cause today, which is the RED premise of PRD §9 C1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "['\"]root_cause['\"]"
+          paths: ["escalation/src/escalation/"]
+          expect: present
+          # RED today: 0 hits.  root_cause appears only as an unquoted parameter
+          # or attribute in this package, so the first QUOTED occurrence is
+          # necessarily the new projection-tuple entry.  Bare `root_cause`
+          # would have been vacuously green.
+      - name: "compact-drain-projection-carries-member-ids"
+        binding: "capability→producer (wired) — same tuple and application sites; PRD §9 C1 FIXES the key name as `member_ids` (open question #1's suggestion is ratified by the contract), and `detail` stays dropped for the size rationale"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "['\"]member_ids['\"]"
+          paths: ["escalation/src/escalation/"]
+          expect: present
+          # RED today: 0 hits.  `member_ids` exists as promote_to_l2's parameter
+          # but never as a quoted projection key, so the quote anchor
+          # discriminates the new tuple entry from the existing parameter.
+      - name: "members-only-write-policy-retired"
+        binding: "rejection-mechanism — add_members_to_l2 in escalation/src/escalation/queue.py declares the discard policy verbatim in its docstring; PRD §9 C2 replaces that policy with append-the-incoming-framing, so the declaration itself must go"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Only ``members`` is modified"
+          paths: ["escalation/src/escalation/queue.py"]
+          expect: absent
+          # RED today: 1 hit.  Scoped to the single file that declares the
+          # policy — not a whole-repo absent sweep, which would be vacuous.
+      - name: "promote-fold-preserves-incoming-framing-pinned"
+        binding: "rejection-mechanism — the fold path returns only {'id','status','members'} today; PRD §9 C2 deliberately leaves the storage shape open (amendment list vs appended evidence block), so the behaviour is anchored on the two pinning tests §7b names rather than on a guessed symbol"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "test_compact_projection_carries_root_cause|test_add_members_preserves_incoming_framing"
+          paths: ["escalation/tests/"]
+          expect: present
+          # RED today: 0 hits.  Test-anchored BY NECESSITY — C2 fixes no symbol.
+  - label: "β"
+    task_id: 3998
+    title: "Root-cause canonicalisation in find_pending_l2_by_root_cause"
+    capabilities:
+      - name: "exact-string-root-cause-match-retired"
+        binding: "capability→producer (wired) — `esc.root_cause.strip() != candidate` in escalation/src/escalation/queue.py is today's exact-string match; PRD §9 C3 routes both match and store through ONE canonicalisation function (INV-5), so this comparison cannot survive"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "esc\\.root_cause\\.strip\\(\\) *!= *candidate"
+          paths: ["escalation/src/escalation/queue.py"]
+          expect: absent
+          # RED today: 1 hit.  Production expression, not a comment or docstring.
+      - name: "match-path-routes-through-a-canonicaliser"
+        binding: "capability→producer (built by β) — §9 C3 requires exactly one shared canonicalisation function used by BOTH the match and store paths. escalation/src/escalation/dedupe.py already contains `_normalize_description` (casefold → strip non-word → collapse whitespace), which is the INV-5 reuse candidate; β promotes it rather than adding a sibling. Anchored on the MATCH SITE's file rather than on a name, so the check goes green whether β renames the helper or calls the existing one directly"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "canonicali[sz]e|normali[sz]e|_normalize_description"
+          paths: ["escalation/src/escalation/queue.py"]
+          expect: present
+          # RED today: 0 hits in queue.py.  Deliberately NOT scoped package-wide:
+          # a package-wide variant would stay RED if β reuses the existing
+          # dedupe.py helper under its current name — a false RED against a
+          # correctly-completed task.  Scoping to the match site fixes that.
+  - label: "γ"
+    task_id: 3999
+    title: "Auto-watcher drain loop: archive-inclusive read + memory-free already_promoted rebuild"
+    capabilities:
+      - name: "drain-loop-reads-the-escalation-archive"
+        binding: "capability→producer (wired) — the archive-inclusive tool already exists (`get_task_escalations`, ARCHIVE-INCLUSIVE by default) while `get_pending_escalations` is pending-only BY DESIGN; γ's deliverable is that the SKILL.md drain protocol actually calls it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "get_task_escalations"
+          paths: ["skills/escalation-watcher-auto/"]
+          expect: present
+          # RED today: 0 hits.  The SKILL.md IS the production entry path for
+          # this leaf — it is the artifact the rotation executes.
+      - name: "already-promoted-rebuilt-beyond-pending-l2-members"
+        binding: "rejection-mechanism — the SKILL.md drain step unions members of PENDING L2s only, so a RESOLVED L2's members fall straight back into work_batch; §9 C1 lets a consumer rebuild the set from the projection with zero session memory (boundary test B2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "already_promoted = \\{id for L2 in pending_l2s"
+          paths: ["skills/escalation-watcher-auto/SKILL.md"]
+          expect: absent
+          # RED today: 1 hit.  Anchored on the defective comprehension itself,
+          # not on surrounding prose.
+  - label: "δ"
+    task_id: 4000
+    title: "Exit-on-drain + degenerate-exit guard change (same task)"
+    capabilities:
+      - name: "rotation-emits-machine-readable-drained-exit-marker"
+        binding: "capability→producer (built by δ) — §9 C4 fixes the marker vocabulary (`exit_reason=drained`) as a structured field rather than free prose (INV-1); open question #3 leaves only the TRANSPORT open, not the token"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "exit_reason"
+          paths: ["skills/escalation-watcher-auto/SKILL.md"]
+          expect: present
+          # RED today: 0 hits (`exit_reason` occurs nowhere under orchestrator/
+          # or skills/ at all).
+      - name: "supervisor-reads-the-drained-exit-marker"
+        binding: "capability→producer (wired) — the consuming split already exists in orchestrator/src/orchestrator/harness.py (degenerate-clean feeds the misconfigured guard; healthy-clean is the sole outage-L2 clearer); §9 C4 requires the marker to be read at exactly that supervisor, which today inspects only two booleans"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "exit_reason"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+          # RED today: 0 hits.  This is the half that makes C4 machine-checked
+          # rather than a producer-side convention nobody consumes.
+      - name: "guard-storm-escape-retained-for-unmarked-fast-exits"
+        binding: "rejection-mechanism — INV-4: a sub-threshold clean exit WITHOUT the marker must still trip watcher_max_misconfigured_clean_exits; boundary tests B5/B6 are the pair. Anchored on the test names because the retained behaviour is a NEGATIVE property — preserving the escape emits no new production symbol"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "test_drained_exit_does_not_trip_misconfigured_guard|test_unmarked_fast_exit_still_trips_guard"
+          paths: ["orchestrator/tests/"]
+          expect: present
+          # RED today: 0 hits.  Test-anchored BY NECESSITY.
+  - label: "ε"
+    task_id: 4001
+    title: "Quiet-project watcher cost containment + fix the daily-ceiling under-count"
+    capabilities:
+      - name: "quiet-project-zero-work-rotations-stop-launching"
+        binding: "capability→producer (wired, out-of-tree) — the launch-side empty-queue skip landed as task 2629; ε's first deliverable is the DEPLOYED-code check that it is firing on the quiet projects (fleet-staleness lesson: editable install ≠ running code). NOTE 2026-08-11: the deployment half is already answered — all three real units restarted 10:10:37 BST from the shared editable install — leaving only the FIRING evidence"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the quiet projects' orchestrator configs and running units live OUTSIDE this repo's git tree, so no `git grep` in dark-factory can observe them; the signal is an ExecMainStart-style deployed-fleet observation, not a source-state check"
+      - name: "watcher-daily-ceiling-compensates-the-runs-db-under-count"
+        binding: "capability→producer (wired) — `watcher_daily_cost_ceiling_usd` is enforced in orchestrator/src/orchestrator/harness.py against a store that misses ~40% of watcher rotations (measured), so the ceiling polices an under-count"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "PRD open question #4 deliberately leaves the mechanism split undecided (ε re-measures after δ lands before adding config), so no production symbol is forced; a grep on a guessed compensation name would be a false RED at the dispatch gate rather than a check"
+  - label: "ζ"
+    task_id: 4002
+    title: "unblock_auto: CLI-enforced read-only envelope + a cap-wait bound that actually governs"
+    capabilities:
+      - name: "dry-run-argv-carries-an-explicit-permission-mode"
+        binding: "capability→producer (wired) — `permission_mode` is NEVER passed at the dry-run call site, so the invocation inherits `bypassPermissions` from invoke_claude_agent's default; §9 C5 makes the envelope flag-enforced and therefore resume-surviving per the programme's organising principle"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "permission_mode"
+          paths: ["orchestrator/src/orchestrator/dry_run_unblock.py"]
+          expect: present
+          # RED today: 0 hits.  This is the genuinely-missing half of C5.
+      - name: "dry-run-denylist-covers-every-write-tool"
+        binding: "capability→producer (wired, PARTIAL today) — `_DISALLOWED_TOOLS` already exists in dry_run_unblock.py and already carries Edit / Write / mutating git + fused-memory tools, and is emitted unconditionally; the C5 delta is NotebookEdit, which is absent. Anchored on the MISSING member, not on the list's existence"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "NotebookEdit"
+          paths: ["orchestrator/src/orchestrator/dry_run_unblock.py"]
+          expect: present
+          # RED today: 0 hits.  Edit/Write DO already hit — anchoring on those
+          # would have been vacuously GREEN and would have certified a task
+          # that had done nothing.
+      - name: "cap-wait-sanity-bound-governs-the-slot-wait"
+        binding: "floor:bound-exists-but-does-not-govern — `_DRY_RUN_CAP_WAIT_SANITY_SECS = 1800.0` is sampled only by the `_check_cap_wait` closure inside cli_invoke's cap-hit retry loop, while the governing wait sits in usage_gate.invoke_slot bounded by nothing (11× overshoot at 19,805s observed). §9 C5 moves enforcement to where the wait happens"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cap_wait|max_wait_secs|sanity_secs"
+          paths: ["shared/src/shared/usage_gate.py"]
+          expect: present
+          # RED today: 0 hits — usage_gate.py knows nothing of any wait bound.
+          # Disjunction covers three plausible spellings so ζ's naming choice
+          # cannot false-RED it.
+  - label: "η"
+    task_id: 4003
+    title: "Recon Landlock fix: recon config dir inside the sandbox writable set"
+    capabilities:
+      - name: "landlock-exec-stale-claim-corrected"
+        binding: "rejection-mechanism — landlock_exec.py asserts the CLI's session state is redirected to a per-task CLAUDE_CONFIG_DIR *inside the worktree*, 'already writable'. True for the orchestrator, FALSE for reconciliation stages since task 2744. §9 C6 requires the claim corrected in the same change"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "redirected to a per-task ``CLAUDE_CONFIG_DIR`` inside"
+          paths: ["orchestrator/src/orchestrator/agents/landlock_exec.py"]
+          expect: absent
+          # RED today: 1 hit.  Proves the FALSE sentence is gone.
+      - name: "landlock-exec-names-the-reconciliation-path"
+        binding: "capability→producer (built by η) — the paired positive of the check above: deleting the false sentence is necessary but not sufficient; the corrected comment must actually describe the recon caller whose dir is `data_dir/recon-config`, outside the writable set. The word `recon` appears nowhere in that module today, so any honest correction turns this green under BOTH remedies in open question #5"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "recon"
+          paths: ["orchestrator/src/orchestrator/agents/landlock_exec.py"]
+          expect: present
+          # RED today: 0 hits in that file.  Pairing absent+present stops the
+          # task from being certified by a bare deletion.
+      - name: "recon-config-dir-in-the-landlock-writable-set"
+        binding: "capability→producer (wired) — `sandbox_recon_writable_extras` defaults empty and is unset in config.yaml, consumed fail-closed, so the writable set is [] in practice and no recon transcript has been written since 2026-07-18. Anchored on the PRD-named pinning test because open question #5 leaves the production shape genuinely undecided (schema-default grant vs relocation), and the two remedies touch DIFFERENT files. SAFETY: see task 4003's details — the schema-default-grant remedy grants cross-run write access to sibling runs' .credentials.json; open question #5 is a security decision"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "test_recon_config_dir_is_landlock_writable"
+          paths: ["fused-memory/tests/", "orchestrator/tests/"]
+          expect: present
+          # RED today: 0 hits across BOTH test roots.  Deliberately not scoped
+          # to fused-memory/ alone: the relocation remedy could land the test
+          # under orchestrator/tests/, and a single-root scope would false-RED it.
+  - label: "θ"
+    task_id: 4005
+    title: "Verify 3727 is deployed & writing archive_available; settle the no_transcript polarity dispute"
+    capabilities:
+      - name: "fresh-fallback-event-carries-non-null-archive-available"
+        binding: "capability→producer (wired) — `durable_archive_path` in shared/src/shared/transcript_archive.py and the `archive_available` stamp on the session_resume_fallback emit in orchestrator/src/orchestrator/harness.py (helper `_archive_available`) are ON MAIN. ANCHOR CORRECTION 2026-08-11: the .md manifest cites harness.py:1641-1649 for this instrumentation — those lines are only the fault-log rate limiter; the emit and helper are elsewhere in the same module. STATUS 2026-08-11: the RED premise (NULL on all 260 fallbacks) NO LONGER HOLDS — three events that morning carry archive_available=true, so 3727 is deployed and this deliverable is answered; see task 4005's details"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the signal is a fresh runtime event in runs.db on a restarted fleet unit — the repo's source state is already correct, so no grep over the tree can distinguish delivered from undelivered; a script check would have to query a live fleet database"
+      - name: "no-transcript-polarity-dispute-answered-with-per-event-evidence"
+        binding: "rejection-mechanism — INV-2: observation separated from hypothesis; the 3989-architect claim (`reseeded=0` ⇒ the config dir survives) must be settled per-event, from the same event's config-dir stat, before 3578 dispatches (dep wired). This is now θ's ONLY substantive deliverable"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the deliverable is a written adjudication recorded on the task with per-event evidence, not a code artifact — nothing in the tree changes when it is delivered"
+  - label: "ι"
+    task_id: 4007
+    title: "Reassess 3728/3729/3730/3733 against a working resume baseline"
+    capabilities:
+      - name: "each-eligibility-leaf-reaffirmed-or-recast-against-post-3578-data"
+        binding: "DAG-direction — depends on 3578 (upstream, pending); subjects 3728/3729/3730/3733 all verified pending. Decision leaf (execution_class: decision), no code capability asserted"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the outcome is a status/notes decision recorded on four OTHER tasks in fused-memory (re-affirm, cancel, or re-scope with rationale) — task state, not repo state, so no grep or committed script can observe it"

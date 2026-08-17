@@ -28,13 +28,15 @@ import asyncio
 import contextlib
 import fcntl
 import os
+import re
+import select
 import socket
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -153,12 +155,21 @@ def fast_spec(marker: str = 'target/warm.marker') -> MergeVerifySpec:
 # ---------------------------------------------------------------------------
 
 
+#: The stock ``python -c`` bootstrap every spawned verify-merge runs: import the
+#: real CLI and hand straight over to it.  Overridable per call ONLY so a caller
+#: can wrap a production callable in a stopwatch *inside the child* and report
+#: what the child's own clock measured (see :data:`FLOCK_GATE_TIMING_BOOTSTRAP`)
+#: -- the CLI itself still runs unmodified, on the real argv, config and env.
+STOCK_BOOTSTRAP = 'from orchestrator.cli import main; main()'
+
+
 def verify_merge_argv(
     *, sha: str, spec: MergeVerifySpec, cfg_file: Path, request_id: str | None = None,
+    bootstrap: str = STOCK_BOOTSTRAP,
 ) -> list[str]:
     """Build the argv for a real ``orchestrator verify-merge`` invocation."""
     argv = [
-        sys.executable, '-c', 'from orchestrator.cli import main; main()',
+        sys.executable, '-c', bootstrap,
         'verify-merge',
         '--sha', sha,
         '--spec', spec_to_json(spec),
@@ -187,6 +198,19 @@ def subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     if extra:
         env.update(extra)
     return env
+
+
+def stderr_tail(raw: bytes, *, limit: int = 2000) -> str:
+    """Decode *raw* subprocess stderr and keep the TAIL (last *limit* chars).
+
+    The actionable line (a traceback's final ``Error: ...``, a watchdog
+    self-kill message) consistently sits at the END of a subprocess's
+    stderr, so a head slice silently discards it -- task 3318 hit exactly
+    this bug from a head-truncated assertion message.  ``errors='replace'``
+    so a slice landing mid multi-byte UTF-8 sequence can't itself raise and
+    mask the real failure being reported.
+    """
+    return raw.decode(errors='replace')[-limit:]
 
 
 def apply_dispatcher_env(monkeypatch) -> None:
@@ -220,15 +244,22 @@ def spawn_verify_merge(
     request_id: str | None = None,
     stdin: int | None = subprocess.PIPE,
     extra_env: dict[str, str] | None = None,
+    bootstrap: str = STOCK_BOOTSTRAP,
 ) -> subprocess.Popen:
     """Spawn a real ``orchestrator verify-merge`` subprocess.
 
     ``stdin=subprocess.PIPE`` by default so callers can drive the
     connection-death protocol (heartbeat writer / EOF-on-close); tests that
     don't pass --request-id never arm the watchdog so stdin is inert for them.
+
+    ``bootstrap`` defaults to :data:`STOCK_BOOTSTRAP` (byte-identical to the
+    pre-seam argv); see that constant for the only reason to override it.
     """
     return subprocess.Popen(
-        verify_merge_argv(sha=sha, spec=spec, cfg_file=cfg_file, request_id=request_id),
+        verify_merge_argv(
+            sha=sha, spec=spec, cfg_file=cfg_file, request_id=request_id,
+            bootstrap=bootstrap,
+        ),
         env=subprocess_env(extra_env),
         stdin=stdin,
         stdout=subprocess.PIPE,
@@ -343,7 +374,14 @@ def wait_for_pgid_file(path: Path, *, timeout: float = 20.0, interval: float = 0
     raise AssertionError(f'pgid file {path} did not appear within {timeout}s')
 
 
-def wait_subtree_live(pgid: int, *, timeout: float = 20.0, interval: float = 0.05) -> set[int]:
+def wait_subtree_live(
+    pgid: int,
+    *,
+    proc: subprocess.Popen | None = None,
+    proc_label: str = 'leader',
+    timeout: float = 20.0,
+    interval: float = 0.05,
+) -> set[int]:
     """Poll until *pgid* has at least one live descendant; return the descendant set.
 
     Raises AssertionError on timeout -- a live sleeper never appearing means
@@ -357,6 +395,30 @@ def wait_subtree_live(pgid: int, *, timeout: float = 20.0, interval: float = 0.0
     marker file the build's shell command touches) must poll for that
     artifact directly -- see :func:`wait_for_marker` -- rather than treating
     "subtree live" as a proxy for "build has started".
+
+    *proc* is the already-spawned leader (or, for a caller observing a
+    SEPARATE dispatcher process, that dispatcher) whose ``stdout``/``stderr``
+    were opened with ``subprocess.PIPE`` -- see :func:`spawn_verify_merge`.
+    It's optional so no existing call site is forced to change semantics.
+    *proc_label* names *proc* in the failure message (default ``"leader"``);
+    pass e.g. ``proc_label="dispatcher"`` when *proc* is a stand-in process
+    rather than the leader itself (e.g. the SSH dispatcher in the Row 1
+    orchestrator-killed test), so a reader doesn't apply the rc taxonomy
+    below to the wrong process.  When *proc* is given, a timeout failure
+    names its exit status (``<proc_label> rc=<n|None>``).  For the LEADER
+    specifically, that rc distinguishes a watchdog self-kill (rc == 1, no
+    ``Error:`` line), an exception exit (rc == 1 WITH an ``Error:`` line),
+    and a merely slow leader (rc is None) -- three causes that were
+    otherwise indistinguishable in every log this timeout has ever
+    produced; a non-leader *proc* follows its own exit-code conventions,
+    not this taxonomy.  ``stderr`` is read ONLY when ``proc.poll()`` is not
+    None, and even then via a ``select()``-bounded raw read (2s ceiling)
+    rather than a buffered ``.read()`` (which blocks to EOF): ``poll()``
+    only reports *proc*'s own exit, and a short-lived helper it spawned
+    with inherited fds could still be holding the pipe's write end open,
+    which would hang this helper (and the rest of the suite) rather than
+    raise.  The tail (not head) is kept -- see :func:`stderr_tail` -- since
+    the actionable line is at the END.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -364,7 +426,28 @@ def wait_subtree_live(pgid: int, *, timeout: float = 20.0, interval: float = 0.0
         if descendants:
             return descendants
         time.sleep(interval)
-    raise AssertionError(f'pgid {pgid}: no descendant appeared within {timeout}s')
+    message = f'pgid {pgid}: no descendant appeared within {timeout}s'
+    if proc is not None:
+        rc = proc.poll()
+        message += f'; {proc_label} rc={rc}'
+        if rc is not None and proc.stderr is not None:
+            try:
+                chunks = []
+                read_deadline = time.monotonic() + 2.0
+                fd = proc.stderr.fileno()
+                while True:
+                    remaining = read_deadline - time.monotonic()
+                    if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                        break
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                tail = stderr_tail(b''.join(chunks))
+            except Exception as e:  # noqa: BLE001
+                tail = f'<unreadable: {e!r}>'
+            message += f'; stderr tail:\n{tail}'
+    raise AssertionError(message)
 
 
 def wait_for_marker(path: Path, *, timeout: float = 20.0, interval: float = 0.05) -> None:
@@ -460,6 +543,137 @@ def worktree_base_for(repo: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Task 4025 (de-flake beta) -- pinned SS9 Row 1/2/3 watchdog window.
+#
+# ROW_WATCHDOG_ENV carries the SAME numbers as today's production constants
+# -- verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS (10.0) and
+# WATCHDOG_KILL_GRACE_SECS (5.0) -- but as PINNED LITERALS, deliberately NOT
+# imported from verify_cancel: task 4195 will retune those constants
+# (deriving the timeout from SSH_SERVER_ALIVE_INTERVAL *
+# SSH_SERVER_ALIVE_COUNT_MAX, toward ~60s+), and tracking them here would
+# silently multiply this module's runtime (Row 3 from ~17s to ~70s).  The
+# pin is now STRUCTURAL, not just asserted: the literals live on
+# ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS below,
+# and ROW_TREE_KILL_CEILING_SECS / ROW_PER_TEST_TIMEOUT_SECS are computed
+# from those two floats, so they can no longer drift out of step with the
+# window.  Nothing here imports verify_cancel's watchdog timing constants
+# (WATCHDOG_HEARTBEAT_TIMEOUT_SECS / WATCHDOG_KILL_GRACE_SECS) -- the /proc
+# walkers imported at the top of this module (collect_descendants,
+# pgid_file, etc.) are deliberately still shared; a dedicated drift test
+# below imports the two timing constants LOCALLY, on its own, purely to
+# notice if they ever diverge from this pin.
+#
+# This REPLACES a prior test-only 1.0s/0.5s tightening that bought speed and
+# no coverage, and was the measured cause of the "no descendant appeared
+# within 20.0s" flake on wait_subtree_live (6 failures / 490 legs on the
+# 1.0s arm vs 0 on both the 10s arm and the separate-process producer arm).
+#
+# HONEST CAVEAT: this MOVES the cliff from 1.0s to 10s, it does not remove
+# it.  The watchdog deadline is a wall-clock select() in
+# verify_cancel.run_stdin_watchdog -- LOAD-RIGID -- while the producer
+# (HeartbeatWriter._run) is an Event.wait(0.2) -- LOAD-ELASTIC.  Measured
+# producer inter-write gap at loadavg 113-178 was p999 0.386s / max 0.845s:
+# only ~1.2x real margin against a 1.0s deadline, but ~12x against 10.0s.
+# Do not try to buy margin by pre-buffering heartbeats -- run_stdin_watchdog
+# drains with a single read(4096) per select, so a burst resets exactly one
+# window, not N.
+ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = 10.0
+ROW_WATCHDOG_KILL_GRACE_SECS: float = 5.0
+
+#: Worst-case time to fire and finish killing the tree.  Row 3 takes
+#: run_stdin_watchdog's select-TIMEOUT branch and pays the full sum; Rows
+#: 1/2 take the EOF branch and pay only the grace.
+ROW_WATCHDOG_WINDOW_SECS: float = (
+    ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS + ROW_WATCHDOG_KILL_GRACE_SECS
+)  # 15.0
+
+ROW_WATCHDOG_ENV: dict[str, str] = {
+    'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': str(ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS),
+    'ORCH_WATCHDOG_KILL_GRACE_SECS': str(ROW_WATCHDOG_KILL_GRACE_SECS),
+}
+
+#: Ceiling for the rows' child.wait()/wait_subtree_gone() polls: the full
+#: window plus load headroom.  A WEDGE-DETECTOR, not a speed assertion (the
+#: rows assert THAT the tree was killed, never how fast), so on the success
+#: path a wider ceiling costs zero wall-clock and is paid only when the test
+#: is already failing.
+ROW_TREE_KILL_CEILING_SECS: float = ROW_WATCHDOG_WINDOW_SECS + 15.0  # 30.0
+
+#: Ceiling for the two DISCOVERY waits every row runs BEFORE the watchdog is
+#: even armed -- wait_for_pgid_file and wait_subtree_live, both of which
+#: default to timeout=20.0.  Rows 1/2/3 pass this explicitly at their call
+#: sites below (instead of relying on the bare default) so this value and
+#: those defaults cannot silently drift apart.
+ROW_DISCOVERY_CEILING_SECS: float = 20.0
+
+#: Worst-case BOUNDED work in a row on the failure path: both discovery
+#: waits, then one full watchdog window, then both ceiling-bounded
+#: kill-confirmation waits run to their full ceiling.  (Deliberately excludes
+#: _setup_verify_repo's real git work and the finally block's ~5s
+#: child.kill()/wait() tail -- both small next to the >=2x headroom below.)
+_ROW_WORST_CASE_BOUNDED_SECS: float = (
+    2 * ROW_DISCOVERY_CEILING_SECS
+    + ROW_WATCHDOG_WINDOW_SECS
+    + 2 * ROW_TREE_KILL_CEILING_SECS
+)  # 115.0
+
+#: Per-test opt-out from this module's inherited `timeout = 60`
+#: (orchestrator/pyproject.toml:103, thread-mode -- os._exit()s the xdist
+#: worker on expiry).  2x the bounded worst case, because this module's own
+#: comment (~:870-879) records ~15x elasticity on `from orchestrator.cli
+#: import main` under a full-suite storm.
+ROW_PER_TEST_TIMEOUT_SECS: int = int(2 * _ROW_WORST_CASE_BOUNDED_SECS)  # 230
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Task 4025 amendment -- drift detector for the pin above.  ROW_WATCHDOG_ENV
+# is pinned to today's production numbers but deliberately does not TRACK
+# verify_cancel's constants (see the banner above); that decoupling means
+# nothing else notices the day the two diverge.  This is the one test whose
+# whole job is to notice, so the import it performs (LOCAL to the test body,
+# not module-level) is a deliberate, narrow exception to "nothing here
+# imports verify_cancel's watchdog timing constants" above -- it exists
+# specifically to compare against them, not to consume them.
+# ---------------------------------------------------------------------------
+
+
+def test_row_watchdog_window_still_matches_production_constants():
+    """Fails the day ROW_WATCHDOG_* stops matching verify_cancel's WATCHDOG_*.
+
+    task 4025 pinned ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS /
+    ROW_WATCHDOG_KILL_GRACE_SECS as literals specifically so Rows 1/2/3's
+    runtime does NOT track verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS /
+    WATCHDOG_KILL_GRACE_SECS -- task 4195 is expected to retune those toward
+    ~60s+.  Today the pinned literals happen to equal production, so this
+    passes; it exists to catch the moment that stops being true.
+
+    If this fails: production changed (task 4195 landing is the expected
+    trigger).  Do NOT "fix" it by importing the pinned literals from
+    verify_cancel -- that reintroduces the silent-runtime-multiplication
+    this task exists to prevent.  Instead update the three Row 1/2/3
+    docstrings' "pinned production-equivalent window" wording (it will no
+    longer be accurate), decide afresh whether
+    ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS
+    should move, and re-baseline this assert against the new production
+    values.
+    """
+    from orchestrator import verify_cancel
+
+    pinned = (ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS, ROW_WATCHDOG_KILL_GRACE_SECS)
+    production = (
+        verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+        verify_cancel.WATCHDOG_KILL_GRACE_SECS,
+    )
+    assert pinned == production, (
+        f'pinned ROW_WATCHDOG_* {pinned} no longer match production '
+        f'verify_cancel.WATCHDOG_* {production} -- the pin intentionally '
+        f'does not track production; update the docstrings\' '
+        f'"production-equivalent" wording and re-baseline this assert.'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Task 2819 -- deterministic unit coverage for wait_for_marker_stable, the
 # create+utimensat settle helper that de-flakes the Row 5 marker-retention
 # assertion below.  Both tests inject a private mtime-reader seam
@@ -520,126 +734,125 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Task 2941 -- deterministic unit coverage for measure_uncontended_baseline_secs,
-# the same-shape uncontended-verify-merge baseline helper that replaces task
-# 2921's bare-import baseline in test_flock_wait_env_override_speeds_up_
-# contention_result below.  Both tests inject _spawn/_clock/_parse seams so
-# there is ZERO real subprocess/timing -- mirrors wait_for_marker_stable's
-# _read_mtime_ns seam (task 2819) above.
+# Task 3369 -- in-child stopwatch for the flock GATE, replacing task 2921/2941's
+# outer wall-clock subtraction in test_flock_wait_env_override_speeds_up_
+# contention_result below.
+#
+# The quantity that test is about is the CLI's *bounded flock wait* -- the one
+# thing ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS controls.  Measuring it from OUTSIDE
+# means measuring `subprocess wall time`, which is dominated by a term the
+# override has nothing to do with: interpreter startup + `import
+# orchestrator.cli`.  Task 2921 tried to cancel that term by subtracting a
+# bare-import baseline, and task 2941 by subtracting a same-shape uncontended
+# verify-merge -- but the term is not merely large, it is HIGHLY VARIABLE
+# between two sequential subprocesses, so subtracting one sample of it from
+# another does not cancel it.  Measured on this box with the override provably
+# honored: two back-to-back children reported `import orchestrator.cli` at 1.9s
+# and 4.0s, and a single-test isolated run left a 6.0s residue against a 5.0s
+# ceiling -- i.e. green behaviour reported red, the same unsound-wall-clock-proxy
+# defect fixed for TestB2PreTurn1Wedge in test_liveness_boundary_gate.py.
+#
+# So instrument the child instead and assert on the code-under-test's OWN clock.
+# FLOCK_GATE_TIMING_BOOTSTRAP wraps orchestrator.cli.acquire_merge_verify_flock
+# -- the production callable the gate actually invokes -- in a stopwatch and
+# emits one line per acquire on STDERR (stdout is reserved for the VerifyResult
+# JSON).  The CLI is otherwise untouched: same argv, same config, same env, same
+# real fcntl.flock against a really-held lock.  Across every probe run the wait
+# it reports for a 0.5s override was 0.507-0.509s, load notwithstanding, against
+# the 10.0s MERGE_VERIFY_FLOCK_WAIT_SECS production default an un-wired override
+# would leave -- a discriminant with ~20x margin instead of a coin flip.
 # ---------------------------------------------------------------------------
 
+#: Marker token the instrumented bootstrap prints, one line per gate acquire.
+FLOCK_GATE_MARKER = '__FLOCK_GATE__'
 
-def measure_uncontended_baseline_secs(
-    *,
-    sha: str,
-    spec: MergeVerifySpec,
-    cfg_file: Path,
-    timeout: float = 60.0,
-    _spawn=spawn_verify_merge,
-    _clock=time.monotonic,
-    _parse=result_from_json,
-) -> float:
-    """Time a genuinely uncontended, SAME-SHAPE verify-merge end-to-end.
+FLOCK_GATE_TIMING_BOOTSTRAP = f"""
+import sys, time
+import orchestrator.cli as _cli
+_real_acquire = _cli.acquire_merge_verify_flock
 
-    Spawns a verify-merge subprocess with no holder flock held (so it can
-    never contend) via the SAME spawn path, spec, and config shape as the
-    contended run under test, and returns its wall-clock duration. Unlike
-    task 2921's bare ``python -c 'from orchestrator.cli import main'``
-    baseline -- which measures only module-import cost -- this captures the
-    FULL pre-flock-wait CLI startup the contended run also pays before it
-    ever reaches the flock gate: interpreter startup, the same import, Click
-    dispatch, config load (pydantic/YAML), and GitOps construction. A
-    same-shape baseline cancels that shared startup term when subtracted
-    from the contended run's elapsed time (see
-    test_flock_wait_env_override_speeds_up_contention_result) -- but only
-    that term: because the baseline never contends, it also proceeds PAST
-    the flock gate into fast_spec's trivial build and the merge itself,
-    which the contended run never reaches (it returns immediately on
-    FLOCK_CONTENTION_CATEGORY). That post-gate build+merge work has no
-    counterpart in the contended run, so it biases the flock_component
-    discriminant downward by that (normally trivial) amount rather than
-    cancelling out.
 
-    Guards that the baseline itself never contends: a contended baseline
-    would fold a flock wait into the subtrahend and silently corrupt the
-    discriminant it feeds, so that case is a hard AssertionError rather than
-    a silently-accepted value.
-
-    The ``_spawn``/``_clock``/``_parse`` seams exist ONLY so this helper can
-    be unit-tested deterministically with zero real subprocess/timing (see
-    the two ``test_measure_uncontended_baseline_secs_*`` tests below) --
-    mirroring :func:`wait_for_marker_stable`'s ``_read_mtime_ns`` seam (task
-    2819). Production callers use the real defaults.
-    """
-    t0 = _clock()
-    proc = _spawn(
-        sha=sha, spec=spec, cfg_file=cfg_file,
-        extra_env={'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS': '0.5'},
+def _timed_acquire(path, timeout_secs, **kwargs):
+    _t0 = time.monotonic()
+    fd = _real_acquire(path, timeout_secs, **kwargs)
+    print(
+        '{FLOCK_GATE_MARKER} lock=%s timeout=%r waited=%.4f acquired=%r'
+        % (path.name, timeout_secs, time.monotonic() - _t0, fd is not None),
+        file=sys.stderr,
     )
-    stdout, stderr = proc.communicate(timeout=timeout)
-    elapsed = _clock() - t0
-    assert proc.returncode == 0, (
-        f'expected the uncontended baseline probe to exit 0, got '
-        f'{proc.returncode}; stderr={stderr.decode()[:2000]!r}'
-    )
-    result = _parse(stdout.decode())
-    assert result.category != FLOCK_CONTENTION_CATEGORY, (
-        f'baseline probe unexpectedly reported flock contention '
-        f'(category={result.category!r}) -- the uncontended baseline must '
-        f'never itself contend, or its measured duration would silently '
-        f'fold a flock wait into the flock_component discriminant'
-    )
-    return elapsed
+    return fd
 
 
-def test_measure_uncontended_baseline_secs_returns_elapsed_for_passed_result():
-    """measure_uncontended_baseline_secs returns the _clock-measured elapsed duration.
-
-    Injects a fake proc (MagicMock) that exits 0 with empty stdout/stderr, a
-    scripted _clock yielding a start then end reading (100.0 -> 100.75), and
-    a fake _parse returning a passed-category result.  The helper must
-    return the clock delta (0.75) -- only reachable via the injected seams,
-    since nothing here touches a real subprocess or a real clock.
-    """
-    proc = MagicMock()
-    proc.returncode = 0
-    proc.communicate.return_value = (b'', b'')
-    clock_values = iter([100.0, 100.75])
-
-    result = measure_uncontended_baseline_secs(
-        sha='deadbeef',
-        spec=fast_spec(),
-        cfg_file=Path('unused-config.yaml'),
-        _spawn=lambda **kw: proc,
-        _clock=lambda: next(clock_values),
-        _parse=lambda _s: SimpleNamespace(category='passed'),
-    )
-
-    assert result == pytest.approx(0.75)
+_cli.acquire_merge_verify_flock = _timed_acquire
+_cli.main()
+"""
 
 
-def test_measure_uncontended_baseline_secs_rejects_contended_baseline():
-    """measure_uncontended_baseline_secs raises if the baseline run itself contended.
+class FlockGateWait(NamedTuple):
+    """One instrumented ``acquire_merge_verify_flock`` call inside the child."""
 
-    A contended baseline would fold its own flock wait into the subtrahend
-    and silently corrupt the flock_component discriminant it feeds -- so an
-    accidentally-contended baseline must be a hard AssertionError, never a
-    silently-accepted value.
-    """
-    proc = MagicMock()
-    proc.returncode = 0
-    proc.communicate.return_value = (b'', b'')
-    clock_values = iter([100.0, 100.75])
+    lock: str
+    timeout_secs: float
+    waited_secs: float
+    acquired: bool
 
-    with pytest.raises(AssertionError):
-        measure_uncontended_baseline_secs(
-            sha='deadbeef',
-            spec=fast_spec(),
-            cfg_file=Path('unused-config.yaml'),
-            _spawn=lambda **kw: proc,
-            _clock=lambda: next(clock_values),
-            _parse=lambda _s: SimpleNamespace(category=FLOCK_CONTENTION_CATEGORY),
+
+_FLOCK_GATE_RE = re.compile(
+    re.escape(FLOCK_GATE_MARKER)
+    + r' lock=(?P<lock>\S+) timeout=(?P<timeout>\S+) '
+    r'waited=(?P<waited>\S+) acquired=(?P<acquired>True|False)'
+)
+
+
+def parse_flock_gate_waits(stderr: str) -> list[FlockGateWait]:
+    """Parse the :data:`FLOCK_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr."""
+    return [
+        FlockGateWait(
+            lock=m.group('lock'),
+            timeout_secs=float(m.group('timeout')),
+            waited_secs=float(m.group('waited')),
+            acquired=m.group('acquired') == 'True',
         )
+        for m in _FLOCK_GATE_RE.finditer(stderr)
+    ]
+
+
+def test_flock_gate_timing_bootstrap_parses_its_own_marker_lines():
+    """parse_flock_gate_waits round-trips the bootstrap's marker format.
+
+    The bootstrap emits its lines from inside a spawned child, so a drift
+    between what it prints and what the parser accepts would silently return
+    zero observations -- which would make the ceiling assertion in
+    test_flock_wait_env_override_speeds_up_contention_result vacuous rather
+    than red.  The emit format and this parser are therefore pinned together
+    here, with no subprocess involved.
+    """
+    emitted = (
+        f'{FLOCK_GATE_MARKER} lock=_merge-verify.lock timeout=0.5 '
+        'waited=0.0001 acquired=True\n'
+        'some unrelated stderr chatter\n'
+        f'{FLOCK_GATE_MARKER} lock=.merge_verify.lock timeout=0.5 '
+        'waited=0.5083 acquired=False\n'
+    )
+
+    waits = parse_flock_gate_waits(emitted)
+
+    assert waits == [
+        FlockGateWait('_merge-verify.lock', 0.5, 0.0001, True),
+        FlockGateWait('.merge_verify.lock', 0.5, 0.5083, False),
+    ]
+
+
+def test_parse_flock_gate_waits_returns_empty_for_uninstrumented_stderr():
+    """Stderr with no marker lines yields no observations.
+
+    This is the case the ceiling assertion's non-vacuity guard exists to
+    catch: if the CLI ever stops reaching the gate through the module-level
+    ``orchestrator.cli.acquire_merge_verify_flock`` name the bootstrap
+    patches, the child produces no marker lines at all, and an assertion over
+    an empty list would pass by default.
+    """
+    assert parse_flock_gate_waits('Traceback (most recent call last):\nboom\n') == []
 
 
 # ---------------------------------------------------------------------------
@@ -652,61 +865,49 @@ def test_measure_uncontended_baseline_secs_rejects_contended_baseline():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(180)  # task 2941: two subprocesses now (same-shape baseline + contended run)
+#: Ceiling on the CLI's own measured flock wait.  Sits an order of magnitude
+#: above the 0.5s override the test sets and half way below the 10.0s
+#: MERGE_VERIFY_FLOCK_WAIT_SECS production default an un-wired override would
+#: leave -- so it discriminates the two cases with a huge margin either side.
+FLOCK_WAIT_CEILING_SECS = 5.0
+
+
+@pytest.mark.timeout(180)  # task 3369: one subprocess again (the baseline probe is gone)
 def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     """ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS overrides the flock bounded wait.
 
     Holds the real flock (+ writes the holder pgid) exactly as
     test_cli.py:1419 does, then spawns a real knob-on verify-merge with the
     override set small.  Today (RED) verify-merge ignores the env var and
-    waits the full 10.0s production window; asserting completion in well
+    waits the full 10.0s production window; asserting the wait came in well
     under that fails until cli.py reads the override.
 
-    task 2921 (load-robustness): `elapsed` (the contended-run wall-clock) is
-    dominated by the pre-flock-gate CLI startup cost, not the 0.5s flock
-    wait -- so any absolute ceiling below the 10s production default
-    (MERGE_VERIFY_FLOCK_WAIT_SECS) is startup-bound, not flock-bound, and
-    cannot be made load-robust by widening alone. This test instead
-    measures a baseline cost and asserts on
-    `max(0, elapsed - baseline_cost)` -- cancelling the load-sensitive
-    startup term while still catching an un-wired override, which would
-    leave the flock component at the full ~10s production wait instead of
-    the ~0.5s override.
+    task 3369 (de-flake): the assertion is on the wait the CLI's OWN clock
+    measured, reported by :data:`FLOCK_GATE_TIMING_BOOTSTRAP` from inside the
+    child, NOT on the child's wall-clock duration.
 
-    task 2941 (baseline-shape fix): task 2921's baseline was a bare
-    ``python -c 'from orchestrator.cli import main'`` subprocess, which
-    measures ONLY module-import cost. The flock is a PRE-FLIGHT gate
-    (cli.py) the contended run reaches only AFTER interpreter startup +
-    the same import + Click dispatch + config load (pydantic/YAML) +
-    GitOps construction -- so under extreme host load those unaccounted
-    terms dominated `elapsed` while the bare-import baseline stayed low,
-    and the subtraction no longer cancelled them (the flock component
-    ballooned past the 5.0 ceiling even with the override honored).
-    `baseline_cost` is now measured via
-    :func:`measure_uncontended_baseline_secs`, a SAME-SHAPE uncontended
-    verify-merge (same spawn path, spec, and config as the contended run
-    below) that pays that same pre-flock-gate startup too, so the
-    subtraction cancels the shared startup term: an honored override
-    leaves flock_component ~= 0.0 (clamped); an un-wired override leaves
-    it at ~10s minus the shared startup tail -- load-robust and still
-    regression-catching either way. This cancellation is exact only for
-    the pre-flock-gate startup; past the flock gate the baseline (which
-    never contends) also runs fast_spec's trivial build and the merge,
-    work the contended run never reaches before returning on
-    FLOCK_CONTENTION_CATEGORY, so flock_component is biased slightly
-    downward by that (normally trivial) build+merge term -- see
-    measure_uncontended_baseline_secs's docstring.
+    Tasks 2376/2921/2941 successively widened, then baseline-subtracted, an
+    outer wall-clock measurement, and it kept coming back red on green
+    behaviour.  The reason is structural rather than a matter of tuning: the
+    override governs one term of the child's runtime (the bounded flock wait),
+    while its wall clock is dominated by a term the override has nothing to do
+    with -- interpreter startup plus ``import orchestrator.cli`` -- and that
+    term is not stable enough between two sequential subprocesses to cancel by
+    subtracting one sample of it from another.  Probed on this box with the
+    override provably honored (the gate itself reported waited=0.508s), two
+    back-to-back children put that import at 1.9s and 4.0s, and a
+    single-test, otherwise-idle run left a 6.0s residue against the old 5.0s
+    ceiling.  Same defect and same remedy as TestB2PreTurn1Wedge in
+    test_liveness_boundary_gate.py: stop using wall clock as a proxy for a
+    quantity the code under test already measures itself.
 
-    task 2921 (reviewer amendment, still applicable to the new baseline):
-    the baseline probe runs cold, before the contended run's own startup
-    benefits from a warm FS cache, and the two subprocess measurements are
-    sequential -- so under a full-suite storm they can drift apart by a
-    nontrivial fraction of a second on their own. The fixed 5.0s ceiling is
-    kept deliberately (rather than a ratio of `baseline_cost`): the
-    residual drift between the two measurements is additive scheduler
-    jitter, not a term proportional to baseline_cost, so a fixed budget
-    models it better than a ratio would, and the 0.5s-honored vs
-    ~10s-unwired gap leaves ample margin either way.
+    The child still runs the real CLI end to end -- real argv, real config,
+    real env, real ``fcntl.flock`` against a really-held lock.  The bootstrap
+    only wraps the production ``acquire_merge_verify_flock`` callable in a
+    stopwatch, so an un-wired override still shows up as a ~10s wait.  Its
+    one failure mode -- the CLI reaching the gate by some path other than the
+    patched module-level name, leaving zero observations and a vacuously-true
+    ceiling -- is closed by the non-vacuity assertion below.
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     worktree_base = worktree_base_for(repo)
@@ -715,41 +916,23 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     cfg_file = tmp_path / 'config.yaml'
     write_verify_config(cfg_file, repo, persistent_merge_worktree=True)
 
-    # task 2941: same-shape uncontended verify-merge baseline, run BEFORE
-    # the holder flock is acquired below -- measures the load-sensitive
-    # pre-flock-gate CLI startup (interpreter + import + Click dispatch +
-    # config load + GitOps construction), in isolation, so it can be
-    # subtracted from the contended run's `elapsed` (see flock_component
-    # below). Because this baseline run never contends, it also proceeds
-    # past the flock gate into fast_spec's trivial build and the merge --
-    # work the contended run below never reaches -- so the subtraction is
-    # exact only for the shared startup term and is biased slightly
-    # downward by that extra (normally trivial) build+merge cost. See the
-    # helper's docstring and the "task 2941" docstring note above for the
-    # full baseline-shape rationale.
-    baseline_cost = measure_uncontended_baseline_secs(
-        sha=head_sha, spec=fast_spec(), cfg_file=cfg_file, timeout=60.0,
-    )
-
     write_lock_holder_pgid(worktree_base, 999999)
     lock_path = merge_verify_lock_path(worktree_base)
     held_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
     fcntl.flock(held_fd, fcntl.LOCK_EX)
     try:
-        started = time.monotonic()
         proc = spawn_verify_merge(
             sha=head_sha,
             spec=fast_spec(),
             cfg_file=cfg_file,
             extra_env={'ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS': '0.5'},
+            bootstrap=FLOCK_GATE_TIMING_BOOTSTRAP,
         )
         # task 2376: widened from 15s -- host oversubscription can delay
         # subprocess completion past a short deadline; the discriminating
-        # invariant is the `flock_component < 5.0` assertion below (task
-        # 2921), not this ceiling. task 2941: 45->60 for extra load headroom
-        # now that the baseline probe is a heavier cold verify-merge too.
+        # invariant is the FLOCK_WAIT_CEILING_SECS assertion below (task
+        # 3369), never this ceiling, which only bounds a wedged child.
         stdout, stderr = proc.communicate(timeout=60)
-        elapsed = time.monotonic() - started
     finally:
         with contextlib.suppress(OSError):
             fcntl.flock(held_fd, fcntl.LOCK_UN)
@@ -757,38 +940,34 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
 
     assert proc.returncode == 0, (
         f'expected exit 0 (contention result on stdout), got {proc.returncode}; '
-        f'stderr={stderr.decode()[:2000]!r}'
+        f'stderr={stderr_tail(stderr)!r}'
     )
     result = result_from_json(stdout.decode())
     assert result.category == FLOCK_CONTENTION_CATEGORY, (
         f'expected flock-contention result, got category={result.category!r} '
         f'stdout={stdout.decode()[:2000]!r}'
     )
-    # task 2941: subtract the same-shape uncontended baseline (measured
-    # above, before the holder flock is acquired) to cancel the
-    # load-sensitive pre-flock-gate startup term out of `elapsed`,
-    # approximating the flock-wait component. (Not an exact isolation: the
-    # baseline never contends, so it also pays fast_spec's trivial
-    # build+merge past the flock gate that the contended run -- which
-    # returns immediately on contention -- never reaches; that extra,
-    # normally-trivial cost biases flock_component slightly downward. See
-    # measure_uncontended_baseline_secs's docstring.) An honored 0.5s
-    # override keeps flock_component well under 5.0; an un-wired override
-    # leaves the full ~10s production wait (flock_component well over 5.0)
-    # -- so this discriminant is both load-robust and still catches a
-    # regression, unlike a bare absolute ceiling on `elapsed`. Clamped at
-    # 0.0: the baseline is a separate, earlier subprocess (see the
-    # docstring's "reviewer amendment" note above), so under load it can
-    # occasionally run slower than the in-run startup and drive the
-    # subtraction negative -- clamping keeps flock_component a well-formed
-    # non-negative duration instead of a confusing negative value.
-    flock_component = max(0.0, elapsed - baseline_cost)
-    assert flock_component < 5.0, (
-        f'expected the flock-wait component of the contended run to be '
-        f'well under the 10s production wait (env override=0.5s) once the '
-        f'same-shape baseline is subtracted out -- elapsed={elapsed:.2f}s, '
-        f'baseline_cost={baseline_cost:.2f}s, flock_component={flock_component:.2f}s; '
-        f'the env override is not wired up yet'
+
+    waits = parse_flock_gate_waits(stderr.decode())
+    # Non-vacuity guard: the ceiling below is a max() over these observations,
+    # so an empty list would pass by default.  Zero observations means the CLI
+    # no longer calls the gate through the module-level
+    # ``orchestrator.cli.acquire_merge_verify_flock`` name the bootstrap
+    # patches -- a real signal that this test stopped measuring anything, not
+    # a pass.
+    assert waits, (
+        'no instrumented flock-gate observation on the child stderr -- the '
+        'timing bootstrap patches orchestrator.cli.acquire_merge_verify_flock, '
+        'so zero observations means the gate is no longer reached through that '
+        'name and the ceiling assertion below would be vacuous; '
+        f'stderr={stderr_tail(stderr)!r}'
+    )
+    longest = max(w.waited_secs for w in waits)
+    assert longest < FLOCK_WAIT_CEILING_SECS, (
+        f'expected the CLI-measured flock wait to be well under the 10s '
+        f'production wait (MERGE_VERIFY_FLOCK_WAIT_SECS) given the 0.5s env '
+        f'override -- longest={longest:.2f}s over {len(waits)} gate acquire(s): '
+        f'{waits}; the env override is not wired up yet'
     )
 
 
@@ -979,6 +1158,7 @@ def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, mo
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025 amendment: shares the derived per-row budget -- same real-subprocess exposure as Rows 1/2/3, previously left on the module's bare 60s ini timeout
 def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
     """SS9 Row 4: cancel-verify leaves no orphan while the stdin watchdog is live.
 
@@ -1015,7 +1195,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
         pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val)
+        wait_subtree_live(pgid_val, proc=child)
 
         monkeypatch.setattr(cli_module, 'load_config', lambda _path: config_obj)
         result = CliRunner().invoke(main, [
@@ -1054,6 +1234,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
 def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     """SS9 Row 1: dispatcher process killed -> child sees stdin EOF -> tree-killed.
 
@@ -1065,14 +1246,14 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     when the OS reclaims its file descriptors, ITS end of the child's stdin
     pipe closes, giving the grandchild a clean EOF on fd 0.
 
-    The step-2 env seam is threaded through the dispatcher's own environment
+    ROW_WATCHDOG_ENV is threaded through the dispatcher's own environment
     (:func:`spawn_ssh_heartbeat_dispatcher`'s *extra_env*, ambiently inherited
-    by the grandchild verify-merge) so the assertion window is small and
-    deterministic rather than the 10s+5s production window.  Per
-    ``run_stdin_watchdog``, EOF fires on the very next ``select`` readiness
-    check regardless of *heartbeat_timeout* -- only ``grace_secs`` (the
-    SIGTERM->SIGKILL pause in ``fire_watchdog_kill``) materially bounds this
-    row's timing; both overrides are set for a documented, generous ceiling.
+    by the grandchild verify-merge) -- the pinned 10s+5s production-equivalent
+    window, not a fast one; see ROW_WATCHDOG_ENV's comment above for the pin
+    rationale.  Per ``run_stdin_watchdog``, EOF fires on the very next
+    ``select`` readiness check regardless of *heartbeat_timeout* -- only
+    ``grace_secs`` (the SIGTERM->SIGKILL pause in ``fire_watchdog_kill``)
+    materially bounds this row's timing (~5s, measured ~7.3s end-to-end).
 
     Asserts within a bounded T: the full descendant subtree (including the
     start_new_session sleeper escape) AND the pgid leader are gone.
@@ -1091,19 +1272,21 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     dispatcher = spawn_ssh_heartbeat_dispatcher(
         argv=argv,
         heartbeat_interval=0.2,
-        extra_env={
-            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '1.0',
-            'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.5',
-        },
+        extra_env=ROW_WATCHDOG_ENV,
     )
     try:
-        pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val)
+        pgid_val = wait_for_pgid_file(pgf, timeout=ROW_DISCOVERY_CEILING_SECS)
+        # Row 1 owns the DISPATCHER process, not the leader -- the leader's
+        # own stdout/stderr aren't piped to this test, so pass the dispatcher.
+        wait_subtree_live(
+            pgid_val, proc=dispatcher, proc_label='dispatcher',
+            timeout=ROW_DISCOVERY_CEILING_SECS,
+        )
 
         dispatcher.kill()
         dispatcher.wait(timeout=10)
 
-        assert wait_subtree_gone(pgid_val, timeout=10.0), (
+        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
             f'pgid {pgid_val}: subtree and/or leader still alive after the '
             f'dispatcher was killed (EOF-triggered watchdog tree-kill did '
             f'not fire)'
@@ -1125,6 +1308,7 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
 def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
     """SS9 Row 2: ssh channel closes but the dispatcher stays alive -> EOF tree-kill.
 
@@ -1137,9 +1321,13 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
     1 and the same ``run_stdin_watchdog`` EOF branch fires; the difference
     from Row 1 is that no dispatcher PROCESS dies here, only the transport.
 
-    Uses the step-2 env seam directly on the spawned verify-merge (already
-    an in-process dispatcher, so no extra remove is needed, unlike Row 1's
-    separate-process case) for a fast, deterministic assertion window.
+    Uses ROW_WATCHDOG_ENV directly on the spawned verify-merge (already an
+    in-process dispatcher, so no extra remove is needed, unlike Row 1's
+    separate-process case) -- the pinned 10s+5s production-equivalent
+    window.  Row 2 is an EOF row like Row 1, not a timeout row:
+    ``close_stdin()`` closes the write end, so only ``grace_secs`` bounds it
+    (~5s, measured ~6.7s end-to-end), NOT the ~15s a reader might assume
+    from the heartbeat timeout.
 
     Asserts within a bounded T: the full descendant subtree AND the pgid
     leader are gone, and the verify-merge process itself self-exits non-zero
@@ -1158,15 +1346,12 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
         spec=sleeper_spec(300.0),
         cfg_file=cfg_file,
         request_id=REQUEST_ID,
-        extra_env={
-            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '1.0',
-            'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.5',
-        },
+        extra_env=ROW_WATCHDOG_ENV,
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val)
+        pgid_val = wait_for_pgid_file(pgf, timeout=ROW_DISCOVERY_CEILING_SECS)
+        wait_subtree_live(pgid_val, proc=child, timeout=ROW_DISCOVERY_CEILING_SECS)
 
         heartbeat.close_stdin()
 
@@ -1178,14 +1363,17 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
         # child.wait() -- confirmed by a manual repro that hung the full
         # poll window with this ordering reversed.
         try:
-            child.wait(timeout=10)
+            child.wait(timeout=ROW_TREE_KILL_CEILING_SECS)
         except subprocess.TimeoutExpired:
-            pytest.fail('verify-merge did not exit within 10s after stdin EOF')
+            pytest.fail(
+                f'verify-merge did not exit within '
+                f'{ROW_TREE_KILL_CEILING_SECS}s after stdin EOF'
+            )
         assert child.returncode != 0, (
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
         )
 
-        assert wait_subtree_gone(pgid_val, timeout=10.0), (
+        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
             f'pgid {pgid_val}: subtree and/or leader still alive after the '
             f'ssh channel EOF (dispatcher alive) -- watchdog tree-kill did '
             f'not fire'
@@ -1206,6 +1394,7 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
 def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     """SS9 Row 3: heartbeat starved, stdin stays OPEN -> select-timeout tree-kill.
 
@@ -1218,9 +1407,11 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     ready set) rather than seeing EOF, taking the branch that calls
     ``on_fire`` directly without ever attempting a read.
 
-    Uses the step-2 env seam directly on the spawned verify-merge for a
-    fast, deterministic assertion window bounded by
-    ``~(heartbeat_timeout + grace_secs)``.
+    Uses ROW_WATCHDOG_ENV -- the pinned production-equivalent window
+    (10.0s heartbeat timeout + 5.0s kill grace) -- directly on the spawned
+    verify-merge, so the assertion window here is ~15s, not fast; see
+    ROW_WATCHDOG_ENV's comment above for the pin rationale and the honest
+    cliff-moved caveat.
 
     Asserts the leader self-exits non-zero and, after reaping it (same
     zombie-avoidance ordering as Row 2 -- ``child`` is again a direct child
@@ -1239,15 +1430,12 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
         spec=sleeper_spec(300.0),
         cfg_file=cfg_file,
         request_id=REQUEST_ID,
-        extra_env={
-            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '1.0',
-            'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.5',
-        },
+        extra_env=ROW_WATCHDOG_ENV,
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val)
+        pgid_val = wait_for_pgid_file(pgf, timeout=ROW_DISCOVERY_CEILING_SECS)
+        wait_subtree_live(pgid_val, proc=child, timeout=ROW_DISCOVERY_CEILING_SECS)
 
         heartbeat.stop_heartbeats()
         assert child.stdin is not None and not child.stdin.closed, (
@@ -1256,17 +1444,18 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
         )
 
         try:
-            child.wait(timeout=10)
+            child.wait(timeout=ROW_TREE_KILL_CEILING_SECS)
         except subprocess.TimeoutExpired:
             pytest.fail(
-                'verify-merge did not self-exit within 10s of heartbeat '
-                'starvation (select-timeout branch did not fire)'
+                f'verify-merge did not self-exit within '
+                f'{ROW_TREE_KILL_CEILING_SECS}s of heartbeat starvation '
+                f'(select-timeout branch did not fire)'
             )
         assert child.returncode != 0, (
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
         )
 
-        assert wait_subtree_gone(pgid_val, timeout=10.0), (
+        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
             f'pgid {pgid_val}: subtree and/or leader still alive after '
             f'heartbeat starvation -- watchdog tree-kill did not fire'
         )
@@ -1343,7 +1532,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     heartbeat_holder = HeartbeatWriter(holder, interval=0.2).start()
     try:
         holder_pgid_val = wait_for_pgid_file(pgf_holder)
-        wait_subtree_live(holder_pgid_val)
+        wait_subtree_live(holder_pgid_val, proc=holder)
 
         persistent_wt = worktree_base / '_merge-verify'
         marker = persistent_wt / 'target' / 'warm.marker'
@@ -1376,7 +1565,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
             # task 3318: tail-sliced (not head-truncated) -- the actual
             # failure cause (e.g. a watchdog self-kill traceback) is at the
             # END of stderr, and a 2000-char head slice was hiding it.
-            f'{waiter.returncode}; stderr={stderr.decode()[-4000:]!r}'
+            f'{waiter.returncode}; stderr={stderr_tail(stderr, limit=4000)!r}'
         )
         result = result_from_json(stdout.decode())
         assert is_flock_contention_failure(result), (

@@ -12,7 +12,9 @@ import contextlib
 import functools
 import inspect
 import json
+import os
 import re
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -635,6 +637,147 @@ def ensure_fresh_collection(
 
 
 # ---------------------------------------------------------------------------
+# Shared FalkorDB test scaffolding (task 3502)
+# ---------------------------------------------------------------------------
+#
+# Connection constants, reachability probe and skip-marker factory for tests
+# that drive a live FalkorDB. Placed directly after the Qdrant section above so
+# the two reachability-probe pairs (constants → probe → skipif factory) read as
+# one convention. tests/test_falkor_probe_routing_guard.py enforces that no
+# test module forks this scaffolding back into itself.
+# ---------------------------------------------------------------------------
+
+def _falkor_host_from_env() -> str:
+    """Derive the FalkorDB host from FALKOR_HOST, defaulting to localhost.
+
+    A named function rather than an expression inlined at the constant's
+    assignment, so the derivation is reachable at call time and can be tested
+    under a monkeypatched environment without ``importlib.reload``.
+    """
+    return os.environ.get('FALKOR_HOST', 'localhost')
+
+
+def _falkor_port_from_env() -> int:
+    """Derive the FalkorDB port from FALKOR_PORT, defaulting to 6379.
+
+    The ``int()`` is load-bearing, not cosmetic: ``os.environ`` yields str, and
+    ``FalkorDB(port='6379')`` fails or misbehaves on a str port.
+
+    Unset *or empty* takes the default. Empty is what a CI template like
+    ``FALKOR_PORT: ${FALKOR_PORT}`` produces when the variable is not set, and
+    it is the same shape ``known_project_roots_from_env`` (models/scope.py)
+    already treats as unset.
+
+    A non-empty, non-numeric value is an operator error and raises
+    ``RuntimeError`` naming the offending value.
+
+    That raise fires at *import* of this module, and conftest.py imports it on
+    every session — so a malformed FALKOR_PORT aborts the whole run, including
+    the unit lane, which never touches FalkorDB. This is intentional, and is
+    faithful to the behaviour it replaces: each of the six migrated modules
+    already did a bare ``int(os.environ.get('FALKOR_PORT', 6379))`` at its own
+    import, so a malformed value was always fatal. What changes is (a) the
+    message — actionable text naming the offending value, rather than a
+    ``ValueError`` traceback into a shared helper — and (b) the blast radius,
+    which widens from the six FalkorDB modules to every fused-memory module.
+    Deferring the raise into ``_falkor_available()`` would narrow (b), at the
+    cost of letting a typo'd port read as "FalkorDB not reachable" and silently
+    skip the live lane rather than reporting the typo. Failing loudly is the
+    better trade.
+    """
+    raw = os.environ.get('FALKOR_PORT', '').strip()
+    if not raw:
+        return 6379
+    try:
+        return int(raw)
+    except ValueError:
+        raise RuntimeError(
+            f'FALKOR_PORT must be an integer, got {raw!r}. Unset it to use the '
+            f'default (6379), or set it to the port your FalkorDB listens on.'
+        ) from None
+
+
+# Evaluated once at import; consumers import the constants, not the helpers.
+FALKOR_HOST: str = _falkor_host_from_env()
+FALKOR_PORT: int = _falkor_port_from_env()
+
+
+def _falkor_available() -> bool:
+    """Probe whether a FalkorDB instance is reachable at FALKOR_HOST:FALKOR_PORT.
+
+    Returns False rather than raising for any failure — construct, query or
+    close — and is bounded by ``socket_connect_timeout=2``, so an unreachable
+    host costs ~2s at most.
+
+    Uses the falkordb-native sync client rather than ``redis``: redis is not a
+    declared dependency of fused-memory, only a transitive of
+    graphiti-core[falkordb], so a redis-based probe would break silently if
+    falkordb ever switched transport.
+
+    Imports FalkorDB lazily so (a) conftest.py's session-wide import of this
+    module does not drag falkordb into sessions that never touch it, and (b)
+    the name resolves at call time, which is what lets tests patch
+    ``falkordb.FalkorDB`` deterministically. Same convention as
+    ``_qdrant_available`` above.
+
+    Deliberately NOT cached: each consuming module pays its own probe at its
+    own collection time. Memoising would break the call-time tracking
+    ``falkor_skipif`` relies on, and test_integration_marker_real_service.py
+    budgets for the per-module cost explicitly.
+    """
+    from falkordb import FalkorDB
+
+    try:
+        client = FalkorDB(
+            host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2
+        )
+        try:
+            client.select_graph('_probe').query('RETURN 1')
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+        return True
+    except Exception:
+        return False
+
+
+def falkor_skipif(reason: str = 'FalkorDB not reachable'):
+    """Return a ``pytest.mark.skipif`` marker gated on `_falkor_available()`.
+
+    A factory rather than a module-level marker constant: conftest.py imports
+    this module on every session, so evaluating the probe at import time would
+    cost a bounded ~2s connection attempt even for sessions that never touch
+    FalkorDB. Called from a consuming module's ``pytestmark``, or as a
+    class/function decorator, the probe instead fires at that module's own
+    collection time.
+
+    Resolves ``_falkor_available`` through the module global at call time
+    rather than capturing it, so the marker tracks whatever the probe
+    currently reports.
+    """
+    return pytest.mark.skipif(not _falkor_available(), reason=reason)
+
+
+def unique_graph_name(slug: str) -> str:
+    """Return a fresh per-run FalkorDB graph name, ``_test_<slug>_<8 hex>``.
+
+    A fresh name is minted on every call so that concurrent test runs —
+    pytest-xdist ``-n auto``, or a CI matrix pointed at one shared FalkorDB —
+    never select the same graph and wipe each other's fixtures.
+
+    The caller still owns the rest of the lifecycle: the best-effort delete of
+    a stale graph left by a prior run, and the teardown ``graph.delete()`` /
+    ``client.aclose()`` pair.
+
+    Args:
+        slug: Should embed the owning task id, by convention (e.g.
+            ``2207_merge_entities``), so a graph orphaned by a killed run is
+            traceable back to the test module that created it.
+    """
+    return f'_test_{slug}_{uuid.uuid4().hex[:8]}'
+
+
+# ---------------------------------------------------------------------------
 # Shared poll_until() helper (task 2377)
 # ---------------------------------------------------------------------------
 #
@@ -698,6 +841,131 @@ async def poll_until(
             return result
         if loop.time() >= deadline:
             raise AssertionError(message or f'poll_until: condition not met within {timeout}s')
+        await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+# Shared poll_until_stable() settle barrier (task 3697)
+# ---------------------------------------------------------------------------
+#
+# The companion to poll_until above, and deliberately placed beside it so the
+# two read as a matched PAIR of barrier primitives rather than two unrelated
+# utilities. poll_until is a LIVENESS barrier; this is a SETTLE barrier. Picking
+# the wrong one is the defect this exists to prevent -- see the docstring's
+# decision rule. Public (no leading underscore) for the reason this module
+# already documents for poll_until / ensure_fresh_collection: it is imported
+# cross-module.
+# ---------------------------------------------------------------------------
+
+#: Cap on the observed-value trail carried in the never-settled AssertionError.
+#: A pathological sampler must not be able to produce a multi-megabyte message.
+_STABLE_TRAIL_LIMIT = 10
+
+
+async def poll_until_stable(
+    sample: Callable[[], Any],
+    *,
+    settle: float = 0.2,
+    timeout: float = 10.0,
+    interval: float = 0.02,
+    message: str | None = None,
+) -> Any:
+    """Poll *sample* until its truthy value STOPS CHANGING, then return it verbatim.
+
+    Choosing between this and :func:`poll_until` — the whole point of having
+    both:
+
+    * ``poll_until`` is a **liveness** barrier. Correct when the assertion that
+      follows is "X happened".
+    * ``poll_until_stable`` is a **settle** barrier. **Required** when the
+      assertion that follows is an exact count or an "exactly once" claim,
+      because a liveness poll returns at the *first* occurrence and therefore
+      structurally cannot observe a duplicate that arrives after it.
+
+    The motivating call site is
+    ``test_ticket_worker.py::test_worker_created_path_emits_journal_event``,
+    whose ``assert len(task_created_events) == 1`` was gated on
+    ``poll_until(lambda: any(...))`` — so the assertion ran the instant the
+    first event landed. The duplicate that assertion exists to catch is
+    concrete, not hypothetical: ``task_created`` is emitted from two distinct
+    code paths (``task_interceptor.py`` lines 3786-3795 and 4164-4173), each
+    persisting the terminal ticket row *before* emitting — so no ticket-row
+    predicate closes the emission window either, and only a settle window does.
+
+    **The flake asymmetry**, which is what makes adding a settle window safe: a
+    too-short *settle* can only cause a false PASS (a missed duplicate), never
+    a false FAIL, because a stable value stays stable no matter how starved the
+    host is. The only false-FAIL surface is the outer *timeout*, which keeps
+    ``poll_until``'s already-proven 10s default. Raising *settle* is therefore
+    always safe, and is the correct response to a suspected missed duplicate.
+
+    *sample* may be a plain sync callable or an async/coroutine function —
+    either way it is called with no arguments each iteration and, if the result
+    is awaitable (``inspect.isawaitable``), awaited before use. A falsy result
+    means "not ready yet": polling continues and the settle window does not
+    start. Change detection uses ``!=``, and the deadline uses the asyncio
+    event-loop monotonic clock (same rationale as ``poll_until``), bounding
+    total time *including* settle restarts so a forever-changing value cannot
+    spin past *timeout*.
+
+    Args:
+        sample: Zero-arg sync or async callable evaluated each iteration.
+        settle: Seconds the value must be observed unchanged before it is
+            returned. Any change restarts this window. Defaults to 0.2s.
+        timeout: Total seconds to keep polling before giving up. Defaults to
+            10s, matching ``poll_until``.
+        interval: Seconds to sleep between polls. Defaults to 0.02s.
+        message: Custom AssertionError message used when the value never
+            became truthy at all.
+
+    Returns:
+        The settled truthy value, returned verbatim (not coerced to ``True``),
+        matching ``poll_until``.
+
+    Raises:
+        AssertionError: with two deliberately DISTINGUISHABLE messages, because
+            "it never happened" and "it kept changing" demand different
+            debugging and must not collapse into one string —
+
+            * never became truthy → the caller's *message* (or a default
+              naming *timeout*), matching ``poll_until``'s failure text so the
+              common case reads identically;
+            * became truthy but never settled → a message saying so and
+              naming the observed values (capped at the last
+              ``_STABLE_TRAIL_LIMIT`` distinct ones).
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    candidate: Any = None
+    have_candidate = False
+    stable_since = 0.0
+    trail: list[Any] = []
+    while True:
+        result = sample()
+        if inspect.isawaitable(result):
+            result = await result
+        if result:
+            now = loop.time()
+            if not have_candidate or result != candidate:
+                candidate = result
+                have_candidate = True
+                stable_since = now
+                trail.append(result)
+                del trail[:-_STABLE_TRAIL_LIMIT]
+            elif now - stable_since >= settle:
+                return candidate
+        else:
+            # Not ready yet — a falsy sample does not start the settle window.
+            have_candidate = False
+        if loop.time() >= deadline:
+            if trail:
+                raise AssertionError(
+                    f'poll_until_stable: value never settled for {settle}s within '
+                    f'{timeout}s; observed (last {len(trail)}): {trail!r}'
+                )
+            raise AssertionError(
+                message or f'poll_until_stable: condition not met within {timeout}s'
+            )
         await asyncio.sleep(interval)
 
 

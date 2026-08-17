@@ -27,6 +27,7 @@ extraPaths = [
     # test_root_pyright_extrapaths_resolves_scripts_imports (task 3456).
     "scripts",
     "scripts/legibility",
+    "scripts/local-model-serving",
     "cockpit/src",
     "dashboard/src",
     "escalation/src",
@@ -61,3 +62,96 @@ markers = [
 # deselect.
 addopts = "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'"
 asyncio_mode = "auto"
+
+# ── ruff: the rule set for everything OUTSIDE a workspace member ──────────────
+#
+# WHY THIS EXISTS (task 3457). ruff resolves its config HIERARCHICALLY AND PER
+# FILE, and it SKIPS a pyproject.toml that carries no [tool.ruff] section. Until
+# this table landed there was no such section here and no ruff.toml anywhere in
+# the repo, so every .py file outside a workspace member fell through to ruff's
+# BUILT-IN defaults (E401/E402/E7xx/E9 + F) while every member ran
+# E,F,UP,B,SIM,I. That was not a latent inconsistency: scripts/ and
+# tests/scripts/ are GATED directories (scripts/orchestrator.yaml and
+# tests/scripts/orchestrator.yaml each declare a directory-wide lint_command,
+# added by tasks 3445 and 3350), so both gates reported "All checks passed!"
+# while running a rule set nobody chose, and B/SIM/UP/import-sorting violations
+# accumulated unseen in live operator tooling.
+#
+# WHAT IT DOES *NOT* CHANGE. Every workspace member declares its own
+# [tool.ruff], and ruff takes the NEAREST applicable config WITHOUT merging, so
+# member linting is untouched by this table. VERIFIED, not assumed: the
+# repo-root lint_command
+#     uv run ruff check shared escalation fused-memory orchestrator dashboard
+# reported "All checks passed!" both with and without this block.
+#
+# THE MEASUREMENT (taken at base 6357b79b4e). Widening these two directories to
+# the members' rule set surfaced 150 findings -- 125 in scripts/, 25 in
+# tests/scripts/ (UP017 44, I001 30, SIM117 14, SIM300 12, SIM115 11, SIM105 8,
+# UP037 7, B023 5, UP015 5, B007 3, B905 3, UP031 2, UP032 2, UP035 2, SIM108 1,
+# UP041 1). 139 were cleared by SAFE autofix and the remaining 42 by hand, all
+# in the SAME branch. They were FIXED, never excluded: that is task 3350's
+# precedent, and it is why both guard tests forbid --exclude on the lint
+# commands. A per-site `# noqa: <CODE>  # <reason>` is the sanctioned escape
+# hatch, because it is local, visible and greppable; a config carve-out or a
+# command-level --exclude un-gates whole files invisibly while still reporting
+# green.
+#
+# WHY THE ATOMICITY MATTERS. verify.run_full_verification asyncio-gathers over
+# ALL module_configs.values(), not merely those a diff touches, and the repo
+# root sets merge_verify_breadth: "full". A red lint_command in either directory
+# therefore blocks every merge, review checkpoint and main-tip sweep repo-wide,
+# on branches carrying no defect at all. Widening the rule set without the
+# burn-down in the same branch is a fleet-wide outage, not a transiently-red
+# gate -- which is why this table was added LAST, onto an already-clean tree.
+#
+# WHY NOT A PER-DIRECTORY ruff.toml OR A scripts/pyproject.toml. A
+# scripts/pyproject.toml is NOT a safe vehicle: orchestrator.config's
+# _discover_module_configs and verify._single_subproject_prefix both key on
+# pyproject.toml PRESENCE, so adding one would silently re-route verify for
+# scripts/ diffs. Two ruff.toml files would patch today's two directories and
+# leave the NEXT non-member directory to re-open the same gap silently -- the
+# invisible-asymmetry class this table exists to close. tests/scripts/
+# test_nonmember_ruff_config.py asserts both halves: behavioural parity with a
+# live member, and -- by SWEEPING every non-member directory at any depth rather
+# than checking a hand-written list -- that no shadowing config reappears.
+#
+# THE UN-GATED RESIDUE, recorded rather than left silent. This table also now
+# governs conftest.py, df_pytest_isolation.py and
+# skills/factory-init/scripts/find_escalation_port.py, none of which any
+# lint_command targets -- so their findings are latent, not live. Measured under
+# the widened set: df_pytest_isolation.py 0, find_escalation_port.py 0,
+# repo-root conftest.py 2 x SIM105. Those two were deliberately NOT fixed here:
+# editing the repo-root conftest.py is a FULL_SUITE/STRUCTURAL classification
+# trigger that would swing this branch's own verify onto the whole-fleet path,
+# for a change otherwise confined to two directories.
+#
+# [tool.ruff.format] IS DELIBERATELY ABSENT -- do not "restore parity" by adding
+# it back without the burn-down. The members declare quote-style = "single", but
+# the files THIS table governs are largely double-quoted (scripts/legibility's
+# census_trigger.py, codebook.py and trickle_state.py, and most of
+# scripts/tests/). `ruff format` needs no flags to pick up a config, so declaring
+# one here that is known to disagree with its own files arms the next person who
+# runs `ruff format scripts/` with a large, silent, unrelated reformat -- the
+# same "a rule set nobody chose applies silently" failure this task was filed to
+# eliminate, merely moved from lint to format. There is NO `ruff format --check`
+# gate anywhere in the repo (verified by grep over every orchestrator.yaml,
+# hooks/project-checks and hooks/pre-commit), so nothing is lost by omitting it.
+# A formatter config belongs here only in the same branch as a measured
+# burn-down and a gate that keeps it true -- the discipline the lint half of
+# this change followed. Note the members are not even self-consistent on it:
+# dashboard, fused-memory, orchestrator and sampler add
+# docstring-code-format = true; cockpit, escalation and shared do not.
+#
+# WHAT IS ENFORCED, EXACTLY. tests/scripts/test_nonmember_ruff_config.py asserts
+# the three values below equal every member's, over the member list read from
+# [tool.uv.workspace].members -- and additionally asserts this table declares
+# NOTHING BEYOND them, because an un-compared key here would be an eighth
+# hand-maintained copy free to drift from the seven. To add one, extend that
+# comparison first.
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "UP", "B", "SIM", "I"]
+ignore = ["E501"]

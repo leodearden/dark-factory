@@ -16,22 +16,22 @@ separately-landing ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` preventer.
 from __future__ import annotations
 
 import json
+import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-
 from legibility import check_transcript_persistence as mod
 from legibility.config import load_config
-from orchestrator import session_registry
 
+from orchestrator import session_registry
 
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers
 # ---------------------------------------------------------------------------
 
-FIXED_NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
+FIXED_NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=UTC)
 
 
 def _iso(dt: datetime) -> str:
@@ -574,7 +574,7 @@ def test_payload_exports_force_persistence_false_for_quoted_echo():
 def _missing_finding(
     slug: str = "sess-lost",
     cwd: str = "/home/leo/src/dark-factory/.worktrees/2701",
-) -> "mod.MissingTranscript":
+) -> mod.MissingTranscript:
     return mod.MissingTranscript(
         session_slug=slug,
         cwd=cwd,
@@ -596,8 +596,25 @@ class _RecordingPoster:
 
 
 class _FakeHttpxResponse:
+    """A 200 `application/json` reply with an empty JSON-RPC body.
+
+    `status_code`, `headers` and `json()` were added for task 3644:
+    `_default_poster` now delegates to `census_trigger.post_mcp_envelope`,
+    which reads `status_code` (to detect the stateful escalation server's 400
+    "Missing session ID") and `content-type` (to detect an SSE-framed body)
+    before decoding. Without them this fake would die on an AttributeError
+    and stop exercising the real code path -- so the task-2953 header
+    contract below keeps being asserted against the transport that actually
+    ships, not against a fake the implementation has outgrown."""
+
+    status_code = 200
+    headers = {"content-type": "application/json"}
+
     def raise_for_status(self):
         pass
+
+    def json(self):
+        return {}
 
 
 def test_default_poster_sends_streamable_http_accept_headers(install_fake_httpx):
@@ -888,3 +905,142 @@ def test_read_spawn_script_unreadable_returns_empty(tmp_path):
     a_dir = tmp_path / "a_dir"
     a_dir.mkdir()
     assert mod._read_spawn_script(a_dir) == ""
+
+
+# ---------------------------------------------------------------------------
+# task 3644: the transcript-loss alarm must survive a STATEFUL server
+# ---------------------------------------------------------------------------
+#
+# Same defect as nightly.py's and census.py's posters: `_default_poster`
+# bare-POSTed `tools/call`, the escalation server rejects it at the transport
+# layer with `400 Bad Request` / "Missing session ID" (captured live
+# 2026-08-05), and `post_findings` swallows that best-effort and returns
+# False -- so the transcript-loss alarm never reached anyone. Fixed by the
+# same single-sourced transport in census_trigger.
+
+
+class _FakeStatefulResponse:
+    """An `httpx.Response` stand-in for the stateful-server handshake."""
+
+    def __init__(self, *, status_code=200, headers=None, payload=None, text=""):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+        self._payload = payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            # A plain RuntimeError, not httpx.HTTPStatusError: the shared
+            # install_fake_httpx stub exposes only `post` and pytest.fails on
+            # any other attribute (task 3376).
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("response has no JSON body")
+        return self._payload
+
+
+def _stateful_escalation_post(recorded, *, session_id="sid-transcript"):
+    """A fake `httpx.post` behaving like the STATEFUL escalation server:
+    session-less `tools/call` -> 400; `initialize` -> 200 + the assigned id
+    as a response header; `notifications/initialized` -> 202; `tools/call`
+    WITH that header -> 200."""
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        method = envelope.get("method")
+        if method == "initialize":
+            return _FakeStatefulResponse(
+                headers={"mcp-session-id": session_id,
+                         "content-type": "application/json"},
+                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
+            )
+        if method == "notifications/initialized":
+            return _FakeStatefulResponse(status_code=202)
+        if (kwargs.get("headers") or {}).get("mcp-session-id") != session_id:
+            return _FakeStatefulResponse(
+                status_code=400,
+                headers={"content-type": "application/json"},
+                payload={"jsonrpc": "2.0", "id": "server-error",
+                         "error": {"code": -32600,
+                                   "message": "Bad Request: Missing session ID"}},
+            )
+        return _FakeStatefulResponse(
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1,
+                     "result": {"structuredContent": {"id": "esc-11", "status": "queued"}}},
+        )
+
+    return _post
+
+
+def _recording_delete(deleted):
+    """A fake `httpx.delete` recording the MCP session-termination call the
+    transport makes after a handshake, so the long-lived escalation server does
+    not leak a session per transcript-loss alarm."""
+    def _delete(url, **kwargs):
+        deleted.append((url, kwargs))
+        return _FakeStatefulResponse(status_code=200)
+
+    return _delete
+
+
+def test_post_findings_lands_against_a_stateful_server(tmp_path, install_fake_httpx):
+    """The DEFAULT poster (no `poster=` injection) must handshake and land.
+
+    `post_findings` -- NOT `post_escalation`; this module's escalation
+    entrypoint takes a `Sequence[MissingTranscript]` -- so a minimal non-empty
+    findings list is what reaches the POST."""
+    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+    recorded = []
+    deleted = []
+    install_fake_httpx(
+        _stateful_escalation_post(recorded), delete=_recording_delete(deleted),
+    )
+
+    assert mod.post_findings(cfg, [_missing_finding("sess-lost-1")]) is True
+
+    methods = [(kwargs.get("json") or {}).get("method") for _url, kwargs in recorded]
+    assert methods == [
+        "tools/call", "initialize", "notifications/initialized", "tools/call",
+    ]
+    # The retried call carries the server-assigned session id...
+    assert (recorded[-1][1].get("headers") or {}).get("mcp-session-id") == "sid-transcript"
+    # ...and is still the escalate_info the alarm meant to file.
+    params = (recorded[-1][1].get("json") or {})["params"]
+    assert params["name"] == "escalate_info"
+    assert "sess-lost-1" in params["arguments"]["detail"]
+    # ...and the session opened to file it is released again.
+    assert [(kw.get("headers") or {}).get("mcp-session-id") for _u, kw in deleted] == [
+        "sid-transcript"
+    ]
+
+
+def test_post_findings_reports_false_on_a_tool_error_envelope(
+    tmp_path, install_fake_httpx, caplog
+):
+    """HTTP 200 is not success. `post_findings` discards the response body and
+    reports True on "no exception", so a tool-level failure
+    (`result.isError: true`) would otherwise read as a landed alarm -- the same
+    green-on-paper/nothing-filed failure task 3644 exists to close, one layer
+    up from the transport."""
+    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+
+    def _post(url, **kwargs):
+        return _FakeStatefulResponse(
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1, "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": "unknown category 'nope'"}],
+            }},
+        )
+
+    install_fake_httpx(_post)
+
+    with caplog.at_level(logging.WARNING):
+        assert mod.post_findings(cfg, [_missing_finding("sess-lost-1")]) is False
+
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("escalation post failed" in m for m in warned), warned
+    assert any("isError" in m or "reported an error" in m for m in warned), warned

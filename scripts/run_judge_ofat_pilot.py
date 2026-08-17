@@ -23,7 +23,6 @@ sonnet and escalate with the generated report.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -35,7 +34,16 @@ for _rel in ('orchestrator/src', 'shared/src', 'escalation/src'):
     _p = str(_REPO_ROOT / _rel)
     if _p not in sys.path:
         sys.path.insert(0, _p)
+# scripts/ itself: implicit on sys.path[0] when run standalone (Python adds the
+# main script's own dir), and explicit via scripts/tests/conftest.py under
+# pytest — but not guaranteed when this module is loaded via
+# importlib.util.spec_from_file_location (orchestrator/tests/test_judge_ofat_pilot.py),
+# so make it explicit here too (idempotent).
+_p = str(_REPO_ROOT / 'scripts')
+if _p not in sys.path:
+    sys.path.insert(0, _p)
 
+from _eval_results_io import load_results_from_dir  # noqa: E402
 from orchestrator.evals.judge_pilot import (  # noqa: E402
     CANDIDATE_JUDGE,
     DEFAULT_NON_INFERIORITY_MARGIN,
@@ -49,28 +57,16 @@ from orchestrator.evals.judge_pilot import (  # noqa: E402
 _EXIT_BY_VERDICT = {'adopt': 0, 'marginal': 1, 'reject': 2}
 
 
-def _load_results_from_dir(results_dir: Path) -> list:
-    """Load every persisted ``EvalResult`` JSON in *results_dir*.
-
-    Mirrors ``runner.load_results`` (filter to known dataclass fields so results
-    predating a field still load) but over an arbitrary dir rather than the
-    packaged ``RESULTS_DIR`` — the ``--results-dir`` override.
-    """
-    from orchestrator.evals.runner import EvalResult
-
-    known = {f.name for f in EvalResult.__dataclass_fields__.values()}
-    results = []
-    for path in sorted(Path(results_dir).glob('*.json')):
-        with open(path) as f:
-            data = json.load(f)
-        results.append(EvalResult(**{k: v for k, v in data.items() if k in known}))
-    return results
-
-
 def _load_results(results_dir: Path | None) -> list:
-    """Persisted results from *results_dir*, or the packaged ``RESULTS_DIR``."""
+    """Persisted results from *results_dir*, or the packaged ``RESULTS_DIR``.
+
+    The ``--results-dir`` branch is :func:`_eval_results_io.load_results_from_dir`
+    (task 3743) — shared with ``scripts/run_fable_trial_v2_campaign.py`` so the
+    missing-dir / malformed-file hardening lands once for both drivers, both of
+    which read the same shared packaged results dir by default.
+    """
     if results_dir is not None:
-        return _load_results_from_dir(results_dir)
+        return load_results_from_dir(results_dir)
     from orchestrator.evals.runner import load_results
 
     return load_results()

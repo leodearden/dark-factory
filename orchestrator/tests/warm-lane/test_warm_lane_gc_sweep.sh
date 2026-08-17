@@ -1183,4 +1183,91 @@ assert "U12: no live reference → --extra-protect-glob NOT appended (no spuriou
 assert "U13: gc-script still invoked (the lane scan does not abort the sweep)" \
     bash -c '[ -s "$1" ]' _ "$U11_GC_LOG"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Block Y — the BRIDGE-COST SEAM's own contract (task 3655)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# WHY THIS BLOCK EXISTS. run_sweep's header (above) states outright that "NO
+# assert in this file inspects the protect glob". So the pin the whole seam
+# exists for — REIFY_WARM_LANE_GC_PROTECT_GLOB short-circuiting gc.sh's python3
+# render — was, until this block, verified by NOTHING. A silently-broken pin
+# would not fail a single assert here; it would only make the suite slower, and
+# task 3298 showed that a wall-clock change on this host is unattributable.
+# Every assertion below is therefore a SET-MEMBERSHIP or a COUNT, never a
+# duration: a wall-clock assert on this host is a flake generator, which is the
+# whole reason task 3655 was filed.
+#
+# THE DISCRIMINATOR. REIFY_WARM_LANE_IACT_PREFIX moves the interactive band in
+# the RENDERED glob — `lane_protect_glob` emits `..._mainsweep-*,_sentinelband-*`
+# with it set, in place of `..._mainsweep-*,_iact-*`. It does NOT and cannot
+# affect $LANE_PROTECT_GLOB_FALLBACK, which is a static literal. So setting the
+# sentinel alongside run_sweep's existing pin splits the two worlds cleanly:
+#
+#   render SHORT-CIRCUITED (correct) -> applied set is the fallback
+#                                       -> `_iact-` protected, `_sentinelband-` NOT
+#   render RAN (pin broken)          -> applied set is the render
+#                                       -> `_sentinelband-` protected, `_iact-` NOT
+#
+# Y2 and Y3 are that pair, read straight off gc.sh's own `skipping protected:`
+# log line. The entries are plain directories, not git worktrees: gc.sh tests
+# the protect glob BEFORE `_is_git_worktree` (warm-lane-gc.sh, Pass-1
+# enumeration), so a bare mkdir is enough to observe the applied set — and
+# nothing is destroyed, so this block is non-destructive as well as hermetic.
+#
+# COST. This block adds NO render: it drives the real gc.sh through run_sweep,
+# whose pin is the very thing under test. Verified by task 3655's execve
+# counters — one full suite run execs `.venv/bin/python3` exactly ONCE, and that
+# one is Block W's direct `bash "$GC_REAL"` (line ~415), which bypasses
+# run_sweep and so pays the render this pin avoids.
+echo ""
+echo "--- Block Y: bridge-cost seam contract (pin short-circuits the render) ---"
+
+Y_ROOT="$(mktemp -d /tmp/test-gc-sweep-y-XXXXXX)"
+_TMPDIRS+=("$Y_ROOT")
+Y_MOUNT="$Y_ROOT/worktrees"
+Y_BASE="$Y_ROOT/base"
+mkdir -p "$Y_MOUNT/_iact-probe" "$Y_MOUNT/_sentinelband-probe" "$Y_BASE/target.gen.1"
+touch "$Y_BASE/target.gen.1.lock"
+ln -sfn "$Y_BASE/target.gen.1" "$Y_BASE/target"
+
+Y_DF_STUB="$Y_ROOT/df_stub.sh"
+_df_stub "$Y_DF_STUB" 107374182400  # 100 GiB avail — no disk-pressure path
+
+# The sentinel rides ALONGSIDE run_sweep's pin, deliberately: this asserts what
+# the PRODUCTION-SHAPED invocation does, not a bespoke one.
+REIFY_WARM_LANE_IACT_PREFIX=_sentinelband- \
+REIFY_WARM_LANE_GC_SWEEP_DF="$Y_DF_STUB" \
+    run_sweep --mount "$Y_MOUNT" --gc-script "$GC_REAL" --critical-free-gib 2
+
+assert "Y1: exit 0 (pinned real-gc sweep)" test "$RC" -eq 0
+assert "Y2: _iact- IS protected — gc.sh applied the PINNED fallback set" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "skipping protected: _iact-probe"' _ "$ERR_OUT"
+assert "Y3: _sentinelband- NOT protected — the python3 render was short-circuited by the pin" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "skipping protected: _sentinelband-probe"' _ "$ERR_OUT"
+
+# ── Y4: the RENDER MULTIPLIER, as a count ─────────────────────────────────────
+# "Renders per suite run" = "renders per gc.sh invocation" x "gc.sh invocations
+# per sweep". Y2/Y3 pin the first factor at ZERO for the pinned path; this pins
+# the second at ONE, so the product stays checkable if either factor moves.
+# Counted through the existing stub-with-call-log idiom (_t_gc_stub -> $GC_LOG),
+# NOT through strace, which needs ptrace permissions the offline/CI lane may not
+# grant.
+Y4_ROOT="$(mktemp -d /tmp/test-gc-sweep-y4-XXXXXX)"
+_TMPDIRS+=("$Y4_ROOT")
+Y4_MOUNT="$Y4_ROOT/worktrees"
+mkdir -p "$Y4_MOUNT/_lane-1/target"
+
+Y4_GC_LOG="$Y4_ROOT/gc_calls.log"
+Y4_GC_STUB="$Y4_ROOT/gc_stub.sh"
+_t_gc_stub "$Y4_GC_STUB"
+
+Y4_DF_STUB="$Y4_ROOT/df_stub.sh"
+_df_stub "$Y4_DF_STUB" 107374182400
+
+GC_LOG="$Y4_GC_LOG" REIFY_WARM_LANE_GC_SWEEP_DF="$Y4_DF_STUB" \
+    run_sweep --mount "$Y4_MOUNT" --gc-script "$Y4_GC_STUB" --critical-free-gib 2
+
+assert "Y4: exactly ONE gc.sh invocation per sweep (the render multiplier, as a count)" \
+    bash -c '[ "$(wc -l < "$1")" -eq 1 ]' _ "$Y4_GC_LOG"
+
 test_summary

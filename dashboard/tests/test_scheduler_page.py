@@ -1898,15 +1898,20 @@ def test_override_endpoint_rejects_invalid_ttl_minutes(client, bad_ttl):
 
 
 # ---------------------------------------------------------------------------
-# step-23: index.html references new scheduler JSX files + cache-buster bumped
+# step-23: index.html references new scheduler JSX files + cache-buster floor
 # ---------------------------------------------------------------------------
 
 
 def test_index_html_references_new_scheduler_jsx_files(client):
     """index.html must include script tags for the three new scheduler JSX files.
 
-    Also asserts all ?v= cache-busters on /static/redux/* assets share the same
-    version number and that number is ≥ 10 (the bump from the previous max of 11).
+    Also pins every ?v= cache-buster on /static/redux/* assets at or above the
+    floor the scheduler jsx registration landed at.
+
+    That pin is ANTI-REVERT, not a live bump check: index.html is far past 10
+    today, so it fails only if someone rolls the cache-busters back below what
+    scheduler jsx registration needed. Whether the versions are UNIFORM, and
+    whether the newest bump landed, are both asserted in test_index_html.py.
     """
     import re
 
@@ -1918,16 +1923,15 @@ def test_index_html_references_new_scheduler_jsx_files(client):
         assert jsx in body, f'index.html missing script tag for {jsx}'
 
     # Extract all ?v=NNN suffixes from /static/redux/ asset URLs
-    versions = re.findall(r'/static/redux/[^"\']+\?v=(\d+)', body)
-    assert versions, 'No ?v= version strings found in index.html'
-    unique = set(versions)
-    assert len(unique) == 1, (
-        f'Multiple different ?v= versions in index.html: {unique!r}. '
-        'All assets must share one version string.'
+    versions = {int(v) for v in re.findall(r'/static/redux/[^"\']+\?v=(\d+)', body)}
+    assert versions, (
+        'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
+        'cache-buster convention has been dropped or the URLs were rewritten.'
     )
-    version = int(unique.pop())
-    # Pin: version must be at least 10 (bumped from previous max of 11)
-    assert version >= 10, f'Expected ?v= ≥ 10, got {version}'
+    assert min(versions) >= 10, (
+        f'the oldest index.html cache-buster version is {min(versions)}, '
+        'expected >= 10 (the floor scheduler jsx registration landed at).'
+    )
 
 
 # ---------------------------------------------------------------------------

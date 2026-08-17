@@ -12,10 +12,9 @@ from __future__ import annotations
 import json
 
 import pytest
+import trial_module_tagger_haiku as mod  # pyright: ignore[reportMissingImports]
 
 from orchestrator import module_tagger_prompt
-
-import trial_module_tagger_haiku as mod
 
 
 def _extract_json_block(md: str) -> dict:
@@ -212,11 +211,11 @@ def _summary(*, haiku_f1, sonnet_f1, jaccard, worse, n):
 
 
 def test_decision_thresholds_are_module_level_named_constants():
-    assert mod.F1_PARITY_BAND == pytest.approx(0.05)
-    assert mod.F1_FAIL_GAP == pytest.approx(0.15)
-    assert mod.AGREEMENT_FLOOR == pytest.approx(0.70)
-    assert mod.AGREEMENT_FAIL == pytest.approx(0.50)
-    assert mod.ADJ_WORSE_FAIL == pytest.approx(0.60)
+    assert pytest.approx(0.05) == mod.F1_PARITY_BAND
+    assert pytest.approx(0.15) == mod.F1_FAIL_GAP
+    assert pytest.approx(0.70) == mod.AGREEMENT_FLOOR
+    assert pytest.approx(0.50) == mod.AGREEMENT_FAIL
+    assert pytest.approx(0.60) == mod.ADJ_WORSE_FAIL
     assert mod.MIN_SAMPLES == 20
 
 

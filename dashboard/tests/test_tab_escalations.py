@@ -245,7 +245,8 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
 
     The entry must be present in the static (unwindowed) section of endpointsFor,
     and the empty-defaults block must initialise ESCALATIONS with the shape
-    expected by redux_api.shape_escalations: {subsections, summary:{by_level,by_status}}.
+    expected by redux_api.shape_escalations:
+    {subsections, summary:{by_level, by_status, skipped_count}}.
     """
     assert '/api/v2/dashboard/escalations' in data_js_body, (
         "data.js does not contain the literal URL '/api/v2/dashboard/escalations' — "
@@ -283,6 +284,13 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
     assert re.search(r'\bby_status\s*:', summary_block), (
         "ESCALATIONS.summary seed missing key 'by_status:' — "
         'add it nested under summary in the ESCALATIONS seed block.'
+    )
+    assert re.search(r'\bskipped_count\s*:', summary_block), (
+        "ESCALATIONS.summary seed missing key 'skipped_count:' — "
+        'add it nested under summary in the ESCALATIONS seed block.  The seed '
+        "declares the server's true payload shape before the first poll resolves; "
+        'omitting the key leaves the global "N unreadable" pill reading `undefined` '
+        'rather than a real zero.'
     )
 
 
@@ -674,6 +682,179 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
         'tab_escalations.jsx sidebar does not have a `task_unresolved` fallback branch — '
         'add `{row.task_unresolved ? <unresolved note> : <task card>}` to handle '
         'escalations whose linked task could not be resolved.'
+    )
+
+
+def test_tab_escalations_renders_skipped_queue_files(tab_escalations_jsx_body: str) -> None:
+    """tab_escalations.jsx must surface the queue files the reader could not parse.
+
+    The ESCALATIONS payload carries per-subsection ``skipped``
+    (``[{path, error}, ...]``) and ``summary.skipped_count``.  A tab that
+    renders one escalation short with nothing saying so is the exact silent
+    degradation INV-2 (``structured-facts-at-failure``) forbids.
+
+    Asserts:
+    (a) a ``data-testid="escalation-skipped"`` notice element exists.
+    (b) the notice names BOTH ``.path`` and ``.error`` — the operator must be
+        told WHICH file and WHY, not just a count.
+    (c) the notice is driven by ``sec.skipped`` and gated on a non-zero length.
+    (d) the notice sits OUTSIDE the ``filteredRows.length === 0`` ternary, so a
+        group whose every row is filtered out still shows it.
+    (e) the notice is NOT gated on the level/status filter chips — a file that
+        could not be parsed has neither field to filter on.
+    (f) the per-subsection group summary carries a skipped badge, beside the
+        existing L1/L2 pips, so it is visible while the group is collapsed.
+    (g) the global controls header renders a ``skipped_count`` pill, gated on > 0.
+    (h) the notice caps how many rows it lists while still counting the true
+        total, so a whole-directory fault does not bury the escalation table.
+    """
+    body = tab_escalations_jsx_body
+
+    # (a) The notice element exists.
+    assert 'data-testid="escalation-skipped"' in body, (
+        'tab_escalations.jsx has no `data-testid="escalation-skipped"` notice — '
+        'add a SkippedNotice component (modelled on tab_memory_evals.jsx::IssuesNotice) '
+        'that renders the subsection\'s unreadable queue files.'
+    )
+
+    # (b) The notice names each file and its cause, not just a count.
+    #
+    # The window is the SkippedNotice component body — sliced from its `function`
+    # declaration to the next top-level one — not a fixed character count.  A
+    # char-count window makes the negative assertions in (e) below depend on how
+    # much unrelated source happens to sit within N characters, so an edit
+    # nowhere near this notice could fail them.
+    comp_m = re.search(r'^function SkippedNotice\(', body, re.MULTILINE)
+    assert comp_m is not None, (
+        'tab_escalations.jsx declares no top-level `function SkippedNotice(` — the '
+        'notice must be a named component, not inlined into the subsection map.'
+    )
+    next_fn = re.search(r'^function ', body[comp_m.end():], re.MULTILINE)
+    notice = body[comp_m.start():comp_m.end() + next_fn.start()] if next_fn else body[comp_m.start():]
+    assert 'data-testid="escalation-skipped"' in notice, (
+        'the `escalation-skipped` testid is not rendered by SkippedNotice — keep the '
+        'notice and its testid in one component so this test window covers it.'
+    )
+    for field in ('.path', '.error'):
+        assert field in notice, (
+            f'the escalation-skipped notice does not reference `{field}` — a bare count '
+            'tells the operator something is wrong but not what; render one line per '
+            'entry naming the path and the parse error.'
+        )
+
+    # (c) Driven by the subsection field, gated on a non-zero length.
+    assert 'sec.skipped' in body, (
+        'tab_escalations.jsx never reads `sec.skipped` — the notice must be driven by '
+        'the per-subsection payload field, not re-derived or hardcoded.'
+    )
+    assert re.search(r'skipped\.length|skipped\s*\.\s*length', body), (
+        'the escalation-skipped notice is not gated on the skipped list length — '
+        'render nothing when the queue read cleanly.'
+    )
+
+    # (d) The notice sits OUTSIDE the all-rows-filtered empty-state branch.
+    map_m = re.search(r'subsections\.map\(sec\s*=>', body)
+    assert map_m is not None, (
+        'could not locate the `subsections.map(sec =>` body in tab_escalations.jsx'
+    )
+    map_body = body[map_m.start():]
+    skipped_at = map_body.find('sec.skipped')
+    mount_at = map_body.find('<SkippedNotice')
+    empty_at = map_body.find('filteredRows.length === 0')
+    assert skipped_at != -1 and empty_at != -1
+    # Anchor on the MOUNT site, not the `const skipped = sec.skipped` read: an
+    # implementation that hoisted the read but moved the mount into the
+    # empty-state branch would satisfy a read-position check while silently
+    # reintroducing the exact looks-empty-but-isn't case this asserts against.
+    assert mount_at != -1, (
+        'the subsection map never mounts `<SkippedNotice …>` — the component must be '
+        'rendered inside the group, not merely declared.'
+    )
+    assert mount_at < empty_at, (
+        'the skipped notice is mounted inside or after the '
+        '`filteredRows.length === 0` ternary — hoist it above that branch so a group '
+        'rendering "No escalations match current filters" while holding an unreadable '
+        'file still says so.'
+    )
+
+    # (e) Not routed through the level/status filter chips.
+    for gate in ('matchesFilter', 'filter.levels', 'filter.statuses'):
+        assert gate not in notice, (
+            f'the escalation-skipped notice references `{gate}` — a file that could not '
+            'be parsed has no level or status, so routing it through the chips would let '
+            'an arbitrary default decide whether the operator is told about corruption.'
+        )
+    skipped_stmt = map_body[skipped_at:map_body.find('\n', skipped_at)]
+    for gate in ('matchesFilter', 'filter.levels', 'filter.statuses'):
+        assert gate not in skipped_stmt, (
+            f'`sec.skipped` is filtered through `{gate}` before reaching the notice — '
+            'pass the list through unfiltered.'
+        )
+
+    # (f) Per-subsection badge beside the existing L1/L2 pips.
+    #
+    # Bounded structurally — from the `const summary = (` fragment to the group's
+    # own `return (` — rather than by a character count, and anchored on the
+    # `secByLevel[2]` identifier rather than the rendered `L2 ·` label, so a
+    # reformat or a label tweak does not fail this test with a misdirecting
+    # "widen the window" message.
+    frag_start = map_body.find('const summary = (')
+    assert frag_start != -1, (
+        'could not locate the per-subsection `const summary = (` fragment'
+    )
+    frag_end = map_body.find('return (', frag_start)
+    frag = map_body[frag_start:frag_end if frag_end != -1 else len(map_body)]
+    assert 'secByLevel[2]' in frag, (
+        'the per-subsection summary fragment no longer renders the L2 pip from '
+        '`secByLevel[2]` — this test anchors the skipped badge beside it.'
+    )
+    assert re.search(r'skipped\.length\s*>\s*0', frag), (
+        'the per-subsection group summary carries no skipped badge — add a '
+        '`{skipped.length > 0 && <span className="pip">…</span>}` badge after the L2 pip '
+        'so the count is visible while the group is collapsed.'
+    )
+    assert 'badge' in frag, (
+        'the skipped badge does not use the `badge` span idiom the L1/L2 pips use'
+    )
+
+    # (g) Global controls-header pill from the top-level summary.
+    assert 'skipped_count' in body, (
+        'tab_escalations.jsx never reads `skipped_count` — add a global pill beside the '
+        'existing `N pending · N L1 · N L2` summary pills.'
+    )
+    # Anchored on the `byLevel[2]` identifier (the global pills; the subsection
+    # pips read `secByLevel[2]`, which does not match) and bounded at the next
+    # structural landmark — the subsection map — rather than by a character
+    # count.  The stated contract is "in the controls header, after the
+    # pending/L1/L2 pills and before the subsection groups", which survives a
+    # reformat or a label change; `'L1 · {byLevel[2]'` pinned exact whitespace
+    # and an interpunct.
+    pills_at = body.find('byLevel[2]')
+    assert pills_at != -1, 'could not locate the global summary-pill span'
+    pills_end = body.find('subsections.map(', pills_at)
+    pills_window = body[pills_at:pills_end if pills_end != -1 else len(body)]
+    assert 'skipped_count' in pills_window, (
+        'the `skipped_count` pill is not rendered beside the existing pending/L1/L2 '
+        'pills — append it to that same summary span.'
+    )
+    assert re.search(r'skipped_count[^\n]*>\s*0', pills_window), (
+        'the global `skipped_count` pill is not gated on `> 0` — a clean fleet must not '
+        'render a permanent "0 unreadable" pill.'
+    )
+
+    # (h) The notice bounds how many rows it renders, without understating the
+    # loss.  A whole-directory fault (truncated write, permission fault, a
+    # half-synced mount) yields hundreds of records; rendering them all,
+    # always-expanded, pushes the escalation table below the fold and degrades
+    # the same operator view the notice exists to serve.
+    assert '.slice(' in notice, (
+        'SkippedNotice renders every entry unbounded — slice the list to a cap and add '
+        'an overflow line, so a whole-directory fault does not bury the escalation table.'
+    )
+    assert 'rows.length' in notice, (
+        'the SkippedNotice headline no longer counts from the full `rows.length` — the '
+        'headline must state the TRUE total even when the listing is capped, or the '
+        'notice understates the loss it exists to report.'
     )
 
 

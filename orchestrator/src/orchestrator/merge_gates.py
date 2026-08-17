@@ -70,9 +70,32 @@ class PlanFilesTouchedResult:
             touch.  Non-empty means the architect declared work that the
             branch never actually delivered.  Empty list means every plan
             entry is covered by some commit on the branch.
+        missing_from_tree: Declared entries that do NOT exist in the branch
+            tree at ``branch_head`` and for which no rename resolved.
+            ALWAYS a subset of ``not_touched`` (a stale entry is reported in
+            both), so fail-closed behaviour and every existing
+            ``not_touched``-only consumer are unchanged.  A non-empty value
+            means the declared PATH is stale — renamed away or never created
+            — NOT that the branch under-delivered: the touched-set was never
+            consulted for these entries, so no claim about the branch's
+            commits can be made from them.  Entries whose absence could not
+            be measured (a git error on the existence probe) are deliberately
+            NOT listed here; they land in ``not_touched`` only.  Entries that
+            RESOLVED are likewise never listed here, and safely so: a
+            resolution's target is always verified to exist at
+            ``branch_head`` (see :func:`_resolve_renamed_plan_path`), so the
+            file is genuinely present under a known new name.
+        resolved_renames: Declared entry → the current path it resolved to,
+            recorded whether or not that resolved path was touched, as the
+            gate's audit trail.  Keyed by the ORIGINAL declared string (the
+            architect's spelling, pre-normalization) so the diagnostic names
+            exactly what plan.json says.  A resolution alone never passes the
+            gate — the resolved path must additionally be in the touched set.
     """
 
     not_touched: list[str] = field(default_factory=list)
+    missing_from_tree: list[str] = field(default_factory=list)
+    resolved_renames: dict[str, str] = field(default_factory=dict)
 
 
 DROPPED_PLAN_TARGETS_REASON_PREFIX = 'Merge commit is missing plan target files'
@@ -1037,6 +1060,276 @@ def _normalize_plan_path(entry: str) -> str:
     return entry if norm == '.' else norm
 
 
+_MAX_RENAME_HOPS = 8
+"""Upper bound on how many consecutive rename hops the resolver will follow.
+
+A relocation staged as several ``git mv`` commits (``a → b`` then
+``b → c``) is one logical move to a human but N pair-hops to git, so
+mechanism 1 must chase the chain rather than stop at the first pair.  The
+bound exists purely so a pathological history cannot turn one stale plan
+entry into an unbounded subprocess fan-out; 8 is far above any observed
+real chain (the measured reify harness-consolidation moves were 1-2 hops)
+and a chain that exceeds it simply falls through to mechanism 2.
+"""
+
+
+def _ls_tree_object_type(ls_out: str) -> str | None:
+    """Return the git object type named by the first ``git ls-tree`` record.
+
+    ``git ls-tree`` prints ``<mode> <type> <sha>\\t<path>`` — the metadata
+    is TAB-separated from the path, so the type must be read out of the
+    left half only.  Substring-sniffing the whole line for ``' tree '``
+    misclassifies any blob whose repo-relative path happens to contain
+    that substring (e.g. ``docs/my tree notes.md``), which matters because
+    the existence probe's type classification now gates three arms, not
+    one.
+
+    Returns ``None`` for empty or unparseable output (defensive: the
+    caller then treats the object as a non-directory, which is the
+    conservative reading — a directory misread as a blob only costs a
+    prefix-match, never a spurious pass).
+    """
+    for line in ls_out.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split('\t', 1)[0].split()
+        return fields[1] if len(fields) >= 2 else None
+    return None
+
+
+async def _rename_pair_for(
+    path: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> tuple[str, str] | None:
+    """One hop of git's own rename detection for *path*, or ``None``.
+
+    Finds the commit reachable from *branch_head* that DELETED *path*
+    (``git log --diff-filter=D -1``), then re-reads that commit with
+    rename detection on (``git show --name-status -M``) looking for an
+    ``R<score>\\t<old>\\t<new>`` pair whose old side is *path*.
+
+    Returns ``(new_path, deleting_sha)``.  Fails CLOSED: a git error, no
+    deleting commit, or no pairable rename all return ``None``.
+    """
+    rc, del_out, del_err = await _run(
+        ['git', 'log', '--diff-filter=D', '-1', '--format=%H', branch_head, '--', path],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'plan-files-touched: rename-probe git error task_id=%s entry=%s '
+            'cmd=%r rc=%s stderr=%s',
+            task_id or '<unknown>', path,
+            'git log --diff-filter=D -1 --format=%H <head> -- <entry>',
+            rc, (del_err or '').strip()[:400],
+        )
+        return None
+
+    del_sha = del_out.strip().splitlines()[0].strip() if del_out.strip() else ''
+    if not del_sha:
+        return None
+
+    rc, show_out, show_err = await _run(
+        ['git', 'show', '--name-status', '-M', '--format=', del_sha],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'plan-files-touched: rename-probe git error task_id=%s entry=%s '
+            'cmd=%r rc=%s stderr=%s',
+            task_id or '<unknown>', path,
+            f'git show --name-status -M --format= {del_sha[:12]}',
+            rc, (show_err or '').strip()[:400],
+        )
+        return None
+
+    for line in show_out.splitlines():
+        fields = line.split('\t')
+        if len(fields) < 3:
+            continue
+        status, old_path, new_path = fields[0], fields[1], fields[2]
+        if status.startswith('R') and old_path == path and new_path:
+            return new_path, del_sha
+    return None
+
+
+async def _path_existed_in_branch_history(
+    norm: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> bool:
+    """True when some commit reachable from *branch_head* touched *norm*.
+
+    This is the evidence gate on the basename heuristic: it establishes
+    that the declared path was ever REAL under that exact name.  Without
+    it, a path the architect simply invented (``docs/foo.md``, never
+    created) would fall straight into the basename fallback and could be
+    "rename-resolved" to a coincidentally-unique ``other/place/foo.md`` —
+    a category error (nothing was renamed) that weakens the gate for the
+    one case it must always block.
+
+    Fails CLOSED: a git error returns ``False``, so the heuristic is not
+    consulted on evidence we could not measure.
+    """
+    rc, out, err = await _run(
+        ['git', 'log', '-1', '--format=%H', branch_head, '--', norm],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'plan-files-touched: history-probe git error task_id=%s entry=%s '
+            'head=%s rc=%s stderr=%s',
+            task_id or '<unknown>', norm, branch_head, rc,
+            (err or '').strip()[:400],
+        )
+        return False
+    return bool(out.strip())
+
+
+async def _resolve_renamed_plan_path(
+    norm: str,
+    branch_head: str,
+    git_ops: GitOps,
+    tree_paths: Callable[[], Awaitable[list[str] | None]],
+    *,
+    task_id: str | None = None,
+) -> tuple[str, str] | None:
+    """Resolve a declared path that is ABSENT from the branch tree to its
+    current name, or ``None`` when no resolution is recoverable.
+
+    Returns ``(resolved_path, mechanism)`` where *mechanism* is a short
+    human-readable description for the audit log.
+
+    **Invariant: a returned ``resolved_path`` always EXISTS in the branch
+    tree at ``branch_head``.**  Both mechanisms enforce it (mechanism 1
+    verifies each hop against the tree listing; mechanism 2 draws its
+    candidates from that listing), so a resolution can never point a human
+    at a second phantom path, and an entry that resolved is never
+    ``missing_from_tree``.
+
+    Mechanism 1 (authoritative — git's own rename detection): follow the
+    rename CHAIN from *norm*, hop by hop, via :func:`_rename_pair_for`.
+    Each hop's target is checked against the branch tree: a hop that lands
+    on a live path is the answer; a hop that lands on a path which was
+    itself relocated again keeps walking (bounded by
+    :data:`_MAX_RENAME_HOPS`, with a cycle guard).  Stopping at the FIRST
+    pair would answer a two-step ``a → b → c`` relocation with the dead
+    intermediate ``b`` — blocking a branch that delivered exactly what was
+    asked, and naming a path that does not exist at branch HEAD in the
+    audit trail.  Staged multi-step moves are precisely the shape the
+    reify harness-consolidation programme used.
+
+    Mechanism 2 (heuristic fallback, tried only when the chain dead-ends):
+    a UNIQUE basename match against the branch tree listing supplied by
+    *tree_paths*.  Mechanism 1 cannot see a relocation staged as SEPARATE
+    delete and add commits (git pairs renames only within one commit),
+    which is exactly how the reify harness-consolidation programme staged
+    its moves.  The fallback is deliberately conservative and bounded four
+    ways: it requires EXACTLY ONE candidate; it only runs for a path that
+    exists nowhere in the branch tree; it only runs for a path with actual
+    history under its declared name (see
+    :func:`_path_existed_in_branch_history` — an invented path is a stale
+    declaration, not a rename); and a resolution never passes the gate on
+    its own — the caller additionally requires the resolved path to be in
+    the touched set.  So an ambiguous or coincidental basename cannot
+    silently satisfy the gate.
+
+    *tree_paths* is an async provider, not a list, so the (single) tree
+    listing is shelled out at most ONCE per gate invocation, shared across
+    every stale entry and every hop, and never computed at all when no
+    entry is stale.  It returns ``None`` on a git error, which fails this
+    resolver closed for BOTH mechanisms — without a tree listing neither
+    the hop-liveness check nor the basename bound can be evaluated, so no
+    entry resolves.
+
+    Anchored on *branch_head* rather than main's live HEAD deliberately:
+    this gate has no ``main_sha`` parameter, and reading ``HEAD`` in
+    ``project_root`` would make a merge gate depend on a ref the merge
+    worker itself advances concurrently — a nondeterministic gate.
+    ``branch_head`` is deterministic and strictly sufficient for this
+    false-positive class: the branch touched the POST-rename paths, so the
+    renaming commit is necessarily an ancestor of ``branch_head``.
+
+    Fails CLOSED — any git error, missing deleting commit, or unmatched
+    rename pair returns ``None`` and the caller still blocks.  (Contrast
+    with the whole-gate fail-OPEN on the touched-set fetch: a transient
+    error there would block every plan entry at once, whereas a per-entry
+    probe failure can only leave one already-suspect entry flagged.)
+    """
+    tree_set: set[str] | None = None
+
+    async def _tree_set() -> set[str] | None:
+        nonlocal tree_set
+        if tree_set is None:
+            paths = await tree_paths()
+            if paths is None:
+                return None
+            tree_set = set(paths)
+        return tree_set
+
+    # ── Mechanism 1: follow the deleting commits' rename chain ──────────
+    current = norm
+    seen = {norm}
+    shas: list[str] = []
+    for _hop in range(_MAX_RENAME_HOPS):
+        pair = await _rename_pair_for(current, branch_head, git_ops, task_id=task_id)
+        if pair is None:
+            break
+        new_path, del_sha = pair
+        if new_path in seen:
+            # Degenerate a → b → a history; stop rather than loop.
+            break
+        seen.add(new_path)
+        shas.append(del_sha)
+        current = new_path
+
+        live = await _tree_set()
+        if live is None:
+            return None
+        if current in live:
+            mechanism = (
+                f'rename in {shas[0][:12]}' if len(shas) == 1
+                else f'{len(shas)}-hop rename chain ending in {shas[-1][:12]}'
+            )
+            return current, mechanism
+        # The hop landed on a path that is itself gone from the tree: it was
+        # relocated again.  Keep walking rather than returning a dead answer.
+
+    # ── Mechanism 2: unique basename match in the branch tree ───────────
+    # Reached when no commit deleted the path (never created, or the
+    # relocation predates any reachable delete), when the deleting commit
+    # carried no pairable rename (separate delete+add commits), or when
+    # the chain dead-ended on a path that is absent from the tree.
+    if not await _path_existed_in_branch_history(
+        norm, branch_head, git_ops, task_id=task_id,
+    ):
+        logger.warning(
+            'plan-files-touched: declared %s has NO history under that name at '
+            'head=%s — basename fallback deliberately not attempted (a path that '
+            'never existed is an invented declaration, not a rename). task_id=%s',
+            norm, branch_head, task_id or '<unknown>',
+        )
+        return None
+
+    live = await _tree_set()
+    if live is None:
+        return None
+
+    basename = posixpath.basename(norm)
+    if not basename:
+        return None
+    candidates = [p for p in live if posixpath.basename(p) == basename]
+    if len(candidates) == 1:
+        return candidates[0], 'unique basename match'
+
+    return None
+
+
 async def _check_plan_files_touched_in_branch(
     plan_files: list[str],
     base_sha: str,
@@ -1053,7 +1346,21 @@ async def _check_plan_files_touched_in_branch(
         (b) the entry resolves to a directory in the branch tree (via
             ``git ls-tree``) and at least one touched file path has it as
             a path-prefix (directory entries are valid plan targets when
-            an agent stages multiple files inside).
+            an agent stages multiple files inside), OR
+        (c) the entry is ABSENT from the branch tree entirely and
+            :func:`_resolve_renamed_plan_path` maps it to a current path
+            that IS in the touched set — i.e. the declared path was
+            renamed on main after the architect declared it, and the
+            branch delivered against the file's current name (task 3110,
+            measured on reify-5196 / esc-5196-22).
+
+    The ``git ls-tree`` call is read as a three-way existence probe:
+    ``rc == 0`` with non-empty output means the path EXISTS at
+    ``branch_head`` (as a tree, which takes arm (b), or as a blob);
+    ``rc == 0`` with EMPTY output means the path is genuinely ABSENT,
+    which takes arm (c); ``rc != 0`` means git could not tell us, so the
+    entry is flagged UNCLASSIFIED — never claim an absence we did not
+    measure.
 
     Empty ``plan_files`` returns no entries — vacuously satisfied.
 
@@ -1067,7 +1374,41 @@ async def _check_plan_files_touched_in_branch(
     touched = await git_ops.get_files_touched_in_branch(base_sha, branch_head)
     touched_set = set(touched)
 
+    # Lazily-computed, once-per-invocation listing of every path in the
+    # branch tree, used by the rename resolver to verify each chain hop
+    # landed on a path that still EXISTS and to bound its basename
+    # fallback.  It is reached only on the already-failing absent-path
+    # arm, so the cost is off the hot path — and it is paid at most once
+    # per gate invocation even when several declared entries are stale
+    # (the reify-5196 shape had two) and each walks several hops.
+    tree_listing: list[str] | None = None
+    tree_listing_failed = False
+
+    async def _tree_paths() -> list[str] | None:
+        nonlocal tree_listing, tree_listing_failed
+        if tree_listing is not None or tree_listing_failed:
+            return tree_listing
+        rc, out, err = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', branch_head],
+            cwd=git_ops.project_root,
+        )
+        if rc != 0:
+            # Fail closed: without a tree listing we cannot bound the
+            # basename heuristic, so no entry resolves through it.
+            tree_listing_failed = True
+            logger.warning(
+                'plan-files-touched: tree-listing failed task_id=%s head=%s '
+                'rc=%s stderr=%s',
+                task_id or '<unknown>', branch_head, rc,
+                (err or '').strip()[:400],
+            )
+            return None
+        tree_listing = [line for line in out.splitlines() if line]
+        return tree_listing
+
     not_touched: list[str] = []
+    missing_from_tree: list[str] = []
+    resolved_renames: dict[str, str] = {}
     for entry in plan_files:
         if not entry:
             continue
@@ -1079,28 +1420,92 @@ async def _check_plan_files_touched_in_branch(
         if norm in touched_set:
             continue
 
-        # Directory match: ask the branch tree what kind of object the
+        # Existence probe: ask the branch tree what kind of object the
         # entry names.  ``git ls-tree`` prints "<mode> tree <sha>\t<path>"
-        # for directories and "<mode> blob <sha>\t<path>" for files.
+        # for directories and "<mode> blob <sha>\t<path>" for files, and
+        # exits 0 with EMPTY output when the path is absent from the tree
+        # (rc != 0 is reserved for a real git error, e.g. an unresolvable
+        # rev) — which is why this call, and not `git cat-file -e`, is the
+        # existence oracle: cat-file returns 128 for BOTH a missing path
+        # and a bad rev, so it cannot distinguish "the declared path is
+        # stale" from "we could not measure anything".
         rc, ls_out, ls_err = await _run(
             ['git', 'ls-tree', branch_head, '--', norm],
             cwd=git_ops.project_root,
         )
-        if rc == 0 and ls_out.strip() and ' tree ' in ls_out:
-            # Directory: prefix-match against the touched set.
-            prefix = norm.rstrip('/') + '/'
-            if any(t.startswith(prefix) for t in touched_set):
+        if rc != 0:
+            # Could not measure existence — flag UNCLASSIFIED rather than
+            # asserting an absence we never established.
+            logger.warning(
+                'plan-files-touched: ls-tree probe failed task_id=%s entry=%s '
+                'head=%s rc=%s stderr=%s',
+                task_id or '<unknown>', entry, branch_head, rc,
+                (ls_err or '').strip()[:400],
+            )
+            not_touched.append(entry)
+            continue
+
+        if ls_out.strip():
+            # Path EXISTS at branch_head.  Read the object type out of the
+            # TAB-separated metadata half only — sniffing the whole line for
+            # the substring ' tree ' misreads any blob whose path contains
+            # it (e.g. 'docs/my tree notes.md').
+            if _ls_tree_object_type(ls_out) == 'tree':
+                # Directory: prefix-match against the touched set.
+                prefix = norm.rstrip('/') + '/'
+                if any(t.startswith(prefix) for t in touched_set):
+                    continue
+            not_touched.append(entry)
+            continue
+
+        # Path is ABSENT from the branch tree: the declared path is stale,
+        # so the touched set can say nothing about it.  Try to resolve the
+        # rename before blaming the branch (task 3110).
+        resolution = await _resolve_renamed_plan_path(
+            norm, branch_head, git_ops, _tree_paths, task_id=task_id,
+        )
+        if resolution is not None:
+            resolved, mechanism = resolution
+            # Key on the ORIGINAL declared string so the diagnostic names
+            # exactly what plan.json says (composes with task 1587's
+            # ./-prefix normalization instead of re-solving it).
+            resolved_renames[entry] = resolved
+            if resolved in touched_set:
+                # A resolved rename means the task's declared metadata.files
+                # is stale — a real data-quality signal on a path that
+                # otherwise produces no output at all.  Log it LOUD even
+                # though the gate passes (no-silent-fail-soft).
+                logger.warning(
+                    'plan-files-touched: declared %s resolved to %s via %s; '
+                    'branch touched the resolved path — gate PASSES. task_id=%s',
+                    entry, resolved, mechanism, task_id or '<unknown>',
+                )
                 continue
+        else:
+            # Absent AND unresolvable: the declared PATH is stale.  Recorded
+            # in BOTH lists (subset invariant) so every existing
+            # not_touched-only consumer is unchanged while the diagnosis
+            # can distinguish "the branch under-delivered" from "the plan
+            # names a path that isn't there".  Entries reaching here via
+            # the git-error arm above are deliberately NOT classified —
+            # their absence was never measured.
+            missing_from_tree.append(entry)
 
         not_touched.append(entry)
 
     if not_touched:
         logger.warning(
             'plan-files-touched: not_touched task_id=%s '
-            'base=%s head=%s entries=%r',
+            'base=%s head=%s entries=%r '
+            'missing_from_tree=%r resolved_renames=%r',
             task_id or '<unknown>', base_sha, branch_head, not_touched,
+            missing_from_tree, resolved_renames,
         )
-    return PlanFilesTouchedResult(not_touched=not_touched)
+    return PlanFilesTouchedResult(
+        not_touched=not_touched,
+        missing_from_tree=missing_from_tree,
+        resolved_renames=resolved_renames,
+    )
 
 
 async def _check_post_merge_equivalence(

@@ -14,7 +14,7 @@ CLI acceptance surface.
 Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 §5.2, contract §7.4). It owns its own signal-scoring primitives, reusing
 only the low-level JSONL-line iterator
-(:func:`legibility.inventory._iter_json_lines`) from its own sibling
+(:func:`legibility.inventory.iter_json_lines`) from its own sibling
 module rather than duplicating it.
 
 This module was originally "self-contained — does not import task α's
@@ -34,11 +34,11 @@ import logging
 import math
 import re
 import sys
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable, Sequence
 
 # Self-bootstrap for standalone `python scripts/legibility/sampling.py` runs
 # — must run BEFORE the `legibility.*` imports below, since a direct script
@@ -51,14 +51,14 @@ from legibility import digest  # noqa: E402
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
 from legibility.inventory import (  # noqa: E402
     SessionRecord,
-    _iter_json_lines,
     enumerate_sessions,
+    iter_json_lines,
     resolve_agent_transcript_roots,
 )
 
 logger = logging.getLogger('legibility.sampling')
 
-# _iter_json_lines lives in legibility.inventory — this module reuses that
+# iter_json_lines lives in legibility.inventory — this module reuses that
 # single fire-and-forget-transcript-read implementation rather than keeping
 # its own byte-for-byte copy (a future fix to the graceful-degrade contract
 # then only needs to land in one place).
@@ -170,20 +170,50 @@ def _assistant_text(record: dict[str, Any]) -> str:
     return '\n'.join(parts).lower()
 
 
-def _has_tool_error(record: dict[str, Any]) -> bool:
-    """True iff *record* is a user record carrying a tool_result with a truthy is_error.
+def _classify_tool_errors(record: dict[str, Any]) -> tuple[bool, bool]:
+    """Return (has_genuine_error, has_designed_outcome) for one *record*.
 
-    Structural only — never a text/"FAIL" substring match (mirrors the
-    decoy-FAIL suppression decision applied to task α's digest.py)."""
+    Entry into the scan is structural only — a block counts iff it is a
+    tool_result with a truthy ``is_error`` flag, never a text/"FAIL"
+    substring match (mirrors the decoy-FAIL suppression decision applied
+    to task α's digest.py). Only AFTER a block has qualified structurally
+    is its already-extracted content passed to the classifier, so no
+    substring hunt can resurrect a decoy.
+
+    Splitting genuine from designed reuses digest's SINGLE definition --
+    the one PUBLIC entry point :func:`digest.classify_error_content`,
+    which takes a raw tool_result ``content`` field and returns
+    ``(exit_code, designed_label)`` -- rather than growing a second one
+    here or reaching across the module boundary into digest's private
+    helpers. Before task 3610 this module's parallel five-class
+    tally ranked a ceiling-only session as 13 tool_errors while the
+    digest reported 0 — a silent divergence between two things both
+    documented as "PRD §7.2 signal_counts" (07-31 census cluster 1.3).
+
+    Returns two INDEPENDENT booleans, not a partition of the record: a
+    record carrying both a real failure and a declared ceiling reports
+    True for both, and each class increments once. That preserves the
+    one-increment-per-class-per-RECORD semantics documented on
+    :func:`score_signals`.
+    """
     if record.get('type') != 'user':
-        return False
+        return False, False
     content = _message_content(record)
     if not isinstance(content, list):
-        return False
-    return any(
-        isinstance(block, dict) and block.get('type') == 'tool_result' and block.get('is_error')
-        for block in content
-    )
+        return False, False
+
+    genuine = designed = False
+    for block in content:
+        if not (isinstance(block, dict) and block.get('type') == 'tool_result'):
+            continue
+        if not block.get('is_error'):
+            continue
+        _, label = digest.classify_error_content(block.get('content'))
+        if label is None:
+            genuine = True
+        else:
+            designed = True
+    return genuine, designed
 
 
 def _has_guard_tool_use(record: dict[str, Any]) -> bool:
@@ -209,9 +239,27 @@ class SignalCounts:
     self_correct: int = 0
     df_guard: int = 0
     interrupt: int = 0
+    designed_outcome: int = 0
 
     @property
     def total_signal(self) -> int:
+        """Sum of the five SCORED confusion classes — the sampler's ranking scale.
+
+        ``designed_outcome`` is deliberately excluded. A declared
+        bounded-poll ceiling is a designed loop-continuation, not agent
+        confusion, so it is counted for visibility but must not lift a
+        session's rank; this mirrors digest.py leaving it out of
+        SIGNAL_WEIGHTS (task 3610, 07-31 census cluster 1.3).
+
+        Excluded from the scale means excluded from the zero-signal gate
+        too, since that gate is ``score > 0`` over this value: a session
+        whose ONLY structured errors are designed outcomes totals 0, is
+        counted into ``zero_signal_dropped``, and never reaches the digest
+        stage — so its ``designed_outcome`` count is never observable
+        downstream. That is intended (such a session carries no confusion
+        signal to read), but it bounds the "counted for visibility" claim
+        to MIXED sessions; see PRD §7.2.1.
+        """
         return (
             self.tool_error + self.not_found + self.self_correct
             + self.df_guard + self.interrupt
@@ -228,18 +276,22 @@ def _score_and_find_first_turn(path: Path) -> tuple[SignalCounts, dict[str, Any]
     locate its first non-sidechain, non-meta user turn
     (reviewer_comprehensive/performance, task 2573 amendment pass #2).
     This helper folds both searches into the SAME iteration over
-    :func:`legibility.inventory._iter_json_lines`, so a session transcript
+    :func:`legibility.inventory.iter_json_lines`, so a session transcript
     is read once instead of twice. :func:`score_signals` and
     :func:`_find_first_user_turn` both delegate to this function, so every
     other caller (including the direct unit tests of :func:`score_signals`)
     keeps its existing single-purpose signature and exact return value.
     """
     tool_error = not_found = self_correct = df_guard = interrupt = 0
+    designed_outcome = 0
     first_turn: dict[str, Any] | None = None
     try:
-        for record in _iter_json_lines(path):
-            if _has_tool_error(record):
+        for record in iter_json_lines(path):
+            has_genuine, has_designed = _classify_tool_errors(record)
+            if has_genuine:
                 tool_error += 1
+            if has_designed:
+                designed_outcome += 1
 
             text = _record_text(record)
             if text and any(pattern in text for pattern in _NOT_FOUND_PATTERNS):
@@ -275,6 +327,7 @@ def _score_and_find_first_turn(path: Path) -> tuple[SignalCounts, dict[str, Any]
         self_correct=self_correct,
         df_guard=df_guard,
         interrupt=interrupt,
+        designed_outcome=designed_outcome,
     )
     return counts, first_turn
 
@@ -284,9 +337,12 @@ def score_signals(path: Path) -> SignalCounts:
 
     One increment per class per RECORD (not per pattern match) — a record
     carrying multiple synonymous markers for the same class still counts
-    once. ``tool_error`` and the tool-use half of ``df_guard`` are
-    structural checks; every other class is a plain case-insensitive
-    substring scan. Malformed/unreadable input degrades to an all-zero
+    once. ``tool_error``/``designed_outcome`` and the tool-use half of
+    ``df_guard`` are structural checks; every other class is a plain
+    case-insensitive substring scan. ``tool_error`` counts only GENUINE
+    failures: declared-designed outcomes are split off into
+    ``designed_outcome`` by :func:`_classify_tool_errors`, which reuses
+    digest's classifier so the two modules cannot drift. Malformed/unreadable input degrades to an all-zero
     :class:`SignalCounts` rather than raising. Delegates to
     :func:`_score_and_find_first_turn` (shared with
     :func:`_find_first_user_turn` so :func:`main`'s scoring loop can get
@@ -826,6 +882,11 @@ def stratified_sample(
     for stratum_records in by_stratum.values():
         stratum_size = len(stratum_records)
 
+        # The gate is the SCORED classes only (SignalCounts.total_signal),
+        # so a session carrying nothing but designed outcomes drops here
+        # and is never digested -- deliberate, and the reason
+        # signal_counts.designed_outcome only ever surfaces on a session
+        # that also has real signal (PRD §7.2.1).
         nonzero = [r for r in stratum_records if r.score > 0]
         zero_signal_dropped += stratum_size - len(nonzero)
 

@@ -6,6 +6,11 @@ Step-7: RED — idempotent resume + quiescence (I2/B3/B4/B11)
 
 from __future__ import annotations
 
+import asyncio
+import functools
+import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -328,6 +333,215 @@ def _seed_escalation(
     if resolved:
         queue.resolve(esc.id, 'resolved for test setup')
     return esc
+
+
+# Repo root of this worktree, derived exactly as orchestrator/tests/conftest.py
+# derives _SRC / _SHARED_SRC / _ESCALATION_SRC (conftest.py:20-27) — same source
+# of truth, same idiom, no new constant to drift.
+_REPO_ROOT = Path(__file__).parent.parent.parent
+_CHILD_SRC_ROOTS = (
+    _REPO_ROOT / 'escalation' / 'src',
+    _REPO_ROOT / 'shared' / 'src',
+    _REPO_ROOT / 'orchestrator' / 'src',
+)
+
+
+# Every child this module spawns is bounded.  30s, NOT the 60s a reviewer
+# suggested, because orchestrator/pyproject.toml sets a 60s per-test
+# pytest-timeout with `timeout_method = "thread"` — at parity the two would
+# race, and pytest-timeout's thread method resolves a hit by `os._exit()`-ing
+# the xdist worker, which produces no diagnosis at all.  Firing strictly inside
+# that budget guarantees the named AssertionError below wins the race.
+_CHILD_TIMEOUT_SECS = 30
+
+
+def _child_env() -> dict[str, str]:
+    """os.environ plus the repo src roots prepended to PYTHONPATH.
+
+    One definition, shared by `_run_wrapper_payload` and `_probe_submit_cli`,
+    so the preflight probes a child environment identical to the one the
+    wrapper actually runs in.  The injected roots take precedence; any
+    inherited PYTHONPATH is appended rather than dropped.  See
+    `_run_wrapper_payload` for why the injection is needed at all.
+    """
+    env = {**os.environ}
+    inherited = env.get('PYTHONPATH')
+    env['PYTHONPATH'] = os.pathsep.join(
+        [*(str(p) for p in _CHILD_SRC_ROOTS), *([inherited] if inherited else [])]
+    )
+    return env
+
+
+@functools.cache
+def _probe_submit_cli(python_exe: str) -> tuple[int, str]:
+    """Run ``<python_exe> -m escalation submit --help``; return (rc, output).
+
+    Memoized per interpreter path: spawning a fresh CPython costs ~0.3-0.7s and
+    the answer is deterministic for the life of a suite run, while
+    `_assert_submit_cli_invokable` runs on every wrapper-exec test.  The cache
+    key omits the ambient PYTHONPATH deliberately — `_child_env` *prepends* the
+    repo src roots, so an inherited value (appended, lower precedence) cannot
+    change whether the import resolves.  Failures are cached as VALUES, not
+    raised in here, so a broken interpreter still re-reports its full diagnosis
+    at every call site.
+    """
+    from orchestrator.proc_supervision import EscalationSpec
+
+    argv = EscalationSpec(
+        queue_dir='', task_id='0', summary='preflight',
+    ).to_submit_argv(python_exe)
+    # The slice below is the ONLY thing keeping this probe honest, so pin the
+    # shape it assumes.  If `to_submit_argv` ever grows a leading interpreter
+    # flag (`-X faulthandler`, `-P`) or an option before the subcommand,
+    # argv[:4] would drop the `submit` token and `--help` would then be handled
+    # by escalation/submit.py's TOP-LEVEL parser — which also exits 0 (its
+    # subparsers are declared with dest='command' and are not required).  The
+    # probe would pass vacuously: exactly the silent-pass class it exists to
+    # eliminate.  Re-derive the prefix rather than widening the slice.
+    expected_prefix = [python_exe, '-m', 'escalation', 'submit']
+    assert argv[:4] == expected_prefix, (
+        f'submit argv prefix drifted from {expected_prefix!r}: got {argv[:5]!r}. '
+        f'The preflight probe slices argv[:4] and appends --help; with `submit` '
+        f'no longer 4th the probe degrades into a top-level --help that exits 0 '
+        f'unconditionally, i.e. it would pass vacuously.'
+    )
+    # The option list is dropped so the probe stays side-effect-free (it parses
+    # `--help` and exits; it files nothing and touches no queue dir).
+    probe = [*argv[:4], '--help']
+
+    try:
+        result = subprocess.run(
+            probe,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=_child_env(),
+            timeout=_CHILD_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = (exc.output or b'').decode(errors='replace')
+        # Reported as a non-zero rc so the caller handles it on its single
+        # failure path; the text carries the distinction.  A wedged probe (a
+        # stuck queue lock, an interpreter waiting on stdin) must name itself,
+        # not hang the whole run.
+        return -1, (
+            f'probe timed out after {_CHILD_TIMEOUT_SECS}s and was killed; '
+            f'partial output: {partial!r}'
+        )
+    return result.returncode, result.stdout.decode(errors='replace')
+
+
+def _assert_submit_cli_invokable(python_exe: str) -> None:
+    """Fail loudly, and specifically, if *python_exe* cannot run the submit CLI.
+
+    The probe argv is taken from ``EscalationSpec.to_submit_argv``
+    (proc_supervision.py:117-133) — the very function the RP-4 wrapper's
+    on-failure branch uses — truncated to its interpreter/module prefix and
+    given ``--help``, with that prefix shape asserted in `_probe_submit_cli`
+    so the preflight cannot silently drift from the real invocation.
+
+    Raises ``AssertionError`` naming the interpreter and quoting the child's
+    output.  Without this preflight a non-invokable CLI surfaces only as
+    "exactly one L2 must be filed on failure, got 0" — a message that
+    misdirects the reader at production filing logic (task 3404).
+    """
+    rc, out = _probe_submit_cli(python_exe)
+    if rc != 0:
+        from orchestrator.proc_supervision import RP4_ESCALATION_SUBMIT_FAILED_RC
+
+        raise AssertionError(
+            f'the escalation submit CLI is not invokable by {python_exe!r} '
+            f'(exit {rc}): {out.strip()!r}. '
+            f'The RP-4 wrapper files its on-failure L2 by exec-ing '
+            f'{" ".join([python_exe, "-m", "escalation", "submit"])!r}, so this '
+            f'environment would file NOTHING. '
+            f'Remedy: this venv most likely lacks the `escalation` editable '
+            f'install — run `uv sync` at the repo root. '
+            f'In PRODUCTION, an interpreter that cannot run this makes a fired '
+            f'RP-4 transient unit exit {RP4_ESCALATION_SUBMIT_FAILED_RC} '
+            f'(RP4_ESCALATION_SUBMIT_FAILED_RC) with '
+            f'"RP-4: on-failure escalation submit failed rc=<N> '
+            f'(payload rc=<M>)" on stderr, instead of the payload\'s own exit '
+            f'code — that line and that code are the journald signature to '
+            f'grep for (task 3404).'
+        )
+
+
+async def _run_wrapper_payload(wrapped: str) -> tuple[int, str]:
+    """Execute a deferred RP-4 ``/bin/sh -c`` wrapper the way systemd would.
+
+    *wrapped* is the payload `systemd-run` was asked to defer — i.e. the
+    four-part `{payload}; __rc=$?; if [ "$__rc" -ne 0 ]; then {on_failure};
+    __esc=$?; if [ "$__esc" -ne 0 ]; then echo "RP-4: ..." >&2; exit 97; fi;
+    fi; exit "$__rc"` shell built by
+    ``RestartPlan``/``EscalationSpec.to_submit_argv``.  Running it for real is
+    what makes the wrapper-exec tests higher-fidelity than argv assertions.
+
+    Returns ``(returncode, combined_output)``.  The output half is returned
+    **specifically so assertion failures can quote it**: on the
+    submit-succeeded path the wrapper still exits the PAYLOAD's own code, so
+    the exit status alone never says which of the two commands produced it,
+    and the text the child printed is the only evidence.  The pre-3404 inline
+    pattern called ``await proc.communicate()`` and discarded that result,
+    leaving a failure to report itself as a bare "got 0" with the real
+    diagnosis unread.  (Pre-3404 the wrapper also swallowed a FAILED submit
+    entirely; it now exits ``RP4_ESCALATION_SUBMIT_FAILED_RC`` with an `RP-4:`
+    line on stderr, which this helper likewise surfaces.)
+
+    The child is given the repo's src roots on ``PYTHONPATH``.  WHY (measured,
+    task 3404): the wrapper's on-failure branch is
+    ``EscalationSpec.to_submit_argv(sys.executable)`` =>
+    ``[sys.executable, '-m', 'escalation', 'submit', ...]``, and that is a
+    FRESH interpreter — it inherits none of root conftest.py's in-process
+    ``sys.path`` injection, only site-packages plus cwd.  In a venv whose
+    site-packages lacks the `escalation` editable install (`.worktrees/3352`
+    had ONLY `_editable_impl_dark_factory_shared.pth`), the child resolves the
+    repo's `escalation/` directory as an implicit NAMESPACE package with no
+    `__main__`, exits non-zero, and files nothing — while the wrapper's
+    trailing `exit "$__rc"` still returns the payload script's own code.  So
+    the test saw rc==7 and zero escalations and blamed production filing logic.
+    Injecting the roots fixes it for real:
+    ``PYTHONPATH=<roots> <that stripped venv>/bin/python3 -m escalation submit
+    --help`` exits 0.  This supplements the venv, it does not replace it —
+    escalation's third-party deps still resolve from site-packages (a bare
+    /usr/bin/python3 + PYTHONPATH still fails), so a genuinely unsynced
+    environment still fails, just loudly and specifically.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        '/bin/sh', '-c', wrapped,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=_child_env(),
+    )
+    # Bounded: the wrapper's on-failure branch really invokes the submit CLI,
+    # which writes into a queue dir under an EscalationQueue lock.  A child that
+    # blocks — stuck lock, an interpreter waiting on stdin, a payload that never
+    # exits — would otherwise wedge the run with no diagnosis, the exact
+    # opposite of this harness's purpose.
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_CHILD_TIMEOUT_SECS)
+    except TimeoutError:
+        proc.kill()
+        try:
+            # Reap so the killed child cannot leak as a zombie / unawaited pipe.
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except TimeoutError:
+            out = b''
+        raise AssertionError(
+            f'the wrapper payload did not exit within {_CHILD_TIMEOUT_SECS}s and '
+            f'was killed. Payload: {wrapped!r}. Output captured before the kill: '
+            f'{out.decode(errors="replace")!r}'
+        ) from None
+    output = out.decode(errors='replace')
+    # `communicate()` has reaped the child, so returncode is always set — but it
+    # is typed `int | None`, so narrow it explicitly.  NOT `proc.returncode or
+    # 0`: that would silently report an unexited child as a clean exit 0, which
+    # is the exact value the success-path caller asserts on.  Same idiom as
+    # shared/tests/test_proc_group.py:524.
+    rc = proc.returncode
+    assert rc is not None, (
+        f'communicate() returned but the child has no exit status; output: {output!r}'
+    )
+    return rc, output
 
 
 # ---------------------------------------------------------------------------
@@ -2101,6 +2315,201 @@ class TestBeforeDoneTargetUnitlessDeploy:
 
 
 # ---------------------------------------------------------------------------
+# Task 4065 — DEPLOY-path parity pin for the default runner's INNER timeout.
+#
+# `_default_run_script`'s own per-subprocess `asyncio.wait_for` fires strictly
+# BEFORE the outer wall-clock guard (`timeout_secs + run_timeout_grace_secs`),
+# so on the production path (script_runner=None) the inner timeout is what the
+# deploy classifier actually sees.  Task 4065 changes how the PREDICATE path
+# classifies that event; the deploy path's handling must not move.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDefaultRunnerInnerTimeoutDeployParity:
+    """DeterministicRunner — the REAL default runner's inner timeout on the
+    deploy path stays classified exactly as it is today (task 4065).
+
+    Deliberate CHARACTERIZATION PIN, not a RED test: it is GREEN on arrival
+    and must stay green across task 4065's refactor.  Unlike the predicate
+    path — where a non-zero rc is a milestone VERDICT and the inner timeout
+    was therefore misclassified — the deploy classifiers have no verdict
+    semantics at all: every non-zero rc there already routes to
+    ``_file_infra_issue_and_block``.  So the legacy ``(1, '<script timed out
+    after Ns>')`` pair must still reach the deploy classifier byte-for-byte
+    after the fix, and this test is what proves the refactor did not disturb
+    it.
+
+    Drives the REAL ``_default_run_script`` (``script_runner=None``) — the
+    existing hung-seam coverage all injects a custom ``script_runner`` and so
+    only ever exercises the OUTER guard.
+
+    BOTH deploy branches are pinned — target_unit-less
+    (``_run_deploy_script_guarded``) and named-target (``_RunFnProcShim`` ->
+    ``RestartPlan.execute()``).  They share ONE
+    ``_invoke_run_fn_translating_timeout``, so a drift that pushed the
+    ``ScriptTimeout`` restore down into either call site would degrade only
+    the other one — a single-branch pin would not catch it.
+    """
+
+    async def test_targetless_deploy_default_runner_inner_timeout_files_infra_issue(
+        self, tmp_path: Path,
+    ):
+        """A real deploy script that overruns ``before_done['timeout_secs']``
+        under the default runner must file exactly one born-at-L2
+        ``infra_issue`` whose detail still carries the legacy ``rc=1`` +
+        ``<script timed out after 1s>`` pair.
+
+        ``timeout_secs=1`` against a 30s sleep leaves the outer guard at
+        ``1 + 30 = 31s``, so the INNER timeout provably wins (the 20s
+        tripwire below would fire first if it did not).
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'slow-deploy.sh'
+        script.write_text('#!/bin/sh\nsleep 30\n')
+        script.chmod(0o755)
+
+        task = _deploy_task(
+            task_id='4065',
+            target_unit=None,
+            script=str(script),
+            cwd=str(tmp_path),
+            timeout_secs=1,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=None,
+        )
+
+        # Hang tripwire: also proves the INNER timeout (1s) beat the outer
+        # guard (31s) rather than the other way round.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4065', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue', (
+            f'the deploy path classifies a timed-out script as an infra fault; '
+            f'task 4065 must not change that: {esc.category!r}'
+        )
+        assert 'rc=1' in esc.detail, (
+            f'the legacy rc=1 must still reach the deploy classifier: {esc.detail!r}'
+        )
+        assert '<script timed out after 1s>' in esc.detail, (
+            f'the legacy timed-out tail marker must still reach the deploy '
+            f'classifier verbatim: {esc.detail!r}'
+        )
+
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
+        unit_inspector.assert_not_awaited()
+
+    async def test_named_target_deploy_default_runner_inner_timeout_is_restart_failed(
+        self, tmp_path: Path,
+    ):
+        """Same parity pin for the OTHER deploy branch: a named ``target_unit``
+        routes the ``(rc, tail)`` pair through ``_RunFnProcShim`` into
+        ``RestartPlan.execute()``, which must classify it as
+        ``RESTART_FAILED`` -> the ``Deploy failed: <unit>`` infra_issue.
+
+        This is the half of ``_invoke_run_fn_translating_timeout``'s anti-drift
+        claim the target_unit-less case cannot cover.  Both deploy branches go
+        through that ONE shared wrapper; if the ``ScriptTimeout`` catch were
+        ever moved down into ``_run_deploy_script_guarded``, THIS branch would
+        silently degrade — ``ScriptTimeout`` would escape ``plan.execute()``
+        into ``run()``'s catch-all and be reported as 'Deploy run_fn raised an
+        unexpected error', i.e. the same category with materially worse
+        diagnostics.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'slow-named-deploy.sh'
+        script.write_text('#!/bin/sh\nsleep 30\n')
+        script.chmod(0o755)
+
+        target_unit = 'orchestrator-reify.service'
+        task = _deploy_task(
+            task_id='4065b',
+            target_unit=target_unit,
+            script=str(script),
+            cwd=str(tmp_path),
+            timeout_secs=1,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        # Baseline inspect only: the script "fails" (rc=1), so execute() skips
+        # the post-deploy verify re-inspect entirely.
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=None,
+        )
+
+        # Hang tripwire: also proves the INNER timeout (1s) beat the outer
+        # guard (31s) rather than the other way round.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4065b', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+        assert esc.summary == f'Deploy failed: {target_unit}', (
+            f'the restored (rc, tail) pair must reach RestartPlan.execute() and '
+            f'come back as RESTART_FAILED — NOT escape as a raw ScriptTimeout '
+            f"into run()'s catch-all ('Deploy run_fn failed (unexpected error): "
+            f"{target_unit}'): {esc.summary!r}"
+        )
+        assert 'rc=1' in esc.detail, (
+            f'the legacy rc=1 must still reach the named-target classifier: '
+            f'{esc.detail!r}'
+        )
+        assert '<script timed out after 1s>' in esc.detail, (
+            f'the legacy timed-out tail marker must survive the _RunFnProcShim '
+            f'round-trip verbatim: {esc.detail!r}'
+        )
+
+        assert unit_inspector.await_count == 1, (
+            f'baseline inspect only — a failed script skips the verify '
+            f're-inspect: {unit_inspector.await_count}'
+        )
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
+
+
+# ---------------------------------------------------------------------------
 # ζ D2 boundary: an illegal deploy-phase transition files a REAL born-at-L2
 # escalation before raising — never a silent write.
 # ---------------------------------------------------------------------------
@@ -3160,21 +3569,27 @@ class TestBeforeDoneSubprocessTimeoutHardening:
     curl, journalctl, sleep, the restarted daemon) that inherit the write end
     of the merged stdout pipe.  Killing only the direct child (pre-2090
     behavior) leaves the tree alive and the pipe open forever.
+
+    Task 4065 amendment: the timeout branch now RAISES ``ScriptTimeout``
+    instead of returning ``(1, '<script timed out after Ns>')`` — see that
+    class's docstring for why.  The Layer-A teardown below is unchanged and
+    must still happen BEFORE the raise, so the grandchild-is-dead assertion
+    stays exactly as it was.
     """
 
     async def test_timeout_kills_whole_process_group(self, tmp_path: Path):
         """On timeout, a backgrounded grandchild must be killed too, not just
-        the direct child.
+        the direct child — and the timeout must surface as ``ScriptTimeout``.
 
-        RED today: current code calls ``proc.kill()`` on the direct child only
-        (no ``start_new_session``, no process-group kill) — the orphaned
-        grandchild survives the timeout branch.
+        The raise carries the legacy ``rc``/``tail`` pair as structured data
+        so ``_invoke_run_fn_translating_timeout`` can hand the deploy
+        classifiers exactly what they saw before (task 4065).
         """
         import asyncio
         import os
         import time
 
-        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.deterministic_runner import DeterministicRunner, ScriptTimeout
 
         script = tmp_path / 'hang.sh'
         pidfile = tmp_path / 'grandchild.pid'
@@ -3199,12 +3614,19 @@ class TestBeforeDoneSubprocessTimeoutHardening:
 
         # Hang tripwire: if the fix regresses into a real hang, fail loudly
         # instead of stalling the suite.
-        rc, tail = await asyncio.wait_for(
-            runner._default_run_script(before_done), timeout=10,
-        )
+        with pytest.raises(ScriptTimeout) as excinfo:
+            await asyncio.wait_for(
+                runner._default_run_script(before_done), timeout=10,
+            )
 
-        assert rc == 1, f'expected rc=1 on timeout, got {rc}'
-        assert 'timed out' in tail, f'expected a timed-out marker in tail, got {tail!r}'
+        exc = excinfo.value
+        assert exc.timeout_secs == 1, (
+            f'ScriptTimeout must carry the budget it overran, got {exc.timeout_secs!r}'
+        )
+        assert exc.rc == 1, f'expected the legacy rc=1 on the exception, got {exc.rc}'
+        assert '<script timed out after 1s>' in exc.tail, (
+            f'expected the legacy timed-out marker on the exception, got {exc.tail!r}'
+        )
 
         grandchild_pid = int(pidfile.read_text().strip())
         deadline = time.monotonic() + 3.0
@@ -6617,7 +7039,6 @@ class TestDefaultScheduleDetachedRestart:
         it for real with a SUCCEEDING restart script.  No escalation must be
         filed (the bug was that registration itself filed one eagerly).
         """
-        import asyncio as _asyncio
         from unittest.mock import patch
 
         from orchestrator.deterministic_runner import DeterministicRunner
@@ -6635,7 +7056,6 @@ class TestDefaultScheduleDetachedRestart:
         }
 
         captured: dict = {}
-        real_exec = _asyncio.create_subprocess_exec
 
         async def fake_exec(*argv, **kwargs):
             captured['argv'] = argv
@@ -6657,15 +7077,14 @@ class TestDefaultScheduleDetachedRestart:
         wrapped = argv[-1]
 
         # Fire the wrapped payload as systemd would (real shell, real CLI path).
-        proc = await real_exec(
-            '/bin/sh', '-c', wrapped,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.STDOUT,
-        )
-        await proc.communicate()
-        assert proc.returncode == 0, 'success-script wrapper must exit 0'
+        wrapper_rc, out = await _run_wrapper_payload(wrapped)
+        assert wrapper_rc == 0, f'success-script wrapper must exit 0; wrapper output: {out!r}'
+        # Preflight: a CLI the interpreter cannot invoke would make the
+        # queue assertion below pass for the WRONG reason (nothing filed
+        # because nothing could run).  Name that failure instead.
+        _assert_submit_cli_invokable(sys.executable)
         assert queue.get_by_task('900') == [], (
-            'no escalation may be filed on the success path'
+            f'no escalation may be filed on the success path; wrapper output: {out!r}'
         )
 
     async def test_handler_executes_on_failure_path(self, tmp_path: Path):
@@ -6674,7 +7093,6 @@ class TestDefaultScheduleDetachedRestart:
         Confirms the failure branch still reaches δ's escalation-submit CLI and
         preserves the non-zero exit code.
         """
-        import asyncio as _asyncio
         from unittest.mock import patch
 
         from orchestrator.deterministic_runner import DeterministicRunner
@@ -6692,7 +7110,6 @@ class TestDefaultScheduleDetachedRestart:
         }
 
         captured: dict = {}
-        real_exec = _asyncio.create_subprocess_exec
 
         async def fake_exec(*argv, **kwargs):
             captured['argv'] = argv
@@ -6707,18 +7124,105 @@ class TestDefaultScheduleDetachedRestart:
             )
 
         wrapped = captured['argv'][-1]
-        proc = await real_exec(
-            '/bin/sh', '-c', wrapped,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.STDOUT,
+        wrapper_rc, out = await _run_wrapper_payload(wrapped)
+        assert wrapper_rc == 7, (
+            f'failure-script wrapper must preserve the exit code; '
+            f'wrapper output: {out!r}'
         )
-        await proc.communicate()
-        assert proc.returncode == 7, 'failure-script wrapper must preserve the exit code'
+
+        # Preflight: a non-invokable interpreter would make the assertions
+        # below report "got 0" while the real cause went unnamed.  Fail on the
+        # actual cause instead.  (Since 3404 such a wrapper exits the reserved
+        # RP4_ESCALATION_SUBMIT_FAILED_RC, so the `wrapper_rc == 7` assert
+        # above would now catch it too — but with a bare number, not a name.)
+        _assert_submit_cli_invokable(sys.executable)
 
         filed = queue.get_by_task('901')
-        assert len(filed) == 1, f'exactly one L2 must be filed on failure, got {len(filed)}'
-        assert filed[0].category == 'infra_issue'
-        assert filed[0].level == 2
+        assert len(filed) == 1, (
+            f'exactly one L2 must be filed on failure, got {len(filed)}; '
+            f'wrapper output: {out!r}'
+        )
+        assert filed[0].category == 'infra_issue', (
+            f'wrapper output: {out!r}'
+        )
+        assert filed[0].level == 2, f'wrapper output: {out!r}'
+
+    async def test_fired_wrapper_reports_a_failed_escalation_submit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A submit that DIES must be loud end-to-end, through the real caller.
+
+        The sibling pins in test_proc_supervision.py exercise ``RestartPlan``
+        directly; this one drives ``_default_schedule_detached_restart``, so the
+        DELEGATION seam is covered too — if deterministic_runner ever stops
+        delegating to RestartPlan and reintroduces a wrapper of its own, this
+        catches it and those cannot.
+
+        ``sys.executable`` is patched to a stub exiting 9 before the wrapper is
+        built, so the on-failure ``to_submit_argv(sys.executable)`` branch
+        genuinely fails when the wrapper is later fired for real.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.proc_supervision import RP4_ESCALATION_SUBMIT_FAILED_RC
+
+        queue = EscalationQueue(tmp_path / 'q')
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        fail_script = tmp_path / 'deploy-fail.sh'
+        fail_script.write_text('#!/bin/sh\nexit 7\n')
+        fail_script.chmod(0o755)
+        before_done = {
+            'script': str(fail_script),
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        # A stub interpreter that ignores argv and dies — stands in for a
+        # service that is down, a bad argv, or an interpreter that cannot
+        # import `escalation`.  Patched BEFORE the call, because the wrapper
+        # string is built (and reads sys.executable) at scheduling time.
+        stub_python = tmp_path / 'stub-python'
+        stub_python.write_text('#!/bin/sh\nexit 9\n')
+        stub_python.chmod(0o755)
+        monkeypatch.setattr(sys, 'executable', str(stub_python))
+
+        captured: dict = {}
+
+        async def fake_exec(*argv, **kwargs):
+            captured['argv'] = argv
+            return self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-902.service',
+                on_active_secs=1,
+                task_id='902',
+            )
+
+        wrapped = captured['argv'][-1]
+        wrapper_rc, out = await _run_wrapper_payload(wrapped)
+
+        assert wrapper_rc == RP4_ESCALATION_SUBMIT_FAILED_RC, (
+            f'a failed on-failure submit must exit the reserved '
+            f"{RP4_ESCALATION_SUBMIT_FAILED_RC}, not the payload's own code; "
+            f'got {wrapper_rc}. Wrapper output: {out!r}'
+        )
+        assert 'RP-4' in out, (
+            f'missing the RP-4 diagnostic marker; wrapper output: {out!r}'
+        )
+        assert 'rc=9' in out, (
+            f"missing the failed submit's own rc; wrapper output: {out!r}"
+        )
+        assert 'payload rc=7' in out, (
+            f"missing the payload's rc; wrapper output: {out!r}"
+        )
+        assert queue.get_by_task('902') == [], (
+            f'the submit died, so nothing can have been filed — the point is '
+            f'that this is now VISIBLE; wrapper output: {out!r}'
+        )
 
     async def test_argv_contains_escalation_submit_cli(self, tmp_path: Path):
         """escalation submit CLI must appear in the spawn argv for OnFailure handling."""
@@ -6854,6 +7358,107 @@ class TestDefaultScheduleDetachedRestart:
         assert 'orch-redeploy-restart-900.service' in all_argv, (
             f'transient unit name must appear in --detail context: {all_argv!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3404: the wrapper-payload exec harness.
+#
+# `TestDefaultScheduleDetachedRestart`'s two higher-fidelity tests capture the
+# deferred `/bin/sh -c` wrapper and then execute it for REAL.  That exec left
+# the in-process world: the child interpreter inherits none of conftest.py's
+# sys.path surgery, and the child's output was discarded outright.  These tests
+# pin the harness that fixes both — it must return the child's exit code AND
+# its combined output, and it must hand the child the repo's src roots.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestWrapperPayloadHarness:
+    """The shared `_run_wrapper_payload` harness used by the wrapper-exec tests."""
+
+    async def test_run_wrapper_payload_returns_rc_and_captured_output(self):
+        """The harness must surface the child's rc AND its combined output.
+
+        The pre-3404 inline pattern threw `await proc.communicate()`'s result
+        away, so a wrapper whose on-failure branch died printed its own precise
+        diagnosis into a pipe nobody read.  Both halves are returned now.
+        """
+        rc, out = await _run_wrapper_payload(
+            "printf 'MARKER-3404\\n' >&2; exit 7"
+        )
+        assert rc == 7, f'harness must return the child exit code, got {rc!r} (output: {out!r})'
+        assert 'MARKER-3404' in out, (
+            f'harness must return the child combined stdout/stderr, got {out!r}'
+        )
+
+    async def test_run_wrapper_payload_injects_repo_src_roots_into_child_pythonpath(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The child must get the same import roots conftest.py grants in-process.
+
+        The wrapper's on-failure branch is `sys.executable -m escalation
+        submit` — a FRESH interpreter that inherits none of root conftest.py's
+        sys.path surgery, only site-packages plus cwd.  In a venv whose
+        site-packages lacks the `escalation` editable install that branch
+        cannot import the package at all, so the harness hands the child the
+        three repo src roots explicitly.
+        """
+        repo_root = Path(__file__).parent.parent.parent
+        roots = [
+            str(repo_root / 'escalation' / 'src'),
+            str(repo_root / 'shared' / 'src'),
+            str(repo_root / 'orchestrator' / 'src'),
+        ]
+        payload = 'printf \'%s\' "$PYTHONPATH"'
+
+        # Clear any ambient value so this is a real RED, not a coincidence.
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        rc, out = await _run_wrapper_payload(payload)
+        assert rc == 0, f'probe payload must exit 0, got {rc!r} (output: {out!r})'
+        for root in roots:
+            assert root in out, (
+                f'child PYTHONPATH must carry the repo src root {root!r}; got {out!r}'
+            )
+
+        # An inherited PYTHONPATH must be preserved, never clobbered.
+        monkeypatch.setenv('PYTHONPATH', '/tmp/df-3404-sentinel')
+        rc, out = await _run_wrapper_payload(payload)
+        assert rc == 0, f'probe payload must exit 0, got {rc!r} (output: {out!r})'
+        assert '/tmp/df-3404-sentinel' in out, (
+            f'an inherited PYTHONPATH must be preserved, not dropped; got {out!r}'
+        )
+        for root in roots:
+            assert root in out, (
+                f'injected root {root!r} must survive alongside an inherited '
+                f'PYTHONPATH; got {out!r}'
+            )
+
+    async def test_assert_submit_cli_invokable_rejects_a_broken_interpreter(
+        self, tmp_path: Path,
+    ):
+        """The preflight must actually fail for an interpreter that cannot run the CLI.
+
+        This pins only that the helper is not a no-op: an interpreter which
+        cannot run `-m escalation submit` must raise, so a broken environment
+        stops at the preflight instead of degrading into "exactly one L2 must
+        be filed on failure, got 0" (task 3404).  The *wording* of the raised
+        message is deliberately NOT asserted — it is test scaffolding, not
+        production behaviour, and the real journald signature is covered
+        against the real wrapper by
+        `test_fired_wrapper_reports_a_failed_escalation_submit` (above) and
+        test_proc_supervision.py::test_wrapper_surfaces_failed_on_failure_submit.
+        """
+        stub = tmp_path / 'broken-python'
+        stub.write_text(
+            "#!/bin/sh\nprintf 'NO-ESCALATION-MODULE-3404\\n' >&2\nexit 1\n"
+        )
+        stub.chmod(0o755)
+
+        with pytest.raises(AssertionError):
+            _assert_submit_cli_invokable(str(stub))
+
+    async def test_assert_submit_cli_invokable_passes_for_the_real_interpreter(self):
+        """The interpreter running this suite must be able to reach the CLI."""
+        _assert_submit_cli_invokable(sys.executable)
 
 
 # ---------------------------------------------------------------------------
@@ -8782,6 +9387,172 @@ class TestPredicateModeTimeout:
         assert esc.category == 'infra_issue'
 
         scheduler.set_task_status.assert_awaited_once_with('703', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Task 4065 — RED: the REAL default runner's INNER per-script timeout on the
+# predicate path.
+#
+# The classes above all inject a hanging/erroring `script_runner`, so they
+# only ever exercise the OUTER wall-clock guard.  On the production path
+# (script_runner=None) `_default_run_script`'s OWN per-subprocess timeout
+# fires strictly first — it used to return an ordinary (1, tail), landing in
+# the `rc != 0` milestone-VERDICT branch and stamping gate_escalated_at for
+# what is actually an infra fault with no verdict at all.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPredicateDefaultRunnerInnerTimeout:
+    """DeterministicRunner — a predicate script that overruns its own
+    ``timeout_secs`` under the REAL default runner is an INFRA fault, never a
+    milestone verdict (task 4065).
+
+    The harm being pinned: ``milestone_check_failed`` additionally stamps
+    ``gate_escalated_at``, which latches the task into section-1's
+    resolve-to-done path — so a human resolving the escalation drives a task
+    to done whose invariant was never actually evaluated.  ``infra_issue``
+    leaves the stamp unset and the read-only check is simply re-attempted.
+    """
+
+    async def test_default_runner_inner_timeout_files_infra_issue_not_milestone_check_failed(
+        self, tmp_path: Path,
+    ):
+        """A real predicate script that overruns ``before_done['timeout_secs']``
+        must file ``infra_issue`` (no ``gate_escalated_at`` stamp), with a
+        message naming the INNER per-script timeout.
+
+        ``timeout_secs=1`` against a 30s sleep leaves the outer guard at the
+        default ``1 + 30 = 31s``, so the INNER timeout provably wins.
+
+        RED today: the inner timeout returns ``(1, tail)``, so this lands in
+        the ``rc != 0`` VERDICT branch -> ``milestone_check_failed`` +
+        ``gate_escalated_at``.
+        """
+        import asyncio
+        import time
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'slow-predicate.sh'
+        script.write_text('#!/bin/sh\nsleep 30\n')
+        script.chmod(0o755)
+
+        task = _predicate_task(
+            task_id='704',
+            script=str(script),
+            cwd=str(tmp_path),
+            timeout_secs=1,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        # run_timeout_grace_secs left at its default so the outer guard
+        # (1 + 30 = 31s) provably CANNOT be what fires.
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=None,
+        )
+
+        started = time.monotonic()
+        # Hang tripwire: fail loudly instead of stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 15, (
+            f'the INNER 1s timeout must be what fires, not the 31s outer '
+            f'guard — run took {elapsed:.1f}s'
+        )
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('704', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue', (
+            f'a timed-out script produced NO exit code, so there is no verdict '
+            f'— must not be milestone_check_failed: {esc.category!r}'
+        )
+
+        # The message must identify WHICH guard fired: all three predicate
+        # infra_issue arms share one category, so the text is the only
+        # discriminator a human gets.  Each arm has a unique, STABLE summary,
+        # so pin that exactly rather than sniffing the detail — detail
+        # substrings do not actually discriminate (the outer-guard detail also
+        # cites before_done['timeout_secs'], and its '31s' contains '1s'), and
+        # negative substring pins would fail on a purely additive wording
+        # improvement.
+        assert esc.summary == 'Predicate check script timed out (no verdict produced)', (
+            f'must be the INNER per-script timeout arm — not the outer-guard '
+            f"arm ('Predicate check timed out (subprocess hung)') nor the "
+            f"generic arm ('Predicate check run_fn failed (unexpected "
+            f"error)'): {esc.summary!r}"
+        )
+
+        scheduler.update_task.assert_not_awaited()  # no gate_escalated_at stamp
+        scheduler.set_task_status.assert_awaited_once_with('704', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+    async def test_custom_script_runner_nonzero_rc_is_still_a_verdict(self, tmp_path: Path):
+        """PIN: an INJECTED ``script_runner`` returning the literal legacy
+        ``(1, '<script timed out after 1s>')`` tuple must STILL file
+        ``milestone_check_failed`` and stamp ``gate_escalated_at``.
+
+        Green before and after task 4065.  It forbids implementing the fix by
+        substring-sniffing ``'timed out'`` out of the tail — which would
+        silently reclassify any predicate script that merely PRINTS that
+        phrase from an honest verdict into a re-attempted infra fault.
+        Classification must key on the exception TYPE, and only the default
+        runner raises it.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='705', timeout_secs=1)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        script_runner = AsyncMock(return_value=(1, '<script timed out after 1s>'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('705', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed', (
+            f'an injected runner keeps the plain (rc, tail) contract — a '
+            f'non-zero rc is a VERDICT no matter what the tail says: '
+            f'{esc.category!r}'
+        )
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('gate_escalated_at')
+        ]
+        assert stamp_calls, (
+            'a verdict must still stamp gate_escalated_at (resolve-to-done path)'
+        )
+        scheduler.set_task_status.assert_awaited_once_with('705', 'blocked')
         unit_inspector.assert_not_awaited()
 
 

@@ -13,6 +13,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from shared.timestamps import parse_timestamp_or_warn
 
@@ -1399,3 +1400,98 @@ class EscalationQueue:
             nxt = current + 1
             self._write_seq_counter(counter_path, nxt)
             return f'esc-{task_id}-{nxt}'
+
+
+def observed_submit_response(
+    queue: EscalationQueue,
+    esc_id: str,
+    *,
+    fallback_level: int | None = None,
+) -> dict[str, Any]:
+    """Shape a post-write response from OBSERVED state, never from write intent.
+
+    Task 3236.  The submit paths used to return a hardcoded
+    ``{'id': ..., 'status': 'queued'}`` with no re-read, so a filing that a
+    concurrent resolver/sweep had already dismissed in the same instant was
+    still reported to its filer as 'queued'.  The filer then had no way to
+    learn its escalation had been swallowed.
+
+    Re-reads the persisted record and returns:
+    - still pending → ``{'id', 'status': 'queued', 'level'}`` (as before, plus
+      the persisted level so a caller that asked for ``level=1`` can confirm
+      it landed);
+    - anything else → the auto-resolved shape ``escalate_blocker``'s docstring
+      already promises, ``{'id', 'status', 'resolution', 'resolved_by',
+      'level'}``, carrying the record's REAL values.  No new status vocabulary
+      is invented, so no consumer needs updating.
+
+    FAIL-OPEN by construction: a re-read that returns ``None`` or raises falls
+    back to the historical ``'queued'`` response and logs a WARNING rather than
+    raising.  A filing must never be lost to a bookkeeping read — that is the
+    very failure mode being fixed here.
+
+    ``fallback_level`` is the level the CALLER wrote (i.e. ``esc.level``).  It
+    is echoed on the two fail-open branches so ``level`` is present on EVERY
+    response this function can return: the ``level`` echo is documented as the
+    way a caller confirms its requested level landed, and a caller written to
+    that contract must not hit a ``KeyError`` in exactly the degraded case the
+    fail-open exists to survive.  It is a fallback, never an override — when
+    the re-read succeeds, the PERSISTED level is reported even if it differs
+    from what the caller asked for (born-at-L2 severity legitimately overrides
+    a requested level=1).
+
+    Lives in ``queue`` rather than ``dedupe`` because it re-reads a persisted
+    record and shapes a response — it has nothing to do with fold logic, and
+    ``server._submit_or_dedupe``'s born-at-L2 branch needs it precisely because
+    that branch does NOT route through dedupe.
+
+    COST NOTE: this adds one ``queue.get()`` per successful submit.  For a
+    just-written record that is a cheap queue-root hit, but ``get()`` falls
+    through to ``_locate_path``'s archive listing when the record is absent
+    from the root — i.e. an O(archive) scan is possible on the submit path in
+    exactly the resolve+archive race this targets.  Acceptable at current
+    volumes; if it ever shows up in a storm profile (e.g. a 30-task infra
+    fan-out), read ``queue_dir/{id}.json`` directly and treat an absent record
+    as the fail-open 'queued' case — that is already this function's documented
+    behaviour for an unreadable record, though it would forfeit the honest
+    observed-state report for a record archived between submit and re-read.
+    """
+    try:
+        persisted = queue.get(esc_id)
+    except Exception as exc:
+        logger.warning(
+            'Post-submit re-read of %s failed (%s); reporting queued (fail-open)',
+            esc_id, exc,
+        )
+        return _fail_open_queued(esc_id, fallback_level)
+    if persisted is None:
+        logger.warning(
+            'Post-submit re-read of %s returned nothing; reporting queued (fail-open)',
+            esc_id,
+        )
+        return _fail_open_queued(esc_id, fallback_level)
+    if persisted.status == 'pending':
+        return {'id': esc_id, 'status': 'queued', 'level': persisted.level}
+    logger.warning(
+        'Escalation %s was already %s at filing time (resolved_by=%r); '
+        'reporting observed state instead of queued',
+        esc_id, persisted.status, persisted.resolved_by,
+    )
+    return {
+        'id': esc_id,
+        'status': persisted.status,
+        'resolution': persisted.resolution,
+        'resolved_by': persisted.resolved_by,
+        'level': persisted.level,
+    }
+
+
+def _fail_open_queued(esc_id: str, fallback_level: int | None) -> dict[str, Any]:
+    """The fail-open 'queued' response, carrying *fallback_level* when known.
+
+    ``level`` is omitted only when the caller supplied no fallback — legacy
+    callers that predate the echo contract — so the key is never fabricated.
+    """
+    if fallback_level is None:
+        return {'id': esc_id, 'status': 'queued'}
+    return {'id': esc_id, 'status': 'queued', 'level': fallback_level}

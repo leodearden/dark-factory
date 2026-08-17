@@ -17,6 +17,14 @@ Design contracts (see plan.json design_decisions for rationale):
   This keeps the function pure/testable and avoids action-at-a-distance.
 - Cross-task: get_pending() scans all tasks, so infra fan-out (same
   summary from 30 task_ids simultaneously) collapses into a single parent.
+- Cross-LEVEL folding never happens (task 3236): find_dedupe_parent
+  requires parent.level == candidate.level.  The ladder levels have
+  different consumers by contract (L0 → steward, L1 →
+  escalation-watcher-auto, L2 → human), so folding across them would
+  hand the record to the wrong consumer.  Note this is orthogonal to the
+  born-at-L2 dedupe bypass in server._submit_or_dedupe, which is keyed on
+  SEVERITY: a level-1 filing carries severity='blocking' and therefore
+  does route through this matcher.
 """
 
 from __future__ import annotations
@@ -31,6 +39,7 @@ __all__ = [
 ]
 
 import hashlib
+import logging
 import math
 import re
 from collections.abc import Callable
@@ -40,6 +49,11 @@ from typing import TYPE_CHECKING, Any
 
 from shared.timestamps import parse_timestamp_or_warn
 
+# observed_submit_response lives next to the record it re-reads (queue), not
+# here — this module owns fold logic only.  Re-exported by neither module's
+# ``__all__``; server imports it from ``escalation.queue`` directly.
+from escalation.queue import observed_submit_response
+
 if TYPE_CHECKING:
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
@@ -48,6 +62,8 @@ if TYPE_CHECKING:
 # to a hashable value used for matching.  None return (e.g. unset fingerprint)
 # is treated as "never fold" by the empty-key guard in find_dedupe_parent.
 KeyFn = Callable[['Escalation'], Any]
+
+logger = logging.getLogger(__name__)
 
 _NON_WORD_PATTERN = re.compile(r'[^\w\s]', flags=re.UNICODE)  # strips punctuation, symbols, control; keeps word chars and whitespace
 _WHITESPACE_PATTERN = re.compile(r'\s+')  # collapse runs of whitespace
@@ -239,6 +255,10 @@ def find_dedupe_parent(
     A parent matches when ALL of the following hold:
     - ``parent.status == 'pending'`` (get_pending() already ensures this).
     - ``parent.category == candidate.category``.
+    - ``parent.level == candidate.level`` — dedupe never folds across ladder
+      levels, because the levels have different consumers by contract (L0 →
+      steward, L1 → escalation-watcher-auto, L2 → human), so folding an L1
+      into an L0 parent would hand the record to the wrong consumer.
     - ``key_fn(parent) == key_fn(candidate)`` where key_fn is resolved from
       ``config.key_fn`` (None → ``_default_summary_key`` wrapping
       ``summary_dedupe_key``).
@@ -284,6 +304,16 @@ def find_dedupe_parent(
         # Category filter — caller already verified candidate_category is in
         # infra_dedupe_categories, so checking equality is sufficient.
         if parent.category != candidate_category:
+            continue
+        # Level filter (task 3236) — dedupe NEVER folds across ladder levels.
+        # Placed alongside the category filter so it short-circuits before the
+        # key computation and the timestamp parse.  The levels have different
+        # consumers by contract (models.py module header: L0 → steward,
+        # L1 → escalation-watcher-auto, L2 → human), so folding an L1 into an
+        # L0 parent hands the record to the wrong consumer.  Concretely: a
+        # steward re-escalating an infra_issue at level=1 would otherwise fold
+        # straight back into the pending level-0 record it was handling.
+        if parent.level != candidate.level:
             continue
         # Key filter using the resolved key function.
         if _key_fn(parent) != candidate_key:
@@ -331,10 +361,24 @@ def submit_or_dedupe(
       was resolved between the find scan and the attach call; in that case
       fall through to ``queue.submit()`` so the escalation is never dropped.
 
-    Response shapes (identical to server._submit_or_dedupe):
-    - Queued:        ``{'id': esc_id, 'status': 'queued'}``
+    Response shapes (identical to server._submit_or_dedupe).  ``level`` is on
+    EVERY branch, so the documented "echo confirms the level landed" contract
+    holds no matter which one a caller lands on:
+    - Queued:        ``{'id': esc_id, 'status': 'queued', 'level': <persisted>}``
+    - Auto-resolved/dismissed (the record was NOT pending after the write —
+      e.g. a concurrent sweep won the race): ``{'id', 'status', 'resolution',
+      'resolved_by', 'level'}``.  See ``queue.observed_submit_response``: the
+      response reports observed post-write state, never write intent, and
+      fails open to ``'queued'`` (still carrying ``level``) if the re-read is
+      unavailable.
     - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
-                        'parent_id': parent_id, 'child_id': esc.id}``
+                        'parent_id': parent_id, 'child_id': esc.id,
+                        'level': esc.level}``
+      (the id/parent/child keys are deliberately unchanged — they are already
+      explicit that the filing folded into another record; ``level`` is
+      additive.  It is the CHILD's level, which since task 3236 equals the
+      parent's: ``find_dedupe_parent`` requires ``parent.level ==
+      candidate.level``, so no extra read is needed to report it.)
 
     Recon (A7b) calls this directly with ``DedupeConfig.for_recon()`` instead
     of ``queue.submit()``, routing through the same gate + TOCTOU logic used
@@ -344,6 +388,8 @@ def submit_or_dedupe(
     """
     # Gate 1 (enabled) and Gate 2 (category membership) both short-circuit
     # in pure memory before any disk I/O via find_dedupe_parent.
+    # NOTE: the post-write response is shaped by observed_submit_response, not
+    # by a hardcoded 'queued' — see that function's docstring.
     if config.infra_dedupe_enabled and esc.category in config.infra_dedupe_categories:
         parent_id = find_dedupe_parent(queue, esc, config, now=now)
         # TOCTOU guard: attach_dedupe_child returns None when the parent was
@@ -355,6 +401,11 @@ def submit_or_dedupe(
                 'status': 'dedup_skipped',
                 'parent_id': parent_id,
                 'child_id': esc.id,
+                # Level-scoped folding (task 3236) means the parent's level is
+                # the child's, so echoing esc.level costs no extra read and
+                # keeps the 'level' key present on every response branch.
+                'level': esc.level,
             }
     esc_id = queue.submit(esc)
-    return {'id': esc_id, 'status': 'queued'}
+    return observed_submit_response(queue, esc_id, fallback_level=esc.level)
+

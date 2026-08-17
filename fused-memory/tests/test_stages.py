@@ -11760,6 +11760,161 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
         )
 
 
+class TestRenderLiveWorkflowSectionPendingPureGate:
+    """_render_live_workflow_section drops the bare project-wide orchestrator
+    signal for a PENDING deterministic PURE GATE (task 3751 step-9/10).
+
+    The observed Stage-2 symptom: dark_factory task 3845 — a pending
+    ``always_escalates`` deterministic gate with NO ``before_done`` — was listed
+    under Live-Workflow Signals with ONLY the bare ``orchestrator`` signal for 3+
+    consecutive reconciliation cycles (runs 0e98f0ac, f112de8), which blocked its
+    disposition. Such a task never acquires a worktree or branch, and its entire
+    DeterministicRunner run is "file escalation, stamp gate_escalated_at, set
+    blocked" — no script, no systemd, no git_ops — so the project-wide lock is
+    never task-specific evidence for it.
+
+    Direct-call harness copied from TestRenderLiveWorkflowSectionCorroborationGate;
+    only the git side_effect (no worktree / no commit) and the task metadata differ.
+    The corroboration gate (task 2963) is inert here because it is in-progress-only.
+
+    RED until step-10 computes and passes ``pure_gate`` — only case (a) fails
+    today; (b)-(d) are the narrowing controls and pin the keep-listed behavior.
+    """
+
+    _NOW = datetime(2026, 8, 8, 12, 0, 0, tzinfo=UTC)
+    _TASK_ID = 3845
+    _BRANCH = 'task/3845'
+
+    # dark_factory task 3845's real metadata, verified first-hand. The
+    # `operational_mode`/`execution_class` labels are incidental — the
+    # classification keys on (always_escalates, before_done), the pair
+    # DeterministicRunner itself branches on.
+    _PURE_GATE_METADATA = {
+        'task_kind': 'deterministic',
+        'execution_class': 'operational',
+        'operational_mode': 'gate',
+        'always_escalates': True,
+    }
+
+    def _git_side_effect(self, *, worktree_for_branch: str | None = None):
+        """Drive worktree_registered=False, recent_commit=False, and an UNKNOWN
+        (not zero) own-commit count.
+
+        A failing ``rev-list`` yields an unknown count, so ``branch_bare`` is
+        False and task 2767's rule 4 cannot mask the result — the ONLY signal
+        left is the project-wide orchestrator lock, which is exactly what rule 5
+        must drop. Pass *worktree_for_branch* to additionally register a live
+        worktree for that branch.
+        """
+        import subprocess  # noqa: PLC0415 — module-local per this file's convention
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                stdout = 'worktree /project\nHEAD abc1234\nbranch refs/heads/main\n\n'
+                if worktree_for_branch is not None:
+                    stdout += (
+                        f'worktree /project-{self._TASK_ID}\nHEAD def5678\n'
+                        f'branch refs/heads/{worktree_for_branch}\n\n'
+                    )
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=stdout, stderr='',
+                )
+            # rev-list AND git log both fail: unknown commit count (=> not
+            # bare) and no tip timestamp (=> recent_commit False).
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout='', stderr='fatal: bad revision',
+            )
+
+        return side_effect
+
+    def _render(self, tmp_path, task, monkeypatch, *, worktree_for_branch=None):
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        with patch(
+            'subprocess.run',
+            side_effect=self._git_side_effect(worktree_for_branch=worktree_for_branch),
+        ):
+            return _render_live_workflow_section(
+                [task], ProjectRoot(str(tmp_path)), now=self._NOW
+            )
+
+    # ----- cases -----
+
+    def test_pending_pure_gate_is_dropped(self, tmp_path, monkeypatch):
+        """(a) THE SYMPTOM — task 3845's exact shape is dropped entirely."""
+        task = {
+            'id': self._TASK_ID,
+            'status': 'pending',
+            'metadata': dict(self._PURE_GATE_METADATA),
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert self._BRANCH not in result, (
+            f"Expected {self._BRANCH} DROPPED (pending deterministic pure gate, "
+            f"orchestrator-only signal); got:\n{result!r}"
+        )
+        assert result == '', (
+            f"Expected an EMPTY section (the only task was dropped); got:\n{result!r}"
+        )
+
+    def test_pending_before_done_deterministic_is_still_listed(self, tmp_path, monkeypatch):
+        """(b) NARROWING — a pending deterministic task WITH before_done may be
+        mid-deploy inside DeterministicRunner, so its signal is kept."""
+        task = {
+            'id': self._TASK_ID,
+            'status': 'pending',
+            'metadata': {
+                **self._PURE_GATE_METADATA,
+                'before_done': {'kind': 'predicate'},
+            },
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert f'- {self._BRANCH}: orchestrator' in result, (
+            f"Expected {self._BRANCH} STILL listed with the orchestrator signal "
+            f"(before_done disqualifies the pure-gate shape); got:\n{result!r}"
+        )
+
+    def test_pending_normal_task_is_still_listed(self, tmp_path, monkeypatch):
+        """(c) Ordinary pending tasks are completely unaffected."""
+        task = {
+            'id': self._TASK_ID,
+            'status': 'pending',
+            'metadata': {'task_kind': 'normal'},
+        }
+
+        result = self._render(tmp_path, task, monkeypatch)
+
+        assert f'- {self._BRANCH}: orchestrator' in result, (
+            f"Expected pending NORMAL task {self._BRANCH} STILL listed — rule 5 is "
+            f"deterministic-only; got:\n{result!r}"
+        )
+
+    def test_pure_gate_with_registered_worktree_is_still_listed(self, tmp_path, monkeypatch):
+        """(d) Per-task evidence wins — only the bare project-wide orchestrator
+        signal is suppressed, never a real worktree."""
+        task = {
+            'id': self._TASK_ID,
+            'status': 'pending',
+            'metadata': dict(self._PURE_GATE_METADATA),
+        }
+
+        result = self._render(
+            tmp_path, task, monkeypatch, worktree_for_branch=self._BRANCH
+        )
+
+        assert f'- {self._BRANCH}: worktree' in result, (
+            f"Expected {self._BRANCH} listed via its REGISTERED WORKTREE (and "
+            f"WITHOUT the suppressed orchestrator signal); got:\n{result!r}"
+        )
+
+
 class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
     """TaskKnowledgeSync._maybe_queue_briefing_refresh_tasks retains its
     taskmaster-None no-op (task 2150 step-3/4): the falsy-``project_root``
@@ -12861,6 +13016,125 @@ class TestTaskKnowledgeSyncDeterministicCycleSummaryWrite:
             'deterministically now.'
         )
         assert '### Per-Cycle Summary Nonce' not in prompt
+
+    # -- task 3732: the extracted write_stage2_cycle_summary wrapper --------
+    #
+    # Stage 2's write was inlined at a single call site inside run(). The
+    # harness-level backstop (task 3732) is a SECOND call site, so the five
+    # bound Stage-2 values are factored into one wrapper — exactly what
+    # write_stage1_cycle_summary does for Stage 1 (task 2440), and for the
+    # same reason: a future change to any of them can never silently diverge
+    # between the two call sites.
+
+    @pytest.mark.asyncio
+    async def test_write_stage2_cycle_summary_lands_a_real_ledger_row(
+        self, mock_deps, ledger_store,
+    ):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        run_id = 'run-3732-wrapper-row'
+        report = self._base_report(run_id)
+        report.llm_calls = 7
+        report.tokens_used = 777
+
+        written = await write_stage2_cycle_summary(
+            mock_deps['memory_service'], 'reify', report, run_id,
+        )
+
+        assert written is True
+        record = await ledger_store.get_by_identity(
+            'reify', 'cycle_summary', task_id='',
+            flag_type='task_knowledge_sync', run_id=run_id,
+        )
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        assert payload['stage'] == 'task_knowledge_sync'
+        assert payload['llm_calls'] == 7
+        assert payload['tokens_used'] == 777
+
+    @pytest.mark.asyncio
+    async def test_write_stage2_cycle_summary_binds_the_stage2_constants(
+        self, mock_deps,
+    ):
+        """Pins the binding the wrapper exists to centralise."""
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _STAGE2_CYCLE_SUMMARY_RECON_POOL,
+            _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+            STAGE2_CYCLE_SUMMARY_POOL_CAP,
+            write_stage2_cycle_summary,
+        )
+
+        run_id = 'run-3732-wrapper-binding'
+        report = self._base_report(run_id)
+
+        with patch.object(
+            tks, 'write_cycle_summary', new=AsyncMock(return_value=True),
+        ) as mock_write:
+            await write_stage2_cycle_summary(
+                mock_deps['memory_service'], 'reify', report, run_id,
+            )
+
+        mock_write.assert_awaited_once()
+        assert mock_write.await_args is not None
+        kwargs = mock_write.await_args.kwargs
+        assert kwargs['stage'] == 'task_knowledge_sync'
+        assert kwargs['recon_pool'] == _STAGE2_CYCLE_SUMMARY_RECON_POOL
+        assert kwargs['trim_source'] == _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE
+        assert kwargs['cap'] == STAGE2_CYCLE_SUMMARY_POOL_CAP
+        # Defaults to a full cycle unless the caller says otherwise.
+        assert kwargs['remediation'] is False
+
+    @pytest.mark.asyncio
+    async def test_write_stage2_cycle_summary_forwards_remediation(
+        self, mock_deps, ledger_store,
+    ):
+        """`remediation` is the one keyword Stage 1's wrapper does not need —
+        Stage 2's write is unconditional and fires on remediation passes too
+        (task_knowledge_sync.py's "Do not 'fix' this to mirror Stage 1's
+        full-cycle-only gating" note), and get_cycle_summary_presence reads
+        payload['remediation'] to disambiguate expected-missing rows."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        run_id = 'run-3732-wrapper-remediation'
+        report = self._base_report(run_id)
+
+        await write_stage2_cycle_summary(
+            mock_deps['memory_service'], 'reify', report, run_id, remediation=True,
+        )
+
+        record = await ledger_store.get_by_identity(
+            'reify', 'cycle_summary', task_id='',
+            flag_type='task_knowledge_sync', run_id=run_id,
+        )
+        assert record is not None
+        assert json.loads(record.payload_json)['remediation'] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('returned', [True, False])
+    async def test_write_stage2_cycle_summary_returns_verbatim(
+        self, mock_deps, returned,
+    ):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        report = self._base_report('run-3732-wrapper-return')
+
+        with patch.object(
+            tks, 'write_cycle_summary', new=AsyncMock(return_value=returned),
+        ):
+            result = await write_stage2_cycle_summary(
+                mock_deps['memory_service'], 'reify', report,
+                'run-3732-wrapper-return',
+            )
+
+        assert result is returned
 
 
 # ---------------------------------------------------------------------------

@@ -206,3 +206,48 @@ class TestFetchTaskRuntime:
             result = await fetch_task_runtime(client, _urls(8100, 8102, 8105))
 
         assert set(result) == {'proj8100', 'proj8102', 'proj8105'}
+
+
+class TestProbeOneTimeoutBudget:
+    """The probe's budget must reach client.post, not just the wait_for.
+
+    Twin of ``test_merge_halt.TestProbeOneTimeoutBudget`` — this module
+    clones merge_halt's fan-out pattern, so it clones its bound too. The
+    per-request budget matters because ``client.post(timeout=...)`` also
+    governs **pool acquisition** on the shared client; wait_for alone left
+    each post able to wait httpx's 10s default for a connection slot.
+
+    AsyncMock rather than MockTransport deliberately: MockTransport never
+    surfaces the ``timeout`` kwarg to its handler.
+    """
+
+    @staticmethod
+    def _cold_session_responses(inner: dict, url: str) -> list[httpx.Response]:
+        responses = [
+            _init_response(),
+            httpx.Response(202, headers={'mcp-session-id': 'test-session-id'}),
+            _mcp_response(inner),
+        ]
+        for resp in responses:
+            resp.request = httpx.Request('POST', f'{url.rstrip("/")}/mcp')
+        return responses
+
+    async def test_budget_reaches_every_post(self):
+        from unittest.mock import AsyncMock
+
+        from dashboard.data.task_runtime import _probe_one
+
+        url = 'http://127.0.0.1:8100'
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = self._cold_session_responses(
+            TaskRuntimeSnapshot().model_dump(mode='json'), url,
+        )
+
+        result = await _probe_one(mock_client, url, 0.05)
+
+        assert result.offline is False, f'probe should have succeeded: {result}'
+        timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
+        assert timeouts == [0.05, 0.05, 0.05], (
+            f"the probe budget must reach every post, not httpx's 10s "
+            f'default, got {timeouts}'
+        )

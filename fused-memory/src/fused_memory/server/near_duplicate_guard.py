@@ -101,16 +101,39 @@ def find_matching_topic_cluster(
     content: str,
     clusters: list[ProceduralTopicCluster],
 ) -> tuple[ProceduralTopicCluster, list[str]] | None:
-    """Select the first topic cluster *content* matches by distinct-phrase count.
+    """Select the first topic cluster *content* matches, by phrase count OR sufficiency.
 
     For each cluster in order, counts the DISTINCT ``phrases`` (compared
     case-insensitively) that appear as substrings of *content*, and returns
-    ``(cluster, sorted matched phrases)`` for the first cluster whose distinct
-    hit count is ``>= cluster.min_phrase_hits``. A phrase repeated in *content*
-    counts once (distinct-phrase membership, not occurrence count); an empty
-    phrase is ignored (it would otherwise substring-match everything). Returns
-    ``None`` when *content* is empty, *clusters* is empty, or no cluster
-    qualifies.
+    ``(cluster, sorted matched phrases)`` for the first cluster that qualifies.
+    A cluster qualifies when EITHER:
+
+    * its distinct hit count is ``>= cluster.min_phrase_hits`` (the original
+      rule), OR
+    * at least one hit phrase is declared in ``cluster.sufficient_phrases``
+      -- phrases so distinctive they cannot appear incidentally, which
+      therefore qualify the cluster alone (task 3054).
+
+    The second arm exists because hits do NOT aggregate across clusters: a
+    write touching one distinctive phrase in each of several clusters used to
+    be blocked by none, even though each phrase unambiguously identified its
+    own topic. Note the consequence for callers -- on a sufficient-phrase
+    match the returned ``matched_phrases`` may contain FEWER entries than the
+    cluster's ``min_phrase_hits``. That is correct, not a guard bug: it
+    reports exactly what fired.
+
+    PRECEDENCE (deliberate): sufficiency decides WHETHER a cluster qualifies,
+    never WHICH qualifying cluster wins. The scan is a single pass in list
+    order, so an EARLIER cluster qualifying on a plain count beats a LATER
+    cluster qualifying on a declared-sufficient phrase. Seed order stays the
+    one priority knob rather than gaining a second, implicit axis -- and both
+    candidates are on-topic by construction, so the cost of the arbitration
+    is at most routing a soft block to the neighbouring human gate task.
+
+    A phrase repeated in *content* counts once (distinct-phrase membership,
+    not occurrence count); an empty phrase is ignored (it would otherwise
+    substring-match everything). Returns ``None`` when *content* is empty,
+    *clusters* is empty, or no cluster qualifies.
 
     Pure and synchronous — mirrors :func:`find_near_duplicate_memory`: it does
     no I/O and no embedding round-trip, and raises nothing on empty input. This
@@ -126,7 +149,8 @@ def find_matching_topic_cluster(
             for phrase in cluster.phrases
             if phrase and phrase.lower() in content_lower
         }
-        if len(matched) >= cluster.min_phrase_hits:
+        sufficient = {phrase.lower() for phrase in cluster.sufficient_phrases if phrase}
+        if matched and (len(matched) >= cluster.min_phrase_hits or matched & sufficient):
             return cluster, sorted(matched)
     return None
 
@@ -224,6 +248,13 @@ def build_topic_cluster_block(
     two guards' agent-facing diagnostics stay cleanly separable. Uses the
     matched cluster's ``hint`` when set, else the module default
     (:data:`_TOPIC_CLUSTER_DEFAULT_HINT`).
+
+    ``matched_phrases`` may contain FEWER entries than the matched cluster's
+    ``min_phrase_hits`` -- that is a correct sufficient-phrase block, not a
+    guard bug. :func:`find_matching_topic_cluster` also qualifies a cluster on
+    a single phrase declared in its ``sufficient_phrases`` (task 3054), and
+    this field then reports exactly the one phrase that fired, which is what
+    makes the routing unambiguous.
     """
     return {
         'error': 'procedural_knowledge_known_topic_cluster_write_blocked',

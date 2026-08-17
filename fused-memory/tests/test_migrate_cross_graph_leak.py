@@ -1647,6 +1647,97 @@ class TestRunApplyCoMovingPreserved:
 
 
 # ===========================================================================
+# Tests: run() apply surfaces the MERGE fold's dropped-MENTIONS census
+# (task 4183)
+# ===========================================================================
+
+class TestRunApplyMergeMentionsDroppedCensus:
+    """Proves Phase B's dropped-MENTIONS census (merge_mentions_dropped +
+    merge_mentions_dropped_uuids -- the incoming MENTIONS links onto a MERGE
+    spec's wrong copy that Phase C's DETACH DELETE destroys) reaches the
+    report verbatim, and follows embedding_omitted's informational,
+    NOT-folded-into-exit_code precedent rather than
+    dropped_cross_target_edges/phase_b_blocked's gating one.
+    """
+
+    def _write_manifest(self, tmp_path, nodes, census) -> Path:
+        manifest = _mod.build_manifest(nodes, census, dry_run=True)
+        manifest_path = tmp_path / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path
+
+    async def _run_with_edge_result(self, tmp_path, monkeypatch, edge_result):
+        """Drive run() over one clean MOVE node with *edge_result* injected as
+        Phase B's return -- the same SubgraphEdgeResult-injection harness the
+        embedding_omitted / dropped_cross_target_edges tests use."""
+        move_node = _classified_node(
+            'u-M', source_graph='reify', target_graph='dark_factory', disposition=_mod.MOVE,
+        )
+        manifest_path = self._write_manifest(
+            tmp_path, [move_node], {'reify': 1, 'dark_factory': 0},
+        )
+
+        monkeypatch.setattr(_mod, 'create_moved_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(_mod, 'delete_source_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            _mod, 'recreate_subgraph_relationships', AsyncMock(return_value=edge_result),
+        )
+
+        memory_service = _make_memory_service({
+            'reify': _make_graph_mock(ro_pages=[[]]),
+            'dark_factory': _make_graph_mock(ro_pages=[[]]),
+        })
+        args = _args(apply=True, manifest=str(manifest_path))
+
+        return await _mod.run(args, memory_service)
+
+    @pytest.mark.asyncio
+    async def test_merge_mentions_dropped_surfaced_in_report_and_does_not_gate_exit_code(
+        self, tmp_path, monkeypatch,
+    ):
+        """A Phase-B result carrying merge_mentions_dropped=2 with two
+        mentioning-episode uuids, everything else clean: both fields reach
+        the report VERBATIM (never truncated or re-ordered), and exit_code
+        stays 0. The census is deliberately NOT folded into exit_code, exactly
+        like embedding_omitted -- a MERGE whose wrong copy carries MENTIONS is
+        the EXPECTED case (a wrong-graph mentioning episode is EPISODIC_SKIP,
+        never actioned), so gating on it would make nearly every merge run
+        exit non-zero and train operators to ignore the signal.
+        """
+        report = await self._run_with_edge_result(
+            tmp_path, monkeypatch,
+            SubgraphEdgeResult(
+                merge_mentions_dropped=2,
+                merge_mentions_dropped_uuids=['episode-1', 'episode-2'],
+            ),
+        )
+
+        assert report['merge_mentions_dropped'] == 2
+        assert report['merge_mentions_dropped_uuids'] == ['episode-1', 'episode-2']
+
+        # nothing else is dirty -- the census alone must not force a
+        # human-review exit.
+        assert report['post_verify']['matched'] is True
+        assert report['dropped_cross_target_edges'] == []
+        assert report['phase_b_blocked'] == []
+        assert report['exit_code'] == 0
+
+    @pytest.mark.asyncio
+    async def test_zero_census_still_reports_both_keys(self, tmp_path, monkeypatch):
+        """A default (all-clean) Phase-B result still reports the keys as
+        0/[] -- they are always present, never conditionally omitted, so an
+        operator diffing two runs never has to distinguish "no dropped
+        MENTIONS" from "this build didn't count them"."""
+        report = await self._run_with_edge_result(
+            tmp_path, monkeypatch, SubgraphEdgeResult(),
+        )
+
+        assert report['merge_mentions_dropped'] == 0
+        assert report['merge_mentions_dropped_uuids'] == []
+        assert report['exit_code'] == 0
+
+
+# ===========================================================================
 # Tests: run() apply surfaces cross-target-dropped edges
 # (task 2415, step-15/16)
 # ===========================================================================

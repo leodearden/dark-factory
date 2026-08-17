@@ -16,7 +16,6 @@ test_transcript_archive_producer_hook.py's established convention.
 from __future__ import annotations
 
 import asyncio
-import gzip
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -76,18 +75,18 @@ def _write_transcript(worktree: Path, task_id: str, sid: str, data: bytes) -> Pa
     return p
 
 
-def _archived_gz(git_repo: Path, task_id: str, sid: str) -> Path:
-    """The durable gz mirror the backstop should produce for *sid*."""
+def _archived(git_repo: Path, task_id: str, sid: str) -> Path:
+    """The durable plain-.jsonl mirror the backstop should produce for *sid*."""
     return (
         git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-        / task_id / ENC / f'{sid}.jsonl.gz'
+        / task_id / ENC / f'{sid}.jsonl'
     )
 
 
 @pytest.mark.asyncio
 class TestBackstop:
 
-    async def test_end_to_end_transcript_gz_appears(self, git_repo):
+    async def test_end_to_end_transcript_appears(self, git_repo):
         """A worktree with an un-archived transcript is archived, then removed."""
         tid = '2786'
         sid = 'sess-A'
@@ -98,10 +97,9 @@ class TestBackstop:
 
         await git_ops.cleanup_worktree(wt.path, tid)
 
-        gz = _archived_gz(git_repo, tid, sid)
-        assert gz.exists()
-        with gzip.open(gz, 'rb') as fh:
-            assert fh.read() == fake_bytes
+        archived = _archived(git_repo, tid, sid)
+        assert archived.exists()
+        assert archived.read_bytes() == fake_bytes
         # Teardown still happened — the backstop runs before removal, not instead.
         assert not wt.path.exists()
 
@@ -115,15 +113,15 @@ class TestBackstop:
         wt = await git_ops.create_worktree(tid)
 
         # Session A: already archived. Lay down the source, then pre-create its
-        # gz mirror with a DISTINCTIVE marker payload and a mirrored mtime so the
-        # helper's ``int(dest.mtime) == int(src.mtime)`` skip fires — re-archiving
-        # would overwrite the marker with a real gzip of the source.
+        # archive mirror with a DISTINCTIVE marker payload and a mirrored mtime so
+        # the helper's ``int(dest.mtime) == int(src.mtime)`` skip fires —
+        # re-archiving would overwrite the marker with the source bytes.
         src_a = _write_transcript(wt.path, tid, 'A', b'{"a":1}\n')
-        gz_a = _archived_gz(git_repo, tid, 'A')
-        gz_a.parent.mkdir(parents=True, exist_ok=True)
-        gz_a.write_bytes(b'STALE-MARKER-NOT-A-REAL-GZIP')
+        archived_a = _archived(git_repo, tid, 'A')
+        archived_a.parent.mkdir(parents=True, exist_ok=True)
+        archived_a.write_bytes(b'STALE-MARKER-NOT-THE-SOURCE-BYTES')
         src_mtime = src_a.stat().st_mtime
-        os.utime(gz_a, (src_mtime, src_mtime))
+        os.utime(archived_a, (src_mtime, src_mtime))
 
         # Session B: un-archived.
         _write_transcript(wt.path, tid, 'B', b'{"b":2}\n')
@@ -131,13 +129,12 @@ class TestBackstop:
         await git_ops.cleanup_worktree(wt.path, tid)
 
         # A skipped: marker payload AND mtime both unchanged.
-        assert gz_a.read_bytes() == b'STALE-MARKER-NOT-A-REAL-GZIP'
-        assert int(gz_a.stat().st_mtime) == int(src_mtime)
-        # B newly archived to a real gzip of its source.
-        gz_b = _archived_gz(git_repo, tid, 'B')
-        assert gz_b.exists()
-        with gzip.open(gz_b, 'rb') as fh:
-            assert fh.read() == b'{"b":2}\n'
+        assert archived_a.read_bytes() == b'STALE-MARKER-NOT-THE-SOURCE-BYTES'
+        assert int(archived_a.stat().st_mtime) == int(src_mtime)
+        # B newly archived as a verbatim copy of its source.
+        archived_b = _archived(git_repo, tid, 'B')
+        assert archived_b.exists()
+        assert archived_b.read_bytes() == b'{"b":2}\n'
         assert not wt.path.exists()
 
     async def test_arg_wiring_positional_session_none_and_archive_root(self, git_repo):

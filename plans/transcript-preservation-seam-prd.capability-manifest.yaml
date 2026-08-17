@@ -1,0 +1,255 @@
+prd: plans/transcript-preservation-seam-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 3618
+  title: Drop gzip from the transcript archive — one plain, greppable corpus
+  capabilities:
+  - name: writer-emits-plain-jsonl
+    binding: capability→producer (wired) — grep:shared/src/shared/transcript_archive.py:37,101
+      sole writer, called from workflow.py:11824 + git_ops.py:11788
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^import gzip
+      paths:
+      - shared/src/shared/transcript_archive.py
+      expect: absent
+  - name: legibility-readers-drop-the-gz-branch
+    binding: capability→producer (wired) — grep:scripts/legibility/inventory.py:409-421
+      rglob superset; digest.py:86 .gz branch
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^import gzip
+      paths:
+      - scripts/legibility/inventory.py
+      - scripts/legibility/digest.py
+      expect: absent
+  - name: complete-gz-consumer-set-including-memory-eval-corpus
+    binding: capability→producer (extent widened, finding F1) — PRD §4 named 4; measured
+      set adds fused-memory/scripts/memory_eval_transcript_corpus.py:280,697
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: jsonl\.gz
+      paths:
+      - fused-memory/scripts/memory_eval_transcript_corpus.py
+      - scripts/gc_agent_transcripts.py
+      - scripts/legibility/
+      - shared/src/shared/transcript_archive.py
+      expect: absent
+  - name: unicode-decode-normalization-retained
+    binding: capability→producer (extent narrowed, finding F2) — grep:scripts/legibility/inventory.py:136-139
+      states UnicodeDecodeError is reachable on a PLAIN .jsonl path
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: UnicodeDecodeError
+      paths:
+      - scripts/legibility/inventory.py
+      expect: present
+  - name: archive-holds-no-gz-after-migration
+    binding: capability→producer — α owns the one-off bulk gunzip of the 4,369 existing
+      archives
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the archive tree is gitignored runtime state; the check is the operator-run
+        find, not a repo grep
+  - name: migration-corroborates-before-unlink-and-is-idempotent
+    binding: INV-3 + INV-7 — per-file gunzip → verify readable → unlink; re-runnable,
+      ordered before reader-branch deletion
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: migration ordering and idempotence are properties of the one-off script's
+        tests, not a grep
+  - name: disk-headroom-floor
+    binding: 'floor: +1.3 GB one-off ≪ 2.1 TB free (0.06%) — MEASURED 2026-08-04:
+      462 MB archive, 4,369 .gz, 2.1 TB of 6.8 TB free'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a disk-headroom bound is an operator measurement, not a repo-resident
+        check
+- label: β
+  task_id: 3619
+  title: Transcript preservation as a precondition of config-dir deletion
+  capabilities:
+  - name: same-device-rename-archive-ward
+    binding: capability→producer (wired) — stat -c '%d' → .worktrees 66312 == data/orchestrator
+      66312, one /dev/nvme2n1p5. VERIFIED 2026-08-04
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: device identity is a deployment property; the code-side obligation is
+        the EXDEV copy+unlink fallback below
+  - name: synchronous-uncancellable-archive-step
+    binding: DAG-direction — the cancellable await asyncio.to_thread at workflow.py:11823
+      / git_ops.py:11787 exists only for compression, removed upstream by α
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: '''no longer awaited'' is a control-flow property; asserted by β''s
+        own teardown tests'
+  - name: shared-guard-helper-at-both-deletion-sites
+    binding: capability→producer + INV-5 — one helper in shared/src/shared/transcript_archive.py
+      called from _cleanup_config_dir (workflow.py:7723-7733) and the cleanup_worktree
+      backstop (git_ops.py:11777-11812); dry_run_unblock.py:450 is task 3271's site,
+      named as a downstream consumer
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def archive_before_delete
+      paths:
+      - shared/src/shared/transcript_archive.py
+      expect: present
+  - name: archival-failure-carries-a-rate-streak-escalation
+    binding: INV-4 — extends the module-level per-file failure counter at shared/src/shared/transcript_archive.py:44
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the escalation's streak semantics are a behavioural property; naming
+        its symbol here would over-prescribe the implementation
+  - name: startup-sweeper-for-the-sigkill-tail
+    binding: capability→producer — hook site Harness._recover_crashed_tasks (harness.py:3112);
+      collides with in-flight 3256, dep wired (finding F3)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: sweeper siting is left to the implementer once the 3256 lock clears;
+        pinning a symbol would pre-empt that
+  - name: credential-container-still-dies-fast
+    binding: INV-7 + D1 — a permanently-failing archive must not become an unbounded
+      hold on a .credentials.json-bearing dir; non-transcript members are deleted
+      unconditionally
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: credential-lifetime is a teardown-ordering property asserted by β's
+        tests
+  - name: coverage-claim-scoped-to-the-post-fix-cohort
+    binding: floor/achievability — 100% is asserted over sessions preserved AFTER
+      this lands; the historical 12.5% cohort is not retroactively recoverable
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the coverage query runs against runtime state (runs.db + archive tree),
+        not the repo
+  - name: exdev-copy-unlink-fallback
+    binding: capability→producer — PRD §9 Q4; unreachable today (one device) but must
+      not be assumed away
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: EXDEV
+      paths:
+      - shared/src/shared/transcript_archive.py
+      expect: present
+- label: γ
+  task_id: 3620
+  title: Deterministic config-dir resolution + ambiguity signal
+  capabilities:
+  - name: config-dir-prefix-imported-not-restated
+    binding: capability→producer (wired) + INV-5 — grep:shared/src/shared/config_dir.py:34
+      constant, :232 sole mkdir site in the tree
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: CONFIG_DIR_PREFIX
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: ambiguity-event-type-exists
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/event_store.py:229-237,
+      the session_resume/_fallback/_capped family
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: session_config_dir_ambiguous
+      paths:
+      - orchestrator/src/orchestrator/event_store.py
+      expect: present
+  - name: separately-deduped-l1-excluded-from-the-storm-streak
+    binding: INV-4 + D7 — mirrors the 'capped' carve-out at harness.py:7653-7661 /
+      config.py:869; dedup via has_open_l1(<sentinel>) at harness.py:6076, distinct
+      sentinel required (task 3528 collision class)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: streak exclusion and dedup-sentinel distinctness are behavioural, asserted
+        by γ's tests
+  - name: never-stash-a-non-matching-dir
+    binding: 'rejection-mechanism (D5) — MEASURED: .worktrees/3464/.task holds exactly
+      one claude-config-* (''claude-config-3464-unblock''), so len==1 and the >1 warning
+      at harness.py:3032 never fires; .worktrees/2971/.task/claude-config-df_task_13
+      is a real foreign sibling'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the live 3464 worktree may be reaped before dispatch; γ's fixture reproduces
+        the shape and is the durable check
+  - name: boot-time-fixtures-encode-the-wrong-contract
+    binding: capability→producer — grep:orchestrator/tests/test_crash_recovery.py:144
+      and test_session_resume_integration_gate.py:166 both build claude-config-<session_id>;
+      VERIFIED, and the breakage is the signal
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: claude-config-\{session_id\}
+      paths:
+      - orchestrator/tests/test_crash_recovery.py
+      - orchestrator/tests/test_session_resume_integration_gate.py
+      expect: absent
+- label: δ
+  task_id: 3621
+  title: Retention sizing so age is the only binding policy
+  capabilities:
+  - name: max-task-dirs-raised-to-50000
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/config.py:1025-1031
+      default 5000; :4920-4923 retention reloads as one atomic green-tier leaf
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: default=50_?000
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: three-lockstep-sites-move-together
+    binding: INV-5 — config.py:1026, scripts/gc_agent_transcripts.py:107 DEFAULT_MAX_TASK_DIRS,
+      and the pinning assert at scripts/tests/test_gc_agent_transcripts.py:410; already
+      test-pinned (house pattern)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: DEFAULT_MAX_TASK_DIRS *= *50_?000
+      paths:
+      - scripts/gc_agent_transcripts.py
+      expect: present
+  - name: count-pruning-is-loud-when-it-binds
+    binding: INV-4 — grep:scripts/gc_agent_transcripts.py:183 is_count has no distinct
+      signal today, so a bound cap silently truncates the 90-day window
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: loudness is a runtime-emission property asserted by δ's tests, not a
+        repo grep
+  - name: derived-bound-test-is-non-vacuous
+    binding: INV-1 — a cap ≥ 90 × rate × safety assert with a HARDCODED rate is arithmetic
+      on constants and can never fail (the integration_skew I7-gate shape); the rate
+      must be derived from real archive dir mtimes, skipping when the archive is absent
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: non-vacuity is a property of how the test sources its input; a grep
+        cannot distinguish a measured rate from a literal
+  - name: peak-rate-premise
+    binding: 'floor: 50,000 / (90 × 71 peak/day) ≈ 7.8× headroom — MEASURED 2026-08-04:
+      600 task dirs / 17 days, mean 35/day, recent-7d 46.6/day (84% of the 5,000 cap),
+      peak 71/day → 6,390 @ 90d, binding at ~day 70'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the rate is measured off the live archive tree, which is gitignored
+        runtime state

@@ -1006,6 +1006,119 @@ class TestStewardOutcomeRouting:
         )
         wf._ensure_l1_escalation_for_blocked.assert_not_awaited()
 
+    # -- Row 9 (task 3236): the sweep's LEVEL SCOPE and its observability ----
+
+    @staticmethod
+    def _level_scoped_get_by_task(by_level: dict[int, list]):
+        """A ``get_by_task`` stub that actually HONOURS its ``level`` kwarg.
+
+        The real ``EscalationQueue.get_by_task`` filters on ``level``; the
+        plain MagicMock used by the row-9 anchor above returns the same list
+        for ANY kwargs, which would make a level-scoped assertion vacuous.
+        """
+
+        def _stub(
+            task_id: str,
+            status: str | None = None,
+            level: int | None = None,
+            **kwargs: Any,
+        ) -> list:
+            if level is None:
+                # The real method's level-less query spans every level.
+                return [esc for recs in by_level.values() for esc in recs]
+            return list(by_level.get(level, []))
+
+        return _stub
+
+    async def test_row9_wip_sweep_is_level0_scoped_so_an_l1_survives(
+        self, tmp_path: Path,
+    ):
+        """Task 3236: a steward's level-1 re-escalation is outside this sweep.
+
+        The task-2060 dismissal is scoped to ``level=0``, so a re-escalation
+        filed at level 1 — now possible via ``escalate_blocker(level=1)`` —
+        survives it BY CONSTRUCTION, with no ``agent_role`` predicate to
+        defeat.  This pins that structural property against a future widening
+        of the sweep's scope.
+        """
+        wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
+        wf._steward = MagicMock()
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardInterrupted('timeout', wip_commits_present=True),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        l0 = _make_escalation(id='esc-42-1', level=0, agent_role='orchestrator')
+        l1 = _make_escalation(
+            id='esc-42-2', level=1, agent_role='steward',
+            category='infra_issue', summary='steward re-escalation',
+        )
+        wf.escalation_queue.get_by_task.side_effect = (  # type: ignore[union-attr]
+            self._level_scoped_get_by_task({0: [l0], 1: [l1]})
+        )
+        wf._ensure_l1_escalation_for_blocked = AsyncMock()
+
+        outcome = await wf._mark_blocked('steward timed out with WIP present')
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        resolved_ids = [
+            c.args[0] for c in wf.escalation_queue.resolve.call_args_list  # type: ignore[union-attr]
+        ]
+        assert 'esc-42-1' in resolved_ids, f'L0 should be swept: {resolved_ids}'
+        assert 'esc-42-2' not in resolved_ids, (
+            f'The level-1 re-escalation was swallowed: {resolved_ids}'
+        )
+        wf._ensure_l1_escalation_for_blocked.assert_not_awaited()
+
+    async def test_row9_wip_sweep_logs_each_dismissal_loudly(
+        self, tmp_path: Path, caplog,
+    ):
+        """Every swept record is named in a WARNING — no silent swallow.
+
+        The sweep used to log a single aggregate INFO naming only a COUNT, so
+        a dismissed steward filing left no trace of WHICH record went and who
+        filed it.  Per the repo's loud-over-silent-degradation norm and the
+        no-silent-fail-soft design invariant, each dismissal is logged at
+        WARNING naming the escalation id and its ``agent_role``.
+        """
+        import logging
+
+        wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
+        wf._steward = MagicMock()
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardInterrupted('timeout', wip_commits_present=True),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        swept = [
+            _make_escalation(id='esc-42-1', level=0, agent_role='orchestrator'),
+            _make_escalation(
+                id='esc-42-2', level=0, agent_role='steward',
+                category='infra_issue', summary='steward chained follow-on',
+            ),
+        ]
+        wf.escalation_queue.get_by_task.side_effect = (  # type: ignore[union-attr]
+            self._level_scoped_get_by_task({0: swept})
+        )
+        wf._ensure_l1_escalation_for_blocked = AsyncMock()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            outcome = await wf._mark_blocked('steward timed out with WIP present')
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        for esc in swept:
+            assert any(esc.id in msg for msg in warnings), (
+                f'No WARNING named dismissed escalation {esc.id}: {warnings}'
+            )
+            assert any(esc.id in msg and esc.agent_role in msg for msg in warnings), (
+                f'No WARNING named the filer of {esc.id} '
+                f'(agent_role={esc.agent_role!r}): {warnings}'
+            )
+        wf._ensure_l1_escalation_for_blocked.assert_not_awaited()
+
     # -- Row 9 producer: _ensure_steward_started wiring ----------------------
 
     async def test_row9_ensure_steward_started_wires_outcome_channel_and_wip_probe(
