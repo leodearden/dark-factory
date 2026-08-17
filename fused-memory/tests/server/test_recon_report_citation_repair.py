@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock
 import pytest
 from _fm_helpers import FakeMemoryLookup, build_journal_with_closed_run
 
+from fused_memory.models.reconciliation import StageReport
 from fused_memory.server.recon_report import (
     RECON_REPORT_INSTRUCTIONS,
     ReconReportState,
@@ -89,7 +90,12 @@ class TestStateRepairMemoryCitation:
 
             assert outcome['status'] == 'repaired'
             run = await journal.get_run(TARGET_RUN)
-            finding = run.stage_reports['memory_consolidator'].items_flagged[0]
+            assert run is not None
+            # Still a parsed StageReport, not a raw dict: the repair rewrites
+            # the blob through the journal's own model round-trip.
+            report = run.stage_reports['memory_consolidator']
+            assert isinstance(report, StageReport)
+            finding = report.items_flagged[0]
             # repaired_by comes from the caller's own live run — no new
             # LLM-typed identifier to get wrong.
             assert finding['citation_repairs'][0]['repaired_by'] == f'run:{CALLER_RUN}'

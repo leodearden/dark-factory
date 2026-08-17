@@ -161,8 +161,9 @@ class TestRepairHappyPath:
             assert record['reason'] == 'memory_not_found'
             assert record['repaired_by'] == 'run:caller-1'
             repaired_at = datetime.fromisoformat(record['repaired_at'])
-            assert repaired_at.tzinfo is not None
-            assert repaired_at.utcoffset().total_seconds() == 0
+            utc_offset = repaired_at.utcoffset()
+            assert utc_offset is not None
+            assert utc_offset.total_seconds() == 0
 
             # Nothing but the target finding moved: the sibling finding, the raw
             # non-StageReport entry, and every stat/summary field are untouched,
@@ -340,7 +341,10 @@ class TestRepairResolutionErrors:
         try:
             before = _dump(await journal.get_run(RUN_ID))
             memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
-            kwargs = {'memory_id': DANGLING, 'replacement_memory_id': SUCCESSOR}
+            kwargs: dict[str, Any] = {
+                'memory_id': DANGLING,
+                'replacement_memory_id': SUCCESSOR,
+            }
             kwargs[field] = bad_id
 
             outcome = await citation_repair.repair_memory_citation(
@@ -630,7 +634,7 @@ class TestRepairLiveRunRefusalAndDryRun:
             spy = AsyncMock(wraps=journal.update_run_stage_reports)
             journal.update_run_stage_reports = spy
 
-            call = dict(
+            call: dict[str, Any] = dict(
                 target_run_id=RUN_ID,
                 finding_id='f-1',
                 memory_id=DANGLING,
@@ -760,7 +764,7 @@ class TestRepairDropOnlyAndIdempotency:
         )
         try:
             memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
-            call = dict(
+            call: dict[str, Any] = dict(
                 target_run_id=RUN_ID,
                 finding_id='f-1',
                 memory_id=DANGLING,
