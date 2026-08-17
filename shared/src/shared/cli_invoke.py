@@ -3448,7 +3448,16 @@ async def _run_subprocess(
                 # The post-kill transcript_turns re-read in the except block is
                 # unaffected — it is a separate, one-shot read outside this loop.
                 if not seen_turn and config_dir and session_id:
-                    n = count_transcript_turns(config_dir, session_id)
+                    # OFF-LOOP (task 3925).  count_transcript_turns globs
+                    # <config_dir>/projects/*/<session_id>.jsonl, opens the whole
+                    # file and json.loads every line — 1.0-1.3 MB for a mature
+                    # session.  The orchestrator runs every role of every
+                    # concurrent task on ONE event loop, so up to
+                    # max_concurrent_tasks agents would each block it inline
+                    # here.  Same rationale (and same to_thread shape) as the
+                    # run_substrate_recheck / write_heartbeat offloads in
+                    # orchestrator/src/orchestrator/harness.py.
+                    n = await asyncio.to_thread(count_transcript_turns, config_dir, session_id)
                     if n is None:
                         if not unreadable_escape_fired:
                             unreadable_escape_fired = note_unreadable_transcript(
