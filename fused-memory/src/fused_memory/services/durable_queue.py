@@ -539,7 +539,11 @@ class DurableWriteQueue:
         """
         terminal: tuple[str, str | None] | None = None
         write_op_id: str | None = None
-        executed = False
+        # Seeded from the freshly-SELECTed row, not reset to False: "a backend
+        # write for this item landed" is an ITEM-level fact (see
+        # POST_EXECUTE_DEAD_PREFIX), so an earlier attempt's landing must still
+        # be known to the attempt that finally dead-letters.
+        executed = bool(item.executed)
         async with self._semaphore:
             try:
                 # Parsed ONCE, and the join key captured BEFORE dispatch:
@@ -557,7 +561,15 @@ class DurableWriteQueue:
                 # The backend write LANDED. Anything that fails below is a
                 # post-execute failure, which is a materially different fact
                 # for anyone deciding whether a dead item is safe to replay.
+                #
+                # ORDER IS LOAD-BEARING, both halves:
+                #  - the local is set BEFORE the await, so even if the flag
+                #    write itself fails, THIS attempt still reports correctly;
+                #  - the flag is made DURABLE before the callback runs, because
+                #    the callback is precisely what can fail and schedule the
+                #    retry that would otherwise lose the fact.
                 executed = True
+                await self._mark_executed(item)
                 # Fire callback before marking completed — failure retries item.
                 # A FRESH parse, deliberately not `payload`: _execute_write pops
                 # journal metadata that the callbacks read back out.
@@ -606,6 +618,24 @@ class DurableWriteQueue:
                 'Item %d: on_terminal hook failed for write_op %s (%s)',
                 item_id, write_op_id, status, exc_info=True,
             )
+
+    async def _mark_executed(self, item: QueueItem) -> None:
+        """Durably record that a backend write for this item LANDED.
+
+        One extra commit per item, weighed against a backend round trip
+        measured in seconds — not worth conditionalising on ``callback_type``,
+        since an item with no callback can still dead-letter on the completion
+        commit. Skipped when the row already carries the flag, so a retry of an
+        already-flagged item costs nothing.
+        """
+        if item.executed:
+            return
+        assert self._db is not None
+        await self._db.execute(
+            'UPDATE write_queue SET executed = 1 WHERE id = ?',
+            (item.id,),
+        )
+        await self._db.commit()
 
     async def _mark_completed(self, item: QueueItem) -> None:
         assert self._db is not None
@@ -767,7 +797,15 @@ class DurableWriteQueue:
     # -- management -----------------------------------------------------------
 
     async def replay_dead(self, group_id: str | None = None) -> int:
-        """Reset dead items to pending for retry. Returns count reset."""
+        """Reset dead items to pending for retry. Returns count reset.
+
+        Resets the retry BUDGET (attempts, next_retry_at) and clears the last
+        error. Deliberately does NOT clear ``executed``: that flag is sticky
+        for the life of the row. "A backend write for this item landed at some
+        point" does not stop being true because an operator pressed replay —
+        and it is exactly the fact that makes a SECOND blind replay dangerous.
+        The asymmetry with the fields below is intentional, not an oversight.
+        """
         assert self._db is not None
         if group_id:
             cursor = await self._db.execute(
