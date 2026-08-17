@@ -2923,17 +2923,35 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
         logger.error('lease-claim %s failed', name, exc_info=True)
         print(f'decision={LeaseDecision.PROCEED.value}')
         print(f'lease-claim {name} faulted; proceeding (fail-open)')
+        # `slug=` is emitted here too, while `holder_liveness=` deliberately is
+        # not: the fault made the HOLDER unknown, not US. This is also where
+        # the line is most useful -- the claim's outcome is least certain.
+        print(f'slug={slug}')
         return
     print(f'decision={claim.decision.value}')
     print(claim.message)
-    # ADDITIVE and LAST (task 3994 defect 4): `decision=` stays line 1 and the
-    # message line 2, so a skill parser that reads only the first two lines is
-    # unaffected -- which is why this is an appended line rather than a fourth
-    # LeaseDecision token a not-yet-reloaded skill would face as an
-    # unrecognised value. Lease SEMANTICS are unchanged: we never auto-steal.
-    # This only lets a stand-down name a machine-readable owner, so a watcher
-    # can file a DecisionRecord for a provably-gone holder instead of exiting
-    # silently (INV-6/INV-7).
+    # ADDITIVE and LAST (task 3994 defect 4; extended by task 4248): `decision=`
+    # stays line 1 and the message line 2, so a skill parser that reads only the
+    # first two lines is unaffected -- which is why these are appended lines
+    # rather than a fourth LeaseDecision token a not-yet-reloaded skill would
+    # face as an unrecognised value. Lease SEMANTICS are unchanged: we never
+    # auto-steal. This only lets a stand-down name a machine-readable owner, so
+    # a watcher can file a DecisionRecord for a provably-gone holder instead of
+    # exiting silently (INV-6/INV-7).
+    #
+    # TWO appended lines now: `holder_liveness=` (about the CONTENDING HOLDER)
+    # and, last, `slug=` (about THIS CALLER). The second exists because the
+    # skills no longer pass `--slug` at all: it makes the CLI-derived identity
+    # LEGIBLE, so an agent whose later heartbeat returns `result=refused` can
+    # cross-check what it claimed as against `lease-show`'s holder_slug. It is a
+    # DIAGNOSTIC, explicitly NOT a value for the skills to thread into the next
+    # verb -- a shell variable cannot survive to the next Claude Code Bash tool
+    # call (each is a fresh `/bin/bash -c`), which is precisely why the
+    # derivation had to move into the CLI rather than be printed for quoting.
+    #
+    # The MUTATING verbs deliberately gain no `slug=` line: `_run_lease_mutation`
+    # already names the presented slug alongside the real holder in its refusal
+    # message, so a second line would restate what the caller was just told.
     #
     # THREE values, not two: an ACQUIRED claim has no contending holder at all
     # -- the holder is this caller -- so it prints `none`. This first shipped
@@ -2946,6 +2964,7 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     # and must not assert one either way.
     if claim.acquired:
         print('holder_liveness=none')
+        print(f'slug={slug}')
         return
     # A SINGLE signal, deliberately: `orphaned` means exactly "the pid
     # recorded in the lease body is not running". This predicate used to
@@ -2973,6 +2992,8 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     # deliberate, bounded cost of keeping such a lease reapable at all.
     orphaned = claim.holder is not None and not claim.holder_alive
     print(f'holder_liveness={"orphaned" if orphaned else "held"}')
+    # THIS CALLER's slug, never the holder's -- see the block comment above.
+    print(f'slug={slug}')
 
 
 def _run_lease_mutation(

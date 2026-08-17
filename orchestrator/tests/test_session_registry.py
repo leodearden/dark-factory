@@ -3618,7 +3618,9 @@ def test_main_lease_claim_reports_orphaned_for_a_dead_holder_pid(
     lines = _contend_via_cli(tmp_path, capsys, holder_pid=_DEAD_PID)
 
     assert lines[0] == 'decision=stand-down'
-    assert lines[-1] == 'holder_liveness=orphaned'
+    # Anchored by INDEX, not [-1]: task 4248 appended a `slug=` line after this
+    # one, and [-1] would have silently re-aimed at it instead of failing.
+    assert lines[2] == 'holder_liveness=orphaned'
 
 
 def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
@@ -3635,7 +3637,8 @@ def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
 
     assert rc == 0
     # 'unknown' must never be promoted to an orphan finding: fail toward held.
-    assert capsys.readouterr().out.splitlines()[-1] == 'holder_liveness=held'
+    # Index, not [-1] -- task 4248's `slug=` line now follows it.
+    assert capsys.readouterr().out.splitlines()[2] == 'holder_liveness=held'
 
 
 class TestLeaseSlugIsNotASessionRecordKey:
