@@ -351,14 +351,22 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
     - The ruling above (whisper-writer stays resident) is **unchanged** — only the capacity number
       it implies is corrected.
     - **Consequence** (not a decision — see Open Q3): on a **weights-only** basis — the same basis
-      that disqualifies the MoE arm below — the two remaining dense LLM arms (~12, ~9 GiB — the
+      that disqualifies the MoE arm below — the two remaining dense LLM arms (~11.2, ~8.3 GiB — the
       ~14 GiB Mistral-Small-3.2-24B arm was dropped 2026-08-06, see the candidate slate) and all
       embedding arms fit inside ~16.4 GiB; the MoE stretch arm as then specified (~17GB, i.e.
-      Qwen3.6-35B-A3B at IQ4) does not. **Note on the `~12, ~9` figures, marked here at the point of
-      use:** these are the arms.yaml **measured** `est_vram_gib` values, refreshed by task 3973
-      (2026-08-17) from the 2026-08-05 research-time estimates this sentence originally cited (`~6,
-      ~9`) — the `~6` was known-wrong (arms.yaml measured Qwen3.5-9B at 11.21 GiB of weights, ~5 GiB
-      above the estimate), `~9` for Phi-4 14B was checked and confirmed accurate. **Runtime fit is
+      Qwen3.6-35B-A3B at IQ4) does not. **Note on the `~11.2, ~8.3` figures, marked here at the point
+      of use:** both are weights, not `est_vram_gib`. Qwen3.5-9B's **11.21 GiB** is vLLM-reported,
+      measured 2026-08-06 (arms.yaml's `qwen3.5-9b` comment: "vLLM reports 11.21 GiB FOR WEIGHTS ALONE
+      at this quant"); Phi-4 14B's **~8.27 GiB** is derived, not itself measured — arms.yaml:97-101
+      scales its 8.51 GiB of on-disk safetensors by the 0.972x vLLM load ratio the qwen snapshot
+      calibrated (11.21 / 11.53 GiB). arms.yaml's `est_vram_gib` (12.0 for qwen3.5-9b, 9.0 for
+      phi-4-14b) is a **different, stricter** quantity — a **declared** ADMISSION FLOOR, weights plus
+      a non-KV allowance (~0.79 GiB for qwen; 8.27 + 0.79 = 9.06, i.e. exactly phi-4's declared 9.0) —
+      deliberately NOT the figure used in this sentence, since substituting it would compare admission
+      floors against the MoE comparators above, which are weights-only. This sentence originally cited
+      the 2026-08-05 research-time estimates (`~6, ~9`); `~6` was known-wrong — about 5 GiB below the
+      measured 11.21 GiB weights figure — while `~9` was already close to the ~8.27 GiB weights figure
+      and needed no correction. **Runtime fit is
       stricter and separate**: vLLM's paged KV
       cache can balloon well past the weights figure (α's README, `RESOLVED alongside: the pooling
       arms' KV balloon` — a 0.6B embedding arm declared at 2.0 GiB weights measured 16.2 GiB resident
