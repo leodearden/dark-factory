@@ -4267,11 +4267,20 @@ class TestDispositionDoubleFidelity:
 
         Exempt from ``TestNoBareVerifyResultDoubles`` by enclosing scope via
         ``_BARE_DOUBLE_EXEMPT_SCOPES`` — the one site in this module where a
-        bare double is the point.
+        bare double is the point.  TWO independent guards cover this shape and
+        the site is deliberately exempted from BOTH: that file-local scope
+        exemption, and the shared detector's ``# noqa: bare-dataclass-double``
+        pragma below (fused-memory/scripts/check_bare_magicmock_config.py,
+        task 4016).  Both suppressions are paired on purpose — neither is a
+        licence to add another bare double here.
         """
         for logger_name in _FAIL_OPEN_LOGGERS:
             caplog.set_level(logging.WARNING, logger=logger_name)
 
+        # Paired with the _BARE_DOUBLE_EXEMPT_SCOPES entry at test_merge_speculation.py:4062,
+        # which exempts this same scope from task 3980's file-local guard. This module is
+        # deliberately OFF _DATACLASS_DOUBLE_DEBT so every other double here stays covered.
+        # noqa: bare-dataclass-double — permanent mutation leg: this bare double IS the test subject, proving the positive leg can actually fail
         bare = MagicMock(
             passed=False, summary='tests failed', test_output='FAIL',
             lint_output='', type_output='', category='', timed_out=False,
