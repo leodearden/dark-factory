@@ -65,25 +65,11 @@
 // scales into a bare 0..height viewport, whereas a chart scales into a box
 // offset by its axis gutter, so x gains an `x0` and y a `y0`.
 //
-// ── AND THE ROW-SHAPED ONE (task 3681) ────────────────────────────────────
-//
-// charts.jsx's HBarChart closed out the same defect class, and needed NO new
-// export to do it. What made it different is its INPUT: rows of OBJECTS behind
-// a `valueKey`/`labelKey` indirection rather than a bare values array. So it
-// projects at the call site — `rows.map(r => r[valueKey])`, and once more per
-// row for its optional segments — and hands the result to `plottableMax` and
-// `barFractions` unchanged, rather than getting a key-projecting export of its
-// own here. A one-line projection at the call site adds zero module surface;
-// a `keyedValues(rows, key)` wrapper would have bought only a null-ROW guard,
-// which is a different defect class (the API always emits well-formed rows).
-//
-// It also carried one failure the other five did not, and it is worth naming
-// because it is not a rendering fault: the raw value went straight into the
-// CALLER's formatter, and both live call sites format money with `.toFixed(2)`,
-// so a row missing the key threw a TypeError DURING RENDER and unmounted the
-// whole tab. A hole took out the page rather than one bar. The component now
-// derives that decision from the same `barFractions` null its bar branches on,
-// which is exact rather than approximate — see `barFractions` below.
+// charts.jsx's HBarChart (task 3681) closed out the same defect class with NO
+// new export here: its input is rows of OBJECTS, so it projects to a values
+// array at the CALL SITE and reuses this module's builders unchanged. Why it
+// needed nothing of its own — and what its hole decision drives — is documented
+// where that code lives, in charts.jsx.
 
 // ── Is this value a real, plottable measurement? ───────────────────────────
 // Finite numbers only. `null`/`undefined` (a missing sample), `NaN`/`±Infinity`
@@ -403,12 +389,10 @@ function axisPaths(values, geom) {
 // three. (HBarChart projects its rows to a values array first, and calls this
 // a second time per row for that row's segments, scaled against the same max.)
 //
-// The null is also what HBarChart's VALUE CELL branches on, not just its bar.
-// That is exact, not approximate: its `max` is `plottableMax(values, 1)`, which
-// is always finite and >= 1, so the degenerate-max path below is unreachable
-// from there and `fractions[i] === null` is precisely `!isPlottable(values[i])`.
-// One hole decision per row is what keeps a row's text and its bar from
-// disagreeing about whether a measurement exists.
+// A caller may branch on the null for more than its bar — HBarChart also drives
+// its value cell off it, and says there why that is exact rather than
+// approximate. Nothing here needs to know that; the contract below is the same
+// either way.
 //
 // WHY A NULL ENTRY AND NOT A ZERO. There is no NUMBER a bar renderer can draw
 // that means "no measurement here". charts.jsx proved this twice: a `null`

@@ -344,30 +344,34 @@ function HBarChart({ rows, valueKey = 'total', labelKey = 'label', segments, for
   const max = plottableMax(values, 1);
   const { fractions } = barFractions(values, max);
 
-  // ONE hole decision per row, driven off the SAME barFractions null the bar
-  // branches on, so a row's value text and its bar can never disagree about
-  // whether it was measured — a divergence that would render as a plausible
-  // chart rather than as an error.
+  // ONE hole decision per row: the value text and the bar both branch on the
+  // SAME barFractions null, so they can never disagree about whether the row
+  // was measured — a divergence would render as a plausible chart rather than
+  // as an error.
   //
-  // The load-bearing part is NOT the placeholder: it is that `formatVal` is
-  // never INVOKED on a hole. Both live call sites pass ``v => `$${v.toFixed(2)}```
-  // (tabs.jsx), so calling it on a missing value throws a TypeError DURING
-  // RENDER and unmounts the whole Costs tab. A blank bar degrades; a throw
+  // What is load-bearing is not the placeholder but that `formatVal` is never
+  // INVOKED on a hole. This component's contract PERMITS a row that lacks the
+  // key — it reads rows through a caller-supplied `valueKey` and cannot know
+  // which keys a caller's rows carry — and both live call sites pass
+  // ``v => `$${v.toFixed(2)}``` (tabs.jsx), which throws on a missing value,
+  // during render, so React drops the whole Costs tab rather than one bar.
+  // No payload does that TODAY: redux_api.py's shape_costs builds every
+  // by_project/by_role row with an explicit `total`. So this hardens an input
+  // the contract allows, rather than fixing an observed outage — the reason a
+  // throw is worth guarding anyway is that a blank bar degrades and a throw
   // does not.
   //
-  // Deriving the decision from the fraction is EXACT here, not approximate:
-  // `max` above is `plottableMax(values, 1)`, which is always finite and >= 1,
-  // so barFractions' degenerate-max path is unreachable from this component and
-  // `fraction === null` is precisely `!isPlottable(r[valueKey])`. That is the
-  // one non-obvious coupling in here, and it is what lets the decision be taken
-  // without reaching for `isPlottable` — a name the DF_SPARK_PATH destructure
-  // above does not bind, and binding it would force an index.html
-  // cache-buster bump for no reachable benefit.
+  // Branching on the fraction is EXACT, not approximate: `max` is
+  // `plottableMax(values, 1)`, always finite and >= 1, so barFractions'
+  // degenerate-max path is unreachable from here and `fraction === null` is
+  // precisely `!isPlottable(r[valueKey])`. That is why the decision needs no
+  // `isPlottable` — a name the DF_SPARK_PATH destructure above does not bind,
+  // and binding it would force an index.html cache-buster bump.
   //
-  // Lives inside the component, next to the fractions it reads, so the
-  // placeholder is visible at its point of use rather than delegated somewhere
-  // this component's own contract could not see it.
-  const valueText = (fraction, value, fmt) => (fraction === null ? '—' : fmt(value));
+  // Closes over `formatVal` rather than taking it as an argument: it is in
+  // lexical scope at both call sites, and one formatter per component is part
+  // of what keeps those two sites structurally identical.
+  const valueText = (fraction, value) => (fraction === null ? '—' : formatVal(value));
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       {rows.map((r, i) => {
@@ -385,7 +389,7 @@ function HBarChart({ rows, valueKey = 'total', labelKey = 'label', segments, for
             <div key={i}>
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
                 <span style={{ color: 'var(--fg-1)' }}>{r[labelKey]}</span>
-                <span className="mono" style={{ color: 'var(--fg-2)' }}>{valueText(f, r[valueKey], formatVal)}</span>
+                <span className="mono" style={{ color: 'var(--fg-2)' }}>{valueText(f, r[valueKey])}</span>
               </div>
               <div style={{ display: 'flex', height: 14, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
                 {segments.map((s, si) => {
@@ -396,11 +400,11 @@ function HBarChart({ rows, valueKey = 'total', labelKey = 'label', segments, for
                   //
                   // The tooltip goes through the same guard as the value cell.
                   // On this branch `sf` cannot be null — a holed segment never
-                  // gets here — so it is the two formatVal call sites staying
-                  // structurally IDENTICAL that matters: it is what stops the
-                  // raw call being reintroduced here by the next edit.
+                  // gets here — so what this buys is the two formatVal call
+                  // sites staying structurally IDENTICAL: that is what stops
+                  // the raw call being reintroduced here by the next edit.
                   return sf === null ? null : (
-                    <div key={s.key} title={`${s.label}: ${valueText(sf, r[s.key], formatVal)}`} style={{ width: `${sf * 100}%`, background: s.color }} />
+                    <div key={s.key} title={`${s.label}: ${valueText(sf, r[s.key])}`} style={{ width: `${sf * 100}%`, background: s.color }} />
                   );
                 })}
               </div>
@@ -411,7 +415,7 @@ function HBarChart({ rows, valueKey = 'total', labelKey = 'label', segments, for
           <div key={i}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
               <span style={{ color: 'var(--fg-1)' }}>{r[labelKey]}</span>
-              <span className="mono" style={{ color: 'var(--fg-2)' }}>{valueText(f, r[valueKey], formatVal)}</span>
+              <span className="mono" style={{ color: 'var(--fg-2)' }}>{valueText(f, r[valueKey])}</span>
             </div>
             <div style={{ height: 6, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
               {/* No measurement here -> NO fill div, while the row keeps its
