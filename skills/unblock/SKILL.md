@@ -39,25 +39,37 @@ just made visible:
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-claim \
   --name "unblock-<project>#<TASK_ID>" \
-  --slug "unblock-<project>-<TASK_ID>-${CLAUDE_PID:-$PPID}" \
   --policy warn-and-proceed
 ```
 
-**Never `$$` — it is both the wrong pid and an unusable slug.** Inside a Claude Code Bash tool call
-`$$` is the transient `/bin/bash -c` wrapper, dead the instant the call returns; the long-lived
-`claude` process is `$CLAUDE_PID` (fall back to `$PPID`) — verify with
-`ps -o comm= -p "${CLAUDE_PID:-$PPID}"`, which prints `claude`. A `$$` pid makes the lease's liveness
-guard inert (every holder reads as dead), and a `$$` slug is unusable as an identity because each
-Bash tool call gets a fresh one — so the release below would present a slug that never matches what
-you claimed with, and be refused. `${CLAUDE_PID:-$PPID}` is stable across tool calls (task 3994).
-`--pid` is now optional and resolves from `$CLAUDE_PID` inside the CLI; pass it only as an explicit
-operator override. With `$CLAUDE_PID` unset the CLI records **pid 0**, a never-alive sentinel that
-degrades the lease to heartbeat-only staleness (loudly logged) instead of recording an unrelated
-durable pid that would leave the lease unreapable forever.
+**Do not assemble the slug (or the pid) in shell — the CLI owns both.** `--slug` is optional and
+defaults to `<--name>-$CLAUDE_PID`; `--pid` is optional and resolves from `$CLAUDE_PID` the same way.
+Pass either only as a deliberate operator override. Both are derived rather than documented because
+the token decides whether the release below **acts or is refused**, and it must not depend on this
+document getting one shell token right (tasks 3994, 4248). It also has to be **re-derivable**, not
+carried: each Bash tool call is a fresh `/bin/bash -c`, so a `SLUG=$(...)` captured here would be gone
+by the time you release — hence the CLI re-derives it on every verb.
+
+**Never `$$`, and never `$PPID`.** Inside a Claude Code Bash tool call `$$` is the transient
+`/bin/bash -c` wrapper, dead the instant the call returns, which makes the lease's liveness guard
+inert (every holder reads as dead). `$PPID` is not stable across tool calls either (measured:
+1430433, then 1471645 on the next call, the first already dead), so a slug built on it would not
+match what your own release presents. The long-lived `claude` process is `$CLAUDE_PID` — verify with
+`ps -o comm= -p "$CLAUDE_PID"`, which prints `claude`.
+
+If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** naming both,
+rather than silently drifting to a slug your own later release would fail to match; the CLI will not
+invent one, because a synthesized token would be identical for every degraded session and let each
+act on the others' leases. Pass `--slug <stable-token>` to proceed, re-using the same token on the
+release. On that path the CLI records **pid 0**, a never-alive sentinel that degrades the lease to
+heartbeat-only staleness (loudly logged) instead of recording an unrelated durable pid that would
+leave the lease unreapable forever.
 
 (`<project>` is the same short project token used elsewhere for this task, e.g. the basename of
-`PROJECT_ROOT`.) Parse the printed lines (`decision=<acquired|proceed>`, message, then
-`holder_liveness=<none|held|orphaned>`):
+`PROJECT_ROOT`.) Parse the printed lines (`decision=<acquired|proceed>`, message,
+`holder_liveness=<none|held|orphaned>`, then `slug=<the slug this claim used>` — your own derived
+identity, a diagnostic to compare against `lease-show`'s `holder_slug`, never a value to carry into
+the release):
 
 - **`decision=proceed` with a holder reported in the message**: surface that line verbatim to the
   user — this is exactly the near-duplicate second-`/unblock`-on-the-same-task case (reify 06-28) —
@@ -87,13 +99,13 @@ session.
 
 **Release on exit.** When this `/unblock` session ends (Step 4.5 reflect, or an early stop), release
 the lease so it doesn't linger and falsely report a holder to the next `/unblock` on this task. The
-slug is **required** and must be the one you claimed with — a mismatch is refused, so one `/unblock`
-session can never release another's lease:
+release acts **only for the holder** — a mismatched slug is refused, so one `/unblock` session can
+never release another's lease. You do not pass the slug: the CLI derives the same one it derived at
+claim time, which is what makes the two match:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release \
-  --name "unblock-<project>#<TASK_ID>" \
-  --slug "unblock-<project>-<TASK_ID>-${CLAUDE_PID:-$PPID}"
+  --name "unblock-<project>#<TASK_ID>"
 ```
 
 It prints `result=<applied|forced|absent|refused|faulted>` first. `applied` = released; `absent` =

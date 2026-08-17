@@ -84,8 +84,7 @@ watcher. Run once, at session startup, not per cycle:
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-reap
 
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-claim \
-  --name recon-watcher-<project> --slug "recon-watcher-<project>-${CLAUDE_PID:-$PPID}" \
-  --policy stand-down
+  --name recon-watcher-<project> --policy stand-down
 ```
 
 **Why this watcher takes a lease (task 3994).** `recon-watch/run.sh` `exec`s a hand-launched
@@ -98,19 +97,35 @@ interactive single-owner-per-session shape, exactly like `escalation-watcher`. I
 a supervised, always-on rotation rather than a single-owner actor. The lease name is the one task
 2289 specified and that `build_lease_name('recon-watcher', '<project>')` already produces.
 
-**Never `$$` — it is both the wrong pid and an unusable slug.** Inside a Claude Code Bash tool call
-`$$` is the transient `/bin/bash -c` wrapper, dead the instant the call returns; the long-lived
-`claude` process is `$CLAUDE_PID` (fall back to `$PPID`) — verify with
-`ps -o comm= -p "${CLAUDE_PID:-$PPID}"`, which prints `claude`. A `$$` pid makes the liveness guard
-inert, and a `$$` slug differs on every tool call, so your own later heartbeat/release would be
-refused. `--pid` is optional (the CLI resolves it from `$CLAUDE_PID`) and is an operator override
-only. With `$CLAUDE_PID` unset the CLI records **pid 0**, a never-alive sentinel that degrades the
-lease to heartbeat-only staleness (loudly logged) rather than recording an unrelated durable pid that
-would make the lease unreapable forever; pass `--pid "$PPID"` if you want the body's pid to match the
-one in your slug.
+**Do not assemble the slug (or the pid) in shell — the CLI owns both.** `--slug` is optional and
+defaults to `<--name>-$CLAUDE_PID`; `--pid` is optional and resolves the same way. Pass either only
+as a deliberate operator override. Both are derived rather than documented because the token is
+load-bearing on every heartbeat and on the final release, and must not depend on this document
+getting one shell token right (tasks 3994, 4248). It has to be **re-derivable**, not carried: each
+Bash tool call is a fresh `/bin/bash -c`, so a `SLUG=$(...)` captured here would be gone by the next
+call — hence the CLI re-derives it on every verb.
+
+**Never `$$`, and never `$PPID`.** Inside a Claude Code Bash tool call `$$` is the transient
+`/bin/bash -c` wrapper, dead the instant the call returns, which makes the liveness guard inert.
+`$PPID` is not stable across tool calls either (measured: 1430433, then 1471645 on the next call,
+the first already dead), so a slug built on it would not match your own later heartbeat. The
+long-lived `claude` process is `$CLAUDE_PID` — verify with `ps -o comm= -p "$CLAUDE_PID"`, which
+prints `claude`.
+
+If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** naming both,
+rather than silently drifting to a slug your own later heartbeat would fail to match; the CLI will
+not invent one, because a synthesized token would be identical for every degraded session and let
+each act on the others' leases. Pass `--slug <stable-token>` to proceed, re-using it on every later
+lease verb. On that path the CLI records **pid 0**, a never-alive sentinel that degrades the lease to
+heartbeat-only staleness (loudly logged) rather than recording an unrelated durable pid that would
+make the lease unreapable forever.
 
 Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-readable message, then
-`holder_liveness=<none|held|orphaned>`.
+`holder_liveness=<none|held|orphaned>`, then `slug=<the slug this claim used>`.
+- **`slug=`** reports the identity the CLI derived for *you* (never the holder's). Quote it to the
+  user when useful, and compare it against `lease-show`'s `holder_slug` if a later heartbeat returns
+  `result=refused`. It is a **diagnostic only** — do not carry it into the next call; the CLI
+  re-derives it.
 - **`decision=acquired` or `decision=proceed`**: continue into the Main Loop. `proceed` is the
   fail-open outcome — a lease-substrate fault is logged loudly and reported as `proceed`, never a
   false `stand-down`, so a lease fault can never block the only consumer of this queue. An acquired
@@ -133,8 +148,12 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
   python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
     --id recon-watcher-lease-orphan-<project> --project <project> \
     --text "recon-watcher-<project> lease held by orphaned holder <holder_slug> (pid <holder_pid> not running, heartbeat <n>s ago); the 8103 queue has no live closer until it is reclaimed" \
-    --session-id "recon-watcher-<project>-${CLAUDE_PID:-$PPID}"
+    --session-id "recon-watcher-<project>-${CLAUDE_PID:-unknown}"
   ```
+
+  `--session-id` is a best-effort **provenance label** with no ownership semantics — unlike the lease
+  slug, which the CLI owns (above). It is deliberately not fail-loud: a watcher that cannot file a
+  DecisionRecord is strictly worse than one that files it with a degraded label.
 
   Never force-release on this evidence alone: `holder_liveness` is a single-signal pid probe, and a
   dead-*looking* holder that is merely quiet is the duplicate-spawn incident. This guard carries the
@@ -157,12 +176,13 @@ A fresh heartbeat means you **stand down** even when the pid reads as not runnin
 BOTH a dead pid AND a heartbeat past the TTL.
 
 **Heartbeat + release.** Touch the lease every Main Loop cycle (see "Starting the watcher" below),
-and release it when the session ends. Both verbs **require** the slug you claimed with — a mismatch
-is refused, so no other session can evict your lease or keep a dead one alive:
+and release it when the session ends. Both verbs act **only for the holder** — a mismatched slug is
+refused, so no other session can evict your lease or keep a dead one alive. You do not pass the slug:
+the CLI derives the same one it derived at claim time, which is what makes the two match:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release \
-  --name recon-watcher-<project> --slug "recon-watcher-<project>-${CLAUDE_PID:-$PPID}"
+  --name recon-watcher-<project>
 ```
 
 Both print `result=<applied|forced|absent|refused|faulted>` first: `applied` = done; `absent` = no
@@ -242,11 +262,12 @@ observes this one as alive and stands down:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
-  --name recon-watcher-<project> --slug "recon-watcher-<project>-${CLAUDE_PID:-$PPID}"
+  --name recon-watcher-<project>
 ```
 
 `result=refused` means your heartbeat did **not** land (you are not the holder) — investigate with
-`lease-show`, don't re-run with `--force`.
+`lease-show`, comparing its `holder_slug` against the `slug=` line your `lease-claim` printed; don't
+re-run with `--force`.
 
 **`result=absent` on a heartbeat means your lease is GONE**, not that the call was a harmless no-op:
 it was reaped after a TTL lapse or force-released by an operator, and you are now draining the 8103

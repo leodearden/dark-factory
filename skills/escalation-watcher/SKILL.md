@@ -47,34 +47,42 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 # Claim watcher-<project> (e.g. watcher-df) — STAND_DOWN policy: a live duplicate wins the lease
 # and this session must exit rather than run a second watch loop against the same project.
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-claim \
-  --name watcher-<project> --slug "watcher-<project>-${CLAUDE_PID:-$PPID}" --policy stand-down
+  --name watcher-<project> --policy stand-down
 ```
 
-**Never `$$` — it is both the wrong pid and an unusable slug.** Inside a Claude Code Bash tool call
-`$$` is the transient `/bin/bash -c` wrapper, dead the instant the call returns; the long-lived
-`claude` process is `$CLAUDE_PID` (fall back to `$PPID`). Verify with:
+**Do not assemble the slug (or the pid) in shell — the CLI owns both.** `--slug` is **optional** and
+defaults to `<--name>-$CLAUDE_PID`; `--pid` is optional and resolves from `$CLAUDE_PID` the same way.
+Pass either **only** as a deliberate operator override. Both are derived rather than documented for
+one reason (tasks 3994, 4248): the token is load-bearing on *every* heartbeat and on the final
+release, and it must not depend on this document getting one shell token right — which is exactly
+how it went wrong before. Note it must be **re-derivable**, not carried: each Bash tool call is a
+fresh `/bin/bash -c`, so a `SLUG=$(...)` you capture here is gone by the next call. That is why the
+CLI re-derives it on every verb instead of you passing it along.
+
+**Never `$$`, and never `$PPID`.** Inside a Claude Code Bash tool call `$$` is the transient
+`/bin/bash -c` wrapper, dead the instant the call returns. `$PPID` is **not** stable across tool
+calls either (measured: 1430433, then 1471645 on the next call, the first already dead) — a slug
+built on it would not match the one your own later heartbeat presents. The long-lived `claude`
+process is `$CLAUDE_PID`. Verify with:
 
 ```bash
-ps -o comm= -p "${CLAUDE_PID:-$PPID}"   # prints: claude
+ps -o comm= -p "$CLAUDE_PID"   # prints: claude
 ```
 
-This bit twice over (task 3994). A `$$` **pid** made the lease's liveness guard inert — every holder
-read as dead, so the lease silently degraded to a bare heartbeat TTL. A `$$` **slug** is worse now
-that ownership is enforced: every Bash tool call gets a fresh `$$`, so the slug you claimed with
-would never match the one your own later `lease-heartbeat`/`lease-release` present, and every one of
-them would be refused. `${CLAUDE_PID:-$PPID}` is stable across tool calls — that is exactly why it
-works as the slug.
-
-`--pid` is now **optional**: omitted, the CLI resolves it from `$CLAUDE_PID` itself, so the correct
-pid no longer depends on this document getting one shell token right. Pass `--pid <n>` only as a
-deliberate operator override. If `$CLAUDE_PID` is unset the CLI records **pid 0** — a sentinel that
-reads as never-alive, so the lease degrades to heartbeat-only staleness (loudly logged) rather than
-recording some other durable-but-unrelated pid that would make the lease unreapable forever. On that
-path the body's pid won't match the `$PPID` in your slug; pass `--pid "$PPID"` explicitly if you want
-the two to agree.
+If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** with a
+message naming both, rather than silently drifting to a slug your own later heartbeat would fail to
+match. The CLI deliberately will not invent one: a synthesized token would be identical for every
+degraded session, so each could act on the others' leases. Supply `--slug <stable-token>` to proceed
+(re-use the same token on every later lease verb). On that path the CLI records **pid 0** — a
+sentinel that reads as never-alive, so the lease degrades to heartbeat-only staleness (loudly
+logged) rather than recording some durable-but-unrelated pid that would make it unreapable forever.
 
 Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-readable message, then
-`holder_liveness=<none|held|orphaned>`.
+`holder_liveness=<none|held|orphaned>`, then `slug=<the slug this claim used>`.
+- **`slug=`** reports the identity the CLI derived for *you* (never the holder's). Quote it to the
+  user when useful, and compare it against `lease-show`'s `holder_slug` if a later heartbeat comes
+  back `result=refused`. It is a **diagnostic only** — do not carry it into the next call; the CLI
+  re-derives it.
 - **`decision=acquired` or `decision=proceed`**: continue into the Main Loop below. `proceed` is the
   fail-open outcome (see below) and is handled identically to `acquired`. An acquired claim prints
   `holder_liveness=none` — there is no contending holder, the lease is yours; a faulted (`proceed`)
@@ -96,8 +104,12 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
   python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
     --id watcher-lease-orphan-<project> --project <project> \
     --text "watcher-<project> lease held by orphaned holder <holder_slug> (pid <holder_pid> not running, heartbeat <n>s ago); no live L2 consumer until it is reclaimed" \
-    --session-id "watcher-<project>-${CLAUDE_PID:-$PPID}"
+    --session-id "watcher-<project>-${CLAUDE_PID:-unknown}"
   ```
+
+  `--session-id` is a best-effort **provenance label** with no ownership semantics — unlike the lease
+  slug, which the CLI owns (above). It is deliberately not fail-loud: a watcher that cannot file a
+  DecisionRecord is strictly worse than one that files it with a degraded label.
 
   Do **not** force-release it on this evidence alone — `holder_liveness` is a single-signal
   diagnostic, and a dead-*looking* holder that is merely quiet is the duplicate-spawn incident. This
@@ -139,13 +151,14 @@ logged loudly by `session_registry` and reported back as `decision=proceed` — 
 
 **Heartbeat + release.** Once claimed, touch the lease every Main Loop cycle (see "Starting the
 watcher" below) so it never appears stale to another session's claim attempt, and release it when
-the watch session ends (clean exit, or the human stops it). Both verbs **require** the slug you
-claimed with — a mismatch is refused, so no other session can evict your lease, and no stranger can
-keep a dead holder's lease alive forever:
+the watch session ends (clean exit, or the human stops it). Both verbs act **only for the holder** —
+a mismatched slug is refused, so no other session can evict your lease, and no stranger can keep a
+dead holder's lease alive forever. You do not pass the slug: the CLI derives the same one it derived
+at claim time (see "Claiming the Watcher Lease" above), which is what makes the two match:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release \
-  --name watcher-<project> --slug "watcher-<project>-${CLAUDE_PID:-$PPID}"
+  --name watcher-<project>
 ```
 
 Both print `result=<applied|forced|absent|refused|faulted>` as their first line:
@@ -289,14 +302,15 @@ Watcher Lease" above):
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
-  --name watcher-<project> --slug "watcher-<project>-${CLAUDE_PID:-$PPID}"
+  --name watcher-<project>
 ```
 
 This is what makes a second session's `lease-claim` observe this session as "alive" and stand down —
-there is no need to separately pgrep/ps-tree for other watcher processes. `--slug` must be the exact
-slug you claimed with; `result=refused` means you are not the holder and your heartbeat did **not**
-land — investigate with `lease-show` (see "Claiming the Watcher Lease" above) rather than repeating
-the call with `--force`.
+there is no need to separately pgrep/ps-tree for other watcher processes. The CLI re-derives your
+slug, so it matches the claim automatically; `result=refused` means you are not the holder and your
+heartbeat did **not** land — investigate with `lease-show` and compare its `holder_slug` against the
+`slug=` line your `lease-claim` printed (see "Claiming the Watcher Lease" above) rather than
+repeating the call with `--force`.
 
 **`result=absent` on a heartbeat is not idempotence — it means your lease is GONE** (reaped after a
 TTL lapse, or force-released by an operator). You are now running **un-leased**: a duplicate watcher
@@ -370,7 +384,7 @@ already reads it breaks.
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
   --id <stable-id> --project <project> --text "<one-line question>" \
   [--task-id <task_id>] [--escalation-id <escalation_id>] \
-  [--session-id "watcher-<project>-${CLAUDE_PID:-$PPID}"] \
+  [--session-id "watcher-<project>-${CLAUDE_PID:-unknown}"] \
   [--severity <esc.severity>] [--escalations-dir <project_root>/data/escalations]
 ```
 
