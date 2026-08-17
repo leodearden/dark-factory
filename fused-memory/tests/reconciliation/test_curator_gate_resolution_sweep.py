@@ -14,6 +14,9 @@ Covers:
 - curator_gate_source / CURATOR_GATE_SOURCE_TEMPLATE: the single owner of the
   ``curator_gate_{task_id}`` source-key spelling — the one load-bearing
   string of this task.
+- extract_open_gate_task_ids: pure selector that reads
+  ``FilteredTaskTree.active_tasks`` and returns the sorted, deduped str ids
+  of tasks carrying ``metadata.operational_mode == 'gate'``.
 """
 
 from __future__ import annotations
@@ -21,7 +24,9 @@ from __future__ import annotations
 from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     CURATOR_GATE_SOURCE_TEMPLATE,
     curator_gate_source,
+    extract_open_gate_task_ids,
 )
+from fused_memory.reconciliation.task_filter import FilteredTaskTree
 
 
 class TestCuratorGateSource:
@@ -59,3 +64,112 @@ class TestCuratorGateSource:
         assert CURATOR_GATE_SOURCE_TEMPLATE == 'curator_gate_{task_id}', (
             f'template spelling drifted; got {CURATOR_GATE_SOURCE_TEMPLATE!r}'
         )
+
+
+class TestExtractOpenGateTaskIds:
+    """extract_open_gate_task_ids(tasks) selects operational_mode == 'gate' tasks.
+
+    Inputs are built as ``FilteredTaskTree(active_tasks=[...])`` and the
+    ``active_tasks`` field is passed, mirroring how
+    ``extract_stalled_gate_backlog_task_ids`` is exercised — that helper is
+    the live proof that ``task['metadata']`` is reachable as a dict on those
+    dicts.  Restricting to ``active_tasks`` excludes done/cancelled gates for
+    free.  The match is deliberately value-sensitive and exact, mirroring
+    ``TaskInterceptor._is_gate_metadata``.
+    """
+
+    def test_selects_only_operational_mode_gate_tasks(self):
+        """A gate task is selected; a non-gate task alongside it is not."""
+        tree = FilteredTaskTree(active_tasks=[
+            {'id': 5561, 'status': 'blocked', 'metadata': {'operational_mode': 'gate'}},
+            {'id': 4242, 'status': 'pending', 'metadata': {'operational_mode': 'llm'}},
+        ])
+
+        result = extract_open_gate_task_ids(tree.active_tasks)
+
+        assert result == ['5561'], (
+            f'only operational_mode == "gate" tasks may be selected, got {result!r}'
+        )
+
+    def test_excludes_missing_empty_and_modeless_metadata(self):
+        """No metadata key, empty metadata, and metadata without operational_mode all skip."""
+        tree = FilteredTaskTree(active_tasks=[
+            {'id': 1, 'status': 'blocked'},
+            {'id': 2, 'status': 'blocked', 'metadata': {}},
+            {'id': 3, 'status': 'blocked', 'metadata': {'execution_class': 'operational'}},
+            {'id': 4, 'status': 'blocked', 'metadata': {'operational_mode': 'gate'}},
+        ])
+
+        result = extract_open_gate_task_ids(tree.active_tasks)
+
+        assert result == ['4'], (
+            'absent/empty/mode-less metadata must never select a task, got '
+            f'{result!r}'
+        )
+
+    def test_operational_mode_match_is_value_sensitive(self):
+        """operational_mode='llm' is NOT a gate — the match is exact, not truthy."""
+        tree = FilteredTaskTree(active_tasks=[
+            {'id': 7, 'status': 'pending', 'metadata': {'operational_mode': 'llm'}},
+            {'id': 8, 'status': 'pending', 'metadata': {'operational_mode': 'GATE'}},
+            {'id': 9, 'status': 'pending', 'metadata': {'operational_mode': None}},
+        ])
+
+        result = extract_open_gate_task_ids(tree.active_tasks)
+
+        assert result == [], (
+            'the operational_mode comparison must be an exact == "gate" match '
+            f'(mirroring TaskInterceptor._is_gate_metadata), got {result!r}'
+        )
+
+    def test_skips_non_dict_metadata_without_raising(self):
+        """A str/list/None metadata value is skipped, not fed to .get()."""
+        tree = FilteredTaskTree(active_tasks=[
+            {'id': 1, 'metadata': 'operational_mode=gate'},
+            {'id': 2, 'metadata': ['gate']},
+            {'id': 3, 'metadata': None},
+            {'id': 4, 'metadata': {'operational_mode': 'gate'}},
+        ])
+
+        result = extract_open_gate_task_ids(tree.active_tasks)
+
+        assert result == ['4'], (
+            f'non-dict metadata must be skipped without raising, got {result!r}'
+        )
+
+    def test_skips_non_dict_tasks_and_none_ids(self):
+        """A non-dict element, and a gate task whose id is None, contribute nothing."""
+        tree = FilteredTaskTree(active_tasks=[
+            'not-a-dict',  # type: ignore[list-item]
+            None,  # type: ignore[list-item]
+            {'id': None, 'metadata': {'operational_mode': 'gate'}},
+            {'metadata': {'operational_mode': 'gate'}},
+            {'id': 12, 'metadata': {'operational_mode': 'gate'}},
+        ])
+
+        result = extract_open_gate_task_ids(tree.active_tasks)
+
+        assert result == ['12'], (
+            'non-dict tasks and gates with a missing/None id must be skipped — a '
+            f'spurious id would query the wrong source key; got {result!r}'
+        )
+
+    def test_coerces_int_ids_and_returns_sorted_deduped(self):
+        """int ids coerce to str; the result is sorted and deduped."""
+        tree = FilteredTaskTree(active_tasks=[
+            {'id': 5563, 'metadata': {'operational_mode': 'gate'}},
+            {'id': '5561', 'metadata': {'operational_mode': 'gate'}},
+            {'id': 5561, 'metadata': {'operational_mode': 'gate'}},
+        ])
+
+        result = extract_open_gate_task_ids(tree.active_tasks)
+
+        assert result == ['5561', '5563'], (
+            'int and str spellings of one id must collapse, and the result must '
+            f'be sorted; got {result!r}'
+        )
+
+    def test_empty_input_returns_empty_list(self):
+        """No active tasks -> []."""
+        assert extract_open_gate_task_ids(FilteredTaskTree().active_tasks) == []
+        assert extract_open_gate_task_ids([]) == []
