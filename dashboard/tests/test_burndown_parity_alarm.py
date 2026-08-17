@@ -13,9 +13,11 @@ Two halves:
   alarm is fixture-testable with no DB, no clock and no config I/O.
 
 The cap is compared PER SNAPSHOT against the cap stored on that snapshot.
-``max_concurrent_tasks`` is green-tier hot-reloadable, so re-deriving one
-"current" cap and applying it across history would forgive a past breach
-after a cap raise and invent one after a cut.
+``max_concurrent_tasks`` is restart-only (red-tier), but a burndown window
+spans restarts and the cap also varies between projects, so it is
+TIME-VARYING across the window regardless: re-deriving one "current" cap and
+applying it across history would forgive a past breach after a cap raise and
+invent one after a cut.
 """
 
 from __future__ import annotations

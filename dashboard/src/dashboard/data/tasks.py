@@ -297,7 +297,17 @@ async def fetch_statuses(
 ) -> Mapping[Any, Any]:
     """Fetch a compact ``{int(id): status}`` map for *project_root* via MCP.
 
-    Used by the burndown collector — ~95% smaller than ``fetch_tasks``.
+    ~95% smaller than ``fetch_tasks``, so it is the right seam for a
+    status-only caller.  The sole consumer today is
+    ``active_tasks.collect_done_counts``, which needs nothing but a per-status
+    count.
+
+    NOTE: the burndown collector used to be the headline consumer and is NOT
+    one any more — ``burndown.collect_snapshot`` moved to ``fetch_tasks`` in
+    task 3543 because this compact map carries no claimant columns, so the
+    live/stranded split is physically underivable from it.  (The mirror of
+    this note lives on ``collect_done_counts``; keep the two in step.)
+
     Returns ``{'offline': True, 'error': str}`` if every server fails.
     """
     project_root_str = str(project_root)

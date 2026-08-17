@@ -1198,10 +1198,12 @@ function BurnTab({ projectFilter, displayWindow }) {
   const allOpen = projIds.every(p => openMap[p]);
 
   // Concurrency-parity banner (E12). The verdict is computed server-side, where
-  // each snapshot is judged against the cap stored ON that snapshot — the cap is
-  // hot-reloadable, so re-deriving it here from the rendered series would forgive
-  // a real past breach after a raise and invent one after a cut. This renders the
-  // verdict and nothing else.
+  // each snapshot is judged against the cap stored ON that snapshot.
+  // max_concurrent_tasks is restart-only (red-tier), but a burndown window spans
+  // restarts and the cap also varies between projects, so it is TIME-VARYING
+  // across the window regardless: re-deriving one cap here from the rendered
+  // series would forgive a real past breach after a raise and invent one after a
+  // cut. This renders the verdict and nothing else.
   const parityBanner = (block, projects) => {
     if (!block || !block.parity_alarm) return null;
     const n = block.parity_breach_count ?? 0;
