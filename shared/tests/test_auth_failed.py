@@ -18,7 +18,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig, UsageCapConfig
+from shared.invocation_outcome import auth_failure_reason, classify_invocation
 from shared.usage_gate import AccountState, UsageGate
 
 
@@ -88,6 +90,25 @@ class TestAuthFailedPersistsResetsAt:
     text contains a "resets …" phrase. Source of truth for cap-time parsing
     is the gate's _parse_resets_at; the dashboard reads what we persist
     rather than re-parsing the reason string itself.
+
+    DECIDED SHAPE (task 4042) — do not "helpfully" re-disable this branch.
+    Restoring the 401/403 response-body snippet re-armed the ``'resets' in
+    reason.lower()`` branch in ``_handle_auth_failure``, which was unreachable
+    dead code while the reason was always the bare ``HTTP 401``. Two halves are
+    deliberately pinned here:
+
+      1. The branch IS allowed to fire — a 401/403 body carrying a genuinely
+         parseable "resets in 3h" persists a REAL ETA. The line predates the
+         regression (93baf1193a < b68eea415b), so suppressing it would invent
+         new behaviour.
+      2. An UNPARSEABLE "resets" hint persists NOTHING rather than a fabricated
+         hour. The branch's original parser was the forked
+         ``usage_gate._parse_resets_at``, which returns ``now + 1h`` on parse
+         failure; the dashboard (``dashboard/data/costs.py::_extract_resets_at``)
+         surfaces the persisted value verbatim as a real reset ETA, so that
+         would put a fabricated recovery time on a revoked token — violating
+         PRD 7.1.a ("an unknown reset time must be reported as explicitly
+         unknown, never fabricated").
     """
 
     def _capture_fired_details(self, gate: UsageGate) -> list[tuple[str, str, str]]:
@@ -183,6 +204,65 @@ class TestAuthFailedPersistsResetsAt:
         details = json.loads(details_json)
         assert 'resets_at' not in details
         assert details['reason'] == 'HTTP 403: token has been revoked'
+
+    def test_unparseable_resets_hint_persists_no_resets_at(self):
+        """Half 2 of the decided shape: a "resets" substring with no parseable
+        phrase must persist NOTHING, not a fabricated now+1h.
+        """
+        import json
+        gate = _make_gate(['a'])
+        captured = self._capture_fired_details(gate)
+        reason = 'HTTP 401: your admin resets access quarterly'
+        gate._handle_auth_failure(reason, oauth_token='fake-token-a')
+        _, _, details_json = captured[0]
+        details = json.loads(details_json)
+        assert 'resets_at' not in details
+        assert details['reason'] == reason
+
+    def test_parseable_resets_in_401_body_persists_real_resets_at(self):
+        """Half 1 of the decided shape: the branch is deliberately allowed to
+        fire, so a genuinely parseable reset time in a 401 body is surfaced.
+        """
+        import json
+        from datetime import datetime as _dt
+        from datetime import timedelta as _td
+        gate = _make_gate(['a'])
+        captured = self._capture_fired_details(gate)
+        before = _dt.now(UTC)
+        gate._handle_auth_failure(
+            'HTTP 401: token rejected, quota resets in 3h',
+            oauth_token='fake-token-a',
+        )
+        _, _, details_json = captured[0]
+        details = json.loads(details_json)
+        assert 'resets_at' in details
+        assert details['resets_at'].endswith('+00:00')
+        parsed = _dt.fromisoformat(details['resets_at'])
+        # Generous window so this cannot flake on the real wall clock.
+        assert before + _td(hours=2, minutes=50) <= parsed <= before + _td(hours=3, minutes=10)
+
+    def test_pure_revocation_body_persists_reason_but_no_resets_at(self):
+        """End-to-end through the real seam: classifier -> reason renderer ->
+        gate. The restored snippet must reach PERSISTED state (the whole point
+        of task 4042), and a revocation body carries no reset ETA.
+        """
+        import json
+        gate = _make_gate(['a'])
+        captured = self._capture_fired_details(gate)
+        result = AgentResult(
+            success=False,
+            output=(
+                '{"type":"error","error":{"type":"authentication_error",'
+                '"message":"OAuth token has been revoked"}}'
+            ),
+            api_error_status=401,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        gate._handle_auth_failure(auth_failure_reason(outcome), oauth_token='fake-token-a')
+        _, _, details_json = captured[0]
+        details = json.loads(details_json)
+        assert 'OAuth token has been revoked' in details['reason']
+        assert 'resets_at' not in details
 
 
 @pytest.mark.asyncio
