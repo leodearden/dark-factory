@@ -165,16 +165,23 @@ the branch's newest commit is older than *max_worktree_age_hours* (default:
 production caller overrides it, so the signal must default on to ever
 resolve without caller wiring). Passing ``None`` or any non-positive value
 disables the check entirely. When ``worktree_stale`` is True AND
-``orchestrator_live`` is False, ``is_live`` is downgraded to False and the
-result is flagged ``indeterminate=True`` — the same semantics as the
-task-2963 gate above, and the two are ORed together (they cannot conflict,
-since both produce identical output). ``orchestrator_live`` is deliberately
-required False so worktree age alone never overrides a live project-wide
-lock; in practice, ``_orchestrator_signal_ineligible``'s rule 1 is what makes
-the gate reachable for ``deferred``/``done``/``cancelled`` tasks holding a
-lingering registration. Like every signal in this module, ``worktree_stale``
-is fail-safe toward live: an absent/unparseable commit timestamp, an unknown
-own-commit count, or a disabled threshold all leave it False.
+``orchestrator_live`` is False AND the caller has not supplied
+``corroborated=True``, ``is_live`` is downgraded to False and the result is
+flagged ``indeterminate=True`` — the same semantics as the task-2963 gate
+above, and the two are ORed together (they cannot conflict, since both
+produce identical output). ``orchestrator_live`` is deliberately required
+False so worktree age alone never overrides a live project-wide lock; in
+practice, ``_orchestrator_signal_ineligible``'s rule 1 is what makes the gate
+reachable for ``deferred``/``done``/``cancelled`` tasks holding a lingering
+registration. The ``corroborated is not True`` conjunct extends the 2963
+gate's "any one fresh per-task signal keeps it live" contract to this gate:
+a caller-supplied positive corroboration (fresh claimant heartbeat, scheduler
+holder/park, or post-restart routing decision) is never overridden by branch
+age alone; ``corroborated is None`` (the default) or ``False`` leaves the
+gate's reachability as described above. Like every signal in this module,
+``worktree_stale`` is fail-safe toward live: an absent/unparseable commit
+timestamp, an unknown own-commit count, or a disabled threshold all leave it
+False.
 
 Branch convention: ``task/<task_id>`` (matches the orchestrator's worktree naming).
 Injectable ``now`` for deterministic tests.
@@ -288,26 +295,21 @@ class WorkflowLiveness:
             lingering ``worktree_registered`` (no ``recent_commit``), for
             which the caller supplied ``corroborated=False`` (no fresh
             per-task signal); and (2) the stale-worktree gate (task 3947) —
-            ``worktree_stale`` is True (a registered worktree with no recent
-            commit whose branch tip predates ``max_worktree_age_hours``) and
-            ``orchestrator_live`` is False. This is SEMANTICALLY DISTINCT
-            from an all-signals-false genuine not-live result (``indeterminate``
+            see the module docstring's "Stale worktree registrations" section
+            for its full definition. This is SEMANTICALLY DISTINCT from an
+            all-signals-false genuine not-live result (``indeterminate``
             False): the former had a worktree/orchestrator signal but no
             corroboration — stranded but was dispatched — while the latter
             never had any signal. Both carry ``is_live=False`` so ``if
             is_live`` consumers stop treating the task as owned, permitting
             the stranded-remediation path. Always False unless one of the
             gates fired.
-        worktree_stale: True only when a LIVE (non-prunable) worktree is
-            registered for ``branch``, the branch carries commits of its own
-            beyond ``base_branch``, and its newest commit is older than
-            ``max_worktree_age_hours`` (task 3947). ``worktree_registered``
-            itself is NEVER rewritten by this signal — it keeps reporting
-            exactly what git reports; staleness is a separate,
-            policy-thresholded judgement about the branch. Positive-evidence
-            only: an absent/unparseable tip timestamp, an unknown own-commit
-            count, or a disabled threshold (``None`` or non-positive) all
-            fail safe to False. Always False unless every conjunct holds.
+        worktree_stale: Companion signal (task 3947) that can downgrade a
+            stale-but-still-registered worktree's contribution to
+            ``is_live``. ``worktree_registered`` itself is NEVER rewritten by
+            this signal. See the module docstring's "Stale worktree
+            registrations" section for the full definition and fail-safe
+            contract.
     """
 
     is_live: bool
@@ -345,20 +347,15 @@ def detect_live_workflow(
             tests for determinism.
         max_commit_age_hours: Commits newer than this many hours count as recent.
         max_worktree_age_hours: Age threshold (hours) for the ``worktree_stale``
-            companion signal (task 3947): a registered worktree with no
-            ``recent_commit`` whose branch tip is older than this is stale.
+            companion signal and its ``is_live`` downgrade gate (task 3947).
             Defaults to :data:`DEFAULT_MAX_WORKTREE_AGE_HOURS` (168 h / 7
-            days) — deliberately ON by default, unlike the opt-in
-            ``corroborated``/``pure_gate`` verdicts, because no production
-            caller overrides it; leaving it opt-in would leave the signal
-            exactly as unreachable as before this task. Pass ``None`` or any
-            non-positive value to disable the check entirely (fail-safe
-            toward live). Independent of *max_commit_age_hours*: the two
-            windows overlapping is harmless, since a commit inside
-            *max_commit_age_hours* sets ``recent_commit`` True, which the
-            stale-gate computation requires False. No consumer wiring is
-            required for this parameter to take effect — all three
-            production callers of this detector read only ``is_live``.
+            days, deliberately ON — see the module docstring's "Stale
+            worktree registrations" section for the full rationale and
+            fail-safe contract). Pass ``None`` or any non-positive value to
+            disable the check entirely. Independent of *max_commit_age_hours*
+            — a commit inside that window sets ``recent_commit`` True, which
+            the stale-gate computation requires False, so the two windows
+            overlapping is harmless.
         branch_prefix: Branch name prefix; combined with *task_id* to form the
             branch name (e.g. ``"task/4321"``).
         base_branch: The branch *branch* is created from.  Used to compute the
@@ -434,7 +431,10 @@ def detect_live_workflow(
             (the render-time Live-Workflow Signals section),
             ``recon_write_policy.check``'s Gate 2 (via its
             ``_corroboration_verdict`` helper), and ``reconciliation/harness.py``'s
-            integrity-escalation gate over cited tasks.
+            integrity-escalation gate over cited tasks. ``corroborated is
+            True`` also inhibits the stale-worktree downgrade gate (task
+            3947, see the module docstring) — a caller-supplied positive
+            corroboration is never overridden by branch age alone.
         _orchestrator_live: Pre-computed project-level orchestrator-lock result.
             When provided, skips the ``is_orchestrator_live_for(project_root)``
             call — use this to hoist the constant project-level check out of
@@ -495,20 +495,12 @@ def detect_live_workflow(
         branch_bare = own_commit_count == 0
     recent_commit = recent_commit and not branch_bare
 
-    # worktree_stale (task 3947): a LIVE worktree is registered, there is no
-    # recent commit, and the branch's tip predates max_worktree_age_hours.
-    # worktree_registered is NOT rewritten here — it keeps reporting the raw
-    # git fact; staleness is a separate, policy-thresholded companion signal.
-    #
-    # The rev-list confirmation below is a REQUIRED third conjunct, not an
-    # optimization: `last_commit_at` is the branch's TIP timestamp, and for a
-    # bare branch (zero commits beyond base_branch) that tip IS the
-    # base-branch commit — its age describes base_branch, not this worktree.
-    # Without this check an old `main` tip could mark a freshly-created
-    # worktree stale instantly. It is evaluated LAST, only once the cheap age
-    # conjuncts have already passed, and reuses the memoized
-    # _own_commit_count() above, so the common already-live path (and the
-    # common not-yet-stale path) pays no extra subprocess call.
+    # worktree_stale (task 3947): see the module docstring's "Stale worktree
+    # registrations" section for the full rule and rationale. The rev-list
+    # confirmation is a REQUIRED conjunct (not an optimization — a bare
+    # branch's tip is the base-branch commit, not task work), evaluated LAST
+    # via the memoized _own_commit_count() above so the common already-live/
+    # not-yet-stale paths pay no extra subprocess call.
     worktree_stale = False
     if (
         worktree_registered
@@ -567,24 +559,27 @@ def detect_live_workflow(
         and corroborated is False
     )
 
-    # Stale-worktree downgrade gate (task 3947). A registered worktree has no
-    # expiry of its own — only `git worktree remove`/prune clears it — so
-    # before this gate, no elapsed-time condition could ever flip
-    # worktree_registered False, and any standing policy waiting on that
-    # signal to resolve was structurally unreachable (it does now, once
-    # worktree_stale fires). `not orchestrator_live` is deliberately required
-    # so worktree age alone never overrides a live project-wide lock — this
-    # composes with, and runs after, the _orchestrator_signal_ineligible
-    # block above, whose rule 1 is what makes the gate reachable in practice:
-    # for a `deferred`/`done`/`cancelled` task holding a lingering
-    # registration, rule 1 has already zeroed orchestrator_live, so a stale
-    # worktree is free to downgrade is_live on its own. worktree_stale already
-    # implies worktree_registered and not recent_commit, so no extra
-    # conjuncts are needed here — the gate fires exactly when a stale
-    # registration is the SOLE remaining liveness signal. Both this gate and
-    # the 2963 gate above produce identical (is_live=False,
-    # indeterminate=True) semantics, so ORing them cannot conflict.
-    stale_gate_fires = worktree_stale and not orchestrator_live
+    # Stale-worktree downgrade gate (task 3947) — see the module docstring's
+    # "Stale worktree registrations" section for the full rationale. Mirrors
+    # the 2963 gate's (is_live=False, indeterminate=True) semantics, so ORing
+    # them cannot conflict. `corroborated is not True` extends the 2963
+    # gate's "any one fresh per-task signal keeps it live" contract here too,
+    # so a caller-supplied positive corroboration is never overridden by
+    # branch age alone.
+    stale_gate_fires = worktree_stale and not orchestrator_live and corroborated is not True
+
+    if stale_gate_fires:
+        # Loud, not silent: this is the one path in the module that flips a
+        # signal AGAINST liveness (every other fail-safe branch here logs at
+        # debug). last_commit_at is guaranteed non-None whenever worktree_stale
+        # is True (see _worktree_age_exceeded), but the age is recomputed via
+        # `is not None` rather than assumed, for the type checker's benefit.
+        age = (reference - last_commit_at) if last_commit_at is not None else None
+        logger.info(
+            'live_workflow_detector: stale-worktree downgrade for branch=%s '
+            'last_commit_at=%s age=%s threshold_hours=%s',
+            branch, last_commit_at, age, max_worktree_age_hours,
+        )
 
     if gate_fires or stale_gate_fires:
         is_live = False
