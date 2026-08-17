@@ -782,6 +782,7 @@ class TestWorktreeLedgerViolations:
 
         assert len(violations) == 1
         v = violations[0]
+        assert str(wt.resolve()) in v
         assert 'scheduled for automatic reclaim' in v
         # Names the age at which reclaim comes due, so the reader can tell how
         # long the self-healing window still has to run.
