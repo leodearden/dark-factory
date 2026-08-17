@@ -928,7 +928,7 @@ def _resolve_check_exit_code(
     report: dict,
     max_backlog: int,
     *,
-    fail_on_blind_spot: bool = False,
+    fail_on_blind_spot: bool = True,
 ) -> int:
     """Resolve --check's exit code from a sweep report.
 
@@ -1107,7 +1107,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--fail-on-blind-spot', dest='fail_on_blind_spot',
-        action='store_true', default=False,
+        action='store_true', default=None,
         help=(
             'REQUIRES --check (rejected at parse time without it). Escalate '
             'an OBSERVED enumeration blind spot (this sweep matched 0 records '
@@ -1169,6 +1169,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             'or drop --fail-on-blind-spot: the blind spot is reported in the '
             "log and in the JSON report's cross_check block either way."
         )
+    # Resolve the tri-state sentinel AFTER the validation above (task 3923).
+    # Order is load-bearing: the rejection keys on the flag having been
+    # passed EXPLICITLY, so resolving first would make the nightly
+    # `--apply --terminal-drain` invocation (which passes neither spelling,
+    # and never reaches _resolve_check_exit_code anyway) fail parse with
+    # exit 2 under a default it never asked for.
+    if args.fail_on_blind_spot is None:
+        args.fail_on_blind_spot = True
     return args
 
 
