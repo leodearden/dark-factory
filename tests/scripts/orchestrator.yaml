@@ -177,27 +177,67 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # investigation cycle before the steward reproduced it clean and found no
 # standing outage.
 #
-# NARROWED, NOT ELIMINATED (amendment pass, task 3842). The `pyright`
-# resolved here is pyright-python (PyPI, installed into the shared venv),
-# which does not bundle the type checker itself: its install_pyright()
-# (site-packages/pyright/_utils.py) npm-installs into a version-keyed
-# ~/.cache/pyright-python/<version>/node_modules the FIRST time that
-# version runs, and skips npm on every run after — so a WARM run (the
-# steady state, and what the 1.1.408/1.1.411 measurements below reflect) is
-# npm-free, which is the real gain. A COLD one — e.g. the first run after
-# `uv lock --upgrade` bumps pyright-python past shared/pyproject.toml's
-# unpinned `pyright>=1.1.404` floor — still shells out to the same `npm`
-# binary and the same global $HOME state (~/.npm/_logs, the exact path
-# esc-3473-2's failure named, is npm-global, not per-project), so it is not
-# immune to that failure class, only far less exposed to it: once per
-# version bump instead of on every invocation. Lines 122-130 above already
-# document `scripts` and `tests/scripts` being gathered CONCURRENTLY in one
-# worktree with no dedupe by command; a cold-cache run of this command can
-# in principle land in that same window. Recorded per this file's own
-# standard (lines 144-146) rather than left a silent hazard to rediscover;
-# not closed here — closing it would mean pinning PYRIGHT_PYTHON_CACHE_DIR
-# per worktree or the pyright-python version, and task 3842 was scoped to
-# the invocation switch only.
+# NPM IS NOT INVOKED AT ALL under this repo's default configuration —
+# correcting the "NARROWED, NOT ELIMINATED" claim task 3842's own
+# amendment pass made for this same block, found wrong by this task's
+# review pass. That claim said pyright-python does not bundle the type
+# checker, and that a cold run after a version bump still shells out to
+# `npm` and could race concurrent verify legs. Both are wrong, refuted
+# here by reading site-packages/pyright/_utils.py and site-packages/
+# pyright/_version.py in this worktree, not by inference. Replaced rather
+# than merely softened, and said so rather than silently rewritten — this
+# file's own lines 144-146 standard is to record a mistake found, not
+# leave a weakened-but-still-wrong claim standing.
+#
+# `pyright` resolved here IS pyright-python (PyPI), but it DOES bundle
+# the type checker in this install: site-packages/pyright/dist exists.
+# install_pyright() checks, before ever touching `cache_dir =
+# ROOT_CACHE_DIR / version` or shelling out to `npm`: `if version ==
+# __pyright_version__ and env_to_bool('PYRIGHT_PYTHON_USE_BUNDLED_PYRIGHT',
+# default=True):`, and returns the bundled dist directory when it exists.
+# With no PYRIGHT_PYTHON_* variable set anywhere in this repo or
+# environment, `_get_configured_pyright_version()` returns
+# `__pyright_version__` (pinned to '1.1.408' by this install's
+# site-packages/pyright/_version.py), so the condition holds, the bundled
+# dist exists, and `npm` is NEVER invoked to resolve this command — not
+# on a warm run, not on a cold one. There is no "first run after `uv lock
+# --upgrade`" that reaches the npm branch: a bumped pyright-python wheel
+# ships its own matching bundled dist.
+#
+# `npm` re-enters ONLY under a non-default environment:
+# PYRIGHT_PYTHON_FORCE_VERSION set to anything but this wheel's own
+# pinned version (including `latest`), PYRIGHT_PYTHON_PYLANCE_VERSION
+# set, PYRIGHT_PYTHON_USE_BUNDLED_PYRIGHT=0, or a future pyright-python
+# release shipped without `dist`. None of those hold anywhere in this
+# repo today.
+#
+# EMPIRICAL PROOF, not just the code path read above: ~/.cache/pyright-
+# python/ holds version dirs for 1.1.409, 1.1.410 and 1.1.411 (each a
+# real `npm install` result, with node_modules) plus `off` (package.json
+# only — a FAILED `npm install pyright@off`, producible only by
+# explicitly setting PYRIGHT_PYTHON_FORCE_VERSION=off), but NO 1.1.408
+# dir, despite this exact command having run repeatedly in this
+# worktree. The npm cache was never populated by this command; those
+# dirs are leftovers from a non-default environment at some other time,
+# not counter-evidence.
+#
+# The ACTUAL residual is far weaker than what this block used to claim:
+# on every non-quiet, non---outputjson run, `_should_warn_version()` —
+# reached before the bundled-dist check above, not after it — calls
+# `utils.get_latest_version()`: one HTTPS GET to
+# https://pypi.org/pypi/pyright/json, timeout=1, `@lru_cache`d per
+# process, returning None (fails soft) on any exception. It cannot turn
+# this leg red and writes nothing under $HOME. It IS observable today, at
+# rc=0: this leg's stdout currently includes "WARNING: there is a new
+# pyright version available (v1.1.408 -> v1.1.411)." — silenceable with
+# PYRIGHT_PYTHON_IGNORE_WARNINGS, not done here since it is cosmetic, not
+# a reliability concern. Recorded per this file's own standard (lines
+# 144-146) rather than left a silent surprise.
+#
+# Also corrected: pyright does not run from "the shared venv" — it
+# resolves from the WORKSPACE-ROOT .venv (verified: `uv run --project
+# shared which pyright` -> <worktree>/.venv/bin/pyright; shared/.venv
+# does not exist).
 #
 # --project shared mirrors this file's own test_command/lint_command pairing
 # above (no --directory, so cwd stays at the worktree root and this directory
