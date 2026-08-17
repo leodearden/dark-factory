@@ -374,3 +374,84 @@ class TestAddMemoryStampsReferents:
         assert payload['source_description'] == 'add_memory:decisions_and_rationale'
         assert '_causation_id' in payload
         assert '_write_op_id' in payload
+
+
+class TestAddEpisodeStampsReferents:
+    """The second producer. `add_episode` deliberately never persists a
+    metadata argument — the same fact that forced task 3142's
+    `unverified_claim` onto this payload channel — so the derived scan is the
+    only live source here."""
+
+    @pytest.mark.asyncio
+    async def test_derived_from_content(self, service):
+        await service.add_episode(
+            content='Task 3127 was merged', project_id='dark_factory',
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_content_stamps_an_explicit_empty_set(self, service):
+        await service.add_episode(
+            content='the merge-lane hardening work', project_id='dark_factory',
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {'source': 'none', 'refs': []}
+
+    @pytest.mark.asyncio
+    async def test_never_reaches_the_metadata_source(self, service):
+        """Documents the asymmetry with add_memory: this producer has no
+        metadata parameter to bridge from, so 'metadata' is structurally
+        unreachable no matter what the prose says."""
+        for content in ('Task 3127 was merged', 'an ordinary note'):
+            service.durable_queue.enqueue.reset_mock()
+            await service.add_episode(content=content, project_id='dark_factory')
+
+            payload = service.durable_queue.enqueue.call_args[1]['payload']
+            assert payload['referents']['source'] in ('derived', 'none')
+
+    @pytest.mark.asyncio
+    async def test_every_preexisting_payload_key_survives(self, service):
+        """The referent set is ADDITIVE, never a replacement."""
+        await service.add_episode(
+            content='Task 3127 was merged',
+            project_id='dark_factory',
+            agent_id='a1',
+            session_id='s1',
+            source_description='notes',
+            causation_id='c1',
+            temporal_context='planning',
+            unverified_claim=True,
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        for key in (
+            'uuid', 'name', 'content', 'source', 'group_id', 'source_description',
+            'project_id', 'agent_id', 'session_id', '_causation_id', '_write_op_id',
+            'temporal_context', 'unverified_claim', 'reference_time',
+        ):
+            assert key in payload, f'{key} was dropped from the payload'
+        assert payload['content'] == 'Task 3127 was merged'
+        assert payload['source'] == 'text'
+        assert payload['source_description'] == 'notes'
+        assert payload['project_id'] == 'dark_factory'
+        assert payload['agent_id'] == 'a1'
+        assert payload['session_id'] == 's1'
+        assert payload['_causation_id'] == 'c1'
+        assert payload['temporal_context'] == 'planning'
+        assert payload['unverified_claim'] is True
+        assert payload['reference_time'] is None
+
+    @pytest.mark.asyncio
+    async def test_the_stamped_blob_is_json_safe(self, service):
+        await service.add_episode(
+            content='Task 3127 was merged', project_id='dark_factory',
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert json.loads(json.dumps(payload['referents'])) == payload['referents']
