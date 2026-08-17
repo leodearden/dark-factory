@@ -195,7 +195,19 @@ CREATE TABLE IF NOT EXISTS write_queue (
     next_retry_at REAL  NOT NULL DEFAULT 0,
     created_at  REAL    NOT NULL,
     completed_at REAL,
-    error       TEXT
+    error       TEXT,
+    -- executed (task 4116): "a backend write for this item LANDED at some
+    -- point" — an ITEM-level fact, not a per-attempt one, which is what
+    -- POST_EXECUTE_DEAD_PREFIX has always claimed to report.
+    --
+    -- Declared bare NULLable, and appended LAST, deliberately: ALTER TABLE can
+    -- only append, so an identical declaration in both paths is what keeps a
+    -- migrated DB's column ORDER identical to a fresh one's. That matters more
+    -- here than in the other tables using this idiom, because QueueItem
+    -- positionally unpacks `SELECT *` — a divergence would corrupt every field
+    -- silently rather than fail loudly. bool(None) is already the right
+    -- reading of "no prior attempt executed", so no DEFAULT is needed.
+    executed    INTEGER
 );
 """
 
@@ -210,10 +222,15 @@ CREATE INDEX IF NOT EXISTS idx_wq_status_group
 class QueueItem:
     """Lightweight representation of a row."""
 
+    # ORDER IS LOAD-BEARING: __init__ positionally unpacks a `SELECT *` row,
+    # so this sequence must stay identical to write_queue's column order.
+    # Nothing in the schema references this tuple and nothing here references
+    # the schema, so a mismatch shifts every field silently instead of
+    # raising. TestExecutedColumnSchema pins the two together.
     __slots__ = (
         'id', 'group_id', 'operation', 'payload', 'callback_type',
         'status', 'attempts', 'max_attempts', 'next_retry_at',
-        'created_at', 'completed_at', 'error',
+        'created_at', 'completed_at', 'error', 'executed',
     )
 
     def __init__(self, row: aiosqlite.Row | tuple):
@@ -221,6 +238,7 @@ class QueueItem:
             self.id, self.group_id, self.operation, self.payload,
             self.callback_type, self.status, self.attempts, self.max_attempts,
             self.next_retry_at, self.created_at, self.completed_at, self.error,
+            self.executed,
         ) = row
 
     def parsed_payload(self) -> dict[str, Any]:
@@ -306,7 +324,11 @@ class DurableWriteQueue:
         self._db = await connect_daemon(str(db_path))
         self._db.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
+        # Table, then in-place migrate, then indexes — matching ticket_store's
+        # ordering, so a migration-added column is present before any index
+        # that might reference it.
         await self._db.execute(_CREATE_TABLE)
+        await self._migrate()
         await self._db.execute(_CREATE_INDEX)
         await self._db.commit()
         # Recover any items left in_flight from a previous crash
@@ -314,6 +336,38 @@ class DurableWriteQueue:
         # Spin up workers for groups that have pending work
         await self._start_workers_for_pending_groups()
         logger.info('DurableWriteQueue initialized at %s', db_path)
+
+    async def _migrate(self) -> None:
+        """Add columns that post-date a DB's creation.
+
+        ``CREATE TABLE IF NOT EXISTS`` is a no-op against an existing table, so
+        additive changes need an explicit ALTER for DBs already on disk.
+        Idempotent: probes ``PRAGMA table_info`` first.
+
+        No ``PRAGMA user_version`` ladder — the project's rule (stated in
+        orchestrator/run_store.py) is that purely additive changes use this
+        light feature-detect idiom.
+        """
+        assert self._db is not None
+        cursor = await self._db.execute('PRAGMA table_info(write_queue)')
+        cols = {row[1] for row in await cursor.fetchall()}
+        if 'executed' not in cols:
+            try:
+                await self._db.execute(
+                    'ALTER TABLE write_queue ADD COLUMN executed INTEGER'
+                )
+                logger.info(
+                    'DurableWriteQueue: migrated write_queue — added executed column'
+                )
+            except Exception as exc:
+                # Multiple processes can open this same DB file, so two
+                # initialize() calls can race between the probe and the ALTER.
+                # Losing that race is benign; anything else is not.
+                if 'duplicate column name' not in str(exc).lower():
+                    raise
+                logger.debug(
+                    'DurableWriteQueue: executed column already exists (concurrent init)'
+                )
 
     async def close(self) -> None:
         self._closed = True
