@@ -1136,7 +1136,8 @@ def create_mcp_server(
     # Task 3141 (PRD memory-write-path-convergence §9 leaf o): reject writes
     # carrying raw MCP envelope markup at all four write boundaries. Per-server
     # (not module-global) so no counter state bleeds between servers or tests.
-    # DF 3083 owns the root cause and the retroactive corpus sweep.
+    # plans/toolcall-markup-containment-prd.md owns the live root-cause work;
+    # DF 3083 (done, 7899eef17b) is the closed predecessor evidence log.
     _markup_storm = MarkupStormCounter()
 
     def _markup_gate(
@@ -1174,7 +1175,8 @@ def create_mcp_server(
                 'markup_tripwire_storm: %d markup writes rejected in %.0fs '
                 '(threshold=%d agent_id=%r field=%r matched_pattern=%r '
                 'project_root=%r) — the upstream serialization leak is ACTIVE; '
-                'DF 3083 owns the root cause',
+                'plans/toolcall-markup-containment-prd.md owns the live work '
+                '(DF 3083 is done and closed to appends)',
                 storm.get('count', -1), storm.get('window_seconds', -1.0),
                 storm.get('threshold', -1), agent_id, field, pattern, project_root,
             )
@@ -2693,7 +2695,8 @@ def create_mcp_server(
         # recon-stage content guards below, so a partly-serialized payload can
         # never be run through is_mixed_temporal_framing / the batch-plan and
         # proposed-resolution auto-taggers and come back as some other, more
-        # misleading verdict. DF 3083 owns the root cause + corpus sweep.
+        # misleading verdict. plans/toolcall-markup-containment-prd.md owns the
+        # live work; DF 3083 is the closed predecessor.
         if block := _markup_gate({'content': content}, agent_id, metadata, _kp.get(project_id)):
             return block
         # DEFENSIVE ONLY — nothing observes this today: add_episode reads metadata
@@ -2926,8 +2929,9 @@ def create_mcp_server(
         # Task 3141 / PRD leaf o: reject leaked MCP envelope markup BEFORE the
         # recon-stage content guards below, so a partly-serialized payload can
         # never be run through is_count_snapshot / is_mixed_temporal_framing and
-        # come back as some other, more misleading verdict. DF 3083 owns the root
-        # cause + corpus sweep.
+        # come back as some other, more misleading verdict.
+        # plans/toolcall-markup-containment-prd.md owns the live work; DF 3083 is
+        # the closed predecessor.
         if block := _markup_gate({'content': content}, agent_id, metadata, _kp.get(project_id)):
             return block
         metadata = strip_markup_override(metadata)
