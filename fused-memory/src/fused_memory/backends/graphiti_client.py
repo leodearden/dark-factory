@@ -434,6 +434,17 @@ _ALL_VALID_EDGES_PAGE_TEMPLATE = (
 )
 _ALL_VALID_EDGES_CENSUS = _ALL_VALID_EDGES_MATCH + 'RETURN count(*)'
 
+# Entity nodes. Here `n.uuid` alone IS a total order — one row per node, and
+# node uuids are unique — unlike the edge case above.
+_ENTITY_NODES_MATCH = 'MATCH (n:Entity) '
+_ENTITY_NODES_PAGE_TEMPLATE = (
+    _ENTITY_NODES_MATCH
+    + 'RETURN n.uuid, n.name, n.summary '
+    'ORDER BY n.uuid '
+    'SKIP {skip} LIMIT {limit}'
+)
+_ENTITY_NODES_CENSUS = _ENTITY_NODES_MATCH + 'RETURN count(*)'
+
 
 @dataclass(frozen=True)
 class PagedRead:
@@ -3182,12 +3193,70 @@ class GraphitiBackend:
         }
 
     @_canonicalize_group_args
+    async def enumerate_entity_nodes(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE
+    ) -> tuple[list[dict], PagedRead]:
+        """Paginated variant of list_entity_nodes that also reports completeness.
+
+        Same rows and same NULL coercions as list_entity_nodes (which is a thin
+        shim over this method); the difference is that the completeness of the
+        underlying enumeration is returned as a first-class value instead of
+        only reaching a log line.
+
+        Args:
+            group_id: Project graph to query.
+            page_size: Rows per page. Must stay strictly below the server's
+                result-set cap — see _paged_ro_query.
+
+        Returns:
+            (nodes, paged) where *nodes* is the same list list_entity_nodes
+            returns and *paged* is the PagedRead carrying
+            ``complete``/``rows_seen``/``expected_rows``/``reason``.
+        """
+        graph = self._graph_for(group_id)
+        paged = await _paged_ro_query(
+            graph,
+            _ENTITY_NODES_PAGE_TEMPLATE,
+            _ENTITY_NODES_CENSUS,
+            page_size=page_size,
+        )
+        nodes = [
+            {
+                'uuid': row[0],
+                'name': row[1] or '',
+                'summary': row[2] or '',
+            }
+            for row in paged.rows
+        ]
+        return nodes, paged
+
+    @_canonicalize_group_args
     async def list_entity_nodes(self, *, group_id: str) -> list[dict]:
         """Return all Entity nodes (uuid, name, summary) for a given group_id.
 
         FalkorDB is multi-tenant — each project lives in its own graph, so no
         group_id filter is needed in the Cypher itself.  Uses ro_query since
         no writes are performed.
+
+        PAGINATED (task 4340).  Measured 2026-08-17 with RESULTSET_SIZE=10000::
+
+            graph          Entity nodes   an unpaginated read saw
+            dark_factory       16038          10000  (62%)
+            reify              23589          10000  (42%)
+
+        THE COMPOUNDING HAZARD, and the reason this method is in scope for a
+        task nominally about edges: ``detect_stale_with_edges`` calls this
+        method and ``get_all_valid_edges`` on consecutive lines, and the two
+        truncations were INDEPENDENT.  An entity that survived the node cut
+        could still lose every one of its edges to the edge cut, yielding a
+        bogus "stale, zero valid facts" verdict that ``rebuild_entity_from_edges``
+        then WROTE BACK into ``n.summary``.  That makes the defect corrupting
+        rather than merely under-reporting, which is why it was fixed rather
+        than deferred.
+
+        Like get_all_valid_edges, this deliberately WARNs rather than raising
+        on an incomplete enumeration; the first-class completeness signal is
+        on enumerate_entity_nodes.
 
         Args:
             group_id: Project graph to query.
@@ -3196,17 +3265,15 @@ class GraphitiBackend:
             List of dicts with keys: uuid, name, summary (summary defaults to
             empty string when the node property is NULL).
         """
-        graph = self._graph_for(group_id)
-        cypher = 'MATCH (n:Entity) RETURN n.uuid, n.name, n.summary'
-        result = await graph.ro_query(cypher)
-        return [
-            {
-                'uuid': row[0],
-                'name': row[1] or '',
-                'summary': row[2] or '',
-            }
-            for row in (result.result_set or [])
-        ]
+        nodes, paged = await self.enumerate_entity_nodes(group_id=group_id)
+        if not paged.complete:
+            logger.warning(
+                'list_entity_nodes(group_id=%r): enumeration INCOMPLETE — '
+                'returning %d nodes, but %s. rows_seen=%s expected_rows=%s',
+                group_id, len(nodes), paged.reason,
+                paged.rows_seen, paged.expected_rows,
+            )
+        return nodes
 
     @_canonicalize_group_args
     async def detect_stale_with_edges(
@@ -3216,6 +3283,18 @@ class GraphitiBackend:
 
         Shared by detect_stale_summaries (public API) and MemoryService.rebuild_entity_summaries
         to avoid a duplicate bulk edge fetch when both are needed.
+
+        Both reads below are paginated (task 4340).  Before that they were
+        INDEPENDENTLY truncated at the server's 10000-row result-set cap, and
+        the compounding is what made the defect corrupting: an entity that
+        survived the node cut could still lose every edge to the edge cut,
+        yielding a bogus "stale, zero valid facts" verdict that
+        rebuild_entity_from_edges then wrote back into n.summary.
+
+        ``total_count`` is fixed by construction as a side effect: it is
+        ``len(entities)``, and so was a silently-capped denominator (10000 on
+        any graph above the cap) that made every rate computed against it
+        wrong.  With pagination it is the true node count.
 
         Args:
             group_id: Project graph to query.
