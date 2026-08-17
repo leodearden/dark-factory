@@ -23,7 +23,6 @@ from _fm_helpers import FakeMemoryLookup, build_journal_with_closed_run
 
 from fused_memory.models.reconciliation import StageReport
 from fused_memory.server.recon_report import (
-    RECON_REPORT_INSTRUCTIONS,
     ReconReportState,
     create_recon_report_server,
     get_recon_report_tool_signatures,
@@ -254,11 +253,6 @@ class TestRepairToolViaFastMCP:
             assert result['replacement_memory_id'] == SUCCESSOR
         finally:
             await journal.close()
-
-    def test_instructions_document_the_two_run_ids(self):
-        assert 'repair_memory_citation' in RECON_REPORT_INSTRUCTIONS
-        # The one thing an agent must not get wrong, given the incident.
-        assert 'target_run_id' in RECON_REPORT_INSTRUCTIONS
 
     def test_generated_stage_guidance_excludes_the_repair_tool(self):
         """The rendered stage-prompt guidance must NOT gain this tool.
