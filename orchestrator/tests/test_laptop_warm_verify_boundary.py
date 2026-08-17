@@ -959,6 +959,51 @@ def test_discovery_ceiling_env_override_parses_and_pins():
     assert row_discovery_ceiling_secs(_override=7.5, _loadavg=0.0, _cpu_count=32) == 7.5
 
 
+def test_row_per_test_timeout_still_covers_the_max_discovery_ceiling():
+    """The per-test pytest timeout must cover the WIDEST discovery ceiling reachable.
+
+    Extends task 4025's "the coupling is STRUCTURAL, not merely asserted"
+    property (commit 71a4d37f17) to the now load-scaled discovery ceiling,
+    against the AMBIENT module constants.
+
+    Without (b), a load-widened discovery wait would be silently truncated by
+    the import-time ``@pytest.mark.timeout(...)`` decorator -- and a widened
+    deadline that never gets to run is WORSE than no fix at all, because
+    pytest-timeout's thread mode ``os._exit()``s the xdist worker: the row
+    then reports as a worker kill rather than as the self-diagnosing
+    AssertionError (leader rc taxonomy + stderr tail) task 4025-alpha built
+    precisely so this failure would explain itself.
+    """
+    resolved = row_discovery_ceiling_secs()
+    assert resolved <= ROW_DISCOVERY_CEILING_MAX_SECS, (
+        f'row_discovery_ceiling_secs() returned {resolved}, above the '
+        f'ROW_DISCOVERY_CEILING_MAX_SECS ({ROW_DISCOVERY_CEILING_MAX_SECS}) that '
+        f'ROW_PER_TEST_TIMEOUT_SECS is derived from -- the widened wait would be '
+        f'truncated by @pytest.mark.timeout instead of running'
+    )
+    if _DISCOVERY_CEILING_OVERRIDE_SECS is None:
+        # An operator pin deliberately escapes the base floor (pinning LOW is
+        # how you reproduce a discovery timeout quickly), so the floor is
+        # asserted only for the unpinned, CI-reachable configuration.
+        assert resolved >= ROW_DISCOVERY_CEILING_BASE_SECS, (
+            f'row_discovery_ceiling_secs() returned {resolved}, below the base '
+            f'ceiling ({ROW_DISCOVERY_CEILING_BASE_SECS}) -- load scaling must '
+            f'never hand a quiet box a TIGHTER deadline than it always had'
+        )
+
+    required = (
+        2 * ROW_DISCOVERY_CEILING_MAX_SECS
+        + ROW_WATCHDOG_WINDOW_SECS
+        + 2 * ROW_TREE_KILL_CEILING_SECS
+    )
+    assert ROW_PER_TEST_TIMEOUT_SECS >= required, (
+        f'ROW_PER_TEST_TIMEOUT_SECS ({ROW_PER_TEST_TIMEOUT_SECS}) does not cover '
+        f'the bounded worst case at the MAX discovery ceiling ({required}) -- '
+        f'both discovery waits, one full watchdog window, and both '
+        f'kill-confirmation waits run to their ceiling'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task 2819 -- deterministic unit coverage for wait_for_marker_stable, the
 # create+utimensat settle helper that de-flakes the Row 5 marker-retention
