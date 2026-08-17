@@ -1771,19 +1771,34 @@ class TestResolveCheckExitCode:
             },
         }
 
-    def test_blind_spot_does_not_change_exit_code_by_default(self):
-        """BACKWARD COMPATIBILITY, the load-bearing case.
+    def test_blind_spot_fails_the_check_verdict_by_default(self):
+        """ARMED BY DEFAULT (task 3923), the load-bearing case.
 
-        scripts/fused-memory-flag-marker-check.sh is ALREADY wired as a
-        before_done.script predicate for a deterministic watch task. A blind
-        spot must not silently start failing that gate: without the opt-in
-        flag, a report with blind_spot=True and total_source=0 still holds.
+        This test previously asserted the OPPOSITE, on the premise that
+        scripts/fused-memory-flag-marker-check.sh "is ALREADY wired as a
+        before_done.script predicate for a deterministic watch task" and so
+        must not start failing. That premise is now false: the esc-2866-1 O2
+        watch (task 2902) was a ONE-SHOT dated milestone that fired
+        2026-07-29, exited 0, and is status=done. A scan of the live task
+        store found no other before_done wiring of the wrapper anywhere in
+        the project, so the gate has ZERO consumers.
+
+        With no consumer to protect, the permissive default is pure
+        downside: a verdict rendered from an enumeration that matched
+        NOTHING read as a pass, so anyone re-wiring this gate later would
+        get a silent pass forever instead of a signal. Nothing "fails
+        forever" here precisely because nothing runs it — arming the
+        default only means a future re-wire fails loudly on day one.
+
+        The explicit keyword is still honoured (see
+        test_blind_spot_fails_when_opted_in); what changes is that omitting
+        it no longer downgrades an OBSERVED blind spot to a pass.
         """
         report = self._blind_spot_report(blind_spot=True)
-        assert _mod._resolve_check_exit_code(report, max_backlog=0) == 0
+        assert _mod._resolve_check_exit_code(report, max_backlog=0) == 1
         assert _mod._resolve_check_exit_code(
-            report, max_backlog=0, fail_on_blind_spot=False,
-        ) == 0
+            report, max_backlog=0, fail_on_blind_spot=True,
+        ) == 1
 
     def test_blind_spot_fails_when_opted_in(self):
         """With --fail-on-blind-spot, an observed blind spot is exit 1 even
@@ -1857,11 +1872,14 @@ class TestBuildParser:
         assert args.check is False
         assert args.max_backlog == 0
         assert args.terminal_drain is False
-        # task 3897: OFF by default. The flag_for_stage2 pool is a healthy
-        # rolling 14-day window, so a gate keyed on its non-emptiness would
-        # fail forever — the same footgun already documented for
-        # --max-backlog 0 against undated markers.
-        assert args.fail_on_blind_spot is False
+        # task 3923: the RAW parser leaves the tri-state sentinel UNRESOLVED
+        # (None = "nobody asked"). _parse_args resolves it to True after its
+        # cross-flag validation — see TestParseArgs. The distinction is
+        # load-bearing: keying the requires---check rejection on `is not
+        # None` is what lets the nightly `--apply --terminal-drain` run
+        # (which passes neither spelling) parse cleanly instead of being
+        # rejected with exit 2 by an armed default it never asked for.
+        assert args.fail_on_blind_spot is None
 
     def test_fail_on_blind_spot_opt_in(self):
         """--fail-on-blind-spot is a store_true opt-in (task 3897)."""
@@ -1980,8 +1998,16 @@ class TestParseArgs:
 
     def test_pre_existing_invocations_are_unaffected(self):
         """Every shape that predates the flag still parses unchanged — the
-        validation must not narrow the existing CLI contract."""
-        assert _mod._parse_args([]).fail_on_blind_spot is False
+        validation must not narrow the existing CLI contract.
+
+        task 3923: the bare-dry-run assertion flips False -> True because
+        _parse_args now RESOLVES the tri-state sentinel to the armed
+        default. The contract that must not narrow is that these shapes
+        still PARSE; what the resolved default is is asserted here, and its
+        irrelevance to the non---check paths is pinned by
+        test_nightly_sweep_argv_still_parses_under_the_armed_default.
+        """
+        assert _mod._parse_args([]).fail_on_blind_spot is True
         assert _mod._parse_args(['--check']).check is True
         assert _mod._parse_args(['--apply', '--terminal-drain']).apply is True
         assert _mod._parse_args(['--check', '--max-backlog', '5']).max_backlog == 5
@@ -1996,11 +2022,13 @@ class TestMainExitCode:
     """main() is the only place args.fail_on_blind_spot reaches
     _resolve_check_exit_code.
 
-    A regression dropping that keyword would revert to the parameter default
-    (False) and leave every other test in this file green while the opt-in
-    gate silently stopped escalating — so the wiring is asserted end-to-end
-    here (argv -> parse -> exit code), with the live MemoryService
-    construction short-circuited at asyncio.run.
+    Since task 3923 armed the blind-spot policy by default, that keyword is
+    what carries an operator's EXPLICIT --no-fail-on-blind-spot opt-out down
+    to the verdict. A regression dropping it would silently re-arm the gate
+    for a caller who asked to relax it, while leaving every other test in
+    this file green — so the wiring is asserted end-to-end here (argv ->
+    parse -> exit code), with the live MemoryService construction
+    short-circuited at asyncio.run.
     """
 
     _BLIND_SPOT_REPORT = {
@@ -2034,12 +2062,24 @@ class TestMainExitCode:
             monkeypatch, ['--check', '--fail-on-blind-spot'], self._BLIND_SPOT_REPORT,
         ) == 1
 
-    def test_check_alone_still_holds_on_the_same_report(self, monkeypatch, capsys):
-        """The already-wired esc-2866-1 O2 watch task's contract: the same
-        report, without the opt-in, still resolves to 0 via backlog_verdict."""
+    def test_check_alone_now_fails_on_the_same_report(self, monkeypatch, capsys):
+        """END-TO-END proof the armed default reaches the exit code (3923).
+
+        This previously asserted 0, citing "the already-wired esc-2866-1 O2
+        watch task's contract". That watch (task 2902) is done — a one-shot
+        dated milestone that fired 2026-07-29 and closed — so the gate has
+        no consumers and the contract it protected is discharged.
+
+        Bare `--check` on a report whose enumeration matched nothing while
+        an adjacent population is non-empty must now be exit 1. Asserting
+        it through main() rather than _resolve_check_exit_code directly is
+        the point: it proves the armed default survives the full argv ->
+        _parse_args (sentinel resolution) -> main() -> verdict path, which
+        a unit-level assertion on the function default alone would miss.
+        """
         assert self._run_main(
             monkeypatch, ['--check'], self._BLIND_SPOT_REPORT,
-        ) == 0
+        ) == 1
 
     def test_opt_in_without_check_never_reaches_the_sweep(self, monkeypatch, capsys):
         """Rejection happens at parse time, before any live service is built
