@@ -247,6 +247,18 @@ class MemoryConsolidator(BaseStage):
         # distinction explicit instead of implying "no summary at all".
         report.stats['stage1_cycle_summary_ledger_written'] = 0
 
+        # Always present (task 3084, mirroring the two pre-inits above): set
+        # BEFORE the remediation early-return so neither key is ever
+        # conditionally absent — Stage 1's whole report.stats blob is
+        # serialized verbatim into Stage 2's prompt by _format_report
+        # (task_knowledge_sync.py), so a consumer should not need a
+        # .get(..., 0) fallback.  Overwritten below on a full (non-remediation)
+        # cycle once the sweep actually runs; stays 0 on remediation passes
+        # (which deliberately skip the sweep, see that block below) and when
+        # filtered_task_tree is unset.
+        report.stats['curator_gate_resolution_scanned'] = 0
+        report.stats['curator_gate_resolution_flags_emitted'] = 0
+
         # Skip dedup for remediation passes
         if self.remediation_findings is not None:
             return report
@@ -276,14 +288,33 @@ class MemoryConsolidator(BaseStage):
         # (2) It lets the ``if report.items_flagged:`` guard below fire on a cycle
         #     where the LLM emitted zero flags of its own but the sweep found a
         #     resolved gate.
+        #
+        # Best-effort: a whole-sweep failure must never abort the stage or leave
+        # items_flagged partially mutated — it is logged and swallowed, and the
+        # two stats stay at their pre-early-return 0 for this cycle.
         if self.filtered_task_tree is not None:
             gate_ids = extract_open_gate_task_ids(self.filtered_task_tree.active_tasks)
-            gate_sweep = await sweep_resolved_curator_gates(
-                self.memory, self.project_id, gate_ids,
-            )
-            report.items_flagged = (report.items_flagged or []) + gate_sweep['flags']
-            report.stats['curator_gate_resolution_scanned'] = gate_sweep['scanned']
-            report.stats['curator_gate_resolution_flags_emitted'] = len(gate_sweep['flags'])
+            try:
+                gate_sweep = await sweep_resolved_curator_gates(
+                    self.memory, self.project_id, gate_ids,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                logger.exception(
+                    'reconciliation.curator_gate_resolution_sweep_failed',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': run_id,
+                        'gate_id_count': len(gate_ids),
+                    },
+                )
+            else:
+                report.items_flagged = (report.items_flagged or []) + gate_sweep['flags']
+                report.stats['curator_gate_resolution_scanned'] = gate_sweep['scanned']
+                report.stats['curator_gate_resolution_flags_emitted'] = len(
+                    gate_sweep['flags'],
+                )
 
         # Always present (task-2029 amendment): downstream consumers that read this
         # stat symmetrically with stats['stage2_flag_markers_acknowledged'] (which is

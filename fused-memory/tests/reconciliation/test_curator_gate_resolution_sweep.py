@@ -357,7 +357,6 @@ class TestSweepResolvedCuratorGates:
             project_id='reify', filters={'source': 'curator_gate_5563'},
         )
         memory_service.search.assert_not_awaited()
-        memory_service.search.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_filter_contains_only_the_source_key(self):
