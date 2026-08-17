@@ -424,6 +424,23 @@ def simulate_candidate(name: str, facts: Iterable[str]) -> CandidateResult:
 # back short really is the end of the data rather than the server's ceiling.
 DEFAULT_PAGE_SIZE = 5000
 
+# FalkorDB's server-wide result-set ceiling.
+#
+# THIS IS AN ASSUMPTION ABOUT SERVER CONFIGURATION, not something this repo
+# sets — which is exactly why the census cross-check below does not trust it.
+# The value only has to be RIGHT for the structural check to be useful; the
+# empirical check is what stays correct when it is wrong.
+RESULTSET_SIZE = 10000
+
+# Hard safety cap on the number of SKIP/LIMIT pages a single graph's
+# enumeration will fetch, bounding worst-case pagination against a
+# pathological corpus. Normal use never approaches it: at the default page
+# size this is 5,000,000 edges against a live maximum near 16,000. Copied
+# from census_foreign_nodes' MAX_CENSUS_PAGES precedent
+# (scripts/migrate_cross_graph_leak.py:161), including its rule that hitting
+# the cap on a still-full page is reported, never swallowed.
+MAX_ENUM_PAGES = 1000
+
 # The same MATCH pattern GraphitiBackend.get_all_valid_edges uses, so this
 # measures the corpus the production sweep is aimed at — but issued with
 # SKIP/LIMIT instead of unpaginated. This is DELIBERATELY not a call to
@@ -432,10 +449,17 @@ DEFAULT_PAGE_SIZE = 5000
 # the production sweep, but it lives in graphiti_client.py, outside this
 # task's scope — it is filed as a follow-up and noted in the report rather
 # than fixed here.
+#
+# ORDER BY is load-bearing, not cosmetic. Every page is a SEPARATE query, and
+# DISTINCT + SKIP/LIMIT with no total order gives the store no obligation to
+# return rows in the same order twice — so `SKIP n` on page 2 can skip rows
+# page 1 never returned (silently dropped, permanently) or re-return rows it
+# did (harmlessly deduped here, which is what makes the drop so easy to miss).
 _EDGE_PAGE_CYPHER = (
     'MATCH (n:Entity)-[e:RELATES_TO]-() '
     'WHERE e.invalid_at IS NULL '
     'RETURN DISTINCT e.uuid, e.fact '
+    'ORDER BY e.uuid '
     'SKIP {skip} LIMIT {limit}'
 )
 
@@ -444,6 +468,8 @@ async def enumerate_valid_edge_facts(
     query_fn: Callable[[str], Awaitable[Sequence[Sequence[Any]]]],
     *,
     page_size: int = DEFAULT_PAGE_SIZE,
+    resultset_size: int = RESULTSET_SIZE,
+    max_pages: int = MAX_ENUM_PAGES,
 ) -> tuple[dict[str, str], bool]:
     """Enumerate every valid RELATES_TO edge's fact text, keyed on edge uuid.
 
@@ -456,10 +482,40 @@ async def enumerate_valid_edge_facts(
     an under-enumerated corpus must be reported as a FAILURE rather than as a
     smaller report, because the headline result is a zero and a truncated
     zero is worthless.
+
+    ``complete`` is FALSE — and every one of these paths logs a WARNING
+    naming the numbers, so a shortfall is never silent — when:
+
+    1. ``page_size >= resultset_size``. The short-page break reasons 'this
+       page was not full, so the data is exhausted', which is sound ONLY if
+       the server cannot be what shortened it. At or above the cap the two
+       causes are indistinguishable, so no enumeration is attempted at all
+       and an EMPTY dict is returned: a partial dict invites a caller to use
+       it anyway.
+    2. The ``max_pages`` bound is reached while the last page was still full
+       — a suspected shortfall, reported rather than swallowed.
+
+    The check is deliberately ``>=`` and not ``>``. Equality is
+    arithmetically safe on a server configured at exactly ``RESULTSET_SIZE``,
+    but that constant is an ASSUMPTION about server configuration, so
+    equality leaves zero margin: a server configured one row lower silently
+    re-opens the truncation. One page of throughput buys that margin.
     """
+    if page_size >= resultset_size:
+        logger.warning(
+            'enumerate_valid_edge_facts: page_size=%d is at or above the '
+            "server's result-set cap (resultset_size=%d), so a short page "
+            'cannot be distinguished from a server-truncated one and '
+            'completeness is unprovable. Refusing to enumerate — re-run '
+            'with --page-size well below %d.',
+            page_size, resultset_size, resultset_size,
+        )
+        return {}, False
+
     facts: dict[str, str] = {}
     skip = 0
-    while True:
+    complete = False
+    for _page in range(max_pages):
         page = await query_fn(
             _EDGE_PAGE_CYPHER.format(skip=skip, limit=page_size),
         )
@@ -470,12 +526,23 @@ async def enumerate_valid_edge_facts(
                 continue
             facts[edge_uuid] = row[1] or ''
         if len(rows) < page_size:
-            # Short (or empty) page: the data is exhausted. A FULL page can
-            # never prove that, which is exactly why the loop continues.
+            # Short (or empty) page, and page_size < resultset_size was
+            # checked above — so the server cannot be what shortened it and
+            # the data really is exhausted. A FULL page can never prove that,
+            # which is exactly why the loop continues.
+            complete = True
             break
         skip += len(rows)
 
-    return facts, True
+    if not complete:
+        logger.warning(
+            'enumerate_valid_edge_facts: hit the %d-page cap (page_size=%d, '
+            'enumerated=%d) while the last page was still full — enumeration '
+            'is incomplete. Re-run with a larger --page-size.',
+            max_pages, page_size, len(facts),
+        )
+
+    return facts, complete
 
 
 # ---------------------------------------------------------------------------
@@ -877,6 +944,31 @@ class _AppendReplacingDefault(argparse.Action):
         current.append(values)
 
 
+def _page_size_arg(value: str) -> int:
+    """``--page-size`` values that could not yield a provable enumeration.
+
+    argparse turns an ArgumentTypeError into ``parser.error()``, so the
+    operator is told at the CLI rather than discovering it as a fail-closed
+    exit after the run. The identical check inside
+    ``enumerate_valid_edge_facts`` stays regardless: it is the one that is
+    directly testable and the one that protects direct callers.
+    """
+    try:
+        size = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'{value!r} is not an integer') from None
+    if size < 1:
+        raise argparse.ArgumentTypeError(f'must be >= 1, got {size}')
+    if size >= RESULTSET_SIZE:
+        raise argparse.ArgumentTypeError(
+            f'{size} is at or above the assumed server result-set cap '
+            f'(RESULTSET_SIZE={RESULTSET_SIZE}); a short page would then be '
+            f'indistinguishable from a server-truncated one and the '
+            f'enumeration could not be proven complete. Use a smaller value.'
+        )
+    return size
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -888,10 +980,12 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        '--page-size', dest='page_size', type=int, default=DEFAULT_PAGE_SIZE,
+        '--page-size', dest='page_size', type=_page_size_arg,
+        default=DEFAULT_PAGE_SIZE,
         help=(
-            f'SKIP/LIMIT page size (default: {DEFAULT_PAGE_SIZE}). Keep it '
-            f"well under FalkorDB's RESULTSET_SIZE (10000) — see "
+            f'SKIP/LIMIT page size (default: {DEFAULT_PAGE_SIZE}). Must be '
+            f"well under FalkorDB's RESULTSET_SIZE ({RESULTSET_SIZE}); "
+            f'values at or above it are rejected — see '
             f'enumerate_valid_edge_facts.'
         ),
     )
