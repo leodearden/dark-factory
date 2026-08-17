@@ -16763,10 +16763,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if self.mcp is None:
             return
         try:
-            async with __import__('httpx').AsyncClient() as client:
+            import httpx as httpx_mod
+            async with httpx_mod.AsyncClient(follow_redirects=True) as client:
                 for decision in decisions:
-                    await client.post(
-                        f'{self.mcp.url}/mcp/',
+                    resp = await client.post(
+                        mcp_endpoint_url(self.mcp.url),
+                        headers=MCP_POST_HEADERS,
                         json={
                             'jsonrpc': '2.0',
                             'id': 1,
@@ -16783,6 +16785,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         },
                         timeout=10,
                     )
+                    check_mcp_post_response(
+                        resp,
+                        context=f'decisions memory write for task {self.task_id}',
+                    )
         except Exception as e:
             logger.warning(f'Failed to write decisions to memory: {e}')
 
@@ -16795,10 +16801,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return
         try:
             import httpx as httpx_mod
-            async with httpx_mod.AsyncClient() as client:
+            async with httpx_mod.AsyncClient(follow_redirects=True) as client:
                 for suggestion in suggestions[:5]:  # cap at 5 to avoid noise
-                    await client.post(
-                        f'{self.mcp.url}/mcp/',
+                    resp = await client.post(
+                        mcp_endpoint_url(self.mcp.url),
+                        headers=MCP_POST_HEADERS,
                         json={
                             'jsonrpc': '2.0',
                             'id': 1,
@@ -16814,6 +16821,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                             },
                         },
                         timeout=10,
+                    )
+                    check_mcp_post_response(
+                        resp,
+                        context=f'suggestions memory write for task {self.task_id}',
                     )
         except Exception as e:
             logger.warning(f'Failed to write suggestions to memory: {e}')
