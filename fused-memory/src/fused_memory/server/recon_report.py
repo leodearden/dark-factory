@@ -2631,7 +2631,8 @@ This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
 
 Tools: start_report, add_finding, set_stat, inc_stat, complete, delete_finding,
-       cite_entity, cite_edge, cite_task, cite_memory, cite_run.
+       cite_entity, cite_edge, cite_task, cite_memory, cite_run,
+       write_entity_standing_decision.
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.  Idempotent:
@@ -2672,6 +2673,35 @@ Citation tools (call after add_finding, before or after complete):
                   (via mem0 count) and attach it.  Copy cited_run_id verbatim
                   from a fresh tool result's run_id/metadata.run_id field —
                   never re-type or paraphrase it from memory.
+
+Ledger write (Stage 2 ONLY):
+11. write_entity_standing_decision(project_id, entity_uuid, grounds, evidence)
+                  — record that a class of complaint about entity_uuid,
+                  identified by grounds (a closed-enum value), has been
+                  investigated and dismissed, so later stages can filter or
+                  annotate future recon flags instead of re-raising them.
+                  Stage-2 ONLY: blocked in Stage 1 and Stage 3 via
+                  DISALLOW_RECON_REPORT_LEDGER_WRITES
+                  (reconciliation/cli_stage_runner.py), because this is the
+                  first recon-report tool that writes past in-process
+                  ReconReportState — it upserts a row into the durable SQLite
+                  reconciliation ledger.  It takes NO run_id (the decision is
+                  about an entity, not scoped to a report entry) and NO
+                  authorized_by: the write is ALWAYS evidence-gated, and
+                  succeeds only if EITHER arm holds — arm 1: >=1 cited,
+                  locally-resolvable, human-authored mem0 evidence record;
+                  arm 2: >=3 investigation_outcome mem0 records for this
+                  entity with actionable=false and distinct run_ids.
+                  evidence is a list of cited-ref dicts ({type, id, ...});
+                  mem0 refs are resolved for provenance, foreign refs
+                  (escalation/task ids) are recorded but never count toward a
+                  gate arm.  Returns {status: 'written', entity_uuid, grounds,
+                  edge_count_at_decision, expires_at, decided_at} on success,
+                  or a structured error dict: insufficient_evidence
+                  (unmet_arms + hint) when neither arm is satisfied,
+                  invalid_grounds when grounds is outside the enum, or
+                  service_not_configured when the memory service is
+                  unavailable.
 """
 
 
