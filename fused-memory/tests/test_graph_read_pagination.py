@@ -238,6 +238,7 @@ class TestPagedRoQueryHappyPath:
         assert paged.rows_seen == _LIVE_EDGE_ROWS
         assert paged.expected_rows == _LIVE_EDGE_ROWS
         assert paged.reason is None
+        assert paged.incomplete_kind is None
         # 1 census probe + ceil(24938 / 5000) = 5 page queries.
         assert len(graph.census_queries) == 1
         assert len(graph.page_queries) == 5
@@ -292,7 +293,10 @@ class TestPagedRoQueryStructuralGuards:
         arithmetically safe on a server configured at exactly 10000, but since
         that constant is an assumption, equality leaves zero margin.
         """
-        from fused_memory.backends.graphiti_client import _paged_ro_query
+        from fused_memory.backends.graphiti_client import (
+            INCOMPLETE_STRUCTURAL_REFUSAL,
+            _paged_ro_query,
+        )
 
         graph = FakeCappedGraph(make_edge_corpus(100), resultset_cap=None)
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
@@ -307,6 +311,7 @@ class TestPagedRoQueryStructuralGuards:
         assert paged.rows == []
         assert paged.rows_seen == 0
         assert paged.expected_rows is None
+        assert paged.incomplete_kind == INCOMPLETE_STRUCTURAL_REFUSAL
         assert isinstance(paged.reason, str) and paged.reason
         assert str(page_size) in paged.reason
         assert str(_LIVE_RESULTSET_CAP) in paged.reason
@@ -325,7 +330,10 @@ class TestPagedRoQueryStructuralGuards:
         module exists to fix, moved one layer up. The rows fetched so far ARE
         returned here — they were really fetched — but ``complete`` is False.
         """
-        from fused_memory.backends.graphiti_client import _paged_ro_query
+        from fused_memory.backends.graphiti_client import (
+            INCOMPLETE_PAGE_CAP,
+            _paged_ro_query,
+        )
 
         graph = FakeCappedGraph(make_edge_corpus(100), resultset_cap=None)
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
@@ -335,6 +343,7 @@ class TestPagedRoQueryStructuralGuards:
         assert paged.complete is False
         assert paged.rows_seen == 20
         assert len(paged.rows) == 20
+        assert paged.incomplete_kind == INCOMPLETE_PAGE_CAP
         assert isinstance(paged.reason, str) and paged.reason
         assert '2' in paged.reason and '20' in paged.reason
         assert any('20' in m for m in _warnings(caplog))
@@ -365,7 +374,10 @@ class TestPagedRoQueryCensusGuards:
         there is nothing to gain from distinguishing flavours of missing
         evidence.
         """
-        from fused_memory.backends.graphiti_client import _paged_ro_query
+        from fused_memory.backends.graphiti_client import (
+            INCOMPLETE_CENSUS_UNAVAILABLE,
+            _paged_ro_query,
+        )
 
         graph = FakeCappedGraph(
             make_edge_corpus(100),
@@ -379,6 +391,7 @@ class TestPagedRoQueryCensusGuards:
             )
         assert paged.expected_rows is None
         assert paged.complete is False
+        assert paged.incomplete_kind == INCOMPLETE_CENSUS_UNAVAILABLE
         assert isinstance(paged.reason, str) and paged.reason
         assert paged.rows_seen == 100
         assert len(paged.rows) == 100
@@ -387,7 +400,10 @@ class TestPagedRoQueryCensusGuards:
     @pytest.mark.asyncio
     async def test_census_reports_more_rows_than_enumerated_is_incomplete(self, caplog):
         """A SHORTFALL is the truncation signature: report it, naming both numbers."""
-        from fused_memory.backends.graphiti_client import _paged_ro_query
+        from fused_memory.backends.graphiti_client import (
+            INCOMPLETE_SHORT_READ,
+            _paged_ro_query,
+        )
 
         graph = FakeCappedGraph(
             make_edge_corpus(100), resultset_cap=None, census_override=150
@@ -399,6 +415,7 @@ class TestPagedRoQueryCensusGuards:
         assert paged.complete is False
         assert paged.rows_seen == 100
         assert paged.expected_rows == 150
+        assert paged.incomplete_kind == INCOMPLETE_SHORT_READ
         assert isinstance(paged.reason, str) and paged.reason
         assert '100' in paged.reason and '150' in paged.reason
         assert any('100' in m and '150' in m for m in _warnings(caplog))
@@ -426,36 +443,49 @@ class TestPagedRoQueryCensusGuards:
             )
         assert paged.complete is True
         assert paged.reason is None
+        assert paged.incomplete_kind is None
         assert paged.rows_seen == 100
         assert paged.expected_rows == 50
         assert _warnings(caplog) == []
+
+
+_ALL_GUARD_CASES = [
+    pytest.param({'page_size': 10}, {}, None, id='complete'),
+    pytest.param(
+        {'page_size': 10, 'resultset_size': 10},
+        {},
+        'INCOMPLETE_STRUCTURAL_REFUSAL',
+        id='structural-refusal',
+    ),
+    pytest.param(
+        {'page_size': 10, 'max_pages': 2},
+        {},
+        'INCOMPLETE_PAGE_CAP',
+        id='max-pages-exhausted',
+    ),
+    pytest.param(
+        {'page_size': 10},
+        {'census_result_set': [], 'census_result_set_set': True},
+        'INCOMPLETE_CENSUS_UNAVAILABLE',
+        id='unusable-census',
+    ),
+    pytest.param(
+        {'page_size': 10},
+        {'census_override': 150},
+        'INCOMPLETE_SHORT_READ',
+        id='census-shortfall',
+    ),
+]
 
 
 class TestPagedReadReasonInvariant:
     """``reason`` is None exactly when ``complete`` is True — in every case above."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        'kwargs, graph_kwargs',
-        [
-            pytest.param({'page_size': 10}, {}, id='complete'),
-            pytest.param(
-                {'page_size': 10, 'resultset_size': 10}, {}, id='structural-refusal'
-            ),
-            pytest.param(
-                {'page_size': 10, 'max_pages': 2}, {}, id='max-pages-exhausted'
-            ),
-            pytest.param(
-                {'page_size': 10},
-                {'census_result_set': [], 'census_result_set_set': True},
-                id='unusable-census',
-            ),
-            pytest.param(
-                {'page_size': 10}, {'census_override': 150}, id='census-shortfall'
-            ),
-        ],
-    )
-    async def test_reason_is_none_exactly_when_complete(self, kwargs, graph_kwargs):
+    @pytest.mark.parametrize('kwargs, graph_kwargs, _kind_name', _ALL_GUARD_CASES)
+    async def test_reason_is_none_exactly_when_complete(
+        self, kwargs, graph_kwargs, _kind_name
+    ):
         from fused_memory.backends.graphiti_client import _paged_ro_query
 
         graph = FakeCappedGraph(
@@ -468,6 +498,133 @@ class TestPagedReadReasonInvariant:
             assert paged.reason is None
         else:
             assert isinstance(paged.reason, str) and paged.reason
+
+
+# ---------------------------------------------------------------------------
+# step-16: a machine-checkable discriminator for the four incompleteness kinds
+# ---------------------------------------------------------------------------
+#
+# Guard 1 returns a FABRICATED empty — zero queries issued, zero rows — and the
+# shims collapse that into `{}` / `[]`, byte-identical to a genuinely empty
+# graph. Downstream, rebuild_entity_from_edges computes
+# `'\n'.join([]) == ''` and update_node_summary WRITES it. The whole fix rests
+# on "refused to enumerate" being distinguishable from "enumerated an empty
+# corpus", so that distinction has to be a TYPED FIELD — never a substring
+# match on an English sentence that any future edit to the warning text would
+# silently break. These tests assert on the constants BY IMPORT for the same
+# reason: hardcoding their literal values here would re-open exactly the
+# stringly-typed coupling the field exists to remove.
+
+
+class TestIncompleteKindDiscriminator:
+    """``incomplete_kind`` tells the four fail-closed paths apart, by type."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kwargs, graph_kwargs, kind_name', _ALL_GUARD_CASES)
+    async def test_each_guard_reports_its_own_kind(
+        self, kwargs, graph_kwargs, kind_name
+    ):
+        """Every guard sets the kind that names it — one case per fail-closed path."""
+        from fused_memory.backends import graphiti_client
+
+        graph = FakeCappedGraph(
+            make_edge_corpus(100), resultset_cap=None, **graph_kwargs
+        )
+        paged = await graphiti_client._paged_ro_query(
+            graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, **kwargs
+        )
+        expected = None if kind_name is None else getattr(graphiti_client, kind_name)
+        assert paged.incomplete_kind == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kwargs, graph_kwargs, kind_name', _ALL_GUARD_CASES)
+    async def test_kind_is_none_exactly_when_complete(
+        self, kwargs, graph_kwargs, kind_name
+    ):
+        """BOTH directions of the invariant, not just the easy one.
+
+        A one-directional check would pass a bug that set a kind on a complete
+        read (making every caller's ``if paged.incomplete_kind:`` branch fire
+        on healthy data), and a bug that left the kind None on an incomplete
+        one (making the raise in step-19 silently unreachable — the corrupting
+        direction).
+        """
+        from fused_memory.backends.graphiti_client import _paged_ro_query
+
+        graph = FakeCappedGraph(
+            make_edge_corpus(100), resultset_cap=None, **graph_kwargs
+        )
+        paged = await _paged_ro_query(
+            graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, **kwargs
+        )
+        if paged.complete:
+            assert paged.incomplete_kind is None
+        else:
+            assert isinstance(paged.incomplete_kind, str)
+            assert paged.incomplete_kind
+
+    def test_the_four_kinds_are_distinct(self):
+        """Four distinct values — two kinds sharing one string would merge two paths."""
+        from fused_memory.backends.graphiti_client import (
+            INCOMPLETE_CENSUS_UNAVAILABLE,
+            INCOMPLETE_PAGE_CAP,
+            INCOMPLETE_SHORT_READ,
+            INCOMPLETE_STRUCTURAL_REFUSAL,
+        )
+
+        kinds = [
+            INCOMPLETE_STRUCTURAL_REFUSAL,
+            INCOMPLETE_PAGE_CAP,
+            INCOMPLETE_CENSUS_UNAVAILABLE,
+            INCOMPLETE_SHORT_READ,
+        ]
+        assert all(isinstance(k, str) and k for k in kinds)
+        assert len(set(kinds)) == 4
+
+    def test_structural_kinds_are_exactly_the_two_deterministic_ones(self):
+        """Step-19 keys the raise off the GROUP, not off one specific kind.
+
+        The refusal and the page cap are both DETERMINISTIC: fully determined
+        by configuration and code, reproduce identically on retry, and can
+        never be caused by a concurrent write. The two empirical kinds are
+        transient-capable — a census disagreeing by a handful of rows is the
+        expected signature of a live graph being written to mid-read — which
+        is why they must stay OUT of this set.
+        """
+        from fused_memory.backends.graphiti_client import (
+            INCOMPLETE_CENSUS_UNAVAILABLE,
+            INCOMPLETE_PAGE_CAP,
+            INCOMPLETE_SHORT_READ,
+            INCOMPLETE_STRUCTURAL_KINDS,
+            INCOMPLETE_STRUCTURAL_REFUSAL,
+        )
+
+        assert isinstance(INCOMPLETE_STRUCTURAL_KINDS, frozenset)
+        assert INCOMPLETE_STRUCTURAL_KINDS == {
+            INCOMPLETE_STRUCTURAL_REFUSAL,
+            INCOMPLETE_PAGE_CAP,
+        }
+        assert INCOMPLETE_CENSUS_UNAVAILABLE not in INCOMPLETE_STRUCTURAL_KINDS
+        assert INCOMPLETE_SHORT_READ not in INCOMPLETE_STRUCTURAL_KINDS
+        # None is not a kind: a complete read must never test as structural.
+        assert None not in INCOMPLETE_STRUCTURAL_KINDS
+
+    def test_incomplete_kind_defaults_to_none(self):
+        """Back-compat: the field is last and defaulted, so existing construction holds.
+
+        ``PagedRead`` is built positionally nowhere in the tree today, but the
+        five original fields have no defaults, so the new one has to be last
+        AND defaulted or every existing construction site breaks.
+        """
+        from fused_memory.backends.graphiti_client import PagedRead
+
+        paged = PagedRead(
+            rows=[], complete=True, rows_seen=0, expected_rows=0, reason=None
+        )
+        assert paged.incomplete_kind is None
+        # Positional construction of the original five keeps working too.
+        positional = PagedRead([], True, 0, 0, None)
+        assert positional.incomplete_kind is None
 
 
 # ---------------------------------------------------------------------------
