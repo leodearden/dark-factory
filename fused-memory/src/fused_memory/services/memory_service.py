@@ -76,6 +76,11 @@ from fused_memory.services.memory_metadata_census import (
     file_unknown_key_storm_escalation,
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
+from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.referent_resolution import (
+    ReferentResolution,
+    ReferentSet,
+)
 from fused_memory.utils.task_naming import canonicalize_task_node_name
 from fused_memory.utils.validation import require_full_uuid
 
@@ -1079,6 +1084,72 @@ def _serialize_temporal(
         'valid_at': _to_iso(valid_at),
         'invalid_at': _to_iso(invalid_at),
     }
+
+
+def _encode_referents(resolution: ReferentResolution) -> dict[str, Any]:
+    """Encode a resolved referent set for the durable-queue payload.
+
+    THE WIRE CONTRACT (task 3670, PRD leaf epsilon).  One additional key,
+    ``'referents'``, on the EXISTING ``add_episode`` / ``add_memory_graphiti``
+    payloads::
+
+        {'source': <one of REFERENT_SOURCES>,
+         'refs': [{'kind': ..., 'project_id': ..., 'number': ...}, ...]}
+
+    Deliberately NO ``payload_version``, no unknown-operation guard and no
+    migration (PRD "Queue compatibility is free here").  An OLD consumer
+    draining a new row ignores exactly one unknown key; a NEW consumer draining
+    an old row finds the key absent and treats it as "no referents" — which is
+    today's behaviour exactly.  A new queue OPERATION would have needed all
+    three; one additional key on an existing payload needs none of them.
+
+    Nesting everything under a single key (rather than flat ``referent_source``
+    + ``referent_refs``) keeps the back-compat story to one presence test and
+    gives :func:`_decode_referents` exactly one thing to validate.
+
+    Emits PLAIN JSON SCALARS ONLY, never the frozen :class:`Referent` dataclass
+    itself: the queue persists payloads as JSON TEXT in SQLite, so a
+    non-serializable value here would surface only in production.
+    """
+    return {
+        'source': resolution.source,
+        'refs': [
+            {'kind': r.kind, 'project_id': r.project_id, 'number': r.number}
+            for r in resolution.referents
+        ],
+    }
+
+
+def _decode_referents(payload: dict[str, Any]) -> tuple[ReferentSet, str]:
+    """Pop and decode the ``'referents'`` blob :func:`_encode_referents` wrote.
+
+    Returns ``(referents, source)``.  An ABSENT key decodes to ``((), 'none')``
+    — an old-format queue row executes byte-identically to today.
+
+    POPS the key, matching how ``_execute_graphiti_write`` already treats
+    ``temporal_context`` / ``unverified_claim`` / ``reference_time``.  Safe
+    because ``DurableWriteQueue._process_item`` hands the executor one
+    ``parsed_payload()`` and the registered callback a SECOND, FRESH one,
+    precisely so the executor can pop what the callbacks read back.
+
+    Each entry is rebuilt through the ``Referent(...)`` constructor rather than
+    kept as a bare dict, so the frozen type's kind-registry validation runs on
+    untrusted wire data too.
+    """
+    blob = payload.pop('referents', None)
+    if blob is None:
+        return (), 'none'
+    return (
+        tuple(
+            Referent(
+                kind=entry['kind'],
+                project_id=entry['project_id'],
+                number=entry['number'],
+            )
+            for entry in blob['refs']
+        ),
+        blob['source'],
+    )
 
 
 def _created_at_to_utc_iso(created_at: datetime | None) -> str | None:
