@@ -193,11 +193,28 @@ def _is_specced(call: ast.Call) -> bool:
     return False
 
 
-# Exemption comment regex.
-# Matches: ``# noqa: bare-magicmock — <non-empty-reason>``
+# Exemption comment regexes, one per rule code.
+# Matches: ``# noqa: <code> — <non-empty-reason>``
 # Accepts em-dash (—) or ASCII hyphen (-) as separator.
 # Requires at least one non-space character after the separator.
-_EXEMPT_RE = re.compile(r'#\s*noqa:\s*bare-magicmock\s*[—\-]+\s*\S.*')
+#
+# Each rule gets its OWN code so a suppression written for one can never silently
+# exempt the other: the remedies are unrelated (mock_orch_config/pydantic_spec vs
+# _fake_verify_result/spec=VerifyResult), so a pragma for one is not informed
+# consent for the other.  Both are built from the same template, so the
+# em-dash/ASCII-hyphen and mandatory-reason contract is identical across rules.
+_EXEMPT_TEMPLATE = r'#\s*noqa:\s*{code}\s*[—\-]+\s*\S.*'
+
+_RULE_A_CODE = 'bare-magicmock'
+_RULE_B_CODE = 'bare-dataclass-double'
+
+# Kept at its historical value so Rule A's behaviour is bit-identical.
+_EXEMPT_RE = re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_A_CODE)))
+
+_EXEMPT_RES: dict[str, re.Pattern[str]] = {
+    _RULE_A_CODE: _EXEMPT_RE,
+    _RULE_B_CODE: re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_B_CODE))),
+}
 
 _VIOLATION_MSG = (
     'bare MagicMock() assigned to a config variable with no spec/spec_set.'
@@ -306,6 +323,10 @@ def _find_dataclass_double_violations(
         if match is None:
             continue
         shape, kwargs = match
+        # Computed lazily — only after a shape match — so the upward line walk keeps
+        # the cost profile it has under Rule A rather than running on every call node.
+        if _is_exempted(lines, node.lineno, _RULE_B_CODE):
+            continue
         violations.append(
             Violation(
                 filename=filename,
@@ -317,19 +338,24 @@ def _find_dataclass_double_violations(
     return violations
 
 
-def _is_exempted(lines: list[str], lineno: int) -> bool:
-    """Return True if the assignment at *lineno* (1-based) is preceded by a valid exemption comment.
+def _is_exempted(lines: list[str], lineno: int, code: str) -> bool:
+    """Return True if the node at *lineno* (1-based) carries a valid ``code`` exemption.
 
     Walks upward from ``lineno - 1`` over blank lines to the nearest non-blank line.
-    If that line matches _EXEMPT_RE the assignment is exempt.
+    If that line matches ``code``'s exemption regex the node is exempt.
     Any intervening non-blank, non-matching line breaks the exemption.
 
+    The *code* parameter keeps the two rules' suppressions strictly separate: a
+    ``# noqa: bare-magicmock`` pragma does not exempt a ``bare-dataclass-double``
+    violation, or vice versa.  Only the regex differs — the walk, the blank-line
+    tolerance and the mandatory-non-empty-reason contract are shared verbatim.
+
     Inline trailing exemption NOT honored: only the nearest *preceding* non-blank line
-    is inspected.  A ``# noqa: bare-magicmock`` comment on the same line as the
-    assignment (inline trailing) is intentionally ignored.  This is by design — see
-    module-level docstring for rationale.
+    is inspected.  A ``# noqa: ...`` comment on the same line as the node (inline
+    trailing) is intentionally ignored.  This is by design — see module-level docstring.
     """
-    # lineno is 1-based; convert to 0-based index of the line ABOVE the assignment.
+    exempt_re = _EXEMPT_RES[code]
+    # lineno is 1-based; convert to 0-based index of the line ABOVE the node.
     idx = lineno - 2  # the line immediately above
     while idx >= 0:
         line = lines[idx]
@@ -338,7 +364,7 @@ def _is_exempted(lines: list[str], lineno: int) -> bool:
             idx -= 1
             continue
         # Nearest non-blank line found — must match the exemption regex.
-        return bool(_EXEMPT_RE.match(stripped))
+        return bool(exempt_re.match(stripped))
     return False
 
 
@@ -405,7 +431,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
             if not _is_config_name(target.id):
                 continue
             if exempted is None:
-                exempted = _is_exempted(lines, assignment_lineno)
+                exempted = _is_exempted(lines, assignment_lineno, _RULE_A_CODE)
             if exempted:
                 # All targets of this node share the same lineno and therefore
                 # the same exemption status — no need to check further targets.
