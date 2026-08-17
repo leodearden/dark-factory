@@ -665,6 +665,16 @@ class TestE3BackstopIdempotent:
         # is exactly the int-truncated skip firing as designed).
         assert _identity(archived_a) == before_a
 
+        # SET EQUALITY, not two independent existence checks: the backstop
+        # archived exactly what was missing AND NOTHING ELSE. Two `.exists()`
+        # assertions would still pass if the sweep had also copied a credential,
+        # duplicated a session under a second name, or left a partial behind —
+        # the whole tree is the claim, so the whole tree is what is asserted.
+        assert _archive_files(git_repo) == {
+            f'{TASK_ID}/{ENC}/{sid_a}.jsonl',
+            f'{TASK_ID}/{ENC}/{sid_b}.jsonl',
+        }
+
         # The teardown really ran, and left no staging debris behind.
         assert not cwd.exists()
         assert not src_b.exists()
