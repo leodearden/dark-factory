@@ -1103,10 +1103,28 @@ class ReconReportState:
         class this default exists to close. As of this writing,
         ``'cross_project_routing'`` is the only production category
         matching the prefix — filed with an explicit ``actionable=False``
-        by ``autopilot_video.py`` and the Stage 2 prompt template, and by
-        the Stage 3 prompt template without an explicit ``actionable``
-        (relying on this computed default, correctly, since that finding
-        shape is genuinely informational).
+        by ``autopilot_video.py`` and the Stage 2 prompt template. The
+        Stage 3 prompt template also omits ``actionable`` for its
+        ``cross_project_routing`` example, so it likewise inherits this
+        computed default — but that example (``severity='serious'``,
+        "get_task returned task from project X, expected Y") is a
+        wrong-``project_root`` data-integrity signal, not an
+        informational routing note, so this docstring does not assert
+        that relying on the default there is correct; combined with the
+        read-time-suppression ripple below, such a finding is a candidate
+        to silently vanish from ``flagged_items`` if its citations happen
+        to trace exclusively to Stage 1. Whether the Stage 3 template
+        should instead pass ``actionable=True`` explicitly is tracked as
+        a follow-up rather than fixed in this docstring-only pass.
+
+        Prefix breadth is local to *this* default only: downstream
+        consumers that also branch on the ``cross_project_routing``
+        category — :func:`_apply_cross_project_routing_guard` (below) and
+        :func:`~fused_memory.reconciliation.scope_freshness.is_cross_project_scope_correction`
+        — exact-match that literal string, not the prefix. A new
+        ``'cross_project_*'``-prefixed category therefore gets this
+        default's non-actionable treatment automatically but stays
+        invisible to those two guards unless they are updated separately.
 
         Ripple with task-1654 read-time suppression: :meth:`get_assembled_report`
         already drops any ``actionable=False`` finding whose citations trace
@@ -1123,9 +1141,12 @@ class ReconReportState:
         ``cite_*`` resolution and :meth:`get_findings_for_run` are
         unaffected — only the ``flagged_items`` projection omits it.
         Suppression is not unconditional either: it is skipped entirely
-        when ``stage == 'memory_consolidator'``, and it also requires at
-        least one citation whose identity set is a subset of the same-run
-        Stage-1 identity union. This is the intended tightening — marking
+        when ``stage == 'memory_consolidator'``, and it also requires the
+        finding to carry at least one typed citation AND for its entire
+        citation-identity set (not just one covered citation) to be a
+        subset of the same-run Stage-1 identity union — a finding with
+        even one uncovered citation is never suppressed. This is the
+        intended tightening — marking
         these findings non-actionable by default is the whole point of
         this computed default — but it is a behaviour change existing
         callers must know about: an omitted-actionable finding of this
@@ -2629,12 +2650,13 @@ Usage pattern (per PRD §9.2):
                   genuinely actionable finding under a NEW category that
                   happens to start with 'cross_project', pass
                   actionable=True explicitly -- do not rely on the default.
-                  Also note: a non-actionable finding whose citations trace
-                  exclusively to a same-run memory_consolidator finding's
-                  citations is dropped from flagged_items at read time
-                  (task-1654, see get_assembled_report) -- pass
-                  actionable=True if a null-task_id/cross_project* finding
-                  must still surface there.
+                  Also note: an actionable=False finding can be dropped
+                  from flagged_items entirely at read time under a
+                  same-run suppression rule (task-1654; see
+                  ReconReportState.add_finding's docstring for the exact
+                  trigger condition) -- pass actionable=True explicitly
+                  if a null-task_id/cross_project* finding must still
+                  surface there.
 3. set_stat / inc_stat — track numeric metrics during the run.
 4. complete — stamp the summary and close the report; idempotent.
 5. delete_finding(run_id, finding_id) — IRREVERSIBLE retraction of a
@@ -2705,12 +2727,12 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         match, not an allowlist -- a NEW 'cross_project'-prefixed category
         that is genuinely actionable must still pass actionable=True
         explicitly (see ReconReportState.add_finding's docstring for the
-        full rationale).  Note: an actionable=False finding (whether
-        explicit or defaulted) whose citations trace exclusively to a
-        same-run memory_consolidator finding's citations is
-        dropped from flagged_items at read time (task-1654, see
-        get_assembled_report) -- pass actionable=True if a
-        null-task_id/cross_project* finding must still surface there.
+        full rationale).  A same-run task-1654 suppression rule can also
+        drop an actionable=False finding from flagged_items entirely at
+        read time -- see ReconReportState.add_finding's docstring and
+        get_assembled_report for the exact trigger condition, and pass
+        actionable=True explicitly if a null-task_id/cross_project*
+        finding must still surface there.
         """
         return state.add_finding(
             run_id=run_id,
