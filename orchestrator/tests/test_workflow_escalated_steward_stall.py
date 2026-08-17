@@ -699,6 +699,35 @@ def _make_steward_config() -> MagicMock:
     return cfg
 
 
+def test_make_steward_config_project_root_is_sandboxed(tmp_path):
+    """``_make_steward_config``'s ``project_root`` is a real dir under ``tmp_path``.
+
+    Deliberately a plain SYNCHRONOUS unit test with no ``git_repo`` / ``git_ops``
+    / ``config`` fixtures — every sibling test in this module builds a real git
+    worktree, and this one only needs the factory.
+    """
+    cfg = _make_steward_config(tmp_path / 'project')
+
+    root = cfg.project_root
+    assert isinstance(root, Path), (
+        f'expected project_root to be a real Path, got '
+        f'{type(root).__name__!r} — a MagicMock child silently satisfies every '
+        f'"/"-join the steward performs without ever producing a directory'
+    )
+    assert root.is_dir(), (
+        f'expected the factory to CREATE {root}; the retired '
+        f"Path('/tmp/fake-project') literal was never created by anything, so a "
+        f'dangling project_root is a latent cwd= failure the moment a test stops '
+        f'patching the invoke seam'
+    )
+    assert root.resolve().is_relative_to(tmp_path.resolve()), (
+        f'expected project_root under tmp_path={tmp_path}, got {root} — the '
+        f"retired '/tmp/fake-project' literal pointed OUTSIDE the test sandbox, "
+        f'so anything the steward wrote relative to config.project_root escaped '
+        f"pytest's tmp_path retention sweep"
+    )
+
+
 def _make_real_steward_factory(
     queue: EscalationQueue, esc: Escalation, task_id: str,
 ):
