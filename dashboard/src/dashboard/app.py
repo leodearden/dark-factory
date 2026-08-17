@@ -1919,9 +1919,14 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     offline marker: an absent root and an unwalkable one are both O(1) to
     re-derive, so re-checking each poll costs nothing, while caching them
     would keep reporting "no evals have ever run" for a full TTL window after
-    the tree lands. A degraded ROW (a corrupt metrics file, an unknown kind)
-    IS still cached — the walk happened, re-running it would not fix it, and
-    that walk is the expensive thing this cache exists to prevent.
+    the tree lands. A build-ABORTING bug (a top-level internal_error, carrying
+    no eval_id) is likewise not cached: how much of the tree is missing from
+    that payload is unknown, and a bug is never a steady state. A degraded ROW
+    (a corrupt metrics file, an unknown kind, or a per-eval internal_error that
+    cost exactly one eval row) IS still cached — the walk happened, re-running
+    it would not fix it, and that walk is the expensive thing this cache exists
+    to prevent. The issue rides the payload either way, so which side of that
+    line a degradation falls on costs the operator no visibility.
 
     Same idiom as api_escalation_analytics' archive_scan_succeeded: both
     routes decline to cache only a scan that reached NOTHING. The asymmetry
