@@ -540,3 +540,93 @@ class TestExecuteGraphitiWriteConsumesReferents:
         )
 
         assert service.graphiti.add_episode.call_count == 1
+
+
+class TestReferentSourceCounter:
+    """The INV-4 storm-escape gate.
+
+    The regression INV-4 guards against is "the plumbing breaks, every row
+    arrives referent-less, and the feature no-ops in total silence".  That
+    failure lives on the PRODUCER side, so a counter emitted at the producer
+    would go dark in exactly the scenario it exists to detect.  Only the
+    CONSUMER sees both new-format and old-format rows, so only the consumer can
+    report the rate — and it buckets ALL FOUR sources, because "sustained 100%
+    none" is a ratio and an absolute none-count cannot distinguish a broken
+    producer from a quiet system.
+    """
+
+    def test_a_fresh_service_exposes_every_source_bucket_at_zero(self, service):
+        """Expected buckets are built from REFERENT_SOURCES itself, not from
+        four re-spelled literals, so a fifth source added to gamma's Literal
+        cannot silently escape the counter."""
+        from fused_memory.utils.referent_resolution import REFERENT_SOURCES
+
+        assert service.referent_source_counts() == dict.fromkeys(REFERENT_SOURCES, 0)
+
+    @pytest.mark.asyncio
+    async def test_an_old_format_row_increments_only_none(self, service):
+        """The explicit INV-4 requirement: the absent path is COUNTED, never a
+        silent fallthrough."""
+        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+
+        counts = service.referent_source_counts()
+        assert counts['none'] == 1
+        assert counts['derived'] == 0
+        assert counts['metadata'] == 0
+        assert counts['declared'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_blob_lands_in_none(self, service):
+        """Degrading is only safe because the anomaly is loud somewhere."""
+        await service._execute_graphiti_write(
+            'add_episode', _graphiti_payload(referents={'source': 'derived', 'refs': 3}),
+        )
+
+        assert service.referent_source_counts()['none'] == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('source', ['declared', 'metadata', 'derived'])
+    async def test_each_resolved_source_increments_its_own_bucket(self, service, source):
+        """Bucketing every source is what gives leaf iota a DENOMINATOR, so it
+        can compute a rate rather than only see an absolute none-count."""
+        await service._execute_graphiti_write(
+            'add_episode',
+            _graphiti_payload(referents=_encoded(source, Referent(number='3127'))),
+        )
+
+        counts = service.referent_source_counts()
+        assert counts[source] == 1
+        assert counts['none'] == 0
+
+    @pytest.mark.asyncio
+    async def test_the_accessor_returns_a_copy(self, service):
+        """A caller mutating the returned dict must not corrupt the escape
+        hatch's own state."""
+        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+
+        snapshot = service.referent_source_counts()
+        snapshot['none'] = 9999
+
+        assert service.referent_source_counts()['none'] == 1
+
+        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+
+        assert service.referent_source_counts()['none'] == 2
+
+    @pytest.mark.asyncio
+    async def test_the_counter_increments_with_no_write_journal(self, service):
+        """The escape hatch is UNCONDITIONAL in-process state, so it can never
+        itself be silently absent — unlike the journal channel, which is None
+        in exactly the degraded configurations where an unnoticed regression is
+        least likely to be caught any other way."""
+        service._write_journal = None
+
+        await service._execute_graphiti_write(
+            'add_episode',
+            _graphiti_payload(referents=_encoded('derived', Referent(number='3127'))),
+        )
+        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+
+        counts = service.referent_source_counts()
+        assert counts['derived'] == 1
+        assert counts['none'] == 1
