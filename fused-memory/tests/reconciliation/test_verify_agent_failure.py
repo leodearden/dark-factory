@@ -157,6 +157,78 @@ async def test_verify_agent_failure_non_dict_uses_error_summary(caplog):
 
 
 # ---------------------------------------------------------------------------
+# ORIGIN-PREFERENCE tests (task 4343): failure_token must carry the SPECIFIC
+# CLI origin when AgentLoop.run() supplies one, and degrade to the generic
+# token when it does not.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'origin_token',
+    ['cli_output_empty', 'cli_output_unparseable'],
+)
+async def test_verify_failure_token_prefers_cli_warning_origin(origin_token):
+    """failure_token must prefer `warning_origin` over the generic `warning`.
+
+    The shape below is exactly what AgentLoop.run() now emits for a CLI
+    no-tool-call exit.  'cli_output_empty' (the CLI returned nothing) and
+    'cli_output_unparseable' (the CLI returned junk) call for different
+    operator responses, so the actionable one is what must reach the DB.
+
+    The human-facing `summary` stays keyed to the GENERIC token: task 1811's
+    'agent-failed:no_tool_calls' contract and its tests are untouched.  The
+    specific diagnosis travels in the structured field instead of being
+    smuggled into prose — INV-2 structured-facts-at-failure.
+    """
+    result_dict = {'warning': 'no_tool_calls', 'warning_origin': origin_token, 'text': ''}
+
+    with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
+        mock_agent_instance = AsyncMock()
+        mock_agent_instance.run = AsyncMock(return_value=(result_dict, []))
+        MockAgentLoop.return_value = mock_agent_instance
+
+        verifier = CodebaseVerifier(_default_config())
+        result = await verifier.verify(claim='Task X completed')
+
+    assert result.agent_failed is True, (
+        f'Expected agent_failed=True but got {result.agent_failed!r}'
+    )
+    assert result.failure_token == origin_token, (
+        f'Expected the specific origin {origin_token!r} but got '
+        f'{result.failure_token!r} — the generic token would lose the diagnosis'
+    )
+    assert result.verdict == 'inconclusive', (
+        f'Expected inconclusive but got {result.verdict!r}'
+    )
+    assert result.summary == 'agent-failed:no_tool_calls', (
+        f'Expected the task-1811 sentinel keyed to the generic token but got '
+        f'{result.summary!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_failure_token_falls_back_when_no_origin():
+    """With no `warning_origin`, failure_token degrades to the generic token.
+
+    Guards that the preference chain DEGRADES rather than blanking the token:
+    a missing origin must not leave failure_token empty, because an empty
+    token is the success-path signal.
+    """
+    with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
+        mock_agent_instance = AsyncMock()
+        mock_agent_instance.run = AsyncMock(return_value=({'warning': 'max_steps_reached'}, []))
+        MockAgentLoop.return_value = mock_agent_instance
+
+        verifier = CodebaseVerifier(_default_config())
+        result = await verifier.verify(claim='Task X completed')
+
+    assert result.agent_failed is True
+    assert result.failure_token == 'max_steps_reached', (
+        f"Expected fallback to 'max_steps_reached' but got {result.failure_token!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # SUCCESS-PATH test (written now; must stay green before AND after step-2)
 # ---------------------------------------------------------------------------
 
