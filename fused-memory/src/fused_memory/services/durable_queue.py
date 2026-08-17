@@ -1036,5 +1036,10 @@ class DurableWriteQueue:
                 'attempts': item.attempts,
                 'error': item.error,
                 'created_at': item.created_at,
+                # The same fact POST_EXECUTE_DEAD_PREFIX encodes in prose on
+                # the error string, exposed as a boolean so a replay decision
+                # does not have to string-match an error message. Purely
+                # additive — every existing key keeps its position and meaning.
+                'executed': bool(item.executed),
             })
         return results
