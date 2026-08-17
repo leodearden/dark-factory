@@ -27,7 +27,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from shared.cli_invoke import detect_resumable_progress
+from shared.cli_invoke import (
+    detect_resumable_progress,
+    resumable_progress_for_session,
+)
 
 # ── Fixture builders ────────────────────────────────────────────────────────
 # Hand-authored transcript record dicts mirroring the on-disk JSONL shape: an
@@ -198,3 +201,84 @@ class TestDetectResumableProgress:
             ['', 0, False, ()],
         ):
             assert isinstance(detect_resumable_progress(records), bool)
+
+
+class TestResumableProgressForSession:
+    """The session-level wrapper: locate the on-disk transcript via
+    ``read_transcript_records``, apply the pure predicate, never raise."""
+
+    def test_text_only_session_has_no_resumable_progress(self, tmp_path) -> None:
+        """The 4396db7a shape on disk: a reachable transcript whose agent only
+        stated an intention → False, so the cap-hit branch retries FRESH."""
+        _write_transcript(
+            tmp_path,
+            'sess-empty',
+            [_user(), _assistant([_text('I will start by reading the plan.')])],
+        )
+        assert resumable_progress_for_session(tmp_path, 'sess-empty') is False
+
+    def test_tool_use_session_has_resumable_progress(self, tmp_path) -> None:
+        """A transcript with a real tool call → True → resume as today."""
+        _write_transcript(
+            tmp_path,
+            'sess-worked',
+            [_user(), _assistant([_text('reading'), _tool_use('Read')])],
+        )
+        assert resumable_progress_for_session(tmp_path, 'sess-worked') is True
+
+    def test_multi_turn_prose_session_has_resumable_progress(self, tmp_path) -> None:
+        """A prose-only worker's accumulated reasoning is worth resuming."""
+        _write_transcript(
+            tmp_path,
+            'sess-prose',
+            [_user(), _assistant([_text('first ...')]), _assistant([_text('therefore ...')])],
+        )
+        assert resumable_progress_for_session(tmp_path, 'sess-prose') is True
+
+    def test_missing_transcript_is_true(self, tmp_path) -> None:
+        """No transcript file on disk → read_transcript_records returns None →
+        True.  The fail-safe direction is INVERTED relative to the background
+        detector: an unreadable transcript must resume rather than silently
+        discard work.  (The cap-hit branch's own reachability arm handles a
+        genuinely absent transcript first, with its more specific message.)"""
+        assert resumable_progress_for_session(tmp_path, 'sess-nonexistent') is True
+
+    def test_truncated_final_line_is_tolerated(self, tmp_path) -> None:
+        """A SIGKILL leaves a half-written final line.  The tolerant parse in
+        read_transcript_records skips it; the surviving tool_use still counts,
+        and nothing raises."""
+        transcript = _write_transcript(
+            tmp_path,
+            'sess-truncated',
+            [_user(), _assistant([_tool_use('Read')])],
+        )
+        with transcript.open('a', encoding='utf-8') as fh:
+            fh.write('{"type": "assistant", "message": {"cont')
+        assert resumable_progress_for_session(tmp_path, 'sess-truncated') is True
+
+    def test_truncated_final_line_on_empty_session_is_tolerated(self, tmp_path) -> None:
+        """Same truncation over a text-only session: the parse still must not
+        raise, and the proven-empty verdict still stands."""
+        transcript = _write_transcript(
+            tmp_path,
+            'sess-truncated-empty',
+            [_user(), _assistant([_text()])],
+        )
+        with transcript.open('a', encoding='utf-8') as fh:
+            fh.write('{"type": "assis')
+        assert resumable_progress_for_session(tmp_path, 'sess-truncated-empty') is False
+
+    def test_empty_transcript_file_is_false(self, tmp_path) -> None:
+        """A transcript that exists but parsed to zero records is proven-empty
+        — this is precisely the 'reachable but carries nothing' gap."""
+        slug_dir = tmp_path / 'projects' / 'myproject'
+        slug_dir.mkdir(parents=True, exist_ok=True)
+        (slug_dir / 'sess-blank.jsonl').write_text('')
+        assert resumable_progress_for_session(tmp_path, 'sess-blank') is False
+
+    def test_never_raises_on_unreadable_config_dir(self, tmp_path) -> None:
+        """Totality contract inherited from read_transcript_records."""
+        assert isinstance(
+            resumable_progress_for_session(tmp_path / 'does' / 'not' / 'exist', 'sess-x'),
+            bool,
+        )
