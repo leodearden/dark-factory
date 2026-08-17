@@ -12,6 +12,15 @@ server:
 llm:
   provider: "openai"
   model: "gpt-4o-mini"
+
+  # Output-token budget per LLM request (restart-tier — not hot-reloadable).
+  # Reaches the wire on EVERY arm: both graphiti client_class values, the
+  # graphiti anthropic arm, and mem0. Before task 3864 the default client
+  # silently sent 16384 regardless of this value. The effective value is
+  # echoed in the "Graphiti LLM: ..." startup INFO line.
+  # Raise this if the write path reports "Output length exceeded max tokens",
+  # then restart. Note it is SHARED: raising it also raises the anthropic arm
+  # and mem0, and Anthropic rejects a value above a model's output ceiling.
   max_tokens: 4096
 
   # Which graphiti LLM client to build (restart-tier — not hot-reloadable).
