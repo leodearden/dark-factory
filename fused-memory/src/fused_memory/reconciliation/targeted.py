@@ -682,13 +682,37 @@ class TargetedReconciler:
                     context=f'Task details: {task.get("details") or description}',
                     scope_hints=_extract_scope_hints(task),
                 )
-                # Task 4343: an agent that never produced a parseable verdict
-                # returns the caller-supplied default ('inconclusive'), which
-                # collides with a legitimate healthy verdict — so this branch
-                # MUST be tested before any branch that reads `verdict`, and
-                # MUST read the structured `agent_failed` flag rather than
-                # sniffing the 'agent-failed:' prefix out of `summary` prose
-                # (INV-2 structured-facts-at-failure).
+                # ── verify/codebase audit row contract (task 4343) ──────────
+                # ONE row per invocation of this branch, so the record is a
+                # complete census by construction:
+                #   action_type='verify', target='codebase'
+                #   operation ∈ {confirmed, contradicted, inconclusive,
+                #                agent_failed}  from here, plus 'error' from
+                #                the except arm below.
+                # Recording only the failure outcomes would leave "the agent
+                # failed" distinguishable from "genuinely inconclusive" solely
+                # by a row being present vs absent — and absence already means
+                # "this branch never opened" for the overwhelming majority of
+                # runs.  Emitting on every outcome makes
+                # `SELECT operation, COUNT(*) FROM run_actions
+                #  WHERE action_type='verify'` truthful without parsing detail
+                # JSON.  Mirrors task 1184's distinct-verb precedent below.
+                outcome = 'agent_failed' if verification.agent_failed else str(verification.verdict)
+                audit_detail = {'task_id': task_id, 'verdict': str(verification.verdict)}
+                if verification.failure_token:
+                    audit_detail['failure_token'] = verification.failure_token
+                await self.journal.add_run_action(
+                    run_id, 'verify', 'codebase', outcome, audit_detail,
+                    causation_id=run_id,
+                )
+
+                # An agent that never produced a parseable verdict returns the
+                # caller-supplied default ('inconclusive'), which collides with
+                # a legitimate healthy verdict — so this branch MUST be tested
+                # before any branch that reads `verdict`, and MUST read the
+                # structured `agent_failed` flag rather than sniffing the
+                # 'agent-failed:' prefix out of `summary` prose (INV-2
+                # structured-facts-at-failure).
                 if verification.agent_failed:
                     logger.warning(
                         'verification_agent_failed task=%s token=%s summary=%s',
@@ -698,19 +722,6 @@ class TargetedReconciler:
                         'type': 'verification_agent_failed',
                         'failure_token': verification.failure_token,
                     })
-                    # Symmetric durable audit row for the failure path — mirrors
-                    # the task-1184 precedent below (:947-960), where the
-                    # non-raising rejection path got its own row under a distinct
-                    # action_type verb so operators can compute cardinality with a
-                    # plain WHERE clause instead of parsing detail JSON.  Here the
-                    # verb is 'verify' and the outcome is in `operation`.
-                    await self.journal.add_run_action(
-                        run_id, 'verify', 'codebase', 'agent_failed',
-                        {'task_id': task_id,
-                         'failure_token': verification.failure_token,
-                         'verdict': str(verification.verdict)},
-                        causation_id=run_id,
-                    )
                 elif verification.verdict in ('confirmed', 'contradicted'):
                     written = await self._fenced_add_memory(
                         content=f"Completed task '{title}': {verification.summary}",
@@ -734,6 +745,14 @@ class TargetedReconciler:
                          'deferred': not written},
                         causation_id=run_id,
                     )
+                else:
+                    # Honest inconclusive: the agent looked and found nothing
+                    # either way.  No memory write (there is no finding to
+                    # record) and deliberately NO warning — this is a healthy
+                    # outcome, not an error.  The audit row above is what
+                    # separates it from the agent_failed case that used to be
+                    # byte-identical to it.
+                    result['actions'].append({'type': 'verification_inconclusive'})
             except Exception as e:
                 logger.warning(f'Verification failed for task {task_id}: {e}')
                 # Task 4343: the RAISED failure path is the live one —
