@@ -11721,7 +11721,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         return violations
 
-    def worktree_ledger_violations(self, *, now: float | None = None) -> list[str]:
+    def worktree_ledger_violations(
+        self, *, now: float | None = None, grace_secs: float | None = None,
+    ) -> list[str]:
         """Return I6 worktree-ledger violations as human-readable strings.
 
         Empty list → every on-disk ``_merge-*`` worktree is accounted for.
@@ -11754,6 +11756,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         *now* is injectable for deterministic tests; defaults to
         ``time.time()``.
 
+        *grace_secs* (task 3622) overrides the age floor for this call only;
+        ``None`` inherits :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`.  Mirrors
+        :meth:`reap_orphaned_merge_worktrees`'s ``min_age_secs`` idiom — same
+        module, same "None means inherit the class default" semantics — so
+        detection and remediation expose the identical override shape.
+        Raising the floor narrows WHICH leaks are reported and changes
+        nothing else: every other exclusion (ownership, ``_merge-`` prefix,
+        the persistent verify worktree, the ``_running`` guard) is orthogonal
+        to it and still applies.  Its consumer is
+        :meth:`_check_resource_audit`'s escalation predicate, which re-asks
+        this question at :meth:`_resource_audit_escalation_age_secs` to find
+        the leaks that have outlived their scheduled reclaim; the default
+        callers (:meth:`snapshot`, and this method's own detection/logging
+        path) keep the lower floor so the census stays truthful.
+
         Pure/synchronous (no await, no git subprocess). Fail-safe: never
         raises; any unexpected exception is caught and surfaced as a
         violation string, mirroring :meth:`two_layer_invariants`'s idiom.
@@ -11767,7 +11784,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if base is None or not base.is_dir():
                 return []
             effective_now = now if now is not None else time.time()
-            grace = self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+            grace = (
+                grace_secs
+                if grace_secs is not None
+                else self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+            )
             owned = {p.resolve() for p in self._owned_merge_worktrees}
             with os.scandir(base) as it:
                 candidates = list(it)
