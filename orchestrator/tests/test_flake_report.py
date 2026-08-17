@@ -792,7 +792,9 @@ class TestRenderReport:
 
     def test_a_none_rate_renders_as_n_a_never_zero(self):
         rendered = render_report(_report(gate_blind=compute_gate_blind([])))
-        rate_lines = [ln for ln in rendered.splitlines() if 'rate' in ln.lower()]
+        # Matched on the full phrase, not a bare 'rate': the header's "generated_at"
+        # contains that substring and would otherwise be picked as the rate line.
+        rate_lines = [ln for ln in rendered.splitlines() if 'unconfirmable rate' in ln.lower()]
         assert rate_lines, rendered
         assert 'n/a' in rate_lines[0].lower(), rate_lines
         assert '0.00' not in rate_lines[0], rate_lines

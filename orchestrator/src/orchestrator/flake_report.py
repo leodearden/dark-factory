@@ -554,8 +554,18 @@ def render_report(report: FlakeLedgerReport) -> str:
     ``format_stratification_table``'s determinism property.  No ``click`` import: this
     returns a string and the CLI only echoes it.
     """
-    lines: list[str] = [f'flake ledger: {report.db_path}']
-    if report.gate_blind.truncated:
+    gb, nc, sy = report.gate_blind, report.non_convergence, report.systemic
+    lines: list[str] = [
+        f'flake ledger: {report.db_path}',
+        f'generated_at: {report.generated_at.isoformat()}',
+    ]
+    if not report.db_present:
+        # Absence is a DIFFERENT fact from an empty ledger, and α's readers cannot tell
+        # them apart (they provision on read).  Say which one this is.
+        lines.append('  NO LEDGER: this project has no runs.db — nothing has been recorded yet.')
+    else:
+        lines.append(f'window since: {report.window_since}')
+    if gb.truncated:
         # α's read_occurrences docstring: a count over a limit-capped read is a count
         # over an unknown window, and dividing by it is meaningless.  The counters are
         # still printed — a bounded read is better than an unbounded one — but they are
@@ -564,4 +574,90 @@ def render_report(report: FlakeLedgerReport) -> str:
             '  WARNING: the occurrence read was TRUNCATED at its limit — the counters '
             'below cover a PARTIAL window, not the full one.'
         )
+
+    # --- section 1: open debt ---
+    lines += ['', 'OPEN DEBT', '-' * 60]
+    if not report.open_debt:
+        lines.append('  (no open debt)')
+    for row in report.open_debt:
+        d = row.debt
+        # A blank owner cell would render a §5.9 breach as MISSING DATA.  It is instead
+        # the single most consequential state this report can encounter: suppression
+        # LANDS the merge (§5.7), so an unowned debt row means a flaky test is silently
+        # no longer blocking anything and nobody owns fixing it.  Naming it loudly is a
+        # READ of the ledger — ι files nothing.
+        owner = f'owner={d.owner_task_id}' if d.owner_task_id else '*** NO OWNER (invariant breach) ***'
+        over = ' OVER-AGE' if (row.age is not None and row.age > timedelta(days=nc.age_threshold_days)) else ''
+        lines.append(
+            f'  {d.test_id}  age={format_age(row.age)}  {owner}  '
+            f'open_count={d.open_count}{over}'
+        )
+
+    # --- section 2: recurrence chains ---
+    lines += ['', 'RECURRENCE CHAINS', '-' * 60]
+    if not report.chains:
+        lines.append('  (no occurrences in window and no open debt)')
+    for chain in report.chains:
+        d = chain.debt
+        lines.append(f'  {chain.test_id}')
+        if d is None:
+            # κ's case: an occurrence with no debt row at all must still be visible.
+            lines.append('      debt: (none — occurrences only, no debt row)')
+        else:
+            state = 'resolved' if d.resolved_at else 'open'
+            lines.append(
+                f'      debt: {state}  open_count={d.open_count}  '
+                f'prior_resolved_at={d.prior_resolved_at or "-"}  '
+                f'prior_resolving_commit={d.prior_resolving_commit or "-"}'
+            )
+        # Sorted so the split is byte-stable, and every site is spelled out rather than
+        # summed, so κ's chronic_marker cannot hide inside a merge_gate total.
+        sites = '  '.join(f'{k}={v}' for k, v in sorted(chain.call_site_counts.items()))
+        lines.append(
+            f'      occurrences: {chain.occurrence_count}  [{sites or "none in window"}]  '
+            f'last={chain.last_observed_at or "-"}'
+        )
+
+    # --- section 3: health counters ---
+    lines += ['', 'HEALTH COUNTERS', '-' * 60]
+    lines.append(f'  gate blind (class 1, {gb.window_hours}h window):')
+    if not gb.total:
+        lines.append('      no occurrences in window')
+    # `n/a`, never `0.00`: α warns that a zero-row answer "reads as healthy rather than
+    # as a broken query", and "we cannot tell" must not print as "the gate is fine".
+    rate_txt = 'n/a' if gb.rate is None else f'{gb.rate:.2f}'
+    lines.append(
+        f'      unconfirmable rate: {rate_txt}  '
+        f'({gb.unconfirmable} unconfirmable / {gb.total} observations)  '
+        f'threshold={gb.threshold:.2f}'
+    )
+    if not gb.sufficient:
+        # DISTINCT from "below threshold": those two states mean opposite things.
+        lines.append(
+            f'      status: insufficient observations '
+            f'(need {gb.min_observations}, have {gb.total})'
+        )
+    else:
+        lines.append(f'      status: {"OVER THRESHOLD" if gb.exceeds_threshold else "ok"}')
+
+    lines.append(f'  non-convergence (class 2, age backstop {nc.age_threshold_days}d):')
+    lines.append(
+        f'      open={nc.open_tests}  recurrent={nc.recurrent_tests}  '
+        f'over_age={nc.over_age_tests}  unowned={nc.unowned_tests}  '
+        f'oldest={format_age(nc.oldest_age)}'
+    )
+    if nc.unparseable_opened_at:
+        lines.append(
+            f'      WARNING: {nc.unparseable_opened_at} row(s) have an unreadable '
+            'opened_at and are excluded from the age figures above'
+        )
+
+    lines.append(f'  systemic (class 3, {sy.window_minutes}m window):')
+    psi_txt = 'n/a' if sy.peak_window_psi is None else f'{sy.peak_window_psi:.1f}'
+    lines.append(
+        f'      peak distinct tests: {sy.peak_distinct_tests}  threshold={sy.threshold}  '
+        f'peak_window_start={sy.peak_window_start or "-"}  peak_psi_cpu_some10={psi_txt}'
+    )
+    lines.append(f'      status: {"OVER THRESHOLD" if sy.exceeds_threshold else "ok"}')
+
     return '\n'.join(lines)
