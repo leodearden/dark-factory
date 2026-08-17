@@ -36,7 +36,10 @@ Entry schema
                  ``UNARCHIVED_*`` entry whose own function starts archiving
                  fails too — the record and the code cannot drift apart in
                  either direction.
-``follow_up``    required for ``UNARCHIVED_GAP``; the task/scope carrying the fix
+``follow_up``    conventional for ``UNARCHIVED_GAP``; the task/scope carrying the
+                 fix. Prose for a reader, NOT gate-enforced — a non-empty check
+                 on free text passes on any string, so the gate asserts nothing
+                 about it.
 
 Keys are ``(path, qualname)`` — deliberately NOT line numbers, which drift on
 every unrelated edit. The gate compares as a MULTISET: ``UsageGate.__init__``

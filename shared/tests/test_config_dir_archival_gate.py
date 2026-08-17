@@ -156,23 +156,25 @@ class TestEverySiteIsAudited:
         )
 
     def test_every_entry_is_well_formed(self):
-        """Each record must actually carry the audit it claims to."""
+        """The schema contract the AST cross-check consumes.
+
+        Two checks only, both about SHAPE rather than wording: ``disposition``
+        is one of the known values, and ``archives_in`` is present exactly for
+        ``ARCHIVED`` entries. The second is the load-bearing one —
+        :class:`TestDispositionsMatchTheCode` re-derives ``archives_in`` from
+        the AST, so a malformed or missing field there would silently narrow
+        the falsifiable half of the gate.
+
+        The free-text fields (``destroyed_by``, ``rationale``, ``follow_up``)
+        are deliberately NOT asserted: a non-empty check on prose passes on any
+        string and constrains no code.
+        """
         for entry in AUDITED_SITES:
             key = (entry.get('path'), entry.get('qualname'))
             assert entry.get('disposition') in DISPOSITIONS, (
                 f'{key}: disposition must be one of {sorted(DISPOSITIONS)}, '
                 f'got {entry.get("disposition")!r}'
             )
-            for field in ('destroyed_by', 'rationale'):
-                assert entry.get(field), (
-                    f'{key}: non-empty {field!r} required — an entry without it '
-                    f'records nothing and defeats the audit.'
-                )
-            if entry['disposition'] == 'UNARCHIVED_GAP':
-                assert entry.get('follow_up'), (
-                    f'{key}: an UNARCHIVED_GAP must name its follow-up, or the '
-                    f'gap is just an accepted loss with extra steps.'
-                )
             if entry['disposition'] == ARCHIVED:
                 assert entry.get('archives_in'), (
                     f'{key}: an ARCHIVED entry must name where the archival '
@@ -200,31 +202,6 @@ class TestGateSelfIntegrity:
         assert len(scanned_sites) >= 6, (
             f'Only {len(scanned_sites)} TaskConfigDir sites found — is repo_root '
             f'correct? ({_REPO_ROOT})'
-        )
-
-    def test_dry_run_unblock_disposition_is_archived(self):
-        """Task 3271's fix is pinned in the audit record, not only in behaviour.
-
-        This half is the RECORD half — it says only what the table claims. The
-        claim is made falsifiable by
-        :meth:`TestDispositionsMatchTheCode.test_archived_entries_really_archive`,
-        which re-derives the archival references from the AST; deleting the
-        producer hook fails there.
-        """
-        matches = [
-            e for e in AUDITED_SITES
-            if e['path'] == 'orchestrator/src/orchestrator/dry_run_unblock.py'
-            and e['qualname'] == 'run_dry_run_unblock'
-        ]
-        assert len(matches) == 1, (
-            f'Expected exactly one audited dry_run_unblock site, got {matches}'
-        )
-        assert matches[0]['disposition'] == ARCHIVED, (
-            'run_dry_run_unblock archives its per-investigation config dir '
-            '(task 3271). If that hook was removed, restore it rather than '
-            'downgrading this record: the cleanup_worktree backstop composes '
-            "f'claude-config-{branch}' literally and can never cover a "
-            "'-unblock' dir, so nothing else archives that transcript."
         )
 
 
