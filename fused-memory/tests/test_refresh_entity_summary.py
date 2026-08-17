@@ -409,9 +409,15 @@ class TestGetAllValidEdges:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        call_args = graph.ro_query.call_args
-        assert call_args is not None, "graph.ro_query was not called"
-        cypher = extract_cypher(call_args)
+        # The read is paginated (task 4340), so `call_args` is only the LAST
+        # call — read the SKIP/LIMIT page query explicitly instead.
+        pages = [
+            extract_cypher(c)
+            for c in graph.ro_query.call_args_list
+            if 'SKIP' in extract_cypher(c)
+        ]
+        assert pages, f'no page query issued: {graph.ro_query.call_args_list}'
+        cypher = pages[0]
         # The whole point of W6-zeta (task 2213): drop the WITH DISTINCT idiom.
         assert 'WITH DISTINCT' not in cypher, (
             f'Cypher must NOT use WITH DISTINCT — dedup is (n.uuid, e.uuid)-keyed in Python: {cypher}'
@@ -435,7 +441,11 @@ class TestGetAllValidEdges:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        graph.ro_query.assert_awaited_once()
+        # Paginated (task 4340): a census probe plus N pages, so "exactly one
+        # query" no longer describes the shape. The load-bearing half of the
+        # original assertion — every query stays on the read-only path — is
+        # what this test is named for and is kept.
+        assert graph.ro_query.await_count >= 1
         graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
