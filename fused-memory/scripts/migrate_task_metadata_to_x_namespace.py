@@ -691,10 +691,12 @@ async def main_async(args: argparse.Namespace) -> int:
         # reach "committed but UNVERIFIED" at all — likelier than the
         # malformed read-back payloads guarded below. No reply means no way to
         # tell landed from lost, so this exit names the snapshot too.
+        # Built OUTSIDE the guard below: a payload-construction bug is not a
+        # lost reply, and reporting it as one would tell the operator a write
+        # may have landed when nothing was ever sent.
+        payload = build_update_payload(args.task_id, project_root, migrated)
         try:
-            write_result = await client.call_tool(
-                'update_task', build_update_payload(args.task_id, project_root, migrated),
-            )
+            write_result = await client.call_tool('update_task', payload)
         except Exception as exc:
             traceback.print_exc()
             print(
