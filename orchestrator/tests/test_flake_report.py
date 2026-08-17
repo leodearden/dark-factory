@@ -587,3 +587,68 @@ class TestBuildReport:
         assert [c.test_id for c in report.chains] == ['tests/test_old.py::test_x']
         assert report.chains[0].debt is not None
         assert report.chains[0].occurrence_count == 0
+
+
+class TestReadOnlyContract:
+    """The report must never write — including never PROVISIONING a DB it finds absent."""
+
+    def test_an_absent_ledger_is_not_provisioned(self, tmp_path):
+        # α's readers all route through `_open`, which does
+        # `parent.mkdir(parents=True, exist_ok=True)` -> connect (which CREATES the
+        # file) -> `executescript(_SCHEMA)`.  So an unguarded "read-only" report would
+        # provision data/orchestrator/runs.db plus WAL sidecars as a side effect of
+        # PRINTING.  Neither the file nor its parent exists here.
+        db_path = tmp_path / 'project' / 'data' / 'orchestrator' / 'runs.db'
+        assert not db_path.parent.exists()
+
+        build_report(db_path, now=_NOW)
+
+        assert not db_path.exists(), 'the report must not create the ledger DB'
+        assert not db_path.parent.exists(), 'the report must not create data/orchestrator/'
+        assert not (tmp_path / 'project' / 'data' / 'orchestrator' / 'runs.db-wal').exists()
+        assert not (tmp_path / 'project' / 'data' / 'orchestrator' / 'runs.db-shm').exists()
+
+    def test_an_absent_ledger_reports_absence_honestly(self, tmp_path):
+        db_path = tmp_path / 'project' / 'data' / 'orchestrator' / 'runs.db'
+        report = build_report(db_path, now=_NOW)
+        assert report.db_present is False
+        assert report.open_debt == []
+        assert report.chains == []
+        # Absence must not render as a healthy 0.0 rate — that is exactly the silent
+        # degradation the PRD exists to end.
+        assert report.gate_blind.rate is None
+        assert report.gate_blind.sufficient is False
+
+    def test_the_report_module_binds_no_write_entry_point(self):
+        # A direct structural check on the read-only contract, and the one that survives
+        # `from x import y` binding: if a future edit imports a writer into this module,
+        # this fails immediately rather than waiting for a call site to exercise it.
+        import orchestrator.flake_report as report_module
+
+        for writer in ('record_flake_occurrence', 'open_debt', 'resolve_debt'):
+            assert not hasattr(report_module, writer), (
+                f'flake_report must not bind the write entry point {writer}'
+            )
+
+    def test_build_report_succeeds_with_every_writer_booby_trapped(self, tmp_path, monkeypatch):
+        # Plain SYNC raisers even though open_debt/resolve_debt are `async def`: the
+        # assertion is that they are never AWAITED, so an AsyncMock would only be needed
+        # if the code under test were expected to await them — precisely what this
+        # forbids.  A sync raiser also fails louder if one is called and not awaited.
+        def _boom(*args, **kwargs):
+            raise AssertionError('the read-only report reached a ledger WRITE entry point')
+
+        for writer in ('record_flake_occurrence', 'open_debt', 'resolve_debt'):
+            monkeypatch.setattr(f'orchestrator.flake_ledger.{writer}', _boom)
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        _seed_debt(db_path, test_id='tests/test_a.py::test_one',
+                   opened_at='2026-08-09T12:00:00+00:00')
+        _seed_occurrence(db_path, test_id='tests/test_a.py::test_one',
+                         observed_at='2026-08-09T13:00:00+00:00')
+
+        report = build_report(db_path, now=_NOW)
+        assert report.db_present is True
+        assert len(report.open_debt) == 1
+        assert report.gate_blind.total == 1
