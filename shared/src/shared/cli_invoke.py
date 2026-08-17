@@ -3626,8 +3626,20 @@ async def _run_subprocess(
                     f'Process terminated after {timeout_seconds}s timeout (SIGTERM); ' + stderr_text
                 )
             duration_ms = int(time.monotonic() * 1000) - start_ms
+            # OFF-LOOP (task 3925) — one-shot, but the same blocking glob +
+            # whole-file parse as the polls above, and it lands on the shared
+            # loop at the worst moment: a timeout kill is exactly when other
+            # agents' coroutines are queued behind it.  The guard is kept so no
+            # thread hop is paid when there is nothing to read.
+            #
+            # Cancellation: this handler already awaits (wait_for(communicate)
+            # above), so awaits here are established.  A CancelledError from the
+            # to_thread propagates out of the inner try/except into the outer
+            # `except asyncio.CancelledError:` below, which cancels comm_task and
+            # reaps the process group — the same treatment a cancel landing
+            # anywhere else in the outer try receives.  No new leak path.
             tt = (
-                count_transcript_turns(config_dir, session_id)
+                await asyncio.to_thread(count_transcript_turns, config_dir, session_id)
                 if (config_dir and session_id)
                 else None
             )
