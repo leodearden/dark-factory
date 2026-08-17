@@ -1009,12 +1009,26 @@ class TestLargePayloadHandling:
         assert len(captured_communicate_input) == 1
         assert captured_communicate_input[0] == large_prompt.encode()
 
-    async def test_resume_skips_system_prompt_file(self, tmp_path):
-        """When resuming a session, --system-prompt-file is not used."""
+    async def test_resume_still_passes_system_prompt_file(self, tmp_path):
+        """When resuming a session, --system-prompt-file is STILL used (task 3983).
+
+        The system prompt is a process-invocation parameter the session does not
+        carry, so a resumed invocation that omitted it ran under the stock Claude
+        Code prompt with no role charter.  The resume path therefore writes the
+        prompt to a temp file just like the fresh path — and that new temp file
+        must be swept by the same cleanup the fresh path relies on.
+        """
         captured_cmd = []
+        captured_sysprompt = []
 
         async def fake_exec(*args, **kwargs):
             captured_cmd.extend(args)
+            # Read the sysprompt file HERE — spawn time is the only moment it is
+            # guaranteed to exist; _invoke_claude's `finally` unlinks it as soon
+            # as the call returns.
+            if '--system-prompt-file' in args:
+                idx = args.index('--system-prompt-file')
+                captured_sysprompt.append(Path(args[idx + 1]).read_text())
             proc = MagicMock()
             proc.communicate = AsyncMock(return_value=(
                 _successful_json_output().encode(),
@@ -1029,14 +1043,75 @@ class TestLargePayloadHandling:
         with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
             await invoke_claude_agent(
                 prompt='continue',
-                system_prompt='ignored on resume',
+                system_prompt='You are a resumed role agent.',
                 cwd=tmp_path,
                 resume_session_id='sess-abc',
             )
 
         assert '--resume' in captured_cmd
-        assert '--system-prompt-file' not in captured_cmd
+        assert '--system-prompt-file' in captured_cmd
+        # The inline form must still never appear (ARG_MAX).
         assert '--system-prompt' not in captured_cmd
+        assert captured_sysprompt == ['You are a resumed role agent.']
+
+        # The newly-created resume temp file is swept by the existing cleanup.
+        idx = captured_cmd.index('--system-prompt-file')
+        file_path = captured_cmd[idx + 1]
+        assert not Path(file_path).exists(), 'Temp system prompt file was not cleaned up'
+
+    async def test_resume_carries_the_current_system_prompt(self, tmp_path):
+        """A resume runs under the CURRENT system prompt, not the original one.
+
+        This is the one caller-visible SEMANTIC consequence of task 3983, and it
+        only shows up when the two invocations differ: charter A opens the
+        session, charter B resumes it, and B is what reaches the process.  The
+        prompt is a process-invocation parameter the session does not carry, so
+        there is nothing to replay — whatever the resuming caller passes NOW is
+        the charter in force.
+
+        That matters because real call sites re-resolve the prompt at resume
+        time rather than passing a constant: `workflow._resolve_role_system_prompt(
+        role, model)` is a model-keyed PromptArtifactStore lookup, and recon
+        Stage 2 builds its prompt from `project_id`.  A crash-recovery resume
+        that re-resolves to a different model therefore legitimately swaps the
+        charter mid-transcript.  `build_claude_argv` documents this as the
+        intended semantics; this test holds it.
+        """
+        captured_sysprompts: list[str] = []
+
+        async def fake_exec(*args, **kwargs):
+            # Read at spawn time — the only moment the temp file exists, since
+            # _invoke_claude's `finally` unlinks it as soon as the call returns.
+            idx = args.index('--system-prompt-file')
+            captured_sysprompts.append(Path(args[idx + 1]).read_text())
+            proc = MagicMock()
+            proc.communicate = AsyncMock(return_value=(
+                _successful_json_output().encode(),
+                b'',
+            ))
+            proc.returncode = 0
+            proc.terminate = MagicMock()
+            proc.kill = MagicMock()
+            proc.wait = AsyncMock()
+            return proc
+
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await invoke_claude_agent(
+                prompt='start',
+                system_prompt='charter A',
+                cwd=tmp_path,
+                session_id='sess-abc',
+            )
+            await invoke_claude_agent(
+                prompt='continue',
+                system_prompt='charter B',
+                cwd=tmp_path,
+                resume_session_id='sess-abc',
+            )
+
+        assert captured_sysprompts == ['charter A', 'charter B'], (
+            'the resumed process must receive the prompt supplied at RESUME time'
+        )
 
 
 # ── session_id preallocation (crash-recovery resume) ──────────────────

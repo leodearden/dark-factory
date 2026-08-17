@@ -717,6 +717,42 @@ park_stop_enabled: true
 park_stop_parked_threshold: 15
 park_stop_parked_window_hours: 1.0
 
+# EASY-backfill admission through parks (task 3823, PRD task η / C7)
+#
+# A candidate blocked ONLY by another task's park may be admitted through it
+# when its predicted hold, times a safety factor, provably fits inside the gap
+# the park's owner is going to wait anyway.  The final acquisition still goes
+# through try_acquire, and only the PARK gate is bypassed — the held-lock limit
+# gate is untouched, so an admitted-but-actually-contended candidate simply
+# fails to acquire.
+#
+# Evidence: plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md
+#
+# backfill_enabled: operator kill switch.  When false, a park-blocked candidate
+#   is passed over exactly as before (no admission is even attempted).
+#
+# backfill_safety_factor: multiplier on the candidate's predicted hold before it
+#   is compared against the parked owner's provable assembly delay (gt=0;
+#   default 2.5).  2.5 is INTERPOLATED between two measured 80%-coverage
+#   multipliers — x2.9 (dark-factory) and x2.0 (reify), report :126 — not
+#   guessed; modelled overstay at x2.5 is 7-9% (:254-255).  Raise it toward 2.9
+#   if park_backfill_overstay events show a sustained higher rate.
+#
+# backfill_min_samples: minimum observed hold samples before the predictor will
+#   answer at all (ge=1; default 3).  Below it predicted_hold is None and
+#   backfill REFUSES.  This is the single source of truth for HoldHistory's
+#   sample floor.  A floor of 0 would let an empty history certify a backfill.
+#
+# backfill_max_park_age_secs: refuse backfill through any park older than this,
+#   measured from the owner's FIRST install (gt=0; default 3600.0).  The clause
+#   is measured (report :256 — without a cutoff one reify starver flips to
+#   never-dispatched in-window); the 1h figure is a judgment default, ~40% of
+#   the measured 2.2-3h median process era.
+backfill_enabled: true
+backfill_safety_factor: 2.5
+backfill_min_samples: 3
+backfill_max_park_age_secs: 3600.0
+
 # Escalation-watcher subprocess supervisor (AFK hardening, task 1326)
 #
 # An orchestrator-managed asyncio supervisor that keeps a fresh

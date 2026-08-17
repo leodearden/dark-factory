@@ -58,14 +58,19 @@ from dashboard.data.costs import (
     aggregate_cost_summary,
     aggregate_cost_trend,
 )
-from dashboard.data.db import DbPool
+from dashboard.data.db import DbPool, track_task
 from dashboard.data.escalation_analytics import (
     archive_scan_succeeded,
     build_escalation_analytics,
 )
 from dashboard.data.escalations import build_escalation_queues
 from dashboard.data.load import get_load_metrics
-from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.data.mcp_fanout import (
+    PreformattedFanoutError,
+    TTLCache,
+    describe_exc,
+    first_success,
+)
 from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
@@ -330,12 +335,126 @@ async def _metrics_loop(
             logger.warning('Metrics snapshot error', exc_info=True)
 
 
+# ── shared httpx client pool bound (task 3871) ──────────────────────
+#
+# The dashboard shares ONE httpx.AsyncClient across every fan-out (merge_halt,
+# task_runtime, live merge queue, the metrics samplers). Constructed with no
+# `limits=` it inherited httpx's stock DEFAULT_LIMITS — max_connections=100,
+# max_keepalive_connections=20, keepalive_expiry=5.0 (httpx/_config.py).
+#
+# THIS IS A GUARD, NOT A LEAK FIX. It bounds idle-socket retention and stops
+# the client from racing the server's keep-alive close, while letting the
+# concurrency ceiling track the fleet (see the two-dimensions note below). It
+# does NOT fix the CLOSE-WAIT accumulation — that diagnosis is owned by the
+# task-3857 re-spec, and nothing here should be read as addressing it.
+#
+# keepalive_expiry is derived from the SMALLER of the two server populations
+# the dashboard talks to, because the smaller one binds:
+#   * escalation MCP servers (one per orchestrator, and the target of most of
+#     the fan-out) are served by uvicorn with NO timeout_keep_alive override
+#     — orchestrator/src/orchestrator/harness.py — and uvicorn's default is 5s.
+#   * fused-memory sets keepalive_timeout: 120 (fused-memory/config/config.yaml),
+#     far looser, so 4.0 clears it comfortably too.
+# httpx's own default is exactly 5.0 — a DEAD TIE with the escalation servers'
+# close, i.e. the client considers a connection reusable at precisely the
+# moment the server may close it. 4.0 buys 1s of margin under that close while
+# staying above the ~3s dashboard poll interval (merge_halt.py names a "3s
+# polling loop"), so a connection still survives one poll cycle rather than
+# reconnecting every time. Below ~3.5 destroys reuse; >= 5.0 keeps the race.
+_HTTP_KEEPALIVE_EXPIRY_SECONDS = 4.0
+
+# TWO DIMENSIONS, BOUNDED DIFFERENTLY — the distinction matters:
+#
+#   * CONCURRENCY (max_connections) SCALES UP with the fleet. The real peak is
+#     (viewers x concurrent endpoint families x projects). Roughly three
+#     families run concurrently per project — get_merge_halt_status and
+#     fetch_live_merge_queues are gathered over every escalation URL, plus the
+#     task_runtime fan-out — with the metrics samplers over fused_memory_urls
+#     on top; _HTTP_CONNS_PER_ENDPOINT rounds that up for headroom.
+#
+#     The multiplier that is easy to miss is the VIEWER count: every open
+#     browser tab drives its OWN 2s poll of all of the above, so in-flight
+#     demand is per-tab, not per-install. _HTTP_ASSUMED_CONCURRENT_VIEWERS
+#     names that assumption instead of leaving it implicit — raise it if the
+#     dashboard is ever put in front of a larger audience.
+#
+#     _HTTP_MIN_CONNECTIONS is deliberately httpx's own stock max_connections:
+#     for a small install the derived product lands below it, and this change
+#     must never make the pool TIGHTER than what already shipped. Sizing below
+#     stock would convert ordinary queueing into httpx.PoolTimeout — which,
+#     now that the per-call budget also bounds pool acquisition, would render
+#     as an "offline" pill on a perfectly healthy orchestrator. (When that
+#     does happen it is diagnosable: mcp_fanout.describe_exc names the
+#     exception type, so 'PoolTimeout' in the log distinguishes local
+#     saturation from a dead endpoint.)
+#
+#   * IDLE RETENTION (max_keepalive_connections) is held FLAT at httpx's stock
+#     20, NOT scaled as a fraction of the total. A `max_connections // 2` rule
+#     would hand a 40-project install 84 idle keepalive slots against httpx's
+#     stock 20 — i.e. this "guard" would LOOSEN retention for exactly the
+#     large fleets it is meant to bound, and retention is the dimension the
+#     deferred CLOSE-WAIT investigation (task 3857) cares about. The `// 2`
+#     term stays only as a sanity clamp for tiny pools.
+_HTTP_MIN_CONNECTIONS = 100
+_HTTP_CONNS_PER_ENDPOINT = 4
+_HTTP_ASSUMED_CONCURRENT_VIEWERS = 3
+_HTTP_MAX_KEEPALIVE_CONNECTIONS = 20
+
+
+def _build_http_limits(config: DashboardConfig) -> httpx.Limits:
+    """Derive the shared client's connection-pool bound from *config*.
+
+    Pure by design: ``httpx.AsyncClient`` exposes no public accessor for its
+    limits, so a helper is the only way to test the sizing without asserting
+    on private internals (``client._transport._pool._max_connections``), which
+    are brittle across httpx versions.
+    """
+    endpoints = len(config.escalation_urls) + len(config.fused_memory_urls)
+    max_connections = max(
+        _HTTP_MIN_CONNECTIONS,
+        _HTTP_CONNS_PER_ENDPOINT * _HTTP_ASSUMED_CONCURRENT_VIEWERS * endpoints,
+    )
+    return httpx.Limits(
+        max_connections=max_connections,
+        max_keepalive_connections=min(
+            max_connections // 2, _HTTP_MAX_KEEPALIVE_CONNECTIONS,
+        ),
+        keepalive_expiry=_HTTP_KEEPALIVE_EXPIRY_SECONDS,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage shared resources: HTTP client, DB connection pool."""
-    app.state.http_client = httpx.AsyncClient(follow_redirects=True)
+    """Manage shared resources: HTTP client, DB connection pool.
+
+    **Shutdown closes the objects THIS lifespan opened, held in locals — never
+    whatever ``app.state`` happens to point at by then** (task 3466).
+    ``app.state`` is a single mutable namespace on the ``FastAPI`` instance, so
+    two overlapping lifespans over one ``app`` (which the dashboard test suite
+    does routinely: ~15 module-scoped ``TestClient(app)`` fixtures coexist with
+    the function-scoped ``client`` fixture in ``tests/conftest.py``, and
+    starlette runs a full lifespan per ``TestClient`` context) leave the inner
+    one's handles installed.  Reading them back at shutdown made the OUTER
+    lifespan close the INNER's already-closed stores — a silent no-op — and
+    strand its own two writable WAL connections plus its ``DbPool``.  Each
+    stranded ``aiosqlite.Connection`` is later finalised by ``__del__``, whose
+    ``stop()`` queues work onto a loop that has since closed, so
+    ``RuntimeError: Event loop is closed`` escapes ``_connection_worker_thread``
+    and pytest blames whichever unrelated test is running at that instant.
+    ``app.state`` stays assigned for request handlers and for tests that swap
+    ``app.state.config``; it is simply not the shutdown path's source of truth.
+    """
+    # Config first: the shared client's pool bound is DERIVED from it (see
+    # _build_http_limits above). DashboardConfig.from_env() has no dependency
+    # on the client, so evaluating it first is safe.
     app.state.config = DashboardConfig.from_env()
-    app.state.db = DbPool()
+    http_client = httpx.AsyncClient(
+        follow_redirects=True,
+        limits=_build_http_limits(app.state.config),
+    )
+    app.state.http_client = http_client
+    pool = DbPool()
+    app.state.db = pool
     app.state.start_time = time.monotonic()
 
     # Burndown snapshot collector (writable WAL connection with full durability triad).
@@ -347,7 +466,7 @@ async def lifespan(app: FastAPI):
         _burndown_loop(
             burndown_store,
             app.state.config,
-            app.state.http_client,
+            http_client,
         )
     )
 
@@ -366,10 +485,10 @@ async def lifespan(app: FastAPI):
     for task in (collector_task, metrics_task):
         with contextlib.suppress(asyncio.CancelledError):
             await task
-    await app.state.burndown_store.close()
-    await app.state.metrics_store.close()
-    await app.state.db.close_all()
-    await app.state.http_client.aclose()
+    await burndown_store.close()
+    await metrics_store.close()
+    await pool.close_all()
+    await http_client.aclose()
 
 
 app = FastAPI(title='Dark Factory Dashboard', lifespan=lifespan)
@@ -425,22 +544,24 @@ def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
 
 # Abandoned _probe_db tasks (see below) — the event loop only holds a WEAK
 # reference to a Task, so an unreferenced one can be garbage-collected
-# mid-flight; this set holds the strong reference until each task's own
+# mid-flight; this set holds the strong reference until track_task's
 # done-callback removes it.
 _ABANDONED_PROBES: set[asyncio.Task] = set()
 
 
-def _discard_abandoned_probe(task: asyncio.Task) -> None:
-    _ABANDONED_PROBES.discard(task)
-    if not task.cancelled():
-        task.exception()  # consume so "exception was never retrieved" isn't logged
+def _abandon_probe(task: asyncio.Task) -> None:
+    """Cancel *task* fire-and-forget and hold a strong reference until it ends."""
+    task.cancel()  # fire-and-forget — do NOT await the unwinding
+    track_task(task, _ABANDONED_PROBES)
 
 
 async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     """Probe one database under a single deadline covering acquire + execute + fetch.
 
     Returns 'ok' | 'failed' | 'timeout' | 'error' | 'unavailable'. Never
-    raises: a /healthz probe must always yield a verdict for its DB.
+    raises for any DB-level failure — every probe outcome is a status
+    string. The single exception is caller cancellation, which is
+    propagated deliberately (see below).
 
     'timeout' means the probe did not finish inside *budget*. 'error' means
     it finished fast by RAISING (corrupt DB, connection closed under us,
@@ -450,8 +571,10 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     reaches the payload, so the exception itself is logged at WARNING with
     exc_info; without that it would be unrecoverable anywhere.
 
-    Runs the probe in its own task and, on expiry, ABANDONS it rather than
-    awaiting its cancellation. A deadline wrapped around `async with
+    Runs the probe in its own task and ABANDONS it — rather than awaiting
+    its cancellation — on EVERY exceptional exit from the `asyncio.wait`
+    below: budget expiry, or the caller (this coroutine's own task) being
+    cancelled out from under it. A deadline wrapped around `async with
     conn.execute(...)` is not actually hang-free: when it fires mid-fetch,
     the cancellation is consumed unwinding into the cursor's `__aexit__`,
     which issues a NEW `await cursor.close()` that nothing will cancel a
@@ -460,11 +583,25 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     `asyncio.wait(..., timeout=budget)` returns at the deadline WITHOUT
     awaiting the task, so a hung cleanup can never block this handler.
 
-    Cancelling the abandoned task does NOT stop aiosqlite's underlying
-    worker thread — a wedged connection stays wedged and will simply time
-    out again on the next /healthz call. That's intended: /healthz reports,
-    it does not repair, and per-DB caps mean a poisoned connection costs one
-    _DB_PROBE_TIMEOUT, never the whole handler.
+    Abandoning the task does not repair a wedged connection — it stays
+    wedged and will simply time out again on the next /healthz call. That's
+    intended: /healthz reports, it does not repair, and per-DB caps mean a
+    poisoned connection costs one _DB_PROBE_TIMEOUT, never the whole handler.
+
+    It does not LEAK one either, though it once did (task 3466, and again —
+    via caller cancellation rather than budget expiry — as task 4089). When
+    the abandoned task is cancelled inside `pool.get()`, DbPool keeps the
+    in-flight `aiosqlite.connect()` alive under `asyncio.shield` and adopts
+    the connection when it lands, so a slow open becomes a warm cached
+    connection for the next probe rather than a stranded (non-daemon)
+    aiosqlite worker thread. That matters here specifically: the
+    `_THREAD_LIMIT` check above exists to detect exactly such leaks, so
+    /healthz must not manufacture them itself. Caller cancellation (uvicorn
+    `--timeout-graceful-shutdown` force-cancelling request tasks at
+    restart; a client disconnect) reaches this same await, which is why the
+    `except BaseException` below re-raises rather than swallowing it — a
+    cancelled request must stay cancelled, never be laundered into a
+    'timeout' verdict.
     """
 
     async def _inner() -> str:
@@ -479,11 +616,16 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
         return 'ok' if row is not None else 'failed'
 
     task = asyncio.create_task(_inner())
-    done, _pending = await asyncio.wait({task}, timeout=budget)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=budget)
+    except BaseException:
+        # asyncio.wait() does not cancel what it waits on, and we catch
+        # BaseException (not just CancelledError) so no exceptional exit
+        # from this await leaves the task untracked — rationale above.
+        _abandon_probe(task)
+        raise
     if task not in done:
-        task.cancel()  # fire-and-forget — do NOT await the unwinding
-        _ABANDONED_PROBES.add(task)
-        task.add_done_callback(_discard_abandoned_probe)
+        _abandon_probe(task)
         return 'timeout'  # ONLY a real budget expiry is a 'timeout'
     try:
         return task.result()
@@ -683,6 +825,20 @@ async def api_tasks(request: Request) -> JSONResponse:
     )
 
 
+# Per-HTTP-request budget for /memory's three MCP legs (task 3871), matching
+# the metrics samplers' 5.0s. Without it each leg silently ran to
+# mcp_tool_call's 10s default — including pool acquisition — while its
+# sibling legs honoured a real budget.
+#
+# Deliberately NOT also wrapped in asyncio.wait_for, unlike the curator leg
+# below: this gather has no return_exceptions=True, so a TimeoutError raised
+# by a wrapper would escape as a 500 rather than degrading one leg. The three
+# callees swallow their own per-URL failures and return offline dicts, so
+# adding a whole-operation bound here means first giving each leg its own
+# exception containment — a shape change beyond this task.
+_MEMORY_ENDPOINT_TIMEOUT_SECONDS = 5.0
+
+
 @app.get('/api/v2/dashboard/memory')
 async def api_memory(request: Request) -> JSONResponse:
     """MEMORY_STATUS, including queue counts and per-project totals."""
@@ -691,12 +847,18 @@ async def api_memory(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     metrics_db = await pool.get(config.metrics_db)
     status, queue, sparks, queue_spark, delta_24h, wal = await asyncio.gather(
-        memory_data.get_memory_status(http_client, config),
-        memory_data.get_queue_stats(http_client, config),
+        memory_data.get_memory_status(
+            http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
+        ),
+        memory_data.get_queue_stats(
+            http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
+        ),
         get_memory_sparks(metrics_db, days=1),
         get_queue_pending_series(metrics_db, days=1),
         get_memory_24h_ago(metrics_db),
-        memory_data.get_wal_status(http_client, config),
+        memory_data.get_wal_status(
+            http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
+        ),
     )
     return JSONResponse(
         redux_api.shape_memory(
@@ -899,8 +1061,12 @@ async def api_performance(request: Request) -> JSONResponse:
 # only its message arg — NOT the response body — so the cap defends
 # against long message strings rather than response-body leakage.  The
 # WARNING log still records the full untruncated exception text.
-# Intentionally cancel-handler-scoped for now; other proxy handlers can
-# adopt the same constant if they gain an equivalent truncation path.
+# Also adopted by _scheduler_proxy, whose hand-rolled `str(exc)[:200]` was the
+# "equivalent truncation path" this comment anticipated; the name is kept for
+# its original site rather than renamed across both.  Note the two caps differ
+# slightly in what they bound: the cancel handler truncates str(exc) and then
+# prefixes the type, while _scheduler_proxy truncates the already-rendered
+# 'Type: message' — so the type name there is inside the cap, never after it.
 _CANCEL_DETAIL_EXC_CHAR_LIMIT = 200
 
 
@@ -967,7 +1133,14 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
             ValueError,
         ) as exc:
             logger.warning('cancel_ticket failed for %s: %s', url, exc)
-            raise ValueError(
+            # PreformattedFanoutError, not ValueError: the message below is
+            # already a rendered 'Type: message', and first_success renders
+            # every caught exception through describe_exc — which would
+            # prepend a second type name, surfacing 'ValueError: ConnectError:
+            # refused' in the 502 detail and the offline pill. See that
+            # class's docstring. str(exc) (NOT the composed string) is what
+            # gets truncated, so the cap bounds the exception text alone.
+            raise PreformattedFanoutError(
                 f'{type(exc).__name__}: {str(exc)[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]}'
             ) from exc
         if result.get('error') == 'not_found':
@@ -978,6 +1151,11 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
         config.fused_memory_urls,
         _call,
         log_label='cancel_ticket',
+        # log_failures=False: _call above already emits a fully-detailed
+        # WARNING per failing URL (pinned by test_api_curator_cancel.py), so
+        # letting first_success report too would give one failure two
+        # identical-level lines. Reported exactly once, at the call site.
+        log_failures=False,
         offline_result=lambda errs: JSONResponse(
             {'error': 'fused_memory_unreachable', 'detail': '; '.join(errs)},
             status_code=502,
@@ -1029,7 +1207,19 @@ async def api_curator(request: Request) -> JSONResponse:
         ),
         _sparks_leg(),
         _intervals_leg(),
-        memory_data.get_curator_state(http_client, config),
+        # Bounded on BOTH layers, like every other probe in task 3871: the
+        # budget bounds each individual HTTP request (including pool
+        # acquisition), wait_for bounds the whole operation because a cold
+        # session is three posts across up to N urls. Previously this leg took
+        # neither, so /curator could block for roughly N x 3 x 10s during a
+        # fused-memory outage while its fan-out sibling honoured 5s.
+        # TimeoutError lands in safe_gather_result below as the offline state.
+        asyncio.wait_for(
+            memory_data.get_curator_state(
+                http_client, config, timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
+            ),
+            timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
+        ),
         return_exceptions=True,
     )
     # fan_out_list_tickets never raises a normal Exception (per-root failures are
@@ -1186,8 +1376,18 @@ async def _scheduler_proxy(
             httpx.HTTPStatusError,
             ValueError,
         ) as exc:
-            logger.warning('%s failed for %s: %s', tool_name, url, exc)
-            raise ValueError(str(exc)[:200]) from exc
+            # describe_exc, not the bare exc: several exceptions on this path
+            # stringify to '' (most importantly httpx.PoolTimeout, i.e. THIS
+            # client's pool is saturated rather than the server being down), so
+            # a bare str(exc) made both this WARNING and the 502 detail
+            # content-free.  PreformattedFanoutError, not ValueError: the
+            # message is already a rendered 'Type: message' and first_success
+            # renders every caught exception through describe_exc again, which
+            # would prepend a second type name.  Mirrors the cancel_ticket
+            # fan-out above — the two proxies must render errors identically.
+            detail = describe_exc(exc)
+            logger.warning('%s failed for %s: %s', tool_name, url, detail)
+            raise PreformattedFanoutError(detail[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]) from exc
         # Guard the not_found mapping with isinstance: an MCP tool that
         # returns a list or None (buggy/older server) would AttributeError
         # on `.get(...)` and escape as a 500.  Defensive at the single
@@ -1201,7 +1401,14 @@ async def _scheduler_proxy(
         return JSONResponse(result)
 
     return await first_success(
-        config.fused_memory_urls, _call, log_label=tool_name, offline_result=_sched_fan_out_error,
+        config.fused_memory_urls,
+        _call,
+        log_label=tool_name,
+        # See the cancel_ticket fan-out: _call already logs each failing URL at
+        # WARNING with the same content, so first_success stays quiet here and
+        # the failure is reported exactly once.
+        log_failures=False,
+        offline_result=_sched_fan_out_error,
     )
 
 

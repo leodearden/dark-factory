@@ -24,6 +24,14 @@
     "orchestrator/src/orchestrator/artifacts.py",
     "orchestrator/src/orchestrator/workflow.py"
   ],
+  "reference": {
+    "post_task_commit": "506516dee251d162f9665d5e67758ae423177cb2",
+    "diff_stat": {
+      "files": 5,
+      "insertions": 79,
+      "deletions": 18
+    }
+  },
   "plan": {
     "task_id": "df_task_13",
     "title": "Bug: Reviewers receive empty diff, rubber-stamp PASS",

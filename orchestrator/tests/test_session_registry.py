@@ -11,16 +11,19 @@ tests/scripts/test_spawn_claude.py's bash-level harness.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import fcntl
 import json
 import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -259,6 +262,17 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
     concrete, distinguishable value so a round-trip test can catch a field
     being dropped/mis-typed; ``overrides`` lets a test tweak just the
     field(s) it cares about.
+
+    ONE DELIBERATE EXCEPTION: ``escalations_dir`` is absent from the map
+    below, so the DecisionRecord dataclass default ('' -- unset/legacy)
+    supplies it. It is the only field that is a GUARD INPUT to the reaper's
+    axis-2 queue check (``_run_reap_decisions._status``), so a non-empty
+    shared default here would make every _make_decision()-built decision
+    carry a queue FOREIGN to the tmp_path queue a reap test invokes the
+    reaper with -- short-circuiting _status before read_escalation_status
+    runs and collapsing the test into a vacuous ``assert state == OPEN``. Do
+    not add it here; a test needing a real queue passes ``escalations_dir=``
+    at its own call site.
     """
     fields: dict = {
         'id': 'dec-1',
@@ -277,6 +291,19 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
     return sr.DecisionRecord(**fields)
 
 
+def test_make_decision_defaults_to_the_unset_queue_sentinel() -> None:
+    """The fixture must not hand escalations_dir a non-'' default.
+
+    Guards the one exception documented on _make_decision: escalations_dir is
+    a control-flow guard input to ``_run_reap_decisions._status``, and a
+    non-empty shared default silently neuters every reap-decisions test that
+    does not override it (task 3528 -- it cost three live regression tests at
+    once, each still passing with its premise inverted). Omitting the key is
+    the structural fix; this is the one-line tripwire against re-adding it.
+    """
+    assert _make_decision().escalations_dir == ''
+
+
 def test_decision_state_enum_values() -> None:
     assert issubclass(sr.DecisionState, str)
     assert {m.value for m in sr.DecisionState} == {'open', 'answered', 'dropped'}
@@ -286,12 +313,16 @@ def test_decision_state_enum_values() -> None:
 
 
 def test_decision_record_dict_round_trip_is_lossless() -> None:
-    d = _make_decision()
+    # escalations_dir is stated explicitly (the fixture deliberately omits it
+    # and lets the '' dataclass default stand): a dropped key would round-trip
+    # indistinguishably from '', so only a non-empty value keeps this test's
+    # field-drop catch power.
+    d = _make_decision(escalations_dir='/p/data/reconciliation/escalations')
     assert sr.DecisionRecord.from_dict(d.to_dict()) == d
 
 
 def test_decision_record_json_round_trip_is_lossless() -> None:
-    d = _make_decision()
+    d = _make_decision(escalations_dir='/p/data/reconciliation/escalations')
     assert sr.DecisionRecord.from_json(d.to_json()) == d
 
 
@@ -300,7 +331,13 @@ def test_decision_record_round_trip_with_null_fields() -> None:
     project-level decision with no session/task/escalation context yet);
     the round trip must preserve that, not coerce it or drop the key.
     """
-    d = _make_decision(session_id=None, task_id=None, escalation_id=None, options=None)
+    d = _make_decision(
+        session_id=None,
+        task_id=None,
+        escalation_id=None,
+        options=None,
+        escalations_dir='/p/data/reconciliation/escalations',
+    )
     round_tripped = sr.DecisionRecord.from_dict(d.to_dict())
     assert round_tripped == d
     assert round_tripped.session_id is None
@@ -316,6 +353,7 @@ def test_decision_record_defaults() -> None:
     assert d.manual_boost == 0
     assert d.state == sr.DecisionState.OPEN
     assert d.severity == ''
+    assert d.escalations_dir == ''
 
 
 def test_decision_record_to_dict_includes_severity() -> None:
@@ -343,6 +381,53 @@ def test_decision_record_parses_pre_severity_dict_additive() -> None:
     }
     record = sr.DecisionRecord.from_dict(pre_severity)
     assert record.severity == ''
+
+
+def test_decision_record_parses_pre_escalations_dir_dict_additive() -> None:
+    """Every one of the ~300 decision records already on disk predates the
+    escalations_dir field (task 3528). Such a dict must still parse, yielding
+    the '' unset/legacy sentinel that makes the reaper fall back to today's
+    project-only scoping -- the backward-compatibility half of the fix.
+    """
+    pre_queue = {
+        'id': 'dec-1',
+        'project': 'df',
+        'text': 'approve?',
+        'filed_at': '2026-07-07T00:00:00+00:00',
+        'escalation_id': 'esc-1',
+        'state': 'open',
+        'severity': 'blocking',
+    }
+    record = sr.DecisionRecord.from_dict(pre_queue)
+    assert record.escalations_dir == ''
+
+
+def test_decision_record_parses_null_escalations_dir_as_empty() -> None:
+    """An explicit JSON null (a hand-edited or third-party-written record)
+    must also collapse to '', not None -- the annotation is `str`, and the
+    reaper's queue guard is a single `if decision_dir and ...` test with no
+    None-vs-''-vs-missing branching. Fail-soft, not a raise.
+    """
+    record = sr.DecisionRecord.from_dict(
+        {
+            'id': 'dec-1',
+            'project': 'df',
+            'text': 'approve?',
+            'filed_at': '2026-07-07T00:00:00+00:00',
+            'escalations_dir': None,
+        }
+    )
+    assert record.escalations_dir == ''
+
+
+def test_decision_record_to_dict_always_includes_escalations_dir() -> None:
+    """The key is emitted unconditionally -- including for a queue-less
+    record -- so a round-tripped record never loses its queue stamp and the
+    cockpit's read-modify-write helpers carry it through untouched.
+    """
+    stamped = _make_decision(escalations_dir='/p/data/reconciliation/escalations')
+    assert stamped.to_dict()['escalations_dir'] == '/p/data/reconciliation/escalations'
+    assert 'escalations_dir' in _make_decision().to_dict()
 
 
 def test_decision_path_for_id_under_decisions_dir(tmp_path: Path) -> None:
@@ -409,6 +494,32 @@ def test_sanitize_slug_matches_build_session_slug_regression() -> None:
     assert slug == sr.sanitize_slug('un block-df/prod-20#85-4242')
 
 
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [('.', '-'), ('..', '--'), ('...', '---')],
+)
+def test_sanitize_slug_collapses_all_dots_slug(raw: str, expected: str) -> None:
+    # Task 4112: the all-dots branch is the SOLE guard against a path escape
+    # out of sessions_dir. '.' is inside _SLUG_SANITIZE_RE's allowed class, so
+    # the character substitution alone passes '..' straight through, and
+    # record_path_for_slug is a bare join that sanitizes nothing of its own --
+    # so an unguarded '..' would be handed to the filesystem as a traversal
+    # segment. Every '.' maps to '-', so length is preserved.
+    slug = sr.sanitize_slug(raw)
+    assert slug == expected
+    assert re.fullmatch(r'[A-Za-z0-9._-]+', slug)
+
+
+@pytest.mark.parametrize('raw', ['..foo', 'foo..', 'a.b', '.hidden-x'])
+def test_sanitize_slug_leaves_partially_dotted_slug_untouched(raw: str) -> None:
+    # The guard's LOWER edge: a value that merely CONTAINS dots alongside other
+    # characters is a literal, non-traversing directory name (sanitize_slug's
+    # docstring says so) and must pass through byte-identical. Pinning only the
+    # collapse direction would leave a future "hardening" free to over-broaden
+    # into stripping every dot, silently mangling ordinary slugs like 'a.b'.
+    assert sr.sanitize_slug(raw) == raw
+
+
 def test_fleet_root_defaults_to_dot_claude_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv('CLAUDE_FLEET_ROOT', raising=False)
     monkeypatch.setenv('HOME', '/home/fakeuser')
@@ -435,6 +546,33 @@ def test_fleet_root_explicit_root_overrides_env(
 def test_record_path_for_slug(tmp_path: Path) -> None:
     path = sr.record_path_for_slug('unblock-df-2085-4242', root=tmp_path)
     assert path == tmp_path / 'sessions' / 'unblock-df-2085-4242' / 'record.json'
+
+
+def test_record_path_for_slug_all_dots_slug_stays_under_sessions_dir(tmp_path: Path) -> None:
+    # Task 4112: the containment property sanitize_slug's all-dots branch buys.
+    # resolve() + is_relative_to, NOT a string prefix check -- str(root/'sessions'
+    # /'..'/'record.json') startswith str(root/'sessions') is TRUE, so a prefix
+    # check would pass for the very path that escapes. resolve() is non-strict
+    # (these paths do not exist) and collapses '..' with the exact filesystem
+    # semantics under defense.
+    sessions = sr.sessions_dir(root=tmp_path).resolve()
+    # '..' is the ONLY genuine escape vector in this loop; '.' and '...' are
+    # non-traversing CONTROLS, not extra attack coverage. Unsanitized,
+    # 'sessions/./record.json' still resolves under sessions_dir and '...' is a
+    # literal POSIX dirname resolve() leaves in place -- so only the '..'
+    # iteration discriminates against a guard-deleted build.
+    for raw in ('.', '..', '...'):
+        slug = sr.sanitize_slug(raw)
+        path = sr.record_path_for_slug(slug, root=tmp_path)
+        assert path.resolve().is_relative_to(sessions)
+
+    # NON-VACUITY COUNTERFACTUAL: the UNsanitized token genuinely escapes, i.e.
+    # record_path_for_slug performs NO sanitization of its own (it is a bare
+    # join) -- which is exactly why sanitize_slug has to be the chokepoint.
+    # Without this, the assertions above could pass for the wrong reason if
+    # record_path_for_slug's shape ever changed, and nobody would notice the
+    # test had stopped proving anything.
+    assert not sr.record_path_for_slug('..', root=tmp_path).resolve().is_relative_to(sessions)
 
 
 def test_transcript_path_for_cwd_encodes_slash() -> None:
@@ -599,6 +737,134 @@ def test_set_manual_boost_persists(tmp_path: Path) -> None:
     assert reread.manual_boost == 3
 
 
+def test_set_decision_escalations_dir_persists_normalized(tmp_path: Path) -> None:
+    """The back-fill's writer (task 3640) normalizes ON THE WAY IN.
+
+    A non-canonical spelling passed by a caller must not be stored raw: the
+    reaper's axis-2 guard compares stored-value against reaper-value, and a
+    dotted/trailing-slash spelling stored verbatim would compare unequal to
+    the very queue it names -- the fail-open direction, so the record would
+    silently never close again. Normalizing here means every writer of this
+    field (write-decision, the back-fill) stores ONE spelling.
+    """
+    rec = _make_decision(id='dec-setescdir')
+    sr.write_decision(rec, root=tmp_path)
+    queue = tmp_path / 'escalations'
+    queue.mkdir()
+    (tmp_path / 'sub').mkdir()
+    dotted = str(tmp_path / 'sub' / '..' / 'escalations') + '/'
+    assert dotted != str(queue)
+
+    updated = sr.set_decision_escalations_dir(rec.id, dotted, root=tmp_path)
+
+    assert updated is not None
+    assert updated.escalations_dir == sr.normalize_escalations_dir(queue)
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.escalations_dir == sr.normalize_escalations_dir(queue)
+
+
+def test_set_decision_escalations_dir_stores_the_unknown_sentinel_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The composition that matters: sentinel in, sentinel on disk.
+
+    This is the one path the back-fill uses for every record whose owning
+    queue it could not determine. If the writer's normalize step turned the
+    sentinel into a cwd-relative path (the bug fixed in step-2), the live
+    fleet would end up with hundreds of records stamped
+    '/home/leo/src/dark-factory/.worktrees/3640/<unknown>' -- a value that
+    both lies about the record and varies with whoever ran the migration.
+    Running under chdir pins that the stored value is cwd-INdependent.
+    """
+    monkeypatch.chdir(tmp_path)
+    rec = _make_decision(id='dec-setescdir-unknown')
+    sr.write_decision(rec, root=tmp_path)
+
+    updated = sr.set_decision_escalations_dir(rec.id, sr.UNKNOWN_QUEUE, root=tmp_path)
+
+    assert updated is not None
+    assert updated.escalations_dir == sr.UNKNOWN_QUEUE
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.escalations_dir == sr.UNKNOWN_QUEUE
+
+
+def test_set_decision_escalations_dir_preserves_every_other_field(tmp_path: Path) -> None:
+    """A read-modify-write must modify exactly ONE field.
+
+    write_decision rewrites the whole file, so a dropped/defaulted field in
+    the round-trip is silent data loss -- and the back-fill runs this over the
+    entire open cockpit population at once, where losing e.g. `options` or
+    `manual_boost` would quietly degrade real human gates. _make_decision
+    gives every field a distinguishable value precisely so this can catch it.
+    """
+    rec = _make_decision(id='dec-setescdir-preserve', state=sr.DecisionState.OPEN)
+    sr.write_decision(rec, root=tmp_path)
+
+    updated = sr.set_decision_escalations_dir(rec.id, sr.UNKNOWN_QUEUE, root=tmp_path)
+
+    assert updated is not None
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread == dataclasses.replace(rec, escalations_dir=sr.UNKNOWN_QUEUE)
+    # Spelled out as well as compared wholesale, so a failure names the field.
+    assert reread.state == sr.DecisionState.OPEN
+    assert reread.manual_boost == rec.manual_boost
+    assert reread.severity == rec.severity
+    assert reread.escalation_id == rec.escalation_id
+    assert reread.session_id == rec.session_id
+    assert reread.task_id == rec.task_id
+    assert reread.options == rec.options
+    assert reread.text == rec.text
+    assert reread.filed_at == rec.filed_at
+    assert reread.project == rec.project
+
+
+def test_set_decision_escalations_dir_fail_soft_on_unknown_id(tmp_path: Path) -> None:
+    """Same fail-soft contract as its two siblings: None, never a raise.
+
+    The back-fill reads the whole decision list and then writes each id back;
+    a record closed or removed by a live watcher in between is expected, not
+    exceptional, and must not abort a migration mid-population.
+    """
+    assert sr.set_decision_escalations_dir('no-such-id', '/tmp/q', root=tmp_path) is None
+
+
+def test_set_decision_escalations_dir_fail_soft_on_corrupt_body(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A corrupt on-disk body returns None (logged at ERROR), not a traceback."""
+    corrupt_path = sr.decision_path_for_id('dec-setescdir-corrupt', root=tmp_path)
+    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_path.write_text('{not valid json')
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.set_decision_escalations_dir('dec-setescdir-corrupt', '/tmp/q', root=tmp_path)
+
+    assert result is None
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_set_decision_escalations_dir_is_repeatable(tmp_path: Path) -> None:
+    """Called twice on the same id it simply succeeds twice (last write wins).
+
+    The back-fill is re-runnable by design, and the lock is a stable sidecar
+    the first call creates -- so a second call must not trip over its own
+    lock file. The locking contract itself is covered by TestDecisionIdLock;
+    this only pins that repeated calls compose.
+    """
+    rec = _make_decision(id='dec-setescdir-twice')
+    sr.write_decision(rec, root=tmp_path)
+
+    first = sr.set_decision_escalations_dir(rec.id, sr.UNKNOWN_QUEUE, root=tmp_path)
+    second = sr.set_decision_escalations_dir(rec.id, tmp_path / 'q', root=tmp_path)
+
+    assert first is not None
+    assert second is not None
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.escalations_dir == sr.normalize_escalations_dir(tmp_path / 'q')
+
+
 def test_decisions_are_per_file_isolated(tmp_path: Path) -> None:
     """Distinct <id>.json paths are the whole isolation guarantee: writing or
     updating one decision must never touch another's file (no global index,
@@ -665,7 +931,7 @@ def test_update_and_set_boost_fail_soft_when_absent(tmp_path: Path) -> None:
     assert sr.set_manual_boost('no-such-id', 5, root=tmp_path) is None
 
 
-def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
+def test_all_decision_setters_fail_soft_when_lock_acquisition_raises(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -677,6 +943,11 @@ def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
     Regression guard for the `with decision_id_lock(...)` placement: if it
     were ever moved outside (or above) the helpers' existing try/except, this
     would start raising instead of returning None.
+
+    Covers ALL THREE writers, including task 3640's set_decision_escalations_dir
+    -- the back-fill iterates the whole live decision population, so a single
+    unabsorbed lock fault there would abort a migration mid-way and leave it
+    half-stamped.
     """
     rec = _make_decision(id='dec-lockfault', state=sr.DecisionState.OPEN, manual_boost=0)
     sr.write_decision(rec, root=tmp_path)
@@ -691,9 +962,11 @@ def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
     with caplog.at_level(logging.ERROR):
         state_result = sr.update_decision_state('dec-lockfault', sr.DecisionState.ANSWERED, root=tmp_path)
         boost_result = sr.set_manual_boost('dec-lockfault', 5, root=tmp_path)
+        stamp_result = sr.set_decision_escalations_dir('dec-lockfault', '/tmp/q', root=tmp_path)
 
     assert state_result is None
     assert boost_result is None
+    assert stamp_result is None
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
@@ -764,8 +1037,14 @@ class TestDecisionIdLock:
 
 class TestDecisionHelpersAdoptLock:
     """Spy tests (mirror TestSubmitResolveAdoptLock, test_queue.py:2913):
-    update_decision_state and set_manual_boost must each acquire
-    decision_id_lock for the correct decision id.
+    update_decision_state, set_manual_boost and set_decision_escalations_dir
+    must EACH acquire decision_id_lock for the correct decision id.
+
+    One case per public helper, deliberately, even though all three now share
+    _mutate_decision: the lock is a per-helper CONTRACT, and a future setter
+    that grows its own body (or a wrapper that mutates before delegating)
+    would slip past a single shared-implementation test. TestDecisionIdLock
+    covers the lock primitive itself; these cover its ADOPTION.
     """
 
     def test_update_decision_state_acquires_lock_for_decision_id(
@@ -809,6 +1088,36 @@ class TestDecisionHelpersAdoptLock:
         sr.set_manual_boost('dec-spy-2', 5, root=tmp_path)
 
         assert 'dec-spy-2' in acquired, f'Expected lock acquisition for dec-spy-2; got {acquired}'
+
+    def test_set_decision_escalations_dir_acquires_lock_for_decision_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The queue-stamp setter is the THIRD writer on a decision id.
+
+        Its docstring makes the lock the central claim -- the task-3640
+        back-fill runs against live records while the C8 watchers and the
+        cockpit are up, so an unserialized read-modify-write here would drop
+        a concurrent state transition. Without this spy, deleting the
+        `with decision_id_lock(...)` span would leave every other test in the
+        suite green.
+        """
+        rec = _make_decision(id='dec-spy-3', escalations_dir='')
+        sr.write_decision(rec, root=tmp_path)
+
+        real_lock = sr.decision_id_lock
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            with real_lock(decision_id, root=root):
+                yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        sr.set_decision_escalations_dir('dec-spy-3', '/tmp/some-queue', root=tmp_path)
+
+        assert 'dec-spy-3' in acquired, f'Expected lock acquisition for dec-spy-3; got {acquired}'
 
 
 @pytest.mark.timeout(30)
@@ -2200,6 +2509,23 @@ def test_lease_decision_has_exactly_acquired_stand_down_proceed() -> None:
     assert sr.LeaseDecision.PROCEED.value == 'proceed'
 
 
+def test_lease_mutation_has_exactly_applied_forced_absent_refused_faulted() -> None:
+    values = {member.value for member in sr.LeaseMutation}
+    assert values == {'applied', 'forced', 'absent', 'refused', 'faulted'}
+    assert sr.LeaseMutation.APPLIED.value == 'applied'
+    assert sr.LeaseMutation.FORCED.value == 'forced'
+    assert sr.LeaseMutation.ABSENT.value == 'absent'
+    assert sr.LeaseMutation.REFUSED.value == 'refused'
+    assert sr.LeaseMutation.FAULTED.value == 'faulted'
+
+
+def test_lease_mutation_is_a_str_enum_like_its_siblings() -> None:
+    # Mirrors LeasePolicy/LeaseDecision: the CLI prints `.value` directly and
+    # a StrEnum member compares equal to its own string form.
+    assert issubclass(sr.LeaseMutation, str)
+    assert sr.LeaseMutation.REFUSED == 'refused'
+
+
 def test_lease_heartbeat_ttl_is_a_timedelta() -> None:
     assert isinstance(sr.LEASE_HEARTBEAT_TTL, timedelta)
 
@@ -2216,6 +2542,139 @@ def test_lease_holder_dict_round_trip_is_lossless() -> None:
         session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
     )
     assert sr.LeaseHolder.from_dict(holder.to_dict()) == holder
+
+
+# --- _render_contention_message (task 3994 defect 3) ----------------------
+#
+# The old form was `lease held by <slug> ({alive|dead}, heartbeat <n>s ago)`,
+# which reads as SELF-CONTRADICTORY on its most important branch: "dead,
+# heartbeat 42s ago" invites the reader to conclude the holder is gone and
+# the lease is reclaimable, when a fresh heartbeat means precisely the
+# opposite. That exact string misled the 2026-08-08 rotation into
+# force-releasing a live holder's lease. Liveness and freshness are two
+# INDEPENDENT axes and each must now name itself.
+
+_LIVE_HOLDER = sr.LeaseHolder(
+    session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
+)
+
+
+def test_contention_message_live_holder_names_the_slug_and_the_pid() -> None:
+    msg = sr._render_contention_message(
+        _LIVE_HOLDER, holder_alive=True, age_secs=42.0, policy=sr.LeasePolicy.STAND_DOWN
+    )
+
+    assert 'watcher-df-100' in msg
+    assert '4242' in msg
+    assert 'pid 4242 alive' in msg
+    assert msg.endswith('— standing down')
+
+
+def test_contention_message_dead_pid_but_fresh_heartbeat_says_not_reclaimable() -> None:
+    ttl = timedelta(seconds=7200)
+    msg = sr._render_contention_message(
+        _LIVE_HOLDER,
+        holder_alive=False,
+        age_secs=1200.0,
+        policy=sr.LeasePolicy.STAND_DOWN,
+        ttl=ttl,
+    )
+
+    # The withdrawn string, pinned as an ANTI-assertion.
+    assert '(dead, heartbeat' not in msg
+    lowered = msg.lower()
+    assert 'not running' in lowered  # the pid axis, named
+    assert 'fresh' in lowered  # the heartbeat axis, named
+    assert 'not reclaimable' in lowered  # the decision, explained
+    assert '6000' in msg  # the remaining TTL, in seconds
+
+
+def test_contention_message_remaining_ttl_tracks_the_injected_ttl() -> None:
+    msg = sr._render_contention_message(
+        _LIVE_HOLDER,
+        holder_alive=False,
+        age_secs=100.0,
+        policy=sr.LeasePolicy.STAND_DOWN,
+        ttl=timedelta(seconds=900),
+    )
+    assert '800' in msg
+
+
+def test_contention_message_dead_pid_past_ttl_is_phrased_as_reclaim_eligible() -> None:
+    msg = sr._render_contention_message(
+        _LIVE_HOLDER,
+        holder_alive=False,
+        age_secs=9000.0,
+        policy=sr.LeasePolicy.STAND_DOWN,
+        ttl=timedelta(seconds=7200),
+    )
+
+    assert '(dead, heartbeat' not in msg
+    lowered = msg.lower()
+    assert 'not running' in lowered
+    # Past the TTL the lease WAS reclaim-eligible; we are here only because
+    # the reclaim race was lost to someone else, and the message must say so
+    # rather than implying the holder is still healthy.
+    assert 'reclaim' in lowered
+    assert 'not reclaimable' not in lowered
+
+
+def test_contention_message_corrupt_body_does_not_invent_a_holder() -> None:
+    msg = sr._render_contention_message(
+        None, holder_alive=False, age_secs=42.0, policy=sr.LeasePolicy.STAND_DOWN
+    )
+
+    assert 'unreadable' in msg.lower()
+    assert '42s ago' in msg  # freshness is still reported
+    assert msg.endswith('— standing down')
+
+
+@pytest.mark.parametrize(
+    ('policy', 'suffix'),
+    [
+        (sr.LeasePolicy.STAND_DOWN, '— standing down'),
+        (sr.LeasePolicy.WARN_AND_PROCEED, '— proceeding anyway'),
+    ],
+)
+@pytest.mark.parametrize(
+    ('holder', 'alive', 'age'),
+    [
+        (_LIVE_HOLDER, True, 42.0),
+        (_LIVE_HOLDER, False, 1200.0),
+        (_LIVE_HOLDER, False, 9000.0),
+        (None, False, 42.0),
+    ],
+    ids=['live', 'dead-fresh', 'dead-expired', 'corrupt'],
+)
+def test_contention_message_is_always_one_greppable_line(
+    policy: sr.LeasePolicy,
+    suffix: str,
+    holder: sr.LeaseHolder | None,
+    alive: bool,
+    age: float,
+) -> None:
+    msg = sr._render_contention_message(holder, holder_alive=alive, age_secs=age, policy=policy)
+
+    assert '\n' not in msg
+    assert msg.endswith(suffix)
+
+
+def test_claim_lease_dead_holder_within_ttl_reports_the_non_contradictory_message(
+    tmp_path: Path,
+) -> None:
+    # End-to-end: the branch the 2026-08-08 rotation actually hit.
+    dead = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=dead, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=10))
+
+    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=contender, root=tmp_path, now=_NOW)
+
+    assert claim.decision == sr.LeaseDecision.STAND_DOWN
+    assert '(dead, heartbeat' not in claim.message
+    assert 'not reclaimable' in claim.message.lower()
+    assert str(_DEAD_PID) in claim.message
 
 
 # --- claim_lease: free lease --------------------------------------------
@@ -2257,7 +2716,10 @@ def test_claim_lease_held_by_live_holder_stand_down_policy(tmp_path: Path) -> No
     assert claim.holder.session_slug == 'watcher-df-100'
     assert claim.holder_alive is True
     assert claim.heartbeat_age_secs == 42
-    assert claim.message == 'lease held by watcher-df-100 (alive, heartbeat 42s ago) — standing down'
+    assert claim.message == (
+        f'lease held by watcher-df-100 (pid {os.getpid()} alive, heartbeat 42s ago) '
+        '— standing down'
+    )
     # No clobber: the on-disk body still names the ORIGINAL holder.
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
 
@@ -2516,15 +2978,10 @@ def test_heartbeat_lease_advances_mtime(tmp_path: Path) -> None:
     _set_mtime(lease_path, _NOW, timedelta(hours=1))
     old_mtime = lease_path.stat().st_mtime
 
-    result = sr.heartbeat_lease('watcher-df', root=tmp_path)
+    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
 
-    assert result is True
+    assert result is sr.LeaseMutation.APPLIED
     assert lease_path.stat().st_mtime > old_mtime
-
-
-def test_heartbeat_lease_on_absent_lease_returns_false_without_raising(tmp_path: Path) -> None:
-    result = sr.heartbeat_lease('watcher-df', root=tmp_path)
-    assert result is False
 
 
 def test_release_lease_removes_the_lease_file(tmp_path: Path) -> None:
@@ -2532,9 +2989,9 @@ def test_release_lease_removes_the_lease_file(tmp_path: Path) -> None:
     sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
     lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
 
-    result = sr.release_lease('watcher-df', root=tmp_path)
+    result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
 
-    assert result is True
+    assert result is sr.LeaseMutation.APPLIED
     assert not lease_path.exists()
 
 
@@ -2542,11 +2999,268 @@ def test_release_lease_is_idempotent_on_a_second_call(tmp_path: Path) -> None:
     holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
     sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
 
-    first = sr.release_lease('watcher-df', root=tmp_path)
-    second = sr.release_lease('watcher-df', root=tmp_path)
+    first = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+    second = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
 
-    assert first is True
-    assert second is False
+    assert first is sr.LeaseMutation.APPLIED
+    assert second is sr.LeaseMutation.ABSENT
+
+
+# --- heartbeat_lease: ownership (task 3994 defect 1) -----------------------
+
+
+def _seed_lease(tmp_path: Path, *, slug: str = 'watcher-df-100', pid: int | None = None) -> Path:
+    """Claim `watcher-df` for *slug*/*pid* under tmp_path; return its lease path.
+
+    Shared by the three task-3994 sections below (heartbeat ownership, release
+    ownership, lease_status) -- defined once, here, at its first use.
+    """
+    holder = sr.LeaseHolder(
+        session_slug=slug, pid=os.getpid() if pid is None else pid, start_ts=_NOW.isoformat()
+    )
+    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+    return sr.lease_path_for_name('watcher-df', root=tmp_path)
+
+
+def test_heartbeat_lease_by_a_stranger_is_refused_and_the_mtime_is_untouched(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    backdated_mtime = lease_path.stat().st_mtime
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.heartbeat_lease('watcher-df', slug='watcher-df-STRANGER', root=tmp_path)
+
+    assert result is sr.LeaseMutation.REFUSED
+    # THE assertion: an unrelated caller can no longer keep someone else's
+    # lease structurally unreapable by refreshing its heartbeat clock.
+    assert lease_path.stat().st_mtime == backdated_mtime
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors
+    blob = ' '.join(r.getMessage() for r in errors)
+    assert 'watcher-df-100' in blob
+    assert 'watcher-df-STRANGER' in blob
+
+
+def test_heartbeat_lease_on_an_absent_lease_is_absent_and_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.ERROR):
+        result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    assert result is sr.LeaseMutation.ABSENT
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_heartbeat_lease_on_a_reaped_lease_is_absent_and_the_owner_can_re_claim(
+    tmp_path: Path,
+) -> None:
+    """ABSENT on a HEARTBEAT is not the harmless idempotence it is on a release.
+
+    Code backing for the skill contract: the holder's own per-cycle heartbeat
+    reporting ABSENT means its lease is GONE (reaped here; an operator
+    `--force` release does the same), so the session is now running un-leased
+    and any duplicate can take the name freely. The prescribed response is to
+    re-claim, which must actually work — a watcher that kept beating into the
+    void would sit at `result=absent` forever, which is the duplicate-watcher
+    condition the lease exists to prevent.
+    """
+    lease_path = _seed_lease(tmp_path, pid=_DEAD_PID)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+    assert [r.reason for r in sr.reap_stale_leases(root=tmp_path, now=_NOW)] == ['stale_pid']
+
+    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    assert result is sr.LeaseMutation.ABSENT
+    # ...and re-claiming is the documented recovery, so it must succeed.
+    reclaim = sr.claim_lease(
+        'watcher-df',
+        holder=sr.LeaseHolder(
+            session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat()
+        ),
+        root=tmp_path,
+        now=_NOW,
+    )
+    assert reclaim.acquired
+    assert sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path) is (
+        sr.LeaseMutation.APPLIED
+    )
+
+
+def test_heartbeat_lease_on_a_corrupt_body_is_refused_with_mtime_untouched(
+    tmp_path: Path,
+) -> None:
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    backdated_mtime = lease_path.stat().st_mtime
+
+    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    assert result is sr.LeaseMutation.REFUSED
+    assert lease_path.stat().st_mtime == backdated_mtime
+
+
+def test_heartbeat_lease_with_force_overrides_a_stranger_refusal_loudly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    backdated_mtime = lease_path.stat().st_mtime
+
+    with caplog.at_level(logging.WARNING):
+        result = sr.heartbeat_lease(
+            'watcher-df', slug='watcher-df-STRANGER', force=True, root=tmp_path
+        )
+
+    assert result is sr.LeaseMutation.FORCED
+    assert lease_path.stat().st_mtime > backdated_mtime
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings
+    blob = ' '.join(r.getMessage() for r in warnings)
+    assert 'watcher-df-100' in blob
+    assert 'watcher-df-STRANGER' in blob
+
+
+def test_heartbeat_lease_faults_soft_when_utime_itself_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed_lease(tmp_path)
+
+    def _boom_utime(*_args: object, **_kwargs: object) -> None:
+        raise OSError('simulated permission error')
+
+    monkeypatch.setattr(sr.os, 'utime', _boom_utime)
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    # Fail-soft: a lease-substrate fault never raises into a watcher's loop.
+    assert result is sr.LeaseMutation.FAULTED
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_a_strangers_refused_heartbeat_leaves_a_dead_holders_lease_reapable(
+    tmp_path: Path,
+) -> None:
+    # The structural-unreapability defect, pinned end to end: before task 3994
+    # any caller could bump a dead holder's lease mtime forever, so the
+    # (dead pid AND aged heartbeat) staleness AND-guard could never fire and
+    # the lease outlived its holder indefinitely.
+    lease_path = _seed_lease(tmp_path, slug='watcher-df-dead', pid=_DEAD_PID)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    assert sr.heartbeat_lease('watcher-df', slug='watcher-df-STRANGER', root=tmp_path) is (
+        sr.LeaseMutation.REFUSED
+    )
+
+    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+
+    assert {r.lease_name: r.reason for r in reaped} == {'watcher-df': 'stale_pid'}
+    assert not lease_path.exists()
+
+
+# --- release_lease: ownership (task 3994 defect 1) -------------------------
+
+
+def test_release_lease_by_a_stranger_is_refused_and_the_lease_survives(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+    original_body = lease_path.read_text()
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.release_lease('watcher-df', slug='watcher-df-STRANGER', root=tmp_path)
+
+    assert result is sr.LeaseMutation.REFUSED
+    assert lease_path.is_file()
+    # Byte-identical: a refused release must not touch the holder's body.
+    assert lease_path.read_text() == original_body
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, 'a refused release must be loud (INV-2 structured-facts-at-failure)'
+    blob = ' '.join(r.getMessage() for r in errors)
+    # Both parties named: the real holder AND the would-be releaser.
+    assert 'watcher-df-100' in blob
+    assert 'watcher-df-STRANGER' in blob
+
+
+def test_release_lease_on_an_absent_lease_is_absent_and_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.ERROR):
+        result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    assert result is sr.LeaseMutation.ABSENT
+    # An idempotent release is not a failure -- it must not cry ERROR.
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_release_lease_on_a_corrupt_body_is_refused_and_the_file_survives(
+    tmp_path: Path,
+) -> None:
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+
+    result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    # Fail TOWARD held, mirroring _read_lease_holder_state's documented rule.
+    assert result is sr.LeaseMutation.REFUSED
+    assert lease_path.read_text() == '{not valid json'
+
+
+def test_release_lease_with_force_overrides_a_stranger_refusal_loudly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        result = sr.release_lease(
+            'watcher-df', slug='watcher-df-STRANGER', force=True, root=tmp_path
+        )
+
+    assert result is sr.LeaseMutation.FORCED
+    assert not lease_path.exists()
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, 'an operator force must be attributable'
+    blob = ' '.join(r.getMessage() for r in warnings)
+    assert 'watcher-df-100' in blob  # the displaced holder
+    assert 'watcher-df-STRANGER' in blob  # who forced it
+
+
+def test_release_lease_with_force_on_a_corrupt_body_removes_it(tmp_path: Path) -> None:
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+
+    result = sr.release_lease('watcher-df', slug='watcher-df-100', force=True, root=tmp_path)
+
+    assert result is sr.LeaseMutation.FORCED
+    assert not lease_path.exists()
+
+
+def test_release_lease_faults_soft_when_the_unlink_itself_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+    real_unlink = Path.unlink
+
+    def _flaky_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self == lease_path:
+            raise OSError('simulated permission error')
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', _flaky_unlink)
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    # Fail-soft: a lease-substrate fault never raises into a watcher's loop.
+    assert result is sr.LeaseMutation.FAULTED
+    assert lease_path.is_file()
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -2630,6 +3344,128 @@ def test_reap_stale_leases_continues_sweep_when_one_removal_fails(
 
 
 # ---------------------------------------------------------------------------
+# lease_status / lease-show (task 3994 defect 3)
+#
+# `cat <lease>` CANNOT show freshness: the body carries an immutable
+# `start_ts` and the heartbeat lives only in the file mtime, so the archaeology
+# a human actually needs is `cat` + `stat -c %y` + a TTL comparison done by
+# hand. That is what misled the 2026-08-08 rotation. lease_status computes all
+# of it through the same _read_lease_holder_state claim_lease decides on --
+# one reader, one clock -- and lease-show prints it.
+# ---------------------------------------------------------------------------
+
+
+def test_lease_status_reports_the_holder_and_the_heartbeat_clock(tmp_path: Path) -> None:
+    path = _seed_lease(tmp_path)
+    _set_mtime(path, _NOW, timedelta(minutes=30))
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.name == 'watcher-df'
+    assert status.state == 'held'
+    assert status.holder_slug == 'watcher-df-100'
+    assert status.holder_pid == os.getpid()
+    assert status.holder_pid_alive is True
+    # Freshness is derived from the MTIME, the axis `cat` cannot show.
+    assert int(status.heartbeat_age_secs) == 1800
+    # heartbeat_ts is None only for an absent lease; a held one always has one.
+    assert status.heartbeat_ts is not None
+    assert datetime.fromisoformat(status.heartbeat_ts).replace(microsecond=0) == _NOW - timedelta(
+        minutes=30
+    )
+    assert status.reclaimable is False
+
+
+def test_lease_status_heartbeat_age_tracks_the_mtime(tmp_path: Path) -> None:
+    path = _seed_lease(tmp_path)
+
+    for age in (timedelta(seconds=5), timedelta(minutes=17), timedelta(hours=3)):
+        _set_mtime(path, _NOW, age)
+        status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+        assert int(status.heartbeat_age_secs) == int(age.total_seconds())
+
+
+@pytest.mark.parametrize(
+    ('age', 'expected'),
+    [
+        (sr.LEASE_HEARTBEAT_TTL - timedelta(seconds=1), False),
+        (sr.LEASE_HEARTBEAT_TTL, False),
+        (sr.LEASE_HEARTBEAT_TTL + timedelta(seconds=1), True),
+    ],
+)
+def test_lease_status_reclaimable_flips_exactly_at_the_ttl_for_a_dead_pid(
+    tmp_path: Path, age: timedelta, expected: bool
+) -> None:
+    path = _seed_lease(tmp_path, pid=_DEAD_PID)
+    _set_mtime(path, _NOW, age)
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.holder_pid_alive is False
+    # Exactly claim_lease/reap_stale_leases' own predicate: staleness needs
+    # BOTH a dead pid AND a heartbeat STRICTLY past the TTL. The display and
+    # the decision cannot disagree, because they are the same computation.
+    assert status.reclaimable is expected
+
+
+def test_lease_status_never_reports_a_live_holder_reclaimable_at_any_age(tmp_path: Path) -> None:
+    path = _seed_lease(tmp_path)  # our own, provably-live, pid
+    _set_mtime(path, _NOW, timedelta(days=30))
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.holder_pid_alive is True
+    assert int(status.heartbeat_age_secs) == 30 * 24 * 3600
+    # A live holder is never reclaimable however quiet it has been -- the
+    # inverse reading is the duplicate-spawn incident.
+    assert status.reclaimable is False
+
+
+def test_lease_status_on_an_absent_lease_reports_state_absent(tmp_path: Path) -> None:
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.name == 'watcher-df'
+    assert status.state == 'absent'
+    assert status.holder_slug is None
+    assert status.holder_pid is None
+    assert status.holder_pid_alive is False
+    assert status.reclaimable is False
+
+
+def test_lease_status_on_a_corrupt_body_is_unreadable_but_still_dates_the_heartbeat(
+    tmp_path: Path,
+) -> None:
+    path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{not valid json')
+    _set_mtime(path, _NOW, timedelta(minutes=42))
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    # Fail-soft: an unreadable body is REPORTED, never raised, and never
+    # rendered as a fake holder -- but its freshness is still real, which is
+    # exactly what decides whether it is reapable.
+    assert status.state == 'unreadable'
+    assert status.holder_slug is None
+    assert status.holder_pid is None
+    assert int(status.heartbeat_age_secs) == 2520
+
+
+def test_lease_status_is_read_only(tmp_path: Path) -> None:
+    path = _seed_lease(tmp_path)
+    _set_mtime(path, _NOW, timedelta(hours=1))
+    mtime_before = path.stat().st_mtime
+    body_before = path.read_text()
+
+    sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    # Inspecting a lease must never be a heartbeat: an operator running
+    # lease-show cannot be allowed to keep a dead holder's lease unreapable.
+    assert path.stat().st_mtime == mtime_before
+    assert path.read_text() == body_before
+
+
+# ---------------------------------------------------------------------------
 # CLI lease-* verbs + fail-open fail-soft
 # ---------------------------------------------------------------------------
 
@@ -2646,8 +3482,14 @@ def test_main_lease_claim_on_free_name_acquires_and_prints_decision_token(
     )
 
     assert rc == 0
-    out = capsys.readouterr().out
-    assert out.splitlines()[0] == 'decision=acquired'
+    lines = capsys.readouterr().out.splitlines()
+    # The WHOLE acquired-path contract, not just line 1: a successful claim has
+    # no contending holder, so it must not print `holder_liveness=held` (which
+    # reads as "someone else has it"). `none` is the third token in the
+    # vocabulary, and it is pinned here because nothing else exercises it.
+    assert lines[0] == 'decision=acquired'
+    assert lines[-1] == 'holder_liveness=none'
+    assert len(lines) == 3
     assert sr.lease_path_for_name('watcher-df', root=tmp_path).is_file()
 
 
@@ -2680,7 +3522,9 @@ def test_main_lease_claim_when_held_by_live_holder_stands_down(
     out = capsys.readouterr().out
     lines = out.splitlines()
     assert lines[0] == 'decision=stand-down'
-    assert re.search(r'lease held by \S+ \(alive, heartbeat \d+s ago\) — standing down', lines[1])
+    assert re.search(
+        r'lease held by \S+ \(pid \d+ alive, heartbeat \d+s ago\) — standing down', lines[1]
+    )
     # the on-disk holder must still be the ORIGINAL claimant (no clobber).
     body = sr.lease_path_for_name('watcher-df', root=tmp_path).read_text()
     assert 'watcher-df-100' in body
@@ -2698,7 +3542,7 @@ def test_main_lease_heartbeat_bumps_mtime(
     _set_mtime(lease_path, _NOW, timedelta(hours=1))
     backdated_mtime = lease_path.stat().st_mtime
 
-    rc = sr.main(['lease-heartbeat', '--name', 'watcher-df'])
+    rc = sr.main(['lease-heartbeat', '--name', 'watcher-df', '--slug', 'watcher-df-100'])
 
     assert rc == 0
     assert lease_path.stat().st_mtime > backdated_mtime
@@ -2714,10 +3558,464 @@ def test_main_lease_release_removes_the_file(
     lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
     assert lease_path.is_file()
 
-    rc = sr.main(['lease-release', '--name', 'watcher-df'])
+    rc = sr.main(['lease-release', '--name', 'watcher-df', '--slug', 'watcher-df-100'])
 
     assert rc == 0
     assert not lease_path.exists()
+
+
+# --- CLI holder_liveness orphan signal (task 3994 defect 4) ---------------
+#
+# SINGLE-SIGNAL by construction: `holder_liveness=orphaned` means exactly
+# "the pid recorded in the lease body is not running". These tests run under
+# PRODUCTION-REALISTIC conditions -- no session record is written anywhere,
+# because a lease's `session_slug` is a claimant-chosen ownership token
+# (`watcher-<project>-<pid>`) and NOT a session-registry record key, so no
+# production path can ever put a record there (see
+# TestLeaseSlugIsNotASessionRecordKey below). The originally-designed
+# session-record corroboration was withdrawn for exactly that reason; the
+# emitted values are byte-identical either way.
+
+
+def _contend_via_cli(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], *, holder_pid: int
+) -> list[str]:
+    """Seed a lease held by watcher-df-100/holder_pid, contend it, return stdout lines."""
+    sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(holder_pid)])
+    capsys.readouterr()
+    rc = sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-200', '--pid', str(os.getpid())]
+    )
+    assert rc == 0
+    return capsys.readouterr().out.splitlines()
+
+
+def test_main_lease_claim_orphan_signal_is_additive_after_decision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    lines = _contend_via_cli(tmp_path, capsys, holder_pid=os.getpid())
+
+    # `decision=` STAYS line 1 and the message line 2, so a skill parser that
+    # reads only the first two lines is provably unaffected by the addition.
+    assert lines[0] == 'decision=stand-down'
+    assert lines[1].startswith('lease held by watcher-df-100')
+    assert lines[2] == 'holder_liveness=held'
+
+
+def test_main_lease_claim_reports_orphaned_for_a_dead_holder_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    # No session record is written -- that is the production shape, and the
+    # dead pid is the whole of the evidence.
+    lines = _contend_via_cli(tmp_path, capsys, holder_pid=_DEAD_PID)
+
+    assert lines[0] == 'decision=stand-down'
+    assert lines[-1] == 'holder_liveness=orphaned'
+
+
+def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+
+    rc = sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-200', '--pid', str(os.getpid())]
+    )
+
+    assert rc == 0
+    # 'unknown' must never be promoted to an orphan finding: fail toward held.
+    assert capsys.readouterr().out.splitlines()[-1] == 'holder_liveness=held'
+
+
+class TestLeaseSlugIsNotASessionRecordKey:
+    """`read_record(<a lease slug>)` raises — pinned so the withdrawn corroboration cannot return.
+
+    Task 3994 originally corroborated the orphan signal with the holder's own
+    session_registry record, via ``read_record(holder.session_slug)``. That
+    lookup is STRUCTURALLY IMPOSSIBLE, and the tests that appeared to exercise
+    its branches only did so by hand-writing a record under a lease-shaped
+    slug — a state no production path can produce. They were deleted; this
+    class replaces them with the reason.
+
+    MEASURED EVIDENCE (2026-08-15, live fleet root): the real
+    ``~/.claude/fleet/leases/watcher-df.lease`` holds
+    ``session_slug=watcher-df-1894895``, while 0 of the 46,624
+    ``~/.claude/fleet/sessions/`` record dirs begin with ``watcher-``. Real
+    record slugs look like ``architect-dark_factory-3133-25737ee4-...``.
+
+    The namespaces differ in all three segments:
+    - the LEASE slug is claimant-chosen, prescribed by the skills as
+      ``<lease-role>-<project>-<session pid>``
+      (skills/escalation-watcher/SKILL.md:50) — there is no production
+      *builder* for it, only shell in a SKILL.md, so it is spelled out here;
+    - the RECORD slug comes from ``build_session_slug(role, project, task,
+      <uniqueness token>)``, where the token is a session UUID for a
+      hand-launched session (``session_hooks.hook_session_slug``) and the
+      project token is the registry's project id (``dark_factory``), not the
+      lease's short name (``df``).
+
+    Only ONE test lives here, on purpose: the disjointness RATIONALE belongs to
+    (and is recorded in) ``LeaseHolder.session_slug``'s docstring, and a test
+    that merely compares a literal this file wrote against
+    ``build_session_slug``'s output cannot fail as a result of any production
+    change. The single assertion below has real coupling — it would break if
+    ``read_record`` ever started resolving a lease slug, which is exactly the
+    reintroduction worth catching.
+    """
+
+    # A hand-launched session's uniqueness token: hook_session_slug passes the
+    # hook's `session_id` (a UUID string) into build_session_slug's
+    # launcher_pid slot. Kept literal so the test is deterministic.
+    SESSION_UUID = '25737ee4-3b1e-4a7f-9f0e-6a1c2d3e4f50'
+
+    def _lease_slug(self, project: str = 'df', pid: int = 1894895) -> str:
+        """The lease slug exactly as skills/escalation-watcher/SKILL.md:50 builds it."""
+        return f'watcher-{project}-{sr.resolve_session_pid({sr.SESSION_PID_ENV: str(pid)})}'
+
+    def _record_slug(self, project: str = 'dark_factory') -> str:
+        """The record slug exactly as session_hooks.hook_session_slug builds it."""
+        return sr.build_session_slug(
+            'session',
+            project,
+            None,
+            self.SESSION_UUID,  # type: ignore[arg-type]
+        )
+
+    def test_a_real_record_provably_does_not_live_under_its_lease_slug(
+        self, tmp_path: Path
+    ) -> None:
+        # A well-formed record IS written for this notional session, under the
+        # slug the registry actually keys on...
+        record_slug = self._record_slug()
+        sr.write_record(_make_record(session_slug=record_slug), root=tmp_path)
+        assert sr.read_record(record_slug, root=tmp_path).session_slug == record_slug
+
+        # ...and read_record(<lease slug>) STILL raises FileNotFoundError. That
+        # is why holder_session_state was a constant 'absent' in production.
+        with pytest.raises(FileNotFoundError):
+            sr.read_record(self._lease_slug(), root=tmp_path)
+
+
+# --- resolve_session_pid (task 3994 defect 2) ------------------------------
+
+
+def test_session_pid_env_names_claude_pid() -> None:
+    assert sr.SESSION_PID_ENV == 'CLAUDE_PID'
+
+
+def test_resolve_session_pid_prefers_claude_pid(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        pid = sr.resolve_session_pid({'CLAUDE_PID': '1348600'})
+
+    assert pid == 1348600
+    # The happy path is silent: a resolvable session pid is not a degradation.
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+@pytest.mark.parametrize(
+    'env',
+    [
+        {},
+        {'CLAUDE_PID': ''},
+        {'CLAUDE_PID': '   '},
+        {'CLAUDE_PID': 'not-a-pid'},
+        {'CLAUDE_PID': '0'},
+        {'CLAUDE_PID': '-1'},
+    ],
+    ids=['unset', 'empty', 'blank', 'non-numeric', 'zero', 'negative'],
+)
+def test_resolve_session_pid_falls_back_loudly_to_a_provably_dead_pid(
+    env: dict[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        pid = sr.resolve_session_pid(env)
+
+    # Fallback, never a raise -- and never a pid that merely LOOKS resolved.
+    # THE assertion: the degraded pid must be one `_pid_alive` reports dead,
+    # so the lease's staleness AND-guard collapses to its heartbeat half (the
+    # documented degradation) rather than to a never-reapable lease. The
+    # earlier `os.getsid(0)` fallback failed this: the POSIX session leader is
+    # the interactive shell, which outlives a crashed `claude`.
+    assert pid == 0
+    assert sr._pid_alive(pid) is False
+    # LOUD, not silent: the repo's loud-over-silent-degradation norm (INV-2).
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings
+    blob = ' '.join(r.getMessage() for r in warnings).lower()
+    assert 'degraded' in blob
+
+
+def test_resolve_session_pid_defaults_to_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('CLAUDE_PID', '424242')
+    assert sr.resolve_session_pid() == 424242
+
+
+def test_a_degraded_pid_lease_still_ages_out_and_is_reaped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end: an unresolvable CLAUDE_PID must not make a lease immortal.
+
+    The whole point of returning 0 rather than a durable-but-unrelated pid:
+    both staleness rules need a DEAD pid AND an aged heartbeat, so a fallback
+    pid that stays alive (the interactive shell) would make a crashed holder's
+    lease permanently unreapable — recoverable only by a human `--force`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+    sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-degraded'])
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert json.loads(lease_path.read_text())['pid'] == 0
+
+    # Fresh: NOT reaped — the heartbeat half of the guard still protects it.
+    _set_mtime(lease_path, _NOW, timedelta(seconds=60))
+    assert sr.reap_stale_leases(root=tmp_path, now=_NOW) == []
+    assert lease_path.is_file()
+
+    # Aged past the TTL: reaped, exactly as pre-3994 heartbeat-only behaviour.
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+
+    assert [r.reason for r in reaped] == ['stale_pid']
+    assert not lease_path.exists()
+
+
+def test_main_lease_claim_without_pid_writes_the_resolved_session_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    # Deliberately NOT this process's own pid: that is what the old
+    # `--pid` default was, so an env-blind implementation would still pass.
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100'])
+
+    assert rc == 0
+    # The correct pid is STRUCTURAL: it no longer depends on every skill doc
+    # getting one shell token right (the `--pid $$` defect).
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert sr.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
+
+
+def test_main_lease_claim_explicit_pid_still_overrides_the_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+
+    rc = sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(_DEAD_PID)]
+    )
+
+    assert rc == 0
+    # The operator-override path operators already used by hand.
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert sr.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
+
+
+# --- CLI ownership on the mutating verbs (task 3994 defect 1) -------------
+
+
+def _claim_via_cli(slug: str = 'watcher-df-100', pid: int | None = None) -> None:
+    sr.main(
+        [
+            'lease-claim',
+            '--name',
+            'watcher-df',
+            '--slug',
+            slug,
+            '--pid',
+            str(os.getpid() if pid is None else pid),
+        ]
+    )
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_require_slug(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, verb: str
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+
+    # A pre-3994 invocation must now FAIL LOUDLY rather than silently
+    # evicting/refreshing a lease it may not hold. argparse exits 2.
+    with pytest.raises(SystemExit) as excinfo:
+        sr.main([verb, '--name', 'watcher-df'])
+
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_print_result_applied_for_the_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+    capsys.readouterr()
+
+    rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-100'])
+
+    assert rc == 0
+    # Mirrors lease-claim's `decision=` convention: one parse rule for all
+    # four lease verbs.
+    assert capsys.readouterr().out.splitlines()[0] == 'result=applied'
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_refuse_a_stranger_without_changing_rc(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+    capsys.readouterr()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    original_body = lease_path.read_text()
+
+    rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-STRANGER'])
+
+    # Fail-soft: a refusal is an OUTCOME, not an exit-code change.
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'result=refused'
+    # The human line must name the REAL holder, so an agent reading stdout
+    # learns who owns it rather than only that it was told no.
+    assert 'watcher-df-100' in lines[1]
+    assert lease_path.read_text() == original_body
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_force_overrides_a_stranger_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+    capsys.readouterr()
+
+    rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-STRANGER', '--force'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'result=forced'
+    assert 'watcher-df-100' in lines[1]
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_report_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-100'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.splitlines()[0] == 'result=absent'
+
+
+# --- CLI lease-show (task 3994 defect 3) ----------------------------------
+
+
+def _parse_kv(out: str) -> dict[str, str]:
+    """Parse lease-show's `key=value` lines -- the whole point of the verb."""
+    return dict(line.split('=', 1) for line in out.splitlines() if '=' in line)
+
+
+def test_main_lease_show_prints_machine_readable_fields_for_a_held_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, datetime.now(UTC), timedelta(hours=1))
+    capsys.readouterr()
+
+    rc = sr.main(['lease-show', '--name', 'watcher-df'])
+
+    assert rc == 0
+    fields = _parse_kv(capsys.readouterr().out)
+    assert fields['name'] == 'watcher-df'
+    assert fields['state'] == 'held'
+    assert fields['holder_slug'] == 'watcher-df-100'
+    assert fields['holder_pid'] == str(os.getpid())
+    assert fields['holder_pid_alive'] == 'true'
+    assert fields['reclaimable'] == 'false'
+    # The freshness clock `cat <lease>` cannot show, replacing `stat -c %y`.
+    assert abs(int(fields['heartbeat_age_secs']) - 3600) <= 5
+    assert datetime.fromisoformat(fields['heartbeat_ts']).tzinfo is not None
+
+
+def test_main_lease_show_reports_a_dead_and_expired_holder_reclaimable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli(pid=_DEAD_PID)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, datetime.now(UTC), sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+    capsys.readouterr()
+
+    rc = sr.main(['lease-show', '--name', 'watcher-df'])
+
+    assert rc == 0
+    fields = _parse_kv(capsys.readouterr().out)
+    assert fields['holder_pid_alive'] == 'false'
+    assert fields['reclaimable'] == 'true'
+
+
+def test_main_lease_show_on_an_absent_lease_reports_state_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(['lease-show', '--name', 'watcher-df'])
+
+    assert rc == 0
+    assert 'state=absent' in capsys.readouterr().out.splitlines()
+
+
+def test_main_lease_show_on_a_corrupt_body_is_fail_soft(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+    _set_mtime(lease_path, datetime.now(UTC), timedelta(hours=1))
+
+    rc = sr.main(['lease-show', '--name', 'watcher-df'])
+
+    assert rc == 0
+    fields = _parse_kv(capsys.readouterr().out)
+    # Marks the body unreadable rather than asserting a fake holder -- and
+    # still reports a REAL heartbeat age, the axis that decides reapability.
+    assert fields['state'] == 'unreadable'
+    assert abs(int(fields['heartbeat_age_secs']) - 3600) <= 5
+    assert lease_path.is_file()  # read-only: inspection never reaps
 
 
 def test_main_lease_reap_removes_a_stale_lease(
@@ -2849,6 +4147,64 @@ def test_main_write_decision_severity_defaults_empty(
     assert listed[0].severity == ''
 
 
+def test_main_write_decision_stamps_escalations_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A watcher stamps the queue its --escalation-id belongs to, so the
+    fleet-global decision can later be joined back to the right per-queue
+    escalation-id namespace (task 3528). The verb must store the NORMALIZED
+    form, not the raw argv string: a watcher invoking with a relative/dotted
+    spelling must still match a reaper passing the absolute one.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    recon = tmp_path / 'recon'
+    recon.mkdir()
+    (tmp_path / 'sub').mkdir()
+    dotted = str(tmp_path / 'sub' / '..' / 'recon') + '/'
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-q',
+            '--project',
+            'df',
+            '--text',
+            'q',
+            '--escalation-id',
+            'esc-1',
+            '--escalations-dir',
+            dotted,
+        ]
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+    assert Path(listed[0].escalations_dir).is_absolute()
+
+
+def test_main_write_decision_escalations_dir_defaults_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Omitting --escalations-dir yields '' on the filed record: the flag is
+    optional, and a queue-less record keeps today's project-only-scoped
+    reaper behaviour (mirrors --severity's default at
+    test_main_write_decision_severity_defaults_empty).
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(['write-decision', '--id', 'dec-noq', '--project', 'df', '--text', 'q'])
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert len(listed) == 1
+    assert listed[0].escalations_dir == ''
+
+
 def test_main_write_decision_prints_filed_id(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2913,6 +4269,127 @@ def test_main_write_decision_refiling_same_id_overwrites_not_duplicates(
 # ---------------------------------------------------------------------------
 # Step-6: decision reaper (C8 close-on-resolve)
 # ---------------------------------------------------------------------------
+
+
+def test_normalize_escalations_dir_makes_a_relative_path_absolute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A queue passed relative to the watcher's cwd must be stored/compared as
+    an absolute path, so a reaper invoked from a different cwd still matches.
+    """
+    (tmp_path / 'esc').mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    assert sr.normalize_escalations_dir('esc') == str((tmp_path / 'esc').resolve())
+
+
+def test_normalize_escalations_dir_collapses_equivalent_spellings(tmp_path: Path) -> None:
+    """The whole point of the helper: two spellings of the SAME queue dir must
+    produce ONE identical string, so the reaper's queue guard compares equal
+    for a decision stamped via a dotted/trailing-slash spelling.
+    """
+    esc = tmp_path / 'esc'
+    esc.mkdir()
+    (tmp_path / 'sub').mkdir()
+    dotted = str(tmp_path / 'sub' / '..' / 'esc') + '/'
+
+    assert sr.normalize_escalations_dir(dotted) == sr.normalize_escalations_dir(esc)
+
+
+def test_normalize_escalations_dir_empty_and_blank_are_the_unset_sentinel() -> None:
+    """'' means "unset/legacy" and is never a path; a whitespace-only value
+    from a sloppy shell interpolation must collapse to the same sentinel
+    rather than normalizing to the cwd.
+    """
+    assert sr.normalize_escalations_dir('') == ''
+    assert sr.normalize_escalations_dir('   ') == ''
+    assert sr.normalize_escalations_dir('\t\n') == ''
+
+
+def test_normalize_escalations_dir_expands_user(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Watchers write queue paths as ~/... in SKILL.md snippets; those must
+    expand, or a stamped record would never match a reaper's absolute path.
+    """
+    monkeypatch.setenv('HOME', str(tmp_path))
+
+    assert sr.normalize_escalations_dir('~/data/escalations') == str(
+        (tmp_path / 'data' / 'escalations').resolve()
+    )
+
+
+def test_normalize_escalations_dir_nonexistent_dir_still_normalizes(tmp_path: Path) -> None:
+    """Path.resolve() is non-strict in Python 3.11+: a well-formed queue path
+    that does not exist yet (a project checked out but never escalated, or a
+    record migrated between machines) still normalizes rather than faulting.
+    """
+    missing = tmp_path / 'never' / 'created'
+
+    assert sr.normalize_escalations_dir(missing) == str(missing)
+
+
+def test_normalize_escalations_dir_fail_soft_on_unresolvable_value() -> None:
+    """Fail-soft, matching the module's contract for helpers a C8 watch loop
+    calls directly: a value the OS cannot resolve (embedded NUL) degrades to
+    the raw string instead of raising into the caller. The raw string simply
+    won't match any real queue, which is the fail-OPEN direction.
+    """
+    assert sr.normalize_escalations_dir('a\x00b') == 'a\x00b'
+
+
+def test_unknown_queue_sentinel_is_distinguishable_from_the_unset_sentinel() -> None:
+    """UNKNOWN_QUEUE is a THIRD queue state (task 3640), not a respelling of ''.
+
+    '' means "nobody told us" (legacy/unset -- the reaper falls back to
+    project-only scoping and MAY close the record). UNKNOWN_QUEUE means "we
+    investigated and could not determine the owning queue" -- the reaper must
+    refuse to close it. Collapsing the two would silently hand every
+    back-filled undeterminable record back to the false-closure hazard task
+    3528 exists to remove, so the values must never compare equal, and the
+    sentinel must be TRUTHY (the reaper's axis-2 guard is gated on
+    `if decision_dir and ...`).
+
+    The angle brackets are load-bearing, not decoration: a resolved queue path
+    always begins with '/', so a real queue and this sentinel can never
+    collide no matter what a project is named.
+    """
+    assert sr.UNKNOWN_QUEUE
+    assert sr.UNKNOWN_QUEUE != ''
+    assert not sr.UNKNOWN_QUEUE.startswith('/')
+
+
+def test_normalize_escalations_dir_preserves_the_unknown_sentinel_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """THE RED DRIVER (task 3640): the sentinel must round-trip unchanged.
+
+    Without a special case, `'<unknown>'` is a bare word and falls through to
+    `Path(raw).expanduser().resolve()`, which resolves it RELATIVE TO THE
+    CALLING PROCESS'S CWD -- so the same record normalizes to
+    `<cwd-A>/<unknown>` in the back-fill script and `<cwd-B>/<unknown>` in a
+    watcher's reaper. A stamp whose value depends on who reads it is not a
+    contract at all: the two would never compare equal, and worse, whichever
+    accidental absolute path got STORED would be an outright lie about where
+    the record's escalation lives.
+
+    Asserting under two different cwds is the point -- a single call would
+    pass against a buggy implementation that merely happened to be invoked
+    from the right directory.
+    """
+    (tmp_path / 'a').mkdir()
+    (tmp_path / 'b').mkdir()
+
+    monkeypatch.chdir(tmp_path / 'a')
+    from_a = sr.normalize_escalations_dir(sr.UNKNOWN_QUEUE)
+    monkeypatch.chdir(tmp_path / 'b')
+    from_b = sr.normalize_escalations_dir(sr.UNKNOWN_QUEUE)
+
+    assert from_a == sr.UNKNOWN_QUEUE
+    assert from_b == sr.UNKNOWN_QUEUE
 
 
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
@@ -3145,6 +4622,352 @@ def test_main_reap_decisions_scopes_to_project(
     assert listed['dec-other-project'] == sr.DecisionState.OPEN
 
 
+def _two_queues(tmp_path: Path) -> tuple[Path, Path]:
+    """Build the observed two-queue collision on disk (task 3528).
+
+    dark_factory runs TWO escalation queues over ONE ``esc-<taskid>-<n>`` id
+    namespace: the orchestrator's ``data/escalations`` and the reconciliation
+    watcher's ``data/reconciliation/escalations``. Here that is `orch` and
+    `recon`, both holding an *unrelated* escalation that happens to share the
+    id ``esc-3036-1`` -- RESOLVED (archived) in `orch`, still PENDING (queue
+    root) in `recon`, exactly as observed when a blocking recon gate sat
+    invisible in the cockpit for ~7 days.
+
+    Reuses the layout pinned by test_read_escalation_status_reads_queue_root_file
+    / ..._falls_back_to_archive: queue-root file = pending, dated
+    ``archive/YYYY-MM-DD/`` file = resolved.
+    """
+    orch = tmp_path / 'orch'
+    recon = tmp_path / 'recon'
+    orch_archive = orch / 'archive' / '2026-07-26'
+    orch_archive.mkdir(parents=True)
+    recon.mkdir(parents=True)
+    (orch_archive / 'esc-3036-1.json').write_text(json.dumps({'status': 'resolved'}))
+    (recon / 'esc-3036-1.json').write_text(json.dumps({'status': 'pending'}))
+    return orch, recon
+
+
+def test_main_reap_decisions_does_not_close_across_queues(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """THE REGRESSION (task 3528), cases (a) + (d) in ONE reaper run.
+
+    (a) A decision stamped with the `recon` queue must NOT be closed by a
+    reaper scanning the `orch` queue, even though `orch` holds a RESOLVED
+    escalation with the same id -- they are unrelated escalations that merely
+    collide in the shared id namespace. Before this fix the join was scoped
+    on project alone, so this decision closed to ANSWERED and vanished from
+    the cockpit queue while its own escalation was still PENDING.
+
+    (d) In the SAME run, a queue-less (pre-change, escalations_dir='')
+    decision on the SAME escalation id still closes exactly as before -- so
+    one invocation proves the new guard is both blocking (a) and backward-
+    compatible (d), and that the only thing distinguishing them is the queue
+    stamp.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='dec-recon-gate',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.normalize_escalations_dir(recon),
+        ),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(
+            id='dec-legacy-queueless',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir='',
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-recon-gate'] == sr.DecisionState.OPEN
+    assert listed['dec-legacy-queueless'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_does_not_close_across_queues_mirrored(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (b): the guard is symmetric. A decision stamped with the `orch`
+    queue is equally protected from the recon watcher's reaper, which scans
+    `recon` and finds a RESOLVED escalation of the same id there. Neither
+    watcher is privileged; either one reaping the other's decisions is the
+    same bug.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    recon_archive = recon / 'archive' / '2026-07-26'
+    recon_archive.mkdir(parents=True)
+    (recon_archive / 'esc-mirror.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-orch-gate',
+            project='df',
+            escalation_id='esc-mirror',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(recon)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-orch-gate'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_same_queue_still_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (c): the guard must not over-block. A decision stamped with the
+    SAME queue the reaper is scanning still closes on its escalation's
+    terminal status -- otherwise queue-scoping would quietly turn the reaper
+    into a permanent no-op and every decision would need manual closure.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='dec-orch-same-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-orch-same-queue'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_queue_match_is_spelling_insensitive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (e): the comparison normalizes BOTH sides, rather than doing a raw
+    string compare of whatever each side happened to store.
+
+    The decision here carries a dotted, trailing-slash spelling of the `orch`
+    queue -- what a hand-repaired record, a future writer, or a record
+    migrated between checkouts can hold, since it bypassed write-decision's
+    write-time normalization. A raw compare would treat it as a foreign
+    queue and fail OPEN forever; worse, the same laxness in reverse is how a
+    false NON-match would reintroduce silent divergence between writer and
+    reaper.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    (tmp_path / 'x').mkdir()
+    dotted = str(orch.parent / 'x' / '..' / orch.name) + '/'
+    assert dotted != str(orch)
+    sr.write_decision(
+        _make_decision(
+            id='dec-dotted-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=dotted,
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-dotted-queue'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_normalizes_the_reapers_own_escalations_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (e) MIRRORED: the REAPER's side of the compare is normalized too.
+
+    ..._queue_match_is_spelling_insensitive only exercises the DECISION side
+    -- it stores a dotted spelling and passes the already-canonical
+    ``str(orch)`` to the CLI, so the reaper-side normalize is a no-op there.
+    Here it is the other way round: the record carries the canonical form and
+    the CLI is handed a relative, dotted spelling of the same queue.
+
+    This is the real invocation shape, not a contrivance. Both SKILL.md files
+    now promise "stored normalized, so any spelling of the same directory
+    works", and the recon watcher's documented command is
+    ``--escalations-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations``
+    where ``$DARK_FACTORY_ROOT`` may legitimately be relative or symlinked.
+    Drop the reaper-side normalize and EVERY stamped decision becomes a
+    permanent no-close -- fail-open, so invisible: nothing errors, decisions
+    just quietly stop closing. Running under monkeypatch.chdir also pins that
+    the reaper side resolves against the cwd, matching
+    normalize_escalations_dir's documented expanduser/resolve contract.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    (tmp_path / 'x').mkdir()
+    monkeypatch.chdir(tmp_path)
+    relative = f'x/../{orch.name}/'
+    assert not Path(relative).is_absolute()
+    sr.write_decision(
+        _make_decision(
+            id='dec-canonical-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', relative])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-canonical-queue'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_its_stamped_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Pins the acknowledged MODE-2 tradeoff (task 3528, raised in review).
+
+    A MODE-2 same-subject duplicate (esc-5914-1) collapses to ONE record by
+    design -- but ``escalations_dir`` is single-valued and write_decision
+    rewrites the whole file, so the survivor carries only the LAST filer's
+    queue (pinned by ..._same_id_from_two_queues_stays_one_decision). The
+    axis-2 guard then makes the OTHER queue's reaper skip it outright.
+
+    So if the escalation that actually reaches a terminal status is the one
+    in the NON-stamped queue -- entirely possible for two independently-filed
+    escalations covering the same gate -- the decision now stays OPEN and
+    needs human closure, where before this change either reaper would have
+    closed it. That is a real behaviour change for the MODE-2 population,
+    accepted because it is the fail-OPEN direction: an over-held decision is
+    a visible, human-triageable cockpit row, while a falsely closed one is
+    invisible (the ~7-day loss this task exists to prevent). Pinned here so
+    the tradeoff is explicit rather than latent; documented on
+    _run_reap_decisions and in the recon watcher's MODE-2 bullet.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    # The same gate is filed as a separate escalation in each queue; only the
+    # orchestrator's copy has resolved.
+    (orch / 'archive' / '2026-07-26' / 'esc-5914-1.json').write_text(
+        json.dumps({'status': 'resolved'})
+    )
+    (recon / 'esc-5914-1.json').write_text(json.dumps({'status': 'pending'}))
+    for queue in (orch, recon):  # two watchers, one collapsed record; recon files last
+        assert (
+            sr.main(
+                [
+                    'write-decision',
+                    '--id',
+                    'esc-5914-1',
+                    '--project',
+                    'df',
+                    '--text',
+                    'Adopt the reify plan?',
+                    '--escalation-id',
+                    'esc-5914-1',
+                    '--escalations-dir',
+                    str(queue),
+                ]
+            )
+            == 0
+        )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['esc-5914-1'] == sr.DecisionState.OPEN
+
+
+def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Case (f): MODE-2 same-subject collapse (task 3528 ADDENDUM, req. (b)).
+
+    Two collision modes must be kept apart. MODE 1 (esc-3036-1, the cases
+    above) is two UNRELATED escalations sharing an id -- cross-queue closing
+    there is a straight bug. MODE 2 (observed: esc-5914-1) is both queues
+    surfacing the SAME underlying human gate; those must collapse to ONE
+    cockpit decision, because a human asked the same question twice is a
+    regression of its own.
+
+    This design satisfies MODE 2 BY CONSTRUCTION: the queue is recorded as a
+    FIELD on the record and the decision id is left untouched, so a second
+    watcher filing the same question lands on the same id. This case passes
+    both before and after the fix by design -- it is the guard that a future
+    refactor to per-queue decision ids ('recon:esc-5914-1' vs
+    'orch:esc-5914-1') would double-file the same question and must not be
+    adopted. Complements test_main_write_decision_refiling_same_id_overwrites_not_duplicates,
+    which pins the same-queue restart case.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+
+    rc1 = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'esc-5914-1',
+            '--project',
+            'df',
+            '--text',
+            'Adopt the reify plan?',
+            '--escalation-id',
+            'esc-5914-1',
+            '--escalations-dir',
+            str(orch),
+        ]
+    )
+    rc2 = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'esc-5914-1',
+            '--project',
+            'df',
+            '--text',
+            'Adopt the reify plan?',
+            '--escalation-id',
+            'esc-5914-1',
+            '--escalations-dir',
+            str(recon),
+        ]
+    )
+
+    assert rc1 == 0
+    assert rc2 == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    # The discriminator is a FIELD holding a normalized queue path, never a
+    # namespace prefix baked into the id.
+    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+    assert listed[0].id == 'esc-5914-1'
+
+
 def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3172,3 +4995,875 @@ def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-cli-badescdir'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_refuses_unknown_queue_but_still_closes_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """REGRESSION GUARD, not a RED driver (task 3640) -- and deliberately so.
+
+    Probed against the merged 3528 code before this test was written: a
+    decision stamped with ANY truthy non-matching value already survives the
+    axis-2 `if decision_dir and decision_dir != reaper_dir` compare, so an
+    UNKNOWN_QUEUE stamp is ALREADY safe today. A test asserting "the reaper
+    closes unknown-stamped records" would therefore be doomed-green and could
+    never drive an implementation. What this pins instead is that the safety
+    SURVIVES: it is currently an accident of string inequality, and a future
+    simplification of that compare (or of the explicit by-name guard step-2
+    adds) would silently make every back-filled undeterminable record closable
+    again, restoring the exact ~7-day invisible-close failure 3528 removed.
+
+    Both arms run in ONE reaper invocation against a queue holding a RESOLVED
+    escalation with the shared id, so the ONLY thing distinguishing them is
+    the queue stamp:
+      - the UNKNOWN_QUEUE-stamped record stays OPEN (refuse, never default to
+        close -- it stays a visible cockpit row for human closure);
+      - the legacy `escalations_dir=''` record on the SAME id still closes to
+        ANSWERED. That second assertion is the load-bearing one: task 3640
+        must NOT redefine '' under the human. '' keeps its 3528 meaning
+        (fall back to project-only scoping); the back-fill DRAINS that
+        population instead of changing what it means.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='dec-unknown-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.UNKNOWN_QUEUE,
+        ),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(
+            id='dec-legacy-unset',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir='',
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-unknown-queue'] == sr.DecisionState.OPEN
+    assert listed['dec-legacy-unset'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_refuses_unknown_queue_even_when_reaper_passes_the_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The degenerate case the string-inequality compare alone does NOT cover.
+
+    If a reaper is invoked with the sentinel as its own ``--escalations-dir``
+    (an operator copy-pasting a stamped value out of a record, or a wrapper
+    threading the field straight through), then `decision_dir == reaper_dir`
+    and the axis-2 guard does not fire at all. Today the record still survives
+    only because read_escalation_status finds no queue at that bogus path and
+    returns None -- safety by lucky accident, one directory named
+    ``<unknown>`` away from failing. Step-2's explicit by-name guard is what
+    makes the refusal intentional, and this pins it.
+
+    Note the sentinel must reach the record VERBATIM for this to be a real
+    test, which is exactly what step-2's normalize_escalations_dir case
+    guarantees.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    # A real directory literally named '<unknown>', holding a RESOLVED
+    # escalation for the shared id -- so a reaper that resolved the sentinel
+    # as a relative path WOULD find a close-worthy status there.
+    monkeypatch.chdir(tmp_path)
+    bogus = tmp_path / sr.UNKNOWN_QUEUE
+    bogus.mkdir()
+    (bogus / 'esc-3036-1.json').write_text(json.dumps({'status': 'resolved'}))
+    assert (orch / 'archive' / '2026-07-26' / 'esc-3036-1.json').is_file()
+    sr.write_decision(
+        _make_decision(
+            id='dec-unknown-selfmatch',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.UNKNOWN_QUEUE,
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', sr.UNKNOWN_QUEUE])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-unknown-selfmatch'] == sr.DecisionState.OPEN
+
+
+class TestAtomicWriteSemantics:
+    """``_atomic_write_text``'s on-disk semantics, pinned WITHOUT a delegation seam.
+
+    Task 3223 consolidated the repo's tmp+rename writers into
+    ``shared.safe_io.atomic_write_text``, but this module is the deliberate
+    exception: it is stdlib-only so ``skills/spawn/spawn-claude.sh`` can run it
+    with no venv (see ``TestStdlibOnlySelfContainment`` below and
+    ``_ALLOWED_RENAMERS`` in ``shared/tests/test_safe_io.py``).
+
+    So these assert the OBSERVABLE result on disk rather than that a particular
+    helper was called. That is the more durable pin anyway: it holds whether
+    the body is inlined or delegated, and it does not go stale the next time
+    the implementation choice is revisited.
+    """
+
+    def test_writes_0600_and_leaves_no_temp_residue(self, tmp_path):
+        """The record is created 0600 (mkstemp's mode), with no tmp left behind."""
+        target = tmp_path / 'record.json'
+
+        sr._atomic_write_text(target, '{"a": 1}')
+
+        assert target.read_text() == '{"a": 1}'
+        assert target.stat().st_mode & 0o777 == 0o600, (
+            'session records hold session state and must stay owner-only'
+        )
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
+
+    def test_creates_missing_parent_dirs(self, tmp_path):
+        """The parent chain is created rather than surfacing FileNotFoundError."""
+        target = tmp_path / 'nested' / 'deeper' / 'record.json'
+
+        sr._atomic_write_text(target, '{"a": 1}')
+
+        assert target.read_text() == '{"a": 1}'
+
+    def test_overwrites_atomically_leaving_no_residue(self, tmp_path):
+        """A rewrite replaces the contents wholesale and leaves no tmp file."""
+        target = tmp_path / 'record.json'
+
+        sr._atomic_write_text(target, '{"a": 1}')
+        sr._atomic_write_text(target, '{"b": 2}')
+
+        assert target.read_text() == '{"b": 2}'
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
+
+    def test_failed_write_leaves_original_intact_and_no_residue(
+        self, tmp_path, monkeypatch
+    ):
+        """On a mid-write failure the original survives and the tmp is cleaned up."""
+        target = tmp_path / 'record.json'
+        sr._atomic_write_text(target, '{"original": true}')
+
+        def _boom(*_args, **_kwargs):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(sr.os, 'replace', _boom)
+
+        with pytest.raises(OSError, match='disk full'):
+            sr._atomic_write_text(target, '{"replacement": true}')
+
+        assert target.read_text() == '{"original": true}'
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
+
+    def test_write_record_creates_missing_nested_dir_and_round_trips(self, tmp_path):
+        """End-to-end: write_record into a non-existent nested root still works."""
+        root = tmp_path / 'does' / 'not' / 'exist'
+        assert not root.exists()
+
+        record = _make_record(session_slug='sess-3223', task_id='3223')
+        sr.write_record(record, root=root)
+
+        loaded = sr.read_record('sess-3223', root=root)
+        assert loaded is not None
+        assert loaded.session_slug == 'sess-3223'
+        assert loaded.task_id == '3223'
+
+
+#: Repo root of this worktree, resolved from THIS FILE so the subprocess
+#: contract test below is CWD-independent (the suite is run from
+#: ``<worktree>/orchestrator``, but a scratch-CWD run must behave identically).
+_SR_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _non_venv_interpreter() -> str | None:
+    """Return an interpreter that has no workspace packages installed, or None.
+
+    ``sys.executable`` is the venv interpreter, which HAS ``shared`` installed
+    and therefore cannot discriminate — the contract under test is precisely
+    "imports without a venv".  Prefer the system interpreter, then the base
+    interpreter this venv was built from.
+    """
+    candidates = ['/usr/bin/python3', str(Path(sys.base_prefix) / 'bin' / 'python3')]
+    for candidate in candidates:
+        if Path(candidate).is_file() and Path(candidate).resolve() != Path(
+            sys.executable
+        ).resolve():
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Bare-shell entrypoint registry + mutation matrix (task 4027)
+# ---------------------------------------------------------------------------
+#
+# Production runs orchestrator modules from plain shell scripts with NO venv
+# and no install, under MORE THAN ONE environment.  Each such invocation is
+# registered below as a ROW, and `_MUST_BE_REJECTED` mutation-tests those rows
+# so the guard is observed FAILING rather than merely observed green.
+#
+# Register a new bare-shell entrypoint as a ROW; do not write another ad-hoc
+# test.  The rows are NOT interchangeable — see
+# `test_tier1_is_strictly_stronger_than_tier2` below.
+
+#: The directory that plays the role of ``orchestrator/src`` — i.e. the PARENT
+#: of the ``orchestrator`` package.  A mutation run substitutes a sandbox for
+#: it (see ``_inject_import_sandbox``), which is why every path below is
+#: expressed relative to this rather than hardcoded.
+_SR_PKG_ROOT = _SR_REPO_ROOT / 'orchestrator' / 'src'
+
+#: The one repo-relative ``PYTHONPATH`` entry the hook shells export.  Any row
+#: entry that RESOLVES to the same directory (``_row_env`` compares resolved
+#: paths, not strings) is rewritten to the sandbox root during a mutation run,
+#: so the row measures the MUTATED copy rather than the real tree.
+_SR_PKG_ROOT_ENTRY = 'orchestrator/src'
+
+
+class _EntrypointShape(StrEnum):
+    """How a bare-shell caller invokes an entrypoint. The shapes differ.
+
+    ``SCRIPT`` puts only the script's OWN directory on ``sys.path``; ``IMPORT``
+    resolves off ``PYTHONPATH``.  A module can satisfy one and break the other,
+    so a row records which one its callers actually use.
+    """
+
+    SCRIPT = 'script'
+    """``python /abs/path/to/module.py <argv...>``"""
+
+    IMPORT = 'import'
+    """``python -c 'import <dotted.name>'``"""
+
+
+@dataclasses.dataclass(frozen=True)
+class _BareShellEntrypoint:
+    """One production invocation of an orchestrator module without a venv.
+
+    Attributes:
+        name: human label, used verbatim as the pytest parametrization id.
+        path: absolute path of the entrypoint, under ``_SR_PKG_ROOT``.
+        pythonpath: repo-relative ``PYTHONPATH`` entries.  ``()`` means the key
+            is ABSENT from the env — NOT set to ``''``.  CPython reads an empty
+            entry as "the current directory", which would silently put the
+            neutral cwd on ``sys.path`` and change what the row measures.
+        shape: ``SCRIPT`` or ``IMPORT`` (see ``_EntrypointShape``).
+        argv: argv tail for a ``SCRIPT`` row; unused by ``IMPORT`` rows.
+            ``('--help',)`` exercises the module import PLUS ``_build_parser()``
+            construction — the two things a bad module-scope import breaks —
+            and exits 0 without touching ``~/.claude/fleet``.
+        probe: an import that MUST FAIL under THIS row's own env.  If it
+            succeeds, the row cannot discriminate a compliant module from a
+            violating one, and the mutation test skips loudly rather than
+            passing vacuously.  Per-row rather than global because the rows
+            forbid different sets (tier-1 forbids strictly more than tier-2).
+            It is a general health check for the row, NOT a stand-in for the
+            payload: ``test_forbidden_import_is_rejected`` additionally requires
+            the payload itself to be unreachable under this env, because probe
+            and payload can name different modules.
+        callers: the shell scripts that make this invocation, so a failure
+            names the production path that breaks.
+    """
+
+    name: str
+    path: Path
+    pythonpath: tuple[str, ...]
+    shape: _EntrypointShape
+    argv: tuple[str, ...]
+    probe: str
+    callers: str
+
+
+_BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
+    _BareShellEntrypoint(
+        name='session_registry.py (tier-2: import with PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_registry.py',
+        pythonpath=(_SR_PKG_ROOT_ENTRY,),
+        shape=_EntrypointShape.IMPORT,
+        argv=(),
+        probe='from shared import safe_io',
+        callers=(
+            'downstream Python consumers that import orchestrator.session_registry '
+            'with orchestrator/src on PYTHONPATH but no install (T4 verify, T5 '
+            'result, T6 hooks, T7 leases). This row carries the assertion formerly '
+            'made by test_imports_under_a_bare_interpreter_with_no_workspace_'
+            'packages (task 3223 step-31).'
+        ),
+    ),
+    _BareShellEntrypoint(
+        name='session_registry.py (tier-1: bare shell, NO PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_registry.py',
+        # THE POINT OF THIS ROW: running a script by absolute path puts only
+        # the script's OWN directory on sys.path. Nothing else is reachable —
+        # not `shared`, not `orchestrator.<sibling>`. That is a STRICTLY
+        # stronger contract than the tier-2 row above, which the PYTHONPATH
+        # entry makes able to reach every intra-orchestrator sibling.
+        pythonpath=(),
+        shape=_EntrypointShape.SCRIPT,
+        argv=('--help',),
+        probe='from orchestrator import stop_instruction',
+        callers=(
+            'skills/spawn/spawn-claude.sh lines 145 (launching), 428 (exit), 596 '
+            'and 693 (refresh), 871 (set-display) — `python3 "$SESSION_REGISTRY_PY"` '
+            'with no venv, no install and no PYTHONPATH. FOUR OF THE FIVE end in '
+            '`|| true`, so a break here is SILENT: the subprocess simply never '
+            'writes record.json and the session goes missing from the fleet.'
+        ),
+    ),
+    _BareShellEntrypoint(
+        name='session_hooks.py (tier-2: bare shell + PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_hooks.py',
+        # A THIRD distinct shape: script-by-absolute-path WITH PYTHONPATH. Not
+        # reducible to either row above — the tier-1 row has no PYTHONPATH, and
+        # the tier-2 IMPORT row does not put the script's own directory on
+        # sys.path. This one is exactly what session-start.sh:25 + :29 does.
+        pythonpath=(_SR_PKG_ROOT_ENTRY,),
+        shape=_EntrypointShape.SCRIPT,
+        argv=('--help',),
+        probe='from shared import safe_io',
+        callers=(
+            'skills/spawn/hooks/{session-start,stop,notification,install-hooks}.sh '
+            '— each exports PYTHONPATH="$REPO_ROOT/orchestrator/src" (line 25) and '
+            'then runs session_hooks.py by absolute path (line 29). These fire on '
+            'EVERY session start / stop / notification in every project, including '
+            'hand-launched ones.'
+        ),
+    ),
+)
+
+#: Mutation matrix: ``(entrypoint filename, import injected at module scope)``.
+#: Each pair MUST be rejected by at least one registry row covering that
+#: entrypoint.  This is the load-bearing signal — a guard that has never been
+#: observed to fail is not evidence that it guards anything.
+_MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
+    ('session_registry.py', 'from shared import safe_io'),
+    ('session_registry.py', 'from orchestrator import config'),
+    ('session_registry.py', 'from orchestrator import stop_instruction'),
+    # The dependency-footprint half of the contract: a plain third-party import
+    # at module scope. Without it the matrix only ever exercises workspace
+    # packages, and nothing observes the rows rejecting `pip install`-ware.
+    #
+    # `pydantic` rather than `yaml` DELIBERATELY, and it is measured, not
+    # assumed: on this host `import yaml` resolves out of the distro's
+    # /usr/lib/python3/dist-packages and SUCCEEDS under every row's env (it is
+    # not user-site, so PYTHONNOUSERSITE does not remove it), which would make
+    # the payload non-discriminating and skip the row instead of pinning it.
+    # `pydantic` is absent from the bare interpreter — that absence is the same
+    # one that makes `from orchestrator import config` fail below.
+    ('session_registry.py', 'import pydantic'),
+    # session_hooks.py's contract is the WEAKER tier-2 one: it does
+    # `from orchestrator import session_registry` at module scope (line 50) and
+    # its callers export PYTHONPATH for exactly that, so `orchestrator.*` is
+    # ALLOWED. `shared` and third-party are not — nothing puts shared/src or a
+    # site-packages on that path.
+    ('session_hooks.py', 'from shared import safe_io'),
+    ('session_hooks.py', 'import pydantic'),
+)
+
+
+def _registry_row(filename: str, shape: _EntrypointShape) -> _BareShellEntrypoint:
+    """The unique registry row for ``filename`` invoked as ``shape``.
+
+    Anything needing "the tier-2 env" must read it off the ROW via ``_row_env``
+    rather than hand-rolling a dict, so there is exactly ONE definition of each
+    row's environment.  Two copies drift: a scrub added to ``_row_env`` later
+    (``PYTHONNOUSERSITE`` was one) would reach the row but not the helper that
+    claims to characterise it.
+    """
+    matches = [
+        row
+        for row in _BARE_SHELL_ENTRYPOINTS
+        if row.path.name == filename and row.shape is shape
+    ]
+    assert len(matches) == 1, (
+        f'expected exactly one _BARE_SHELL_ENTRYPOINTS row for {filename} invoked '
+        f'as {shape}, found {[row.name for row in matches]}'
+    )
+    return matches[0]
+
+
+def _row_env(row: _BareShellEntrypoint, *, pkg_root: Path) -> dict[str, str]:
+    """Build ``row``'s scrubbed env, with ``pkg_root`` standing in for src.
+
+    ``pkg_root`` is the real ``orchestrator/src`` for a positive run and a
+    mutation sandbox for a rejection run.
+    """
+    env = {
+        'PATH': '/usr/bin:/bin',
+        'HOME': os.environ.get('HOME', '/tmp'),
+        # Every row, always: a sandbox mirrors the package as SYMLINKS, so
+        # bytecode written through one would land in the real source tree.
+        'PYTHONDONTWRITEBYTECODE': '1',
+        # STRICTER than production, deliberately.  The shells do not set this,
+        # but ``~/.local/lib/pythonX.Y/site-packages`` is on ``sys.path`` by
+        # default (``site.ENABLE_USER_SITE`` is True on the system interpreter),
+        # so one developer's ``pip install --user`` of anything named ``shared``
+        # would make these rows accept a module that breaks on every other box —
+        # and would silently defeat the vacuity probes below, which measure
+        # importability under exactly this env.  Erring toward the stricter
+        # environment can only produce a loud false RED, never a false green.
+        'PYTHONNOUSERSITE': '1',
+    }
+    # An empty tuple leaves the key genuinely ABSENT — see the dataclass
+    # docstring; PYTHONPATH='' is not the same environment.
+    if not row.pythonpath:
+        return env
+
+    real_pkg_root = _SR_PKG_ROOT.resolve()
+    is_mutation_run = pkg_root.resolve() != real_pkg_root
+    entries: list[str] = []
+    for entry in row.pythonpath:
+        resolved = (_SR_REPO_ROOT / entry).resolve()
+        if resolved == real_pkg_root:
+            # THE substitution that makes a mutation run measure the sandbox.
+            entries.append(str(pkg_root))
+            continue
+        # Resolve-and-compare rather than string-equality against
+        # ``_SR_PKG_ROOT_ENTRY``: a row spelled 'orchestrator/src/',
+        # './orchestrator/src', or carrying a second entry that also reaches the
+        # package, would otherwise miss the substitution and point a MUTATION run
+        # at the real, UNMUTATED tree.  That row would then always exit 0 and
+        # quietly stop pinning anything — masked, because
+        # ``test_forbidden_import_is_rejected`` only needs ANY row to reject.
+        assert not (is_mutation_run and resolved.is_relative_to(real_pkg_root)), (
+            f'{row.name}: PYTHONPATH entry {entry!r} resolves inside the real '
+            f'{real_pkg_root} but was not substituted for the mutation sandbox '
+            f'{pkg_root}, so this run would import the UNMUTATED module and the '
+            f'mutation test would measure nothing. Spell it exactly '
+            f'{_SR_PKG_ROOT_ENTRY!r} so it is substituted.'
+        )
+        entries.append(str(resolved))
+    env['PYTHONPATH'] = os.pathsep.join(entries)
+    return env
+
+
+def _run_row(
+    row: _BareShellEntrypoint, *, pkg_root: Path, tmp_path: Path
+) -> subprocess.CompletedProcess[str]:
+    """Run ``row``'s production invocation shape against ``pkg_root``."""
+    interpreter = _non_venv_interpreter()
+    assert interpreter is not None, 'callers skip when no non-venv interpreter exists'
+
+    target = pkg_root / row.path.relative_to(_SR_PKG_ROOT)
+    if row.shape is _EntrypointShape.SCRIPT:
+        argv = [interpreter, str(target), *row.argv]
+    else:
+        dotted = '.'.join(target.relative_to(pkg_root).with_suffix('').parts)
+        argv = [interpreter, '-c', f'import {dotted}']
+
+    # ``cwd=tmp_path`` here and in ``_probe_discriminates`` is LOAD-BEARING,
+    # not tidiness (task 3223 step-31's measured finding, carried forward).
+    # Python puts the process's own cwd on sys.path, so a run from the REPO
+    # ROOT resolves ``<repo>/shared`` — the wrapper directory, NOT the real
+    # ``shared/src/shared`` package — as an empty NAMESPACE package.  The probe's
+    # ``shared`` import then succeeds, the test skips, and the contract goes
+    # unpinned.  Measured: inert from the repo root, live from ``orchestrator/``.
+    # The canonical test_command runs ``cd orchestrator && pytest tests/``, so it
+    # only bit an ad-hoc ``pytest orchestrator/tests/...`` from the root — which
+    # is exactly what someone checking this one file types.  A neutral cwd holds
+    # either way.  (conftest.py's autouse ``_no_mock_derived_stray_dirs`` is a
+    # second reason never to let a subprocess inherit the suite's cwd.)
+    return subprocess.run(
+        argv,
+        env=_row_env(row, pkg_root=pkg_root),
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+class _BareShellProbes:
+    """Session-scoped memo for the subprocess measurements the rows need.
+
+    Two kinds, each a pure function of (row env, subject) and therefore
+    identical for every test that asks:
+
+    - ``rejects(row, statement)`` — does ``statement`` FAIL as a bare import
+      under ``row``'s own documented env?  A row can only be counted as
+      discriminating when this is True; if the interpreter reaches the package
+      anyway, the row would accept a violating module too and its green is
+      unearned.
+    - ``control_run(row, entrypoint)`` — does ``row`` run CLEAN against a
+      sandbox with NOTHING injected?
+
+    Memoised because the mutation matrix asks the same questions repeatedly:
+    unmemoised, every (matrix entry x covering row) pair spawns its own
+    interpreter, so the two session_registry rows are re-probed once per payload
+    with identical inputs.  That count grows multiplicatively as rows and
+    payloads are added — exactly what a registry design invites — for results
+    that cannot differ.
+    """
+
+    def __init__(self, cwd: Path) -> None:
+        #: Neutral cwd for every subprocess — LOAD-BEARING, see ``_run_row``.
+        self._cwd = cwd
+        self._rejects: dict[tuple[str, str], bool] = {}
+        self._control_sandboxes: dict[str, Path] = {}
+        self._control_runs: dict[tuple[str, str], subprocess.CompletedProcess[str]] = {}
+
+    def rejects(self, row: _BareShellEntrypoint, statement: str) -> bool:
+        """True when ``statement`` FAILS as a bare import under ``row``'s env."""
+        key = (row.name, statement)
+        if key not in self._rejects:
+            interpreter = _non_venv_interpreter()
+            assert interpreter is not None, (
+                'callers skip when no non-venv interpreter exists'
+            )
+            probe = subprocess.run(
+                [interpreter, '-c', statement],
+                env=_row_env(row, pkg_root=_SR_PKG_ROOT),
+                cwd=self._cwd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self._rejects[key] = probe.returncode != 0
+        return self._rejects[key]
+
+    def control_run(
+        self, row: _BareShellEntrypoint, entrypoint: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Run ``row`` against a sandbox of ``entrypoint`` with NOTHING injected.
+
+        The control for every rejection.  It proves the symlink farm and the
+        source rewrite still produce a RUNNABLE module, so a non-zero exit on a
+        mutated copy is attributable to the payload.  Without it, a silently
+        degraded sandbox — a missing symlink, an anchor line that lands inside a
+        docstring, a syntax-breaking rewrite — makes every covering row exit
+        non-zero and every mutation test PASS while measuring nothing, which is
+        the same silent-pass mode this registry exists to close.
+        """
+        if entrypoint not in self._control_sandboxes:
+            # Empty payload: same code path, same symlink farm, same rewrite —
+            # only the injected line differs from a mutation run.
+            self._control_sandboxes[entrypoint] = _inject_import_sandbox(
+                self._cwd, entrypoint, ''
+            )
+        key = (row.name, entrypoint)
+        if key not in self._control_runs:
+            self._control_runs[key] = _run_row(
+                row, pkg_root=self._control_sandboxes[entrypoint], tmp_path=self._cwd
+            )
+        return self._control_runs[key]
+
+
+@pytest.fixture(scope='session')
+def bare_shell_probes(tmp_path_factory: pytest.TempPathFactory) -> _BareShellProbes:
+    """Session-scoped so each (row, statement) pair is measured exactly once."""
+    return _BareShellProbes(tmp_path_factory.mktemp('bare-shell-probes'))
+
+
+#: Intra-orchestrator modules documented stdlib-only for LAYERING reasons
+#: (cycle avoidance), NOT for bare-shell executability. Each is therefore
+#: importable under the tier-2 env and NOT under tier-1 — which is exactly the
+#: difference `test_tier1_is_strictly_stronger_than_tier2` demonstrates.
+#:
+#: `orchestrator.config` is deliberately NOT in this list. Measured: it fails
+#: the TIER-2 env too, because orchestrator/config.py imports pydantic, which
+#: the bare interpreter lacks — a dependency-footprint failure, not the
+#: layering one being demonstrated. Using it as the probe would make the test
+#: tautological and mislead the next reader. It stays in `_MUST_BE_REJECTED`
+#: (it must fail tier-1, and does), it just cannot serve as the tier-2-accepts
+#: probe.
+_BARE_IMPORTABLE_SIBLINGS = ('stop_instruction', 'fm_retry', 'routing')
+
+
+def _first_bare_importable_sibling(probes: _BareShellProbes) -> str | None:
+    """Return the first sibling importable under the tier-2 env, or None.
+
+    Probed at runtime rather than hardcoded: if the chosen module later grows a
+    pydantic/yaml dependency it stops being bare-importable, and a hardcoded
+    reference would turn its caller into a confusing false failure instead of a
+    skip. Probing the list degrades to None only when ALL candidates stop
+    qualifying.
+
+    The env comes off the tier-2 ROW itself (see ``_registry_row``), never a
+    local copy — this probe exists to characterise what that row accepts, so
+    measuring a different environment than the row would silently weaken
+    ``test_tier1_is_strictly_stronger_than_tier2``'s premise.
+    """
+    tier2 = _registry_row('session_registry.py', _EntrypointShape.IMPORT)
+    for candidate in _BARE_IMPORTABLE_SIBLINGS:
+        if not probes.rejects(tier2, f'from orchestrator import {candidate}'):
+            return candidate
+    return None
+
+
+def _inject_import_sandbox(tmp_path: Path, entrypoint_filename: str, payload: str) -> Path:
+    """Mirror the orchestrator package, with ``payload`` injected into one file.
+
+    Returns the directory that stands in for ``orchestrator/src``.
+
+    Every entry of the real package is mirrored as a SYMLINK (``__pycache__``
+    excepted) and only the mutated entrypoint is a real file.  Faithfulness and
+    cost: in production a ``SCRIPT`` row's own directory holds all ~90 sibling
+    modules, so a lone-file temp copy would be over-strict and could manufacture
+    false rejections; a full ``cp -r`` would copy 11M per mutation.  The symlink
+    farm is both faithful and one inode.
+    """
+    slug = re.sub(r'\W+', '-', f'{entrypoint_filename}-{payload}').strip('-')
+    sandbox = tmp_path / f'sandbox-{slug}'
+    pkg = sandbox / 'orchestrator'
+    pkg.mkdir(parents=True)
+
+    real_pkg = _SR_PKG_ROOT / 'orchestrator'
+    for entry in real_pkg.iterdir():
+        if entry.name == '__pycache__':
+            continue
+        (pkg / entry.name).symlink_to(entry)
+
+    marker = 'from __future__ import annotations\n'
+    source = (real_pkg / entrypoint_filename).read_text()
+    assert marker in source, (
+        f'{entrypoint_filename} has no `{marker.strip()}` line to anchor the '
+        'injection on; pick another anchor rather than injecting blindly'
+    )
+    (pkg / entrypoint_filename).unlink()
+    (pkg / entrypoint_filename).write_text(source.replace(marker, f'{marker}{payload}\n', 1))
+    return sandbox
+
+
+class TestStdlibOnlySelfContainment:
+    """The bare-shell entrypoints must run with NO venv, install or workspace deps.
+
+    This is an architectural contract, not a style preference.  Two production
+    shell paths execute orchestrator modules directly, and they do it under
+    DIFFERENT environments — so this class pins a REGISTRY
+    (``_BARE_SHELL_ENTRYPOINTS``) of invocations, not one module:
+
+    - **tier-1 — bare shell, NO PYTHONPATH.**  ``skills/spawn/spawn-claude.sh``
+      runs ``session_registry.py`` by absolute path with nothing exported, so
+      only the script's own directory is on ``sys.path``: no ``shared``, no
+      third-party, and no ``orchestrator.<sibling>`` either.
+    - **tier-2 — bare shell (or plain import) WITH PYTHONPATH=orchestrator/src.**
+      ``skills/spawn/hooks/*.sh`` run ``session_hooks.py``, and Python consumers
+      import ``orchestrator.session_registry``.  Intra-orchestrator siblings are
+      reachable here; ``shared`` and third-party are still not.
+
+    Tier-1 is STRICTLY STRONGER, so the rows are not interchangeable and neither
+    may be deleted as a duplicate of the other — pinned by
+    ``test_tier1_is_strictly_stronger_than_tier2``.
+
+    The registry is MUTATION-TESTED (``_MUST_BE_REJECTED``): each forbidden
+    import is injected into a sandbox and some covering row must be observed
+    REJECTING it, with a ``ModuleNotFoundError`` naming the payload's own
+    dependency and against a control run of the SAME sandbox with nothing
+    injected — so a degraded sandbox cannot masquerade as a working guard.  A
+    guard that has never been observed to fail is not evidence of anything —
+    task 3223's consolidation added ``from shared import safe_io`` and broke
+    exactly this contract (escalation esc-3223-2) while the only symptom in the
+    suite was two downstream ``test_session_hooks.py`` failures.  A row counts
+    as able to discriminate only when BOTH its own vacuity ``probe`` AND the
+    payload under test are unreachable under its documented env; otherwise it
+    SKIPS loudly rather than reporting a green it did not earn.
+
+    Adding a bare-shell entrypoint?  Register a ROW plus a matrix entry.  Do not
+    write another ad-hoc test — a second one drifts from what the shells run.
+
+    DO NOT WIDEN THIS INTO A REPO-WIDE RULE.  "stdlib-only" names at least three
+    different contracts in this repo, and only the first is what these rows pin:
+
+    (a) bare-shell executability — ``session_registry``, ``session_hooks``;
+    (b) layering / cycle avoidance — ``routing``, ``stop_instruction``,
+        ``fm_retry``, ``agents/triage``, ``fused_memory/config``/``schema``,
+        where importing an intra-package sibling is perfectly fine;
+    (c) dependency footprint — ``memory_eval_limits``, ``evals/report``
+        ("no scipy/numpy"), which already import pydantic and
+        ``shared.memory_eval_metrics`` by design.
+
+    A blanket "no non-stdlib import in any file whose docstring says
+    stdlib-only" check false-positives on (c) and misreads (b).
+    """
+
+    def test_every_matrix_entrypoint_has_a_registry_row(self):
+        """Every entrypoint named in the mutation matrix is actually registered.
+
+        Without this, a matrix entry naming an unregistered entrypoint makes
+        ``test_forbidden_import_is_rejected`` iterate an EMPTY row set — it
+        would neither fail nor skip while the contract went unpinned, which is
+        precisely the silent-pass failure mode this registry exists to close.
+        """
+        registered = {row.path.name for row in _BARE_SHELL_ENTRYPOINTS}
+        named = {entrypoint for entrypoint, _payload in _MUST_BE_REJECTED}
+
+        assert named <= registered, (
+            'these entrypoints are mutation-tested but have no '
+            f'_BARE_SHELL_ENTRYPOINTS row: {sorted(named - registered)}. Register '
+            'the production invocation (env + shape + vacuity probe + callers) as '
+            'a row rather than leaving the mutation unpinned.'
+        )
+
+    @pytest.mark.parametrize('row', _BARE_SHELL_ENTRYPOINTS, ids=lambda row: row.name)
+    def test_entrypoint_runs_clean_under_documented_env(self, row, tmp_path):
+        """Every registered bare-shell invocation succeeds against the REAL tree."""
+        if _non_venv_interpreter() is None:
+            pytest.skip('no non-venv interpreter available on this host')
+
+        result = _run_row(row, pkg_root=_SR_PKG_ROOT, tmp_path=tmp_path)
+
+        assert result.returncode == 0, (
+            f'{row.name} must run with no venv/install. Its callers:\n'
+            f'  {row.callers}\n'
+            'Remove the offending module-scope import (or, if the dependency is '
+            'genuinely required, the caller can no longer run it bare).\n'
+            f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+        )
+
+    def test_tier1_is_strictly_stronger_than_tier2(self, tmp_path, bare_shell_probes):
+        """The two session_registry rows encode DIFFERENT contracts, not one twice.
+
+        They read like duplicates ("both just check that session_registry
+        imports"), so a tidy-up could delete the tier-1 row as redundant and
+        silently restore the exact hole task 4027 closed. They are not: tier-2
+        ACCEPTS an intra-orchestrator sibling import that tier-1 REJECTS, and
+        tier-1 is what spawn-claude.sh actually runs.
+        """
+        if _non_venv_interpreter() is None:
+            pytest.skip('no non-venv interpreter available on this host')
+
+        sibling = _first_bare_importable_sibling(bare_shell_probes)
+        if sibling is None:
+            pytest.skip(
+                'no intra-orchestrator sibling is currently bare-importable under '
+                'the tier-2 env, so the two tiers cannot be told apart by this '
+                'probe (they still differ — see the row definitions)'
+            )
+
+        rows = {
+            row.shape: row
+            for row in _BARE_SHELL_ENTRYPOINTS
+            if row.path.name == 'session_registry.py'
+        }
+        assert set(rows) == {_EntrypointShape.SCRIPT, _EntrypointShape.IMPORT}, (
+            'session_registry.py must keep BOTH a SCRIPT row (tier-1, no '
+            'PYTHONPATH — what spawn-claude.sh runs) and an IMPORT row (tier-2, '
+            f'what Python consumers do). Present: {sorted(rows)}'
+        )
+
+        sandbox = _inject_import_sandbox(
+            tmp_path, 'session_registry.py', f'from orchestrator import {sibling}'
+        )
+        tier2 = _run_row(rows[_EntrypointShape.IMPORT], pkg_root=sandbox, tmp_path=tmp_path)
+        tier1 = _run_row(rows[_EntrypointShape.SCRIPT], pkg_root=sandbox, tmp_path=tmp_path)
+
+        both_encode_different_contracts = (
+            'The two session_registry rows are NOT duplicates and neither may be '
+            'deleted as a copy of the other: tier-2 (import with PYTHONPATH) '
+            'tolerates intra-orchestrator siblings, tier-1 (bare shell, no '
+            'PYTHONPATH) does not, and tier-1 is the one spawn-claude.sh runs.\n'
+            f'payload: from orchestrator import {sibling}\n'
+        )
+        assert tier2.returncode == 0, (
+            f'{both_encode_different_contracts}'
+            f'tier-2 was expected to ACCEPT it but exited {tier2.returncode}. If '
+            f'`{sibling}` has grown a non-stdlib dependency it is no longer a valid '
+            f'probe — extend _BARE_IMPORTABLE_SIBLINGS.\nstderr:\n{tier2.stderr}'
+        )
+        assert tier1.returncode != 0, (
+            f'{both_encode_different_contracts}'
+            'tier-1 was expected to REJECT it but exited 0, which means the tier-1 '
+            'row is no longer measuring the no-PYTHONPATH environment.\n'
+            f'stdout:\n{tier1.stdout}'
+        )
+
+    @pytest.mark.parametrize(('entrypoint', 'payload'), _MUST_BE_REJECTED)
+    def test_forbidden_import_is_rejected(
+        self, entrypoint, payload, tmp_path, bare_shell_probes
+    ):
+        """Inject a forbidden import and demand that some covering row REJECTS it.
+
+        This is the signal that the rows above discriminate at all. A guard that
+        has never been observed to fail is not evidence of anything.
+        """
+        if _non_venv_interpreter() is None:
+            pytest.skip('no non-venv interpreter available on this host')
+
+        covering = [row for row in _BARE_SHELL_ENTRYPOINTS if row.path.name == entrypoint]
+        assert covering, (
+            f'no _BARE_SHELL_ENTRYPOINTS row covers {entrypoint}, so the loop below '
+            'would iterate zero rows and this test would PASS while the contract '
+            'went unpinned — the exact silent-pass failure mode the registry exists '
+            'to close. Register a row for it.'
+        )
+
+        # Discrimination is judged against THIS payload, not the row's fixed
+        # `probe` alone.  The two can be about different modules, and then a row
+        # is counted as discriminating on a probe unrelated to what it is being
+        # asked to reject.  Concretely: the tier-1 row's probe is `from
+        # orchestrator import stop_instruction` (no PYTHONPATH, so it fails on
+        # essentially any host), while one payload it must reject is `from shared
+        # import safe_io`.  On a host where `shared` IS reachable by the bare
+        # interpreter, tier-2 is correctly filtered out on its own probe, tier-1
+        # survives the filter on an unrelated one, and the mutated tier-1 run then
+        # exits 0 — a hard RED reporting a fact about the HOST rather than about
+        # the code.  The honest outcome there is the skip below.  Both conditions
+        # are required: the row probe guards the row in general, the payload
+        # guards this parametrization in particular.
+        discriminating = [
+            row
+            for row in covering
+            if bare_shell_probes.rejects(row, row.probe)
+            and bare_shell_probes.rejects(row, payload)
+        ]
+        if not discriminating:
+            pytest.skip(
+                f'every registry row covering {entrypoint} can already import '
+                f'`{payload}` (or its own vacuity probe) under its documented env '
+                '(workspace or third-party packages reachable by the bare '
+                'interpreter?), so none of them can discriminate a compliant module '
+                'from a violating one'
+            )
+
+        # CONTROL BEFORE CONCLUSION: the identical sandbox with NOTHING injected
+        # must run clean, or a non-zero exit on the mutated copy says nothing
+        # about the payload.
+        for row in discriminating:
+            control = bare_shell_probes.control_run(row, entrypoint)
+            assert control.returncode == 0, (
+                f'the UNMUTATED sandbox of {entrypoint} already fails under '
+                f'{row.name} (rc={control.returncode}), so any rejection below would '
+                'be attributable to the sandbox rather than to the injected import. '
+                '_inject_import_sandbox has degraded — a missing symlink, or an '
+                'anchor line that no longer sits at module scope.\n'
+                f'stderr:\n{control.stderr}'
+            )
+
+        sandbox = _inject_import_sandbox(tmp_path, entrypoint, payload)
+        outcomes = [
+            (row, _run_row(row, pkg_root=sandbox, tmp_path=tmp_path))
+            for row in discriminating
+        ]
+
+        detail = '\n'.join(
+            f'- {row.name}: rc={result.returncode}\n'
+            f'  stderr: {result.stderr.strip()[:400]}'
+            for row, result in outcomes
+        )
+        # ``ModuleNotFoundError``, not merely ``rc != 0``: the rejection must be
+        # caused by the module the payload names — directly, or transitively (`from
+        # orchestrator import config` fails on config.py's own pydantic import under
+        # tier-2).  A SyntaxError or a crash also exits non-zero, so accepting any
+        # non-zero exit would let a broken injection masquerade as a working guard.
+        rejected = [
+            row.name
+            for row, result in outcomes
+            if result.returncode != 0 and 'ModuleNotFoundError' in result.stderr
+        ]
+        assert rejected, (
+            f'{entrypoint} with `{payload}` injected at module scope was not rejected '
+            'for the right reason by any registry row covering it: each row either '
+            'ACCEPTED it — nothing pins that part of the contract, so add the row '
+            'whose environment rejects it — or failed WITHOUT a ModuleNotFoundError, '
+            'meaning the injection broke the module instead of exercising the import '
+            'guard.\n'
+            f'{detail}'
+        )

@@ -1053,7 +1053,14 @@ class TestMergeGraphFamily:
     @pytest.mark.asyncio
     async def test_empty_family_makes_no_primitive_calls_and_zeroed_summary(self, monkeypatch):
         """No entity rows and no episode rows -> none of the three-phase
-        primitives are called, and the summary is all-zero/empty."""
+        primitives are called, and the summary is all-zero/empty.
+
+        The exact-shape assertion below is also what pins the presence of
+        task 4183's merge_mentions_dropped/_uuids keys. This script builds
+        MOVE specs only, so that census is structurally always 0/[] here --
+        there is deliberately no test injecting a non-zero census, since it
+        would assert a state this script cannot produce.
+        """
         mocks = self._patch_primitives(monkeypatch)
 
         summary = await _mod.merge_graph_family(MagicMock(), 'know-live', 'know_live', [], [])
@@ -1070,6 +1077,7 @@ class TestMergeGraphFamily:
             'edges_recreated': 0, 'edges_skipped': 0,
             'mentions_recreated': 0, 'mentions_skipped': 0,
             'dropped_cross_target': [], 'blocked': [],
+            'merge_mentions_dropped': 0, 'merge_mentions_dropped_uuids': [],
         }
 
 

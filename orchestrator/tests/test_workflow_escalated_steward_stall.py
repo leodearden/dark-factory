@@ -1025,7 +1025,7 @@ def _make_progressing_steward(
     task_id: str,
     *,
     tick: float,
-    ticks: int,
+    duration: float,
     markers: list[str],
     advance: bool = True,
     counter: str = 'invocations',
@@ -1036,7 +1036,16 @@ def _make_progressing_steward(
     Exposes ``metrics.invocations`` — the same public counter the real
     ``TaskSteward`` bumps after EVERY invocation returns (steward.py:597, and
     :948 on the auto-escalate path), including each timeout-kill retry — and
-    advances it once per *tick* for *ticks* ticks before dismissing its L0.
+    advances it once per *tick* for *duration* wall-clock seconds before
+    dismissing its L0.
+
+    *duration* is wall-clock, not a tick count: the loop runs against a
+    deadline (``elapsed < duration``) rather than a fixed number of
+    ``asyncio.sleep`` calls, so the total time this fake steward keeps
+    ticking stays ~*duration* regardless of how much scheduling latency each
+    individual wakeup absorbs under load — only the NUMBER of ticks that fit
+    shrinks, never the work's wall-clock length relative to the window under
+    test (task 3912).
 
     That spread is the point: with ``steward_max_attempts`` (1) plus
     ``steward_max_timeouts_per_escalation`` (3), a HEALTHY steward can
@@ -1079,7 +1088,8 @@ def _make_progressing_steward(
             self._wip_probe = probe
 
         async def _work(self) -> None:
-            for _ in range(ticks):
+            t0 = asyncio.get_running_loop().time()
+            while asyncio.get_running_loop().time() - t0 < duration:
                 await asyncio.sleep(tick)
                 if advance:
                     setattr(
@@ -1113,6 +1123,18 @@ def _make_progressing_steward(
     return _FakeSteward
 
 
+# Shared tuning for every test in TestObservableProgressRefreshesTheWait,
+# including the negative control: a fake steward ticks its counter every
+# _PROGRESS_TICK seconds for _PROGRESS_DURATION wall-clock seconds, against a
+# window derived from _PROGRESS_COMPLETION + _PROGRESS_INVOCATION.  Keep
+# these in sync across all three tests — see the class docstring below for
+# why a shared, wide tick/window margin matters.
+_PROGRESS_TICK = 0.05
+_PROGRESS_DURATION = 2.0
+_PROGRESS_COMPLETION = 0.3
+_PROGRESS_INVOCATION = 0.5
+
+
 @pytest.mark.asyncio
 class TestObservableProgressRefreshesTheWait:
     """Fix D2: a steward that is visibly WORKING must not be given up on.
@@ -1121,15 +1143,33 @@ class TestObservableProgressRefreshesTheWait:
     tail, because the steward legitimately RETRIES and each retry gets its own
     full ``timeouts.steward`` invocation.  The fix is to refresh the deadline
     whenever the steward is observably still working, so only a GENUINELY
-    SILENT producer trips the backstop.  Both tests share one window and one
-    fake shape, differing ONLY in whether ``metrics.invocations`` advances.
+    SILENT producer trips the backstop.  All three tests share one window
+    (``_PROGRESS_COMPLETION`` + ``_PROGRESS_INVOCATION``) and one fake shape
+    (``_PROGRESS_TICK`` / ``_PROGRESS_DURATION``), differing ONLY in whether
+    ``metrics.invocations`` advances and which counter moves.
+
+    The tick interval is kept small RELATIVE to the window (a 16x margin)
+    rather than a fixed absolute gap: under xdist full-suite load the event
+    loop can be starved for a stretch between when a wait's deadline is
+    anchored and when the fake steward's first tick actually lands, and a
+    narrow margin (the pre-3912 0.3s tick vs 0.5s window, ~0.2s of slack) let
+    that starvation land the first tick AFTER the first give-up check — a
+    race, not a logic regression (task 3912).
     """
 
     async def test_steady_progress_extends_the_wait_past_a_full_window(
         self, config, git_ops, task_assignment, tmp_path,
     ):
-        """~1.2s of steady progress against a 0.5s window."""
-        local_config = _short_window_config(config, completion=0.2, invocation=0.3)
+        """Steady progress against the window.
+
+        See the class docstring for the shared tuning and the xdist-
+        starvation rationale behind the tick/window margin.
+        """
+        local_config = _short_window_config(
+            config,
+            completion=_PROGRESS_COMPLETION,
+            invocation=_PROGRESS_INVOCATION,
+        )
         wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
         queue = EscalationQueue(tmp_path / 'queue')
         esc = _submit_l0(queue, task_assignment.task_id)
@@ -1140,7 +1180,8 @@ class TestObservableProgressRefreshesTheWait:
         _wire_resolve_callback(queue, workflow)
         markers: list[str] = []
         workflow._steward_factory = _make_progressing_steward(
-            queue, task_assignment.task_id, tick=0.3, ticks=4, markers=markers,
+            queue, task_assignment.task_id,
+            tick=_PROGRESS_TICK, duration=_PROGRESS_DURATION, markers=markers,
         )
         evrl_mock, _state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
@@ -1156,9 +1197,10 @@ class TestObservableProgressRefreshesTheWait:
         archived = queue.get(esc.id)
         assert archived is not None, 'the record must still be readable'
         assert archived.resolved_by == 'steward-auto-dismissed', (
-            f'the steward advanced metrics.invocations every 0.3s for ~1.2s — '
-            f'more than two full {window:.1f}s windows of visible progress — so '
-            f'the wait must have been refreshed rather than expired.  '
+            f'the steward advanced metrics.invocations every {_PROGRESS_TICK}s '
+            f'for ~{_PROGRESS_DURATION:.1f}s — more than two full {window:.1f}s '
+            f'windows of visible progress — so the wait must have been '
+            f'refreshed rather than expired.  '
             f'resolved_by={archived.resolved_by!r} means a fixed window fired '
             f'mid-retry on a steward that was demonstrably working'
         )
@@ -1194,7 +1236,11 @@ class TestObservableProgressRefreshesTheWait:
         same cap.  That is exactly the outcome fix D2 says must happen ONLY on a
         genuinely SILENT producer, so the per-attempt counter has to count.
         """
-        local_config = _short_window_config(config, completion=0.2, invocation=0.3)
+        local_config = _short_window_config(
+            config,
+            completion=_PROGRESS_COMPLETION,
+            invocation=_PROGRESS_INVOCATION,
+        )
         wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
         queue = EscalationQueue(tmp_path / 'queue')
         esc = _submit_l0(queue, task_assignment.task_id)
@@ -1205,7 +1251,8 @@ class TestObservableProgressRefreshesTheWait:
         _wire_resolve_callback(queue, workflow)
         markers: list[str] = []
         workflow._steward_factory = _make_progressing_steward(
-            queue, task_assignment.task_id, tick=0.3, ticks=4, markers=markers,
+            queue, task_assignment.task_id,
+            tick=_PROGRESS_TICK, duration=_PROGRESS_DURATION, markers=markers,
             counter='subprocess_attempts',
         )
         evrl_mock, _state = _make_evrl_returner(
@@ -1222,10 +1269,11 @@ class TestObservableProgressRefreshesTheWait:
         archived = queue.get(esc.id)
         assert archived is not None, 'the record must still be readable'
         assert archived.resolved_by == 'steward-auto-dismissed', (
-            f'the steward ticked metrics.subprocess_attempts every 0.3s for '
-            f'~1.2s — more than two full {window:.1f}s windows of visible '
-            f'cap-retry progress — with metrics.invocations frozen throughout, '
-            f'exactly as an all-accounts-capped steward looks.  '
+            f'the steward ticked metrics.subprocess_attempts every '
+            f'{_PROGRESS_TICK}s for ~{_PROGRESS_DURATION:.1f}s — more than two '
+            f'full {window:.1f}s windows of visible cap-retry progress — with '
+            f'metrics.invocations frozen throughout, exactly as an '
+            f'all-accounts-capped steward looks.  '
             f'resolved_by={archived.resolved_by!r} means the backstop fired on '
             f'a working producer'
         )
@@ -1246,7 +1294,11 @@ class TestObservableProgressRefreshesTheWait:
         implementation that simply never expires — which would re-open the
         permanent strand this whole task exists to close.
         """
-        local_config = _short_window_config(config, completion=0.2, invocation=0.3)
+        local_config = _short_window_config(
+            config,
+            completion=_PROGRESS_COMPLETION,
+            invocation=_PROGRESS_INVOCATION,
+        )
         wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
         queue = EscalationQueue(tmp_path / 'queue')
         esc = _submit_l0(queue, task_assignment.task_id)
@@ -1257,7 +1309,8 @@ class TestObservableProgressRefreshesTheWait:
         _wire_resolve_callback(queue, workflow)
         markers: list[str] = []
         workflow._steward_factory = _make_progressing_steward(
-            queue, task_assignment.task_id, tick=0.3, ticks=4, markers=markers,
+            queue, task_assignment.task_id,
+            tick=_PROGRESS_TICK, duration=_PROGRESS_DURATION, markers=markers,
             advance=False,
         )
         evrl_mock, _state = _make_evrl_returner(

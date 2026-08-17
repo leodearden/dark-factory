@@ -1,0 +1,26 @@
+{
+  "7d073281-4c5d-4ba3-a01c-3a167f4460f4": {
+    "tracked_as_task": "3686",
+    "flag": "record_error",
+    "error": "attempt to write a readonly database",
+    "classification": "repairable_duplicate",
+    "source_report": "docs/toolcall-xml-leak-sweep-2026-08-05/apply-report.json",
+    "source_provenance": "docs/toolcall-xml-leak-sweep-2026-08-05/apply-provenance.json",
+    "payload_source_report": "docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json",
+    "payload_content_sha256": "f8cf01120f534d68ff5871042ea56b4cc3086cb5c280ae74ef7d872872c8a6bd",
+    "payload_repaired_content_sha256": "e3214e6042512a9b62c858553c4f749a533b954c1e4efd2e70b07e5778a5691b",
+    "payload_content_chars": 867,
+    "payload_repaired_content_chars": 415,
+    "payload_pin_note": "The DURABLE PIN is content-addressed, not commit-addressed: payload_source_report (a repo-relative path) plus the two sha256 digests above, taken over the UTF-8 bytes of that record's 'content' and 'repaired_content'. fused-memory/tests/test_toolcall_xml_leak_sweep_artifacts.py re-hashes the committed payload and asserts both digests, so a payload that is edited, truncated or swapped fails the suite. A commit sha is deliberately NOT recorded here: the merge lane rebases this branch, so any sha naming a same-branch commit is guaranteed stale by the time the work lands on main, and `git show <sha>:<path>` stops working once gc prunes the orphan -- which would make the recovery instruction below unexecutable. For the historical record ONLY, and explicitly not as provenance: earlier commits on this branch (and commit ac35e5c02b's message) cite the pre-rebase shas 3e926d2744 / a1b77e3265 / 1b7906526b for this payload. Those are unreachable orphans; the repo-relative path plus the digests supersede them.",
+    "points_before": 21089,
+    "points_after": 21088,
+    "qdrant_state": "absent",
+    "recovered": true,
+    "new_id": "184723b4-5f5d-4464-ba34-3818f303a768",
+    "recovered_via": "mcp__fused-memory__add_memory (task 3686) -- the fused-memory MCP server is a SEPARATE, unsandboxed HTTP process (.mcp.json: http://127.0.0.1:8002/mcp), so its SQLite history write executes outside the calling agent's landlock. That is why the re-add succeeded from a sandboxed implementer session while the original in-process script write could not.",
+    "recovered_at": "2026-08-06T12:41:03.918751+00:00",
+    "recovered_category": "observations_and_summaries",
+    "recovery_verification": "Re-add verified THREE ways before this flag was flipped, because MemoryService.add_memory swallows a mem0 backend failure into message as '[mem0_error: ...]' and returns normally -- a non-raising call is NOT evidence of a write. (1) The sweep's own readd_persisted predicate: memory_ids=['184723b4-5f5d-4464-ba34-3818f303a768'], stores_written=['mem0'], no mem0_error in message. (2) Independent get_memory_by_id(184723b4-...) returned found=true. (3) The stored content was re-hashed and is BYTE-IDENTICAL to this entry's payload_repaired_content_sha256 (415 chars, e3214e60...a5691b), and the production detector (has_toolcall_xml_leak) reports it leak-free. recovered_at is the store's own created_at, not a wall-clock guess.",
+    "recovery": "DONE (task 3686). The repaired_content for this id was re-added from payload_source_report -- digests re-confirmed immediately before the write -- via the fused-memory MCP add_memory tool, and now lives under new_id. No metadata needed restoring: the apply-report shows metadata_preserved=[] and metadata_dropped=[created_at, hash, role, updated_at], all mem0-managed keys. The sweep was NOT re-run to recover this record (docs/mcp-toolcall-xml-leak.md). qdrant_state, points_before/after and the digests below are left as the historical record of the loss and are deliberately NOT updated. The environmental cause is now machine-enforced rather than remembered: fused_memory.utils.store_mutation_preflight makes --apply refuse to start where mem0's history directory cannot be written."
+  }
+}

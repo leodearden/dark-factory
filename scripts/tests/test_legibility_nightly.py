@@ -13,25 +13,25 @@ the commit path is genuinely exercised without risking main.
 from __future__ import annotations
 
 import contextlib
-import gzip
 import json
 import logging
 import subprocess
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
-
 from legibility import (
     census_trigger,
     codebook,
-    config as config_mod,
     digest,
     nightly,
     trickle_state,
 )
+from legibility import (
+    config as config_mod,
+)
 from legibility.config import load_config
-
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
@@ -112,20 +112,29 @@ def _encode_cwd(cwd: str) -> str:
 
 def _write_transcript(
     path: Path, *, cwd: str, timestamp: str, session_id: str = 'session-1',
+    user_text: str = 'please fix this confusing bug',
 ) -> None:
     """Write a minimal fixture session transcript JSONL with a genuine user
     turn plus a structural tool-error (nonzero confusion signal): a user
     turn, an assistant tool_use, and a user tool_result carrying
     ``is_error: true`` with 'No such file or directory' content (matches
     sampling._NOT_FOUND_PATTERNS too, for a score > 0 on more than one
-    signal class)."""
+    signal class).
+
+    *user_text* overrides the first user turn. It exists so a test can write
+    TWO transcripts that both survive to the digest phase: the sampler's
+    ``dedupe_shapes`` fingerprints on (stratum, signal-shape,
+    ``_normalize_first_turn(first_turn_text)``), so two transcripts differing
+    only in ``session_id`` collapse to one and a multi-record night silently
+    becomes a single-record one. Defaulted, so every existing caller is
+    unchanged."""
     lines = [
         {
             'type': 'user',
             'cwd': cwd,
             'timestamp': timestamp,
             'sessionId': session_id,
-            'message': {'role': 'user', 'content': 'please fix this confusing bug'},
+            'message': {'role': 'user', 'content': user_text},
         },
         {
             'type': 'assistant',
@@ -214,33 +223,6 @@ def _write_quiet_transcript(
     path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n', encoding='utf-8')
 
 
-def _write_transcript_gz(
-    path: Path, *, cwd: str, timestamp: str, session_id: str = 'session-1',
-) -> None:
-    """Gzip variant of :func:`_write_transcript` — the on-disk form of an
-    archived fleet session (``shared.transcript_archive`` writes
-    ``<sid>.jsonl.gz``). Same nonzero-confusion content, gzip-compressed."""
-    lines = [
-        {
-            'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'sessionId': session_id,
-            'message': {'role': 'user', 'content': 'please fix this confusing bug'},
-        },
-        {
-            'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'sessionId': session_id,
-            'message': {
-                'role': 'user',
-                'content': [
-                    {'type': 'tool_result', 'tool_use_id': 'tool-1', 'is_error': True,
-                     'content': 'No such file or directory'},
-                ],
-            },
-        },
-    ]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(path, 'wt', encoding='utf-8') as f:
-        f.write('\n'.join(json.dumps(line) for line in lines) + '\n')
-
-
 # ---------------------------------------------------------------------------
 # step-3/4: select_scored_records (+ the stratified sampler)
 # ---------------------------------------------------------------------------
@@ -261,12 +243,12 @@ def test_select_scored_records_includes_matching_session(tmp_path):
     assert record.stratum
 
 
-def test_select_scored_records_reads_gz_archive_root(tmp_path):
+def test_select_scored_records_reads_archive_root(tmp_path):
     # End-to-end proof that the shipped agent_transcript_roots is LIVE with no
     # operator flip: resolve (cfg.project_root) -> enumerate (walk the archive)
-    # -> gz-read (_iter_json_lines) -> classify (encoded worktree parent dir).
+    # -> read (iter_json_lines) -> classify (encoded worktree parent dir).
     # An archived role transcript at the production nested layout
-    # <archive>/<task_id>/<enc>/<sid>.jsonl.gz is enumerated ALONGSIDE an
+    # <archive>/<task_id>/<enc>/<sid>.jsonl is enumerated ALONGSIDE an
     # (empty) ~/.claude/projects tree and classified 'orchestrated-task'.
     main_cwd = '/home/leo/src/dark-factory'
     worktree_cwd = '/home/leo/src/dark-factory/.worktrees/2573'
@@ -275,16 +257,17 @@ def test_select_scored_records_reads_gz_archive_root(tmp_path):
         tmp_path, project_id='dark_factory', cwd_prefixes=[main_cwd],
         agent_transcript_roots=['archive'],
     ))
-    gz_path = tmp_path / 'archive' / '2573' / encoded / 'sess-x.jsonl.gz'
-    _write_transcript_gz(
-        gz_path, cwd=worktree_cwd, timestamp='2026-07-13T10:00:00Z', session_id='sess-x',
+    archived = tmp_path / 'archive' / '2573' / encoded / 'sess-x.jsonl'
+    archived.parent.mkdir(parents=True, exist_ok=True)
+    _write_transcript(
+        archived, cwd=worktree_cwd, timestamp='2026-07-13T10:00:00Z', session_id='sess-x',
     )
     empty_projects_root = tmp_path / 'projects'  # never created — projects tree absent
 
     scored = nightly.select_scored_records(cfg, empty_projects_root, date(2026, 7, 13))
 
     assert len(scored) == 1
-    assert scored[0].session.path == gz_path
+    assert scored[0].session.path == archived
     assert scored[0].stratum == 'orchestrated-task'
 
 
@@ -619,7 +602,7 @@ def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkey
         config_path=config_path,
         projects_root=projects_root,
         target_date=date(2026, 7, 13),
-        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=lambda prompt, model: '{"proposals": []}',
         status_fetcher=None,
         poster=lambda url, envelope: None,
@@ -829,28 +812,43 @@ def test_post_escalation_is_best_effort_on_poster_failure(tmp_path):
 
 
 class _FakeHttpxResponse:
+    """A 200 `application/json` reply with an empty JSON-RPC body.
+
+    `status_code`, `headers` and `json()` were added for task 3644:
+    `_default_poster` now delegates to `census_trigger.post_mcp_envelope`,
+    which reads `status_code` (to detect the stateful escalation server's 400
+    "Missing session ID") and `content-type` (to detect an SSE-framed body)
+    before decoding. Without them this fake would die on an AttributeError
+    and stop exercising the real code path -- so the task-2953 header
+    contract below keeps being asserted against the transport that actually
+    ships, not against a fake the implementation has outgrown."""
+
+    status_code = 200
+    headers = {'content-type': 'application/json'}
+
     def raise_for_status(self):
         pass
 
+    def json(self):
+        return {}
 
-def test_default_poster_sends_streamable_http_accept_headers(monkeypatch):
+
+def test_default_poster_sends_streamable_http_accept_headers(install_fake_httpx):
     """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
     lacking an Accept header covering both application/json and
     text/event-stream (verified live against a local MCP /mcp endpoint).
-    `_default_poster`'s httpx import is lazy (httpx is not importable in
-    this test env), so a fake `httpx` module is injected via sys.modules."""
-    import sys
-
+    `_default_poster`'s httpx import is lazy, but httpx IS importable here --
+    a direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
+    task 2965) -- so an un-faked call would really hit the network. The
+    shared `install_fake_httpx` fixture substitutes a stub so the outbound
+    request shape is assertable independent of any live listener."""
     captured_kwargs = {}
-
-    fake_httpx = type(sys)('httpx')
 
     def _fake_post(url, **kwargs):
         captured_kwargs.update(kwargs)
         return _FakeHttpxResponse()
 
-    fake_httpx.post = _fake_post
-    monkeypatch.setitem(sys.modules, 'httpx', fake_httpx)
+    install_fake_httpx(_fake_post)
 
     nightly._default_poster('http://localhost:8199/mcp', {'jsonrpc': '2.0'})
 
@@ -918,6 +916,92 @@ def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
 
     assert fire is True
     assert launcher_calls == [1]
+
+
+def test_evaluate_census_step_survives_a_raising_decide(tmp_path, caplog):
+    """task 4085: the docstring's "this function never raises and never fails
+    the run" must hold for the DECIDE call, not only for the launcher call.
+
+    Today it guards only `launcher()` and parenthetically ASSUMES `decide` is
+    fail-safe ("never raises -- fail-safe") -- a promise about a callee it
+    cannot enforce, and `decide` is an injected seam any caller can replace.
+    The exception raised here is the real one task 4085 reports, from an
+    unvalidated `last_census_done_count` baseline reaching
+    `current_done - baseline`.
+
+    Two properties, and the second is a safety property rather than a style
+    one: a failed evaluation has established NOTHING, so it must not be able to
+    start an expensive census -- hence the return happens before
+    `entrypoint_exists` is even consulted."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
+
+    launcher_calls = []
+    entrypoint_calls = []
+
+    def _recording_entrypoint_exists():
+        entrypoint_calls.append(1)
+        return True
+
+    with caplog.at_level('WARNING', logger='legibility.nightly'):
+        line, fire = nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            entrypoint_exists=_recording_entrypoint_exists,
+            launcher=lambda: launcher_calls.append(1),
+        )
+
+    assert fire is False
+    # A downstream reader of NightlyResult.census_line must still see a
+    # well-formed decision line -- the one case an operator most needs to read
+    # is the worst possible place to emit a novel shape.
+    assert 'NO-FIRE' in line
+    assert line.startswith('census trigger: ')
+    assert 'trigger evaluation failed' in line
+    assert 'TypeError' in line
+
+    assert launcher_calls == [], 'a failed evaluation must never launch a census'
+    assert entrypoint_calls == [], 'the failure path must return before the launcher block'
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert 'TypeError' in warnings[0].getMessage()
+
+
+def test_evaluate_census_step_bounds_a_huge_decide_failure(tmp_path, caplog):
+    """task 4085 (amendment): the fail-safe path must keep the module's
+    one-line guarantee. `decide` is an injected seam and an escaping
+    exception's message is arbitrary -- a StatusFetchUnavailable chained from
+    a big get_statuses payload, a multi-line YAML error -- yet BOTH sinks here
+    are single-line: the WARNING is one nightly journal line and `census_line`
+    is a one-line field on NightlyResult. Dumping a whole payload into either
+    is the opposite of the legible failure this trigger exists for."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        raise RuntimeError('boom ' + 'x' * 50_000 + '\nsecond line')
+
+    with caplog.at_level('WARNING', logger='legibility.nightly'):
+        line, fire = nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            entrypoint_exists=lambda: True, launcher=lambda: None,
+        )
+
+    assert fire is False
+    # Bounded, still well-formed, and still names the fault.
+    assert len(line) < 1000
+    assert line.startswith('census trigger: NO-FIRE -- trigger evaluation failed')
+    assert 'RuntimeError' in line
+    assert 'repr truncated' in line
+    # One line means one line: the repr escapes the embedded newline.
+    assert '\n' not in line
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert len(message) < 1000
+    assert '\n' not in message
 
 
 def test_default_census_launcher_logs_loud_on_nonzero_exit(monkeypatch, caplog):
@@ -1059,7 +1143,7 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
         session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
     )
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     before_log = subprocess.run(
@@ -1166,7 +1250,7 @@ def test_run_nightly_logs_the_sampler_summary_on_a_healthy_night(tmp_path, caplo
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: None,
@@ -1201,7 +1285,7 @@ def test_run_nightly_logs_the_sampler_summary_when_there_are_no_sessions(tmp_pat
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: None,
@@ -1277,7 +1361,7 @@ def test_run_nightly_reports_a_totally_budget_suppressed_night(tmp_path, caplog)
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: escalation_calls.append((url, envelope)),
@@ -1358,7 +1442,7 @@ def test_run_nightly_quiet_night_is_not_reported_as_suppressed(tmp_path, caplog)
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, envelope: escalation_calls.append((url, envelope)),
@@ -1406,7 +1490,7 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     # A single selected session whose invoke fails to parse -> 1/1 failed ->
@@ -1470,7 +1554,7 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     # A valid matching invoke -> the merge/dump genuinely happens; only the
@@ -1511,6 +1595,384 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# task-4144: run_nightly -- one deletion-directive record must not kill the
+# whole night's merge. This is the LIVE trickle path (nothing invokes
+# `codebook.py apply` outside its own tests), and it is worse than the CLI:
+# run_nightly has no enclosing try/except and main() calls it bare, so a
+# NeverDeleteError surfaces as an uncaught traceback -- no NightlyResult, no
+# escalation, dump/commit never reached.
+# ---------------------------------------------------------------------------
+
+def _fake_invoke_deletion_directive(prompt: str, model: str) -> str:
+    """Reachable in production: coder.py rebuilds the record from a fixed key
+    allowlist (stripping a top-level delete/remove/retract/drop key) but
+    copies `matches` VERBATIM, and _MATCH_SCHEMA only requires `entry_id` --
+    so a match-level `action: delete` passes validate_coding_record and lands
+    in run.records."""
+    return json.dumps({
+        'matches': [{
+            'entry_id': 'known-cause',
+            'origin_phase': 'implement',
+            'manifested_phase': 'implement',
+            'action': 'delete',
+        }],
+        'candidates': [],
+    })
+
+
+def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path):
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    before_bytes = codebook_path.read_bytes()
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
+    escalation_calls = []
+
+    # Load-bearing: this RETURNS today only once the merge loop is guarded --
+    # an unguarded NeverDeleteError escapes run_nightly entirely.
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_deletion_directive,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result.exit_code == 0
+    assert result.applied == 0
+    assert result.coder_status == 'ok'
+
+    assert len(escalation_calls) == 1
+    _url, envelope = escalation_calls[0]
+    assert 'deletion directive' in envelope['params']['arguments']['summary'].lower()
+
+    # Nothing applied -> the existing no-change-night path holds.
+    assert codebook_path.read_bytes() == before_bytes
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log == before_log
+    assert result.reason is not None
+    assert 'deletion directive' in result.reason.lower()
+
+
+def test_run_nightly_deletion_directive_does_not_cost_the_rest_of_the_batch(tmp_path):
+    """The headline claim the single-session test above CANNOT make.
+
+    That test seeds one session, so every record in the batch is the
+    deletion-shaped one: turning the merge loop's `continue` into a `break`
+    (or an early `return result`) leaves all of its assertions green. This
+    one seeds TWO sessions and hands the deletion-shaped judgment to the
+    FIRST digest coded -- so a `break` would discard the good record that
+    follows it, and the committed-codebook assertions below go red."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_dir = projects_root / _encode_cwd(work_cwd)
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_dir / 'session-1.jsonl', cwd=work_cwd,
+        timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+    # A DIFFERENT first user turn: sampling.dedupe_shapes fingerprints on
+    # (stratum, signal-shape, normalized first turn), so two byte-similar
+    # transcripts would collapse into one and this would silently become the
+    # single-record test again.
+    _write_transcript(
+        session_dir / 'session-2.jsonl', cwd=work_cwd,
+        timestamp='2026-07-13T11:00:00Z', session_id='session-2',
+        user_text='an entirely different request that also went sideways',
+    )
+
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    # Order-independent: the FIRST digest coded gets the deletion directive,
+    # whichever session the sampler ranked first, so the good record always
+    # sits AFTER the skipped one in run.records.
+    invocations = []
+
+    def _fake_invoke_deletion_then_match(prompt: str, model: str) -> str:
+        invocations.append(prompt)
+        if len(invocations) == 1:
+            return _fake_invoke_deletion_directive(prompt, model)
+        return _fake_invoke_known_cause(prompt, model)
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
+    escalation_calls = []
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_deletion_then_match,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert len(invocations) == 2, 'both sessions must reach the coder'
+    assert result.exit_code == 0
+    assert result.coder_status == 'ok'
+    # The GOOD record still landed: skipped-and-counted, never batch-fatal.
+    assert result.applied == 1
+    assert result.commit_made is True
+
+    committed = codebook.load(codebook_path)
+    entry = next(e for e in committed['entries'] if e['id'] == 'known-cause')
+    assert len(entry['sightings']) == 1
+    sighted = entry['sightings'][0]['session']
+    assert sighted in {'session-1', 'session-2'}
+
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert len(after_log) == len(before_log) + 1
+
+    # ...and the BAD one was still surfaced, naming the OTHER session.
+    assert len(escalation_calls) == 1
+    _url, envelope = escalation_calls[0]
+    arguments = envelope['params']['arguments']
+    assert 'deletion directive' in arguments['summary'].lower()
+    assert f'session={sighted}' not in arguments['detail']
+    assert result.reason is not None
+    assert 'deletion directive' in result.reason.lower()
+
+
+def test_run_nightly_aggregates_deletion_directive_escalations(tmp_path):
+    """A SYSTEMIC cause -- a coder prompt regression, a model that starts
+    emitting `action: delete` for every digest -- makes every record in the
+    night deletion-shaped. That must post ONE escalation naming every
+    skipped session, the shape the extractor-crash and coder-storm triggers
+    already use, not one POST per record."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_dir = projects_root / _encode_cwd(work_cwd)
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_dir / 'session-1.jsonl', cwd=work_cwd,
+        timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+    _write_transcript(
+        session_dir / 'session-2.jsonl', cwd=work_cwd,
+        timestamp='2026-07-13T11:00:00Z', session_id='session-2',
+        user_text='an entirely different request that also went sideways',
+    )
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
+    escalation_calls = []
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_deletion_directive,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result.exit_code == 0
+    assert result.applied == 0
+    assert result.commit_made is False
+    assert result.escalated is True
+
+    assert len(escalation_calls) == 1, 'one aggregated POST, never one per record'
+    _url, envelope = escalation_calls[0]
+    arguments = envelope['params']['arguments']
+    assert '2 coding record(s)' in arguments['summary']
+    assert 'deletion directive' in arguments['summary'].lower()
+    # Both skipped sessions are named, so the aggregate loses no detail.
+    assert 'session=session-1' in arguments['detail']
+    assert 'session=session-2' in arguments['detail']
+    assert result.reason == arguments['summary']
+
+
+def test_run_nightly_records_a_reason_when_the_escalation_post_fails(tmp_path):
+    """With the escalation server down, `post_escalation` returns False --
+    so `escalated` is False and `exit_code` is 0, leaving the returned
+    result structurally identical to a clean night. `reason` is what keeps
+    a never-delete contract violation from surviving as nothing but a
+    WARNING line in the journal."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    def _dead_poster(url, envelope):
+        raise OSError('connection refused')
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        invoke=_fake_invoke_deletion_directive,
+        status_fetcher=None,
+        poster=_dead_poster,
+    )
+
+    assert result.exit_code == 0
+    assert result.escalated is False  # the POST genuinely failed
+    assert result.reason is not None  # ...but the night is still not unremarkable
+    assert '1 coding record(s)' in result.reason
+    assert 'deletion directive' in result.reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# step-9/10: a conflict-only night must PERSIST its recurrence sighting.
+# apply_coding_record's adjudicated-title branch appends the sighting but
+# bumps neither `matched` nor `candidates_applied` -- so a night whose ONLY
+# merge effect is a conflict append would end with applied == 0, skip the
+# `if applied > 0` dump gate, and drop the mutated codebook on the floor.
+# ---------------------------------------------------------------------------
+
+def _fake_invoke_rejected_candidate(prompt: str, model: str) -> str:
+    """Mine a candidate whose title is ALREADY adjudicated in the codebook.
+
+    `matches` is deliberately empty: a single match would bump
+    stats['matched'], push `applied` above 0 for an unrelated reason and mask
+    the defect entirely. coder.py copies `candidates` verbatim from the parsed
+    judgment and _CANDIDATE_RECORD_SCHEMA requires only `title`, so this
+    record passes validate_coding_record and reaches the merger on the live
+    path."""
+    return json.dumps({
+        'matches': [],
+        'candidates': [{
+            'title': 'recurring rejected cause',
+            'cause': 'c',
+            'area': 'a',
+            'origin_phase': 'implement',
+            'manifested_phase': 'implement',
+        }],
+    })
+
+
+def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    # Seed an already-REJECTED candidate and commit it, so the tree is clean
+    # before the run (otherwise _git_status_changed would report true for an
+    # unrelated reason and the commit assertion would pass vacuously). The
+    # seeded sighting carries session 'session-old' -- NOT 'session-1' -- so
+    # apply_coding_record's `already_seen` guard does not short-circuit the
+    # conflict branch, and the later "sightings grew 1 -> 2" assertion
+    # unambiguously proves an APPEND rather than a create.
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    cb = codebook.load(codebook_path)
+    cb['candidates'].append({
+        'id': 'cand-20260722-28',
+        'title': 'recurring rejected cause',
+        'first_seen': '2026-07-22',
+        'disposition': 'rejected',
+        'sightings': [{
+            'date': '2026-07-22',
+            'project': 'testproj',
+            'session': 'session-old',
+            'origin_phase': 'implement',
+            'manifested_phase': 'implement',
+        }],
+    })
+    codebook.dump(cb, codebook_path)
+    subprocess.run(['git', 'add', '-A'], cwd=repo, check=True)
+    subprocess.run(
+        ['git', 'commit', '-q', '-m', 'seed rejected candidate'], cwd=repo, check=True,
+    )
+
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
+    escalation_calls = []
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_rejected_candidate,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result.exit_code == 0
+    assert result.commit_made is True
+    assert result.applied == 1
+    assert result.coder_status == 'ok'
+
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert len(after_log) == len(before_log) + 1
+
+    # The recurrence sighting survived to the COMMITTED file.
+    committed = codebook.load(codebook_path)
+    assert len(committed['candidates']) == 1
+    candidate = committed['candidates'][0]
+    assert candidate['id'] == 'cand-20260722-28'
+    assert candidate['disposition'] == 'rejected'
+    assert len(candidate['sightings']) == 2
+    assert candidate['sightings'][1]['session'] == 'session-1'
+    assert candidate['sightings'][1]['date'] == '2026-07-13'
+
+    # Idempotency: the widened dump gate must not re-commit the same sighting.
+    result_2 = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_rejected_candidate,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result_2.exit_code == 0
+    assert result_2.commit_made is False
+    assert result_2.applied == 0
+
+    after_log_2 = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log_2 == after_log
+
+    committed_2 = codebook.load(codebook_path)
+    assert len(committed_2['candidates'][0]['sightings']) == 2
+
+
+# ---------------------------------------------------------------------------
 # step-21/22: run_nightly -- no-change night commits nothing (§6.7)
 # ---------------------------------------------------------------------------
 
@@ -1535,7 +1997,7 @@ def test_run_nightly_no_change_night_commits_nothing(tmp_path, caplog):
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     # A valid-but-empty judgment ("coded fine, found nothing") -- a genuine
@@ -1611,7 +2073,7 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
         coder_calls.append(prompt)
         return 'not valid json'
 
-    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
 
     result = nightly.run_nightly(
@@ -1956,11 +2418,14 @@ class TestRunNightlyRecordsTrickleState:
         else:
             projects_root.mkdir(parents=True, exist_ok=True)
 
-        kwargs = dict(
+        # Annotated: a heterogeneous dict (Paths, a date, a datetime, injected
+        # callables, None) whose inferred value union would otherwise be
+        # re-reported once per union member at the run_nightly(**kwargs) call.
+        kwargs: dict[str, Any] = dict(
             config_path=config_path,
             projects_root=projects_root,
             target_date=date(2026, 7, 13),
-            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=invoke,
             status_fetcher=None,
             poster=poster if poster is not None else (lambda url, envelope: None),
@@ -2166,7 +2631,7 @@ class _NightRunner:
             config_path=self.config_path,
             projects_root=self.projects_root,
             target_date=target,
-            now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
             status_fetcher=None,
             poster=lambda url, env: self.escalations.append((url, env)),
@@ -2425,3 +2890,139 @@ def test_report_sample_outcome_partial_truncation_stays_at_info(tmp_path, caplog
     assert escalated is False
     assert posted == []
     assert _nightly_warnings(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# task 3644: the trickle's fail-loud escalation must survive a STATEFUL server
+# ---------------------------------------------------------------------------
+#
+# `_default_poster` bare-POSTed `tools/call`, which the escalation server
+# (:8103) rejects at the transport layer before the tool ever runs, with
+# `400 Bad Request` / "Missing session ID" (captured live 2026-08-05).
+# `post_escalation` swallows that best-effort and returns False, so EVERY
+# trickle fail-loud escalation -- extractor crash, coder storm, commit
+# failure -- was silently dropped. Identical root cause and identical fix as
+# census.py's poster; the transport lives single-sourced in census_trigger.
+
+
+class _FakeStatefulResponse:
+    """An `httpx.Response` stand-in for the stateful-server handshake."""
+
+    def __init__(self, *, status_code=200, headers=None, payload=None, text=''):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+        self._payload = payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            # A plain RuntimeError, not httpx.HTTPStatusError: the shared
+            # install_fake_httpx stub exposes only `post` and pytest.fails on
+            # any other attribute (task 3376).
+            raise RuntimeError(f'HTTP {self.status_code}')
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError('response has no JSON body')
+        return self._payload
+
+
+def _stateful_escalation_post(recorded, *, session_id='sid-nightly'):
+    """A fake `httpx.post` behaving like the STATEFUL escalation server:
+    session-less `tools/call` -> 400; `initialize` -> 200 + the assigned id
+    as a response header; `notifications/initialized` -> 202; `tools/call`
+    WITH that header -> 200."""
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get('json') or {}
+        method = envelope.get('method')
+        if method == 'initialize':
+            return _FakeStatefulResponse(
+                headers={'mcp-session-id': session_id,
+                         'content-type': 'application/json'},
+                payload={'jsonrpc': '2.0', 'id': 1, 'result': {}},
+            )
+        if method == 'notifications/initialized':
+            return _FakeStatefulResponse(status_code=202)
+        if (kwargs.get('headers') or {}).get('mcp-session-id') != session_id:
+            return _FakeStatefulResponse(
+                status_code=400,
+                headers={'content-type': 'application/json'},
+                payload={'jsonrpc': '2.0', 'id': 'server-error',
+                         'error': {'code': -32600,
+                                   'message': 'Bad Request: Missing session ID'}},
+            )
+        return _FakeStatefulResponse(
+            headers={'content-type': 'application/json'},
+            payload={'jsonrpc': '2.0', 'id': 1,
+                     'result': {'structuredContent': {'id': 'esc-9', 'status': 'queued'}}},
+        )
+
+    return _post
+
+
+def _recording_delete(deleted):
+    """A fake `httpx.delete` recording the MCP session-termination call the
+    transport makes after a handshake, so the long-lived escalation server does
+    not leak a session per trickle escalation."""
+    def _delete(url, **kwargs):
+        deleted.append((url, kwargs))
+        return _FakeStatefulResponse(status_code=200)
+
+    return _delete
+
+
+def test_post_escalation_lands_against_a_stateful_server(tmp_path, install_fake_httpx):
+    """The DEFAULT poster (no `poster=` injection) must handshake and land."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+    recorded = []
+    deleted = []
+    install_fake_httpx(
+        _stateful_escalation_post(recorded), delete=_recording_delete(deleted),
+    )
+
+    assert nightly.post_escalation(cfg, 'summary text', 'detail text') is True
+
+    methods = [(kwargs.get('json') or {}).get('method') for _url, kwargs in recorded]
+    assert methods == [
+        'tools/call', 'initialize', 'notifications/initialized', 'tools/call',
+    ]
+    # The retried call carries the server-assigned session id...
+    assert (recorded[-1][1].get('headers') or {}).get('mcp-session-id') == 'sid-nightly'
+    # ...and is still the escalate_info the trickle meant to file.
+    params = (recorded[-1][1].get('json') or {})['params']
+    assert params['name'] == 'escalate_info'
+    assert params['arguments']['summary'] == 'summary text'
+    # ...and the session opened to file it is released again.
+    assert [(kw.get('headers') or {}).get('mcp-session-id') for _u, kw in deleted] == [
+        'sid-nightly'
+    ]
+
+
+def test_post_escalation_reports_false_on_a_tool_error_envelope(
+    tmp_path, install_fake_httpx, caplog
+):
+    """HTTP 200 is not success. `post_escalation` discards the response body
+    and reports True on "no exception", so a tool-level failure
+    (`result.isError: true`) would otherwise read as a landed escalation --
+    the same green-on-paper/nothing-filed failure task 3644 exists to close,
+    one layer up from the transport."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def _post(url, **kwargs):
+        return _FakeStatefulResponse(
+            headers={'content-type': 'application/json'},
+            payload={'jsonrpc': '2.0', 'id': 1, 'result': {
+                'isError': True,
+                'content': [{'type': 'text', 'text': "unknown category 'nope'"}],
+            }},
+        )
+
+    install_fake_httpx(_post)
+
+    with caplog.at_level(logging.WARNING):
+        assert nightly.post_escalation(cfg, 'summary text', 'detail text') is False
+
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any('escalation post failed' in m for m in warned), warned
+    assert any('isError' in m or 'reported an error' in m for m in warned), warned

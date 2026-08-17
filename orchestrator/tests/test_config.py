@@ -2024,6 +2024,136 @@ class TestStarvationWatchdogConfig:
         )
 
 
+class TestParkBackfillConfig:
+    """The four EASY-backfill admission knobs (task 3823 / PRD task η, C7).
+
+    Follows the ``TestStarvationWatchdogConfig`` template above — defaults /
+    full YAML override / partial override / bound rejection / reload tier —
+    but asserts on FLAT ``OrchestratorConfig`` attributes, because the four
+    knobs mirror the adjacent ``park_stop_*`` block rather than nesting in a
+    submodel.
+
+    Attribute access (not a source grep) is what pins the three MANDATED
+    literal names the capability manifest greps out of ``config.py``
+    (``backfill_safety_factor`` / ``backfill_min_samples`` /
+    ``backfill_max_park_age_secs``): a rename breaks these tests loudly
+    instead of silently breaking the admission gate.
+    """
+
+    def test_defaults(self):
+        """Bare OrchestratorConfig() exposes the four backfill leaves.
+
+        2.5 is bracketed by the two MEASURED 80%-coverage multipliers —
+        ×2.9 (dark-factory) and ×2.0 (reify) — at
+        plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:126.
+        """
+        cfg = OrchestratorConfig()
+        assert cfg.backfill_enabled is True, (
+            f'Expected backfill_enabled=True; got {cfg.backfill_enabled!r}'
+        )
+        assert cfg.backfill_safety_factor == 2.5, (
+            f'Expected backfill_safety_factor=2.5; got {cfg.backfill_safety_factor!r}'
+        )
+        assert cfg.backfill_min_samples == 3, (
+            f'Expected backfill_min_samples=3; got {cfg.backfill_min_samples!r}'
+        )
+        assert cfg.backfill_max_park_age_secs == 3600.0, (
+            f'Expected backfill_max_park_age_secs=3600.0; '
+            f'got {cfg.backfill_max_park_age_secs!r}'
+        )
+
+    def test_full_yaml_override(self, tmp_path: Path, monkeypatch):
+        """A project config overriding all four leaves is fully adopted."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({
+            'backfill_enabled': False,
+            'backfill_safety_factor': 2.9,
+            'backfill_min_samples': 5,
+            'backfill_max_park_age_secs': 900.0,
+        }))
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        cfg = load_config(project_cfg)
+
+        assert cfg.backfill_enabled is False, (
+            f'Expected backfill_enabled=False; got {cfg.backfill_enabled!r}'
+        )
+        assert cfg.backfill_safety_factor == 2.9, (
+            f'Expected backfill_safety_factor=2.9; got {cfg.backfill_safety_factor!r}'
+        )
+        assert cfg.backfill_min_samples == 5, (
+            f'Expected backfill_min_samples=5; got {cfg.backfill_min_samples!r}'
+        )
+        assert cfg.backfill_max_park_age_secs == 900.0, (
+            f'Expected backfill_max_park_age_secs=900.0; '
+            f'got {cfg.backfill_max_park_age_secs!r}'
+        )
+
+    def test_partial_override_merges_with_defaults(self, tmp_path: Path, monkeypatch):
+        """Overriding only backfill_enabled leaves the other three at defaults."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({'backfill_enabled': False}))
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        cfg = load_config(project_cfg)
+
+        assert cfg.backfill_enabled is False, (
+            f'Expected backfill_enabled=False; got {cfg.backfill_enabled!r}'
+        )
+        assert cfg.backfill_safety_factor == 2.5, (
+            f'Expected backfill_safety_factor=2.5 (default preserved); '
+            f'got {cfg.backfill_safety_factor!r}'
+        )
+        assert cfg.backfill_min_samples == 3, (
+            f'Expected backfill_min_samples=3 (default preserved); '
+            f'got {cfg.backfill_min_samples!r}'
+        )
+        assert cfg.backfill_max_park_age_secs == 3600.0, (
+            f'Expected backfill_max_park_age_secs=3600.0 (default preserved); '
+            f'got {cfg.backfill_max_park_age_secs!r}'
+        )
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_safety_factor_rejects_non_positive(self, bad):
+        """backfill_safety_factor is gt=0 — a zero factor admits everything."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(backfill_safety_factor=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_min_samples_rejects_below_one(self, bad):
+        """backfill_min_samples is ge=1 — the bound IS the contract.
+
+        A floor of 0 would let an EMPTY hold history certify a backfill,
+        which C7 forbids by name ("An empty history must refuse, not
+        admit — a predicate that accepts the empty case certifies
+        structure, not capability").
+        """
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(backfill_min_samples=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_max_park_age_secs_rejects_non_positive(self, bad):
+        """backfill_max_park_age_secs is gt=0 — a zero cutoff refuses every park."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(backfill_max_park_age_secs=bad)
+
+    @pytest.mark.parametrize('leaf', [
+        'backfill_enabled',
+        'backfill_safety_factor',
+        'backfill_min_samples',
+        'backfill_max_park_age_secs',
+    ])
+    def test_backfill_leaves_are_green_tier_reloadable(self, leaf):
+        """All four leaves are hot-reloadable (green tier).
+
+        PRD Open Q3 ships 2.5 and lets production overstay data settle
+        2.5-vs-2.9, which is only actionable if the factor is retunable
+        without a restart.
+        """
+        assert leaf in RELOADABLE_FIELDS, (
+            f"'{leaf}' must be in RELOADABLE_FIELDS (green-tier hot-reloadable, "
+            'alongside fairness.skip_threshold in the scheduler-tuning slice)'
+        )
+
+
 class TestVerifyInfraRetryConfig:
     """Tests for verify_infra_retry_* config fields (step-5)."""
 
@@ -3040,7 +3170,7 @@ class TestSessionResumeConfig:
     SessionResumeConfig mirrors DeliveredChecksConfig's shape (an `enabled`
     kill-switch plus ge-bounded int knobs), is exposed on OrchestratorConfig
     under the literal field name `session_resume` (delivered-check contract),
-    and all four leaves are green-tier hot-reloadable via the
+    and all five leaves are green-tier hot-reloadable via the
     `_submodel_leaf_paths('session_resume', SessionResumeConfig)` whole-submodel
     group in RELOADABLE_FIELDS.
     """
@@ -3054,6 +3184,19 @@ class TestSessionResumeConfig:
         assert cfg.freshness_window_secs == 86400
         assert cfg.max_resumes_per_task == 3
         assert cfg.fallback_storm_threshold == 5
+        # task 3256: the storm streak is a rolling window, not a cumulative
+        # per-boot counter. 3600s is read off the measured signature — bursts
+        # are ~17 fallbacks inside one hour, quiet gaps are ~7h and ~39h.
+        assert cfg.storm_window_secs == 3600
+
+    def test_storm_window_secs_ge_1_rejects_zero(self):
+        """storm_window_secs < 1 must raise ValidationError (ge=1 bound)."""
+        from orchestrator.config import SessionResumeConfig
+
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(storm_window_secs=0)
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(storm_window_secs=-1)
 
     def test_freshness_window_secs_ge_1_rejects_zero(self):
         """freshness_window_secs < 1 must raise ValidationError (ge=1 bound)."""
@@ -3094,14 +3237,20 @@ class TestSessionResumeConfig:
         assert config.session_resume.enabled is True
 
     def test_leaves_in_reloadable_fields(self):
-        """All four session_resume leaves are green-tier hot-reloadable
+        """All five session_resume leaves are green-tier hot-reloadable
         (membership assertions, robust to future growth of RELOADABLE_FIELDS).
+
+        `storm_window_secs` (task 3256) needed no RELOADABLE_FIELDS edit —
+        `_submodel_leaf_paths` enumerates `model_fields` dynamically, which is
+        exactly the property its docstring advertises. This assertion is what
+        pins that the property actually held.
         """
         for leaf in (
             'session_resume.enabled',
             'session_resume.freshness_window_secs',
             'session_resume.max_resumes_per_task',
             'session_resume.fallback_storm_threshold',
+            'session_resume.storm_window_secs',
         ):
             assert leaf in RELOADABLE_FIELDS, (
                 f'{leaf} must be a member of RELOADABLE_FIELDS '

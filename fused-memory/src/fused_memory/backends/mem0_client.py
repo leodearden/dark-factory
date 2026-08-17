@@ -6,10 +6,30 @@ from typing import Any
 
 from mem0 import AsyncMemory
 
+from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
 
 logger = logging.getLogger(__name__)
+
+# The canonical Qdrant payload key for a memory's text, with the historical
+# fallbacks. Mirrors memory_service._MEM0_CONTENT_KEYS and
+# scripts/clear_malformed_empty_memory._CONTENT_KEYS so "what counts as a
+# memory's content" is judged identically everywhere.
+_MEM0_TEXT_KEY = 'data'
+_MEM0_TEXT_KEYS = (_MEM0_TEXT_KEY, 'memory', 'content')
+
+# How much of a matching record's text to echo back in a scan hit.
+_EXCERPT_LEN = 240
+
+
+def _extract_payload_text(payload: dict[str, Any]) -> str | None:
+    """Return a Qdrant payload's memory text, in canonical key order."""
+    for key in _MEM0_TEXT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +111,13 @@ def split_managed_metadata(
     return managed, custom
 
 
+# mem0's own default embedding dimensionality, shared by its Qdrant vector
+# store (mem0/configs/vector_stores/qdrant.py) and its OpenAI embedder
+# (mem0/embeddings/openai.py). Emitting the embedder key at this value would
+# be a behaviour CHANGE, not a no-op — see _build_config_dict.
+_MEM0_DEFAULT_EMBEDDING_DIMS = 1536
+
+
 class Mem0Backend:
     """Lazily creates AsyncMemory instances keyed by project_id."""
 
@@ -111,12 +138,39 @@ class Mem0Backend:
                 'config': {
                     'url': cfg.mem0.qdrant_url,
                     'collection_name': collection_name,
+                    # Note the deliberate asymmetry with the embedder's
+                    # 'embedding_dims' below: DIFFERENT key name, different
+                    # upstream semantics, different emission rule. This one
+                    # controls the dimensionality Qdrant CREATES the collection
+                    # with, and mem0's own default is already 1536
+                    # (mem0/configs/vector_stores/qdrant.py), so emitting it
+                    # unconditionally is a no-op at the shipped config.
+                    #
+                    # OPERATOR HAZARD at a NON-1536 embedder.dimensions on an
+                    # EXISTING deployment: neither key was plumbed before, so
+                    # such a config was inert — mem0 created the collection at
+                    # its own 1536 default and requested 1536-wide vectors.
+                    # Both now follow the config, but mem0's
+                    # QdrantDB.create_col short-circuits when the collection
+                    # already exists ('Collection ... already exists. Skipping
+                    # creation.'), leaving a 1536-wide collection that every
+                    # N-wide upsert then fails against at runtime. Changing
+                    # embedder.dimensions requires recreating and re-embedding
+                    # the Qdrant collection; it is not a live-migratable knob.
+                    'embedding_model_dims': cfg.embedder.dimensions,
                 },
             },
         }
 
         # LLM
         if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
+            # See the openai_base_url comment below: config now wins over the
+            # ambient env fallback, which is an egress change for a gateway
+            # deployment that set only OPENAI_BASE_URL. Report it, don't
+            # redirect silently.
+            warn_if_ambient_base_url_is_overridden(
+                cfg.llm.providers.openai.api_url, context='mem0 LLM',
+            )
             config_dict['llm'] = {
                 'provider': 'openai',
                 'config': {
@@ -124,6 +178,15 @@ class Mem0Backend:
                     'temperature': cfg.llm.temperature or 0.1,
                     'max_tokens': cfg.llm.max_tokens,
                     'api_key': cfg.llm.providers.openai.api_key,
+                    # Make config authoritative over the ambient
+                    # OPENAI_BASE_URL / OPENAI_API_BASE env fallback that
+                    # mem0/llms/openai.py would otherwise apply. The default
+                    # resolves to https://api.openai.com/v1, so this is
+                    # byte-identical for anyone not setting those vars.
+                    # OpenAIConfig-only — do NOT add it to the anthropic
+                    # branch below, which would TypeError out of mem0's
+                    # factory.
+                    'openai_base_url': cfg.llm.providers.openai.api_url,
                 },
             }
         elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
@@ -139,12 +202,29 @@ class Mem0Backend:
 
         # Embedder
         if cfg.embedder.provider == 'openai' and cfg.embedder.providers.openai:
+            warn_if_ambient_base_url_is_overridden(
+                cfg.embedder.providers.openai.api_url, context='mem0 embedder',
+            )
+            embedder_config: dict[str, Any] = {
+                'model': cfg.embedder.model,
+                'api_key': cfg.embedder.providers.openai.api_key,
+                # Read from the EMBEDDER provider block, not the llm one, so
+                # the two endpoints stay independent.
+                'openai_base_url': cfg.embedder.providers.openai.api_url,
+            }
+            # Emitted ONLY at a non-default dimensionality. This guard is
+            # mandatory, not stylistic: mem0/embeddings/openai.py does
+            #     self._pass_dimensions_to_api = self.config.embedding_dims is not None
+            # so emitting the key at all — even as 1536 — would start sending a
+            # `dimensions` field on EVERY embeddings request under the shipped
+            # config, which is not byte-identical. Do not "simplify" this away.
+            # (Note the key name: the embedder takes `embedding_dims`;
+            # `embedding_model_dims` is the vector store's, set above.)
+            if cfg.embedder.dimensions != _MEM0_DEFAULT_EMBEDDING_DIMS:
+                embedder_config['embedding_dims'] = cfg.embedder.dimensions
             config_dict['embedder'] = {
                 'provider': 'openai',
-                'config': {
-                    'model': cfg.embedder.model,
-                    'api_key': cfg.embedder.providers.openai.api_key,
-                },
+                'config': embedder_config,
             }
 
         return config_dict
@@ -614,6 +694,180 @@ class Mem0Backend:
             )
 
         return result
+
+    async def scan_payload_text(
+        self,
+        scope: Scope,
+        needles: list[str] | None = None,
+        *,
+        filters: dict[str, Any] | None = None,
+        exhaustive: bool = False,
+        page_size: int = 256,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Literal substring scan over Qdrant payload TEXT for leaked tool-call XML.
+
+        (a) THIS IS NOT SEMANTIC SEARCH AND NOT METADATA EQUALITY. It is the
+        gap that made the corpus unsweepable: :meth:`search` ranks by
+        embedding similarity, and a leaked serialized tool-call fragment
+        carries almost no semantic signal, so it is unfindable that way (a
+        live 2026-07-26 probe returned zero). :meth:`count_by_metadata` /
+        :meth:`scroll_by_metadata` match payload KEYS by equality, which
+        cannot see inside the memory text at all. This method walks the
+        records and applies the shared detector to their content.
+
+        (b) PREFILTER. Unless *exhaustive*, one
+        ``FieldCondition(key='data', match=MatchText(text=needle))`` per
+        needle is OR-combined via ``Filter(should=[...])`` and pushed to
+        Qdrant. On an UN-INDEXED payload field, ``MatchText`` performs a
+        literal, case-sensitive, order-preserving SUBSTRING match — measured
+        on qdrant 1.17.1 over 19,321 points at ~70-90 ms for an exact count.
+
+        (c) THE PREFILTER IS AN OPTIMISATION ONLY. Every returned record is
+        RE-VERIFIED with :func:`find_toolcall_xml_leak`, which is the
+        authoritative verdict. This matters because those are un-indexed-field
+        FALLBACK semantics: creating a text payload index on ``data`` would
+        SILENTLY flip ``MatchText`` to tokenized word-matching. That failure is
+        safe here rather than merely unlikely — tokenized matching is strictly
+        MORE permissive for these needles (a record containing a literal
+        serialized opening tag necessarily contains its constituent word
+        tokens), so the prefilter remains a superset and the Python detector
+        still yields the exact answer. Only speed degrades, never correctness.
+        ``tests/test_mem0_client.py::TestMem0BackendScanPayloadTextIntegration``
+        is the tripwire that fails loudly if those semantics ever change.
+
+        (d) ``exhaustive=True`` skips the prefilter entirely and walks the
+        whole collection. Use it when the answer must not depend on prefilter
+        semantics at all — notably when establishing the TRUE incidence rate,
+        so that claim rests on nothing but the shared detector.
+
+        Both modes PAGINATE, looping on the ``next_page_offset`` that
+        :meth:`scroll_by_metadata` discards. That method's single-shot
+        ``limit=1000`` cap is deliberately not reused: a silently-capped scan
+        would report a plausible-looking undercount, which is the same
+        silent-wrong-value class this scan exists to measure.
+
+        Args:
+            scope: Project/agent/session scope (selects the collection).
+            needles: Literal substrings for the prefilter. ``None`` or empty
+                defaults to
+                :data:`~fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES`
+                — never to "no needles", which would scan for nothing and
+                report a clean corpus. Ignored when *exhaustive*.
+            filters: Optional key→value payload equality filters, AND-ed in
+                via ``must`` exactly as :meth:`count_by_metadata` builds them,
+                to narrow the scan (e.g. ``{'category': ...}``). Applies in
+                both modes.
+            exhaustive: Skip the prefilter and walk every point.
+            page_size: Points per scroll request.
+            limit: Maximum number of points to WALK. Must be strictly positive
+                when given. When the walk stops early, ``truncated`` is True
+                and a WARNING is logged — the truncation is never silent.
+
+        Raises:
+            ValueError: If *limit* is non-positive. A ``limit`` of 0 would make
+                every scroll page request 0 points, so the walk would return
+                ``{'matches': [], 'scanned': 0, 'truncated': False}`` — a
+                result INDISTINGUISHABLE from a genuinely clean corpus, and one
+                that a caller's exit-code predicate reads as a complete,
+                successful sweep. Rejecting it is the same no-silent-wrong-value
+                rule that makes a scan timeout propagate rather than collapse
+                into an empty list.
+
+        Returns:
+            ``{'matches': [...], 'scanned': int, 'truncated': bool}`` where
+            each match is ``{'id', 'created_at', 'matched_fragments',
+            'excerpt', 'metadata'}``. ``scanned`` counts every point walked,
+            including non-matching ones, so it is a correct denominator for an
+            incidence rate.
+
+        Raises:
+            TimeoutError: If any scroll page exceeds the read timeout —
+                PROPAGATED (never swallowed into an empty result), matching
+                count_by_metadata/scroll_by_metadata/get_point_by_id. A
+                timed-out scan must never be mistaken for a clean corpus.
+        """
+        if limit is not None and limit <= 0:
+            raise ValueError(
+                f'scan_payload_text limit must be strictly positive, got {limit}; a '
+                'non-positive limit walks zero points and would report an empty '
+                'result as a clean corpus'
+            )
+
+        from qdrant_client.http import models as qmodels  # noqa: PLC0415
+
+        from fused_memory.utils.toolcall_xml_leak import (  # noqa: PLC0415
+            PREFILTER_NEEDLES,
+            find_toolcall_xml_leak,
+        )
+
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+
+        must: list[qmodels.Condition] = [
+            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
+            for k, v in (filters or {}).items()
+        ]
+        should: list[qmodels.Condition] = []
+        if not exhaustive:
+            should = [
+                qmodels.FieldCondition(key=_MEM0_TEXT_KEY, match=qmodels.MatchText(text=needle))
+                for needle in (needles or PREFILTER_NEEDLES)
+            ]
+        scroll_filter = qmodels.Filter(must=must, should=should) if (must or should) else None
+
+        matches: list[dict[str, Any]] = []
+        scanned = 0
+        truncated = False
+        offset: Any = None
+        while True:
+            page_limit = page_size
+            if limit is not None:
+                page_limit = min(page_size, limit - scanned)
+            points, next_offset = await asyncio.wait_for(
+                client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=scroll_filter,
+                    with_payload=True,
+                    with_vectors=False,
+                    limit=page_limit,
+                    offset=offset,
+                ),
+                timeout=self._read_timeout,
+            )
+
+            for point in points:
+                scanned += 1
+                payload: dict[str, Any] = dict(point.payload) if point.payload else {}
+                hits = find_toolcall_xml_leak(_extract_payload_text(payload))
+                if not hits:
+                    continue
+                text = _extract_payload_text(payload) or ''
+                matches.append({
+                    'id': point.id,
+                    'created_at': payload.get('created_at'),
+                    'matched_fragments': [hit.fragment for hit in hits],
+                    'excerpt': text[:_EXCERPT_LEN] + ('…' if len(text) > _EXCERPT_LEN else ''),
+                    'metadata': payload,
+                })
+
+            if next_offset is None:
+                break
+            if limit is not None and scanned >= limit:
+                truncated = True
+                logger.warning(
+                    'Mem0 scan_payload_text stopped at limit=%d (collection=%s, '
+                    'exhaustive=%s) with more pages available — results are '
+                    'TRUNCATED and any incidence rate derived from them is an '
+                    'undercount. Re-run without --limit for the true rate.',
+                    limit,
+                    collection_name,
+                    exhaustive,
+                )
+                break
+            offset = next_offset
+
+        return {'matches': matches, 'scanned': scanned, 'truncated': truncated}
 
     async def get_point_by_id(self, memory_id: str, scope: Scope) -> dict[str, Any] | None:
         """Direct Qdrant point-fetch by id (non-semantic) → raw payload dict, or None.

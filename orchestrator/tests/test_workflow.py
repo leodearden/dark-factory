@@ -427,6 +427,150 @@ class TestSubmitToMergeQueueCrossRepo:
         self._assert_cross_repo(outcome, emits, narrow, mark_blocked)
 
 
+@pytest.mark.asyncio
+class TestSubmitToMergeQueueStalePathMessage:
+    """The failure message must not claim about the branch what it never
+    measured (task 3110, third false-positive class of this gate).
+
+    When a declared path does not exist in the branch tree at all — renamed
+    away on main, or never created — the touched set was never consulted for
+    it, so "no commit on the branch touched them" is a confident claim about
+    a branch that was never tested.  That misdiagnosis is what sent
+    reify-5196 to a human 22 times (esc-5196-22).
+
+    Routing is deliberately unchanged: still blocks, still emits
+    ``plan_files_not_touched``, still ``escalate_to_human=True``.  Only the
+    wording becomes class-scoped.
+    """
+
+    _NEVER_TOUCHED_SENTENCE = 'no commit on the branch touched them'
+
+    def _wire(self, wf, monkeypatch, results):
+        """Stub the gate with *results*, capture emits and the block reason."""
+        check_seq = _CheckSequence(results)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            check_seq,
+        )
+
+        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+            return 0, 'fake_head_sha\n', ''
+        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+        emits: list = []
+
+        def fake_emit(event_store, task_id, outcome, **kwargs):  # noqa: ARG001
+            emits.append(outcome)
+        monkeypatch.setattr(
+            'orchestrator.merge_queue._emit_merge_attempt', fake_emit,
+        )
+
+        wf._try_narrow_plan = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+        return emits, mark_blocked
+
+    @staticmethod
+    def _reason_of(mark_blocked) -> str:
+        mark_blocked.assert_awaited_once()
+        args, kwargs = mark_blocked.call_args
+        return args[0] if args else kwargs['reason']
+
+    async def test_pure_stale_path_message_does_not_blame_the_branch(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """(a) Every flagged entry is a stale PATH → no branch-blame wording."""
+        from orchestrator.merge_gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
+
+        stale = 'crates/tests/topo_e2e.rs'
+        resolved = 'crates/tests/harness_topo/topo_e2e.rs'
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.plan = {'files': [stale]}
+        # Supplied for BOTH gate calls — narrowing cannot clear a stale path.
+        result = PlanFilesTouchedResult(
+            not_touched=[stale],
+            missing_from_tree=[stale],
+            resolved_renames={stale: resolved},
+        )
+        emits, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+
+        outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        reason = self._reason_of(mark_blocked)
+        # Reason-prefix contract (unblock_types.classify_block_reason →
+        # BlockClass.MERGE_VERIFY_RED) is untouched.
+        assert reason.startswith(PLAN_FILES_NOT_TOUCHED_REASON_PREFIX)
+        assert stale in reason
+        assert self._NEVER_TOUCHED_SENTENCE not in reason, (
+            'a path absent from the tree was never checked against the '
+            'touched set — the message must not claim the branch skipped it'
+        )
+        assert 'does not exist in the tree' in reason.lower()
+        assert 'branch-touched set was not consulted' in reason.lower()
+        assert resolved in reason, (
+            'when the rename resolved, the message must name the real path'
+        )
+        # Routing unchanged.
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert 'plan_files_not_touched' in emits
+        _, kwargs = mark_blocked.call_args
+        assert kwargs.get('escalate_to_human') is True
+
+    async def test_mixed_classes_are_scoped_to_their_own_paths(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """(b) Each sentence names only the paths of its own class."""
+        stale = 'crates/tests/topo_e2e.rs'
+        real = 'a.py'
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.plan = {'files': [real, stale]}
+        result = PlanFilesTouchedResult(
+            not_touched=[real, stale],
+            missing_from_tree=[stale],
+        )
+        _, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+
+        await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        reason = self._reason_of(mark_blocked)
+        lowered = reason.lower()
+        never_idx = lowered.index(self._NEVER_TOUCHED_SENTENCE)
+        exists_idx = lowered.index('does not exist in the tree')
+
+        # Slice each sentence's own clause (ordering-agnostic) and check
+        # path membership.  Everything BEFORE the first sentence is the
+        # prefix head, which names every flagged path by contract.
+        first, second = sorted((never_idx, exists_idx))
+        clauses = {first: reason[first:second], second: reason[second:]}
+        branch_clause = clauses[never_idx]
+        stale_clause = clauses[exists_idx]
+
+        assert real in branch_clause and stale not in branch_clause, (
+            'the branch-never-touched sentence must name only paths that '
+            f'exist in the tree; got: {branch_clause!r}'
+        )
+        assert stale in stale_clause and real not in stale_clause, (
+            'the does-not-exist sentence must name only stale paths; '
+            f'got: {stale_clause!r}'
+        )
+
+    async def test_back_compat_wording_when_nothing_is_stale(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """(c) The pre-existing class's wording is untouched."""
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.plan = {'files': ['a.py']}
+        result = PlanFilesTouchedResult(not_touched=['a.py'], missing_from_tree=[])
+        _, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+
+        await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        reason = self._reason_of(mark_blocked)
+        assert self._NEVER_TOUCHED_SENTENCE in reason
+        assert 'has not delivered against the plan' in reason
+        assert 'does not exist in the tree' not in reason.lower()
+
+
 _PASSING_VERIFY_RESULT = VerifyResult(
     passed=True,
     test_output='',

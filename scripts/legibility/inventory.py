@@ -19,14 +19,16 @@ Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 from __future__ import annotations
 
 import argparse
-import gzip
 import json
+import logging
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger('legibility.inventory')
 
 
 def encode_cwd(cwd: str) -> str:
@@ -92,40 +94,129 @@ def is_member(cwd: str, cwd_prefixes: Sequence[str]) -> bool:
     return any(cwd_path.is_relative_to(Path(prefix)) for prefix in cwd_prefixes)
 
 
-def _iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
+UNREADABLE_FILE_ERRORS = (UnicodeDecodeError,)
+"""Exception types an unreadable transcript can raise that are NOT ``OSError``.
+
+With the archive stored plain (task 3618) exactly ONE such shape remains:
+``UnicodeDecodeError``. It is reachable on any transcript, since the reader
+opens under strict ``encoding='utf-8'``, and being a ``ValueError`` subclass
+it escapes an ``except OSError``-only handler entirely — so it still needs
+normalizing even though the gzip container shapes are gone.
+
+Exported deliberately: ``digest.load_transcript`` catches on THIS name rather
+than a copy, so the two readers cannot drift apart at that boundary.
+"""
+
+
+def as_unreadable_file_error(exc: BaseException) -> OSError:
+    """Normalize an unreadable-transcript exception to one ``OSError``.
+
+    THE single answer to "which exceptions mean this transcript cannot be
+    read, and what does that read as to a caller". Both transcript readers —
+    :func:`iter_json_lines` and its slurping sibling ``digest.load_transcript``
+    — funnel through here, so the normalization is structurally shared rather
+    than copy-pasted and test-pinned in sync (reviewer_comprehensive
+    /duplication, task 3214 amendment pass).
+
+    Why normalization is needed at all: with the archive stored plain (task
+    3618) an unreadable transcript surfaces as exactly ONE shape that is not
+    already an ``OSError``::
+
+        undecodable byte  -> UnicodeDecodeError   (a ValueError, not an OSError)
+
+    That shape is reachable on any transcript, because the reader opens under
+    strict ``encoding='utf-8'`` and the archived fleet transcripts these
+    readers walk are live runtime state — a flipped byte in a file a killed
+    unit left behind is an expected shape, not a theoretical one. Being a
+    ``ValueError`` subclass it escapes an ``except OSError``-only handler
+    entirely, so left un-normalized it escapes every consumer's degrade path
+    and aborts a whole-archive walk over one bad file. Everything else an
+    unreadable file raises (a missing path, a permission failure, a read
+    error) already IS an ``OSError`` and only needs passing through.
+
+    The gzip container shapes this function once also normalized — bad magic,
+    a truncated stream, a corrupt body — are gone with the ``.gz`` archive
+    itself; the readers no longer open gzip, so they can no longer raise them.
+
+    ``OSError`` is the normalized type because it is what ``sampling``,
+    ``check_transcript_persistence`` and the cross-package
+    ``memory_eval_transcript_corpus`` extractor already code against. The
+    original message is preserved in the text, so a coverage report can still
+    tell an undecodable transcript from a merely missing or unopenable one —
+    the decode shape gets its own wording rather than a generic label, which
+    would misdirect an operator reading a disclosed reason.
+
+    Total and idempotent: an exception that is ALREADY an ``OSError`` is
+    returned unchanged rather than double-wrapped, so a caller can hand it
+    anything it caught without first classifying it.
+    """
+    if isinstance(exc, OSError):
+        return exc
+    if isinstance(exc, UnicodeDecodeError):
+        return OSError(f'undecodable transcript bytes: {exc}')
+    return OSError(f'unreadable transcript: {exc}')
+
+
+def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     """Yield parsed dict records from a JSONL file, skipping blank/malformed lines.
 
-    Transparently reads gzip-compressed transcripts: a ``*.jsonl.gz`` path
-    (the archived fleet-transcript format written by
-    ``shared.transcript_archive``) is opened via ``gzip.open(..., 'rt')``,
-    while a plain path keeps the exact ``open(path, encoding='utf-8')`` call
-    for byte-parity. Either way the strip/skip-blank/``json.loads``/
-    dict-check body is identical, so :func:`_session_cwd_and_date` and its
-    callers (incl. ``sampling._score_and_find_first_turn``) become gz-aware
-    with no further change.
+    **The** low-level streaming transcript reader — public, and deliberately
+    so: cross-package consumers exist (``memory_eval_transcript_corpus.py``
+    in ``fused-memory/scripts/`` mines the archived fleet transcripts through
+    it), and a consumer reaching for an underscore name across a package
+    boundary is how a second copy of this function gets written instead.
+
+    Streaming rather than slurping is the point of this one: callers walk
+    thousands of multi-MB archived transcripts, so memory stays bounded by
+    the largest single record. ``digest.load_transcript`` is the slurping
+    sibling for the single-file case, with a byte-identical parse contract.
 
     Mirrors ``digest.load_transcript``'s graceful-degrade contract: a
     transcript is written fire-and-forget and can have a truncated or
     corrupt trailing line, which must not abort the whole read. Raises
-    ``OSError`` if *path* cannot be opened or decompressed at all —
-    ``gzip.BadGzipFile`` (a corrupt ``.gz``) is an ``OSError`` subclass, so
-    the caller's existing ``except OSError`` degrade path already covers it.
+    ``OSError`` if *path* cannot be read at all.
+
+    That split is a contract, not an implementation detail: a corrupt LINE
+    degrades silently, an unreadable FILE raises. Callers that report
+    coverage rely on it to count unreadable files without inflating the
+    count with truncated trailing lines.
+
+    Making that ``OSError`` promise true takes explicit normalization: the
+    decode shape is a ``ValueError`` subclass, not an ``OSError``.
+    :func:`as_unreadable_file_error` is the
+    single place that says which ones and why, and ``digest.load_transcript``
+    funnels through the same helper, so the two readers are interchangeable
+    at this boundary by construction rather than by matching copies.
+
+    Note the decode shape is normalized at the FILE level, not degraded at
+    the line level: a bad byte aborts the underlying text-IO read, so there
+    is no well-formed "rest of the file" left to keep yielding. Counting the
+    file once as unreadable is the honest report; silently substituting
+    replacement characters would let corrupt bytes enter the corpus as
+    plausible-looking data.
     """
-    if str(path).endswith('.gz'):
-        f = gzip.open(path, 'rt', encoding='utf-8')
-    else:
-        f = open(path, encoding='utf-8')
-    with f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict):
-                yield record
+    with open(path, encoding='utf-8') as f:
+        # The wrap covers only the read iteration — decoding
+        # happens lazily HERE, per chunk, not at open() — while the
+        # JSONDecodeError skip stays inside the loop, so the file-level vs
+        # line-level split above is preserved. The catch tuple is the shared
+        # UNREADABLE_FILE_ERRORS rather than a local literal, deliberately:
+        # `except Exception` would swallow errors from the caller's
+        # consumption of this generator, and a local tuple would be a second
+        # answer that could drift from digest.load_transcript's.
+        try:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    yield record
+        except UNREADABLE_FILE_ERRORS as exc:
+            raise as_unreadable_file_error(exc) from exc
 
 
 def _session_cwd_and_date(path: Path) -> tuple[str | None, date | None]:
@@ -145,7 +236,7 @@ def _session_cwd_and_date(path: Path) -> tuple[str | None, date | None]:
     cwd: str | None = None
     session_date: date | None = None
     try:
-        for record in _iter_json_lines(path):
+        for record in iter_json_lines(path):
             if cwd is None:
                 candidate_cwd = record.get('cwd')
                 if isinstance(candidate_cwd, str) and candidate_cwd:
@@ -284,12 +375,43 @@ def _build_session_record(
     )
 
 
+RESIDUAL_GZ_GLOB = '*.jsonl.gz'
+"""Glob for the pre-3618 archived form, kept ONLY to count what is invisible."""
+
+
+def count_residual_gz(root: Path | str) -> int:
+    """Count archived ``*.jsonl.gz`` transcripts under *root* — a count, NOT a read.
+
+    Task 3618 dropped gzip from the archive, but the destructive ``--apply``
+    sweep that converts the EXISTING corpus
+    (``scripts/migrate_transcript_archive_gunzip.py``) is deliberately a
+    human-operated step, so between that merge and the operator's run every
+    residual ``.gz`` is simply not enumerated by
+    :func:`_iter_archive_transcripts` — silently absent from the corpus rather
+    than loudly failed. The gap is accepted and documented (OPERATIONS.md §13),
+    but "accepted" must not mean "invisible": its duration is bounded only by
+    someone remembering, which is exactly the shape design-invariant INV-4
+    rejects.
+
+    So the gap announces itself. This is the machine-readable half — a consumer
+    that renders coverage can report it as a field (the memory-eval extractor's
+    ``residual_gz``); :func:`_iter_archive_transcripts` emits the human half as
+    one greppable WARNING. No gzip branch is reintroduced: nothing here opens a
+    file, and once the migration runs this returns 0 and both signals vanish on
+    their own.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return 0
+    return sum(1 for _ in root.rglob(RESIDUAL_GZ_GLOB))
+
+
 def _iter_archive_transcripts(root: Path) -> Iterator[Path]:
-    """Yield every ``*.jsonl`` / ``*.jsonl.gz`` transcript under *root*, recursively.
+    """Yield every ``*.jsonl`` transcript under *root*, recursively.
 
     The archived fleet-transcript tree (``shared.transcript_archive``) nests
-    transcripts under ``<task_id>/<enc>/<sid>.jsonl.gz`` with an even-deeper
-    ``<sid>/subagents/agent-*.jsonl.gz`` variant, so — unlike the
+    transcripts under ``<task_id>/<enc>/<sid>.jsonl`` with an even-deeper
+    ``<sid>/subagents/agent-*.jsonl`` variant, so — unlike the
     ``~/.claude/projects`` pre-filter (:func:`iter_project_dirs`), whose
     top-level dir names ARE the encoded cwds — the archive is walked
     RECURSIVELY and membership is decided per-file downstream via
@@ -298,30 +420,37 @@ def _iter_archive_transcripts(root: Path) -> Iterator[Path]:
     directory: an absent, not-yet-created archive root is normal (the tree
     is git-ignored and may not exist yet).
 
-    A SINGLE recursive walk (``rglob('*.jsonl*')``) filtered by suffix, not
-    two separate ``rglob`` passes for ``*.jsonl`` and ``*.jsonl.gz`` — the
-    combined glob is a strict superset of both, and the ``endswith`` filter
-    trims it back to exactly the two transcript classes, so the yielded set
-    (and its sort order) is byte-identical to the two-pass form while halving
-    the directory-tree traversal cost (reviewer_comprehensive/performance,
-    task 2730 amendment pass).
+    The archive holds ONE class of transcript (task 3618 dropped the gzipped
+    form), so this is a single ``rglob('*.jsonl')`` with no suffix filter.
+
+    Any residual ``*.jsonl.gz`` is therefore not enumerated AT ALL until the
+    human-operated migration sweep has run. That would be a silent
+    under-report, so it is counted (:func:`count_residual_gz`) and announced
+    once per walk as a greppable WARNING — a count, never a read.
     """
     if not root.is_dir():
         return
-    matches = [
-        p
-        for p in root.rglob('*.jsonl*')
-        if p.name.endswith('.jsonl') or p.name.endswith('.jsonl.gz')
-    ]
-    yield from sorted(matches)
+    residual_gz = count_residual_gz(root)
+    if residual_gz:
+        logger.warning(
+            'inventory: %d residual %s under %s are NOT enumerated — the '
+            'archive corpus under-reports by that many transcripts until '
+            'scripts/migrate_transcript_archive_gunzip.py --apply is run '
+            '(OPERATIONS.md §13). This warning disappears on its own once it '
+            'has been.',
+            residual_gz,
+            RESIDUAL_GZ_GLOB,
+            root,
+        )
+    yield from sorted(root.rglob('*.jsonl'))
 
 
 def _archive_enc(session_path: Path, archive_root: Path) -> str | None:
     """Return the encoded ``<enc>`` cwd dir of an archive transcript, or ``None``.
 
     The archived fleet-transcript tree nests transcripts under
-    ``<task_id>/<enc>/<sid>.jsonl.gz`` (main) and
-    ``<task_id>/<enc>/<sid>/subagents/agent-*.jsonl.gz`` (subagent), so the
+    ``<task_id>/<enc>/<sid>.jsonl`` (main) and
+    ``<task_id>/<enc>/<sid>/subagents/agent-*.jsonl`` (subagent), so the
     encoded cwd directory is ``parts[1]`` of the archive-root-relative path in
     BOTH layouts — NOT ``session_path.parent.name`` (which is ``'subagents'``
     for the subagent variant, and would make the pre-filter drop EVERY subagent
@@ -359,7 +488,7 @@ def _enumerate(
     *agent_transcript_roots* is an ADDITIONAL, opt-in list of archive roots
     (the ``shared.transcript_archive`` fleet-transcript tree, resolved via
     :func:`resolve_agent_transcript_roots`) walked recursively ALONGSIDE the
-    ``~/.claude/projects`` tree — each ``*.jsonl``/``*.jsonl.gz`` under a
+    ``~/.claude/projects`` tree — each ``*.jsonl`` under a
     root is admitted by the same per-file membership + date filter. A cheap
     encoded-``<enc>`` pre-filter — mirroring :func:`iter_project_dirs`'
     superset pre-filter for the projects tree — skips a proven-foreign

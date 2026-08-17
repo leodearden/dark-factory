@@ -64,6 +64,7 @@ import sys
 from typing import NamedTuple
 
 from _task_db_scan import (
+    SCAN_EXIT_CODE_EPILOG,
     add_db_discovery_args,
     format_json,
     group_matches_by_db,
@@ -199,6 +200,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "check's raw stdout tail). Detection/reporting only -- never "
             'mutates task data.'
         ),
+        # The 0/1/2/3 codes are RETURNED BY run_scan_cli() in _task_db_scan.py,
+        # not by anything in this file -- SCAN_EXIT_CODE_EPILOG (defined there,
+        # beside NO_DB_RESOLVED_MESSAGE) is just a --help-visible copy of that
+        # contract, shared with scan_task_toolcall_leaks.py so the two
+        # scanners' epilogs cannot drift apart (task 3744, follow-up to 3547).
+        # main()'s docstring below restates the same numbers in its own prose,
+        # and nothing keeps the two in lockstep -- change them together.
+        epilog=SCAN_EXIT_CODE_EPILOG,
     )
     add_db_discovery_args(
         parser,
@@ -217,12 +226,20 @@ def main(argv: list[str] | None = None) -> int:
 
     Exit codes: 0 = clean, 1 = at least one leak found, 2 = no tasks.db could
     be resolved from --db / --project-root / DASHBOARD_KNOWN_PROJECT_ROOTS /
-    the dark-factory default.
+    the dark-factory default, 3 = every resolved tasks.db was unreadable, so
+    NOTHING was scanned (never treat 3 as a clean run).
 
     A single unreadable database (e.g. a stale/corrupt file, or a transient
     "database is locked"/"file is not a database" condition) does not abort
     the sweep: it is logged to stderr and skipped so every other resolvable
-    database is still scanned and reported.
+    database is still scanned and reported. That warn-and-continue skip is
+    exit 0/1 on the readable remainder — it is only when ALL of them fail,
+    leaving nothing scanned at all, that the run is exit 3.
+
+    On exit 3 stdout STILL looks clean: the report is printed before the exit
+    code is decided, so --json emits an empty ``[]`` and the plain report emits
+    its ordinary "nothing found" line. A consumer that reads only stdout cannot
+    tell a total failure from a clean sweep — branch on the exit code.
     """
     def _render(matches: list[NoteLeakMatch], args: argparse.Namespace) -> str:
         if args.json:

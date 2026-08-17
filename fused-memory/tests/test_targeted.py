@@ -2445,6 +2445,18 @@ class TestShouldWithholdProposedResolutionAcceptsScope:
         ),
         pytest.param({}, False, id='empty_metadata'),
         pytest.param({'supersedes': ''}, False, id='falsy_supersedes_no_other_marker'),
+        pytest.param({'supersedes': ['959b8497']}, True, id='list_shaped_supersedes'),
+        pytest.param(
+            {'supersedes': ['959b8497', 'cd09e261']}, True, id='multi_member_supersedes',
+        ),
+        pytest.param({'supersedes': []}, False, id='empty_list_supersedes'),
+        pytest.param(
+            {'supersedes': ['']}, False, id='list_of_empty_member_not_authoritative',
+        ),
+        pytest.param(
+            {'supersedes': [None]}, False, id='list_of_none_member_not_authoritative',
+        ),
+        pytest.param({'supersedes': None}, False, id='explicit_none_supersedes'),
     ],
 )
 def test_is_authoritative_resolution_truth_table(metadata, expected):
@@ -2478,10 +2490,59 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
     self-echo must stay non-authoritative to this pre-check — otherwise a
     task's own prior echo would suppress its next completion description,
     regressing the task-1984 invariant above.
+
+    The `supersedes` discriminator is MEMBER-level truthiness of the normalized
+    list, and both the canonical list and the legacy scalar are accepted on
+    read (PRD D2 / task 3196). The rationale for both lives once, in
+    `_is_authoritative_resolution`'s docstring — not restated here. The param
+    ids encode the contract more durably than prose would:
+    `list_of_empty_member_not_authoritative` and
+    `list_of_none_member_not_authoritative` are the RED signal a
+    `bool(normalize_supersedes(...))` implementation trips, and
+    `truthy_supersedes` / `falsy_supersedes_no_other_marker` are the legacy
+    scalar read-tolerance contract, kept verbatim.
     """
     from fused_memory.reconciliation.targeted import _is_authoritative_resolution
 
     assert _is_authoritative_resolution(metadata) is expected
+
+
+def test_targeted_uses_the_shared_supersedes_parser(monkeypatch):
+    """INV-5 single-home lock: there is never a SECOND supersedes parser.
+
+    Deliverable (3) of task 3196 — the export contract task 3112's closure
+    predicate and the eval-program E4 sweep hard-depend on — pinned from the
+    CONSUMER side rather than by restating 3195's `TestNormalizeSupersedes`
+    unit tests.
+
+    BEHAVIORAL, not an identity assertion. `targeted.normalize_supersedes is
+    memory_metadata.normalize_supersedes` is near-tautological — a plain `from
+    ... import` always yields object identity, so it only restates the import
+    line and still passes on the realistic INV-5 violation: inlining
+    `isinstance(v, str)` shape logic directly inside
+    `_is_authoritative_resolution` while leaving the now-unused import in
+    place. Swapping the module-level name for a sentinel and asserting the
+    predicate OBSERVES it fails on that inlining, and equally on a rename, a
+    re-home, or a function-local re-import.
+    """
+    from fused_memory import memory_metadata
+    from fused_memory.reconciliation import targeted
+
+    seen = []
+
+    def _sentinel_parser(value):
+        seen.append(value)
+        return ['sentinel-uuid']
+
+    monkeypatch.setattr(targeted, 'normalize_supersedes', _sentinel_parser)
+
+    # `[]` is NON-authoritative under the real parser (`empty_list_supersedes`
+    # in the truth table above), so a True verdict here can only come from the
+    # patched shared name actually being called by the predicate.
+    assert targeted._is_authoritative_resolution({'supersedes': []}) is True
+    assert seen == [[]], 'the raw metadata value must reach the shared parser'
+
+    assert 'normalize_supersedes' in memory_metadata.__all__
 
 
 # ---------------------------------------------------------------------------
@@ -2722,15 +2783,31 @@ def test_format_outcome_echo_no_mid_number_splice_regression():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'supersedes_value', ['cd09e261', ['cd09e261']], ids=['legacy_scalar', 'canonical_list'],
+)
 async def test_on_task_done_suppresses_stale_description_when_authoritative_memory_exists(
-    reconciler, mock_memory_service,
+    reconciler, mock_memory_service, supersedes_value,
 ):
     """When an authoritative resolution/superseding memory already exists for the
     task, the fast-path completion echo must NOT re-append the (possibly stale,
     re-scoped) raw description/details — only the title-only completion fact —
-    and the write must be flagged so operators can query suppressed echoes."""
+    and the write must be flagged so operators can query suppressed echoes.
+
+    Parametrized over both `supersedes` shapes (PRD D2 / task 3196) so the
+    production write shape emitted by
+    `ReconciliationHarness._reconcile_status_correction` is exercised end-to-end
+    through `reconcile_task`, not only through the pure classifier. Every
+    assertion below must hold for BOTH ids. `canonical_list` passes even before
+    the reader migration (a one-element non-empty list is already truthy) — its
+    value is as a durable regression guard for the post-3196 corpus, failing
+    loudly if a later change narrows the reader back to a string-only test.
+    """
     mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
-        {'id': '959b8497', 'metadata': {'task_id': '361', 'supersedes': 'cd09e261'}},
+        {
+            'id': '959b8497',
+            'metadata': {'task_id': '361', 'supersedes': supersedes_value},
+        },
     ])
 
     result = await reconciler.reconcile_task(

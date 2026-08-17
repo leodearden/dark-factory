@@ -32,7 +32,10 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from escalation.models import Escalation
+from escalation.pins import PinRecord, _norm_id, classify_pins
+from escalation.queue import EscalationQueue
 from shared.deploy_state import DeployPhase
+from shared.task_claimant import compose_claimant_run_id
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
@@ -84,10 +87,114 @@ class TestFrozenValueObjects:
         with pytest.raises(dataclasses.FrozenInstanceError):
             claimant.run_id = 'other'  # type: ignore[misc]
 
+    def test_claimant_session_id_is_defaulted_and_frozen(self) -> None:
+        """``session_id`` (task 3563) is defaulted, so every existing
+        construction site keeps working, and shares the frozen contract."""
+        claimant = Claimant(
+            run_id='run-1/sess-1/pid=1', heartbeat_at=None, source=ClaimantSource.DB,
+        )
+        assert claimant.session_id is None
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            claimant.session_id = 'other'  # type: ignore[misc]
+
     def test_escalation_ref_is_frozen(self) -> None:
         ref = EscalationRef(id='esc-1-1', level=1)
         with pytest.raises(dataclasses.FrozenInstanceError):
             ref.level = 2  # type: ignore[misc]
+
+
+class TestEscalationRefCarriesSeverityAndFilingIdentity:
+    """EscalationRef carries severity + filing identity (task 3533).
+
+    Spec ``docs/task-escalation-state-spec.md`` S6: "Severity and level must
+    therefore travel with every escalation reference — a predicate that cannot
+    see severity cannot implement this spec."
+    """
+
+    def test_constructs_with_all_five_fields(self) -> None:
+        ref = EscalationRef(
+            id='esc-1-1',
+            level=0,
+            category='infra_issue',
+            severity='blocking',
+            filing_claimant_run_id='run-A/sess-A/pid=1',
+        )
+        assert ref.id == 'esc-1-1'
+        assert ref.level == 0
+        assert ref.category == 'infra_issue'
+        assert ref.severity == 'blocking'
+        assert ref.filing_claimant_run_id == 'run-A/sess-A/pid=1'
+
+    def test_existing_construction_sites_keep_working(self) -> None:
+        """BACKWARD COMPAT: both new fields are defaulted, so the ~10 existing
+        ``EscalationRef(id=..., level=...)`` sites in this file and in
+        test_stranded_verified_green.py compile and assert unchanged."""
+        ref = EscalationRef(id='esc-1-1', level=1)
+        assert ref.category == ''
+        assert ref.severity == ''
+        assert ref.filing_claimant_run_id is None
+
+    def test_still_frozen_on_the_new_fields(self) -> None:
+        ref = EscalationRef(id='esc-1-1', level=0, severity='blocking')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            ref.severity = 'info'  # type: ignore[misc]
+
+    def test_equality_is_field_wise(self) -> None:
+        base = {'id': 'esc-1-1', 'level': 0, 'category': 'infra_issue'}
+        assert EscalationRef(**base, severity='blocking') == EscalationRef(
+            **base, severity='blocking',
+        )
+
+    def test_refs_differing_only_in_severity_are_unequal(self) -> None:
+        base = {'id': 'esc-1-1', 'level': 0, 'category': 'infra_issue'}
+        assert EscalationRef(**base, severity='blocking') != EscalationRef(
+            **base, severity='info',
+        )
+
+    def test_refs_differing_only_in_filing_identity_are_unequal(self) -> None:
+        base = {'id': 'esc-1-1', 'level': 0, 'severity': 'blocking'}
+        assert EscalationRef(**base, filing_claimant_run_id='run-A/sess-A/pid=1') != (
+            EscalationRef(**base, filing_claimant_run_id='run-B/sess-B/pid=2')
+        )
+
+
+class TestEscalationRefSatisfiesPinRecord:
+    """THE cross-package seam this task exists to create: EscalationRef feeds
+    ``escalation.pins.classify_pins`` directly, with no adapter.
+
+    orchestrator/tests/conftest.py already puts ``escalation/src`` on
+    sys.path, so no new fixture or dependency edit is needed.
+    """
+
+    def test_escalation_ref_is_structurally_a_pin_record(self) -> None:
+        """Checked statically by pyright too — this assignment fails type-check
+        if EscalationRef and PinRecord ever drift."""
+        record: PinRecord = EscalationRef(id='esc-1-1', level=0, severity='blocking')
+        assert record.id == 'esc-1-1'
+        assert record.filing_claimant_run_id is None
+
+    def test_real_refs_classify_into_the_three_buckets(self) -> None:
+        refs = [
+            EscalationRef(
+                id='esc-1-1', level=0, category='infra_issue', severity='blocking',
+                filing_claimant_run_id='run-A/sess-A/pid=1',
+            ),
+            EscalationRef(id='esc-1-2', level=1, category='design_concern', severity='blocking'),
+            EscalationRef(id='esc-1-3', level=0, category='cleanup_needed', severity='info'),
+        ]
+
+        report = classify_pins(
+            '1', refs, live_claimant=True, live_claimant_id='run-B/sess-B/pid=2',
+        )
+
+        # esc-1-1's filing incarnation is not the live one -> convertible.
+        assert report.dead_l0 == ('esc-1-1',)
+        # esc-1-2 is a queue-backed L1 handoff -> pins.
+        assert report.queue_handoff == ('esc-1-2',)
+        # esc-1-3 is info -> never pins.
+        assert report.non_pinning == ('esc-1-3',)
+        assert report.pins is True
+        assert report.vetoes_done_flip is True
 
 
 class TestTruthReportConstruction:
@@ -353,7 +460,7 @@ def _make_ground_truth(
     *,
     git_ops: MagicMock | None = None,
     scheduler: MagicMock | None = None,
-    escalation_queue: MagicMock | None = None,
+    escalation_queue: MagicMock | EscalationQueue | None = None,
     worktree_resolver=None,
     now_fn=None,
     heartbeat_ttl: timedelta | None = None,
@@ -608,8 +715,11 @@ class TestDeriveTruthLiveClaimant:
     async def test_no_db_claimant_live_plan_lock_returns_plan_lock_claimant(
         self, tmp_path: Path,
     ) -> None:
+        # task 3563: the lock records the process run_id, so the resolved
+        # identity is the FULL composed shape — not the bare session id it
+        # used to return.  The raw session id survives under session_id.
         TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        TaskArtifacts(tmp_path).lock_plan('sess-13-abc123')
+        TaskArtifacts(tmp_path).lock_plan('sess-13-abc123', run_id='run-13')
         lock_data = TaskArtifacts(tmp_path).read_plan_lock()
         assert lock_data is not None
         locked_at = lock_data['locked_at']
@@ -620,9 +730,10 @@ class TestDeriveTruthLiveClaimant:
         report = await resolver.derive_truth('13')
 
         assert report.live_claimant == Claimant(
-            run_id='sess-13-abc123',
+            run_id=compose_claimant_run_id('run-13', 'sess-13-abc123', os.getpid()),
             heartbeat_at=locked_at,
             source=ClaimantSource.PLAN_LOCK,
+            session_id='sess-13-abc123',
         )
 
     async def test_stale_db_claimant_returns_none_even_with_live_plan_lock(
@@ -847,6 +958,233 @@ class TestDeriveTruthLiveClaimant:
 
 
 # ---------------------------------------------------------------------------
+# task 3563 — Claimant.run_id is homogeneous across all three sources
+# ---------------------------------------------------------------------------
+
+
+def _write_plan_lock(root: Path, payload: dict) -> Path:
+    """Write a raw plan.lock literal (bypassing lock_plan) under *root*.
+
+    Used for the malformed/legacy shapes ``lock_plan`` itself can no longer
+    produce — exactly the locks already sitting on disk from before this
+    change, which the resolver must still degrade safely on.
+    """
+    artifacts = TaskArtifacts(root)
+    artifacts.root.mkdir(parents=True, exist_ok=True)
+    lock_path = artifacts.root / 'plan.lock'
+    lock_path.write_text(json.dumps(payload))
+    return lock_path
+
+
+@pytest.mark.asyncio
+class TestClaimantRunIdIsComposedOrNone:
+    """``Claimant.run_id`` is a full composed identity, or None (task 3563).
+
+    The contract: ``run_id`` is either a complete
+    ``shared.task_claimant.compose_claimant_run_id`` string, or ``None``
+    meaning UNKNOWN.  NEVER a bare ``session_id``, and never partially
+    composed.  Before this task the three sources were heterogeneous — DB
+    yielded the composed identity, plan.lock a bare session id, in-memory
+    ``None`` — which is why ``escalation.pins._norm_id`` had to reject
+    non-composed values outright rather than compare them.
+
+    A partially-composed value would be WORSE than the bare session id it
+    replaces: ``'/{session_id}/pid={pid}'`` contains the ``/pid=`` marker, so
+    it PASSES ``_norm_id``'s shape guard and then string-mismatches every
+    DB-composed filing identity — which ``classify_pins`` link 4 reads as "a
+    DIFFERENT incarnation is live", converting a genuinely LIVE filer's L0 to
+    DEAD_L0.  Hence: compose only when EVERY component is known, else None.
+    """
+
+    @staticmethod
+    def _unclaimed_task() -> dict:
+        return {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+
+    async def _resolve(self, tmp_path: Path, tid: str = '13') -> Claimant | None:
+        scheduler = _fake_scheduler(is_actively_held=False, task=self._unclaimed_task())
+        resolver = _make_ground_truth(
+            scheduler=scheduler, worktree_resolver=lambda _tid: tmp_path,
+        )
+        return (await resolver.derive_truth(tid)).live_claimant
+
+    async def test_lock_with_run_id_resolves_to_composed_identity(
+        self, tmp_path: Path,
+    ) -> None:
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        TaskArtifacts(tmp_path).lock_plan('sess-13-abc123', run_id='run-abc')
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        # The REAL composer, not a hand-formatted string — the point is that
+        # this is byte-identical to what the DB stamp produces.
+        assert claimant.run_id == compose_claimant_run_id(
+            'run-abc', 'sess-13-abc123', os.getpid(),
+        )
+        # The raw session id is preserved rather than dropped.
+        assert claimant.session_id == 'sess-13-abc123'
+
+    async def test_legacy_lock_without_run_id_resolves_to_none_not_bare_session(
+        self, tmp_path: Path,
+    ) -> None:
+        """The pre-3563 shape still on disk must degrade to UNKNOWN."""
+        _write_plan_lock(tmp_path, {
+            'session_id': 'sess-legacy-abc123',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+        })
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        assert claimant.run_id is None
+        # Explicit: the old bare-session_id shape can never silently return.
+        assert claimant.run_id != 'sess-legacy-abc123'
+        assert claimant.session_id == 'sess-legacy-abc123'
+
+    @pytest.mark.parametrize(
+        'run_id',
+        ['', '   ', 42, None, ['run-abc']],
+        ids=['empty', 'blank', 'int', 'null', 'list'],
+    )
+    async def test_blank_or_non_str_run_id_resolves_to_none(
+        self, tmp_path: Path, run_id,
+    ) -> None:
+        _write_plan_lock(tmp_path, {
+            'session_id': 'sess-13-abc123',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+            'run_id': run_id,
+        })
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.run_id is None
+        assert claimant.session_id == 'sess-13-abc123'
+
+    async def test_string_owner_pid_composes_from_the_PARSED_int(
+        self, tmp_path: Path,
+    ) -> None:
+        """The composed identity embeds the PARSED int, not the raw JSON value.
+
+        Pins the ``parsed_pid`` hoist in ``_resolve_live_claimant`` against a
+        refactor back to composing from ``lock_data.get('owner_pid')`` (or to
+        re-parsing it separately from the liveness check).
+
+        The fixture uses a ZERO-PADDED pid string deliberately: it is the
+        cheapest spelling that survives ``int()`` as the live pid yet differs
+        under ``f'{...}'``.  A plain ``str(os.getpid())`` would NOT discriminate
+        — ``compose_claimant_run_id`` is an f-string, so ``'12345'`` and
+        ``12345`` format identically and the assertion would hold either way.
+        Here the raw value would compose ``.../pid=012345`` while the DB stamp,
+        built from ``os.getpid()``, composes ``.../pid=12345``: a byte mismatch
+        that ``classify_pins`` would read as a DIFFERENT live incarnation.
+        """
+        padded_pid = f'0{os.getpid()}'
+        assert int(padded_pid) == os.getpid()  # same process...
+        assert padded_pid != str(os.getpid())  # ...different byte sequence
+
+        _write_plan_lock(tmp_path, {
+            'session_id': 'sess-13-abc123',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': padded_pid,
+            'run_id': 'run-abc',
+        })
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        assert claimant.run_id is not None
+        assert claimant.run_id == compose_claimant_run_id(
+            'run-abc', 'sess-13-abc123', os.getpid(),
+        )
+        assert f'/pid={padded_pid}' not in claimant.run_id
+
+    @pytest.mark.parametrize(
+        'session_id',
+        ['', '   ', 42, None, ['sess']],
+        ids=['empty', 'blank', 'int', 'null', 'list'],
+    )
+    async def test_valid_run_id_with_bad_session_id_resolves_to_none(
+        self, tmp_path: Path, session_id,
+    ) -> None:
+        """No PARTIALLY-composed identity — every component or nothing."""
+        _write_plan_lock(tmp_path, {
+            'session_id': session_id,
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+            'run_id': 'run-abc',
+        })
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.run_id is None
+        assert claimant.session_id is None
+
+    async def test_db_branch_is_unchanged_and_carries_no_session_id(self) -> None:
+        """DB already yields the composed identity; it is NOT decomposed.
+
+        ``shared.task_claimant`` ships a composer and DELIBERATELY no parser
+        (the identity is compared verbatim, never parsed), so the resolver
+        must not split a composed identity to back-fill ``session_id``.
+        """
+        fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
+        composed = compose_claimant_run_id('run-1', 'session-1', 123)
+        task = {
+            'status': 'in-progress',
+            'claimant_run_id': composed,
+            'heartbeat_at': '2026-07-12T11:55:00+00:00',
+        }
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(
+            scheduler=scheduler, now_fn=lambda: fixed_now, heartbeat_ttl=timedelta(minutes=10),
+        )
+
+        report = await resolver.derive_truth('12')
+
+        assert report.live_claimant is not None
+        assert report.live_claimant.source == ClaimantSource.DB
+        assert report.live_claimant.run_id == composed  # verbatim
+        assert report.live_claimant.session_id is None
+
+    async def test_in_memory_branch_yields_unknown_identity(self) -> None:
+        scheduler = _fake_scheduler(is_actively_held=True)
+        resolver = _make_ground_truth(scheduler=scheduler)
+
+        report = await resolver.derive_truth('11')
+
+        assert report.live_claimant is not None
+        assert report.live_claimant.source == ClaimantSource.IN_MEMORY
+        assert report.live_claimant.run_id is None
+        assert report.live_claimant.session_id is None
+
+    async def test_composed_identity_survives_escalation_pins_shape_guard(
+        self, tmp_path: Path,
+    ) -> None:
+        """Cross-module shape agreement — the whole point of the change.
+
+        Whatever the resolver emits must be comparable by
+        ``escalation.pins``, i.e. survive ``_norm_id`` rather than collapse
+        to unknown.  ``None`` is the honest unknown and is allowed; any
+        NON-None value must carry the ``/pid=`` marker.
+        """
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        TaskArtifacts(tmp_path).lock_plan('sess-13-abc123', run_id='run-abc')
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.run_id is not None
+        assert '/pid=' in claimant.run_id
+        assert _norm_id(claimant.run_id) == claimant.run_id
+
+
+# ---------------------------------------------------------------------------
 # step-11 — derive_truth's remaining TruthReport fields
 # ---------------------------------------------------------------------------
 
@@ -908,8 +1246,12 @@ class TestDeriveTruthRemainingFields:
         report = await resolver.derive_truth('20')
 
         assert report.open_escalations == [
-            EscalationRef(id='esc-20-1', level=1, category='scope_violation'),
-            EscalationRef(id='esc-20-2', level=0, category='cleanup_needed'),
+            EscalationRef(
+                id='esc-20-1', level=1, category='scope_violation', severity='blocking',
+            ),
+            EscalationRef(
+                id='esc-20-2', level=0, category='cleanup_needed', severity='info',
+            ),
         ]
         escalation_queue.get_by_task.assert_called_once_with('20', status='pending')
 
@@ -919,6 +1261,117 @@ class TestDeriveTruthRemainingFields:
         report = await resolver.derive_truth('21')
 
         assert report.open_escalations == []
+
+    # -----------------------------------------------------------------------
+    # step-13 — REAL-queue round-trip: severity + filing identity survive JSON
+    # serialisation, the atomic file write, and from_dict rehydration.
+    # -----------------------------------------------------------------------
+
+    def _real_queue(self, tmp_path: Path) -> EscalationQueue:
+        return EscalationQueue(tmp_path / 'escalations')
+
+    async def test_refs_round_trip_severity_and_filing_identity_via_real_queue(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = self._real_queue(tmp_path)
+        queue.submit(Escalation(
+            id='esc-30-1', task_id='30', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s1', level=0,
+            filing_claimant_run_id='run-A/sess-A/pid=1',
+        ))
+        queue.submit(Escalation(
+            id='esc-30-2', task_id='30', agent_role='implementer',
+            severity='info', category='cleanup_needed', summary='s2', level=1,
+        ))
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        report = await resolver.derive_truth('30')
+
+        assert sorted(report.open_escalations, key=lambda r: r.id) == [
+            EscalationRef(
+                id='esc-30-1', level=0, category='infra_issue', severity='blocking',
+                filing_claimant_run_id='run-A/sess-A/pid=1',
+            ),
+            EscalationRef(
+                id='esc-30-2', level=1, category='cleanup_needed', severity='info',
+                filing_claimant_run_id=None,
+            ),
+        ]
+
+    async def test_legacy_on_disk_record_without_filing_identity_resolves_to_none(
+        self, tmp_path: Path,
+    ) -> None:
+        """ZERO MIGRATION through a real queue: a pre-3533 JSON file on disk
+        has no filing_claimant_run_id key at all."""
+        queue = self._real_queue(tmp_path)
+        (queue.queue_dir / 'esc-31-1.json').write_text(json.dumps({
+            'id': 'esc-31-1', 'task_id': '31', 'agent_role': 'implementer',
+            'severity': 'blocking', 'category': 'infra_issue', 'summary': 'legacy',
+            'status': 'pending', 'level': 0,
+            # NOTE: filing_claimant_run_id intentionally absent
+        }))
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        report = await resolver.derive_truth('31')
+
+        assert report.open_escalations == [
+            EscalationRef(
+                id='esc-31-1', level=0, category='infra_issue', severity='blocking',
+                filing_claimant_run_id=None,
+            ),
+        ]
+
+    async def test_null_severity_on_disk_normalises_to_empty_string(
+        self, tmp_path: Path,
+    ) -> None:
+        """A null severity resolves to '' — the classifier's fail-safe branch,
+        not an exception, governs."""
+        queue = self._real_queue(tmp_path)
+        (queue.queue_dir / 'esc-32-1.json').write_text(json.dumps({
+            'id': 'esc-32-1', 'task_id': '32', 'agent_role': 'implementer',
+            'severity': None, 'category': 'infra_issue', 'summary': 'null severity',
+            'status': 'pending', 'level': 0,
+        }))
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        report = await resolver.derive_truth('32')
+
+        assert report.open_escalations == [
+            EscalationRef(id='esc-32-1', level=0, category='infra_issue', severity=''),
+        ]
+
+    async def test_end_to_end_real_queue_refs_classify_through_classify_pins(
+        self, tmp_path: Path,
+    ) -> None:
+        """The full producer-to-predicate path this task delivers: real
+        Escalation records -> real queue -> derive_truth -> EscalationRefs ->
+        classify_pins."""
+        queue = self._real_queue(tmp_path)
+        queue.submit(Escalation(
+            id='esc-30-1', task_id='30', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s1', level=0,
+            filing_claimant_run_id='run-A/sess-A/pid=1',
+        ))
+        queue.submit(Escalation(
+            id='esc-30-2', task_id='30', agent_role='implementer',
+            severity='info', category='cleanup_needed', summary='s2', level=1,
+        ))
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        report = await resolver.derive_truth('30')
+        pins = classify_pins(
+            '30',
+            sorted(report.open_escalations, key=lambda r: r.id),
+            live_claimant=False,
+        )
+
+        assert pins.dead_l0 == ('esc-30-1',)
+        assert pins.non_pinning == ('esc-30-2',)
+        assert pins.queue_handoff == ()
+        # The dead L0 does not block conversion...
+        assert pins.pins is False
+        # ...but a non-info open record still vetoes a done-flip (PRD D3).
+        assert pins.vetoes_done_flip is True
 
     async def test_deploy_phase_from_present_deploy_state_slice(self) -> None:
         task = {

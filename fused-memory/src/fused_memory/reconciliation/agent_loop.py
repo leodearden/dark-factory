@@ -16,7 +16,12 @@ if TYPE_CHECKING:
     from anthropic.types import MessageParam, ToolParam
     from openai.types.chat import ChatCompletionMessageParam
 
-from shared.cli_invoke import AgentResult, build_failure_message, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AgentResult,
+    build_failure_message,
+    invoke_with_cap_retry,
+    no_mcp_servers_config,
+)
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import JournalEntry
@@ -336,7 +341,10 @@ class AgentLoop:
 
         Multi-turn is handled by passing ``resume_session_id`` on subsequent
         calls; ``_call_llm`` is responsible for serialising tool results into
-        the next turn's prompt before calling this method.
+        the next turn's prompt before calling this method. ``resume_delivers_prompt=True``
+        is what actually gets that serialised prompt to the CLI on turn >= 2 —
+        without it, ``invoke_with_cap_retry`` overwrites ``prompt`` with the
+        short crash-recovery continuation string before ever making the call.
 
         ``_cli_session_id`` is cleared to ``None`` before any exception propagates
         out of this method — whether from ``invoke_with_cap_retry`` itself (e.g.
@@ -353,6 +361,12 @@ class AgentLoop:
                 system_prompt=self._build_cli_system_prompt(tools),
                 output_schema=CLAUDE_CLI_RESPONSE_SCHEMA,
                 disallowed_tools=['*'],
+                # Closes MCP separately from the wildcard deny above, which the
+                # schema expands into a BUILT-INS-ONLY list. Must stay truthy, or
+                # --strict-mcp-config is never emitted (build_claude_argv gates it
+                # on `if mcp_config:`).
+                mcp_config=no_mcp_servers_config(),
+                strict_mcp_config=True,
                 model=self.config.agent_llm_model,
                 # max_turns=1: AgentLoop.run() drives multi-turn externally by calling
                 # _call_claude_cli again with resume_session_id.  A single CLI
@@ -362,12 +376,57 @@ class AgentLoop:
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.agent_cli_timeout_seconds),
                 resume_session_id=self._cli_session_id,
+                # This loop's --resume is its NORMAL operating mode, not crash
+                # recovery: each turn's prompt is _serialize_tool_results(...),
+                # computed in Python and never replayed in the CLI transcript
+                # (disallowed_tools=['*'] above), so it exists nowhere else.
+                # Without resume_delivers_prompt=True, cli_invoke.py would
+                # replace it with CRASH_RECOVERY_RESUME_PROMPT and the turn's
+                # tool results would be silently and unrecoverably lost.
+                # Passed unconditionally (not gated on _cli_session_id): it is
+                # already inert on turn 1 since cli_invoke only reads it inside
+                # `if invoke_kwargs.get('resume_session_id'):`.
+                resume_delivers_prompt=True,
+                # Robustness caveat (not a live bug): resume_delivers_prompt=True
+                # makes this a "live continuation" caller per invoke_with_cap_retry's
+                # own contract (cli_invoke.py:1600-1603, 1703-1706, 2071-2074) — its
+                # original_prompt (the bare _serialize_tool_results(...) string, with
+                # no conversation context) is only meaningful *inside* the resumed
+                # session. If that session is lost, the gated retry loop's
+                # rebuild_prompt hook is what reconstructs a self-contained prompt for
+                # the fresh session it starts instead; this call passes none. That is
+                # harmless today ONLY because AgentLoop's sole production caller
+                # (verify.py) never supplies a real usage_gate, so this call always
+                # takes the gate-less fast path (cli_invoke.py:1507) and never reaches
+                # the resume-to-fresh fallback, auth-failover, or zero-output-wedge
+                # branches that would invoke rebuild_prompt. If AgentLoop is ever
+                # constructed with a real usage_gate, add a rebuild_prompt hook here
+                # at the same time.
                 # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
                 # switched to a neutral cwd. This is a multi-turn agent that
-                # actively adjudicates memory-vs-codebase discrepancies with
-                # CLI built-in tools disabled (disallowed_tools=['*']), so the
+                # actively adjudicates memory-vs-codebase discrepancies, and the
                 # auto-loaded CLAUDE.md is plausibly its main passive codebase
                 # signal.
+                #
+                # This cwd is the project root and holds a live .mcp.json, which
+                # bypassPermissions would otherwise let the CLI ambient-merge and
+                # expose unreviewed. disallowed_tools=['*'] above does NOT cover
+                # that: with output_schema set, cli_invoke expands the wildcard
+                # into _REAL_BUILTIN_TOOLS_DENYLIST, a BUILT-INS-ONLY list that
+                # carries no MCP tool pattern. MCP tools are closed SEPARATELY,
+                # by the mcp_config=no_mcp_servers_config() + strict_mcp_config=True
+                # pair above — which must stay truthy, since --strict-mcp-config is
+                # emitted only inside build_claude_argv's `if mcp_config:` block.
+                # Both kwargs survive every cap-retry resume: _reset_for_fresh_retry
+                # touches only resume_session_id/prompt/session_id, and the `if
+                # mcp_config:` argv block sits outside the resume conditional.
+                # Confirmed by reading shared/cli_invoke.py, but NOT independently
+                # pinned by a resume-path test at that layer — a future refactor
+                # that moved the mcp_config handling into build_claude_argv's
+                # `elif session_id:` branch would silently reopen this for every
+                # turn >= 2 with a green suite here. Tracked as a follow-up test
+                # in shared/tests/test_build_claude_argv.py (out of this task's
+                # locked-module scope).
                 cwd=Path(self.config.explore_codebase_root),
                 cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             )

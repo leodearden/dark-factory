@@ -27,12 +27,14 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-# scripts/ is put on sys.path by tests/scripts/conftest.py at collection time.
-# It is a flat script directory, not a package src root, so it is deliberately
-# absent from [tool.pyright] extraPaths in the root pyproject.toml — hence the
-# targeted ignore, matching the convention at
-# tests/scripts/test_repair_wiped_metadata_files.py:39.
-from migrate_metadata_modules_to_files import (  # pyright: ignore[reportMissingImports]
+# scripts/ is put on sys.path by tests/scripts/conftest.py at collection time,
+# and — as of task 3456 — is ALSO listed (with scripts/legibility) in
+# [tool.pyright] extraPaths in the root pyproject.toml, so this import resolves
+# statically too and needs no ignore. Before 3456 this comment claimed scripts/
+# was "deliberately absent" from that table; declaring the `scripts` module's
+# type gate required the opposite. Same correction in
+# tests/scripts/test_repair_wiped_metadata_files.py.
+from migrate_metadata_modules_to_files import (
     FusedMemoryClient,
 )
 

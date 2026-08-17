@@ -66,6 +66,14 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Traceability pointer to the report that produced the two thresholds
     # above; reloaded alongside them so config never names a stale run.
     'write_triage.calibration_report_path',
+    # Per-category cutoffs (task 3357), same green tier and same live-read
+    # path as the pooled t_high above. _iter_leaves yields the dict WHOLE, so
+    # the map reloads as ONE atomic leaf (same treatment as the
+    # procedural_knowledge_topic_guard_clusters list): a half-applied set of
+    # per-category cutoffs can never gate an audit_duplicate_memories sweep.
+    # Replaced wholesale rather than merged, so a category the latest run
+    # stopped deriving a cutoff for does not keep a stale one.
+    'write_triage.t_high_by_category',
     # In-place update_memory authorization (task 3088). Read live per tool call
     # by resolve_mem0_update_enabled (server/mem0_update_authz.py) off the
     # shared memory_service.config.mem0_update object -- the resolver captures

@@ -23,7 +23,11 @@ from unittest.mock import patch
 import pytest
 
 from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.agents.roles import BACKGROUND_TASK_WARNING, ROLES
+from orchestrator.agents.roles import (
+    BACKGROUND_TASK_WARNING,
+    ROLES,
+    WAIT_PATTERN_REMINDER,
+)
 from orchestrator.config import GitConfig, OrchestratorConfig
 
 
@@ -60,11 +64,30 @@ def briefing(tmp_path: Path) -> BriefingAssembler:
 
 
 @pytest.mark.asyncio
-async def test_amender_prompt_carries_warning(briefing: BriefingAssembler) -> None:
+async def test_amender_prompt_reinforces_warning_at_failure_site(
+    briefing: BriefingAssembler,
+) -> None:
     """The built amender turn-prompt reinforces the warning at the failure site.
+
+    2761's guarantee is that the amender SESSION carries this rule. It still
+    does, via two assertions here: IMPLEMENTER's system prompt (which the
+    amender runs under) carries the warning verbatim, and the turn prompt
+    restates it at the "Run verification before finishing" step.
+
+    Task 3607 changed the turn-prompt injection from the verbatim warning to
+    the short ``WAIT_PATTERN_REMINDER`` pointer, because IMPLEMENTER now carries
+    the full block UP FRONT rather than buried at the tail — so inlining it
+    again here would hand the amender the same text twice in one session. The
+    reminder is held to a minimum size by ``test_roles_wait_pattern.py``, so the
+    reinforcement stays substantive rather than decaying to a bare "see above".
 
     ``_get_memory_context`` is patched to a stub so no real fused-memory HTTP
     call fires (mirrors the resume golden test)."""
+    assert BACKGROUND_TASK_WARNING in ROLES['implementer'].system_prompt, (
+        'The amender runs under IMPLEMENTER; its system prompt must carry the '
+        "2761 warning, since the turn prompt now only points back at it."
+    )
+
     with patch.object(
         BriefingAssembler, '_get_memory_context', return_value='# Context\n\n_stub_',
     ):
@@ -75,4 +98,10 @@ async def test_amender_prompt_carries_warning(briefing: BriefingAssembler) -> No
             locked_modules=['x'],
             task_id='1',
         )
-    assert BACKGROUND_TASK_WARNING in prompt
+
+    assert WAIT_PATTERN_REMINDER in prompt, (
+        'The amender turn-prompt no longer reinforces the wait rules at the '
+        '"Run verification before finishing" step — Reify-5164 exact failure '
+        'site. Restore WAIT_PATTERN_REMINDER (or the full '
+        'BACKGROUND_WAIT_GUIDANCE) there.'
+    )

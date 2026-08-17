@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from orchestrator.agents.roles import BACKGROUND_TASK_WARNING
+from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
 from orchestrator.mcp_lifecycle import mcp_call
 
@@ -51,6 +51,180 @@ def _format_commit_bullets(commits: list[dict], limit: int | None = None) -> str
             f'`git log --oneline` to see the rest)'
         )
     return '\n'.join(lines)
+
+
+FOREIGN_PROJECT_TAG_KEYS = ('src_project', 'project_id', 'group_id', 'project')
+"""Metadata keys, in precedence order, that name a memory result's owning project.
+
+``src_project`` is FIRST: the task-2273 CGL-eta rehome
+(``fused-memory/src/fused_memory/maintenance/rehome_scope_tag.py``, kind
+``cgl_eta_cross_target_rehome``) wrote Mem0 entries that physically live in
+``dst_project``'s collection but reference ``src_project``'s task numbers —
+``src_project`` is the authoritative origin project, so it must win over any
+co-present ``project_id``/``group_id`` on the same entry. ``dst_project`` is
+deliberately ABSENT from this tuple: consulting it would falsely certify a
+rehomed foreign fact as local, since it names where the fact was relocated
+TO, not where it came from.
+"""
+
+
+def _canonical_project(value: str) -> str:
+    """Canonicalise a project identifier for comparison.
+
+    Mirrors fused-memory's ``canonicalize_project_id`` semantics
+    (``fused_memory/utils/validation.py``; see the divergent-spelling
+    contract in ``plans/cross-graph-entity-leak-prd.md`` decision 1 / S1) —
+    strip, lowercase, ``'-'`` -> ``'_'`` — so a tag spelled ``dark-factory``
+    is not mistaken for a project distinct from ``dark_factory``.
+
+    Re-implemented locally rather than imported: orchestrator declares no
+    runtime dependency on fused-memory (it appears only in
+    ``orchestrator/pyproject.toml``'s ``[tool.pyright] extraPaths``, a
+    type-checking-only reference), so importing it here would risk an
+    ``ImportError`` in any deployment where fused-memory is not co-installed.
+    """
+    return value.strip().lower().replace('-', '_')
+
+
+def _result_project(entry: dict) -> tuple[str, str] | None:
+    """Read a result's owning-project tag from its metadata, if any.
+
+    Walks :data:`FOREIGN_PROJECT_TAG_KEYS` in precedence order and returns
+    the ``(key, value)`` pair of the first present, non-empty **string**
+    value found in ``entry['metadata']``. A non-string value (e.g. an int)
+    is treated as absent rather than crashing the comparison. Returns
+    ``None`` — i.e. untagged — when ``entry['metadata']`` is missing, not a
+    dict, or carries none of the recognised keys.
+
+    The matched key is returned alongside the value (not just the value) so
+    a drop can be logged with enough context — which key fired, and what it
+    said — to diagnose a false-positive filter from the logs alone.
+    """
+    metadata = entry.get('metadata')
+    if not isinstance(metadata, dict):
+        return None
+    for key in FOREIGN_PROJECT_TAG_KEYS:
+        tag = metadata.get(key)
+        if isinstance(tag, str) and tag.strip():
+            return key, tag
+    return None
+
+
+def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[str, int]:
+    """Drop cross-project results from a fused-memory ``search`` JSON payload.
+
+    ``payload_text`` is the JSON-serialised ``{'results': [...]}`` dict that
+    FastMCP returns as the ``search`` tool's text block (see
+    :meth:`BriefingAssembler._mcp_search`). Each result's project tag is read
+    via :func:`_result_project` (see :data:`FOREIGN_PROJECT_TAG_KEYS`); the
+    entry is dropped when a tag is present and, after
+    :func:`_canonical_project` normalisation, differs from ``project_id``,
+    and kept otherwise — including when ``metadata`` is missing, empty, or
+    not a dict.
+
+    Untagged results are deliberately kept rather than dropped: every
+    Graphiti-sourced result has ``metadata == {}`` today (verified at
+    ``fused-memory/src/fused_memory/services/memory_service.py:3332-3407``,
+    ``_search_graphiti``, which only ever adds a ``planned`` key), so
+    dropping untagged results would empty the ``# Context`` block for most
+    queries. Only Mem0-sourced results can carry a project tag today.
+
+    Returns the re-serialised payload — sibling top-level keys such as
+    ``degraded``/``failed_stores``/``failed_store_diagnostics`` are preserved
+    verbatim — and the number of results dropped. Returns ``('', dropped)``
+    when nothing survives, so the existing ``if section:`` guards in
+    ``_get_memory_context`` skip an all-foreign section the same way they
+    skip an empty one.
+
+    When nothing is dropped (the common case — see above), ``payload_text``
+    is returned unchanged rather than re-serialised: this preserves the
+    upstream formatting byte-for-byte and avoids the cost of a needless
+    round-trip. When something IS dropped, the re-serialisation uses
+    ``ensure_ascii=False`` so non-ASCII content (dark-factory memory text is
+    dense with em dashes and accented characters) is not escaped into
+    ``\\uXXXX`` sequences in the rendered ``# Context`` block.
+
+    Fails OPEN on a malformed payload — non-JSON text, JSON that is not an
+    object, or a missing/non-list ``results`` — returning ``(payload_text,
+    0)`` unchanged and logging a WARNING. Blanking the ``# Context`` block on
+    a serialisation surprise would be a silent capability loss across every
+    prompt builder; preserving today's (unfiltered) behaviour with a loud
+    warning is the safer failure direction. A stray non-dict entry, or a
+    non-dict ``metadata`` on an otherwise-well-formed entry, is kept rather
+    than raising — treated the same as an untagged result.
+    """
+    try:
+        payload = json.loads(payload_text)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning(f'filter_foreign_project_results: payload is not valid JSON ({e}); keeping unfiltered')
+        return payload_text, 0
+
+    if not isinstance(payload, dict):
+        logger.warning(
+            f'filter_foreign_project_results: payload is a {type(payload).__name__}, '
+            'not a JSON object; keeping unfiltered'
+        )
+        return payload_text, 0
+
+    results = payload.get('results')
+    if not isinstance(results, list):
+        logger.warning(
+            f"filter_foreign_project_results: payload['results'] is a "
+            f'{type(results).__name__}, not a list; keeping unfiltered'
+        )
+        return payload_text, 0
+
+    target = _canonical_project(project_id)
+    kept = []
+    dropped = 0
+    for entry in results:
+        if not isinstance(entry, dict):
+            kept.append(entry)
+            continue
+        match = _result_project(entry)
+        if match is not None:
+            key, tag = match
+            if _canonical_project(tag) != target:
+                dropped += 1
+                logger.debug(
+                    f'filter_foreign_project_results: dropped {entry.get("id")!r} '
+                    f'({key}={tag!r})'
+                )
+                continue
+        kept.append(entry)
+
+    if not kept:
+        return '', dropped
+
+    if dropped == 0:
+        # No-op: nothing was filtered, so avoid re-serialising a payload
+        # that is byte-for-byte unchanged — this is the overwhelmingly
+        # common case, since every Graphiti-sourced result is untagged
+        # today and the filter never fires on it.
+        return payload_text, 0
+
+    payload = dict(payload)
+    payload['results'] = kept
+    return json.dumps(payload, indent=2, ensure_ascii=False), dropped
+
+
+MEMORY_CONTEXT_CAVEAT = (
+    "_This context was recalled from the `{project_id}` project's memory — "
+    'it is NOT a description of this worktree. It may name tasks, repos, '
+    'crates, or file paths that do not exist here. Do not assume a recalled '
+    'path is real: verify it exists before reading it or `cd`-ing into it._'
+)
+"""Standing provenance caveat rendered right after the ``# Context`` heading.
+
+Covers the leak channel :func:`filter_foreign_project_results` cannot reach:
+every Graphiti-sourced memory result has ``metadata == {}`` today (see that
+function's docstring), so an untagged foreign fact — e.g. a path belonging
+to a different project's repo — survives the filter unclassified and
+renders verbatim. The tag filter is the permanent chokepoint for taggable
+(Mem0) results; this caveat is what actually converts "agent `cd`'s/reads
+into a recalled foreign path" into "agent verifies the path first" for the
+untagged majority. Interpolated with ``self.project_id`` via ``.format()``.
+"""
 
 
 @dataclass
@@ -761,7 +935,7 @@ This task holds locks for the following modules:
 3. Apply each in-scope suggestion above. Commit amendments with `amend:`
    prefixes, grouping related fixes when sensible.
 4. Run verification for the touched files before finishing.
-{BACKGROUND_TASK_WARNING}
+{WAIT_PATTERN_REMINDER}
 """
 
     async def build_debugger_prompt(
@@ -1082,40 +1256,122 @@ Handle this escalation, then call `resolve_issue` with a summary.
 
     async def _get_memory_context(self, task_id: str | None = None) -> str:
         """Call fused-memory search for project context."""
-        sections = []
+        recalled_sections: list[str] = []
+        foreign_dropped = 0
+        queries_fired = 0
+        memory_unavailable = False
 
         try:
             # Project overview
-            overview = await self._mcp_search('project overview architecture goals')
+            overview, dropped = await self._scoped_search('project overview architecture goals')
+            foreign_dropped += dropped
+            queries_fired += 1
             if overview:
-                sections.append(f'## Project Context\n\n{overview}')
+                recalled_sections.append(f'## Project Context\n\n{overview}')
 
             # Conventions
-            conventions = await self._mcp_search('coding conventions and project norms')
+            conventions, dropped = await self._scoped_search('coding conventions and project norms')
+            foreign_dropped += dropped
+            queries_fired += 1
             if conventions:
-                sections.append(f'## Conventions\n\n{conventions}')
+                recalled_sections.append(f'## Conventions\n\n{conventions}')
 
             # Recent decisions
-            decisions = await self._mcp_search('recent decisions and rationale')
+            decisions, dropped = await self._scoped_search('recent decisions and rationale')
+            foreign_dropped += dropped
+            queries_fired += 1
             if decisions:
-                sections.append(f'## Recent Decisions\n\n{decisions}')
+                recalled_sections.append(f'## Recent Decisions\n\n{decisions}')
 
             # Task-specific context
             if task_id:
-                task_ctx = await self._mcp_search(
+                task_ctx, dropped = await self._scoped_search(
                     f'task {task_id} context and related decisions'
                 )
+                foreign_dropped += dropped
+                queries_fired += 1
                 if task_ctx:
-                    sections.append(f'## Task Context\n\n{task_ctx}')
+                    recalled_sections.append(f'## Task Context\n\n{task_ctx}')
 
         except Exception as e:
             logger.warning(f'Failed to fetch memory context: {e}')
-            sections.append('## Context\n\n_Memory unavailable — proceed with codebase exploration._')
+            memory_unavailable = True
 
-        if not sections:
+        # Compute (and log) the filtered-result summary BEFORE any early
+        # return below: an all-foreign result set and a partial failure are
+        # both "no facts survived" outcomes, and the fact that a leak was
+        # caught and blocked must never be discarded along with them — see
+        # filter_foreign_project_results' loud-over-silent fail-open stance.
+        # foreign_dropped sums per-query drops over the SAME corpus (four
+        # queries can all match one distinct foreign memory), so the note
+        # names both numbers rather than implying `foreign_dropped` distinct
+        # facts were found.
+        drop_note = ''
+        if foreign_dropped > 0:
+            query_word = 'query' if queries_fired == 1 else 'queries'
+            drop_note = (
+                f'{foreign_dropped} memory result slot(s) across {queries_fired} '
+                f'{query_word} were tagged to another project and filtered out'
+            )
+            logger.info(
+                f'_get_memory_context: {drop_note} of the context assembled for '
+                f'{self.project_id!r}'
+            )
+
+        if not recalled_sections:
+            if memory_unavailable:
+                if drop_note:
+                    return (
+                        '# Context\n\n_Memory unavailable — proceed with codebase '
+                        f'exploration. Note: {drop_note} before the failure._'
+                    )
+                return '# Context\n\n_Memory unavailable — proceed with codebase exploration._'
+            if drop_note:
+                return f'# Context\n\n_No memory context available ({drop_note})._'
             return '# Context\n\n_No memory context available._'
 
-        return '# Context\n\n' + '\n\n---\n\n'.join(sections)
+        # recalled_sections is non-empty: gate the provenance caveat on that
+        # fact alone, NOT on memory_unavailable — a later query failing must
+        # not suppress the caveat (the untagged-leak mitigation) for
+        # sections that were already genuinely recalled. The failure, if
+        # any, is appended afterwards as its own section rather than
+        # silently dropped.
+        caveat = MEMORY_CONTEXT_CAVEAT.format(project_id=self.project_id)
+        if drop_note:
+            caveat += f'\n\n_In total, {drop_note}._'
+
+        rendered_sections = list(recalled_sections)
+        if memory_unavailable:
+            rendered_sections.append(
+                '_Memory unavailable for the remaining queries — proceed with '
+                'codebase exploration for anything not covered above._'
+            )
+
+        return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(rendered_sections)
+
+    async def _scoped_search(self, query: str) -> tuple[str | None, int]:
+        """Search fused-memory and drop cross-project results from the reply.
+
+        Thin wrapper over the UNCHANGED :meth:`_mcp_search` — never touches
+        which queries fire or their ``limit`` (task 3253 owns that
+        adjudication) — that applies :func:`filter_foreign_project_results`
+        to the raw text before it reaches :meth:`_get_memory_context`.
+        Returns ``(None, 0)`` when the underlying search itself returned
+        nothing (nothing to filter).
+
+        Assumes :meth:`_mcp_search` answers with a single JSON document: it
+        joins every MCP response text block with ``'\\n'`` before returning
+        (unchanged by this task, to keep its silent-fallthrough allowlist
+        entry valid). If the search tool ever replies with more than one
+        text block, the joined text is not valid JSON and the filter fails
+        open (unfiltered, WARNING logged) for that query — see
+        ``test_briefing_project_scope.py``'s ``TestScopedSearch`` for the
+        pinned limitation.
+        """
+        raw = await self._mcp_search(query)
+        if not raw:
+            return None, 0
+        return filter_foreign_project_results(raw, self.project_id)
 
     async def _mcp_search(self, query: str) -> str | None:
         """Search fused-memory via its MCP HTTP endpoint."""

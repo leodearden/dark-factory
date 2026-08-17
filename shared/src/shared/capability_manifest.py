@@ -304,4 +304,9 @@ class DeliveredCheckMeta(_CheckFieldsBase):
 # shared/tests/test_task_metadata.py's TestSubmodelRegistry stub registrations
 # — no longer applies: task 3352 moved those tests onto test-owned `_stub`
 # keys. The circular-import reason above is the one that is load-bearing.)
-register_metadata_submodel('delivered_checks', DeliveredCheckMeta)
+# cardinality='list' (task 4142): delivered_checks is the ONE genuinely
+# list-valued metadata slice — orchestrator/delivered_checks.py reads it and
+# verify_delivered_checks_on_main ITERATES it. 'dict' is parse_metadata's
+# fail-closed default, so this declaration is what keeps the enforced shape
+# gate from rejecting a well-formed list here.
+register_metadata_submodel('delivered_checks', DeliveredCheckMeta, cardinality='list')

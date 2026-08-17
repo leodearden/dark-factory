@@ -379,12 +379,28 @@ def clamp_unit_score(score: float) -> float:
     path delivered it.
 
     Clamps to ``[0, 1]`` and rounds to 4 decimal places — the precision
-    :func:`score_plan_structure` has always used. Does NOT handle NaN: ``min``/
-    ``max`` are ordering operations and NaN is unordered, so a NaN input passes
-    straight through unclamped (``round(min(max(nan, 0.0), 1.0), 4)`` is
-    ``nan``). A caller with untrusted input (:func:`judge_plan_quality`) must
-    check for that itself before calling this.
+    :func:`score_plan_structure` has always used. ``min``/``max`` are ordering
+    operations, so if this function accepted non-finite input, a NaN would
+    pass straight through unclamped (``round(min(max(nan, 0.0), 1.0), 4)`` is
+    ``nan``) and ``+/-Infinity`` would clamp mechanically (to ``1.0``/``0.0``)
+    while actually being a fabricated best/worst score rather than a
+    measurement — not something this function could tell apart from a real
+    one. Rather than leave that a convention callers must remember, this
+    function REJECTS all non-finite input outright with ``ValueError`` — a
+    loud floor, not just a documented one (structured-facts-at-failure). The
+    one caller with untrusted input (:func:`judge_plan_quality`) already
+    pre-checks with its own ``math.isfinite`` guard and degrades gracefully to
+    the ``None`` sentinel (with a WARNING) before ever reaching here, so in
+    practice this raise is a defense-in-depth backstop for a future second
+    caller that forgets to — the same class of gap :func:`is_scorable_plan`'s
+    docstring warns a second caller could otherwise silently re-open. This
+    function's contract is finite-in, ``[0, 1]``/4dp-out, ``ValueError`` on
+    anything else.
     """
+    if not math.isfinite(score):
+        raise ValueError(
+            f'clamp_unit_score requires finite input, got {score!r}'
+        )
     return round(min(max(score, 0.0), 1.0), 4)
 
 
@@ -461,6 +477,20 @@ class PlanQualityVerdict:
     # Trailing and defaulted, so every existing 3-arg construction (including
     # the parse-failure fallback below) is unaffected and keeps reading None.
     invocation_error: str | None = None
+    # USD spend of THIS verdict's own judge invocation (eval-revival υ).
+    # ``0.0`` when no invocation happened (the pre-invoke unjudgeable-artifact
+    # refusal below) or when the caller constructed the verdict itself — the
+    # same trailing-defaulted shape as ``invocation_error`` immediately above,
+    # for the same reason: every existing construction site keeps working.
+    # ``run_architect_eval`` reads this to fold the judge's spend into the
+    # cell's own ``cost_usd`` (metrics.py's documented judge_cost_usd-is-a-
+    # SUBSET-of-cost_usd contract). Every POST-invoke construction site below
+    # coerces via ``metrics.coerce_cost_usd`` before assigning here, so
+    # DECLARED type and ACTUAL runtime type agree even under a test double —
+    # a direct dataclass construction (like this default, or the legacy
+    # 3-arg call sites) is the only way this field can hold anything the
+    # helper did not already validate.
+    cost_usd: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -525,14 +555,13 @@ async def judge_plan_quality(
     A successfully parsed ``plan_quality`` is put through
     :func:`clamp_unit_score` rather than returned as a raw float — see that
     function's docstring for why a runtime clamp is still needed despite
-    ``PLAN_QUALITY_SCHEMA``'s declared bounds, and for the NaN-is-unorderable
+    ``PLAN_QUALITY_SCHEMA``'s declared bounds, and for the non-finite-input
     mechanics behind the exception below. The parse contract is one rule with
     two LOUD exceptions (never silent — each leaves one WARNING naming the
-    cell): an out-of-range-but-orderable answer (e.g. ``1.5``) is clamped and
-    the WARNING names the raw and clamped values; a non-finite, unorderable
-    answer (``NaN``) degrades to the ``None`` sentinel instead, exactly like a
-    parse failure. ``+/-Infinity`` IS orderable, so it takes the ordinary
-    clamp path (``1.0``/``0.0``), not the NaN one.
+    cell): an out-of-range but FINITE answer (e.g. ``1.5``) is clamped and
+    the WARNING names the raw and clamped values; ANY non-finite answer
+    (``NaN``, ``+/-Infinity``) degrades to the ``None`` sentinel instead,
+    exactly like a parse failure, because it is not a judgement at all.
 
     On any parse failure the verdict's ``plan_quality`` is ``None`` (the
     sentinel :func:`run_architect_eval` degrades on), never a crash. When the
@@ -541,6 +570,19 @@ async def judge_plan_quality(
     infra cause stays distinguishable from an unparseable answer; the caller
     still degrades to the deterministic structural floor, which remains a
     legitimate content-derived score whenever a real plan exists.
+
+    COST ACCOUNTING (eval-revival υ): the returned verdict's ``cost_usd``
+    reports THIS invocation's own USD spend — every path that reached
+    ``invoke_agent`` (success, transport refusal, NaN, parse failure) carries
+    that call's real cost, whatever the verdict turned out to be; only the
+    PRE-invoke unjudgeable-artifact refusal above, which returns before
+    ``invoke_agent`` is ever called, reports ``0.0``. Each of those four
+    POST-invoke sites coerces ``result.cost_usd`` through
+    :func:`~orchestrator.evals.metrics.coerce_cost_usd` (amendment,
+    reviewer design-coherence) before it rides the verdict, so the
+    dataclass's declared ``float`` type is actually true at every
+    construction site — not just enforced by whichever caller happens to
+    read it defensively.
     """
     # Name WHICH cell to go look at, whichever key the caller populated:
     # ``run_architect_eval`` passes ``id``, but a second caller — precisely the
@@ -584,6 +626,10 @@ async def judge_plan_quality(
                 'plan carries no steps — not a judgeable artifact; scored on '
                 f'the deterministic structural floor ({floor})'
             ),
+            # cost_usd stays the dataclass default (0.0): no invoke_agent call
+            # happened on this path, so recording any spend would fabricate
+            # it — the same anti-fabrication discipline that governs
+            # plan_quality and invocation_error on this exact return.
         )
 
     task_name = task.get('name', task.get('id', 'unknown'))
@@ -643,8 +689,10 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
     # the parse-failure fallback — making an infra refusal indistinguishable
     # from a judge that answered badly. Local import: keeps judge.py's
     # module-level import surface unchanged (and there is no cycle either way —
-    # metrics.py does not import judge).
-    from .metrics import detect_invocation_error
+    # metrics.py does not import judge). coerce_cost_usd is the SAME producer-
+    # side coercion used at every POST-invoke return below (amendment,
+    # reviewer design-coherence) — see its docstring in metrics.py.
+    from .metrics import coerce_cost_usd, detect_invocation_error
 
     invocation_error = detect_invocation_error(result)
     if invocation_error:
@@ -657,6 +705,8 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
             per_criterion={},
             reasoning=f'plan judge invocation refused: {invocation_error}',
             invocation_error=invocation_error,
+            # A refused invocation still burned tokens — real spend, not $0.
+            cost_usd=coerce_cost_usd(result.cost_usd),
         )
 
     # Parse verdict — structured_output first, else json.loads(output); a
@@ -668,27 +718,35 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
             plan_quality = None
         else:
             raw_quality = float(raw_quality)
-            # NaN is unorderable, so clamp_unit_score cannot enforce [0, 1] on
-            # it (see that function's docstring for the mechanics) — checked
-            # BEFORE the clamp, not after. +/-Infinity IS orderable and falls
-            # through to the clamp + out-of-range warning below instead: a
-            # judge answering infinity clearly means "as high/low as it
-            # goes", the same intent-preserving reasoning that governs any
-            # other out-of-range-but-orderable answer.
-            if math.isnan(raw_quality):
+            # A non-finite answer is not a judgement at all, so it degrades
+            # to the None sentinel BEFORE the clamp (see clamp_unit_score's
+            # docstring for the mechanics): NaN because it is unordered and
+            # the clamp cannot constrain it at all; +/-Infinity because the
+            # clamp CAN constrain it, but only by fabricating the best/worst
+            # possible score (1.0/0.0) on a live ranking surface
+            # (report._mean_plan_quality -> select_survivors) — a worse
+            # failure than admitting no measurement. The finite
+            # out-of-range clamp + WARNING path immediately below is
+            # DELIBERATELY unchanged (operator SCOPE RULING 2026-08-12):
+            # this narrows the task-3410 amendment, it does not reverse it
+            # — finite overshoots stay orderable and intent-preserving.
+            if not math.isfinite(raw_quality):
                 logger.warning(
                     f'Plan judge for {cell} answered a non-finite '
-                    f'plan_quality (NaN) — not a real judgement, degraded to '
-                    f'the None sentinel (run_architect_eval falls back to '
-                    f'the deterministic structural floor).'
+                    f'plan_quality ({raw_quality!r}) — not a real judgement, '
+                    f'degraded to the None sentinel (run_architect_eval '
+                    f'falls back to the deterministic structural floor).'
                 )
                 return PlanQualityVerdict(
                     plan_quality=None,
                     per_criterion={},
                     reasoning=(
                         f'Plan judge answered a non-finite plan_quality '
-                        f'(NaN) for {cell}'
+                        f'({raw_quality!r}) for {cell}'
                     ),
+                    # The judge DID run and produced an answer (a nonsense
+                    # one) — real spend, not $0.
+                    cost_usd=coerce_cost_usd(result.cost_usd),
                 )
             plan_quality = clamp_unit_score(raw_quality)
             # See clamp_unit_score's docstring for why the schema bound alone
@@ -711,10 +769,24 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
             plan_quality=None,
             per_criterion={},
             reasoning='Plan judge output parse failure',
+            # The judge DID run and produced output (just unparseable) —
+            # real spend, not $0.
+            cost_usd=coerce_cost_usd(result.cost_usd),
         )
 
     return PlanQualityVerdict(
         plan_quality=plan_quality,
         per_criterion=verdict.get('per_criterion', {}) or {},
         reasoning=verdict.get('reasoning', ''),
+        # Coerced at the producer via the shared metrics.coerce_cost_usd
+        # helper (amendment, reviewer design-coherence): isinstance-gated,
+        # so a bare MagicMock — as the pre-existing judge tests construct,
+        # without setting cost_usd — degrades to 0.0 instead of leaking a
+        # non-float into a field declared ``float`` (verified: MagicMock
+        # configures __float__ to return 1.0, so a naive float() coercion
+        # would have silently FABRICATED spend instead; isinstance avoids
+        # that trap). This makes the declared type actually true at every
+        # construction site, not enforced only by the runner's defensive
+        # read (_verdict_cost_usd, now itself built on this same helper).
+        cost_usd=coerce_cost_usd(result.cost_usd),
     )

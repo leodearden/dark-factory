@@ -7,6 +7,7 @@ fetch_external_statuses short-circuit + fail-safe semantics.
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -548,3 +549,132 @@ class TestFetchTasksCache:
             f'on the same project_root), got {mock_mcp.call_count}'
         )
         assert result1 == result2
+
+
+# ---------------------------------------------------------------------------
+# cross-project fan-out streak isolation (task 4133)
+# ---------------------------------------------------------------------------
+
+
+class TestFanoutStreakIsolationAcrossProjectRoots:
+    """One broken project_root must not re-arm its WARNING every poll cycle.
+
+    The mcp_fanout throttle key is ``(log_label, url)`` and ONE fused-memory
+    URL serves every project_root, so a fixed literal ``log_label`` collapses
+    all roots onto one key. ``note_fanout_success`` *pops* that key, so a
+    healthy root's success in the same poll cycle clears the broken root's
+    open streak — its next failure is ``streak == 1`` again, emitting both an
+    opening and a 'recovered' WARNING every cycle, indefinitely. That is the
+    exact sustained flood the transition-only policy (task 3871) exists to
+    prevent, reintroduced through the key rather than the level.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_state(self):
+        """Give each test clean streak AND cache state.
+
+        Without reset_sessions an earlier test's open streak would silently
+        demote this test's expected opening WARNING to DEBUG — the exact
+        failure mode reset_failure_streaks was added for.
+        """
+        import dashboard.data.tasks as tasks_mod
+        from dashboard.data.memory import reset_sessions
+
+        reset_sessions()
+        tasks_mod._fetch_tasks_cache_clear()
+        yield
+        reset_sessions()
+        tasks_mod._fetch_tasks_cache_clear()
+
+    @staticmethod
+    def _per_root_side_effect(root_a: str, payload: dict):
+        """Raise ConnectError for root A; return *payload* for any other root."""
+        async def _call(client, url, tool, args):
+            if args.get('project_root') == root_a:
+                raise httpx.ConnectError('refused')
+            return payload
+        return _call
+
+    @staticmethod
+    def _fanout_records(caplog):
+        records = [r for r in caplog.records if r.name == 'dashboard.data.mcp_fanout']
+        warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+        return warnings
+
+    async def test_fetch_tasks_broken_root_warns_once_across_poll_cycles(
+        self, dummy_client, dummy_config, tmp_path, caplog
+    ):
+        """Three poll cycles, one shared URL, root A broken and root B healthy."""
+        import dashboard.data.tasks as tasks_mod
+        from dashboard.data.tasks import fetch_tasks
+
+        assert len(dummy_config.fused_memory_urls) == 1, (
+            'the collapse only shows up when both roots share one URL'
+        )
+        root_a = str(tmp_path / 'proj-a')
+        root_b = str(tmp_path / 'proj-b')
+
+        mock_mcp = AsyncMock(
+            side_effect=self._per_root_side_effect(root_a, _CANNED_GET_TASKS_RESULT)
+        )
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'), \
+                patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            for _ in range(3):
+                # Clear the 20 s TTL cache so root B genuinely re-polls each
+                # cycle, as the live UI does once its entry expires.
+                tasks_mod._fetch_tasks_cache_clear()
+                a_result = await fetch_tasks(dummy_client, dummy_config, root_a)
+                b_result = await fetch_tasks(dummy_client, dummy_config, root_b)
+
+        # fetch_tasks returns ``list[dict] | dict``; narrow to the offline
+        # marker branch before reading it (same shape as the cache tests above).
+        assert isinstance(a_result, dict), 'root A must return the offline marker'
+        assert a_result.get('offline') is True, 'root A must be failing'
+        assert isinstance(b_result, list), 'root B must be healthy'
+
+        warnings = self._fanout_records(caplog)
+        assert len(warnings) == 1, (
+            f'a broken root must warn once, not once per poll cycle, got {warnings}'
+        )
+        assert not [m for m in warnings if 'recovered' in m], (
+            f"root B's success must not close root A's streak, got {warnings}"
+        )
+        assert 'proj-a' in warnings[0], (
+            'the WARNING must name the failing project_root — with one shared '
+            f'URL it is the only way to tell which root is down, got {warnings[0]}'
+        )
+
+    async def test_fetch_statuses_broken_root_warns_once_across_poll_cycles(
+        self, dummy_client, dummy_config, tmp_path, caplog
+    ):
+        """Same contract for the burndown collector's fetch_statuses path."""
+        from dashboard.data.tasks import fetch_statuses
+
+        root_a = str(tmp_path / 'proj-a')
+        root_b = str(tmp_path / 'proj-b')
+
+        mock_mcp = AsyncMock(
+            side_effect=self._per_root_side_effect(
+                root_a, {'statuses': {'1': 'done', '2': 'pending'}}
+            )
+        )
+        # fetch_statuses is uncached, so every cycle genuinely re-polls.
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'), \
+                patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            for _ in range(3):
+                a_result = await fetch_statuses(dummy_client, dummy_config, root_a)
+                b_result = await fetch_statuses(dummy_client, dummy_config, root_b)
+
+        assert a_result.get('offline') is True, 'root A must be failing'
+        assert b_result == {1: 'done', 2: 'pending'}, 'root B must be healthy'
+
+        warnings = self._fanout_records(caplog)
+        assert len(warnings) == 1, (
+            f'a broken root must warn once, not once per poll cycle, got {warnings}'
+        )
+        assert not [m for m in warnings if 'recovered' in m], (
+            f"root B's success must not close root A's streak, got {warnings}"
+        )
+        assert 'proj-a' in warnings[0], (
+            f'the WARNING must name the failing project_root, got {warnings[0]}'
+        )

@@ -75,6 +75,7 @@ class TestCheckRun:
         d = run.to_dict()
         assert set(d) == {
             'label', 'cmd', 'rc', 'output', 'timed_out', 'started_at', 'duration_secs',
+            'segments',
         }
 
     def test_to_dict_started_at_passthrough_when_not_none(self):
@@ -113,7 +114,103 @@ class TestCheckRun:
             'timed_out': False,
             'started_at': 'ts',
             'duration_secs': 3.25,
+            'segments': None,
         }
+
+
+class TestCheckRunSegments:
+    """task 3338: CheckRun carries per-segment execution facts for a segmented run.
+
+    The fallback verify runs `dark-factory-orchestrator.yaml`'s `test_command`
+    — an `&&` chain across every subproject — so an unrelated earlier
+    subproject's red short-circuits the shell and a task's OWN tests never run
+    (esc-3062-2). The fix runs each segment separately, which produces per-
+    segment facts that have to reach the triaging agent. They ride on the
+    existing `CheckRun`, so `runs = [c.to_dict() for c in attempt.checks]`
+    carries them with no change to `_persist_attempt_logs`. Landing them in
+    the persisted `attempt-N[.<prefix>].summary.json` did take one change:
+    `_build_summary_payload` rebuilds each command entry from an explicit key
+    whitelist rather than passing the run dict through, so `segments` had to
+    be added there too (amendment; `test_verify_segmented_fallback
+    .TestSegmentsReachThePersistedSummaryJson` reads the written file).
+
+    `segments` is emitted UNCONDITIONALLY (as `None` when the check was not
+    run segmented). A conditionally-present key would leave a consumer unable
+    to tell "this build predates segments" from "this run was not segmented"
+    — an absent-vs-null ambiguity in the very schema whose job is to make
+    skipped-vs-passed unambiguous.
+    """
+
+    def test_segments_defaults_to_none(self):
+        """Every pre-3338 construction site stays valid — it is the LAST field."""
+        from orchestrator.verify import CheckRun  # noqa: PLC0415
+
+        run = CheckRun(
+            label='test',
+            cmd='uv run pytest',
+            rc=0,
+            output='',
+            timed_out=False,
+            started_at='ts',
+            duration_secs=1.5,
+        )
+        assert run.segments is None
+        assert run.to_dict()['segments'] is None
+
+    def test_skipped_leaves_segments_none(self):
+        """A module_config skip ran no command at all, so it ran no segments."""
+        from orchestrator.verify import CheckRun  # noqa: PLC0415
+
+        assert CheckRun.skipped('test').segments is None
+
+    def test_segments_round_trip_through_to_dict_unchanged(self):
+        """Plain JSON-native `list[dict]`, passed through verbatim.
+
+        Flat dicts rather than a nested dataclass for the same reason the rest
+        of this schema is flat: `to_dict()` output is written straight into
+        JSON, so anything that needs its own serialisation step is a second
+        place for the shape to drift.
+        """
+        from orchestrator.verify import CheckRun  # noqa: PLC0415
+
+        segments = [
+            {
+                'index': 1,
+                'label': 'shared-1',
+                'cwd': 'shared',
+                'cmd': 'uv run pytest tests/ --timeout=300',
+                'status': 'passed',
+                'rc': 0,
+                'timed_out': False,
+                'duration_secs': 12.5,
+                'skip_reason': None,
+            },
+            {
+                'index': 2,
+                'label': 'root-2',
+                'cwd': '.',
+                'cmd': 'uv run --project shared pytest tests/scripts/ --timeout=300',
+                'status': 'not_run',
+                'rc': None,
+                'timed_out': False,
+                'duration_secs': 0.0,
+                'skip_reason': 'chain wall-clock budget exhausted',
+            },
+        ]
+        run = CheckRun(
+            label='test',
+            cmd='cd shared && uv run pytest tests/ --timeout=300 && uv run pytest tests/scripts/',
+            rc=1,
+            output='...',
+            timed_out=True,
+            started_at='ts',
+            duration_secs=13.0,
+            segments=segments,
+        )
+        assert run.to_dict()['segments'] == segments
+        # Passed through, not copied-and-rebuilt: a rebuild would be a second
+        # definition of the segment shape, free to drift from _run_segmented's.
+        assert run.to_dict()['segments'] is segments
 
 
 def _run(label, rc=0, timed_out=False, cmd='cmd', output='', started_at='ts', duration_secs=1.0):

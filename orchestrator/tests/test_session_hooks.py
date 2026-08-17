@@ -198,6 +198,34 @@ def test_hook_session_slug_sanitizes_malformed_claude_spawn_session_id() -> None
     assert slug == 'bad-id-x'
 
 
+@pytest.mark.parametrize(
+    ('spawn_session_id', 'expected'),
+    [('.', '-'), ('..', '--'), ('...', '---')],
+)
+def test_hook_session_slug_sanitizes_all_dots_claude_spawn_session_id(
+    spawn_session_id: str,
+    expected: str,
+) -> None:
+    # Task 4112: the live, externally-supplied entry point for the '..' escape.
+    # CLAUDE_SPAWN_SESSION_ID comes from outside the process and
+    # hook_session_slug hands it to sanitize_slug DIRECTLY (deliberately
+    # bypassing build_session_slug to avoid double-prefixing -- see its
+    # docstring). Covering only the registry unit would leave this
+    # attacker-reachable path untested: a future refactor of that bypass could
+    # drop the sanitize call with every registry-level test still green.
+    #
+    # This test owns exactly that routing claim. The downstream containment
+    # property (record_path_for_slug's join stays under sessions_dir) is owned
+    # by test_record_path_for_slug_all_dots_slug_stays_under_sessions_dir in
+    # test_session_registry.py, together with its non-vacuity counterfactual --
+    # asserting it here too would drag a registry-layer invariant across the
+    # module boundary and break two files for one change.
+    hook_input = {'session_id': 'uuid-x', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': spawn_session_id}
+    slug = sh.hook_session_slug(hook_input, env=env)
+    assert slug == expected
+
+
 # ---------------------------------------------------------------------------
 # Step-3: pure OSC-retitle + display-title helpers
 # ---------------------------------------------------------------------------

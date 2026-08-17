@@ -10,3 +10,109 @@ test_command: "uv run --project fused-memory --directory fused-memory pytest tes
 # bare-MagicMock + asyncmock-assertion gates (also run in merge-queue verify; see hooks/project-checks)
 lint_command: "uv run --project fused-memory --directory fused-memory ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests"
 type_check_command: "uv run --project fused-memory --directory fused-memory pyright src/ tests/"
+
+# Per-module verify budget (task 3473). Before this, fused-memory declared
+# nothing here and fell HARD through to the repo-root whole-fleet ceiling.
+#
+# (1) MEASUREMENT PROVENANCE. Six runs of the VERBATIM test_command above,
+# copied byte-for-byte, on base main 5a7770d239. EVERY FIGURE IS CONTENDED — a
+# 32-core host running /proc/loadavg 72-229 throughout — and none is quoted as
+# an unloaded one, per orchestrator/tests/warm-lane/README.md.
+#
+#    181.12s wall /153.76s pytest @ loadavg  72.37  <- the CONVENIENT figure
+#    236.23s wall                 @ loadavg 229.40
+#    273.52s wall /257.66s pytest @ loadavg 119.77
+#    408.45s wall /393.20s pytest @ loadavg 191.12  (6-way concurrent wave)
+#    435.56s wall                 @ loadavg 123.76  (6-way concurrent wave)
+#    439.80s wall /352.86s pytest @ loadavg 120.09  <- the INCONVENIENT one
+#
+# (1a) THIS MODULE HAS NO GREEN RUN, and the budget is sized from RED ones.
+# Stated here rather than left for someone to infer from an exit code. All six
+# runs exit rc=1 with `1 failed, 11350 passed, 2 skipped` on a PRE-EXISTING
+# failure — tests/test_lock_charter_guard.py::
+# test_every_tracked_extension_is_allowlisted, which reports that tracked .csv
+# files under plans/evidence/ are absent from CODE_EXTENSIONS. It is red at base
+# main 5a7770d239, before task 3473 touched anything, and is filed as escalation
+# esc-3473-1; CODE_EXTENSIONS lies outside this task's locked files.
+#
+# The sizing rule is "worst across recorded GREEN runs". Applying it to red runs
+# here is a judgement, not an oversight, and rests on three checkable facts: the
+# failing assertion is a content-derived allowlist check that adds no measurable
+# wall-clock; the suite ran to COMPLETION on every run (no -x, no early exit, all
+# 11353 collected); and the fix is one allowlist entry, which adds zero runtime,
+# so a budget sized against today's figure stays valid after it lands. It
+# remains an assumption with an error bar rather than a clean measurement, and
+# the 2.6x multiple is what absorbs it.
+#
+# (1b) THIS IS AN XDIST FIGURE, VALID ONLY WHILE THAT HOLDS. fused-memory is the
+# only in-scope module running under pytest-xdist — fused-memory/pyproject.toml
+# sets `addopts = "-n auto --dist loadgroup -m 'not integration'"`. 11353
+# collected test functions in ~400s is a PARALLEL figure, which makes this the
+# module whose wall-clock is most sensitive to host load and to the concurrent
+# wave. A future change to `-n` or to the dist mode INVALIDATES this measurement
+# rather than merely shifting it: re-measure, do not scale the number below.
+#
+# (1c) THE CONCURRENT ARM OF THAT SWEEP WAS A 6-WAY WAVE, which is a LOWER
+# BOUND on the production shape rather than a reproduction of it:
+# verify.run_full_verification asyncio.gathers over module_configs.values() —
+# NINE registered configs today, including the dominant `orchestrator` segment
+# measured at 1366.23s — so a full gather is materially heavier than what was
+# measured, and W under-states the fully-concurrent cost. Two uncredited
+# mechanisms bound the gap (verify_plan scoping, and the
+# shared.verify_admission slot gate whose wait falls outside the timeout
+# clock); what remains is what the 2.6x multiple absorbs, as an assumption
+# rather than a measurement. Full statement in shared/orchestrator.yaml
+# paragraph (1a).
+#
+# On THIS module the caveat lands softer: W (439.80s) is a SERIAL warm-up run,
+# LARGER than either wave row (408.45s / 435.56s), so W is not itself a wave
+# figure whose width is in question. The nine-way gather is still unmeasured,
+# and this is the module most sensitive to it — xdist under -n auto competes
+# for the same cores every other gathered segment wants — so the concern is
+# reduced here, not retired.
+#
+# (2) SIZING. W = 439.80s, the WORST run, never the mean.
+#     B ~= 2.6 x W = 1143.5 -> rounded up to 1200.
+# Max-not-mean is forced by recorded evidence: scripts/orchestrator.yaml logs a
+# ~3x spread (310.33s -> 914.61s) for a BYTE-IDENTICAL command on a
+# BYTE-IDENTICAL tree — host load at measurement time, not suite variance. This
+# module's own six runs span 181.12s -> 439.80s, ~2.4x.
+#
+# (3) THE 2.6x MULTIPLE AND THE 600s FLOOR ARE INHERITED DELIBERATELY, not
+# coincidentally: tests/scripts' 600 ~= 2.6 x 233.50 and scripts' 2400 ~= 2.6 x
+# 930.59, and scripts/orchestrator.yaml states it kept the multiple identical
+# across the two on purpose. The 600s floor is not binding here.
+#
+# (4) WHAT THIS ACTUALLY BUYS: 3600s -> 1200s, a 3x narrowing. It does NOT make
+# the suite faster and does not detect suite growth.
+#
+# (4a) COUNT THE RETRIES. config.verify_timeout_retries defaults to 2 and the
+# repo-root yaml does not override it, and verify.py's attempt loop re-runs a
+# PURE TIMEOUT failure — so on the TASK path a hang here costs up to
+# 3 x 1200s = ~60 minutes, not ~20, against up to 3 x 3600s = ~3 hours before
+# this declaration. The 3x ratio is unaffected (the multiplier divides out);
+# the absolute minutes are 3x larger than the budget alone suggests. The
+# merge-verify and background paths pass max_retries=0 and pay 1200s once.
+# Full statement of the mechanism in shared/orchestrator.yaml paragraph (4a).
+#
+# (5) verify_command_timeout_secs is a PER-COMMAND budget, so this bounds the
+# TEST leg on its own — NOT test + lint + type summed. That matters more here
+# than elsewhere: this module's lint_command chains THREE checks.
+#
+# (6) verify_cold_command_timeout_secs is DELIBERATELY LEFT UNSET: no build step
+# whose cold cost would justify a separate cold budget. Per
+# verify._resolve_verify_timeout, an unset module cold knob does NOT inherit the
+# 1200 below — it falls through to the repo-root verify_cold_command_timeout_secs
+# (5400), and on a MERGE-cold verify falls through first to
+# config.merge_verify_cold_command_timeout_secs (7200, shipped by the
+# package-bundled orchestrator/src/orchestrator/defaults.yaml and not overridden
+# by the root yaml). Gated by assertion (f) of the guard below.
+#
+# (7) RAISE THEM TOGETHER. If this suite grows enough to approach 1200s,
+# RE-MEASURE and raise BOTH this value and
+# MEASURED_MODULE_SUITE_WORST_SECS['fused-memory'] in
+# tests/scripts/test_module_verify_budgets.py — never quietly widen one.
+#
+# (8) GATED BY tests/scripts/test_module_verify_budgets.py::
+# test_module_carries_its_own_measured_verify_budget[fused-memory].
+verify_command_timeout_secs: 1200

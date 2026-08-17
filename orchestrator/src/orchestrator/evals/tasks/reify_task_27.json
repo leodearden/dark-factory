@@ -21,6 +21,14 @@
   ],
   "complexity": "high",
   "expected_files_changed": [],
+  "reference": {
+    "post_task_commit": "d70b78ea2ec4bfd8fc9903adbaf4257017be6eda",
+    "diff_stat": {
+      "files": 5,
+      "insertions": 549,
+      "deletions": 3
+    }
+  },
   "plan": {
     "task_id": "reify_task_27",
     "title": "Warm-start protocol with LRU pool",

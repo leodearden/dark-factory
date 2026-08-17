@@ -228,10 +228,46 @@ class EventType(StrEnum):
     # session was present for the dispatched task:
     #   session_resume          — an eligible session was injected as --resume.
     #   session_resume_fallback — an ineligible session degraded to fresh
-    #                             dispatch; data.reason ∈ {stale, no_transcript}.
+    #                             dispatch; data.reason ∈ {stale, no_transcript,
+    #                             reseeded}.
     #   session_resume_capped   — resume_count reached max_resumes_per_task;
     #                             by-design throttling, degrades to fresh dispatch.
     # (enabled=False degrades silently — no event.)
+    #
+    # Of the fallback reasons, `reseeded` is EXPECTED, not a failure (task
+    # 3256): warm-lane acquire ALWAYS re-seeds a lane from base, wiping
+    # <lane>/.task/ and the whole claude-config transcript store with it, so a
+    # session adopted at boot routinely finds its store gone by re-dispatch. It
+    # therefore does NOT feed the fallback-storm streak (like
+    # session_resume_capped); only {stale, no_transcript} do. The event is still
+    # emitted so the rate stays measurable (PRD open question 3 — lane-collision
+    # rate is read off these reasons post-deploy).
+    #
+    # Ratio recipe: there is no separate "attempt" row — attempts are the SUM of
+    # the three outcome events (session_resume + session_resume_fallback +
+    # session_resume_capped) for a window, since the guard emits exactly one per
+    # dispatch that carried a recovered session. Read the fallback RATE as a
+    # ratio against that denominator rather than as an absolute count, and split
+    # the numerator by json_extract(data, '$.reason') to separate expected
+    # reseeds from genuine corroboration failures. (enabled=False emits nothing,
+    # so a zero total means either no recovered sessions or the kill switch.)
+    #
+    # session_resume_fallback additionally carries `data.archive_available: bool`
+    # (task 3727) on BOTH reasons — reseeded and {stale, no_transcript} alike —
+    # answering "was this session actually RECOVERABLE from the durable
+    # transcript archive?", i.e. did its transcript survive outside the wiped
+    # worktree. Query it as json_extract(data, '$.archive_available') alongside
+    # the existing '$.reason' split, so the fallback population can be cut into
+    # recoverable vs genuinely lost.
+    #
+    # session_resume and session_resume_capped deliberately do NOT carry the
+    # field, so the ratio recipe's DENOMINATOR above is unchanged — the
+    # instrument was added to exactly one of the three outcome events.
+    #
+    # The rate this field exposes is a MEASUREMENT, not a target: it quantifies
+    # a recoverable population that nothing yet acts on (INV-3
+    # instrument-before-acting). Task 3619 will deliberately move it upward, so
+    # a rising archive_available rate is that work landing, not a regression.
     session_resume = 'session_resume'
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'
@@ -252,6 +288,29 @@ class EventType(StrEnum):
     # Scheduler-scoped (task_id=None). Payload: {consecutive_failures}.
     park_eviction_deferred_fm_unavailable = 'park_eviction_deferred_fm_unavailable'
     scheduler_tier_cap_idle = 'scheduler_tier_cap_idle'
+    # EASY-backfill admission through parks (task 3823 / scheduler-scoring PRD
+    # C7).  Emitted when a candidate blocked ONLY by another task's park is
+    # admitted through it because its predicted hold, times the configured
+    # safety factor, fits inside the gap that park is provably still waiting
+    # on.  Payload: {predicted_hold, safety_factor, admission_bound,
+    # provable_assembly_delay, park_owners, modules}.
+    #
+    # Predicted AND (via park_backfill_overstay) realized are both recorded so
+    # the modelled 7-9% overstay rate at safety x2.5
+    # (plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:254-255)
+    # is MEASURED in production rather than assumed.  backfill_safety_factor
+    # is green-tier reloadable precisely so that measurement can retune it.
+    park_backfill_granted = 'park_backfill_granted'
+    # The settlement of the above: emitted at release when a back-filled hold
+    # ran LONGER than the bound its admission promised.  Payload:
+    # {predicted_hold, safety_factor, admission_bound, realized_hold,
+    # overstay_secs, park_owners, modules}.  Predicted and realized both ride
+    # on the event on purpose — the comparison is the finding, and nobody
+    # should have to reconstruct it from log lines.
+    #
+    # NOT emitted through _emit_lock_event: that chokepoint is contractually
+    # the lock-event single writer and raises on any other event type.
+    park_backfill_overstay = 'park_backfill_overstay'
 
     # Scheduler priority overrides
     #

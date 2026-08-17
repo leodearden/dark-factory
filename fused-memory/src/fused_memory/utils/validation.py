@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,50 @@ def _is_plain_int(x: object) -> bool:
     as list[int] element IDs.
     """
     return isinstance(x, int) and not isinstance(x, bool)
+
+
+# Remediation text for a rejected non-full-UUID id.  Single-sourced here so the
+# structured `hint` key returned by validate_full_uuid and the message raised by
+# require_full_uuid stay in agreement.
+_FULL_UUID_HINT = (
+    'Resolve the full 36-character UUID first — call search or get_memory_by_id '
+    'and pass that result\'s `id` field verbatim. An 8-character hex prefix read '
+    'out of a search-result snippet is not a valid id.'
+)
+
+
+def is_full_uuid(value: object) -> bool:
+    """True iff *value* is a canonical full-UUID string.
+
+    Deliberately stricter than a bare ``uuid.UUID(value)`` call, which also
+    accepts the 32-char undashed form, braced forms and ``urn:uuid:``
+    prefixes.  Requiring the canonical 36-char dashed rendering is what
+    rejects the ``short_hex`` shape the census counted (3 live ``supersedes``
+    members) and truncated hex generally — a bare parse would let a
+    32-hex-digit string through as "well formed" while no store would
+    resolve it in that spelling.
+
+    Case is tolerated (``str(uuid.UUID(x))`` is lowercase) because casing is
+    a rendering choice, not a different identifier.  Graphiti/Neo4j and mem0
+    do not normalise UUID case on read-back, so rejecting an uppercase id
+    here would mask real edges and memories as malformed before the store is
+    even called.
+
+    Surrounding whitespace is rejected, and that rejection is intentional
+    rather than incidental: ``uuid.UUID`` strips ``urn:``/``uuid:`` prefixes,
+    braces and dashes, but never whitespace — so ``'<uuid>\\n'`` yields a
+    33-character hex body and raises.  This is the one behaviour an anchored
+    ``^...$`` regex applied with ``.match()`` cannot reproduce, because
+    Python's ``$`` matches immediately before a trailing newline; such an id
+    would pass a regex gate and then silently resolve to nothing downstream.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return str(parsed) == value.lower()
 
 
 def _validate_identifier(value: str, field_name: str) -> dict[str, str] | None:
@@ -146,6 +191,30 @@ def validate_int_ids(ids: object, *, name: str = 'ids') -> dict[str, str] | None
     return None
 
 
+def validate_full_uuid(
+    value: object, *, field_name: str = 'memory_id'
+) -> dict[str, str] | None:
+    """Return an error dict if *value* is not a canonical full UUID, else None.
+
+    Shape rules live in :func:`is_full_uuid`.  The ``field_name`` keyword
+    argument customises the field label in the error message so the helper
+    generalises to callers validating list members (e.g. ``supersedes[0]``).
+
+    Unlike the sibling validators this returns a third ``hint`` key: a caller
+    that supplied a truncated id needs to be told how to obtain the real one,
+    not merely that the one it sent was wrong.
+    """
+    if is_full_uuid(value):
+        return None
+    return {
+        'error': (
+            f'{field_name} must be a full 36-character UUID, got {_safe_repr(value)}'
+        ),
+        'error_type': 'ValidationError',
+        'hint': _FULL_UUID_HINT,
+    }
+
+
 def require_project_root(project_root: str) -> None:
     """Raise InputValidationError if project_root is not a non-empty absolute path."""
     if err := validate_project_root(project_root):
@@ -168,6 +237,17 @@ def require_int_ids(ids: object, *, name: str = 'ids') -> None:
     """Raise InputValidationError if ids is not a list of plain (non-bool) integers."""
     if err := validate_int_ids(ids, name=name):
         raise InputValidationError(err['error'])
+
+
+def require_full_uuid(value: object, *, field_name: str = 'memory_id') -> None:
+    """Raise InputValidationError if *value* is not a canonical full UUID.
+
+    The hint is folded into the exception message because an exception has no
+    room for a separate structured key — see :func:`validate_full_uuid` for the
+    MCP-facing form that keeps them apart.
+    """
+    if err := validate_full_uuid(value, field_name=field_name):
+        raise InputValidationError(f'{err["error"]} {err["hint"]}')
 
 
 def validate_known_project_id(

@@ -11,13 +11,11 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
-from _orch_helpers import pydantic_spec, stamp_stock_routing_config
 from escalation import archive
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.usage_gate import AccountLease, InvokeSlot
 
-from orchestrator.config import OrchestratorConfig
 from orchestrator.steward import (
     StewardMetrics,
     TaskSteward,
@@ -92,101 +90,59 @@ def _attach_invoke_slot(gate: MagicMock) -> MagicMock:
 
 
 @pytest.fixture
-def worktree(tmp_path: Path) -> Path:
-    wt = tmp_path / 'worktree'
-    wt.mkdir()
-    task_dir = wt / '.task'
-    task_dir.mkdir()
-    (task_dir / 'metadata.json').write_text(json.dumps({'task_id': '42'}))
-    (task_dir / 'plan.json').write_text(json.dumps({'steps': []}))
-    return wt
+def steward(make_steward):
+    """The module's single steward, built by the shared ``make_steward`` factory.
 
+    Task 3514 folded this file's former five-fixture graph (``worktree`` /
+    ``mock_config`` / ``mock_queue`` / ``mock_mcp`` / ``mock_briefing`` plus a
+    module-local ``_build_steward``) onto the conftest factory, which now owns
+    every steward worktree in the suite.  Those five names survive below as
+    one-line VIEWS onto this steward's collaborators, so no call-site signature
+    changed — and because pytest caches fixtures per test, a test requesting
+    ``(steward, mock_config)`` still sees the very object the steward holds.
 
-@pytest.fixture
-def mock_config():
-    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    config.project_root = Path('/tmp/fake-project')
-    config.models.steward = 'opus'
-    config.budgets.steward = 5.0
-    config.max_turns.steward = 100
-    config.effort.steward = 'high'
-    config.backends.steward = 'claude'
-    # Triage (inner pre-triage invoke) config layer — task η routes
-    # _pre_triage_suggestions through resolve_route too.
-    config.models.triage = 'sonnet'
-    config.budgets.triage = 2.0
-    config.max_turns.triage = 25
-    config.effort.triage = 'medium'
-    config.backends.triage = 'claude'
-    # task η: the two steward sites now call resolve_route, which does real
-    # membership/dict ops against config.routing.* that a bare MagicMock cannot
-    # satisfy — stamp the stock (haiku/sonnet/opus, no ceilings, no rules) shape.
-    stamp_stock_routing_config(config)
-    config.escalation.host = 'localhost'
-    config.escalation.port = 8102
-    config.fused_memory.url = 'http://localhost:8002'
-    config.fused_memory.project_id = 'dark_factory'
-    config.steward_lifetime_budget = 12.0
-    # Matches production default (OrchestratorConfig.steward_max_attempts=1).
-    # Safe to use as the global default: tests that exercise the retry guard set
-    # steward_max_attempts explicitly; tests that don't either resolve successfully,
-    # start with retry_count=0 (0 >= 1 is False), or hit the budget guard first.
-    config.steward_max_attempts = 1
-    config.steward_completion_timeout = 300.0
-    config.steward_max_timeouts_per_escalation = 3
-    config.steward_max_empty_outputs_per_escalation = 2
-    config.timeouts.steward = 1800.0
-    config.suggestion_triage_threshold = 10
-    return config
-
-
-@pytest.fixture
-def mock_queue(tmp_path: Path):
-    queue = MagicMock()
-    queue.queue_dir = tmp_path / 'escalations'
-    queue.queue_dir.mkdir()
-    queue.get_by_task.return_value = []
-    queue.get.return_value = None
-    queue.make_id.return_value = 'esc-42-99'
-    return queue
-
-
-@pytest.fixture
-def mock_mcp():
-    mcp = MagicMock()
-    mcp.url = 'http://localhost:8002'
-    mcp.mcp_config_json.return_value = {'mcpServers': {}}
-    return mcp
-
-
-@pytest.fixture
-def mock_briefing():
-    briefing = AsyncMock()
-    briefing.build_steward_initial_prompt.return_value = 'Full steward briefing.'
-    briefing.build_steward_continuation_prompt.return_value = 'New escalation details.'
-    return briefing
-
-
-def _build_steward(worktree, config, mcp, briefing, escalation_queue):
-    """Shared factory used by both `steward` and `steward_with_real_queue` fixtures.
-
-    Centralises TaskSteward construction so that if new required constructor
-    parameters are added later, only this one place needs updating.
+    ``steward_max_attempts`` rides the ``config_overrides`` channel: it matches
+    the production default (``OrchestratorConfig.steward_max_attempts=1``) and
+    is safe as this module's global default — tests exercising the retry guard
+    set it explicitly, and the rest either resolve successfully, start at
+    ``retry_count=0`` (``0 >= 1`` is False), or hit the budget guard first.
     """
-    return TaskSteward(
-        task_id='42',
-        task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
-        worktree=worktree,
-        config=config,
-        mcp=mcp,
-        escalation_queue=escalation_queue,
-        briefing=briefing,
-    )
+    steward = make_steward(config_overrides={'steward_max_attempts': 1})
+    # Deliberately distinct from _make_escalation's default id 'esc-42-1' —
+    # which is exactly conftest's make_id default.  A steward-minted escalation
+    # must stay distinguishable from the escalation under test, or the two
+    # silently collide in the auto-escalation paths.
+    steward.escalation_queue.make_id.return_value = 'esc-42-99'
+    return steward
+
+
+# The five legacy fixture names, preserved as views so the ~250 existing test
+# signatures that request them keep working unchanged.
 
 
 @pytest.fixture
-def steward(worktree, mock_config, mock_queue, mock_mcp, mock_briefing):
-    return _build_steward(worktree, mock_config, mock_mcp, mock_briefing, mock_queue)
+def worktree(steward) -> Path:
+    return steward.worktree
+
+
+@pytest.fixture
+def mock_config(steward):
+    return steward.config
+
+
+@pytest.fixture
+def mock_queue(steward):
+    return steward.escalation_queue
+
+
+@pytest.fixture
+def mock_mcp(steward):
+    return steward.mcp
+
+
+@pytest.fixture
+def mock_briefing(steward):
+    return steward.briefing
 
 
 def _make_result(
@@ -276,20 +232,9 @@ class TestStewardCostStoreConstructor:
     attribute is absent (AttributeError) when omitted.
     """
 
-    def test_cost_store_stored_when_provided(
-        self, worktree, mock_config, mock_mcp, mock_briefing, mock_queue,
-    ):
+    def test_cost_store_stored_when_provided(self, make_steward):
         sentinel = MagicMock()
-        steward = TaskSteward(
-            task_id='42',
-            task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
-            worktree=worktree,
-            config=mock_config,
-            mcp=mock_mcp,
-            escalation_queue=mock_queue,
-            briefing=mock_briefing,
-            cost_store=sentinel,
-        )
+        steward = make_steward(cost_store=sentinel)
         assert steward.cost_store is sentinel
 
     def test_cost_store_defaults_to_none(self, steward):
@@ -537,7 +482,7 @@ class TestStewardInvokeWithCapRetryWiring:
             pending_escalations=[e.to_dict() for e in fresh_pending],
             worktree=steward.worktree,
         )
-        assert result == 'Full steward briefing.'
+        assert result == mock_briefing.build_steward_initial_prompt.return_value
 
     async def test_forwards_cost_telemetry_kwargs(
         self, steward, worktree, mock_mcp, mock_config,
@@ -2833,6 +2778,22 @@ class TestIsEmptyOutput:
             'predicate must guard with is_timed_out_with_progress'
         )
 
+    def test_cli_input_rejected_subtype_returns_true(self):
+        """Task 3143: a pre-turn CLI rejection has the SAME zero-cost/zero-turn
+        shape and the same "no work was done" property, so it must keep the
+        steward's bounded, retry-budget-preserving path (capped by
+        steward_max_empty_outputs_per_escalation).  Widening the taxonomy must
+        not silently drop it out of that path into normal retry accounting.
+        """
+        result = _make_result(success=False, subtype='error_cli_input_rejected')
+        assert _is_empty_output(result) is True
+
+    def test_cli_input_rejected_progress_run_still_returns_false(self):
+        """The is_timed_out_with_progress carve-out applies to BOTH subtypes."""
+        result = _make_result(success=False, subtype='error_cli_input_rejected', timed_out=True)
+        result.transcript_turns = 5
+        assert _is_empty_output(result) is False
+
 
 # ---------------------------------------------------------------------------
 # Empty-output recovery
@@ -3032,14 +2993,21 @@ class TestMakePreTriageGate:
 
 
 @pytest.fixture
-def steward_with_real_queue(tmp_path, worktree, mock_config, mock_mcp, mock_briefing):
+def steward_with_real_queue(make_steward, tmp_path):
     """TaskSteward using a REAL EscalationQueue backed by tmp_path.
 
-    Replaces mock_queue with a real filesystem-backed queue so that the
+    Replaces the mock queue with a real filesystem-backed one so that the
     on-disk write location (queue root vs archive) can be directly asserted.
+
+    An INDEPENDENT ``make_steward`` build — it deliberately does not request the
+    legacy views above, so this does not construct a second steward alongside
+    the ``steward`` fixture's, and its queue dir cannot collide with the mock
+    queue's (which conftest derives from that steward's own worktree).
     """
-    real_queue = EscalationQueue(tmp_path / 'escalations')
-    return _build_steward(worktree, mock_config, mock_mcp, mock_briefing, real_queue)
+    return make_steward(
+        escalation_queue=EscalationQueue(tmp_path / 'escalations'),
+        config_overrides={'steward_max_attempts': 1},
+    )
 
 
 class TestPatchResolutionMetadataDefect2:

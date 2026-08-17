@@ -1406,6 +1406,67 @@ class TestConfirmMainTipFailureIsReal:
             f'calls={mock_logger.warning.call_args_list!r}'
         )
 
+    # -- task-3290 step-1: composed-command shape (generous --timeout) -----
+
+    def test_confirm_scoped_command_shape_carries_generous_timeout(
+        self, tmp_path: Path
+    ) -> None:
+        """The ModuleConfig handed to run_verification is scoped to the failing
+        node-ids, forced serial, addopts-cleared, runs NEITHER lint NOR
+        typecheck, AND carries a generous explicit ``--timeout``.
+
+        The timeout is the task-3290 gap: pyproject's
+        ``[tool.pytest.ini_options] timeout = 60`` SURVIVES ``-o addopts=``,
+        so without an explicit override a still-loaded host can starve this
+        isolated confirm run into a false "still fails" verdict — and unlike
+        the merge gate (which only holds a merge), a false verdict HERE files
+        a red-main L1.
+
+        Asserted over EVERY run_verification call, not just the first: the
+        scoped ModuleConfig is built ONCE and reused across
+        ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` attempts, so a future refactor that
+        rebuilt the command per attempt must not be able to drop the timeout
+        on attempt 2 unnoticed. The fail-then-pass sequence exercises both.
+
+        The expected seconds are read BACK OFF the module constant so
+        retuning it cannot silently drift this assertion.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        run_calls: list = []
+        fake_run = _make_confirm_fake_run(run_calls, _CONFIRM_PROJECT_LAYOUT)
+
+        # fail-then-pass -> both _SWEEP_CONFIRM_MAX_ATTEMPTS attempts run.
+        rv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake_run),
+            patch.object(verify_module, 'run_verification', rv),
+        ):
+            asyncio.run(
+                verify_module.confirm_main_tip_failure_is_real(
+                    config, git_ops, CONFIRM_FAILING_RESULT, main_sha=MAIN_SHA,
+                )
+            )
+
+        secs = verify_module._SWEEP_CONFIRM_TIMEOUT_SECS
+        assert rv.call_count == 2, (
+            f'Expected both isolated-rerun attempts to run (fail then pass), '
+            f'got {rv.call_count}'
+        )
+        for i, call in enumerate(rv.call_args_list):
+            called_mc = call.args[2]
+            cmd = called_mc.test_command
+            assert '-p no:xdist' in cmd, (i, cmd)
+            assert '-o addopts=' in cmd, (i, cmd)
+            assert (f'--timeout {secs}' in cmd or f'--timeout={secs}' in cmd), (i, cmd)
+            assert CONFIRM_NODE_ID in cmd, (i, cmd)
+            assert called_mc.lint_command is None, (i, called_mc.lint_command)
+            assert called_mc.type_check_command is None, (i, called_mc.type_check_command)
+
 
 # ---------------------------------------------------------------------------
 # task-3095 step-1: verify._group_node_ids_by_subproject

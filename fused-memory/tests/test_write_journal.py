@@ -918,3 +918,304 @@ async def test_existing_db_gains_idx_wo_created_on_initialize(tmp_path):
         await _assert_created_at_seekable(db_inner, context='legacy upgrade')
     finally:
         await j.close()
+
+
+# ------------------------------------------------------------------
+# Terminal queue outcome (task 3582)
+#
+# `write_ops.success` records that the ENQUEUE was accepted; the durable
+# queue's eventual terminal state (completed / dead) was never written back,
+# so a row for a write with a 0% landing rate was byte-for-byte
+# indistinguishable from a row for a write that landed.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_write_ops_has_terminal_columns(journal):
+    """A fresh DB carries the terminal_* columns, NULL at Layer-1 log time."""
+    db = journal._require_db()
+    async with db.execute('PRAGMA table_info(write_ops)') as cursor:
+        cols = {row[1] for row in await cursor.fetchall()}
+    assert 'terminal_status' in cols
+    assert 'terminal_at' in cols
+    assert 'terminal_error' in cols
+
+    op_id = str(uuid.uuid4())
+    await journal.log_write_op(
+        write_op_id=op_id,
+        operation='add_episode',
+        project_id='test-project',
+    )
+    ops = await journal.get_ops_since('2000-01-01T00:00:00')
+    row = next(o for o in ops if o['id'] == op_id)
+    # Terminal state is UNKNOWN at log time — NULL, not False.
+    assert row['terminal_status'] is None
+    assert row['terminal_at'] is None
+    assert row['terminal_error'] is None
+    # ...while `success` keeps its existing meaning: the enqueue was accepted.
+    assert row['success'] == 1
+
+
+@pytest.mark.asyncio
+async def test_existing_db_gains_terminal_columns_on_initialize(tmp_path):
+    """An existing journal gains terminal_* via ALTER, with no backfill."""
+    import aiosqlite
+
+    data_dir = tmp_path / 'terminal_migrate'
+    data_dir.mkdir()
+    db_path = data_dir / 'write_journal.db'
+
+    pre_change_schema = """
+    CREATE TABLE write_ops (
+        id TEXT PRIMARY KEY,
+        causation_id TEXT,
+        source TEXT,
+        provenance TEXT DEFAULT 'original',
+        operation TEXT,
+        project_id TEXT,
+        agent_id TEXT,
+        session_id TEXT,
+        kind TEXT NOT NULL DEFAULT 'write',
+        params TEXT DEFAULT '{}',
+        result_summary TEXT,
+        success INTEGER DEFAULT 1,
+        error TEXT,
+        created_at TEXT NOT NULL
+    );
+    """
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.executescript(pre_change_schema)
+        await db.execute(
+            'INSERT INTO write_ops (id, operation, success, created_at) '
+            'VALUES (?, ?, ?, ?)',
+            ('legacy-terminal-1', 'add_episode', 1, '2026-07-29T12:00:00+00:00'),
+        )
+        await db.commit()
+
+    j = WriteJournal(data_dir)
+    await j.initialize()
+    # Migration must be idempotent — a second initialize() must not blow up on
+    # a duplicate ALTER TABLE ADD COLUMN.
+    await j.initialize()
+    try:
+        db_inner = j._require_db()
+        async with db_inner.execute('PRAGMA table_info(write_ops)') as cursor:
+            cols = {row[1] for row in await cursor.fetchall()}
+        assert 'terminal_status' in cols
+        assert 'terminal_at' in cols
+        assert 'terminal_error' in cols
+
+        async with db_inner.execute(
+            'SELECT operation, success, terminal_status, terminal_at, terminal_error '
+            "FROM write_ops WHERE id = 'legacy-terminal-1'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None, 'pre-existing row must survive the migration'
+        assert row[0] == 'add_episode'
+        assert row[1] == 1
+        # No backfill: a historical row's terminal outcome is genuinely unknown.
+        assert row[2] is None
+        assert row[3] is None
+        assert row[4] is None
+    finally:
+        await j.close()
+
+
+@pytest.mark.asyncio
+async def test_get_write_op_roundtrip(journal):
+    """The no-join audit read: one write_ops row by id, or None."""
+    op_id = str(uuid.uuid4())
+    await journal.log_write_op(
+        write_op_id=op_id,
+        operation='add_episode',
+        project_id='test-project',
+        agent_id='claude-interactive',
+    )
+
+    row = await journal.get_write_op(op_id)
+    assert row is not None
+    assert row['id'] == op_id
+    assert row['operation'] == 'add_episode'
+    assert row['success'] == 1
+    assert 'terminal_status' in row
+    assert row['terminal_status'] is None
+
+    assert await journal.get_write_op('no-such-id') is None
+
+
+@pytest.mark.asyncio
+async def test_record_terminal_outcome_stamps_completed(journal):
+    from datetime import UTC, datetime
+
+    op_id = str(uuid.uuid4())
+    await journal.log_write_op(write_op_id=op_id, operation='add_episode')
+
+    assert await journal.record_terminal_outcome(
+        write_op_id=op_id, terminal_status='completed'
+    ) is True
+
+    row = await journal.get_write_op(op_id)
+    assert row is not None
+    assert row['terminal_status'] == 'completed'
+    assert row['terminal_error'] is None
+    stamped = datetime.fromisoformat(row['terminal_at'])
+    assert stamped.tzinfo is not None
+    assert stamped.utcoffset() == UTC.utcoffset(None)
+
+
+@pytest.mark.asyncio
+async def test_record_terminal_outcome_stamps_dead_and_preserves_success(journal):
+    """`success` (enqueue accepted) and `terminal_status` (write landed) are
+    two different facts and BOTH survive."""
+    op_id = str(uuid.uuid4())
+    await journal.log_write_op(write_op_id=op_id, operation='add_episode')
+
+    assert await journal.record_terminal_outcome(
+        write_op_id=op_id,
+        terminal_status='dead',
+        terminal_error='RuntimeError: node abc not found',
+    ) is True
+
+    row = await journal.get_write_op(op_id)
+    assert row is not None
+    assert row['terminal_status'] == 'dead'
+    assert row['terminal_error'] == 'RuntimeError: node abc not found'
+    assert row['success'] == 1
+    assert row['error'] is None
+
+
+@pytest.mark.asyncio
+async def test_record_terminal_outcome_last_write_wins(journal):
+    """A replayed dead-letter that later lands re-stamps 'completed'."""
+    op_id = str(uuid.uuid4())
+    await journal.log_write_op(write_op_id=op_id, operation='add_episode')
+
+    await journal.record_terminal_outcome(
+        write_op_id=op_id, terminal_status='dead', terminal_error='RuntimeError: boom'
+    )
+    first = await journal.get_write_op(op_id)
+    assert first is not None and first['terminal_status'] == 'dead'
+
+    await journal.record_terminal_outcome(
+        write_op_id=op_id, terminal_status='completed'
+    )
+    second = await journal.get_write_op(op_id)
+    assert second is not None
+    assert second['terminal_status'] == 'completed'
+    assert second['terminal_error'] is None
+    assert second['terminal_at'] >= first['terminal_at']
+
+
+# ------------------------------------------------------------------
+# The enqueue -> log_write_op ordering hazard (task 3582).
+#
+# Both producers INSERT their write_ops row AFTER enqueue() returns —
+# add_episode in a `finally`, add_memory only after the synchronous Mem0 leg,
+# a network/LLM round trip of UNBOUNDED width — so a queue worker can reach a
+# terminal state before the row exists. A bare UPDATE would match 0 rows and
+# drop the outcome silently, re-creating exactly the invisibility this task
+# removes; a time-boxed retry would drop it precisely when the producer was
+# slowest. record_terminal_outcome therefore UPSERTs, and log_write_op fills in
+# around the terminal columns rather than clobbering them.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_terminal_outcome_creates_row_when_producer_has_not_logged(
+    journal,
+):
+    """No row yet is not an error — the outcome is recorded unconditionally."""
+    op_id = str(uuid.uuid4())
+    assert await journal.get_write_op(op_id) is None
+
+    assert await journal.record_terminal_outcome(
+        write_op_id=op_id, terminal_status='dead', terminal_error='RuntimeError: boom'
+    ) is True
+
+    row = await journal.get_write_op(op_id)
+    assert row is not None
+    assert row['terminal_status'] == 'dead'
+    assert row['terminal_error'] == 'RuntimeError: boom'
+    # The stub carries the terminal fact ALONE. `operation` stays NULL rather
+    # than being invented — stage_stats skips non-str operations.
+    assert row['operation'] is None
+    assert row['source'] == 'durable_queue'
+
+
+@pytest.mark.asyncio
+async def test_late_producer_log_write_op_preserves_terminal_outcome(journal):
+    """The unbounded-window case: the producer logs LONG after the write-back.
+
+    add_memory enqueues the Graphiti leg and journals its Layer-1 row only once
+    the synchronous Mem0 add() returns, so this ordering is the normal one
+    whenever Mem0 is slower than Graphiti. The producer's row must complete the
+    terminal row, never overwrite the outcome that beat it there.
+    """
+    op_id = str(uuid.uuid4())
+
+    # Worker gets there first.
+    await journal.record_terminal_outcome(
+        write_op_id=op_id, terminal_status='dead', terminal_error='RuntimeError: boom'
+    )
+    # ...then the producer finally lands its Layer-1 row, arbitrarily later.
+    await journal.log_write_op(
+        write_op_id=op_id,
+        operation='add_memory',
+        project_id='proj-x',
+        agent_id='agent-x',
+        params={'content': 'hello'},
+        result_summary={'memory_ids': ['m1']},
+        success=True,
+    )
+
+    row = await journal.get_write_op(op_id)
+    assert row is not None
+    # Layer 1 filled in...
+    assert row['operation'] == 'add_memory'
+    assert row['project_id'] == 'proj-x'
+    assert row['agent_id'] == 'agent-x'
+    assert row['success'] == 1
+    # ...without losing the terminal fact that arrived first.
+    assert row['terminal_status'] == 'dead'
+    assert row['terminal_error'] == 'RuntimeError: boom'
+    assert row['terminal_at'] is not None
+
+    # And exactly one row exists — the upsert converged, it did not duplicate.
+    ops = [o for o in await journal.get_ops_since('2000-01-01T00:00:00')
+           if o['id'] == op_id]
+    assert len(ops) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_terminal_outcome_returns_false_and_logs_on_db_error(
+    journal, monkeypatch, caplog
+):
+    """The never-propagate guarantee the whole design rests on.
+
+    _notify_terminal swallows hook exceptions, but this method must not raise
+    in the first place — a journaling hiccup flipping a landed write back to
+    retry would turn an audit improvement into a correctness regression.
+    """
+    import logging
+
+    from fused_memory.services import write_journal as wj
+
+    op_id = str(uuid.uuid4())
+    await journal.log_write_op(write_op_id=op_id, operation='add_episode')
+
+    def _boom():
+        raise RuntimeError('db handle exploded')
+
+    monkeypatch.setattr(journal, '_txn', _boom)
+
+    with caplog.at_level(logging.ERROR, logger=wj.logger.name):
+        result = await journal.record_terminal_outcome(
+            write_op_id=op_id, terminal_status='dead'
+        )
+
+    assert result is False
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, 'a failed write-back must be loud, not silent'
+    joined = ' '.join(r.getMessage() for r in errors)
+    assert op_id in joined
+    assert 'dead' in joined

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 
-import reviewer_redundancy_diagnostic as mod  # pyright: ignore[reportMissingImports]
+import reviewer_redundancy_diagnostic as mod
 
 
 def _build_review_tree(tmp_path, *, corrupt_names=(), valid_names=()):

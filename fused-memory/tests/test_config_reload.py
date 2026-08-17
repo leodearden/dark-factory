@@ -438,9 +438,11 @@ class TestMem0UpdateLeavesAreGreenTier:
         [
             ('mem0_update.enabled', False),
             ('mem0_update.content_amend_allowed_agent_prefixes', []),
+            # NB: must differ from the shipped default (which already carries
+            # recon-stage- and curator-), or the diff is vacuously empty.
             (
                 'mem0_update.metadata_patch_allowed_agent_prefixes',
-                ['recon-stage-', 'curator-'],
+                ['recon-stage-', 'curator-', 'auditor-'],
             ),
             ('mem0_update.storm_threshold', 5),
             ('mem0_update.storm_window_seconds', 600.0),
@@ -489,8 +491,13 @@ class TestMem0UpdateLeavesAreGreenTier:
         )
 
     def test_widened_metadata_bar_is_observed_live(self):
-        """The operator story: admit a curator-gate metadata patch on a running
-        server WITHOUT granting content-amend authority."""
+        """The operator story: admit an interactive tagging flow on a running
+        server WITHOUT granting content-amend authority.
+
+        auditor- as the example prefix, NOT curator-: curator- moved onto the
+        shipped default of BOTH arms (esc-3524-1 + the 2026-08-12 ruling), so
+        widening to it would be a vacuous no-op diff and the content-amend
+        denial below would fail."""
         from types import SimpleNamespace
 
         from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
@@ -502,15 +509,15 @@ class TestMem0UpdateLeavesAreGreenTier:
         object.__setattr__(
             fresh.mem0_update,
             'metadata_patch_allowed_agent_prefixes',
-            ['recon-stage-', 'curator-'],
+            ['recon-stage-', 'curator-', 'auditor-'],
         )
         apply_reload(live, fresh)
 
         assert resolve_mem0_update_authorization(
-            svc, agent_id='curator-gate', content_amend=False, metadata_patch=True,
+            svc, agent_id='auditor-session', content_amend=False, metadata_patch=True,
         ).allowed is True
         assert resolve_mem0_update_authorization(
-            svc, agent_id='curator-gate', content_amend=True, metadata_patch=False,
+            svc, agent_id='auditor-session', content_amend=True, metadata_patch=False,
         ).allowed is False, 'widening one bar must not widen the other'
 
 
@@ -555,3 +562,80 @@ class TestWriteTriageLeavesAreGreenTier:
         )
         assert d.applied_candidates[path] == {'old': old, 'new': new_value}
         assert path not in d.restart_required
+
+
+class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
+    """The per-category cutoff map (task 3357), reloaded as ONE leaf.
+
+    Same green tier as its pooled sibling, and for the same reason: a
+    re-calibration must take effect on a running server. Atomicity is the
+    part that matters here — _iter_leaves yields a container WHOLE (as it
+    already does for reconciliation.procedural_knowledge_topic_guard_clusters),
+    so a half-applied set of per-category cutoffs can never gate a sweep.
+    """
+
+    PATH = 'write_triage.t_high_by_category'
+    # SYNTHETIC, deliberately: a real cutoff copied in here would be one
+    # re-calibration away from equalling the live config's map, at which
+    # point diff_config would report no change and the applied_candidates
+    # lookup below would raise KeyError on a test that is not about that.
+    SYNTHETIC = {'procedural_knowledge': 0.5}
+
+    def test_the_leaf_is_allowlisted(self):
+        assert self.PATH in RELOADABLE_FIELDS, (
+            f'{self.PATH} must be allowlisted so a re-calibration needs no restart'
+        )
+
+    def test_iter_leaves_yields_the_map_as_exactly_one_whole_leaf(self):
+        """Not one leaf per category — the map reloads all-or-nothing."""
+        from fused_memory.config.reload import _iter_leaves  # noqa: PLC0415
+
+        config = FusedMemoryConfig()
+        object.__setattr__(config.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
+        paths = [path for path, _ in _iter_leaves(config)]
+
+        assert paths.count(self.PATH) == 1, (
+            f'expected exactly one leaf at {self.PATH}, got {paths.count(self.PATH)}'
+        )
+        assert not [p for p in paths if p.startswith(f'{self.PATH}.')], (
+            'the map must not be descended into: a per-category leaf would let '
+            'one cutoff land while another did not'
+        )
+        assert dict(_iter_leaves(config))[self.PATH] == self.SYNTHETIC, (
+            'the leaf value must be the whole mapping'
+        )
+
+    def test_a_changed_map_lands_in_applied_candidates(self):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = live.write_triage.t_high_by_category
+        assert old != self.SYNTHETIC, (
+            'the fixture must DIFFER from the live map, or diff_config reports '
+            'no change and this test asserts nothing'
+        )
+        object.__setattr__(fresh.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
+
+        d = diff_config(live, fresh)
+
+        assert d.applied_candidates[self.PATH] == {'old': old, 'new': self.SYNTHETIC}
+        assert self.PATH not in d.restart_required
+
+    def test_apply_reload_replaces_the_map_wholesale(self):
+        """Never merged into the old map.
+
+        A merge would leave a category calibrated after the run that
+        calibrated it stopped deriving a cutoff for it — a stale number
+        outliving its own evidence.
+        """
+        from fused_memory.config.reload import apply_reload  # noqa: PLC0415
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        object.__setattr__(live.write_triage, 't_high_by_category', {
+            'procedural_knowledge': 0.5, 'observations_and_summaries': 0.6,
+        })
+        object.__setattr__(fresh.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
+
+        apply_reload(live, fresh)
+
+        assert live.write_triage.t_high_by_category == self.SYNTHETIC

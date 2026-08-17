@@ -13,6 +13,52 @@ const { ProjectGroup, taskId } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const C = window.DF_CHARTS;
 
+// ── Cross-tab focus helpers (module scope) ──
+//
+// Stable empty payload for the `DF.ESCALATIONS` falsy case.  Hoisted rather
+// than written inline as `|| { subsections: [], ... }` because `escalations` is
+// a dependency of the focus effect below: a fresh literal per render would make
+// an effect that is meant to fire on payload ARRIVAL re-run on every paint.
+// data.js's applyKey refuses null/undefined (data.js:153) so the fallback is
+// unreachable today; hoisting keeps it stable if a change ever makes it
+// reachable.
+const ESC_EMPTY = { subsections: [], summary: { by_level: {}, by_status: {} } };
+
+// Has the escalations payload ARRIVED, as opposed to still being data.js's
+// pre-fetch seed?  Read from data.js's per-key first-success marker, which is
+// the only sound signal:
+//
+//   * Not derivable from the payload's contents — the seed and a loaded but
+//     genuinely EMPTY queue are structurally identical by design (ESCALATIONS
+//     is deliberately not in STABLE_ARRAY_KEYS, data.js:96-105).
+//   * Not derivable from object identity either.  Capturing `DF.ESCALATIONS`
+//     at module-eval time and testing `payload !== SEED` races Babel: this is
+//     a `type="text/babel"` module evaluated after DOMContentLoaded, so
+//     startPolling()'s immediate first fetch can land BEFORE the capture,
+//     freezing a real payload as the "seed" — and nothing unfreezes it while
+//     polling is paused or the endpoint is in backoff, so the tab would claim
+//     "still loading" above a fully-populated queue, indefinitely.
+//   * Not derivable from the `df-data-refresh` event, which fires after
+//     Promise.all even when the escalations fetch FAILED — that reports
+//     arrival on a failure, producing a false miss.
+//
+// The failure direction is chosen on purpose: an endpoint stuck in backoff
+// never sets the marker, so the UI keeps WAITING (and says so) rather than
+// asserting a false "no longer in the queue" — the stronger claim, on evidence
+// that cannot support it.
+function escalationsLoaded() {
+  return !!(DF.__loaded && DF.__loaded.ESCALATIONS);
+}
+
+function findEscalationRow(escalations, id) {
+  for (const sub of (escalations.subsections || [])) {
+    for (const row of (sub.escalations || [])) {
+      if (row.id === id) return row;
+    }
+  }
+  return null;
+}
+
 // ── Local helpers (tabs.jsx-compatible copies; not exported from any namespace) ──
 
 function useOpenSet(ids, defaultOpen = true, storageKey = null) {
@@ -83,6 +129,64 @@ function sevClass(sev) {
   if (s === 'critical' || s === 'high') return 'esc-sev-high';
   if (s === 'medium') return 'esc-sev-medium';
   return 'esc-sev-low';
+}
+
+// ── Unreadable-queue-file notice ──
+//
+// Modelled on tab_memory_evals.jsx::IssuesNotice.  Expanded by default, on
+// purpose: collapsing a degraded-state notice reproduces the silent degradation
+// it exists to prevent (INV-2/INV-4, the 2658 parse_failures precedent).  Each
+// entry names its path and the parse error — a bare count tells the operator
+// something is wrong but not what.
+//
+// These records are deliberately NOT filtered by the level/status chips: a file
+// that could not be parsed has neither a `level` nor a `status`, so there is
+// nothing for matchesFilter to test, and routing them through the chips would
+// let an arbitrary default decide whether the operator is told about corruption.
+//
+// At most SKIPPED_ROW_CAP paths are listed, with an overflow line for the rest.
+// The normal case is one or two files, but a truncated write, a permission
+// fault, or a half-synced mount degrades a whole directory at once — hundreds of
+// always-expanded rows would push the actual escalation table far below the fold
+// and degrade the same operator view this notice exists to serve.  The headline
+// and the collapsed-group badge always state the TRUE total, so the cap shortens
+// the list without ever understating the loss.
+const SKIPPED_ROW_CAP = 20;
+
+function SkippedNotice({ skipped }) {
+  const rows = skipped || [];
+  if (!(rows.length > 0)) return null;
+  const shown = rows.slice(0, SKIPPED_ROW_CAP);
+  const hidden = rows.length - shown.length;
+  return (
+    <div
+      data-testid="escalation-skipped"
+      style={{
+        padding: '8px 12px',
+        marginBottom: 8,
+        border: '1px solid var(--line)',
+        borderRadius: 4,
+        background: 'var(--bg-2)',
+        color: 'var(--fg-2)',
+        fontFamily: 'var(--mono)',
+        fontSize: 11,
+      }}
+    >
+      <div style={{ color: 'var(--warn)', marginBottom: 4 }}>
+        {rows.length} queue file(s) unreadable — the counts for this queue are short by that many
+      </div>
+      {shown.map((s, i) => (
+        <div key={`${s.path}-${i}`} style={{ color: 'var(--fg-3)' }}>
+          {s.path || '—'} — {s.error || '—'}
+        </div>
+      ))}
+      {hidden > 0 && (
+        <div style={{ color: 'var(--fg-3)', marginTop: 4 }}>
+          …and {hidden} more (listing the first {SKIPPED_ROW_CAP})
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ── Window slicing (trailing 7d, anchored to the payload's own generated_at
@@ -269,7 +373,11 @@ function EscalationStatStrip({ analytics, projectFilter }) {
 // ── EscalationsTab ──
 
 function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
-  const escalations = DF.ESCALATIONS || { subsections: [], summary: { by_level: {}, by_status: {} } };
+  // ESC_EMPTY is hoisted to module scope; see the note at its declaration.
+  // Note it is NOT a "loaded" signal: arrival is read from data.js's
+  // first-success marker (escalationsLoaded), so falling back to this
+  // placeholder cannot be mistaken for an arrived payload.
+  const escalations = DF.ESCALATIONS || ESC_EMPTY;
 
   // Filter subsections by project when projectFilter is active.
   // Orchestrator subsections: filter by subsection label (label == project name).
@@ -329,26 +437,33 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   // Selected row for sidebar
   const [selected, setSelected] = uS(null);
 
+  // A focus id that matched no row. Held rather than dropped: the operator
+  // clicked a link and is owed an answer either way.
+  const [focusMiss, setFocusMiss] = uS(null);
+
   // Cross-tab focus handoff (from the memory-eval escalation links in
   // tab_memory_evals.jsx, lifted through app.jsx). Search every subsection for
   // the row and open the existing detail sidebar with it.
   //
-  // The focus is consumed UNCONDITIONALLY — including when no row matches,
-  // which happens when the escalation resolved between the poll that produced
-  // the link and the click. Leaving it set would reopen a stale drawer on every
-  // later visit to this tab; retrying silently would be worse.
+  // The focus is consumed once a DECISION is REACHABLE, never before. Keyed on
+  // `escalations` as well as `focusId`: while the payload is still the pre-fetch
+  // seed the effect declines to decide, and the dep's per-poll identity change
+  // (applyKey replaces the reference) is what re-runs it — so a cold load, or an
+  // endpoint in backoff, no longer silently eats the focus.
+  //
+  // Once the payload is in, both outcomes are reported. A miss is real: the
+  // escalation may have resolved between the poll that produced the link and
+  // the click. It is still CONSUMED on a miss, because leaving it set would
+  // reopen a stale drawer on every later visit to this tab — but it is now
+  // recorded and rendered rather than dropped in silence.
   uE(() => {
     if (!focusId) return;
-    let found = null;
-    for (const sub of (escalations.subsections || [])) {
-      for (const row of (sub.escalations || [])) {
-        if (row.id === focusId) { found = row; break; }
-      }
-      if (found) break;
-    }
-    if (found) setSelected(found);
+    if (!escalationsLoaded()) return;
+    const found = findEscalationRow(escalations, focusId);
+    if (found) { setSelected(found); setFocusMiss(null); }
+    else { setFocusMiss(focusId); }
     if (onFocusConsumed) onFocusConsumed();
-  }, [focusId]);
+  }, [focusId, escalations]);
 
   // Global summary from top-level data
   const gs = escalations.summary || {};
@@ -358,6 +473,32 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   return (
     <div style={{ position: 'relative' }}>
       <EscalationStatStrip analytics={DF.ESCALATION_ANALYTICS} projectFilter={projectFilter} />
+
+      {/* Cross-tab focus feedback. Two states, not one: a click that lands
+          before the escalations payload does is WAITING, not a miss, and
+          saying "no longer in the queue" while the endpoint is still in
+          backoff would be a false claim. Both name the id, so the operator
+          can see which link they followed. */}
+      {focusId && !escalationsLoaded() && (
+        <div className="badge" data-testid="esc-focus-pending" style={{ marginBottom: 8 }}>
+          waiting for the escalation queue to load — will open{' '}
+          <span className="mono">{focusId}</span> when it arrives
+        </div>
+      )}
+      {focusMiss && (
+        <div className="badge warn" data-testid="esc-focus-miss" style={{ marginBottom: 8 }}>
+          <span className="mono">{focusMiss}</span> is not in the queue — it was
+          likely resolved between the poll that produced the link and the click
+          <button
+            type="button"
+            className="chip"
+            style={{ marginLeft: 8 }}
+            onClick={() => setFocusMiss(null)}
+          >
+            dismiss
+          </button>
+        </div>
+      )}
 
       {/* Controls header */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
@@ -386,6 +527,19 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
         {/* Summary pills */}
         <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)' }}>
           {byStatus.pending || 0} pending · {byLevel[1] || 0} L1 · {byLevel[2] || 0} L2
+          {/* Global, like the pips beside it: read from the unfiltered top-level
+              summary, so with a project filter active this can count files in
+              queues that are not rendered below.  Titled rather than re-derived
+              from the filtered subsections — a corruption signal that shrinks
+              when you narrow the view would understate the fleet's actual
+              degraded state, which is the failure this whole notice exists to
+              prevent.  The title states the mismatch instead of leaving the
+              operator to infer it from a count with no visible source. */}
+          {(gs.skipped_count || 0) > 0 && (
+            <span title="Across all queues, including any hidden by the project filter">
+              {' '}· {gs.skipped_count} unreadable
+            </span>
+          )}
         </span>
       </div>
 
@@ -406,6 +560,10 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
           return true;
         }));
 
+        // Queue files the reader could not parse.  Read unfiltered — see the
+        // SkippedNotice comment: a corrupt file has no level or status to chip-filter on.
+        const skipped = sec.skipped || [];
+
         const summary = (
           <>
             <span className="pip" style={{ fontSize: 10 }}>{secByStatus.pending || 0} pending</span>
@@ -414,6 +572,9 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
             )}
             {(secByLevel[2] || 0) > 0 && (
               <span className="pip"><span className="badge bad" style={{ fontSize: 9 }}>L2 · {secByLevel[2]}</span></span>
+            )}
+            {skipped.length > 0 && (
+              <span className="pip"><span className="badge bad" style={{ fontSize: 9 }}>{skipped.length} unreadable</span></span>
             )}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{sec.kind}</span>
           </>
@@ -428,6 +589,10 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
               onToggle={() => toggle(sec.id)}
               summary={summary}
             >
+              {/* Above and outside the empty-state ternary on purpose: a group
+                  rendering "No escalations match current filters" while holding an
+                  unreadable file is precisely the looks-empty-but-isn't case. */}
+              <SkippedNotice skipped={skipped} />
               {filteredRows.length === 0 ? (
                 <div style={{ fontSize: 12, color: 'var(--fg-3)', padding: '8px 0' }}>
                   No escalations match current filters.

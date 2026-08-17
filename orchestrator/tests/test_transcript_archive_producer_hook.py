@@ -14,7 +14,6 @@ test_config_verify_admission_reload.py's rationale.
 from __future__ import annotations
 
 import asyncio
-import gzip
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -116,7 +115,7 @@ async def _make_workflow(config, git_ops, task_assignment):
 @pytest.mark.asyncio
 class TestProducerHook:
 
-    async def test_end_to_end_transcript_gz_appears(
+    async def test_end_to_end_transcript_appears(
         self, monkeypatch, git_repo, git_ops, task_assignment
     ):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
@@ -142,13 +141,12 @@ class TestProducerHook:
             await workflow._invoke(SIMPLE_TASK, 'p', cwd)
 
         sid = workflow._last_invoke_session_id
-        gz = (
+        archived = (
             git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
-            / task_assignment.task_id / ENC / f'{sid}.jsonl.gz'
+            / task_assignment.task_id / ENC / f'{sid}.jsonl'
         )
-        assert gz.exists()
-        with gzip.open(gz, 'rb') as fh:
-            assert fh.read() == fake_bytes
+        assert archived.exists()
+        assert archived.read_bytes() == fake_bytes
 
     async def test_flag_guard_disabled_skips_helper(
         self, monkeypatch, git_repo, git_ops, task_assignment

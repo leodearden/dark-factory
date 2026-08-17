@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from graphiti_core.embedder import OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 
+from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.maintenance._utils import maintenance_service
 
 logger = logging.getLogger(__name__)
@@ -135,7 +136,8 @@ async def run_reindex(
     1. Loads FusedMemoryConfig (honouring CONFIG_PATH env var or config_path arg).
     2. Creates and initialises a MemoryService (which owns GraphitiBackend +
        DurableWriteQueue).
-    3. Builds an OpenAIEmbedder with the dimension from config.
+    3. Builds an OpenAIEmbedder with the dimension AND the endpoint
+       (embedder.providers.openai.api_url) from config.
     4. Creates a ReindexManager and runs reindex_and_replay().
     5. Closes all resources in a finally block.
 
@@ -155,12 +157,27 @@ async def run_reindex(
         emb_cfg = config.embedder
         openai_provider = emb_cfg.providers.openai
         openai_api_key: str | None = None
+        openai_base_url: str | None = None
         if openai_provider is not None:
             openai_api_key = openai_provider.api_key
+            openai_base_url = openai_provider.api_url
+            # Config now wins over an ambient OPENAI_BASE_URL / OPENAI_API_BASE
+            # that used to steer this tool. Same egress change as the graphiti
+            # and mem0 paths; report it rather than silently re-pointing a
+            # re-embed run at a different host.
+            warn_if_ambient_base_url_is_overridden(
+                openai_base_url, context='reindex embedder',
+            )
         embedder_config = OpenAIEmbedderConfig(
             api_key=openai_api_key,
             embedding_model=emb_cfg.model,
             embedding_dim=emb_cfg.dimensions,
+            # backends/graphiti_client.py has always passed the configured
+            # endpoint on its embedder path; this tool was the outlier, so a
+            # re-embed run silently went to api.openai.com regardless of
+            # configuration. None yields the SDK default, preserving today's
+            # behaviour when no provider block is configured.
+            base_url=openai_base_url,
         )
         embedder = OpenAIEmbedder(config=embedder_config)
 

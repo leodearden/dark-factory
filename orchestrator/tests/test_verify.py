@@ -15,14 +15,17 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
     _CATEGORY_PRIORITY,
     _PRUNE_THROTTLE_SECS,
+    SIGNAL_KILL_SUMMARY_MARKER,
     VerifyResult,
     _aggregate_results,
     _apply_cargo_scope,
     _build_fallback_config,
+    _build_summary_payload,
     _extract_cause_hint,
     _is_collectable_test_file,
     _is_structural_python_file,
     _is_test_file,
+    _killed_leg_note,
     _maybe_prune_archive,
     _resolve_verify_env,
     _root_plus_single_subproject_prefix,
@@ -2309,6 +2312,31 @@ class TestExtractCauseHint:
             f'Unexpected hint: {hint!r}'
         )
 
+    def test_pytest_undecorated_failure_summary_returned(self):
+        """task 4066: an UNDECORATED ``N failed, ...`` tally is a rung-3 match.
+
+        pytest omits the ``=`` bars when an ``INTERNALERROR`` aborts the
+        session (verify-log 2829's tally, transcribed verbatim below) and
+        under ``-q``. Before the summary regex was widened, rung 3 missed
+        those lines entirely and the hint fell through to the
+        last-non-blank-line fallback rung.
+
+        The trailing wrapper line is deliberate: without a non-progress line
+        AFTER the tally, the fallback rung would return the tally anyway and
+        this test would pass without rung 3 ever matching — proving nothing.
+        """
+        output = (
+            'orchestrator/tests/test_verify.py ...F..                          [ 73%]\n'
+            'orchestrator/tests/test_scheduler.py ....                         [ 99%]\n'
+            '\n'
+            '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)\n'
+            'make: *** [Makefile:12: test] Error 1\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)', (
+            f'Unexpected hint: {hint!r}'
+        )
+
     def test_pytest_traceback_E_line_returns_last(self):
         """When only traceback E-lines exist (no FAILED/INTERNALERROR), the LAST E-line wins."""
         # No FAILED lines, no INTERNALERROR, no failure summary, no
@@ -4224,6 +4252,30 @@ class TestShouldArchiveCategory:
         """'tree_sitter_generate_error' ends with '_error' → True."""
         assert self._should_archive('tree_sitter_generate_error') is True
 
+    def test_pytest_internalerror_archived_for_human_triage(self):
+        """'pytest_internalerror' → True since task 3683.
+
+        This test previously asserted False (and sat in the "must NOT be
+        archived" block below) on the rationale that "an xdist worker-kill
+        INTERNALERROR is infra noise, not human-triage content; the sweep
+        already retries on this category (returns None sentinel)". Task 3683's
+        audit overturned it: that sweep retry is the FIRST-PASS arm only
+        (verify.py:7062/:7141), which returns a None sentinel and never
+        escalates. The category is ALSO retried by three bounded windows that
+        each terminate in a blocking level-1 infra_issue escalation on
+        exhaustion — the primary one being workflow.py:9020's default-5-attempt
+        loop, which stamps escalate_to_human=True / category='infra_issue' at
+        :9060-9067.
+
+        Archival is decided per attempt from the category alone
+        (verify.py:1902), with no knowledge of whether this is the exhausting
+        attempt, so archive=False discarded the log on the attempt that hands
+        the incident to a human too — leaving that human only a truncated
+        failure_report(). See TestPytestInternalerrorArchivesForHumanTriage in
+        test_verify_categories.py for the full grounding.
+        """
+        assert self._should_archive('pytest_internalerror') is True
+
     # Categories that must NOT be archived (debugger can handle without human)
     def test_test_failure_not_archived(self):
         """'test_failure' does not end with '_error' → False."""
@@ -4244,15 +4296,6 @@ class TestShouldArchiveCategory:
     def test_empty_string_not_archived(self):
         """'' (empty) → False."""
         assert self._should_archive('') is False
-
-    def test_pytest_internalerror_not_archived(self):
-        """'pytest_internalerror' ends with '_error' but is in deny-list → False.
-
-        An xdist worker-kill INTERNALERROR is infra noise, not human-triage content.
-        The sweep already retries on this category (returns None sentinel); archiving
-        it would create spurious human-triage artifacts for transient crashes.
-        """
-        assert self._should_archive('pytest_internalerror') is False
 
 
 class TestBuildFallbackConfigConftest:
@@ -5513,6 +5556,82 @@ class TestRunScopedVerificationForwardsWorktreeToFallback:
             f'Expected _build_fallback_config to be called with worktree={tmp_path!r}; '
             f'got {captured.get("worktree")!r}'
         )
+
+
+class TestRunScopedVerificationOptsFallbackIntoSegmentedTest:
+    """The fallback branch asks `run_verification` to SEGMENT its test chain (task 3338).
+
+    Segmentation is opt-in and default-OFF: making `run_verification` segment
+    any chain it is handed would silently change the global tail, the
+    cargo-scoped path, `merge_queue._run_unscoped_typechecks` and every
+    module_configs run — a wide, unrequested change in a function dozens of
+    tests stub. The reported defect (esc-3062-2) is the FALLBACK path, so only
+    this call site opts in.
+
+    The flag goes on the `run_verification` call, NOT on
+    `_build_fallback_config`'s: the NOTE at that call site records (and
+    `TestRunScopedVerificationForwardsWorktreeToFallback` enforces) that its
+    test double is a fixed `(task_files, config=None, worktree=None)` fake with
+    no `**kwargs` catch-all, so any new keyword there breaks task 2344's test.
+
+    `role='merge'` is deliberately EXCLUDED (amendment). The trade inverts on
+    the merge lane: the per-segment diagnostic exists so a task agent can read
+    its own result rather than prove an unrelated red unrelated, but a merge
+    failure goes to a human who has the whole chain anyway — while the cost
+    (running seven more suites, up to the full budget, with the queue blocked)
+    lands on the path this module already treats as latency-critical.
+    """
+
+    @staticmethod
+    async def _await_kwargs(tmp_path: Path, role) -> dict:
+        (tmp_path / 'shared').mkdir(exist_ok=True)
+        (tmp_path / 'shared' / 'thing.py').write_text('x = 1\n')
+
+        fallback = ModuleConfig(
+            prefix='__fallback__',
+            test_command='cd shared && uv run pytest tests/ && uv run pytest tests/scripts/',
+            lint_command=None,
+            type_check_command=None,
+        )
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='', summary='ok',
+        )
+        run_verification_double = AsyncMock(return_value=passing)
+        with patch('orchestrator.verify._build_fallback_config', return_value=fallback), \
+             patch('orchestrator.verify.run_verification', new=run_verification_double):
+            await run_scoped_verification(
+                tmp_path,
+                OrchestratorConfig(project_root=tmp_path),
+                [],
+                task_files=['shared/thing.py'],
+                role=role,
+            )
+
+        assert run_verification_double.await_count == 1
+        await_args = run_verification_double.await_args
+        assert await_args is not None, 'run_verification was not awaited'
+        # `.kwargs` is a Mapping; copy so the annotation is an honest dict.
+        return dict(await_args.kwargs)
+
+    @pytest.mark.asyncio
+    async def test_fallback_branch_passes_segment_chained_test_true(self, tmp_path: Path) -> None:
+        assert (await self._await_kwargs(tmp_path, 'task')).get('segment_chained_test') is True
+
+    @pytest.mark.asyncio
+    async def test_merge_role_fallback_keeps_the_fail_fast_chain(self, tmp_path: Path) -> None:
+        """A red merge verify must still stop at the first subproject.
+
+        Not a style preference: without the gate, a merge verify whose first
+        subproject goes red runs the remaining seven suites before reporting,
+        holding the merge queue for up to the full resolved budget (3600s warm /
+        5400s cold) on every red attempt — and budget exhaustion is strictly
+        MORE likely once every segment always runs.
+        """
+        kwargs = await self._await_kwargs(tmp_path, 'merge')
+        assert kwargs.get('segment_chained_test') is False
+        # The gate must key on `role`, not on some other merge-ish signal that
+        # a caller could set independently.
+        assert kwargs.get('role') == 'merge'
 
 
 class TestBuildFallbackConfigDataModule:
@@ -9017,3 +9136,591 @@ class TestWithJunitxmlStr:
             _with_junitxml_str(cmd, self._JUNIT)
 
         assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
+
+
+class TestSerialPytestStrRefusedRewriteIsLogged:
+    """_serial_pytest_str must RECORD a refused serial rewrite, not swallow it.
+
+    Task 4121, the "louder failure" half. ``verify_cmd``'s raw-chain appender
+    refuses outright rather than splice the flags into an unclosed quote —
+    the rule, and the measurements behind it, live in
+    ``verify_cmd._unspliceable_pytest_spans`` and are deliberately not
+    restated here.
+
+    Refusing is right, but a SILENT refusal is its own defect: the
+    ENV_TRANSIENT retry then re-runs the ORIGINAL command and fails for its
+    own reason, and an operator reading that log cannot tell "recovery ran
+    without its flags" from "recovery ran". One WARNING here makes the
+    difference legible.
+
+    Modelled test-for-test on ``TestWithJunitxmlStr`` above — this file's
+    established template for a ``*_str`` wrapper's capability-loss record —
+    so the two such records in verify.py's ``*_str`` family are pinned the
+    same way rather than each inventing its own assertion style.
+    """
+
+    _REFUSED = "pytest -k 'a && b' tests/ && true"
+
+    def test_refused_rewrite_returns_the_callers_own_string_and_logs_once(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        from orchestrator.verify import _serial_pytest_str
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _serial_pytest_str(self._REFUSED)
+
+        assert result is self._REFUSED, "the no-op must return the caller's own string"
+        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
+        assert len(records) == 1, f'expected exactly one record, got {[r.message for r in records]}'
+        assert records[0].levelno == logging.WARNING
+        # Asserted on substance, not prose: the command must be quotable from
+        # the record, and a stable keyword must identify WHICH recovery was
+        # lost. Anchoring on the full sentence would make this a spelling test.
+        assert self._REFUSED in records[0].getMessage()
+        assert 'serial' in records[0].getMessage().lower()
+        # The OFFENDING SPAN, not just the whole command: on a long
+        # multi-segment test_command the operator would otherwise have to
+        # re-derive the regex segmentation by hand to find it.
+        assert "pytest -k 'a " in records[0].getMessage()
+
+    def test_the_message_does_not_assert_a_cause_it_has_not_measured(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        """A no-op with NO unspliceable span must not be blamed on one.
+
+        ``echo "pytest" && true`` classifies as PYTEST with ``raw`` retained
+        (measured), so it reaches the same structural gate — but its only
+        ``pytest`` token sits inside ``echo``'s quotes, so
+        ``_unspliceable_pytest_spans`` is empty and there is no ``-k``
+        expression to inspect. The record must say what was actually
+        measured (nothing to append to) rather than name an unbalanced quote
+        in an invocation's arguments and send the operator hunting for a
+        ``-k`` that does not exist.
+        """
+        from orchestrator.verify import _serial_pytest_str
+
+        cmd = 'echo "pytest" && true'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            assert _serial_pytest_str(cmd) is cmd
+
+        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert cmd in message
+        assert 'unclosed quote' not in message
+
+    def test_the_numprocesses_sibling_refuses_the_same_way_but_stays_silent(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        """The asymmetry ``_with_pytest_numprocesses_str``'s docstring claims.
+
+        Both wrappers refuse identically (one appender), but only the serial
+        one logs: a suppressed ``-n`` leaves the command at its configured
+        worker count, which is the pre-cap status quo and not a lost
+        capability, whereas suppressed serial-recovery flags mean a recovery
+        attempt ran without the thing that makes it a recovery. That claim is
+        pinned here rather than left to the docstring, since the serial twin
+        got a whole class for exactly this and the asymmetry was otherwise
+        unguarded.
+        """
+        from orchestrator.verify import _with_pytest_numprocesses_str
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _with_pytest_numprocesses_str(self._REFUSED, '4')
+
+        assert result is self._REFUSED, "the no-op must return the caller's own string"
+        assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
+
+    @pytest.mark.parametrize(
+        'cmd',
+        [
+            'cd a && uv run pytest t1 && cd b && uv run pytest t2',
+            'uv run pytest tests/',
+            "pytest -k 'a && pytest b' tests/",
+            'pytest tests/ && echo "pytest done"',
+            'ruff check src/',
+            'true',
+            None,
+        ],
+        ids=[
+            'successful-raw-chain-rewrite',
+            'successful-structured-rewrite',
+            'structured-despite-an-unspliceable-looking-span',
+            'quoted-pytest-word-in-another-command',
+            'non-pytest-ruff',
+            'opaque-true',
+            'none',
+        ],
+    )
+    def test_silent_on_the_ordinary_paths(
+        self, cmd: str | None, caplog: pytest.LogCaptureFixture,
+    ):
+        """No record for anything that is not an actual refusal.
+
+        The third case is why the gate must be STRUCTURAL rather than "does
+        this string contain an unspliceable span": ``pytest -k 'a && pytest
+        b' tests/`` parses with ``raw is None`` (measured), so it takes the
+        STRUCTURED path, never reaches the appender, and IS successfully
+        mutated via ``base_flags`` — a span-content gate would warn about a
+        command that lost nothing. The fourth is the over-refusal guard at
+        the log level: ``pytest tests/ && echo "pytest done"`` has an
+        unterminated SPAN (``'pytest done"'``, the word inside ``echo``'s
+        argument) but no unterminated INVOCATION, so its real invocation is
+        rewritten normally and there is nothing to report. The non-pytest and
+        OPAQUE cases are expected, benign no-ops; logging those would fire on
+        every lint and type leg and train operators to ignore the record.
+        """
+        from orchestrator.verify import _serial_pytest_str
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            _serial_pytest_str(cmd)
+
+        assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
+
+    def test_serial_recovery_still_works_on_the_live_fleet_test_command(self):
+        """Guard that this change did not disable serial recovery generally.
+
+        Reads the committed corpus rather than a hand-copied literal, so a
+        refusal that started over-firing on the fleet's real ``test_command``
+        fails here instead of silently costing every ENV_TRANSIENT retry its
+        flags.
+        """
+        from _verify_config_corpus import ROOT_TEST_COMMAND
+
+        from orchestrator.verify import _serial_pytest_str
+
+        result = _serial_pytest_str(ROOT_TEST_COMMAND)
+        assert result is not None
+        assert result is not ROOT_TEST_COMMAND
+        assert 'no:xdist' in result
+
+
+# ---------------------------------------------------------------------------
+# task 3173 step-7: the two paths that would otherwise ERASE the kill signal
+# after `_summarize_checks` (step-6) correctly recorded it.
+#
+# (a) `_aggregate_results` rebuilds the multi-subproject summary by
+#     substring-scanning child summaries for exactly three literals
+#     ('tests failed' / 'lint issues' / 'type errors').  A kill note matches
+#     none of them, so a multi-module verify silently degrades to a bare
+#     'Failures: ' with no parts at all.
+# (b) `_build_summary_payload` picks the "loudest raw exit code" with
+#     max(key=(rc, timed_out)).  A NEGATIVE rc sorts BELOW a passing rc=0, so
+#     whenever a killed leg co-occurs with a passing leg the archived summary
+#     reports the PASSING run's rc/cmd/duration — actively hiding the kill in
+#     the one artifact that survives for triage.  (This whole defect was only
+#     diagnosable because that archive existed; see the archive=True design
+#     decision.)
+# ---------------------------------------------------------------------------
+
+_KILLED_LINT_CMD = './scripts/verify.sh lint --scope branch --include-infra'
+
+
+def _kill_note_child(*, module: str = 'orchestrator') -> VerifyResult:
+    """A child result whose lint leg was SIGKILLed at 0.31s."""
+    return VerifyResult(
+        passed=False,
+        test_output='',
+        lint_output='DF_VERIFY_ROLE=merge — forcing --scope all\n',
+        type_output='',
+        summary=f'Failures: {_killed_leg_note("lint", -9, 0.31010722508654)}',
+        category='infra_kill',
+        cause_hint=f'{module}: killed',
+        # Task 3173 review amendment: this child's ONE failing leg is the
+        # killed lint leg, so it is what `_summarize_checks` would publish.
+        failing_leg_categories=['infra_kill'],
+    )
+
+
+class TestAggregateResultsKeepsKillNote:
+    """A kill note must survive multi-subproject aggregation verbatim."""
+
+    def test_kill_note_survives_aggregation_with_a_passing_sibling(self):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed',
+        )
+        agg = _aggregate_results([passing, _kill_note_child()])
+        assert not agg.passed
+        assert SIGNAL_KILL_SUMMARY_MARKER in agg.summary
+        assert 'killed by signal 9' in agg.summary
+        assert 'indeterminate' in agg.summary
+        # The bug's signature: everything after the envelope dropped away.
+        assert agg.summary != 'Failures: '
+        assert agg.summary.strip() != 'Failures:'
+
+    def test_kill_note_and_a_real_test_failure_both_survive(self):
+        real_failure = VerifyResult(
+            passed=False, test_output='FAILED tests/x.py::y\n', lint_output='',
+            type_output='', summary='Failures: tests failed',
+            category='test_failure',
+        )
+        agg = _aggregate_results([real_failure, _kill_note_child(module='fused-memory')])
+        assert 'tests failed' in agg.summary
+        assert 'killed by signal 9' in agg.summary
+        assert 'indeterminate' in agg.summary
+
+    def test_aggregate_category_is_infra_kill(self):
+        """_worst_category must let severity_rank=1 dominate test_failure."""
+        real_failure = VerifyResult(
+            passed=False, test_output='FAILED tests/x.py::y\n', lint_output='',
+            type_output='', summary='Failures: tests failed',
+            category='test_failure',
+        )
+        agg = _aggregate_results([real_failure, _kill_note_child()])
+        assert agg.category == 'infra_kill'
+
+    def test_duplicate_kill_notes_are_not_repeated(self):
+        """Two subprojects killed identically must not stutter the same
+        sentence twice; ordering stays deterministic."""
+        agg = _aggregate_results([_kill_note_child(), _kill_note_child(module='dashboard')])
+        assert agg.summary.count('killed by signal 9') == 1
+
+    def test_genuine_multi_child_wording_is_unchanged(self):
+        """REGRESSION GUARD: with no kill anywhere, aggregation is
+        byte-identical to today."""
+        a = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', category='test_failure',
+        )
+        b = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: lint issues, type errors', category='test_failure',
+        )
+        agg = _aggregate_results([a, b])
+        assert agg.summary == 'Failures: tests failed, lint issues, type errors'
+
+
+class TestSummaryPayloadNamesTheKilledRun:
+    """The archived summary.json must name the run that was killed."""
+
+    @staticmethod
+    def _runs() -> list[dict]:
+        return [
+            {'label': 'test', 'cmd': 'pytest', 'rc': 0, 'timed_out': False,
+             'started_at': 't0', 'duration_secs': 900.0},
+            {'label': 'lint', 'cmd': _KILLED_LINT_CMD, 'rc': -9, 'timed_out': False,
+             'started_at': 't1', 'duration_secs': 0.31},
+        ]
+
+    def test_killed_run_outranks_a_passing_run(self):
+        payload = _build_summary_payload(self._runs(), 'infra_kill', '')
+        assert payload['rc'] == -9
+        assert payload['cmd'] == _KILLED_LINT_CMD
+        assert payload['duration_secs'] == 0.31
+        assert payload['started_at'] == 't1'
+
+    def test_killed_run_outranks_a_genuine_nonzero_failure(self):
+        runs = self._runs()
+        runs[0]['rc'] = 1
+        payload = _build_summary_payload(runs, 'infra_kill', '')
+        assert payload['rc'] == -9
+        assert payload['cmd'] == _KILLED_LINT_CMD
+
+    def test_all_commands_are_still_listed(self):
+        payload = _build_summary_payload(self._runs(), 'infra_kill', '')
+        assert [c['label'] for c in payload['commands']] == ['test', 'lint']
+        assert [c['rc'] for c in payload['commands']] == [0, -9]
+
+    def test_control_loudest_nonnegative_rc_is_unchanged(self):
+        """CONTROL: with no negative rc anywhere, the existing
+        "loudest raw exit code" ordering (rc=1 beats rc=0) still holds."""
+        runs = [
+            {'label': 'test', 'cmd': 'pytest', 'rc': 1, 'timed_out': False,
+             'started_at': 't0', 'duration_secs': 12.0},
+            {'label': 'lint', 'cmd': 'ruff check .', 'rc': 0, 'timed_out': False,
+             'started_at': 't1', 'duration_secs': 3.0},
+        ]
+        payload = _build_summary_payload(runs, 'test_failure', '')
+        assert payload['rc'] == 1
+        assert payload['cmd'] == 'pytest'
+        assert payload['duration_secs'] == 12.0
+
+    def test_control_timed_out_tiebreak_is_unchanged(self):
+        runs = [
+            {'label': 'test', 'cmd': 'pytest', 'rc': 1, 'timed_out': True,
+             'started_at': 't0', 'duration_secs': 600.0},
+            {'label': 'lint', 'cmd': 'ruff check .', 'rc': 1, 'timed_out': False,
+             'started_at': 't1', 'duration_secs': 3.0},
+        ]
+        payload = _build_summary_payload(runs, 'infra_timeout', '')
+        assert payload['cmd'] == 'pytest'
+        assert payload['timed_out'] is True
+
+
+# ---------------------------------------------------------------------------
+# task 3173 step-14 (REVIEW AMENDMENT, blocking finding 1): VerifyResult must
+# CARRY what each failing leg decided, so merge_queue's veto gate never has to
+# infer it from the single severity-ranked aggregate `category`.
+#
+# `_worst_category` lets a rank-1 INFRA_KILL dominate a rank-11 TEST_FAILURE.
+# That is correct for "how bad was this run" and catastrophic if read as "this
+# run produced no verdict": a trust anchor whose test leg COMPLETED and blamed
+# the branch, next to an unrelated SIGKILLed lint leg, aggregates to
+# category='infra_kill'.  Only a run in which EVERY failing leg is verdict-less
+# may decline to veto, and that question is unanswerable from one string.
+#
+# RED today: the field does not exist.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyResultCarriesFailingLegCategories:
+    """`VerifyResult.failing_leg_categories`: None = NOT RECORDED (fail
+    CLOSED), a list = one category per FAILING leg in test/lint/type order."""
+
+    @staticmethod
+    def _child(category: str, *, legs: list[str] | None, passed: bool = False) -> VerifyResult:
+        return VerifyResult(
+            passed=passed, test_output='', lint_output='', type_output='',
+            summary='All checks passed' if passed else f'Failures: {category}',
+            category=category, failing_leg_categories=legs,
+        )
+
+    # -- the None contract -------------------------------------------------
+
+    def test_default_is_none_not_empty_list(self):
+        """None means "not recorded" and must NEVER be read as indeterminate.
+        Every result NOT produced by `run_verification` lands here: an old wire
+        payload, a `_trivial_pass`, a verify_runner UNSCOPED_TYPECHECK_*
+        sentinel, or any hand-constructed result in a test."""
+        vr = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='', summary='x',
+        )
+        assert vr.failing_leg_categories is None
+
+    def test_trivial_pass_leaves_it_none(self):
+        assert verify._trivial_pass('reason').failing_leg_categories is None
+
+    # -- codec round-trip (mirrors the `trivial` round-trip tests above) ----
+
+    def test_round_trips_losslessly_through_the_remote_codec(self):
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        original = self._child('infra_kill', legs=['test_failure', 'infra_kill'])
+        restored = result_from_dict(result_to_dict(original))
+        assert restored.failing_leg_categories == ['test_failure', 'infra_kill']
+
+    def test_empty_list_round_trips_as_empty_not_none(self):
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        restored = result_from_dict(result_to_dict(self._child('passed', legs=[], passed=True)))
+        assert restored.failing_leg_categories == []
+        assert restored.failing_leg_categories is not None
+
+    def test_payload_missing_the_key_reconstructs_as_none(self):
+        """DEPLOY ORDERING: an older remote's payload simply omits the key, so
+        the default must be the fail-CLOSED None rather than an empty list."""
+        from orchestrator.verify_runner import result_from_dict, result_to_dict
+
+        d = result_to_dict(self._child('test_failure', legs=['test_failure']))
+        d.pop('failing_leg_categories')
+        assert result_from_dict(d).failing_leg_categories is None
+
+    # -- aggregation over FAILING children only ----------------------------
+
+    def test_aggregate_unions_two_failing_children_in_order(self):
+        agg = _aggregate_results([
+            self._child('test_failure', legs=['test_failure']),
+            self._child('flock_error', legs=['flock_error']),
+        ])
+        assert agg.failing_leg_categories == ['test_failure', 'flock_error']
+
+    def test_passing_child_contributes_nothing(self):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed', failing_leg_categories=[],
+        )
+        agg = _aggregate_results([passing, self._child('test_failure', legs=['test_failure'])])
+        assert agg.failing_leg_categories == ['test_failure']
+
+    def test_aggregate_de_duplicates_and_preserves_order(self):
+        agg = _aggregate_results([
+            self._child('test_failure', legs=['test_failure', 'infra_kill']),
+            self._child('infra_kill', legs=['infra_kill']),
+        ])
+        assert agg.failing_leg_categories == ['test_failure', 'infra_kill']
+
+    def test_a_failing_child_with_none_poisons_the_aggregate(self):
+        """FAIL CLOSED: one unrecorded failing child means the aggregate
+        cannot claim to know what every leg decided."""
+        agg = _aggregate_results([
+            self._child('test_failure', legs=['test_failure']),
+            self._child('infra_kill', legs=None),
+        ])
+        assert agg.failing_leg_categories is None
+
+    def test_a_PASSING_child_with_none_does_not_poison(self):
+        """Only FAILING children are consulted — a passing child has no legs to
+        report, so its None is not evidence of anything missing."""
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed', failing_leg_categories=None,
+        )
+        agg = _aggregate_results([passing, self._child('infra_kill', legs=['infra_kill'])])
+        assert agg.failing_leg_categories == ['infra_kill']
+
+    # -- THE REVIEWER'S COMPOSITION ----------------------------------------
+
+    def test_completed_test_failure_plus_kill_note_child_keeps_both(self):
+        """The aggregate `category` still collapses to the worst
+        (severity_rank=1 infra_kill dominates rank-11 test_failure — i.e.
+        `test_aggregate_category_is_infra_kill` is NOT weakened), while the
+        per-leg list preserves the completed, branch-blaming verdict that the
+        veto gate must not discard."""
+        real_failure = VerifyResult(
+            passed=False, test_output='FAILED tests/x.py::y\n', lint_output='',
+            type_output='', summary='Failures: tests failed',
+            category='test_failure', failing_leg_categories=['test_failure'],
+        )
+        agg = _aggregate_results([real_failure, _kill_note_child()])
+        assert agg.category == 'infra_kill'
+        assert agg.failing_leg_categories == ['test_failure', 'infra_kill']
+
+    def test_single_child_fast_path_passes_the_field_straight_through(self):
+        """len==1 returns the child object itself — pin it so the field cannot
+        be silently dropped by a future rewrite of that fast path."""
+        child = self._child('infra_kill', legs=['infra_kill'])
+        assert _aggregate_results([child]).failing_leg_categories == ['infra_kill']
+
+
+# ---------------------------------------------------------------------------
+# task 3173 amendment: the two couplings the step-5..8 tests left unpinned.
+#
+# (a) `_summarize_checks` joins its fragments with ', ' and `_aggregate_results`
+#     recovers them with `.split(', ')`, keeping only the marker-bearing ones.
+#     That works TODAY only because `_killed_leg_note` happens to separate its
+#     clauses with '; '.  A future comma inside the note — a plausible edit —
+#     would split it in two, and only the marker half would survive: the same
+#     silent degradation the carry-through was added to fix, one edit later.
+#     Pin it at the PRODUCER so the edit fails loudly there.
+# (b) `run_verification`'s two `_summarize_checks(...)` call sites are the only
+#     production consumers of test_duration/lint_duration/type_duration, and
+#     every other duration assertion in the suite calls `_summarize_checks`
+#     directly.  A cross-wire (`lint_duration=attempt.type.duration_secs`)
+#     would keep all of them green while the operator-facing sentence reported
+#     the wrong leg's survival time — and `_killed_leg_note`'s whole contract
+#     is that every clause is a MEASURED fact.
+# ---------------------------------------------------------------------------
+
+
+class TestKillNoteIsOneAggregationFragment:
+    """The ', '-joined summary is the wire format between `_summarize_checks`
+    and `_aggregate_results`, so a kill note must never contain ', '."""
+
+    @pytest.mark.parametrize(
+        ('label', 'rc', 'duration'),
+        [
+            ('test', -9, 900.5),
+            ('lint', -9, 0.31010722508654),
+            ('lint', -15, None),      # no duration in scope -> clause omitted
+            ('type', -2, 0.0),
+            ('type', -1, 12.5),
+        ],
+    )
+    def test_note_never_contains_the_fragment_separator(self, label, rc, duration):
+        note = _killed_leg_note(label, rc, duration)
+        assert ', ' not in note, (
+            f'a comma+space in the note splits it across `.split(", ")` in '
+            f'_aggregate_results and only the {SIGNAL_KILL_SUMMARY_MARKER!r} '
+            f'half survives; use "; " to separate clauses. Got: {note!r}'
+        )
+
+    def test_note_round_trips_through_the_consumer_split_intact(self):
+        """Exactly the parse `_aggregate_results` performs, run against the
+        producer's own output: one fragment in, one fragment out."""
+        note = _killed_leg_note('lint', -9, 0.31010722508654)
+        summary = f'Failures: {note}'
+        assert summary.removeprefix('Failures: ').split(', ') == [note]
+
+    def test_note_beside_a_real_verdict_still_round_trips(self):
+        """The mixed case: a genuine 'tests failed' fragment plus a kill note
+        must recover as exactly two fragments, the second one whole."""
+        note = _killed_leg_note('lint', -9, 0.31)
+        summary = f'Failures: tests failed, {note}'
+        assert summary.removeprefix('Failures: ').split(', ') == ['tests failed', note]
+
+
+class TestRunVerificationThreadsEachLegsOwnDuration:
+    """END-TO-END through `run_verification`: the reported survival time is
+    the KILLED leg's own, not another leg's."""
+
+    @staticmethod
+    def _config(tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='__test_cmd__',
+            lint_command='__lint_cmd__',
+            type_check_command='__type_cmd__',
+            verify_command_timeout_secs=30.0,
+            verify_timeout_retries=0,
+        )
+
+    @staticmethod
+    def _reported_duration(summary: str, signal: int) -> float:
+        import re
+        m = re.search(rf'killed by signal {signal} after (\d+\.\d+)s', summary)
+        assert m is not None, f'no "after N.NNs" clause for signal {signal}: {summary!r}'
+        return float(m.group(1))
+
+    @pytest.mark.asyncio
+    async def test_killed_lint_leg_reports_the_lint_legs_survival_time(self, tmp_path: Path):
+        """Only lint is killed, and it is the SLOW leg: test/type finish
+        immediately.  A cross-wire to either of them reports ~0.00s."""
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__lint_cmd__':
+                await asyncio.sleep(0.30)
+                return -9, '', False  # SIGKILL: not one diagnostic emitted
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert not result.passed
+        assert result.category == 'infra_kill'
+        assert 'lint leg killed by signal 9' in result.summary
+        assert 'lint issues' not in result.summary
+        # >= 0.25 is comfortably above the other two legs (~0.00s) and immune
+        # to scheduler jitter and the ``:.2f`` rounding.
+        assert self._reported_duration(result.summary, 9) >= 0.25, result.summary
+
+    @pytest.mark.asyncio
+    async def test_two_killed_legs_each_report_their_own_duration(self, tmp_path: Path):
+        """The strict wiring test: distinct signals AND distinct durations, so
+        a swap between any two of the three kwargs is detectable."""
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__type_cmd__':
+                await asyncio.sleep(0.40)
+                return -15, '', False  # SIGTERM, the slow leg
+            if cmd == '__test_cmd__':
+                return -9, '', False   # SIGKILL, immediate
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert result.category == 'infra_kill'
+        assert 'test leg killed by signal 9' in result.summary
+        assert 'type leg killed by signal 15' in result.summary
+        assert 'lint' not in result.summary, 'the passing leg must not be named'
+        # test died instantly; type survived 0.40s.  Cross-wiring the kwargs
+        # swaps these two numbers.
+        assert self._reported_duration(result.summary, 9) < 0.25, result.summary
+        assert self._reported_duration(result.summary, 15) >= 0.35, result.summary
+
+    @pytest.mark.asyncio
+    async def test_control_a_genuine_lint_failure_is_worded_as_today(self, tmp_path: Path):
+        """REGRESSION GUARD: the durations change nothing for a leg that
+        actually produced a verdict."""
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__lint_cmd__':
+                await asyncio.sleep(0.05)
+                return 1, 'Found 1 error.\n', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert not result.passed
+        assert result.summary == 'Failures: lint issues'
+        assert result.category != 'infra_kill'
+        assert SIGNAL_KILL_SUMMARY_MARKER not in result.summary

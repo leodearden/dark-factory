@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import json
+from typing import get_args
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -30,6 +31,7 @@ from shared.task_metadata import (
     RetryLedger,
     RoutingDecisionMirror,
     RoutingState,
+    SubmodelCardinality,
     TaskMetadata,
     apply_migrations,
     parse_metadata,
@@ -57,14 +59,21 @@ def _assert_only_test_owned_registry_keys(added: set[str]) -> None:
 
 @pytest.fixture(autouse=True)
 def _reset_metadata_registry_state():
-    """Snapshot/restore task_metadata's module-global registry/migrations.
+    """Snapshot/restore task_metadata's module-global registry/cardinality/migrations.
 
     register_metadata_submodel and the migration registry mutate module-global
     dicts; without this, TestSubmodelRegistry / TestMigrations / the registry
     portion of the parse_metadata tests would leak registrations into later
-    tests. Uses getattr/hasattr defensively since _SUBMODEL_REGISTRY and
-    _MIGRATIONS are added incrementally by later steps in this file's own
-    TDD sequence.
+    tests. Three dicts are covered: `_SUBMODEL_REGISTRY` (key -> model),
+    `_SUBMODEL_CARDINALITY` (key -> 'dict'|'list', task 4142) and
+    `_MIGRATIONS`. Uses getattr/hasattr defensively since all three are added
+    incrementally by later steps in this file's own TDD sequence.
+
+    The cardinality dict needs the same treatment as the registry: a test that
+    registers a stub with `cardinality='list'` would otherwise leak that entry
+    past teardown, and a later same-key registration with a different
+    cardinality raises spuriously — the same class of cross-test leak task 3352
+    fixed for the registry itself.
 
     Teardown does two things: it restores the snapshot, AND it enforces key
     ownership (task 3352) — every key a test ADDED to the registry must be a
@@ -73,18 +82,23 @@ def _reset_metadata_registry_state():
     """
     had_registry = hasattr(task_metadata_module, '_SUBMODEL_REGISTRY')
     registry_snapshot = dict(getattr(task_metadata_module, '_SUBMODEL_REGISTRY', {}))
+    had_cardinality = hasattr(task_metadata_module, '_SUBMODEL_CARDINALITY')
+    cardinality_snapshot = dict(getattr(task_metadata_module, '_SUBMODEL_CARDINALITY', {}))
     had_migrations = hasattr(task_metadata_module, '_MIGRATIONS')
     migrations_snapshot = dict(getattr(task_metadata_module, '_MIGRATIONS', {}))
     yield
     # Ordering is load-bearing in BOTH directions: `added` must be diffed
     # BEFORE any restore (a post-restore diff is always empty, i.e. a silently
-    # vacuous guard), and the assertion must fire AFTER both restores (an
-    # assertion raised before the _MIGRATIONS restore would skip it and leak
-    # migrations into later tests).
+    # vacuous guard), and the assertion must fire AFTER all three restores (an
+    # assertion raised before the _SUBMODEL_CARDINALITY / _MIGRATIONS restores
+    # would skip them and leak state into later tests).
     added = set(getattr(task_metadata_module, '_SUBMODEL_REGISTRY', {})) - set(registry_snapshot)
     if had_registry:
         task_metadata_module._SUBMODEL_REGISTRY.clear()
         task_metadata_module._SUBMODEL_REGISTRY.update(registry_snapshot)
+    if had_cardinality:
+        task_metadata_module._SUBMODEL_CARDINALITY.clear()
+        task_metadata_module._SUBMODEL_CARDINALITY.update(cardinality_snapshot)
     if had_migrations:
         task_metadata_module._MIGRATIONS.clear()
         task_metadata_module._MIGRATIONS.update(migrations_snapshot)
@@ -262,6 +276,91 @@ class TestDoneProvenance:
         # Literal up to arbitrary operational-* strings.
         with pytest.raises(ValidationError):
             DoneProvenance(kind='operational-bogus')  # type: ignore[arg-type]
+
+
+class TestDoneProvenanceStampedAt:
+    """``stamped_at`` — the server-written stamp-write timestamp (task 3576).
+
+    Declared (not merely tolerated via ``extra='allow'``) so it gets type
+    enforcement, a ``None`` default on attribute access, and ``model_fields``
+    visibility. Deliberately OPTIONAL: ~193 historical ``found_on_main``
+    blobs predate the field, and its ABSENCE is load-bearing signal meaning
+    "this stamp predates task 3576" for the found_on_main soak-gate predicate.
+    """
+
+    def test_stamped_at_is_a_declared_field(self):
+        # Not just tolerated as an `extra` — declared, so it carries a type
+        # and a default rather than being an untyped passthrough.
+        assert 'stamped_at' in DoneProvenance.model_fields
+
+    def test_absent_stamped_at_reads_as_none(self):
+        # A legacy blob supplies no stamped_at; attribute access must yield
+        # None rather than raising AttributeError (which is what an
+        # extra='allow' passthrough would do).
+        dp = DoneProvenance(kind='found_on_main', commit='abc123', note='landed in 999')
+        assert dp.stamped_at is None
+
+    def test_stamped_at_string_is_retained(self):
+        dp = DoneProvenance(
+            kind='found_on_main',
+            commit='abc123',
+            note='landed in 999',
+            stamped_at='2026-08-06T01:00:00+00:00',
+        )
+        assert dp.stamped_at == '2026-08-06T01:00:00+00:00'
+        assert dp.model_dump()['stamped_at'] == '2026-08-06T01:00:00+00:00'
+
+    def test_non_string_stamped_at_rejected(self):
+        # extra='allow' would happily accept an int epoch; the declared
+        # `str | None` must reject it.
+        with pytest.raises(ValidationError):
+            DoneProvenance(
+                kind='found_on_main',
+                commit='abc123',
+                note='landed in 999',
+                stamped_at=1754179200,  # type: ignore[arg-type]
+            )
+
+    def test_stamped_at_not_required_for_found_on_main(self):
+        # The conditional-requirements validator must NOT be extended: a
+        # required stamped_at would fail every one of the ~193 historical
+        # blobs at read time.
+        DoneProvenance(kind='found_on_main', commit='abc123', note='landed in 999')
+
+    def test_legacy_blob_round_trips_through_parse_metadata_without_warnings(self):
+        blob = {
+            'done_provenance': {
+                'kind': 'found_on_main',
+                'commit': 'abc123',
+                'note': 'landed in 999',
+            }
+        }
+        model, warnings = parse_metadata(copy.deepcopy(blob), direction='read')
+        assert warnings == []
+        assert isinstance(model.done_provenance, DoneProvenance)
+        assert model.done_provenance.stamped_at is None
+        # exclude_none mirrors how fused-memory persists the blob, so an
+        # absent stamped_at stays absent rather than materialising as null.
+        dumped = model.model_dump(exclude_none=True)['done_provenance']
+        assert dumped == blob['done_provenance']
+        assert 'stamped_at' not in dumped
+
+    @pytest.mark.parametrize('direction', ['read', 'write'])
+    def test_stamped_at_round_trips_through_parse_metadata(self, direction):
+        blob = {
+            'done_provenance': {
+                'kind': 'found_on_main',
+                'commit': 'abc123',
+                'note': 'landed in 999',
+                'stamped_at': '2026-08-06T01:23:45.678901+00:00',
+            }
+        }
+        model, warnings = parse_metadata(copy.deepcopy(blob), direction=direction)
+        assert warnings == []
+        assert isinstance(model.done_provenance, DoneProvenance)
+        assert model.done_provenance.stamped_at == '2026-08-06T01:23:45.678901+00:00'
+        # I1 round-trip preservation: the exact string survives verbatim.
+        assert model.model_dump(exclude_none=True)['done_provenance'] == blob['done_provenance']
 
 
 class TestMemoryHints:
@@ -825,7 +924,7 @@ class TestTaskMetadataFields:
 
 
 class TestDeterministicInvariants:
-    """The two named cross-field invariants (CLAUDE.md field-combo presets)."""
+    """The named cross-field invariants (CLAUDE.md field-combo presets)."""
 
     _MINIMAL_BEFORE_DONE = {'script': 'scripts/x.sh', 'timeout_secs': 60}
 
@@ -866,6 +965,126 @@ class TestDeterministicInvariants:
                 before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
             )
 
+    def test_curator_gate_with_before_done_rejected(self):
+        """human_curator_gate + before_done is a self-contradiction (task 3369).
+
+        A curator gate declares that only a human CONTENT judgement closes the
+        task; before_done is a machine step that closes it. Carrying both means
+        the machine step can drive the task to done without the human ever
+        adjudicating — the task-3181 phantom-done this line of work exists to
+        close. task_kind='deterministic' here deliberately, so the pre-existing
+        "before_done is only valid on deterministic tasks" clause cannot be
+        what fires: this test must isolate the NEW rule.
+        """
+        with pytest.raises(ValidationError) as excinfo:
+            TaskMetadata(
+                task_kind='deterministic',
+                before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+                always_escalates=True,
+                # extra='allow' key, not a typed field — pyright can't see it.
+                human_curator_gate=True,  # type: ignore[call-arg]
+            )
+        # The message is the author-facing remediation, so naming only one side
+        # of the contradiction is not sufficient.
+        message = str(excinfo.value)
+        assert 'human_curator_gate' in message, message
+        assert 'before_done' in message, message
+
+    @pytest.mark.parametrize('marker', ['true', 'True', 1, ['x'], {'a': 1}])
+    def test_truthy_but_not_true_curator_marker_still_rejected(self, marker):
+        """Plain truthiness, not ``is True`` — this is a SAFETY gate.
+
+        Do NOT "simplify" this back to an ``is True`` check. The false
+        NEGATIVE is the expensive direction here: a hand-edited or
+        JSON-round-tripped ``'true'`` that slips past the write boundary lands
+        a record the runner's own guard structurally CANNOT protect, because
+        on the act-then-ask path the marker is never read at all — reproducing
+        the task-3181 phantom-done this line of work exists to close. A
+        truthy-but-not-``True`` value is precisely what a misauthoring LLM or
+        operator produces.
+
+        This deliberately mirrors
+        ``orchestrator.deterministic_runner._is_human_curator_gate``, which
+        uses plain ``bool()`` truthiness as a documented divergence from
+        ``_is_operational_llm_gate``'s ``is True``. Two divergent postures for
+        the same key across the write boundary and the runtime guard would be
+        strictly worse than either posture consistently applied.
+        """
+        with pytest.raises(ValidationError):
+            TaskMetadata(
+                task_kind='deterministic',
+                before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+                always_escalates=True,
+                human_curator_gate=marker,  # type: ignore[call-arg]
+            )
+
+    def test_more_fundamental_clause_reports_first(self):
+        """Clause ORDER inside _deterministic_invariants is load-bearing.
+
+        The curator-gate clause is deliberately LAST: pydantic stops at the
+        first raise, so a blob that is ALSO malformed more fundamentally must
+        report that error, not the narrower curator one. This blob trips two
+        clauses at once — before_done on a non-deterministic task, and the
+        marker alongside before_done — and the author-facing remediation the
+        writer sees must be the fundamental one, because fixing task_kind is
+        the prerequisite for the curator question even being coherent.
+
+        Without this row, TestDeterministicInvariants pins each clause only in
+        ISOLATION, so reordering the three `if` blocks would silently swap the
+        message a mis-authoring writer gets with the whole suite still green.
+        """
+        with pytest.raises(ValidationError) as excinfo:
+            TaskMetadata(
+                task_kind='normal',
+                before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+                human_curator_gate=True,  # type: ignore[call-arg]
+            )
+        message = str(excinfo.value)
+        assert 'before_done is only valid on deterministic tasks' in message, message
+        # ...and specifically NOT the curator-gate clause, which would mean the
+        # ordering had been reversed.
+        assert 'only valid on a pure gate' not in message, message
+
+    # ---- Accepted neighbours: the validator's blast radius is exactly the
+    # contradiction and nothing wider. Every shape below exists on the live
+    # task store today, so a regression here would break real writes.
+
+    def test_curator_gate_on_a_real_pure_gate_accepted(self):
+        # deterministic + no before_done + always_escalates=True + marker.
+        # Tasks 3063 / 3181 / 3234's shape — the whole point of the marker.
+        TaskMetadata(
+            task_kind='deterministic',
+            always_escalates=True,
+            human_curator_gate=True,  # type: ignore[call-arg]
+        )
+
+    def test_curator_gate_on_a_normal_task_accepted(self):
+        # task 3053's shape: the marker is inert on a non-deterministic task,
+        # but recorded-and-preserved rather than rejected.
+        TaskMetadata(
+            task_kind='normal',
+            human_curator_gate=True,  # type: ignore[call-arg]
+        )
+
+    @pytest.mark.parametrize('falsy', [False, None, 0, '', []])
+    def test_falsy_curator_marker_with_before_done_accepted(self, falsy):
+        # An explicitly-CLEARED marker must not block a legitimate deploy
+        # write — only a set one contradicts before_done.
+        TaskMetadata(
+            task_kind='deterministic',
+            before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+            always_escalates=False,
+            human_curator_gate=falsy,  # type: ignore[call-arg]
+        )
+
+    def test_before_done_without_the_marker_accepted(self):
+        # The 33 existing deploy rows: before_done with no marker at all.
+        TaskMetadata(
+            task_kind='deterministic',
+            before_done=self._MINIMAL_BEFORE_DONE,  # type: ignore[arg-type]
+            always_escalates=False,
+        )
+
 
 class _DeployStateStub(BaseModel):
     """Throwaway sub-model standing in for a future W10 registrant."""
@@ -878,6 +1097,11 @@ class _DeployStateStub(BaseModel):
 # TestListValuedSubmodelSlice._KEY = 'delivered_checks_stub'. See
 # _assert_only_test_owned_registry_keys above and task 3352.
 _DEPLOY_STATE_STUB_KEY = 'deploy_state_stub'
+
+# A second test-owned key, for rows that need a `cardinality='list'`
+# registration alongside the dict-shaped _DEPLOY_STATE_STUB_KEY one (a single
+# key cannot hold both — cardinality is immutable per key, task 4142).
+_CHECKS_STUB_KEY = 'cardinality_checks_stub'
 
 
 class TestSubmodelRegistry:
@@ -904,12 +1128,88 @@ class TestSubmodelRegistry:
         with pytest.raises(ValueError):
             register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _OtherDeployStateStub)
 
+    def test_register_without_cardinality_records_dict_default(self):
+        # 'dict' is the FAIL-CLOSED default: it restores the behavior that
+        # held before parse_metadata grew its list branch, so an existing or
+        # future dict-shaped registrant needs no change (task 4142).
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        assert task_metadata_module._SUBMODEL_CARDINALITY[_DEPLOY_STATE_STUB_KEY] == 'dict'
+        # The registry's own value type is UNCHANGED — six `is`-identity
+        # assertions across four packages depend on it, which is why
+        # cardinality lives in a parallel dict rather than widening this one.
+        assert task_metadata_module._SUBMODEL_REGISTRY[_DEPLOY_STATE_STUB_KEY] is _DeployStateStub
+
+    def test_register_with_list_cardinality_records_list(self):
+        register_metadata_submodel(
+            _CHECKS_STUB_KEY, _DeployStateStub, cardinality='list'
+        )
+        assert task_metadata_module._SUBMODEL_CARDINALITY[_CHECKS_STUB_KEY] == 'list'
+        assert task_metadata_module._SUBMODEL_REGISTRY[_CHECKS_STUB_KEY] is _DeployStateStub
+
+    def test_submodel_cardinality_alias_is_importable_and_exported(self):
+        # Grounded in the alias RESOLVING (it is imported at module scope
+        # above, so a broken name fails collection) and in what it actually
+        # admits — a bare `'SubmodelCardinality' in __all__` string check
+        # would pass even if the name did not exist.
+        assert set(get_args(SubmodelCardinality)) == {'dict', 'list'}
+        assert 'SubmodelCardinality' in task_metadata_module.__all__
+
+    def test_reregistering_same_model_same_cardinality_is_idempotent(self):
+        register_metadata_submodel(_CHECKS_STUB_KEY, _DeployStateStub, cardinality='list')
+        register_metadata_submodel(_CHECKS_STUB_KEY, _DeployStateStub, cardinality='list')
+        assert task_metadata_module._SUBMODEL_CARDINALITY[_CHECKS_STUB_KEY] == 'list'
+        assert task_metadata_module._SUBMODEL_REGISTRY[_CHECKS_STUB_KEY] is _DeployStateStub
+
+    def test_reregistering_same_model_different_cardinality_raises(self):
+        # A key's cardinality is as immutable as its model: registration is a
+        # per-process, import-order-driven side effect, so last-writer-wins
+        # would make the ENFORCED shape depend on which module imported first.
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        with pytest.raises(ValueError) as exc_info:
+            register_metadata_submodel(
+                _DEPLOY_STATE_STUB_KEY, _DeployStateStub, cardinality='list'
+            )
+        message = str(exc_info.value)
+        assert _DEPLOY_STATE_STUB_KEY in message
+        # DIRECTION-sensitive fragments, not bare `'dict' in message` /
+        # `'list' in message` substring checks: those would still pass if the
+        # message swapped the recorded and the requested cardinality, which is
+        # the single distinction this message exists to draw.
+        assert "cardinality 'dict'" in message  # the RECORDED one
+        assert "as 'list'" in message  # the REQUESTED one
+
+    def test_cardinality_conflict_leaves_both_dicts_unmutated(self):
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        with pytest.raises(ValueError):
+            register_metadata_submodel(
+                _DEPLOY_STATE_STUB_KEY, _DeployStateStub, cardinality='list'
+            )
+        # No partial write: the two dicts are parallel, so a raise AFTER
+        # mutating one is the one way this design could genuinely desync.
+        assert task_metadata_module._SUBMODEL_CARDINALITY[_DEPLOY_STATE_STUB_KEY] == 'dict'
+        assert task_metadata_module._SUBMODEL_REGISTRY[_DEPLOY_STATE_STUB_KEY] is _DeployStateStub
+
+    def test_model_conflict_leaves_both_dicts_unmutated(self):
+        class _OtherDeployStateStub(BaseModel):
+            phase: str
+
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        with pytest.raises(ValueError):
+            register_metadata_submodel(
+                _DEPLOY_STATE_STUB_KEY, _OtherDeployStateStub, cardinality='list'
+            )
+        assert task_metadata_module._SUBMODEL_REGISTRY[_DEPLOY_STATE_STUB_KEY] is _DeployStateStub
+        assert task_metadata_module._SUBMODEL_CARDINALITY[_DEPLOY_STATE_STUB_KEY] == 'dict'
+
 
 class TestMilestoneRegistration:
     """Milestone's registration with the W10 extension point + parse_metadata integration."""
 
     def test_registered_at_import(self):
         assert task_metadata_module._SUBMODEL_REGISTRY['milestone'] is Milestone
+
+    def test_registered_as_dict_cardinality(self):
+        assert task_metadata_module._SUBMODEL_CARDINALITY['milestone'] == 'dict'
 
     def test_round_trip_no_warnings(self):
         model, warnings = parse_metadata(
@@ -962,6 +1262,9 @@ class TestRoutingRegistration:
     def test_registered_at_import(self):
         assert task_metadata_module._SUBMODEL_REGISTRY['routing'] is RoutingState
 
+    def test_registered_as_dict_cardinality(self):
+        assert task_metadata_module._SUBMODEL_CARDINALITY['routing'] == 'dict'
+
     def test_round_trip_no_warnings(self):
         model, warnings = parse_metadata({'routing': self._VALID_ROUTING}, direction='write')
         assert warnings == []
@@ -978,6 +1281,26 @@ class TestRoutingRegistration:
         assert warnings[0].field == 'routing'
         assert warnings[0].code == 'invalid_submodel'
         assert model.model_dump()['routing'] == {'history': 'bad'}
+
+
+class TestProductionRegistrationCardinality:
+    """The declared shape of every production registrant this module can see.
+
+    Deliberately scoped to registrants THIS module imports. milestone and
+    routing are pinned inside their own classes above, leaving
+    merge_retry_pending here. The other two are pinned next to their own
+    registration, in the suite that actually imports the registering module —
+    otherwise the row asserts the fail-closed default against itself and can
+    never go red:
+      - delivered_checks (the ONE genuinely list-valued slice) —
+        shared/tests/test_capability_manifest.py;
+      - deploy_state (DELIBERATELY left undeclared, so it resolves through the
+        fail-closed 'dict' default) — orchestrator/tests/test_deploy_state.py,
+        which imports shared.deploy_state at module scope.
+    """
+
+    def test_merge_retry_pending_registered_as_dict(self):
+        assert task_metadata_module._SUBMODEL_CARDINALITY['merge_retry_pending'] == 'dict'
 
 
 class TestMigrations:
@@ -1396,13 +1719,27 @@ class TestParseMetadataFailurePolicy:
     # can't be splatted as `submodel(**value)` — that raises TypeError, not
     # ValidationError. parse_metadata must absorb this the same way as any
     # other malformed sub-model, never raising outside write+enforce=True.
-    def test_registered_submodel_slice_non_mapping_value_read_warns_never_raises(self):
+    #
+    # Since task 4142 the two non-mapping shapes are classified apart: a LIST
+    # for a dict-only slice is caught earlier as a declared-shape violation
+    # (`wrong_cardinality`), while every other non-mapping value (str, int, …)
+    # stays on the untouched splat -> TypeError -> `invalid_submodel` path.
+    # The warn-never-raise / retain-raw policy is identical for both.
+    def test_registered_submodel_slice_list_value_read_warns_never_raises(self):
         register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
         model, warnings = parse_metadata({_DEPLOY_STATE_STUB_KEY: [1, 2]}, direction='read')
         assert len(warnings) == 1
-        assert warnings[0].code == 'invalid_submodel'
+        assert warnings[0].code == 'wrong_cardinality'
         assert warnings[0].field == _DEPLOY_STATE_STUB_KEY
         assert model.model_dump()[_DEPLOY_STATE_STUB_KEY] == [1, 2]
+
+    def test_registered_submodel_slice_scalar_value_read_warns_never_raises(self):
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata({_DEPLOY_STATE_STUB_KEY: 'x'}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].code == 'invalid_submodel'
+        assert warnings[0].field == _DEPLOY_STATE_STUB_KEY
+        assert model.model_dump()[_DEPLOY_STATE_STUB_KEY] == 'x'
 
     def test_registered_submodel_slice_non_mapping_value_write_warn_mode_accepts(self):
         register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
@@ -1431,7 +1768,7 @@ class TestParseMetadataFailurePolicy:
         assert warnings[0].field == 'mystery_field'
         assert model.model_dump()['mystery_field'] == 'v'
 
-    # A representative spread of the 39 Tier-A blessed conventional keys
+    # A representative spread of the 40 Tier-A blessed conventional keys
     # (see _BLESSED_METADATA_KEYS), plus one genuine control key
     # (mystery_zzz) that must still warn. RED: none of the blessed keys are
     # skipped yet, so each one currently emits its own unknown_key warning.
@@ -1484,7 +1821,7 @@ class TestParseMetadataFailurePolicy:
 
     # Table-driven over the FULL _BLESSED_METADATA_KEYS frozenset (imported
     # directly), rather than the hand-maintained partial sample above (which
-    # only covers 25 of the 39 entries). Every key gets its own parametrized
+    # only covers 25 of the 40 entries). Every key gets its own parametrized
     # case, so a typo'd or accidentally-unskipped entry fails immediately
     # instead of silently reappearing as unknown_key census noise, and the
     # test stays in lockstep as the allowlist grows -- no manual sample to
@@ -1568,6 +1905,36 @@ class TestParseMetadataFailurePolicy:
             f'Expected no unknown_key warning for human_curator_adjudicated_at; got: {sorted(unknown_key_fields)}'
         )
 
+    def test_last_blocked_at_metadata_key_is_blessed(self):
+        """The orchestrator's block stamp must not census-warn (task 3697).
+
+        Promoted to Tier-A rather than renamed under `x_`, which is the
+        non-obvious part. `last_blocked_at` is MACHINE-written by the
+        orchestrator on every block (orchestrator/src/orchestrator/workflow.py,
+        `_mark_blocked`) and READ back by
+        orchestrator/src/orchestrator/agents/briefing.py to decide whether a
+        briefing is stale — so it is load-bearing, not decorative. A census
+        over .taskmaster/tasks/tasks.db counts 78 tasks carrying it (measured
+        2026-08-06), so x_-renaming it on one task would fork the vocabulary
+        against 77 siblings, blind the briefing reader, and be silently undone
+        the next time the orchestrator wrote the canonical spelling anyway.
+
+        docs/task-authoring.md "Promoting a convention" prescribes exactly this
+        remedy for exactly this profile, and the key's shape matches the
+        already-blessed machine-written *_at stamps (files_tagged_at,
+        gate_escalated_at, combined_at, before_done_ran_at). RED until
+        'last_blocked_at' is added to _BLESSED_METADATA_KEYS.
+        """
+        _, warnings = parse_metadata(
+            {'last_blocked_at': '2026-08-01T07:31:13.914220+00:00'}, direction='read'
+        )
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'last_blocked_at'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for last_blocked_at; got: {offending}'
+        )
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)
@@ -1578,6 +1945,57 @@ class TestParseMetadataFailurePolicy:
         )
         assert len(warnings) == 1
         assert model.task_kind == 'deterministic'
+
+    # human_curator_gate together with a non-null before_done (task 3369). The
+    # marker is blessed and `x_keep` is x_-namespaced, so neither manufactures
+    # an unknown_key warning — the single warning below is the cross-field one.
+    _CURATOR_GATE_CONTRADICTION = {
+        'task_kind': 'deterministic',
+        'always_escalates': True,
+        'before_done': {'script': 'scripts/x.sh', 'timeout_secs': 60},
+        'human_curator_gate': True,
+        'x_keep': 1,
+    }
+
+    def test_curator_gate_contradiction_write_enforce_raises(self):
+        with pytest.raises(ValidationError):
+            parse_metadata(
+                copy.deepcopy(self._CURATOR_GATE_CONTRADICTION),
+                direction='write',
+                enforce=True,
+            )
+
+    def test_curator_gate_contradiction_write_warn_mode_accepts(self):
+        _, warnings = parse_metadata(
+            copy.deepcopy(self._CURATOR_GATE_CONTRADICTION),
+            direction='write',
+            enforce=False,
+        )
+        assert len(warnings) == 1, [(w.field, w.code) for w in warnings]
+        assert warnings[0].field == task_metadata_module._WHOLE_METADATA_FIELD
+        assert warnings[0].code == 'invalid_metadata'
+
+    def test_curator_gate_contradiction_read_warns_and_round_trips(self):
+        """direction='read' never raises, and I1 round-trip survives.
+
+        On this whole-model error branch parse_metadata falls back to
+        ``TaskMetadata.model_construct(**parsed)``, so ``before_done`` stays a
+        RAW dict (field validation was skipped) and a ``model_dump()``
+        assertion here would emit a benign pydantic UserWarning
+        ("PydanticSerializationUnexpectedValue(Expected `BeforeDone` ...)").
+        Assert on ``model_extra``/``before_done`` instead, so this test cannot
+        break under a future ``-W error`` run. That is pre-existing behaviour
+        of the whole-model branch, not something task 3369 introduced.
+        """
+        blob = copy.deepcopy(self._CURATOR_GATE_CONTRADICTION)
+        model, warnings = parse_metadata(blob, direction='read')
+        assert len(warnings) == 1, [(w.field, w.code) for w in warnings]
+        assert warnings[0].field == task_metadata_module._WHOLE_METADATA_FIELD
+        assert warnings[0].code == 'invalid_metadata'
+        extra = model.model_extra or {}
+        assert extra['human_curator_gate'] is True
+        assert extra['x_keep'] == 1
+        assert model.before_done == blob['before_done']
 
     # Valid JSON that decodes to something other than an object, plus one
     # direct non-dict/non-str Python input exercising the `else: parsed =
@@ -1621,21 +2039,170 @@ class _CheckStub(BaseModel):
     name: str
 
 
+class TestListForDictOnlySliceRejected:
+    """Task 4142: a LIST value for a dict-only slice is no longer silent.
+
+    Before this gate, parse_metadata's registry loop branched purely on
+    `isinstance(raw, list)`, so `{'milestone': [{...}]}` validated
+    element-wise into a typed LIST of Milestones and returned ZERO warnings —
+    invisible to both the `task_metadata.schema_warning` census and the
+    `enforce=True` write gate. The resulting non-dict metadata.milestone then
+    made scheduler._milestone_time_gated fail-safe-withhold the task from
+    dispatch indefinitely, with no escalation path.
+    """
+
+    # The verbatim repro blob from the task's premise.
+    _LIST_MILESTONE = {'milestone': [{'mode': 'delayed', 'after_secs': 604800}]}
+
+    def test_write_warn_mode_emits_exactly_one_wrong_cardinality_warning(self):
+        model, warnings = parse_metadata(
+            copy.deepcopy(self._LIST_MILESTONE), direction='write', enforce=False
+        )
+        # Length pinned at 1 so a stray unknown_key/invalid_field would fail:
+        # 'milestone' is in known_fields (no unknown_key) and is not a
+        # declared TaskMetadata field, so the raw list lands in model_extra
+        # under extra='allow' (no invalid_field).
+        assert len(warnings) == 1
+        assert warnings[0].field == 'milestone'
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model is not None
+
+    def test_raw_list_retained_byte_for_byte(self):
+        model, _warnings = parse_metadata(
+            copy.deepcopy(self._LIST_MILESTONE), direction='write', enforce=False
+        )
+        dumped = model.model_dump()['milestone']
+        # I1: the offending value round-trips unswapped, NOT as [Milestone(...)].
+        assert dumped == [{'mode': 'delayed', 'after_secs': 604800}]
+        assert all(not isinstance(item, BaseModel) for item in dumped)
+
+    def test_write_enforce_raises_type_error(self):
+        with pytest.raises(TypeError):
+            parse_metadata(
+                copy.deepcopy(self._LIST_MILESTONE), direction='write', enforce=True
+            )
+
+    def test_read_warns_and_never_raises(self):
+        model, warnings = parse_metadata(
+            copy.deepcopy(self._LIST_MILESTONE), direction='read'
+        )
+        assert len(warnings) == 1
+        assert warnings[0].field == 'milestone'
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model.model_dump()['milestone'] == [{'mode': 'delayed', 'after_secs': 604800}]
+
+    def test_gate_is_generic_not_milestone_special_cased_warn(self):
+        # A test-owned key registered WITHOUT a cardinality gets the
+        # fail-closed 'dict' default and is gated identically.
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata(
+            {_DEPLOY_STATE_STUB_KEY: [{'phase': 'a'}]}, direction='write', enforce=False
+        )
+        assert len(warnings) == 1
+        assert warnings[0].field == _DEPLOY_STATE_STUB_KEY
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model.model_dump()[_DEPLOY_STATE_STUB_KEY] == [{'phase': 'a'}]
+
+    def test_gate_is_generic_not_milestone_special_cased_enforce(self):
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        with pytest.raises(TypeError):
+            parse_metadata(
+                {_DEPLOY_STATE_STUB_KEY: [{'phase': 'a'}]}, direction='write', enforce=True
+            )
+
+    def test_well_shaped_dict_milestone_still_parses_clean(self):
+        # The happy path is untouched — the gate only fires on a shape
+        # mismatch. (Mirrors TestListValuedSubmodelSlice's
+        # test_existing_dict_slice_milestone_unaffected, kept here so this
+        # class states both sides of its own contract.)
+        model, warnings = parse_metadata(
+            {'milestone': {'mode': 'delayed', 'after_secs': 604800}},
+            direction='write',
+            enforce=True,
+        )
+        assert warnings == []
+        assert isinstance(model.milestone, Milestone)  # type: ignore[attr-defined]
+
+
+class TestNonListForListSliceRejected:
+    """Task 4142, the mirror direction: a NON-LIST value for a 'list' slice.
+
+    The same silent-acceptance defect reflected. Today a bare mapping
+    supplied for the list-capable delivered_checks validates quietly into a
+    SINGLE DeliveredCheckMeta — and the consumer
+    (orchestrator/delivered_checks.py, verify_delivered_checks_on_main)
+    ITERATES that value, so a dict iterates its string KEYS and produces
+    garbage checks against a mark-done gate.
+    """
+
+    _KEY = 'mirror_checks_stub'
+
+    def _register(self):
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
+
+    def test_bare_mapping_write_warn_mode_warns_and_retains_raw(self):
+        self._register()
+        model, warnings = parse_metadata(
+            {self._KEY: {'name': 'a'}}, direction='write', enforce=False
+        )
+        assert len(warnings) == 1
+        assert warnings[0].field == self._KEY
+        assert warnings[0].code == 'wrong_cardinality'
+        dumped = model.model_dump()[self._KEY]
+        assert dumped == {'name': 'a'}
+        assert not isinstance(dumped, BaseModel)
+
+    def test_bare_mapping_write_enforce_raises_type_error(self):
+        self._register()
+        with pytest.raises(TypeError):
+            parse_metadata({self._KEY: {'name': 'a'}}, direction='write', enforce=True)
+
+    def test_bare_mapping_read_warns_and_never_raises(self):
+        self._register()
+        model, warnings = parse_metadata({self._KEY: {'name': 'a'}}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model.model_dump()[self._KEY] == {'name': 'a'}
+
+    def test_scalar_value_write_warn_mode_warns(self):
+        self._register()
+        _model, warnings = parse_metadata(
+            {self._KEY: 'not-a-list'}, direction='write', enforce=False
+        )
+        assert len(warnings) == 1
+        assert warnings[0].code == 'wrong_cardinality'
+
+    def test_well_formed_list_still_validates_with_zero_warnings(self):
+        # Regression guard against over-tightening.
+        self._register()
+        model, warnings = parse_metadata(
+            {self._KEY: [{'name': 'a'}]}, direction='write', enforce=True
+        )
+        assert warnings == []
+        assert all(isinstance(item, _CheckStub) for item in getattr(model, self._KEY))
+
+
 class TestListValuedSubmodelSlice:
-    """Generic list-valued registered slice support in parse_metadata.
+    """List-valued registered slice support in parse_metadata.
 
     Pins the behavior needed by capability_manifest.DeliveredCheckMeta
-    (plans/capability-delivered-checks-prd.md §Contract) before that real
-    model is wired in: metadata.delivered_checks is a LIST, but the existing
-    splat `submodel(**parsed[key])` only handles mapping slices (a list
-    raises TypeError). dict-valued slices (milestone, deploy_state) must
-    stay on the byte-identical unchanged path.
+    (plans/capability-delivered-checks-prd.md §Contract): metadata
+    .delivered_checks is a LIST, but the splat `submodel(**parsed[key])`
+    only handles mapping slices (a list raises TypeError). dict-valued
+    slices (milestone, deploy_state) must stay on the byte-identical
+    unchanged path.
+
+    The list arm is no longer generic across every registered key: since
+    task 4142 it runs only for a slice whose registration DECLARED
+    `cardinality='list'`, which is why every registration below passes it.
+    A list handed to a dict-only slice is a `wrong_cardinality` finding —
+    see TestListForDictOnlySliceRejected above.
     """
 
     _KEY = 'delivered_checks_stub'
 
     def test_valid_list_slice_validated_and_typed_no_warnings(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         model, warnings = parse_metadata(
             {self._KEY: [{'name': 'a'}, {'name': 'b'}]}, direction='write'
         )
@@ -1646,7 +2213,7 @@ class TestListValuedSubmodelSlice:
         assert [item.name for item in slice_value] == ['a', 'b']
 
     def test_valid_list_slice_round_trips_as_plain_dicts(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         model, warnings = parse_metadata(
             {self._KEY: [{'name': 'a'}, {'name': 'b'}]}, direction='write'
         )
@@ -1656,13 +2223,13 @@ class TestListValuedSubmodelSlice:
         assert all(not isinstance(item, BaseModel) for item in dumped)
 
     def test_empty_list_slice_validates_to_empty_list(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         model, warnings = parse_metadata({self._KEY: []}, direction='write')
         assert warnings == []
         assert getattr(model, self._KEY) == []
 
     def test_malformed_element_read_warns_and_retains_raw_list(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         model, warnings = parse_metadata({self._KEY: [{'name': 'a'}, {}]}, direction='read')
         assert len(warnings) == 1
         assert warnings[0].field == self._KEY
@@ -1670,26 +2237,26 @@ class TestListValuedSubmodelSlice:
         assert model.model_dump()[self._KEY] == [{'name': 'a'}, {}]
 
     def test_malformed_element_write_enforce_raises(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         with pytest.raises(ValidationError):
             parse_metadata({self._KEY: [{'name': 'a'}, {}]}, direction='write', enforce=True)
 
     def test_malformed_element_write_warn_mode_accepts_raw_list(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         model, warnings = parse_metadata({self._KEY: [{}]}, direction='write', enforce=False)
         assert len(warnings) == 1
         assert warnings[0].code == 'invalid_submodel'
         assert model.model_dump()[self._KEY] == [{}]
 
     def test_non_mapping_element_in_list_read_warns_never_raises(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         model, warnings = parse_metadata({self._KEY: ['not-a-dict']}, direction='read')
         assert len(warnings) == 1
         assert warnings[0].code == 'invalid_submodel'
         assert model.model_dump()[self._KEY] == ['not-a-dict']
 
     def test_non_mapping_element_in_list_write_enforce_raises(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         with pytest.raises((ValidationError, TypeError)):
             parse_metadata({self._KEY: ['not-a-dict']}, direction='write', enforce=True)
 

@@ -1,5 +1,5 @@
 """Tests for scripts/gc_agent_transcripts.py — the retention GC sweep over the
-gzipped agent-transcript archive (task 2731, δ of
+agent-transcript archive (task 2731, δ of
 plans/agent-transcript-archival-prd.md).
 
 step-1: the pure age-cap arm of select_prunable(task_dirs, now, max_age_days,
@@ -17,9 +17,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import pytest
-
 import gc_agent_transcripts as gct
+import pytest
 from gc_agent_transcripts import select_prunable
 
 LOG_PREFIX = "gc_agent_transcripts:"
@@ -185,15 +184,15 @@ def _touch(path: Path, mtime: float) -> None:
 
 def test_scan_reports_newest_descendant_mtime_per_task_dir(tmp_path):
     root = tmp_path / "agent-transcripts"
-    # task dir "100": a single main-session .gz.
-    _touch(root / "100" / "enc" / "sid1.jsonl.gz", NOW - 10 * DAY)
+    # task dir "100": a single main-session transcript.
+    _touch(root / "100" / "enc" / "sid1.jsonl", NOW - 10 * DAY)
     # task dir "200": two files at different mtimes -> newest wins.
-    _touch(root / "200" / "enc" / "sid2.jsonl.gz", NOW - 50 * DAY)
-    _touch(root / "200" / "enc" / "sid3.jsonl.gz", NOW - 5 * DAY)
+    _touch(root / "200" / "enc" / "sid2.jsonl", NOW - 50 * DAY)
+    _touch(root / "200" / "enc" / "sid3.jsonl", NOW - 5 * DAY)
     # task dir "300": nested subagent transcript only.
-    _touch(root / "300" / "enc" / "sid4" / "subagents" / "agent-1.jsonl.gz", NOW - 3 * DAY)
+    _touch(root / "300" / "enc" / "sid4" / "subagents" / "agent-1.jsonl", NOW - 3 * DAY)
     # a stray non-directory file directly under root -> ignored.
-    _touch(root / "loose.jsonl.gz", NOW)
+    _touch(root / "loose.jsonl", NOW)
 
     result = dict(gct.scan_task_dirs(root))
 
@@ -228,7 +227,7 @@ def test_scan_existing_but_empty_root_returns_empty(tmp_path):
 # ---------------------------------------------------------------------------
 # amend (review): scan_task_dirs must be best-effort + never-raise under a
 # stat() failure mid-scan. The archive is written CONCURRENTLY by the α
-# producer hook, so a descendant .gz / task dir can vanish or become
+# producer hook, so a descendant transcript / task dir can vanish or become
 # unstattable between the rglob walk and the stat() call (a classic TOCTOU
 # race). The module docstring loudly promises "never-raise / always exit 0";
 # an unguarded stat() OSError would propagate scan_task_dirs -> main ->
@@ -242,16 +241,16 @@ def test_scan_existing_but_empty_root_returns_empty(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_scan_survives_stat_failure_on_descendant_file(tmp_path, caplog, monkeypatch):
-    """A descendant .gz that becomes unstattable mid-scan is skipped LOUDLY;
-    the remaining readable files still set the dir's age and sibling task dirs
-    are still scanned — the sweep never raises."""
+    """A descendant transcript that becomes unstattable mid-scan is skipped
+    LOUDLY; the remaining readable files still set the dir's age and sibling
+    task dirs are still scanned — the sweep never raises."""
     caplog.set_level(logging.WARNING, logger="gc_agent_transcripts")
     root = tmp_path / "agent-transcripts"
-    good = root / "100" / "enc" / "good.jsonl.gz"
-    vanished = root / "100" / "enc" / "vanished.jsonl.gz"
+    good = root / "100" / "enc" / "good.jsonl"
+    vanished = root / "100" / "enc" / "vanished.jsonl"
     _touch(good, NOW - 20 * DAY)
     _touch(vanished, NOW - 1 * DAY)  # the newest file — but it fails to stat
-    _touch(root / "200" / "enc" / "sib.jsonl.gz", NOW - 8 * DAY)
+    _touch(root / "200" / "enc" / "sib.jsonl", NOW - 8 * DAY)
 
     real_stat = Path.stat
 
@@ -283,7 +282,7 @@ def test_scan_survives_stat_failure_on_task_dir(tmp_path, caplog, monkeypatch):
     root = tmp_path / "agent-transcripts"
     bad = root / "100"
     bad.mkdir(parents=True)
-    _touch(root / "200" / "enc" / "sib.jsonl.gz", NOW - 8 * DAY)
+    _touch(root / "200" / "enc" / "sib.jsonl", NOW - 8 * DAY)
 
     real_stat = Path.stat
 
@@ -316,7 +315,7 @@ def _make_task_dirs(root: Path, records: list[tuple[str, str]]) -> list[tuple[Pa
     for name, reason in records:
         d = root / name
         (d / "enc").mkdir(parents=True)
-        (d / "enc" / "x.jsonl.gz").write_bytes(b"x")
+        (d / "enc" / "x.jsonl").write_bytes(b"x")
         out.append((d, reason))
     return out
 
@@ -404,7 +403,7 @@ def test_default_constants_match_orchestrator_config():
     """
     from orchestrator.config import RetentionConfig, TranscriptArchiveConfig
 
-    assert gct.ARCHIVE_ROOT_RELATIVE == TranscriptArchiveConfig().root
+    assert TranscriptArchiveConfig().root == gct.ARCHIVE_ROOT_RELATIVE
     assert gct.ARCHIVE_ROOT_RELATIVE == "data/orchestrator/agent-transcripts"
     assert gct.DEFAULT_MAX_AGE_DAYS == RetentionConfig().max_age_days == 90
     assert gct.DEFAULT_MAX_TASK_DIRS == RetentionConfig().max_task_dirs == 5000
@@ -433,15 +432,15 @@ def _run_cli(*args):
 
 
 def _make_cli_archive(root: Path, specs: list[tuple[str, float]]) -> None:
-    """Build ``<root>/<name>/enc/session.jsonl.gz`` for each ``(name, mtime)``,
-    stamping the ``.gz`` mtime via ``os.utime`` so ``scan_task_dirs`` reads it
-    as that task dir's retention age."""
+    """Build ``<root>/<name>/enc/session.jsonl`` for each ``(name, mtime)``,
+    stamping the transcript mtime via ``os.utime`` so ``scan_task_dirs`` reads
+    it as that task dir's retention age."""
     root.mkdir(parents=True, exist_ok=True)
     for name, mtime in specs:
-        gz = root / name / "enc" / "session.jsonl.gz"
-        gz.parent.mkdir(parents=True)
-        gz.write_bytes(b"x")
-        os.utime(gz, (mtime, mtime))
+        transcript = root / name / "enc" / "session.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_bytes(b"x")
+        os.utime(transcript, (mtime, mtime))
 
 
 # 5 fresh dirs (all within the age cap), distinct mtimes: "100" newest ...

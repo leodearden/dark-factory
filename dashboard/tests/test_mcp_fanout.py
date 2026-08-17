@@ -13,6 +13,7 @@ propagation.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import httpx
 import pytest
@@ -129,6 +130,405 @@ class TestFirstSuccessAllFail:
         assert 'http://a' in result['error']
         assert 'http://b' in result['error']
         assert 'refused' in result['error']
+
+
+# ── (c2) per-URL failures are surfaced at WARNING, on transition ─────
+
+
+class TestFirstSuccessLogsFailuresAtWarning:
+    """A failing URL must leave a journal trace at WARNING, not DEBUG.
+
+    The dashboard runs at the default WARNING root level, so a DEBUG log
+    here means a *total* fused-memory/escalation outage produces no journal
+    record at all — the fan-out silently degrades to the offline sentinel
+    and the operator sees only an "offline" pill with no cause. Same class
+    of fix as task 1814.
+
+    The opposite failure is equally real: first_success is on ~8 hot paths
+    behind a 2s UI poll, so WARNING-per-failure would turn a *sustained*
+    outage into hundreds of identical lines a minute. The policy is therefore
+    transition-only — see TestFanoutFailureThrottling below.
+    """
+
+    async def test_each_failing_url_logs_one_warning(self, caplog):
+        urls = ['http://a', 'http://b']
+
+        async def call(url):
+            raise httpx.ConnectError(f'{url} refused')
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            result = await first_success(
+                urls, call, log_label='get_memory_status',
+                offline_result=_offline_result,
+            )
+
+        assert result['offline'] is True, 'still returns the caller offline sentinel'
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == len(urls), (
+            f'expected one WARNING per failing URL, got {len(warnings)}: '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+        messages = [r.getMessage() for r in warnings]
+        for url, message in zip(urls, messages, strict=True):
+            assert 'get_memory_status' in message, (
+                f'warning must name the log_label, got: {message}'
+            )
+            assert url in message, f'warning must name the failing url, got: {message}'
+            assert 'refused' in message, (
+                f'warning must carry the underlying error, got: {message}'
+            )
+
+
+# ── (c3) sustained failure must not become a log flood ───────────────
+
+
+class TestFanoutFailureThrottling:
+    """WARNING on transition; DEBUG for the repeats in between.
+
+    A total fused-memory outage lasts minutes-to-hours while the UI polls
+    every 2s across ~8 fan-out paths. One WARNING per failure would emit
+    order 150-300 lines/minute indefinitely, burying the first (diagnostic)
+    line and growing the journal without bound. The operator is served by the
+    first occurrence and by the recovery line, not by the 10,000th repeat.
+    """
+
+    @staticmethod
+    async def _fail_once(label: str = 'probe', url: str = 'http://a') -> None:
+        async def call(_url):
+            raise httpx.ConnectError('refused')
+
+        await first_success(
+            [url], call, log_label=label, offline_result=_offline_result,
+        )
+
+    async def _succeed_once(self, label: str = 'probe', url: str = 'http://a'):
+        async def call(_url):
+            return 'ok'
+
+        return await first_success(
+            [url], call, log_label=label, offline_result=_offline_result,
+        )
+
+    async def test_repeat_failures_are_demoted_to_debug(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+            for _ in range(5):
+                await self._fail_once()
+
+        records = [r for r in caplog.records if r.name == 'dashboard.data.mcp_fanout']
+        warnings = [r for r in records if r.levelno == logging.WARNING]
+        debugs = [r for r in records if r.levelno == logging.DEBUG]
+
+        assert len(warnings) == 1, (
+            f'a sustained streak must warn exactly once, got '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+        assert len(debugs) == 4, (
+            f'the 4 repeats must still be recorded at DEBUG, got '
+            f'{[r.getMessage() for r in debugs]}'
+        )
+
+    async def test_streaks_are_tracked_per_label_and_url(self, caplog):
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            await self._fail_once(label='probe', url='http://a')
+            await self._fail_once(label='probe', url='http://b')
+            await self._fail_once(label='other', url='http://a')
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 3, (
+            'each (log_label, url) pair reports independently, got '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+    async def test_recovery_closes_the_streak_and_re_arms_the_warning(self, caplog):
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            await self._fail_once()
+            await self._fail_once()  # demoted to DEBUG
+            assert await self._succeed_once() == 'ok'
+            await self._fail_once()  # streak closed → warns again
+
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(messages) == 3, (
+            f'expected open + recovery + re-open, got {messages}'
+        )
+        assert 'recovered' in messages[1], (
+            f'the streak needs a visible closing bracket, got {messages[1]}'
+        )
+        assert '2 consecutive' in messages[1], (
+            f'recovery should report the streak length, got {messages[1]}'
+        )
+
+    async def test_reset_sessions_clears_streak_state(self, caplog):
+        from dashboard.data.memory import reset_sessions
+
+        await self._fail_once()
+        reset_sessions()
+        caplog.clear()  # drop the opening WARNING captured above
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            await self._fail_once()
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            'reset_sessions must clear throttling state so one test cannot '
+            "silently demote the next test's first WARNING to DEBUG"
+        )
+
+    async def test_log_failures_false_suppresses_the_fanout_report(self, caplog):
+        """The two app.py proxies log their own detailed WARNING at the call site."""
+        async def call(_url):
+            raise httpx.ConnectError('refused')
+
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+            result = await first_success(
+                ['http://a'], call, log_label='cancel_ticket',
+                offline_result=_offline_result, log_failures=False,
+            )
+
+        assert result['offline'] is True, 'still returns the caller offline sentinel'
+        assert not [
+            r for r in caplog.records if r.name == 'dashboard.data.mcp_fanout'
+        ], 'log_failures=False must leave reporting entirely to the caller'
+
+
+# ── (c4) an empty-str exception must still name a cause ──────────────
+
+
+class TestFanoutFailureNamesTheExceptionType:
+    """``httpx.PoolTimeout`` stringifies to '' — the type name is the signal.
+
+    A PoolTimeout means *this client's own* connection pool is saturated, not
+    that the server is down; with a bare ``str(exc)`` both the WARNING and the
+    offline sentinel would read "failed for <url>: " and name nothing. The
+    distinction matters now that the shared client carries an explicit
+    ``limits=`` bound (task 3871, app.py).
+    """
+
+    async def test_pool_timeout_is_named_in_the_warning_and_the_sentinel(self, caplog):
+        async def call(_url):
+            # An empty message is exactly how httpx raises this in practice.
+            raise httpx.PoolTimeout('')
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            result = await first_success(
+                ['http://a'], call, log_label='get_status',
+                offline_result=_offline_result,
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1
+        assert 'PoolTimeout' in warnings[0], (
+            f'pool saturation must be distinguishable from a dead endpoint, '
+            f'got: {warnings[0]}'
+        )
+        assert 'PoolTimeout' in result['error'], (
+            f'the offline sentinel must name a cause too, got: {result["error"]}'
+        )
+
+
+# ── (c4b) an already-rendered cause must not be prefixed twice ───────
+
+
+class TestPreformattedFanoutError:
+    """A call site that already rendered 'Type: message' must not be re-prefixed.
+
+    ``first_success`` renders every caught exception through ``describe_exc``,
+    which unconditionally prepends ``type(exc).__name__``. A call site that has
+    already formatted the *real* cause and re-raises it therefore reached the
+    operator doubled — ``'ValueError: ConnectError: refused'`` in the
+    cancel_ticket 502 detail and in the dashboard's offline pill.
+    """
+
+    def test_is_a_value_error_subclass(self):
+        from dashboard.data.mcp_fanout import PreformattedFanoutError
+
+        assert issubclass(PreformattedFanoutError, ValueError), (
+            "first_success's catch tuple and callers' own `except ValueError` "
+            'must keep working unchanged'
+        )
+
+    def test_describe_exc_returns_the_message_verbatim(self):
+        from dashboard.data.mcp_fanout import PreformattedFanoutError, describe_exc
+
+        exc = PreformattedFanoutError('ConnectError: refused')
+        assert describe_exc(exc) == 'ConnectError: refused', (
+            'an already-rendered cause must not gain a second type prefix'
+        )
+
+    def test_a_plain_value_error_is_still_prefixed(self):
+        from dashboard.data.mcp_fanout import describe_exc
+
+        assert describe_exc(ValueError('ConnectError: refused')) == (
+            'ValueError: ConnectError: refused'
+        ), 'the opt-out is the marker type only — plain ValueError is unchanged'
+
+    def test_an_empty_message_still_names_a_type(self):
+        from dashboard.data.mcp_fanout import PreformattedFanoutError, describe_exc
+
+        # The content-free-log-line wart describe_exc exists to prevent
+        # (httpx.PoolTimeout stringifies to '') must not re-enter here.
+        assert describe_exc(PreformattedFanoutError('')) == 'PreformattedFanoutError'
+
+    async def test_first_success_emits_a_single_prefix_end_to_end(self, caplog):
+        from dashboard.data.mcp_fanout import PreformattedFanoutError
+
+        async def call(_url):
+            raise PreformattedFanoutError('ConnectError: refused')
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            result = await first_success(
+                ['http://a'], call, log_label='cancel_ticket',
+                offline_result=_offline_result,
+            )
+
+        assert result['error'] == 'http://a: ConnectError: refused', (
+            f'the offline sentinel must carry one prefix, got {result["error"]!r}'
+        )
+        assert 'ValueError: ConnectError' not in result['error']
+
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1
+        assert 'ValueError: ConnectError' not in warnings[0], (
+            f'the WARNING must not double the prefix either, got {warnings[0]}'
+        )
+
+
+# ── (c5) per-project-root label discrimination ───────────────────────
+
+
+class TestFanoutLabel:
+    """``fanout_label`` composes the throttle key's per-project-root discriminator.
+
+    The streak key is ``(log_label, url)``, and ONE fused-memory URL serves
+    every project_root — so a fan-out caller parameterized by project_root that
+    passes a fixed literal label collapses every root onto one key. Because
+    ``note_fanout_success`` *pops* that key, a healthy root's success in the
+    same poll cycle clears a broken root's open streak, re-arming the opening
+    WARNING (plus a 'recovered' WARNING) every cycle — the exact sustained
+    flood the transition-only policy exists to prevent.
+    """
+
+    def test_composes_base_and_project_basename(self):
+        from dashboard.data.mcp_fanout import fanout_label
+
+        assert fanout_label('fetch_tasks', '/home/leo/src/dark-factory') == (
+            'fetch_tasks[dark-factory]'
+        ), 'must generalize scheduler.py\'s existing base[label] shape'
+
+    def test_trailing_slash_is_stripped(self):
+        from dashboard.data.mcp_fanout import fanout_label
+
+        assert fanout_label('fetch_tasks', '/a/b/') == 'fetch_tasks[b]', (
+            'a configured root with a trailing slash must not yield an empty label'
+        )
+
+    def test_pathlib_path_yields_the_same_label_as_the_equivalent_str(self):
+        from pathlib import Path
+
+        from dashboard.data.mcp_fanout import fanout_label
+
+        # Callers pass both: metrics passes a Path-derived str, scheduler a Path.
+        assert fanout_label('list_tickets', Path('/a/b')) == fanout_label(
+            'list_tickets', '/a/b'
+        ) == 'list_tickets[b]'
+
+    def test_root_without_a_basename_falls_back_to_the_full_string(self):
+        from dashboard.data.mcp_fanout import fanout_label
+
+        assert fanout_label('fetch_tasks', '/') == 'fetch_tasks[/]', (
+            'a basename-less root must not degrade to a content-free "[]"'
+        )
+
+    def test_distinct_roots_produce_distinct_labels(self):
+        from dashboard.data.mcp_fanout import fanout_label
+
+        # This is the property the throttle key actually depends on.
+        assert fanout_label('fetch_tasks', '/srv/proj-a') != fanout_label(
+            'fetch_tasks', '/srv/proj-b'
+        )
+
+    def test_label_is_composed_from_the_single_project_label_definition(self):
+        """``fanout_label`` must delegate the basename rule, not re-derive it.
+
+        ``project_label`` is the one definition ``active_tasks._project_label``
+        and ``redux_api._project_label`` are meant to collapse onto; a future
+        edit that inlines the rule here again would silently re-fork it.
+        """
+        from pathlib import Path
+
+        from dashboard.data.mcp_fanout import fanout_label, project_label
+
+        for root in ('/home/leo/src/dark-factory', '/a/b/', '/', Path('/srv/proj-a')):
+            assert fanout_label('fetch_tasks', root) == f'fetch_tasks[{project_label(root)}]'
+
+    def test_same_basename_roots_share_a_label_by_design(self):
+        """Discrimination is by basename, so same-named roots still collapse.
+
+        Documented, inherited behaviour rather than an oversight: scheduler's
+        ``label_to_root`` and redux_api's per-project payload already key on the
+        same basename, so diverging to full paths here alone would make this one
+        log label inconsistent with every other project label the UI renders.
+        Pinned so the assumption is executable, not only prose in the docstring.
+        """
+        from dashboard.data.mcp_fanout import fanout_label
+
+        assert fanout_label('fetch_tasks', '/srv/team-a/app') == fanout_label(
+            'fetch_tasks', '/srv/team-b/app'
+        ) == 'fetch_tasks[app]'
+
+    async def test_distinct_roots_keep_independent_streaks_on_one_url(self, caplog):
+        """End-to-end: the discriminated labels really do decouple the streaks."""
+        from dashboard.data.mcp_fanout import fanout_label
+
+        url = 'http://shared-fused-memory:8765'
+
+        async def failing(_url):
+            raise httpx.ConnectError('refused')
+
+        async def healthy(_url):
+            return 'ok'
+
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+            for _ in range(3):
+                await first_success(
+                    [url], failing,
+                    log_label=fanout_label('fetch_tasks', '/srv/proj-a'),
+                    offline_result=_offline_result,
+                )
+                await first_success(
+                    [url], healthy,
+                    log_label=fanout_label('fetch_tasks', '/srv/proj-b'),
+                    offline_result=_offline_result,
+                )
+
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            f"root B's success must not pop root A's streak, got {warnings}"
+        )
+        assert 'proj-a' in warnings[0], (
+            f'the operator must be able to tell which root is down, got {warnings[0]}'
+        )
 
 
 # ── (d) success path: no invalidation, exactly one call ──────────────

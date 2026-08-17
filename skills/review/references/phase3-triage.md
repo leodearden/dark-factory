@@ -110,6 +110,11 @@ if resolve["status"] == "created":
     task_id = resolve["task_id"]           # new task — use for add_dependency calls
 elif resolve["status"] == "combined":
     task_id = resolve["task_id"]           # merged into existing task — normal, not an error
+elif resolve["status"] == "refused":
+    # A deterministic guard rejected the candidate: no task was created and there
+    # is no task_id (so it can carry no add_dependency edge). Intended outcome —
+    # record resolve["reason"] in the review report. Do NOT retry.
+    note_refused(resolve["reason"])
 elif resolve["status"] == "failed":
     # On `failed`: record the reason in the review report and skip this finding.
     # See skills/_shared/ticket-failure-handling.md for the retryable/terminal

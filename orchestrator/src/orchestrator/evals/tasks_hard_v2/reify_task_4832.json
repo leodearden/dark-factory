@@ -1,0 +1,54 @@
+{
+  "id": "reify_task_4832",
+  "name": "P3\u03b3: feature-provenance round-trip .ri example + two-way boundary test (focused-H gate)",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "817636f65644ba45abd6dc4e03869222fb776b87",
+  "post_task_commit": "78dd13590ce1eca09c7ff595d0887b91bfe70d05",
+  "task_definition": {
+    "title": "P3\u03b3: feature-provenance round-trip .ri example + two-way boundary test (focused-H gate)",
+    "description": "PRD: docs/prds/naming-convergence/P3-feature-provenance-query-surface.md task \u03b3 (LEAF, CI signal \u2014 the focused-H integration gate). Manifest binding: \u00a7\u03b3.\n\nCommit the charter's `FeatureProvenanceSelectorsV2` round-trip example AND implement the \u00a76 two-way boundary matrix (the seam between the query surface and the populated provenance substrate; closes G2 via the C-as-integration-gate pattern).\n\n1. .ri example (examples/\u2026/feature_provenance_selectors_v2.ri): `let base = box(...)` \u2192 `let g = fillet(base, edge, r)` \u2192 `feature(base)` / `feature(g)` \u2192 `created_by_feature(g, feature(g))` vs `created_by_feature(g, feature(base))` give DISTINCT face sets. Must `reify eval`/`check` green in CI (file-exists + content signal).\n\n2. \u00a76 two-way boundary test (crates/reify-eval/tests/):\n   Producer side \u2014 primitive round-trip (feature(base) \u2192 created_by_feature resolves the box face set, non-empty); FILLET DISCRIMINATION (created_by_feature over feature(g) vs feature(base) \u2192 disjoint & non-empty face sets \u2014 production-backed via populate_local_feature_op, engine_build.rs:920); split stability (split_by_feature over a mod_history-bearing path \u2014 OQ#5: morph/split path morph_stage_b.rs:732, or scope the row noting the gap); off-provenance FAIL-CLOSED (structured diagnostic + Value::Undef, never silent empty/panic).\n   Consumer side \u2014 explicit-projection type error (pass a Geometry where a Feature is required \u2192 construct-time `reify check` error, no implicit coercion); kind discipline (Selector(Face) to a face: param ok; non-Face \u2192 kind error); feature() whole-body vs sub-shape both resolve.\n\n3. Document the three new functions (feature, created_by_feature, split_by_feature) in docs/reify-stdlib-reference.md.\n\nG6 GUARD: assert fillet discrimination QUALITATIVELY (disjoint & non-empty) \u2014 do NOT pin a brittle exact face count; pin counts only after observing the realized fixture (PRD OQ#4). Avoid a guessed-count RED test.\n\nUser-observable signal (LEAF, CI): committed examples/\u2026/feature_provenance_selectors_v2.ri that reify eval/check runs green (file-exists + content) AND a committed boundary-test file under crates/reify-eval/tests/ whose \u00a76 rows all pass (fillet discrimination disjoint & non-empty; off-provenance fail-closed; explicit-projection type error).\nConsumer: the integration gate itself (proves the query surface \u2194 populated-provenance contract end-to-end); the example is a user-facing artifact.\nModules touched: reify-eval (tests/), examples/, docs. metadata.files=[] \u2014 new example + new boundary-test file spanning the reify-eval test tree, acquired by BRE (mirrors P0 \u03b3 / P1 \u03b5).\nPrereqs: \u03b1, \u03b2."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [
+    "reify-eval",
+    "docs"
+  ],
+  "complexity": "simple",
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "78dd13590ce1eca09c7ff595d0887b91bfe70d05",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "merge_first_parent",
+    "task_status": "done",
+    "eval_branch_pinned": false,
+    "eval_branch_pin_error": "pin_eval_branch(evals/reify_task_4832) failed: Command git update-ref refs/heads/evals/reify_task_4832 78dd13590ce1eca09c7ff595d0887b91bfe70d05 failed (rc=128): fatal: update_ref failed for ref 'refs/heads/evals/reify_task_4832': cannot lock ref 'refs/heads/evals/reify_task_4832': Unable to create '/home/leo/src/reify/.git/refs/heads/evals/reify_task_4832.lock': Permission denied",
+    "eval_branch_pin_impact": "None for retrievability. The reference block carries the post SHA directly and materialize_reference_diff works off the pre/post SHAs, not the branch; the pin only holds the commit off the GC path. post_task_commit IS an ancestor of main in this checkout, so it is reachable and not GC-eligible regardless. Re-run --mint from a checkout with write access to restore the belt-and-braces ref."
+  },
+  "reference": {
+    "post_task_commit": "78dd13590ce1eca09c7ff595d0887b91bfe70d05",
+    "diff_stat": {
+      "files": 1,
+      "insertions": 57,
+      "deletions": 0
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

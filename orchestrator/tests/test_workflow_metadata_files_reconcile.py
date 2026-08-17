@@ -24,13 +24,47 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec
-from _workflow_helpers import FakeScheduler
+from _workflow_helpers import FakeScheduler, same_module_siblings
 from shared.locking import directory_locks
 
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import files_to_modules
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+
+# The depth these tests pin on their MagicMock config, in ONE place.
+#
+# The constant alone only deduplicates a literal — it CANNOT by itself stop
+# the premise and the code under test from drifting apart, because it is
+# itself the re-typed value: swap a `config.lock_depth` pin for a real config
+# (which resolves the LIVE operational depth via the autouse
+# `_isolate_orch_config` fixture) and `_LOCK_DEPTH` still reads 2, so every
+# `files_to_modules(..., _LOCK_DEPTH)` precondition below would keep asserting
+# 2 and keep PASSING against a workflow running at 12.  That silently-wrong
+# outcome — rather than a loud precondition failure — is the failure mode task
+# 3866 exists to document, so it is `_assert_depth_pin_holds` below, not the
+# constant, that actually forecloses it.
+_LOCK_DEPTH = 2
+
+
+def _assert_depth_pin_holds(wf: TaskWorkflow) -> None:
+    """Fail LOUDLY if the workflow's real depth diverges from `_LOCK_DEPTH`.
+
+    Read through `wf.config` — the object the code under test actually
+    consults — not through the local pin, so this compares the premise the
+    preconditions were computed at against the depth the workflow will really
+    run at.  Both factories call it at construction time, which is what makes
+    the two impossible to diverge silently.
+    """
+    actual = wf.config.lock_depth
+    assert actual == _LOCK_DEPTH, (
+        f'this module computes its same-module/cross-module preconditions at '
+        f'lock_depth={_LOCK_DEPTH}, but the workflow under test resolves '
+        f'{actual}. Those preconditions are now false (or vacuous) for the code '
+        'being exercised. Re-point _LOCK_DEPTH at the depth the workflow really '
+        'uses — do NOT silence this by editing the preconditions alone (task '
+        '3866).'
+    )
 
 
 def _make_workflow(
@@ -48,7 +82,7 @@ def _make_workflow(
     config = MagicMock(spec_set=_spec)
     config.fused_memory.project_id = 'dark_factory'
     config.fused_memory.url = 'http://localhost:8002'
-    config.lock_depth = 2
+    config.lock_depth = _LOCK_DEPTH
     config.project_root = project_root
 
     update_task = AsyncMock(return_value=True)
@@ -72,6 +106,7 @@ def _make_workflow(
         briefing=MagicMock(),
         mcp=MagicMock(),
     )
+    _assert_depth_pin_holds(wf)
     return wf, update_task, get_merge_diff_files, get_merge_commit_diff_files
 
 
@@ -313,45 +348,51 @@ async def test_reconcile_writes_empty_files_on_git_error_fail_open(tmp_path: Pat
 async def test_reconcile_strips_directory_shaped_merge_diff_files(tmp_path: Path):
     """Directory-shaped entries from git diff are stripped before persisting.
 
-    After the 2026-07-28 allowlist widening (reify #5726 / dark_factory #3117)
-    the ONLY directory-shaped output ``git diff --name-only`` can realistically
-    produce is an **extension-less tracked file** — measured: of 2124 tracked
-    paths in this repo, zero have a non-allowlisted extension, and 7 are
-    extension-less (``LICENSE``, ``hooks/pre-commit``,
-    ``fused-memory/docker/Dockerfile``, ...).  Both fixture entries below are
-    therefore real ``git ls-files`` paths that git genuinely emits in a diff,
-    not synthetic directory names: ``git diff --name-only`` lists *files*, never
-    bare directories.
+    The strip itself (``strip_directory_locks`` applied to diff output before
+    writing, mirroring the change-#1 ``scheduler._persist_files_metadata`` fix)
+    is unchanged and still pinned below.  What changed is WHICH entries are
+    directory-shaped.
 
-    Note the classification rule is per-segment-extension, NOT "dotfiles as a
-    class" — ``.gitignore`` IS file-shaped now (``gitignore`` is allowlisted).
-    The converse case (a leading-dot segment that stays directory-shaped, e.g.
-    ``.worktrees``) is pinned in the predicate suites themselves
-    (``test_leading_dot_directories_stay_directories`` in both
-    ``shared/tests/test_locking.py`` and
+    AMENDED by dark_factory #3248 — this test previously encoded the bug.  Its
+    fixture used ``fused-memory/docker/Dockerfile`` and ``hooks/pre-commit`` as
+    the entries that "must be stripped", and its own docstring explained why
+    that was wrong without drawing the conclusion: it argued that the only
+    directory-shaped output ``git diff --name-only`` can realistically produce
+    is an **extension-less tracked FILE**, because "git diff --name-only lists
+    *files*, never bare directories".  Both fixture entries were, by that same
+    reasoning, real ``git ls-files`` paths.  Asserting they be stripped was
+    therefore asserting that real tracked files be silently erased from
+    ``metadata.files`` on every reconcile — the exact data-loss defect #3248
+    fixes, not a property worth pinning.
+
+    Since #3248 those names are in ``EXTENSIONLESS_FILENAMES`` and classify as
+    files, so they now SURVIVE, and this test pins that.  A genuinely
+    directory-shaped entry is kept in the fixture so the strip is still proven
+    to function — it cannot arise from ``--name-only`` output, but the strip is
+    defensive and the coverage is worth keeping.
+
+    Note the classification rule is per-segment-extension (plus the enumerated
+    extension-less name list), NOT "dotfiles as a class" — ``.gitignore`` IS
+    file-shaped (``gitignore`` is allowlisted).  The converse case (a leading-dot
+    segment that stays directory-shaped, e.g. ``.worktrees``) is pinned in the
+    predicate suites themselves (``test_leading_dot_directories_stay_directories``
+    in both ``shared/tests/test_locking.py`` and
     ``fused-memory/tests/test_lock_charter_guard.py``) and deliberately is NOT
     re-asserted here, because such a path cannot appear in a merge diff.
-
-    ``is_file_path`` classifies extension-less entries as directory-shaped, so
-    they would cause the update_task lock-charter guard (changes #2/#3) to return
-    a LockCharterViolation — silently rejected (return value ignored at line
-    1343) — leaving stale plan.files and potentially tripping the phantom-done
-    gate.
-
-    The fix applies ``strip_directory_locks`` to the diff output before writing,
-    mirroring the change-#1 scheduler._persist_files_metadata fix.
     """
     wf, update_task, get_merge_diff_files, get_merge_commit_diff_files = (
         _make_workflow(project_root=tmp_path)
     )
     wf._base_commit = 'a' * 40
     wf._merge_sha = 'b' * 40
-    # Mixed: both extension-less tracked files (Dockerfile, hooks/pre-commit) are
-    # directory-shaped to is_file_path; the .py files are file-level.
+    # Mixed: the two extension-less entries are real tracked FILES and must
+    # SURVIVE (#3248); 'crates/reify-eval/src' is a real directory and must be
+    # stripped; the .py files are ordinary file-level entries.
     get_merge_commit_diff_files.return_value = (
         [
             'fused-memory/docker/Dockerfile',
             'hooks/pre-commit',
+            'crates/reify-eval/src',
             'src/landed.py',
             'orchestrator/src/orchestrator/workflow.py',
         ],
@@ -363,10 +404,13 @@ async def test_reconcile_strips_directory_shaped_merge_diff_files(tmp_path: Path
     persisted = _persisted_payload(update_task)['files']
     # Only file-level entries must survive (order preserved).
     assert persisted == [
+        'fused-memory/docker/Dockerfile',
+        'hooks/pre-commit',
         'src/landed.py',
         'orchestrator/src/orchestrator/workflow.py',
     ], (
-        f'directory-shaped entries must be stripped; got {persisted!r}'
+        f'directory-shaped entries must be stripped and real tracked files '
+        f'must survive; got {persisted!r}'
     )
     # The persisted set passes the update_task lock-charter guard.
     assert directory_locks(persisted) == [], (
@@ -425,7 +469,7 @@ def _make_replan_workflow(
     config.fused_memory.url = 'http://localhost:8002'
     config.max_review_cycles = max_review_cycles
     config.max_amendment_rounds = 1
-    config.lock_depth = 2
+    config.lock_depth = _LOCK_DEPTH
     config.project_root = tmp_path / 'proj'
     # Real reviewer model string so _reviewer_config_fingerprint() (task 2749)
     # yields a deterministic, non-None digest — mirrors
@@ -444,6 +488,7 @@ def _make_replan_workflow(
         briefing=MagicMock(),
         mcp=MagicMock(),
     )
+    _assert_depth_pin_holds(wf)
     worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
     artifacts = TaskArtifacts(worktree)
@@ -564,9 +609,9 @@ class TestReplanScopeReconcile:
     ):
         initial_files = ['a/b/c/d/e.py']
         new_file = 'x/y/z/w/v.py'
-        modules = files_to_modules(initial_files, 2)
-        assert files_to_modules(initial_files, 2) != files_to_modules(
-            [*initial_files, new_file], 2,
+        modules = files_to_modules(initial_files, _LOCK_DEPTH)
+        assert files_to_modules(initial_files, _LOCK_DEPTH) != files_to_modules(
+            [*initial_files, new_file], _LOCK_DEPTH,
         ), 'precondition: the new file must widen the MODULE set'
 
         wf, scheduler = _make_replan_workflow(
@@ -592,7 +637,7 @@ class TestReplanScopeReconcile:
             f'got {snapshots[1]["blast"]!r}'
         )
         widened_files = [*initial_files, new_file]
-        assert wf.modules == files_to_modules(widened_files, 2), (
+        assert wf.modules == files_to_modules(widened_files, _LOCK_DEPTH), (
             'wf.modules must cover the new file module before the 2nd '
             f'EXECUTE; got {wf.modules!r}'
         )
@@ -600,12 +645,12 @@ class TestReplanScopeReconcile:
     async def test_same_module_widen_persists_via_update_task_before_next_execute(
         self, tmp_path: Path,
     ):
-        f1 = 'a/b/c/d/e.py'
-        f2 = 'a/b/c/d/f.py'
-        assert files_to_modules([f1], 2) == files_to_modules([f1, f2], 2), (
-            'precondition: f1 and f2 must map to the SAME module set'
-        )
-        modules = files_to_modules([f1], 2)
+        # Derived, not a literal — see same_module_siblings' docstring for why.
+        f1, f2 = same_module_siblings(_LOCK_DEPTH)
+        assert files_to_modules([f1], _LOCK_DEPTH) == files_to_modules(
+            [f1, f2], _LOCK_DEPTH,
+        ), 'precondition: f1 and f2 must map to the SAME module set'
+        modules = files_to_modules([f1], _LOCK_DEPTH)
 
         wf, scheduler = _make_replan_workflow(
             tmp_path=tmp_path, initial_files=[f1], modules=modules,
@@ -643,9 +688,9 @@ class TestReplanScopeReconcile:
         lock."""
         initial_files = ['a/b/c/d/e.py']
         new_file = 'x/y/z/w/v.py'
-        modules = files_to_modules(initial_files, 2)
-        assert files_to_modules(initial_files, 2) != files_to_modules(
-            [*initial_files, new_file], 2,
+        modules = files_to_modules(initial_files, _LOCK_DEPTH)
+        assert files_to_modules(initial_files, _LOCK_DEPTH) != files_to_modules(
+            [*initial_files, new_file], _LOCK_DEPTH,
         ), 'precondition: the new file must widen the MODULE set'
 
         wf, scheduler = _make_replan_workflow(

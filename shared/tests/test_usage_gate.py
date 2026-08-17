@@ -14,6 +14,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _capacity_skip import looks_like_capacity_failure
+from _oauth_accounts import available_tokens
 from test_config_dir import PROBE_PREFIX, find_dead_pid, plant
 
 from shared.cli_invoke import AgentResult
@@ -1025,19 +1027,28 @@ class TestProbeConfigDirLeakSweep:
 # deselected by default (see shared/pyproject.toml addopts="-m 'not
 # integration'") and only exercised with `-m integration` plus a real OAuth
 # account in env. Mirrors test_cli_invoke_integration.py::TestConfigDirCredentials
-# ("MUST use real agents") — token discovery/skip and capacity-skip pattern
-# replicated minimally here rather than imported (same rationale as that
-# file's own _looks_like_capacity_failure: a purpose-built substring list is
-# the correct shape for a skip-guard, not the stricter combined
-# prefix+confirm-keyword production detector).
+# ("MUST use real agents") — token discovery/skip pattern replicated minimally
+# here.
+#
+# The capacity-skip guard is IMPORTED from _capacity_skip, not replicated.
+# A purpose-built substring list is still the right shape for a skip-guard
+# (rather than production's stricter combined prefix+confirm-keyword
+# detector) — but that argument justified duplicating the POLICY, and was
+# taken as licence to duplicate the STRINGS too. The two lists here and in
+# test_cli_invoke_integration.py stayed byte-for-byte identical and drifted
+# together, carrying the same blind spot into two live pytest.skip sites.
+# _capacity_skip is now the single source; see its contract tests in
+# test_capacity_skip.py.
+#
+# The account scan below is single-homed in _oauth_accounts for the same reason,
+# one task later (3700) — and this module is where the drift actually bit: it
+# held the `BCDEF` copy that could not reach CLAUDE_OAUTH_TOKEN_G. Taking the
+# FLEET default (no explicit letters) is the right choice HERE because this gate
+# spends real capacity. Full history, and why A is excluded, in
+# _oauth_accounts' module docstring; contract tests in test_oauth_accounts.py.
 # ---------------------------------------------------------------------------
 
-_TOKEN_ENV_VARS = [f'CLAUDE_OAUTH_TOKEN_{c}' for c in 'BCDEF']
-_AVAILABLE_TOKENS: list[tuple[str, str]] = [
-    (var, os.environ[var])
-    for var in _TOKEN_ENV_VARS
-    if os.environ.get(var)
-]
+_AVAILABLE_TOKENS: list[tuple[str, str]] = available_tokens(os.environ)
 
 _need_one_account = pytest.mark.skipif(
     len(_AVAILABLE_TOKENS) < 1,
@@ -1047,22 +1058,6 @@ _need_claude_cli = pytest.mark.skipif(
     shutil.which('claude') is None,
     reason='Requires the real claude CLI on PATH',
 )
-
-_CAPACITY_FAILURE_MARKERS: tuple[str, ...] = (
-    ' capped',
-    'rate limit',
-    'account unavailable',
-    'out of extra usage',
-    'usage limit',
-    "you've hit your usage",
-    "you've used all",
-)
-
-
-def _looks_like_capacity_failure(combined_output: str) -> bool:
-    """Conservative substring check — see module docstring above this class."""
-    haystack = combined_output.lower()
-    return any(marker in haystack for marker in _CAPACITY_FAILURE_MARKERS)
 
 
 @pytest.mark.integration
@@ -1128,7 +1123,7 @@ class TestProbeEnvTokenPrecedenceGuard:
         stderr_text = stderr_bytes.decode(errors='replace') if stderr_bytes else ''
         combined = f'{stdout_text}\n{stderr_text}'
 
-        if _looks_like_capacity_failure(combined):
+        if looks_like_capacity_failure(combined):
             pytest.skip(f'Capacity failure, not a precedence signal: {combined!r}')
 
         combined_lower = combined.lower()

@@ -810,18 +810,22 @@ class TestWriteStateSnapshot:
         try/except.  Swallowing here would silently advance bookkeeping for a
         write that never persisted.
         """
-        import orchestrator.scheduler as scheduler_module
+        import shared.safe_io as safe_io_module
 
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         path = tmp_path / 'scheduler_state.json'
 
         # Inject a disk-full error at the os.replace boundary so the test
-        # exercises the propagation path inside the primitive itself.
+        # exercises the propagation path from inside the primitive itself.
+        # Since task 3223 that rename lives in shared.safe_io.atomic_write_text,
+        # so patch it there — patching the delegation call instead would only
+        # prove the call site re-raises, not that the write primitive's own
+        # failure path propagates through it.
         def _boom(*_args, **_kw):
             raise OSError('disk full')
 
-        monkeypatch.setattr(scheduler_module.os, 'replace', _boom)
+        monkeypatch.setattr(safe_io_module.os, 'replace', _boom)
 
         with pytest.raises(OSError):
             scheduler._write_state_snapshot_raw(path)
@@ -1406,4 +1410,125 @@ class TestStateSnapshotOverrideStoreLogging:
         assert record.exc_info is not None, 'Expected exc_info to be set on the WARNING record'
         assert record.exc_info[0] is RuntimeError, (
             f'Expected exc_info[0] == RuntimeError, got {record.exc_info[0]!r}'
+        )
+
+
+class TestDelegatesToSharedAtomicWriter:
+    """``Scheduler._write_state_snapshot_raw`` delegates to ``shared.safe_io.atomic_write_text``.
+
+    Task 3223 consolidated the repo's tmp+rename writers into ``shared.safe_io``,
+    which also gives this site a unique-per-writer temp name in place of the old
+    fixed ``<dest>.json.tmp`` (two concurrent writers used to share it).
+    ``mode`` must stay at the umask default: this file is read by other
+    processes (the dashboard, the gamma/epsilon watchers, scripts/drain_check.py),
+    so narrowing it to 0o600 is the specific silent regression this task avoids.
+    """
+
+    @staticmethod
+    def _recorder(monkeypatch):
+        import shared.safe_io as _safe_io
+
+        calls = []
+        real = _safe_io.atomic_write_text
+
+        def recorder(path, text, **kwargs):
+            calls.append((path, text, kwargs))
+            return real(path, text, **kwargs)
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
+        return calls
+
+    @staticmethod
+    def _assert_common(kwargs):
+        assert kwargs.get('mkdir') is True, 'this site created its parent dir'
+        assert kwargs.get('encoding') == 'utf-8'
+        assert not kwargs.get('fsync'), 'this site never fsynced'
+        assert kwargs.get('mode') is None, (
+            'umask default, NOT 0o600 — this file is read by other processes'
+        )
+
+    def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):
+        calls = self._recorder(monkeypatch)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        scheduler._write_state_snapshot_raw(tmp_path / 'nested' / 'scheduler_state.json')
+
+        assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
+        self._assert_common(calls[0][2])
+
+    def test_on_disk_mode_matches_write_text_reference(self, tmp_path):
+        reference = tmp_path / 'reference.json'
+        reference.write_text('ref', encoding='utf-8')
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        path = tmp_path / 'scheduler_state.json'
+        scheduler._write_state_snapshot_raw(path)
+        assert path.stat().st_mode & 0o777 == reference.stat().st_mode & 0o777
+
+    def test_oserror_still_propagates(self, tmp_path, monkeypatch):
+        """Propagation is required: _last_snapshot_payload must only advance on success."""
+        import shared.safe_io as _safe_io
+
+        def boom(*_a, **_kw):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', boom)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        with pytest.raises(OSError, match='disk full'):
+            scheduler._write_state_snapshot_raw(tmp_path / 'scheduler_state.json')
+
+    @pytest.mark.asyncio
+    async def test_failed_write_does_not_advance_snapshot_bookkeeping(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed write must NOT advance ``_last_snapshot_payload``.
+
+        This is the invariant that MOTIVATES the propagation asserted above,
+        pinned at the level where the bookkeeping actually lives.  Note that
+        ``_write_state_snapshot_raw`` never touches ``_last_snapshot_payload``
+        itself — ``_write_snapshot_best_effort`` does, at scheduler.py:6837,
+        only after the awaited write returns — so asserting the attribute
+        around the ``pytest.raises`` above would be vacuous (None == None).
+
+        Why it matters: scheduler.py:6816 short-circuits the next write when
+        the payload is unchanged.  A regression that both propagated the error
+        AND advanced the bookkeeping would therefore record a snapshot that
+        never reached disk, and silently suppress the NEXT write as a no-op
+        dedup — leaving the on-disk state stale indefinitely.
+        """
+        import shared.safe_io as _safe_io
+
+        snapshot_path = tmp_path / 'scheduler_state.json'
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        scheduler._state_snapshot_path = snapshot_path
+
+        # 1. A real, successful write establishes a non-None payload, so the
+        #    assertion below discriminates rather than comparing None to None.
+        await scheduler._write_snapshot_best_effort(force=True)
+        good_payload = scheduler._last_snapshot_payload
+        assert good_payload is not None, 'precondition: a successful write records a payload'
+
+        # 2. Force a GENUINELY DIFFERENT snapshot, so the content-dedup
+        #    short-circuit at scheduler.py:6816 cannot be what keeps the
+        #    payload unchanged — without this the test would pass vacuously.
+        changed_state = {**scheduler.get_state_snapshot(), 'probe_3223': 'changed'}
+        monkeypatch.setattr(scheduler, 'get_state_snapshot', lambda: dict(changed_state))
+        assert scheduler._build_snapshot_payload() != good_payload, (
+            'precondition: the second write must carry a different payload, '
+            'else dedup — not the failure — would explain an unchanged value'
+        )
+
+        # 3. Now break the write itself.
+        def boom(*_a, **_kw):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', boom)
+        await scheduler._write_snapshot_best_effort(force=True)
+
+        assert scheduler._last_snapshot_payload == good_payload, (
+            '_last_snapshot_payload advanced despite a failed disk write; the '
+            'next snapshot would be short-circuited as an unchanged dedup and '
+            'the on-disk state would stay stale'
         )

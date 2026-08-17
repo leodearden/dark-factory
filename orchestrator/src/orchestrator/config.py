@@ -829,14 +829,17 @@ class SessionResumeConfig(BaseModel):
     (INV-3). Any ineligible session degrades to today's fresh dispatch
     (I3 — never a stall, never a scheduler-visible error), emitting a
     reason-carrying ``session_resume_fallback``/``session_resume_capped``
-    event; a per-boot run of consecutive fallbacks above
-    ``fallback_storm_threshold`` files one L1 escalation (INV-4).
+    event; a run of UNEXPLAINED fallbacks above
+    ``fallback_storm_threshold``, each chained within ``storm_window_secs``
+    of the previous, files one L1 escalation (INV-4). By-design
+    degradations (``capped``, and ``reseeded`` since task 3256) emit their
+    event but never feed that run.
 
     ``enabled=false`` is the kill switch: no ``--resume`` is ever injected
     (B6), and no ``session_resume_*`` event or streak is produced.
 
     Mirrors DeliveredChecksConfig's shape (a kill switch plus ge-bounded
-    int knobs); all four leaves are green-tier hot-reloadable via the
+    int knobs); all five leaves are green-tier hot-reloadable via the
     ``session_resume`` whole-submodel group in RELOADABLE_FIELDS.
     """
 
@@ -875,12 +878,35 @@ class SessionResumeConfig(BaseModel):
         default=5,
         ge=1,
         description=(
-            'Consecutive per-boot session_resume_fallback degradations '
-            '(reset to 0 on any eligible resume) before one L1 escalation is '
-            'filed (INV-4 storm escape — suspected systematic clock skew / '
-            'wiped transcripts / mass reseed). Must be >= 1. Default 5 is '
-            'above both the resume cap and ordinary collision noise, so only '
-            'systematic corroboration breakage trips it.'
+            'Consecutive UNEXPLAINED session_resume_fallback degradations '
+            'before one L1 escalation is filed (INV-4 storm escape — '
+            'suspected systematic clock skew, or transcripts vanishing while '
+            'their config dir survives). Only reason in {stale, no_transcript} '
+            'counts: reason=reseeded is a by-design lane reseed and is '
+            'excluded, exactly as session_resume_capped is. The run is chained '
+            'within storm_window_secs (and reset to 0 on any eligible resume) '
+            'rather than accumulating unbounded per boot. Must be >= 1. '
+            'Default 5 is above both the resume cap and ordinary collision '
+            'noise, so only systematic corroboration breakage trips it.'
+        ),
+    )
+    storm_window_secs: int = Field(
+        default=3600,
+        ge=1,
+        description=(
+            'Maximum gap, in seconds, between two consecutive unexplained '
+            'session-resume fallbacks for them to count as the same storm '
+            'run; a larger gap decays the streak to 0 before the next '
+            'fallback is counted. Without this the streak is cumulative '
+            'rather than consecutive, so a slow drip of isolated failures '
+            'accumulates into a false storm. Must be >= 1. Default 3600 is '
+            'read off the measured signature: real bursts land ~17 fallbacks '
+            'inside one hour, while quiet gaps between isolated failures run '
+            '~7h and ~39h — so a 1h chain window separates burst from drip '
+            'with a wide margin on both sides. Measured on the monotonic '
+            'clock, deliberately: the stale reason is itself PRODUCED by '
+            'clock skew, so a wall-clock decay would be corrupted by the very '
+            'failure mode it must detect.'
         ),
     )
 
@@ -1034,7 +1060,7 @@ class RetentionConfig(BaseModel):
 class TranscriptArchiveConfig(BaseModel):
     """Agent-transcript archival (task 2742, plans/agent-transcript-archival-prd.md α).
 
-    The producer hook in TaskWorkflow._invoke's finally gzips each finished
+    The producer hook in TaskWorkflow._invoke's finally archives each finished
     agent session's transcripts (see shared.transcript_archive) to
     ``<project_root>/<root>`` — a durable location OUTSIDE the per-task
     worktree so the archive survives worktree teardown.
@@ -3737,6 +3763,74 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
 
+    # EASY-backfill admission through parks (task 3823 / PRD task η, C7).
+    # A candidate blocked ONLY by another task's park may be admitted through
+    # it when its predicted hold, times a safety factor, provably fits inside
+    # the gap the park's owner is going to wait anyway.  Flat top-level fields
+    # (not a submodel) mirroring the park_stop_* block above: the capability
+    # manifest greps config.py for the three literal leaf names below, and
+    # nesting would rename them.
+    #
+    # Evidence base:
+    # plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md
+    # :116-126 — module hold-history median is the ONLY predictor with a
+    # positive R² (0.26 dark-factory / 0.68 reify); every static-attribute
+    # predictor scored WORSE than the test-set mean.
+    backfill_enabled: bool = Field(
+        default=True,
+        description=(
+            'Enable EASY-backfill admission through parks (PRD C7). When '
+            'disabled, a candidate blocked by a foreign park is simply passed '
+            'over as before — the operator kill switch, mirroring '
+            'park_stop_enabled / starvation_watchdog.enabled.'
+        ),
+    )
+    backfill_safety_factor: float = Field(
+        default=2.5,
+        gt=0,
+        description=(
+            'Multiplier applied to a candidate\'s predicted hold before it is '
+            'compared against the parked owner\'s provable assembly delay; '
+            'admission requires predicted_hold * factor <= provable_delay. '
+            '2.5 is INTERPOLATED BETWEEN two measured 80%-coverage multipliers '
+            '(PARKING_MODEL_REPORT.md:126: x2.9 dark-factory, x2.0 reify) '
+            'rather than guessed, and the modelled overstay rate at x2.5 is '
+            '7-9% (:254-255). Green-tier so production park_backfill_overstay '
+            'data can settle 2.5-vs-2.9 without a restart (PRD Open Q3).'
+        ),
+    )
+    backfill_min_samples: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Minimum observed hold samples on a task\'s modules before the '
+            'predictor will answer at all; below it, predicted_hold is None '
+            'and backfill REFUSES. This is the SINGLE SOURCE OF TRUTH for '
+            'HoldHistory\'s sample floor — the Scheduler constructs its '
+            'HoldHistory with this value, and hold_history.py deliberately '
+            'carries only a module default so it can stand alone without the '
+            'config object. ge=1 is contract, not decoration: a floor of 0 '
+            'would let an EMPTY history certify a backfill, which C7 forbids '
+            'by name.'
+        ),
+    )
+    backfill_max_park_age_secs: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'Refuse backfill through any park older than this many seconds, '
+            'measured from the owner\'s FIRST install (its total wait). The '
+            'CLAUSE is measured, the NUMBER is a judgment call: '
+            'PARKING_MODEL_REPORT.md:256 names the casualty of having no '
+            'cutoff (one reify starver flips to never-dispatched in-window) '
+            'but publishes no figure. 1h is ~40% of the measured 2.2-3h median '
+            'process era, so it protects parks that have already burned a '
+            'substantial fraction of an era while still admitting backfill in '
+            'the fresh window where most grants occur. Green-tier, so a replay '
+            'can retune it from production data without a deploy.'
+        ),
+    )
+
     # Escalation-watcher subprocess supervisor (AFK hardening, task 1326).
     # Keeps a fresh escalation-watcher-auto agent alive across multi-day AFK
     # windows with rotation, exponential backoff, and a crashloop→pause_scheduler
@@ -4941,6 +5035,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'steward_lifetime_budget',
         # Scheduler tuning
         'fairness.skip_threshold',
+        # EASY-backfill admission (task 3823 / PRD C7).  Explicit literals, not
+        # a _submodel_leaf_paths group: these are FLAT top-level fields, not a
+        # submodel.  Green-tier on purpose — PRD Open Q3 ships safety_factor
+        # 2.5 and lets production park_backfill_overstay data settle
+        # 2.5-vs-2.9, which is only actionable if the factor retunes live.
+        'backfill_enabled',
+        'backfill_safety_factor',
+        'backfill_min_samples',
+        'backfill_max_park_age_secs',
         'starvation_watchdog.enabled',
         'starvation_watchdog.skip_threshold',
         'starvation_watchdog.idle_secs',

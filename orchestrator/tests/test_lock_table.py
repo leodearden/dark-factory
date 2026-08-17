@@ -12,10 +12,16 @@ test_scheduler.py alongside TestModuleLockTable / TestHierarchicalLocking.
 
 from __future__ import annotations
 
+import logging
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import ModuleLockTable
+
+#: Fixed park-install instant for the park-age tests (task 3823 / PRD task η).
+PARK_T0 = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
 
 
 def _lt(lock_depth: int = 2) -> ModuleLockTable:
@@ -535,3 +541,394 @@ class TestForceClear:
         modules, restored = lt.force_clear('nobody')
         assert modules == []
         assert restored == []
+
+
+# ===========================================================================
+# Park age: injectable wall clock + the age reader (task 3823 / PRD task η)
+# ===========================================================================
+#
+# C7 refuses backfill through a park older than backfill_max_park_age_secs.
+# Today `_park_install_at` is stamped with a bare `datetime.now(UTC)`
+# (scheduler.py:998) — uninjected, so no test can drive a park to a chosen
+# age without poking a private dict.  These tests assert the seam.
+
+
+class TestParkInstallClock:
+    """``ModuleLockTable`` stamps park installs from an injectable wall clock."""
+
+    def test_injected_wall_clock_stamps_installed_at(self):
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: PARK_T0,
+        )
+
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.snapshot_parks()['P']['installed_at'] == PARK_T0.isoformat()
+
+    def test_default_wall_clock_still_stamps_a_parseable_iso_utc_string(self):
+        """No injection -> the real clock, and the stamp stays round-trippable."""
+        lt = _lt()
+
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        stamp = lt.snapshot_parks()['P']['installed_at']
+        parsed = datetime.fromisoformat(stamp)
+        assert parsed.tzinfo is not None, f'stamp must be tz-aware; got {stamp!r}'
+        assert parsed.utcoffset() == timedelta(0), (
+            f'stamp must be UTC; got {stamp!r}'
+        )
+
+    def test_scheduler_passes_its_own_wall_clock_down_to_the_lock_table(self):
+        """Scheduler-level tests must be able to control park age end-to-end.
+
+        The Scheduler already injects its wall clock into ``_emit_lock_event``;
+        park stamps must share that same epoch, or an age computed against
+        ``Scheduler._wall_now()`` would be measured across two unrelated clocks.
+        """
+        from orchestrator.scheduler import Scheduler
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: PARK_T0,
+        )
+
+        scheduler.lock_table.install_parks('P', ['m1'], priority='medium')
+
+        assert scheduler.lock_table.snapshot_parks()['P']['installed_at'] == (
+            PARK_T0.isoformat()
+        )
+
+    def test_second_install_does_not_refresh_the_stamp(self):
+        """``setdefault`` semantics are load-bearing, not incidental.
+
+        C7's ``park_age(p)`` means the owner's TOTAL wait.  A stamp refreshed
+        on every re-install would reset the age each time the owner re-parked,
+        so an indefinitely-starving park would read as permanently fresh and
+        keep admitting backfillers through it — the precise failure the age
+        cutoff exists to stop.
+        """
+        clock = {'now': PARK_T0}
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: clock['now'],
+        )
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        clock['now'] = PARK_T0 + timedelta(seconds=900)
+        lt.install_parks('P', ['m2'], priority='medium')
+
+        assert lt.snapshot_parks()['P']['installed_at'] == PARK_T0.isoformat()
+
+
+class TestParkAgeSecs:
+    """``park_age_secs(owner, *, now)`` — the READ that gates admission.
+
+    ``None`` means "age unknown => the caller must REFUSE".  This is
+    deliberately the OPPOSITE of the dashboard's ``_park_age_seconds``
+    (dashboard/src/dashboard/data/scheduler.py:297-328), which fails soft to
+    0 for display.  A soft 0 here would make an unreadable park look brand
+    new and ADMIT a backfill through it — fail-soft in the unsafe direction.
+    """
+
+    def test_age_is_now_minus_install(self):
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: PARK_T0,
+        )
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        age = lt.park_age_secs('P', now=PARK_T0 + timedelta(seconds=900))
+
+        assert age == pytest.approx(900.0)
+
+    def test_unknown_owner_is_none_not_zero(self):
+        lt = _lt()
+
+        assert lt.park_age_secs('never-parked', now=PARK_T0) is None
+
+    def test_unparseable_stamp_is_none_and_warns(self, caplog):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+        lt._park_install_at['P'] = 'not-a-timestamp'
+
+        with caplog.at_level(logging.WARNING):
+            age = lt.park_age_secs('P', now=PARK_T0)
+
+        assert age is None, (
+            'an unreadable stamp must refuse, not read as a fresh park'
+        )
+        assert any('P' in record.getMessage() for record in caplog.records), (
+            'the warning must name the owner whose stamp could not be parsed; '
+            f'got {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_future_stamp_clamps_to_zero(self):
+        """Clock skew must not read as a NEGATIVE age.
+
+        A negative age would sail under any ``age > max_park_age_secs`` cutoff,
+        so an NTP step backwards would silently re-open admission through
+        arbitrarily old parks.
+        """
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: PARK_T0 + timedelta(seconds=600),
+        )
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.park_age_secs('P', now=PARK_T0) == 0.0
+
+    def test_age_measures_total_wait_across_reinstalls(self):
+        """The age tracks the FIRST install, matching ``setdefault``."""
+        clock = {'now': PARK_T0}
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: clock['now'],
+        )
+        lt.install_parks('P', ['m1'], priority='medium')
+        clock['now'] = PARK_T0 + timedelta(seconds=300)
+        lt.install_parks('P', ['m2'], priority='medium')
+
+        age = lt.park_age_secs('P', now=PARK_T0 + timedelta(seconds=900))
+
+        assert age == pytest.approx(900.0), (
+            'age must run from the FIRST install (total wait), not the latest'
+        )
+
+
+# ===========================================================================
+# The two primitives backfill admission needs (task 3823 / PRD task η, C7)
+# ===========================================================================
+
+
+class TestParkOwnersBlocking:
+    """``park_owners_blocking(task_id, modules)`` — WHO would refuse this request.
+
+    ``_is_parked_blocks`` answers only bool, one module at a time, and names
+    nobody; admission has to know which park owners it would be borrowing
+    from.  The accessor must reuse the SAME rank-aware rule ``try_acquire``
+    enforces (INV-5) — a second, subtly different rule would admit through
+    parks the lock layer then refuses, producing churn with no dispatch.
+    """
+
+    def test_conflicting_park_names_its_owner(self):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.park_owners_blocking('C', ['m1']) == ['P']
+
+    def test_non_conflicting_park_is_not_a_backfill_target(self):
+        """C7's ``c.modules ∩ M ≠ ∅`` clause: no intersection, no target."""
+        lt = _lt()
+        lt.install_parks('P', ['other'], priority='medium')
+
+        assert lt.park_owners_blocking('C', ['m1']) == []
+
+    def test_buried_park_never_appears(self):
+        """Only active tops block, so only active tops can be lent (INV-2)."""
+        lt = _lt()
+        lt.install_parks('L', ['m1'], priority='low')
+        lt.install_parks('T', ['m1'], priority='high')  # shadows L
+
+        assert lt.park_owners_blocking('C', ['m1']) == ['T']
+
+    def test_requesters_own_park_never_appears(self):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.park_owners_blocking('P', ['m1']) == []
+
+    def test_preemptable_foreign_top_never_appears(self):
+        """A foreign top the requester outranks does not block, so is no target.
+
+        R holds a high-priority park on a/b/c while F holds a low-priority park
+        on the parent a/b.  ``_is_parked_blocks`` lets R through (its own
+        dominant conflicting rank is strictly lower), so the accessor must
+        agree — otherwise admission would invent a lender for a request that
+        was never blocked.
+        """
+        lt = _lt(lock_depth=3)
+        lt.install_parks('F', ['a/b'], priority='low')
+        lt.install_parks('R', ['a/b/c'], priority='high')
+
+        assert lt.park_owners_blocking('R', ['a/b/c']) == []
+
+    def test_hierarchical_conflict_is_detected(self):
+        lt = _lt(lock_depth=3)
+        lt.install_parks('P', ['a/b'], priority='medium')
+
+        assert lt.park_owners_blocking('C', ['a/b/c']) == ['P']
+
+    def test_two_blocking_owners_both_returned_sorted(self):
+        """Admission is a conjunction over ALL of them, so it must see all."""
+        lt = _lt()
+        lt.install_parks('P2', ['m2'], priority='medium')
+        lt.install_parks('P1', ['m1'], priority='medium')
+
+        assert lt.park_owners_blocking('C', ['m1', 'm2']) == ['P1', 'P2']
+
+    def test_two_owners_blocking_ONE_requested_module_are_both_returned(self):
+        """Two parks on sibling CHILDREN of one requested parent.
+
+        The per-module answer is not one owner: ``a/b/x`` and ``a/b/y`` each
+        conflict with a request for ``a/b``, so both owners block it.  A
+        first-match rule would name only one, and the ``admitted_parks`` set
+        built from that name is then handed to ``try_acquire`` — which
+        re-checks EVERY park and refuses on the owner nobody named.
+
+        That failure is silent: admission certifies, pays for the whole
+        prediction pipeline, and the second acquire fails every tick, so
+        backfill is simply impossible in this topology with no signal saying
+        so.  Hence both halves are asserted here — the naming AND the acquire
+        it is supposed to enable.
+        """
+        lt = _lt(lock_depth=3)
+        lt.install_parks('o1', ['a/b/x'], priority='medium')
+        lt.install_parks('o2', ['a/b/y'], priority='medium')
+
+        assert lt.park_owners_blocking('c', ['a/b']) == ['o1', 'o2']
+
+        # Naming one is not enough — the other still refuses (this is the
+        # observable consequence a first-match rule would produce).
+        assert lt.try_acquire('c', ['a/b'], admitted_parks=frozenset({'o1'})) is False
+        assert 'c' not in lt._held
+        # Naming both is what the accessor now makes possible.
+        assert lt.try_acquire(
+            'c', ['a/b'], admitted_parks=frozenset({'o1', 'o2'})
+        ) is True
+        assert lt._held['c'] == {'a/b'}
+
+
+class TestBlockingHolders:
+    """``blocking_holders(modules, *, exclude_task)`` — which modules are still
+    held, and by whom.  Feeds ``_provable_assembly_delay``: a parked owner's
+    wait is only provable through the holders that are actually blocking it.
+    """
+
+    def test_all_free_is_an_empty_mapping(self):
+        lt = _lt()
+
+        assert lt.blocking_holders(['m1', 'm2'], exclude_task='P') == {}
+
+    def test_held_module_maps_to_its_holder(self):
+        lt = _lt()
+        lt.try_acquire('H', ['m1'])
+
+        assert lt.blocking_holders(['m1'], exclude_task='P') == {'m1': ['H']}
+
+    def test_excluded_task_is_not_its_own_blocker(self):
+        lt = _lt()
+        lt.try_acquire('P', ['m1'])
+
+        assert lt.blocking_holders(['m1'], exclude_task='P') == {}
+
+    def test_limit_is_honoured_not_just_presence(self):
+        """``max_per_module=2`` with ONE holder is not blocked.
+
+        Reusing ``_limit_for`` rather than "is anyone holding it" matters:
+        a module with headroom is free for the parked owner to take, so it
+        contributes no delay to lend.
+        """
+        lt = ModuleLockTable(OrchestratorConfig(max_per_module=2, lock_depth=2))
+        lt.try_acquire('H1', ['m1'])
+
+        assert lt.blocking_holders(['m1'], exclude_task='P') == {}
+
+        lt.try_acquire('H2', ['m1'])
+        assert lt.blocking_holders(['m1'], exclude_task='P') == {'m1': ['H1', 'H2']}
+
+    def test_hierarchical_hold_blocks_the_child_request(self):
+        lt = _lt(lock_depth=3)
+        lt.try_acquire('H', ['a/b'])
+
+        assert lt.blocking_holders(['a/b/c'], exclude_task='P') == {'a/b/c': ['H']}
+
+
+class TestTryAcquireAdmittedParks:
+    """``try_acquire(..., admitted_parks=...)`` bypasses the PARK gate only.
+
+    The held-lock ``_count_conflicts >= _limit_for`` gate is untouched and
+    evaluated on live state at call time.  That is the whole safety property
+    of C7 (INV-3): the scoring-time view is advisory, and ``try_acquire``
+    under the lock remains the acting basis.
+    """
+
+    def test_default_behaviour_is_unchanged(self):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.try_acquire('C', ['m1']) is False
+
+    def test_admitted_park_lets_the_request_through(self):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.try_acquire('C', ['m1'], admitted_parks=frozenset({'P'})) is True
+        assert lt._held['C'] == {'m1'}
+
+    def test_admitted_acquire_does_not_disturb_the_park(self):
+        """Backfill BORROWS a gap; it does not evict.
+
+        PRD §7 rejects preemption of a held lock, and this is the mirror-image
+        discipline for parks: after an admitted acquire the park must be
+        present, un-shadowed and at its original rank, so the owner's claim is
+        exactly as strong as before.
+        """
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+        before = lt.snapshot_park_stacks()
+
+        lt.try_acquire('C', ['m1'], admitted_parks=frozenset({'P'}))
+
+        assert lt.snapshot_park_stacks() == before
+        assert lt.snapshot_parks()['P']['modules'] == ['m1']
+
+    def test_a_real_holder_still_refuses(self):
+        """INV-3: the limit gate is untouched and remains the acting basis."""
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+        lt.try_acquire('H', ['m1'], admitted_parks=frozenset({'P'}))
+
+        assert lt.try_acquire('C', ['m1'], admitted_parks=frozenset({'P'})) is False
+        assert 'C' not in lt._held
+
+    def test_admitting_one_owner_does_not_admit_another(self):
+        """Admission is per-owner; a second blocking park still refuses."""
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+        lt.install_parks('Q', ['m2'], priority='medium')
+
+        assert lt.try_acquire(
+            'C', ['m1', 'm2'], admitted_parks=frozenset({'P'})
+        ) is False
+
+    def test_lock_expansion_still_refuses_a_foreign_park(self):
+        """Plan-refinement lock EXPANSION is not a backfill path.
+
+        C7 anchors on the dispatch scan.  An in-flight task widening its lock
+        set has no admission decision behind it — no predicted-hold check, no
+        safety factor, no park-age cutoff — so it must keep refusing parks
+        unconditionally, with no bypass of any name available to it.
+
+        Stated behaviourally rather than by asserting on
+        ``try_acquire_additional``'s parameter names: renaming the kwarg would
+        leave a name assertion green with the bypass fully present, and a
+        harmless ``**kwargs`` refactor would fail it while nothing changed.
+        """
+        # Positive control FIRST, on its own table: with m2 free the expansion
+        # succeeds, so the refusal below is attributable to the park and not
+        # to a setup that could never have expanded at all.
+        control = _lt()
+        assert control.try_acquire('C', ['m1'])
+        assert control.try_acquire_additional('C', ['m2']) is True
+        assert control._held['C'] == {'m1', 'm2'}
+
+        lt = _lt()
+        assert lt.try_acquire('C', ['m1']), 'C must hold an adjacent module first'
+        lt.install_parks('P', ['m2'], priority='medium')
+
+        assert lt.try_acquire_additional('C', ['m2']) is False
+        assert lt._held['C'] == {'m1'}, (
+            'the expansion was refused but something was acquired anyway — '
+            'try_acquire_additional must refuse before mutating _held'
+        )

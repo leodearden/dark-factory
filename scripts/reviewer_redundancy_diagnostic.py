@@ -201,7 +201,7 @@ def main() -> int:
     pile_on_count: Counter = Counter()  # how many reviewers per location
     pile_on_blocking: Counter = Counter()  # same but for blocking only
 
-    for label, by_rev in per_task.items():
+    for _label, by_rev in per_task.items():
         # location → set of reviewers that mentioned it
         # location → list of (reviewer, severity)
         loc_to_reviewers: dict[str, list[tuple[str, str]]] = defaultdict(list)
@@ -216,7 +216,7 @@ def main() -> int:
                 seen_locs_for_this_rev.add(loc)
                 loc_to_reviewers[loc].append((rev, sev))
 
-        for loc, hits in loc_to_reviewers.items():
+        for _loc, hits in loc_to_reviewers.items():
             n_hits = len(hits)
             pile_on_count[n_hits] += 1
             any_blocking = any(s == 'blocking' for _, s in hits)
@@ -263,7 +263,7 @@ def main() -> int:
     pair_both: Counter = Counter()
     pair_either: Counter = Counter()
     pair_blocking_both: Counter = Counter()
-    for label, by_rev in per_task.items():
+    for _label, by_rev in per_task.items():
         rev_locs: dict[str, set[str]] = {}
         rev_blocking_locs: dict[str, set[str]] = {}
         for rev, findings in by_rev.items():

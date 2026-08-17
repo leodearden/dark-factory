@@ -12,10 +12,31 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fused_memory.config.schema import ProceduralTopicCluster
+# Shared note fixtures, owned by the pure-matcher suite. Imported rather than
+# copied so the two suites cannot drift: an edit to the straddling note (e.g.
+# adding or removing a phrase hit) must move BOTH the matcher assertions there
+# and the whole-tool assertions here, instead of leaving one silently
+# exercising a different scenario (task 3054, reviewer: duplication).
+#
+# The bare import resolves because fused-memory/tests/conftest.py inserts the
+# tests dir onto sys.path (the same mechanism that makes `from _fm_helpers
+# import X` work), and pytest loads a conftest by PATH regardless of import
+# mode. Do NOT reason about this from pytest's rootdir/prepend behaviour: the
+# repo-root pyproject.toml sets `--import-mode=importlib`, under which a test
+# file's own directory is NOT put on sys.path, so a root-bound run would fail
+# at collection without that insert. Verified green under -n0, under xdist,
+# standalone, and root-bound via `pytest -c pyproject.toml` from the repo root.
+from test_config_schema import (
+    MERGE_BASE_NEGATIVE_CONTROL_NOTE,
+    STRADDLING_WRITE_FIXTURE,
+)
+
+from fused_memory.config.schema import ProceduralTopicCluster, ReconciliationConfig
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
+from fused_memory.models.scope import Scope
 from fused_memory.server.tools import create_mcp_server
+from fused_memory.services.memory_service import RRF_K
 
 _PROJECT_ID = 'dark_factory'
 _CONTENT = 'canonical .task gitignore gotcha'
@@ -43,13 +64,26 @@ def _near_duplicate_result(
     score: float = 0.97,
     content: str = 'canonical .task gitignore gotcha (existing entry)',
     category: MemoryCategory = MemoryCategory.procedural_knowledge,
+    store_rank: int = 1,
 ) -> MemoryResult:
+    """Build the POST-RRF result shape the tool really receives from search().
+
+    *score* is the Mem0 COSINE and lands in ``metadata['store_score']``;
+    ``relevance_score`` carries the ordinal RRF value, deliberately unrelated
+    to it.  Every gate test in this module therefore exercises the real
+    post-task-3658 shape, with its threshold expectations unchanged.
+
+    ``RRF_K`` is imported from production rather than restated as the literal
+    60, so a retune of the constant carries this fixture with it instead of
+    leaving it silently modelling a shape ``search()`` no longer emits.
+    """
     return MemoryResult(
         id=id_,
         content=content,
         category=category,
         source_store=SourceStore.mem0,
-        relevance_score=score,
+        relevance_score=1.0 / (RRF_K + store_rank),
+        metadata={'store_rank': store_rank, 'store_score': score},
     )
 
 
@@ -121,6 +155,17 @@ class TestAddMemoryNearDuplicateGate:
         )
         assert isinstance(result.get('similarity'), int | float), (
             f'Expected a numeric similarity, got: {result!r}'
+        )
+        # The reported similarity must be the COSINE, directly comparable to
+        # the 'threshold' emitted alongside it (0.97 vs 0.92). Quoting the
+        # ordinal RRF value (~0.0164) against a 0.92 threshold would read to
+        # the blocked agent as a guard malfunction (task 3658).
+        assert result.get('similarity') == pytest.approx(0.97), (
+            f"Expected the Mem0 cosine as 'similarity', not the fused RRF "
+            f'ordinal, got: {result!r}'
+        )
+        assert result['similarity'] > result['threshold'], (
+            f"'similarity' must be comparable to 'threshold', got: {result!r}"
         )
         assert result.get('matched_excerpt') == matched.content[:200], (
             f'Expected matched_excerpt=matched content[:200], got: {result!r}'
@@ -429,6 +474,63 @@ class TestAddMemoryNearDuplicateGate:
         assert kwargs.get('project_id') == _PROJECT_ID
         assert kwargs.get('categories') == ['procedural_knowledge']
         assert kwargs.get('limit') == 5
+
+    @pytest.mark.asyncio
+    async def test_blocks_on_results_built_by_the_real_search_path(self):
+        """End-to-end seam regression for esc-3658-1.
+
+        Every other test here hand-builds the result shape, so all of them
+        would have stayed green while the guard went dark in production.  This
+        one drives ``memory_service.search`` with results produced by the real
+        ``MemoryService._search_mem0`` — the actual RRF stamping, not a fixture
+        approximating it — and asserts the write is still soft-blocked.
+        """
+        from fused_memory.services.memory_service import MemoryService
+
+        # Real _search_mem0, real stamping, stubbed only at the backend seam.
+        svc = MemoryService.__new__(MemoryService)
+        svc.mem0 = MagicMock()
+        svc.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm-real-1',
+                    'memory': 'canonical .task gitignore gotcha (existing entry)',
+                    'score': 0.97,
+                    'metadata': {'category': 'procedural_knowledge'},
+                },
+            ]
+        })
+        real_results = await svc._search_mem0(
+            _CONTENT,
+            Scope(project_id=_PROJECT_ID),
+            limit=5,
+            categories=['procedural_knowledge'],
+        )
+
+        # Sanity-check the premise: this is genuinely the post-RRF shape.
+        assert real_results[0].relevance_score < 0.02
+        assert real_results[0].metadata['store_score'] == pytest.approx(0.97)
+
+        mock_service = AsyncMock()
+        mock_service.search.return_value = real_results
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error_type') == 'ProceduralKnowledgeNearDuplicateWriteRejected', (
+            f'Real post-RRF search results must still soft-block, got: {result!r}'
+        )
+        assert result.get('matched_memory_id') == 'm-real-1'
+        assert result.get('similarity') == pytest.approx(0.97)
+        mock_service.add_memory.assert_not_called()
 
 
 class TestAddMemoryNearDuplicateGateConfig:
@@ -745,4 +847,144 @@ class TestAddMemoryTopicClusterGate:
             f'Master kill-switch must disable the topic gate; got: {result!r}'
         )
         mock_service.search.assert_not_called()
+        mock_service.add_memory.assert_called_once()
+
+
+class TestAddMemorySufficientPhraseGate:
+    """End-to-end: a sufficient-phrase block reaches a real add_memory call (task 3054).
+
+    Unlike every class above, this wires the REAL shipped cluster seed
+    (``ReconciliationConfig().procedural_knowledge_topic_guard_clusters``)
+    rather than the synthetic ``_topic_cluster()``, so the clusters agents
+    actually hit in production are exercised through the whole tool path.
+
+    The content is the reconstructed straddling-write fixture IMPORTED from
+    ``tests/test_config_schema.py`` -- one distinct phrase in each of three
+    clusters, which under count-only matching was blocked by none. Importing
+    rather than copying keeps this end-to-end assertion and the pure-matcher
+    assertions pinned to the same scenario.
+    """
+
+    STRADDLING_CONTENT = STRADDLING_WRITE_FIXTURE
+
+    @staticmethod
+    def _configure_real_clusters(mock_service: AsyncMock) -> None:
+        _configure_reconciliation(
+            mock_service,
+            procedural_knowledge_near_dup_guard_enabled=True,
+            procedural_knowledge_near_dup_threshold=0.92,
+            procedural_knowledge_topic_guard_clusters=(
+                ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_straddling_write_is_blocked_before_the_cosine_search(self):
+        """The headline fix, end to end: blocked, routed, and no embedding round-trip."""
+        mock_service = AsyncMock()
+        self._configure_real_clusters(mock_service)
+        mock_service.search.return_value = []
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': self.STRADDLING_CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error_type') == 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'Expected the straddling write to be blocked, got: {result!r}'
+        )
+        assert (
+            result.get('topic_id') == 'architect-report-task-already-done-main-reachability'
+        ), f'Expected routing to the report_task_already_done gate, got: {result!r}'
+        # A SINGLE-element list, deliberately shorter than the cluster's
+        # min_phrase_hits=2: a sufficient-phrase block reports exactly what
+        # fired, which is what makes the routing unambiguous.
+        assert result.get('matched_phrases') == ['report_task_already_done'], (
+            f'Expected only the sufficient phrase reported, got: {result!r}'
+        )
+        assert result.get('hint'), f'Expected a non-empty hint, got: {result!r}'
+        # The topic guard is deterministic and must short-circuit BEFORE the
+        # cosine round-trip, exactly as the count-only path already does.
+        mock_service.search.assert_not_called()
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_near_duplicate_override_still_bypasses_a_sufficient_block(self):
+        """The new match arm must not bypass the existing escape hatch."""
+        mock_service = AsyncMock()
+        self._configure_real_clusters(mock_service)
+        mock_service.search.return_value = []
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': self.STRADDLING_CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+                'metadata': {'allow_near_duplicate': True},
+            },
+        )
+
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'Override must bypass a sufficient-phrase block; got: {result!r}'
+        )
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_recon_stage_agent_still_exempt_from_a_sufficient_block(self):
+        """Stage-1 consolidation writes the canonical entry, which contains the phrase."""
+        mock_service = AsyncMock()
+        self._configure_real_clusters(mock_service)
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': self.STRADDLING_CONTENT,
+                'category': 'procedural_knowledge',
+                'agent_id': 'recon-stage-memory_consolidator',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'recon-stage agents must stay exempt; got: {result!r}'
+        )
+        mock_service.search.assert_not_called()
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unrelated_note_still_falls_through_to_the_cosine_path(self):
+        """Negative control against the REAL seed: sufficiency must not over-fire."""
+        mock_service = AsyncMock()
+        self._configure_real_clusters(mock_service)
+        mock_service.search.return_value = []
+        _configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': MERGE_BASE_NEGATIVE_CONTROL_NOTE,
+                'category': 'procedural_knowledge',
+                'agent_id': 'claude-interactive',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', (
+            f'A plain git-ancestry note must not be blocked; got: {result!r}'
+        )
+        mock_service.search.assert_called_once()
         mock_service.add_memory.assert_called_once()

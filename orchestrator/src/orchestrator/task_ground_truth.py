@@ -16,6 +16,38 @@ instead of re-deriving recovery policy themselves is a separate task (θ2).
 TG-1 (journal-first branch state) / TG-2 (one classification table) / TG-3
 (liveness via the public accessor, not scheduler privates) are implemented
 in :meth:`TaskGroundTruth.derive_truth` and :func:`classify_recovery` below.
+
+Task 3533 widened :class:`EscalationRef` with ``severity`` and
+``filing_claimant_run_id`` so refs can feed the shared
+``escalation.pins.classify_pins`` predicate (spec
+``docs/task-escalation-state-spec.md`` S6/E7) without a downstream re-read.
+That task deliberately rewires NO veto site: ``_shape``'s
+``has_open_escalation = bool(report.open_escalations)``, ``classify_recovery``
+and the ``_RECOVERY`` table are unchanged, and making that boolean
+pin-class-aware is task eta (3541).
+
+Task 3563 normalised the OTHER side of that comparison: :class:`Claimant`'s
+``run_id`` is now homogeneous across all three liveness sources — a full
+``shared.task_claimant.compose_claimant_run_id`` identity or ``None``
+(unknown), never a bare ``session_id``. See the :class:`Claimant` docstring
+for the normative contract. This is disposition-neutral by construction: no
+production consumer reads ``Claimant.run_id`` at all (every read is a
+presence check or a ``.source`` check), so it changes no recovery outcome —
+it only makes the field COMPARABLE by ``escalation.pins``.
+
+SCOPE HONESTY on that last point: 3563 shipped the SHAPE contract, NOT
+end-to-end reachability. Two gaps outside its scope still gate the payoff.
+(1) The plan.lock leg of :meth:`TaskGroundTruth._resolve_live_claimant` reads
+``<worktree>/.task/plan.lock`` while the production writer targets the
+``.task-meta`` SIBLING, so on a real orchestrator run that leg can only ever
+find a pre-3563 legacy lock and resolves ``run_id=None`` — i.e. the
+composition branch is INERT in production today (task 4262 relocates the read;
+task 4028 tracks deleting the leg outright if that is the ruling instead).
+(2) The only production ``escalation.pins.classify_pins`` call site still
+passes ``live_claimant=False`` with no ``live_claimant_id`` (task 3541 wires
+it). Live-vs-dead filer discrimination becomes REACHABLE when those land; what
+3563 delivers is that the identity is now expressible at all, and that the
+bare-``session_id`` shape which would have made that comparison UNSAFE is gone.
 """
 
 from __future__ import annotations
@@ -29,7 +61,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 from shared.deploy_state import DeployPhase, DeployState
-from shared.task_claimant import is_stranded
+from shared.task_claimant import compose_claimant_run_id, is_stranded
 from shared.task_statuses import TaskStatus
 
 from orchestrator.artifacts import TaskArtifacts
@@ -103,20 +135,85 @@ class BranchState:
 
 @dataclass(frozen=True)
 class Claimant:
-    """A live claimant identity, folded from one of three liveness signals."""
+    """A live claimant identity, folded from one of three liveness signals.
+
+    ``run_id`` CONTRACT (task 3563) — normative, all three sources:
+    it is either a FULL ``shared.task_claimant.compose_claimant_run_id``
+    identity (``'{run_id}/{session_id}/pid={owner_pid}'``) or ``None``,
+    meaning UNKNOWN.  It is never a bare ``session_id`` and never partially
+    composed.  Per source:
+
+    * DB — the ``claimant_run_id`` column, already composed at dispatch, kept
+      VERBATIM.  CAVEAT: that stored value may ITSELF be partial —
+      ``TaskWorkflow`` stamps ``compose_claimant_run_id(self._process_run_id or
+      '', ...)`` (workflow.py:2297-2299), so a harness-less workflow writes
+      ``'/{session_id}/pid={pid}'`` to the column, exactly the shape the rule
+      above forbids.  This resolver neither detects nor repairs it:
+      ``shared.task_claimant`` ships no parser, so a composed value passes
+      through whole.  The plan.lock leg's fail-safe is deliberately NOT mirrored
+      here — normalising that PRODUCER is a 3563 follow-up (ticket
+      ``tkt_0RSGFS860E6VY37A7XH6S9FYCP``), and the "never partially composed"
+      rule holds for all three sources only once it lands.
+    * PLAN_LOCK — composed here from the lock's ``run_id``/``session_id``/
+      ``owner_pid``, which ``TaskArtifacts.lock_plan`` records in the same
+      process that stamps the DB claimant, making the two byte-identical for
+      one incarnation.  ``None`` when any component is missing or malformed:
+      legacy locks written before 3563 carry no ``run_id``, and harness-less
+      workflows have none to record.
+    * IN_MEMORY — always ``None``; the scheduler's held-set carries no
+      identity.
+
+    Composing PARTIALLY would be worse than the bare session id this replaced:
+    ``'/{session_id}/pid={pid}'`` carries the ``/pid=`` marker, so it PASSES
+    ``escalation.pins._norm_id``'s shape guard and then string-mismatches every
+    DB-composed filing identity — which ``classify_pins`` reads as "a DIFFERENT
+    incarnation is live", converting a genuinely LIVE filer's L0 to DEAD_L0.
+    A format mismatch is not proof the filer is dead; ``None`` (unknown) fails
+    safe to pinning, a wrong-but-well-shaped identity does not.
+
+    ``session_id`` is DIAGNOSTIC SURFACE, not a contract to build on: NO
+    production consumer reads it (nor ``run_id`` — every production read of a
+    :class:`Claimant` is a presence check or a ``.source`` check), and
+    ``escalation.pins`` compares ``run_id`` only.  It exists solely so that
+    re-shaping ``run_id`` does not silently DELETE the raw id the PLAN_LOCK
+    source used to expose; a future consumer should justify itself rather than
+    assume this field is load-bearing.  It carries the raw id only where the
+    source knows it directly (PLAN_LOCK), staying ``None`` for DB because
+    ``shared.task_claimant`` ships no parser — this resolver must not split a
+    composed identity to back-fill it.  Defaulted (like task 3533's
+    :class:`EscalationRef` widening) and last, since ``run_id``/``heartbeat_at``/
+    ``source`` have no defaults.
+    """
 
     run_id: str | None
     heartbeat_at: str | None
     source: ClaimantSource
+    session_id: str | None = None
 
 
 @dataclass(frozen=True)
 class EscalationRef:
-    """A lightweight reference to an open escalation."""
+    """A lightweight reference to an open escalation.
+
+    Severity and level must BOTH travel with every escalation reference — a
+    predicate that cannot see severity cannot discriminate a pinning record
+    from a non-pinning one (spec ``docs/task-escalation-state-spec.md`` S6/E7),
+    which is why ``severity`` is carried here rather than re-read downstream.
+
+    ``severity=''`` and ``filing_claimant_run_id=None`` both mean "unknown".
+    Their semantics and the fail-safe rule are documented once, on
+    ``escalation.pins.classify_pins`` (normative source: spec S6) — this
+    docstring deliberately does not restate them.
+
+    Both new fields are DEFAULTED so every existing construction site keeps
+    working untouched.
+    """
 
     id: str
     level: int
     category: str = ''
+    severity: str = ''
+    filing_claimant_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,12 +222,23 @@ class TruthReport:
 
     Frozen — a point-in-time snapshot, not a live view; callers re-derive
     via :meth:`TaskGroundTruth.derive_truth` for a fresh report.
+
+    KNOWN GAP on ``open_escalations`` (task 3533 -> beta/3535): its ``[]`` is
+    currently AMBIGUOUS — "the store was read and holds no open escalations"
+    and "no escalation store was bound, so no read was possible" are
+    indistinguishable (see :meth:`TaskGroundTruth._resolve_open_escalations`).
+    That is exactly the collapse ``escalation.pins.classify_pins(records=None)
+    -> store_unavailable`` exists to make impossible, so this field has no way
+    to reach that third state yet.  Task beta (3535) widens it; until then a
+    consumer must NOT read ``open_escalations == []`` as proof that the task
+    carries no open escalation.
     """
 
     db_status: str
     live_claimant: Claimant | None
     branch_state: BranchState
     worktree_present: bool
+    # ``[]`` is ambiguous — see the KNOWN GAP note in the class docstring.
     open_escalations: list[EscalationRef]
     deploy_phase: DeployPhase | None
 
@@ -172,6 +280,22 @@ def _pid_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _known_str(value: object) -> str | None:
+    """Return *value* VERBATIM if it is a non-blank ``str``, else ``None``.
+
+    The "is this component KNOWN?" test for the plan.lock claimant identity
+    (task 3563).  A plan.lock is untrusted input — it can be hand-edited, or
+    written by an older orchestrator — so a component may be absent, blank, or
+    not a string at all; every one of those is UNKNOWN, and an identity with an
+    unknown component must not be composed (see :class:`Claimant`).
+
+    Returns the value UNSTRIPPED so a composed identity embeds exactly the
+    bytes the writer recorded, keeping it byte-identical to the DB claimant
+    stamp built from those same components.
+    """
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _lock_fresh(locked_at: object, now: datetime, ttl: timedelta) -> bool:
@@ -386,7 +510,14 @@ class TaskGroundTruth:
            staleness cross-check guards against a PID-reuse false-live read,
            review finding) — consulted ONLY when the db claimant is
            genuinely absent (pre-2182 rows predating the claimant_run_id/
-           heartbeat_at columns).
+           heartbeat_at columns).  Its ``run_id`` is COMPOSED here from the
+           lock's own run_id/session_id/owner_pid, or left ``None`` when any
+           component is missing or malformed — see the :class:`Claimant`
+           docstring for why a partial composition is never acceptable
+           (task 3563).  That composition is INERT on a real orchestrator run
+           today: this leg reads the legacy lock path, which the production
+           writer no longer targets (see the PATH GAP comment at the read
+           site below, task 4262).
 
         A present-but-stale db claimant (``is_stranded`` True) collapses
         straight to ``None`` — it deliberately does NOT fall through to the
@@ -427,6 +558,18 @@ class TaskGroundTruth:
                 source=ClaimantSource.DB,
             )
 
+        # PATH GAP — task 4262, deliberately NOT fixed by task 3563 (which
+        # normalises the identity SHAPE, not where the lock is looked up).
+        # No ``meta_root`` here, so this reads the LEGACY
+        # ``<worktree>/.task/plan.lock``, while the production writer
+        # (``TaskWorkflow``, workflow.py:2384-2385) targets the ``.task-meta``
+        # SIBLING and nothing bridges the two: ``ensure_lane_plan_symlink``
+        # (artifacts.py:354-386) relocates plan.json ONLY, and ``_read_path``
+        # has no new-then-old fallback (unlike ``Harness._resolve_recovery_
+        # artifact``). So on a real run this finds at most a PRE-3563 legacy
+        # lock, carrying no ``run_id``, and the composition below resolves to
+        # the fail-safe ``None``. Task 4028 tracks deleting this leg outright
+        # if that is the ruling instead of relocating the read.
         try:
             lock_data = TaskArtifacts(worktree_path).read_plan_lock()
         except (ValueError, OSError):
@@ -452,31 +595,74 @@ class TaskGroundTruth:
         # test_reconcile_lock_format_variants[non-dict-json]).
         if isinstance(lock_data, dict):
             owner_pid = lock_data.get('owner_pid')
+            # Retain the PARSED pid: the composed identity below must embed the
+            # same int this liveness check validated, not a re-parse of the raw
+            # value (which could be e.g. the string '123', composing a
+            # different byte sequence than the DB stamp's int).
+            parsed_pid: int | None = None
             try:
-                owner_alive = owner_pid is not None and _pid_alive(int(owner_pid))
+                parsed_pid = None if owner_pid is None else int(owner_pid)
+                owner_alive = parsed_pid is not None and _pid_alive(parsed_pid)
             except (TypeError, ValueError):
+                parsed_pid = None
                 owner_alive = False
             lock_fresh = _lock_fresh(lock_data.get('locked_at'), self.now_fn(), self.heartbeat_ttl)
             if owner_alive and lock_fresh:
+                # Compose ONLY when every component is known and well-formed;
+                # otherwise the identity is UNKNOWN (None). A partial
+                # composition would be well-shaped but WRONG — see the
+                # Claimant docstring (task 3563).
+                lock_run_id = _known_str(lock_data.get('run_id'))
+                lock_session_id = _known_str(lock_data.get('session_id'))
+                composed = (
+                    compose_claimant_run_id(lock_run_id, lock_session_id, parsed_pid)
+                    if lock_run_id is not None
+                    and lock_session_id is not None
+                    and parsed_pid is not None
+                    else None
+                )
                 return Claimant(
-                    run_id=lock_data.get('session_id'),
+                    run_id=composed,
                     heartbeat_at=lock_data.get('locked_at'),
                     source=ClaimantSource.PLAN_LOCK,
+                    session_id=lock_session_id,
                 )
         return None
 
     def _resolve_open_escalations(self, tid: str) -> list[EscalationRef]:
         """Map *tid*'s pending escalations to lightweight refs.
 
+        ``severity`` and ``filing_claimant_run_id`` travel with each ref so
+        consumers can feed ``escalation.pins.classify_pins`` directly instead
+        of re-reading the store (spec ``docs/task-escalation-state-spec.md``
+        S6/E7).  ``row.severity or ''`` normalises a null/absent severity to
+        the unknown-severity sentinel, so the classifier reaches its
+        documented fail-safe-to-pinning branch rather than raising.
+
+        STORE-CORRECTNESS (spec S6; esc-3163 was a wrong-store read): this
+        resolver reads the escalation store INJECTED by the task's owning
+        orchestrator — never the reconciliation store.
+
         ``[]`` when no ``escalation_queue`` was injected — a caller that
         doesn't wire one up gets an empty-but-valid TruthReport field rather
-        than an error.
+        than an error.  That degradation is a KNOWN gap: it is indistinguishable
+        from a genuine "no open escalations", which is exactly the collapse
+        ``classify_pins(records=None)`` -> ``store_unavailable`` exists to
+        prevent.  Task beta (3535) replaces it with that distinguishable third
+        state; it is deliberately left unchanged here so this task ships no
+        disposition change.
         """
         if self.escalation_queue is None:
             return []
         rows = self.escalation_queue.get_by_task(tid, status='pending')
         return [
-            EscalationRef(id=row.id, level=row.level, category=row.category)
+            EscalationRef(
+                id=row.id,
+                level=row.level,
+                category=row.category,
+                severity=row.severity or '',
+                filing_claimant_run_id=row.filing_claimant_run_id,
+            )
             for row in rows
         ]
 

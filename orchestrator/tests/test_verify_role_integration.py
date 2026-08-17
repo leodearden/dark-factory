@@ -18,27 +18,46 @@ test_reviewer_trial_corpus.py:129).
 Environment
 -----------
 REIFY_ROOT
-    Path to the reify repository checkout.  Defaults to ``/home/leo/src/reify``
-    (mirrors the hardcoded path already in config.py / evals/reviewer_trial/corpus.py).
-    Override this in CI or on machines that check out reify at a different location:
+    Path to the reify repository checkout.  There is NO hardcoded default: the
+    checkout is DISCOVERED by walking up from this file to the nearest ancestor
+    carrying ``reify/scripts/verify.sh``, which works for any side-by-side
+    checkout on any machine and in either the bare-checkout or worktree layout.
+    Set REIFY_ROOT only to point somewhere else:
 
         export REIFY_ROOT=/path/to/reify
 
-    When the integration test is skipped because the path is absent or nice/ionice
-    are unavailable, a ``UserWarning`` is emitted in CI runs (``CI`` env-var set) so
-    the silent no-op is visible in the CI log rather than silently providing no
-    cross-repo coverage.
+    Precedence, and the full contract, live in ``shared.reify_checkout`` — the
+    single source shared with fused-memory's lock-charter drift guard, so one
+    ``export REIFY_ROOT=`` steers every reify-dependent test in dark-factory.
+    Two consequences worth knowing here:
+
+    - REIFY_ROOT is honored VERBATIM even when it does not exist on disk, so a
+      typo skips LOUDLY naming the bad path rather than silently falling back to
+      a discovered checkout that would answer for a different repo.
+    - The constants below are resolved at IMPORT time, so REIFY_ROOT must be
+      exported BEFORE pytest starts to steer them.
+
+    When the integration test is skipped — reify undiscoverable, REIFY_ROOT
+    naming a path without the script, or nice/ionice unavailable — a
+    ``UserWarning`` carrying EVERY live cause (they are composed, not
+    short-circuited, so a two-cause host is not fixed one re-run at a time) is
+    emitted in CI runs (``CI`` env-var set) so the silent no-op is visible in
+    the CI log rather than silently providing no cross-repo coverage.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
 import subprocess
+import sys
+import warnings
 from pathlib import Path
 from typing import Literal
 
 import pytest
+from shared.reify_checkout import REIFY_ROOT_ENV, reify_skip_reason, resolve_reify_checkout
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import _resolve_verify_env
@@ -46,37 +65,82 @@ from orchestrator.verify import _resolve_verify_env
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+#
+# Resolved at IMPORT time via shared.reify_checkout — the single source of reify
+# discovery, shared with fused-memory's lock-charter drift guard.  Discovery is
+# a nearest-ancestor walk from THIS file, so it is correct in both the bare
+# checkout and the .worktrees/<id> layout; see that module's docstring for the
+# measured evidence table and why no fixed parents[N] index can serve both.
+# ---------------------------------------------------------------------------
 
-REIFY_VERIFY_SH: Path = (
-    Path(os.environ.get("REIFY_ROOT", "/home/leo/src/reify")) / "scripts" / "verify.sh"
+_REIFY_VERIFY_RELPATH = Path("scripts") / "verify.sh"
+# One resolution, carrying both the root and WHERE it came from — the skip
+# reason below is formatted from this same result, so it can never blame
+# REIFY_ROOT for a path that was actually discovered.
+_REIFY_CHECKOUT = resolve_reify_checkout(_REIFY_VERIFY_RELPATH, start=Path(__file__))
+REIFY_ROOT: Path | None = _REIFY_CHECKOUT.root
+REIFY_VERIFY_SH: Path | None = (
+    REIFY_ROOT / _REIFY_VERIFY_RELPATH if REIFY_ROOT is not None else None
 )
 
-_INTEGRATION_SKIP = pytest.mark.skipif(
-    not REIFY_VERIFY_SH.exists()
-    or shutil.which("nice") is None
-    or shutil.which("ionice") is None,
-    reason=(
-        "reify checkout or nice/ionice unavailable — cross-repo integration gate"
-        " cannot run; reify verify.sh degrades its CARGO_PRIO without nice/ionice."
-        " Set REIFY_ROOT env-var to enable."
-    ),
+def _tool_skip_reason(missing: list[str]) -> str | None:
+    """Why this host cannot exercise reify's CARGO_PRIO plan, or None if it can."""
+    if not missing:
+        return None
+    return (
+        f"{'/'.join(missing)} unavailable — reify verify.sh degrades its "
+        f"CARGO_PRIO without nice/ionice"
+    )
+
+
+def _compose_skip_reason(*reasons: str | None) -> str | None:
+    """Join EVERY live cause into one reason, or None when nothing blocks the run.
+
+    Composed rather than short-circuited on purpose.  In the realistic
+    minimal-container case reify is undiscoverable AND nice/ionice are missing;
+    a first-cause-wins reason makes the operator fix the reify half, re-run, and
+    only then learn about the tools — the same one-cause-at-a-time conflation
+    this split exists to remove.
+
+    Returns None (never "") for an all-empty input: a falsy-but-not-None reason
+    would still flip `_SKIP_REASON is not None` and produce a skip with a blank
+    explanation.
+    """
+    return "; ".join(r for r in reasons if r) or None
+
+
+# The skip decision is kept in PARTS on purpose.  _REIFY_SKIP_REASON is the
+# reify half alone: it is host-independent, so the planted-layout tests at the
+# bottom of this file can assert on the gate's ADMISSION DECISION from a module
+# copy loaded out of a synthetic tree without also requiring the host to have
+# nice/ionice.  Splitting also names WHICH of the three causes fired — the old
+# single reason string conflated reify-absent, nice-absent and ionice-absent, so
+# an operator reading `pytest -rs` could not tell them apart — and composing
+# (rather than short-circuiting) the halves back together names ALL of them at
+# once, so a two-cause host is not fixed one re-run at a time.
+_REIFY_SKIP_REASON: str | None = reify_skip_reason(
+    _REIFY_VERIFY_RELPATH, REIFY_ROOT, named_by_env=_REIFY_CHECKOUT.named_by_env
 )
+_MISSING_TOOLS = [t for t in ("nice", "ionice") if shutil.which(t) is None]
+_TOOL_SKIP_REASON: str | None = _tool_skip_reason(_MISSING_TOOLS)
+_SKIP_REASON: str | None = _compose_skip_reason(_REIFY_SKIP_REASON, _TOOL_SKIP_REASON)
+
+_INTEGRATION_SKIP = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
 
 # Emit a visible warning when the integration gate is silently skipped in CI so
-# the coverage gap is not hidden.  Fires at collection time (module import).
-if os.environ.get("CI") and (
-    not REIFY_VERIFY_SH.exists()
-    or shutil.which("nice") is None
-    or shutil.which("ionice") is None
-):
-    import warnings
-
+# the coverage gap is not hidden.  Fires at collection time (module import), and
+# carries the resolved reason VERBATIM so the CI log names every actual cause
+# (and the resolved path, when one was named) rather than a generic three-way
+# string.  Covered by test_ci_skip_emits_a_warning_naming_the_reason below —
+# this block is the mechanism that keeps a silent CI coverage gap visible, so it
+# is precisely the code that must not be allowed to break unnoticed.
+if os.environ.get("CI") and _SKIP_REASON is not None:
     warnings.warn(
         f"Integration gate test_role_env_propagates_to_reify_verify_plan will be "
-        f"SKIPPED in this CI run: "
-        f"REIFY_VERIFY_SH={REIFY_VERIFY_SH} exists={REIFY_VERIFY_SH.exists()}, "
-        f"nice={shutil.which('nice')!r}, ionice={shutil.which('ionice')!r}. "
-        f"Set REIFY_ROOT env-var to a reify checkout path to enable cross-repo "
+        f"SKIPPED in this CI run: {_SKIP_REASON}. "
+        f"(REIFY_ROOT={REIFY_ROOT}, REIFY_VERIFY_SH={REIFY_VERIFY_SH}, "
+        f"nice={shutil.which('nice')!r}, ionice={shutil.which('ionice')!r}.) "
+        f"Set {REIFY_ROOT_ENV} to a reify checkout path to enable cross-repo "
         f"integration coverage.",
         UserWarning,
         stacklevel=1,
@@ -132,7 +196,16 @@ def _run_reify_print_plan(verify_env: dict[str, str]) -> str:
     Invokes the script directly; falls back to `bash <script>` if the +x bit
     is absent in this checkout.
     """
-    reify_root = REIFY_VERIFY_SH.parents[1]
+    # Every caller is guarded by _INTEGRATION_SKIP, so reaching here with an
+    # unresolved checkout means a caller lost its guard.  Fail loudly rather
+    # than stringifying None into a bogus subprocess argv.  (Mirrors the
+    # identical assert in fused-memory's _reify_guard_vector.)
+    assert REIFY_VERIFY_SH is not None and REIFY_ROOT is not None, (
+        "no reify checkout resolved, but a test reached _run_reify_print_plan — "
+        "its @_INTEGRATION_SKIP guard is missing or was evaluated against a "
+        f"different module state (_SKIP_REASON={_SKIP_REASON!r})"
+    )
+    reify_root = REIFY_ROOT
     child_env = {**os.environ, **verify_env}
 
     try:
@@ -289,4 +362,252 @@ def test_command_lines_excludes_env_comment_substrings() -> None:
     )
     assert any("cargo nextest run" in ln for ln in helper_lines), (
         "_command_lines did not return the cargo-nextest line"
+    )
+
+
+def test_tool_skip_reason_names_every_missing_tool() -> None:
+    """The tool half of the skip decision, exercised on synthetic tool lists.
+
+    Host-independent: the module constant built from ``shutil.which`` says
+    nothing on a machine that has both tools, which is exactly the machine this
+    suite normally runs on.
+    """
+    assert _tool_skip_reason([]) is None, "a fully-equipped host must not skip"
+
+    both = _tool_skip_reason(["nice", "ionice"])
+    assert both is not None and both.startswith("nice/ionice unavailable"), both
+
+    # A single missing tool must name only that one — not the pair, which would
+    # send an operator hunting for a tool they already have.
+    only_ionice = _tool_skip_reason(["ionice"])
+    assert only_ionice is not None and only_ionice.startswith("ionice unavailable"), (
+        only_ionice
+    )
+
+
+def test_skip_reasons_compose_instead_of_short_circuiting() -> None:
+    """Every live cause is reported at once, not one per re-run."""
+    assert _compose_skip_reason(None, None) is None
+
+    assert _compose_skip_reason("reify absent", None) == "reify absent"
+    assert _compose_skip_reason(None, "nice absent") == "nice absent"
+    assert _compose_skip_reason("reify absent", "nice absent") == (
+        "reify absent; nice absent"
+    ), (
+        "a two-cause host must learn both causes from one run — a first-cause-wins "
+        "reason is the conflation the reify/tool split exists to remove"
+    )
+
+    # Anti-vacuity: an all-empty compose is None, never "" — a blank-but-truthy
+    # reason would still trip `_SKIP_REASON is not None` and skip with no message.
+    assert _compose_skip_reason("", None) is None
+
+
+# ---------------------------------------------------------------------------
+# Off-machine gate resolution — the layout-independence demonstration
+#
+# A test that merely passes on THIS machine does not discriminate: the gate's
+# old hardcoded ``/home/leo/src/reify`` default resolves to a path that really
+# exists here, so "the integration test ran" was equally consistent with a
+# working resolver and with a broken one that happened to name the developer's
+# own checkout.  These cases load a COPY of this module out of a SYNTHETIC
+# checkout tree and assert on the constants it resolves there, so the answer is
+# about the planted layout rather than about this host.
+#
+# The RED is host-independent in both directions: a fixed literal can never
+# equal a tmp_path, and a tmp_path with no reify in its ancestry must resolve
+# to None on a machine where /home/leo/src/reify exists.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def planted_env(monkeypatch):
+    """Neutralize the ambient env that would otherwise steer a module copy.
+
+    REIFY_ROOT would override the discovery the planted-layout cases exist to
+    exercise; CI would make the copy's import-time warning block fire on the
+    deliberately-unresolvable trees.  Returns monkeypatch so a case can set
+    REIFY_ROOT back to a value it chose itself.
+    """
+    monkeypatch.delenv("REIFY_ROOT", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    return monkeypatch
+
+
+def _load_module_copy(tmp_path: Path, tests_relpath: str, *, plant_verify_sh: bool = True):
+    """Import a COPY of THIS module from a synthetic checkout layout.
+
+    Plants ``<tmp>/src/reify/scripts/verify.sh`` (a real file; content
+    irrelevant) when requested, creates ``<tmp>/src/<tests_relpath>/``, copies
+    this module in, and loads it via ``spec_from_file_location``.
+
+    The copy's ``orchestrator.config`` / ``orchestrator.verify`` /
+    ``shared.reify_checkout`` imports resolve from the parent process's
+    sys.path, while its ``__file__`` is the PLANTED path — so its import-time
+    constant resolution walks the SYNTHETIC ancestry, which is the whole point.
+    The temporary sys.modules entry is popped in a finally block so no copy
+    outlives the call.
+    """
+    src = tmp_path / "src"
+    if plant_verify_sh:
+        planted = src / "reify" / "scripts" / "verify.sh"
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_text("#!/bin/sh\necho stub\n")
+
+    tests_dir = src / tests_relpath
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    copied = tests_dir / "test_copy_probe.py"
+    shutil.copy2(__file__, copied)
+
+    module_name = "_reify_gate_probe_" + re.sub(r"\W+", "_", tests_relpath)
+    spec = importlib.util.spec_from_file_location(module_name, copied)
+    assert spec is not None and spec.loader is not None, f"could not load {copied}"
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.modules.pop(module_name, None)
+    return mod
+
+
+_BARE_LAYOUT = "dark-factory/orchestrator/tests"
+_WORKTREE_LAYOUT = "dark-factory/.worktrees/3978/orchestrator/tests"
+
+
+def test_gate_resolves_against_the_planted_checkout_not_this_machine(tmp_path, planted_env):
+    """The gate must find the reify sibling of the tree it is RUNNING in."""
+    mod = _load_module_copy(tmp_path, _BARE_LAYOUT)
+
+    expected = tmp_path / "src" / "reify" / "scripts" / "verify.sh"
+    assert expected == mod.REIFY_VERIFY_SH, (
+        f"the gate resolved to {mod.REIFY_VERIFY_SH!r} instead of the reify "
+        f"checkout planted beside it at {expected!r} — a hardcoded default "
+        f"answers for this developer's machine rather than for the tree under test"
+    )
+
+
+def test_gate_admits_the_run_from_a_planted_checkout(tmp_path, planted_env):
+    """Resolution is not enough — the skip decision must ADMIT the run.
+
+    Asserts on the reify half alone (``_REIFY_SKIP_REASON``), not the composed
+    ``_SKIP_REASON``, so this case stays green on a host without nice/ionice
+    instead of smuggling a host dependency into the very test written to
+    remove one.
+    """
+    mod = _load_module_copy(tmp_path, _BARE_LAYOUT)
+
+    assert mod._REIFY_SKIP_REASON is None, (
+        f"the gate would SKIP against a planted checkout that really carries "
+        f"scripts/verify.sh: {mod._REIFY_SKIP_REASON!r}"
+    )
+
+
+def test_worktree_and_bare_layouts_resolve_to_the_same_planted_checkout(tmp_path, planted_env):
+    """No fixed parents[N] index can satisfy both layouts."""
+    bare = _load_module_copy(tmp_path, _BARE_LAYOUT)
+    worktree = _load_module_copy(tmp_path, _WORKTREE_LAYOUT)
+
+    expected = tmp_path / "src" / "reify" / "scripts" / "verify.sh"
+    assert expected == worktree.REIFY_VERIFY_SH
+    assert worktree.REIFY_VERIFY_SH == bare.REIFY_VERIFY_SH, (
+        f"'.worktrees/<id>' adds exactly two path segments, so a fixed "
+        f"parents[N] cannot be correct in both layouts (got "
+        f"worktree={worktree.REIFY_VERIFY_SH!r} vs bare={bare.REIFY_VERIFY_SH!r})"
+    )
+    assert worktree._REIFY_SKIP_REASON is None
+
+
+def test_discovery_miss_skips_instead_of_answering_from_this_machine(tmp_path, planted_env):
+    """THE structural pin against a hardcoded default.
+
+    Nothing named reify exists anywhere in the planted ancestry, so the honest
+    answer is None + a skip.  A hardcoded ``/home/leo/src/reify`` produces a
+    path that EXISTS on this machine, so the gate would silently run the
+    cross-repo integration against a checkout unrelated to the tree under test.
+    """
+    mod = _load_module_copy(tmp_path, _BARE_LAYOUT, plant_verify_sh=False)
+
+    assert mod.REIFY_VERIFY_SH is None, (
+        f"no reify checkout exists in the planted ancestry, but the gate "
+        f"resolved {mod.REIFY_VERIFY_SH!r} — an off-tree answer"
+    )
+    reason = mod._REIFY_SKIP_REASON
+    assert isinstance(reason, str) and reason
+    assert "REIFY_ROOT" in reason, f"the skip must name the override: {reason!r}"
+    assert "scripts/verify.sh" in reason, f"the skip must name the marker: {reason!r}"
+
+
+def test_env_override_is_honored_verbatim_and_names_the_bad_path(tmp_path, planted_env):
+    """A REIFY_ROOT typo must skip loudly, not fall back to a lucky discovery."""
+    bad_root = tmp_path / "does-not-exist" / "reify-typo"
+    planted_env.setenv("REIFY_ROOT", str(bad_root))
+
+    mod = _load_module_copy(tmp_path, _BARE_LAYOUT)
+
+    assert bad_root.resolve() == mod.REIFY_ROOT, (
+        f"REIFY_ROOT must win over the discoverable planted sibling, not be "
+        f"shadowed by it (got {mod.REIFY_ROOT!r})"
+    )
+    assert (tmp_path / "src" / "reify") != mod.REIFY_ROOT, (
+        "a typo'd REIFY_ROOT silently falling back to a discovered checkout "
+        "would answer for a DIFFERENT repo than the operator named"
+    )
+    reason = mod._REIFY_SKIP_REASON
+    assert isinstance(reason, str) and reason
+    assert str(bad_root) in reason, (
+        f"the skip reason must name the bad path verbatim so it is self-evident "
+        f"in `pytest -rs` output which path was wrong (got {reason!r})"
+    )
+
+
+def test_verify_sh_constant_tracks_the_resolved_root(tmp_path, planted_env):
+    """Wiring pin: the two module constants must not re-diverge."""
+    mod = _load_module_copy(tmp_path, _BARE_LAYOUT)
+
+    assert mod.REIFY_ROOT is not None
+    assert mod.REIFY_VERIFY_SH == mod.REIFY_ROOT / mod._REIFY_VERIFY_RELPATH
+
+
+def test_ci_skip_emits_a_warning_naming_the_reason(tmp_path, planted_env):
+    """The CI warning block is what keeps a silent coverage gap visible.
+
+    So it must not be allowed to break unnoticed: a typo'd f-string or an
+    inverted condition there would ship green, and every other planted-layout
+    case deliberately delenvs CI to suppress it.  Loaded from a tree with no
+    reify in its ancestry, so the gate genuinely would skip.
+    """
+    planted_env.setenv("CI", "1")
+
+    with pytest.warns(UserWarning) as record:
+        mod = _load_module_copy(tmp_path, _BARE_LAYOUT, plant_verify_sh=False)
+
+    assert mod._SKIP_REASON is not None, "precondition: this tree must skip"
+    messages = [str(w.message) for w in record]
+    assert any(mod._SKIP_REASON in m for m in messages), (
+        f"the CI warning must carry the resolved reason VERBATIM so the log "
+        f"names the actual cause; reason={mod._SKIP_REASON!r} warnings={messages!r}"
+    )
+    assert any(mod.REIFY_ROOT_ENV in m for m in messages), (
+        f"the CI warning must name the env var that enables the coverage: "
+        f"{messages!r}"
+    )
+
+
+def test_no_ci_warning_when_ci_is_unset(tmp_path, planted_env):
+    """The warning is gated on CI — a local run must not be noised up.
+
+    Complements the case above: together they pin both arms of the condition,
+    so an inverted gate cannot pass.
+    """
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        mod = _load_module_copy(tmp_path, _BARE_LAYOUT, plant_verify_sh=False)
+
+    assert mod._SKIP_REASON is not None, "precondition: this tree must skip"
+    gate_warnings = [
+        str(w.message) for w in record if "Integration gate" in str(w.message)
+    ]
+    assert gate_warnings == [], (
+        f"the skip warning must fire only in CI runs, got {gate_warnings!r}"
     )
