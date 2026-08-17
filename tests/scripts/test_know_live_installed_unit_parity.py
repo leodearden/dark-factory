@@ -39,11 +39,10 @@ Each layer checks two properties: the RestartMaxDelaySec=/RestartSteps=
 pairing (systemd silently drops an unpaired cap — see
 tests/scripts/systemd_unit_invariants.py) and the `--config` argument
 naming the canonical dark-factory-orchestrator.yaml basename (task 3641;
-CANONICAL_CONFIG_BASENAME is now IMPORTED from
-tests/scripts/systemd_unit_invariants.py rather than mirrored from
-tests/scripts/test_orchestrator_service_files.py — task 3773 lifted it
-there together with the parser that consumes it, so there is one
-definition instead of two copies to keep in step). Deliberately NOT
+CANONICAL_CONFIG_BASENAME and the parser that consumes it are now
+IMPORTED from tests/scripts/systemd_unit_invariants.py rather than
+mirrored, so there is one definition instead of two copies to keep in
+step). Deliberately NOT
 asserted: ActiveState — liveness is the
 watchdog's job (scripts/orchestrator-watchdog.py) and pinning it here would
 make this suite fail during any legitimate restart window.
@@ -101,27 +100,17 @@ Half of that is now done, and the split is deliberate:
   - ALSO MOVED, by task 3773 — `_config_arg_from_exec_start` (now
     `config_arg_from_exec_start`, taking a unit_name so its failure
     messages name the offender), `CANONICAL_CONFIG_BASENAME`, and the
-    `MalformedExecStart` class the canonical parser raises. Same trigger,
-    found by reviewer_comprehensive on task 3642 and filed as its
-    follow-up: this module hand-copied a parser whose canonical copy
-    already lived in tests/scripts/test_orchestrator_service_files.py.
-    The lift ALSO closed the divergence the bullet this one replaces said
-    a lift alone could NOT close — the copy here collapsed a dangling
-    `--config` (the flag with no value after it) into the same None as
-    "no --config at all", where the canonical parser raises. The shared
-    parser adopts the RAISE contract, because None is load-bearing in the
-    sibling suite (orchestrator-watchdog.service legitimately takes no
-    --config and must SKIP), so overloading None with "malformed" is
-    exactly how a guard waves through the drift it was written to catch.
-    Reconciling cost this module nothing: every call site here already
-    asserted `config_arg is not None`, so a dangling `--config` already
-    failed — just with a generic "carries no --config argument" message
-    instead of one naming the defect. The empty `--config=` spelling was
-    reconciled in the same direction, being the same defect (the
-    orchestrator would start with no config path at all) in the other
-    spelling. Its negative-case owner stays HERE, in the PARSER layer
-    section at the bottom of this file, exactly as systemctl_user_show's
-    did through task 3763's lift.
+    `MalformedExecStart` class it raises. Same trigger: this module had
+    hand-copied a parser whose canonical copy already lived in
+    tests/scripts/test_orchestrator_service_files.py — and the two had
+    ALREADY drifted, answering a dangling `--config` two different ways,
+    which is the drift argument made concrete rather than hypothetical.
+    The lift reconciled them onto ONE contract, stated once on
+    systemd_unit_invariants.config_arg_from_exec_start and not restated
+    here; adopting it cost this module nothing, since both call sites
+    already asserted `config_arg is not None`. Its negative-case owner
+    stays HERE, in the PARSER layer section at the bottom of this file,
+    exactly as systemctl_user_show's did through task 3763's lift.
   - STAYED LOCAL — `_argv_from_exec_start_show`, which still has exactly
     one consumer (this module), so lifting it would buy no de-duplication
     today. This directory's lift trigger is a SECOND consumer, not
@@ -394,24 +383,21 @@ def test_installed_unit_manager_execstart_config_is_canonical() -> None:
     ],
 )
 def test_config_arg_from_exec_start_returns_value_or_none(exec_start_value, expected) -> None:
-    """config_arg_from_exec_start's token scan, pinned against inline fixtures.
+    """The returning half of the shared scan's contract, pinned on fixtures.
 
-    Half of the RECONCILED contract task 3773 settled when this module's
-    hand-copy of the parser was retired in favour of the shared one: None
-    is returned for EXACTLY one input shape — an ExecStart= carrying no
-    `--config` flag at all. That answer is load-bearing rather than
-    incidental, which is why it is asserted as a RETURN and not folded in
-    with the raising cases below: the sibling suite
-    (test_orchestrator_service_files.py) SKIPs its canonical-filename
-    guard on None for orchestrator-watchdog.service, which runs a probe
-    script that legitimately takes no --config, so a shared parser that
-    started raising here would turn that unit's correct shape into a hard
-    failure.
+    Contract: see systemd_unit_invariants.config_arg_from_exec_start, where
+    it is stated once. This module is its single negative-case owner (see
+    the section header above), so both halves are pinned here and nowhere
+    else.
 
-    The `--config` and `--config=` spellings are both accepted because
-    both call sites in this module hand the scan a real-world string it
-    does not control — an installed unit file's ExecStart= value, and the
-    argv[] segment of a `systemctl show` struct.
+    None is asserted as a RETURN, not folded in with the raising cases
+    below, because that answer is load-bearing: the sibling suite
+    (test_orchestrator_service_files.py) SKIPs its canonical-filename guard
+    on None for orchestrator-watchdog.service, which runs a probe script
+    that legitimately takes no --config. Both spellings of a real value are
+    pinned because both call sites in this module hand the scan a
+    real-world string they do not control — an installed unit file's
+    ExecStart= value, and the argv[] segment of a `systemctl show` struct.
     """
     assert config_arg_from_exec_start(exec_start_value, "<fixture>") == expected
 
@@ -430,33 +416,20 @@ def test_config_arg_from_exec_start_returns_value_or_none(exec_start_value, expe
     ],
 )
 def test_config_arg_from_exec_start_raises_on_malformed(exec_start_value) -> None:
-    """The other half of the reconciled contract: no value means RAISE, not None.
+    """The raising half of that same contract: no value means RAISE, not None.
 
-    This is the divergence task 3773 closed. The copy that used to live in
-    this module collapsed a dangling trailing `--config` into the same
-    None as "no --config at all", while test_orchestrator_service_files.py's
-    canonical parser raised — two parsers answering the same question two
-    different ways, which is precisely the silent drift
-    systemd_unit_invariants.py exists to prevent. The shared parser adopts
-    the RAISE contract, so None now means one thing only (see the test
-    above) and a unit that would start the orchestrator with NO config
-    path at all fails loudly.
+    This is the divergence the lift closed — the copy that used to live in
+    this module collapsed a dangling trailing `--config` into the same None
+    as "no --config at all", while test_orchestrator_service_files.py's
+    canonical parser raised, two parsers answering one question two ways.
+    Why RAISE won, and why the empty `--config=` spelling is the same defect
+    in the other spelling: see the shared parser's docstring.
 
-    Adopting it cost this module nothing: both call sites already asserted
-    `config_arg is not None`, so a dangling `--config` already failed here
-    — with a generic "carries no --config argument" message that named
-    the symptom rather than the defect. The unit_name assertion below is
-    what that reconciliation actually bought, and is why the call sites
-    now pass one: the installed unit's PATH, or the `systemctl --user show
-    ... argv[]` provenance, survives into the failure text instead of the
-    reader being left to guess which of the two layers produced it.
-
-    The empty `--config=` spelling is pinned alongside the dangling flag
-    because it is the SAME defect wearing the other spelling — both copies
-    used to return "" for it, which each call site then failed on with a
-    confusing message about a basename. Verified safe to tighten: every
-    committed unit uses the space-separated form with a real path, so no
-    live verdict moves.
+    The unit_name assertion below is what the reconciliation actually
+    bought, and is why the call sites now pass one: both already asserted
+    `config_arg is not None`, so these inputs already failed here — with a
+    generic "carries no --config argument" message that named the symptom
+    and left the reader to guess which of the two layers produced it.
     """
     with pytest.raises(MalformedExecStart) as excinfo:
         config_arg_from_exec_start(exec_start_value, UNIT_BASENAME)

@@ -75,36 +75,16 @@ def require_installed_unit(basename: str) -> pathlib.Path:
 # The `--config` argument of an ExecStart=
 #
 # LIFT TRIGGER: a SECOND consumer appeared.  The canonical parser lived in
-# tests/scripts/test_orchestrator_service_files.py; task 3642 hand-copied it
-# (and CANONICAL_CONFIG_BASENAME) into tests/scripts/test_know_live_installed_
-# unit_parity.py, reviewer_comprehensive caught the copy, and the follow-up it
-# filed is task 3773, which lifted both here.  Same trigger and same reasoning
-# that brought systemctl_user_show here under task 3763 — and the two copies
-# had ALREADY drifted, which is the whole argument made concrete rather than
-# hypothetically: the copy collapsed a dangling `--config` into the same None
-# the canonical parser refused to, so the two answered one question two ways.
+# tests/scripts/test_orchestrator_service_files.py, task 3642 hand-copied it
+# (and CANONICAL_CONFIG_BASENAME) into test_know_live_installed_unit_parity.py,
+# and task 3773 lifted both here — same trigger and same reasoning that brought
+# systemctl_user_show here under task 3763, except that these two copies had
+# ALREADY drifted, answering a dangling `--config` two different ways.
 #
-# RECONCILED CONTRACT, decided once, here: None means EXACTLY "this ExecStart=
-# carries no --config flag at all", and every other way of producing no value
-# RAISES MalformedExecStart.  Raising wins because the None answer is
-# LOAD-BEARING — orchestrator-watchdog.service runs a probe script that takes
-# no --config, and test_orchestrator_service_points_at_canonical_config_
-# filename SKIPs on None so that unit is not dragged into an invariant that
-# does not apply to it (a guard on that skip branch, test_exec_start_config_
-# parser_answers_for_every_orchestrator_run_unit, keeps it genuinely
-# exercised).  Collapsing a malformed unit into that same answer is exactly
-# how a guard waves through the drift it exists to catch.  It cost the adopting
-# module nothing: every call site there already asserted `config_arg is not
-# None`, so a dangling `--config` already failed — just with a generic message
-# instead of one naming the defect and the unit.
-#
-# INPUT IS DELIBERATELY LOOSE: an ExecStart= LINE, its VALUE alone, or the
-# `argv[]=` segment of a `systemctl show` struct are all accepted, because the
-# scan only looks for `--config` tokens and is prefix-agnostic.  That is not
-# laxity — the three existing call sites genuinely hold those three different
-# shapes (file content routed through _exec_start_line, restart_directive's
-# value, and _argv_from_exec_start_show's extract), and normalising them at the
-# boundary would have meant either three wrappers or three copies.
+# The single reconciled contract that resolved that drift is stated ONCE, on
+# config_arg_from_exec_start below; every other site in this directory points
+# at that docstring rather than restating it, because prose copies drift the
+# same way code copies do and nothing keeps them in step.
 #
 # WHAT DID NOT MOVE, and why: `_exec_start_line` (file content -> the
 # ExecStart= line) stayed in test_orchestrator_service_files.py and
@@ -128,23 +108,16 @@ CANONICAL_CONFIG_BASENAME = "dark-factory-orchestrator.yaml"
 class MalformedExecStart(ValueError):
     """A unit's ExecStart= is broken — never a legitimate "no --config" answer.
 
-    Kept distinct from the ``None`` return below because the two outcomes want
-    opposite handling.  ``None`` means "this unit takes no ``--config``", which
-    is true of orchestrator-watchdog.service and must SKIP.  A missing
-    ``ExecStart=`` line, or a ``--config`` flag with no value after it, is a
-    malformed unit (or a regressed parser) and must FAIL: collapsing those into
-    the same ``None`` is how a guard silently waves through the very drift it
-    was written to catch.
+    Kept distinct from the ``None`` return below so the two can be handled
+    oppositely: ``None`` means "this unit takes no ``--config``" and callers
+    SKIP on it, while this class means the unit (or the parser) is defective
+    and must FAIL.  Which inputs land where is the contract on
+    config_arg_from_exec_start below, stated there once.
 
-    ``--config=`` with an EMPTY value raises for the identical reason, and was
-    reconciled INTO this class when the two copies of the parser were merged
-    here (task 3773).  It is the same defect as the dangling flag wearing the
-    other spelling — the orchestrator would start with no config path at all —
-    and both copies previously returned ``""`` for it, which every call site
-    then failed on anyway, with a confusing message about a basename rather
-    than about the broken unit.  Verified before tightening: every committed
-    unit uses the space-separated form with a real path, so no live verdict
-    moved — only the failure text improved.
+    Also raised by callers that own the OTHER half of a parse — locating the
+    ExecStart= text before the scan sees it (cf. test_orchestrator_service_
+    files._exec_start_line) — so a broken unit surfaces as one class whichever
+    layer notices it first.
     """
 
 
@@ -153,42 +126,53 @@ def config_arg_from_exec_start(
 ) -> str | None:
     """Return the `--config` argument in *exec_start_value*, or None if absent.
 
+    THE CONTRACT, stated here ONCE — every other site points at this docstring.
+
     None means exactly ONE thing: the string carries no ``--config`` flag at
     all.  That is a real answer, not a parse failure — orchestrator-watchdog.
-    service runs a probe script that takes no ``--config`` — and callers skip
+    service runs a probe script that takes no ``--config`` — and callers SKIP
     on it, so the watchdog is not dragged into an invariant that does not apply
-    to it.  Every other way this could produce no value raises
-    MalformedExecStart (see that class): a dangling ``--config`` as the final
-    token with nothing after it, and the ``--config=`` spelling with an empty
-    value.  Both describe a unit that would start the orchestrator with no
-    config path — a hard defect, not something to skip past.
+    to it.  Every OTHER way of producing no value raises MalformedExecStart: a
+    dangling ``--config`` as the final token, and the ``--config=`` spelling
+    with an empty value.  Both describe a unit that would start the
+    orchestrator with no config path at all, and collapsing either into None is
+    how a guard waves through the drift it exists to catch.  Verified before
+    the two copies were reconciled onto this contract: every committed unit
+    uses the space-separated form with a real path, so tightening moved no live
+    verdict — only the failure text.  (A caller that has to LOCATE the
+    ExecStart= text first owns the third no-value case, a unit with no usable
+    ExecStart= line, and raises the same class for the same reason.)
 
     *exec_start_value* may be a whole ``ExecStart=`` line, just its value, or
     the ``argv[]=`` segment of a ``systemctl show`` struct: the scan looks only
-    for ``--config`` tokens and is prefix-agnostic (see this section's header).
-    *unit_name* is pure diagnostics — it is interpolated into both raises so
+    for ``--config`` tokens and is prefix-agnostic.  That looseness is not
+    laxity — the three call sites genuinely hold those three shapes, and
+    normalising at the boundary would have meant three wrappers or three
+    copies.  *unit_name* is pure diagnostics, interpolated into both raises so
     the caller's context (a unit path, or a ``systemctl --user show ...``
-    provenance string) survives into the failure instead of the reader having
-    to guess which layer produced it.
+    provenance string) survives into the failure; the messages say "command
+    line" rather than "ExecStart= line" precisely because two of those three
+    accepted shapes are not one.
     """
     tokens = exec_start_value.split()
     for i, token in enumerate(tokens):
         if token == "--config":
             if i + 1 >= len(tokens):
                 raise MalformedExecStart(
-                    f"{unit_name} ends its ExecStart= with a dangling `--config` "
-                    "and no value after it. The orchestrator would start with no "
-                    f"config path at all. ExecStart line: {' '.join(tokens)!r}"
+                    f"{unit_name}: `--config` is the last token of the command "
+                    "line inspected, with no value after it. The orchestrator "
+                    "would start with no config path at all. Command line "
+                    f"inspected: {' '.join(tokens)!r}"
                 )
             return tokens[i + 1]
         if token.startswith("--config="):
             value = token.split("=", 1)[1]
             if not value:
                 raise MalformedExecStart(
-                    f"{unit_name} carries `--config=` with an empty value. The "
+                    f"{unit_name}: `--config=` carries an empty value. The "
                     "orchestrator would start with no config path at all — the "
                     "same defect as a dangling `--config`, in the other "
-                    f"spelling. ExecStart line: {' '.join(tokens)!r}"
+                    f"spelling. Command line inspected: {' '.join(tokens)!r}"
                 )
             return value
     return None
