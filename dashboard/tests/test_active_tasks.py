@@ -30,8 +30,19 @@ def test_minutes_since_handles_z_suffix_and_naive_iso():
     assert 59 <= _minutes_since(one_hour_ago) <= 61
 
 
-def test_minutes_since_returns_zero_on_missing_or_bad():
-    assert _minutes_since(None) == 0
+def test_minutes_since_returns_none_on_missing_and_zero_on_bad():
+    """A MISSING start time is an honest unknown (None); a bad one keeps 0.
+
+    ``None``/``''`` is the per-task artifact-read-failure signal on
+    ``TaskRuntimeEntry.started`` (see ``shared/src/shared/task_runtime_state.py``
+    — "never a fabricated 0"), so the helper must propagate the unknown rather
+    than render it as '0m running'. A present-but-unparseable timestamp is a
+    different failure (upstream data damage, no known producer) and
+    deliberately keeps the existing 0 — out of scope for task 4055, see the
+    plan's design decisions.
+    """
+    assert _minutes_since(None) is None
+    assert _minutes_since('') is None
     assert _minutes_since('not-a-date') == 0
 
 
@@ -477,8 +488,9 @@ async def test_collect_active_tasks_no_escalation_url_treated_as_offline(
 async def test_collect_active_tasks_runtime_per_task_read_failure_stays_online(
     tmp_path, monkeypatch, dummy_client,
 ):
-    """A per-task artifact read failure (loops/attempts/phase=None, error set)
-    is honest but distinct from project-offline: runtime_offline stays False.
+    """A per-task artifact read failure (loops/attempts/started/phase=None,
+    error set) is honest but distinct from project-offline: runtime_offline
+    stays False.
     """
     root, shaped = _make_project(
         tmp_path, project_dir='flaky',
@@ -503,6 +515,9 @@ async def test_collect_active_tasks_runtime_per_task_read_failure_stays_online(
     assert row['loops'] is None
     assert row['attempts'] is None
     assert row['phase'] is None
+    assert row['started'] is None, (
+        "a per-task read failure must not fabricate '0m running'"
+    )
     assert row['runtime_offline'] is False, (
         'a per-task read failure is an honest error, not an offline project'
     )
