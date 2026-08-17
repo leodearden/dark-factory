@@ -706,3 +706,92 @@ class TestReferentSourceIsJournaled:
         assert payload['group_id'] == 'dark_factory'
         assert payload['referent_source'] == 'metadata'
         assert payload['referent_count'] == 1
+
+
+class TestReplayFromStoreStampsReferents:
+    """The third and last producer of `add_memory_graphiti` rows.
+
+    Replayed rows carry real prose whose referents the derived scanner can see.
+    Leaving them on the absent path would stamp them 'none' and inflate leaf
+    iota's undeclared bucket with writes that were plainly derivable — a false
+    regression signal in the very counter this task exists to make trustworthy.
+    """
+
+    @staticmethod
+    def _stub_memories(service, memories):
+        service.mem0.get_all = AsyncMock(return_value={'results': memories})
+
+    @pytest.mark.asyncio
+    async def test_every_replayed_row_carries_a_referent_blob(self, service):
+        self._stub_memories(service, [
+            {'memory': 'Task 3127 landed', 'metadata': {'category': 'temporal_facts'}},
+            {'memory': 'Task 2500 landed', 'metadata': {'category': 'temporal_facts'}},
+            {'memory': 'the merge-lane hardening work', 'metadata': {}},
+        ])
+
+        count = await service.replay_from_store('dark_factory')
+
+        assert count == 3
+        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        assert len(batch) == 3
+        assert all('referents' in item['payload'] for item in batch)
+
+    @pytest.mark.asyncio
+    async def test_task_naming_rows_resolve_derived(self, service):
+        self._stub_memories(service, [
+            {'memory': 'Task 3127 landed', 'metadata': {'category': 'temporal_facts'}},
+            {'memory': 'Task 2500 landed', 'metadata': {'category': 'temporal_facts'}},
+            {'memory': 'the merge-lane hardening work', 'metadata': {}},
+        ])
+
+        await service.replay_from_store('dark_factory')
+
+        blobs = [
+            item['payload']['referents']
+            for item in service.durable_queue.enqueue_batch.call_args[0][0]
+        ]
+        assert blobs[0] == {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+        }
+        assert blobs[1] == {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '2500'}],
+        }
+        assert blobs[2] == {'source': 'none', 'refs': []}
+
+    @pytest.mark.asyncio
+    async def test_the_metadata_bridge_is_live_on_this_producer(self, service):
+        """Unlike add_episode, the replay loop DOES hold a metadata dict — the
+        Mem0 record's own — so the bridge can outrank the derived scan here."""
+        self._stub_memories(service, [
+            {'memory': 'Task 3127 landed',
+             'metadata': {'category': 'temporal_facts', 'task_id': '3129'}},
+        ])
+
+        await service.replay_from_store('dark_factory')
+
+        blob = service.durable_queue.enqueue_batch.call_args[0][0][0]['payload']['referents']
+        assert blob == {
+            'source': 'metadata',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_preexisting_batch_payload_keys_survive(self, service):
+        self._stub_memories(service, [
+            {'memory': 'Task 3127 landed', 'metadata': {'category': 'temporal_facts'}},
+        ])
+
+        await service.replay_from_store('dark_factory')
+
+        item = service.durable_queue.enqueue_batch.call_args[0][0][0]
+        assert item['group_id'] == 'dark_factory'
+        assert item['operation'] == 'add_memory_graphiti'
+        assert item['callback_type'] == 'refresh_entity_summaries'
+        assert item['payload']['name'] == 'replay_temporal_facts'
+        assert item['payload']['content'] == 'Task 3127 landed'
+        assert item['payload']['source'] == 'text'
+        assert item['payload']['group_id'] == 'dark_factory'
+        assert item['payload']['source_description'] == 'replay_from_mem0:temporal_facts'
+        assert json.loads(json.dumps(item['payload'])) == item['payload']
