@@ -42,16 +42,19 @@ def lms_block(setup_host_text: str) -> str:
     Sliced from the parsed statement list rather than by line number, so the
     assertions below survive a reflow of the surrounding sections.
     """
-    matches = [
-        statement
-        for statement in shell_statements(setup_host_text)
-        if CHECKER in statement
-    ]
-    assert matches, f"scripts/setup-host.sh does not invoke {CHECKER}"
-    assert len(matches) == 1, (
-        f"expected exactly one {CHECKER} gate, found {len(matches)}"
+    statements = shell_statements(setup_host_text)
+    starts = [i for i, s in enumerate(statements) if CHECKER in s]
+    assert starts, f"scripts/setup-host.sh does not invoke {CHECKER}"
+
+    # shell_statements yields STATEMENTS, not whole blocks, so the gate spans
+    # several of them. Slice from the first one naming the checker through the
+    # `fi` that closes it — sliced rather than line-numbered so a reflow of the
+    # surrounding sections does not break every assertion below.
+    start = starts[0]
+    end = next(
+        i for i, s in enumerate(statements[start:], start) if s.strip() == "fi"
     )
-    return matches[0]
+    return "\n".join(statements[start : end + 1])
 
 
 def test_setup_host_runs_the_lms_parity_checker(lms_block: str):
@@ -90,9 +93,21 @@ def test_setup_host_does_not_install_the_lms_units(setup_host_text: str):
     The units hold the whole GPU, and which arm runs when is an operator
     decision per the template's own stated rationale — never a side effect of
     running setup. This is also what makes exit 2 benign rather than a defect.
+
+    Asserted as non-INVOCATION rather than non-MENTION: the exit-2 branch
+    deliberately names the installer so an operator who does want the arms
+    knows what to run, and forbidding the string outright would forbid that
+    pointer along with the thing it warns against.
     """
-    assert "install-lms" not in setup_host_text
-    assert "local-model-serving" not in setup_host_text
+    for statement in shell_statements(setup_host_text):
+        stripped = statement.strip()
+        if stripped.startswith("#"):
+            continue
+        # Running the installer, or copying the template in by hand.
+        assert not re.search(r"^[^#]*\binstall-lms-units\.sh\b", stripped, re.M) or (
+            "info " in stripped or "warn " in stripped
+        ), stripped
+        assert "lms-arm@.service" not in stripped or "cp " not in stripped, stripped
 
 
 def test_the_override_case_is_worded_apart_from_a_directive_diff(lms_block: str):
@@ -144,4 +159,4 @@ def test_the_gate_cannot_false_red_when_its_inputs_are_absent(lms_block: str):
     A checkout without the checker is not a host with a drop-in, and reporting
     it as one is the same credibility leak as warning on exit 2.
     """
-    assert re.search(r"\[\s*-f\s", lms_block), lms_block
+    assert re.search(r"\[\s*(!\s*)?-f\s", lms_block), lms_block

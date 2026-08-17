@@ -916,6 +916,50 @@ else
   fi
 fi
 
+# lms-arm@ unit: REPORT ONLY. setup-host.sh does not install the arms and must
+# not start: they hold the whole GPU, and which arm runs when is an operator
+# decision per the unit template's own rationale, never a side effect of
+# running setup. That is also why exit 2 is INFO rather than a warning — on a
+# host that never installed the arms it is the correct and expected state, and
+# warning every run is how operators learn to ignore a gate.
+#
+# This exists because an installer-only check leaves an override invisible
+# BETWEEN installs, which is when it bites: a landed worktree stays on disk for
+# months, so a drop-in pinning WorkingDirectory at one can outlive its worktree
+# with nothing reporting it.
+#
+# Warn-only, never fail: this task deliberately REFUSES to remove a drop-in
+# (it can be load-bearing — task 3750), so a hard failure here would brick host
+# bring-up on precisely the state we chose not to auto-fix. Contrast the
+# orchestrator gate above, which may fail — that one guards an install this
+# script actually performs.
+if [ ! -f "$REPO_ROOT/scripts/check_lms_unit_parity.py" ] \
+   || [ ! -f "$REPO_ROOT/scripts/local-model-serving/lms-arm@.service" ]; then
+  # A checkout without the checker is not a host with a drop-in. Reporting it
+  # as one is the same credibility leak as warning on exit 2.
+  info "lms-arm@ unit: parity checker not present in this checkout — skipped"
+elif python3 "$REPO_ROOT/scripts/check_lms_unit_parity.py" \
+       --installed-dir "$UNIT_DIR" \
+       --repo-root     "$REPO_ROOT"; then
+  ok "lms-arm@ unit: parity with the committed template (effective configuration verified)"
+else
+  _lms_parity_exit=$?
+  if [ "$_lms_parity_exit" -eq 2 ]; then
+    info "lms-arm@ unit: not installed on this host (install with scripts/local-model-serving/install-lms-units.sh)"
+  else
+    # Exit 1 is "drift OR unverifiable" — it also covers a drop-in override and
+    # an effective configuration that disagrees, which the checker deliberately
+    # words apart so the operator is not sent hunting for a directive diff that
+    # does not exist. Naming only DRIFT here would collapse that distinction.
+    warn "lms-arm@ unit: drift, a drop-in override, or an unverifiable effective"
+    warn "  configuration — see the [lms_unit_parity] report above."
+    warn "  A drop-in SURVIVES reinstallation and is NOT removed automatically."
+    warn "  Inspect:  systemctl --user cat lms-arm@<arm>.service"
+    warn "  Remove:   scripts/remove-lms-arm-worktree-dropin.sh (checks its"
+    warn "            safety preconditions first)"
+  fi
+fi
+
 # jCodeMunch watcher
 if systemctl --user is-active jcodemunch-watcher &>/dev/null; then
   ok "jCodeMunch watcher: running"
