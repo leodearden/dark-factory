@@ -434,6 +434,89 @@ async def test_no_tool_calls_ends_loop():
     assert 'I am done thinking.' in result.get('text', '')
 
 
+def _no_tool_call_agent() -> AgentLoop:
+    """AgentLoop wired with one terminal tool, for no-tool-call exit tests."""
+    return AgentLoop(
+        config=_make_config(),
+        system_prompt='Test',
+        tools={
+            'stage_complete': ToolDefinition(
+                name='stage_complete',
+                description='Complete',
+                parameters={'type': 'object', 'properties': {}},
+                function=lambda **kw: kw,
+            ),
+        },
+        terminal_tool='stage_complete',
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'origin_token',
+    ['cli_output_empty', 'cli_output_unparseable'],
+)
+async def test_no_tool_calls_propagates_cli_warning_origin(origin_token):
+    """Task 4343: run() must surface the SPECIFIC CLI-failure origin.
+
+    _CLIResponseAdapter computes 'cli_output_empty' (the CLI returned nothing)
+    vs 'cli_output_unparseable' (the CLI returned junk) — different operator
+    responses — and today run() throws the distinction away, collapsing both
+    into the generic 'no_tool_calls'.
+
+    The generic token must stay UNCHANGED: extract_agent_verdict derives its
+    'agent-failed:<token>' sentinel from result['warning'], and
+    test_no_tool_calls_ends_loop pins it.  The origin travels in a separate,
+    additive key.
+    """
+    agent = _no_tool_call_agent()
+
+    async def mock_llm(messages, tool_schemas):
+        return _CLIResponseAdapter(
+            {'thinking': '', 'tool_calls': [], 'warning': origin_token},
+            session_id='sess-1',
+        )
+
+    agent._call_llm = mock_llm
+
+    result, _entries = await agent.run('test')
+
+    assert result.get('warning') == 'no_tool_calls', (
+        f"Expected the generic token to stay 'no_tool_calls' but got "
+        f'{result.get("warning")!r}'
+    )
+    assert result.get('warning_origin') == origin_token, (
+        f'Expected warning_origin={origin_token!r} but got '
+        f'{result.get("warning_origin")!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_tool_calls_without_origin_omits_warning_origin():
+    """Task 4343: the new key is strictly ADDITIVE and absent when unknown.
+
+    The anthropic and OpenAI adapters have no `.warning` attribute at all —
+    only _CLIResponseAdapter does.  run() must therefore read it defensively
+    and omit the key entirely rather than emitting an empty string that would
+    read like a measured value.  This is the backward-compatibility guard the
+    _CLIResponseAdapter docstring worried about.
+    """
+    agent = _no_tool_call_agent()
+
+    async def mock_llm(messages, tool_schemas):
+        return FakeResponse(content=[FakeText(text='I am done thinking.')])
+
+    agent._call_llm = mock_llm
+
+    result, _entries = await agent.run('test')
+
+    assert result.get('warning') == 'no_tool_calls'
+    assert 'warning_origin' not in result, (
+        f'Expected no warning_origin key when the response carries no origin, '
+        f'got {result.get("warning_origin")!r}'
+    )
+
+
 # --- _OpenAIResponseAdapter tests ---
 
 
