@@ -467,12 +467,20 @@ async def _apply_memory_metadata_validation(
     Task 3195 (leaf β of ``docs/prds/memory-metadata-vocabulary.md``).  The
     third of this module's shared in-place metadata helpers, alongside
     :func:`_normalize_task_id_metadata` and
-    :func:`_apply_cycle_summary_metadata_tagging`, and shared by
-    ``add_memory`` and ``add_system_record`` for the same reason the
-    task-2222 amendment made the cycle-summary tagging shared: PRD D8/§2 pin
-    enforcement at the SERVICE seam precisely because ``add_system_record``
-    is a second write path that a tools-layer validator would leak past.
-    Two call sites with drifting behaviour would reopen that hole.
+    :func:`_apply_cycle_summary_metadata_tagging`, and shared by ALL THREE
+    Mem0 write paths — ``add_memory``, ``add_system_record`` and (task 3523)
+    ``update_memory`` — for the same reason the task-2222 amendment made the
+    cycle-summary tagging shared: PRD D8/§2 pin enforcement at the SERVICE
+    seam precisely because ``add_system_record`` is a second write path that
+    a tools-layer validator would leak past.  Call sites with drifting
+    behaviour would reopen that hole.
+
+    ``update_memory`` is the third such path and reproduced exactly that
+    leak until task 3523: a patch could set any ``topic`` spelling or a
+    second ``canonical`` for a taken topic without ever reaching this
+    function.  D8/§2 enumerated only the two add paths, and that silence
+    read as coverage.  If a FOURTH write path appears, it belongs here too —
+    the enumeration above is the checkable list.
 
     Discharges five obligations:
 
@@ -488,6 +496,33 @@ async def _apply_memory_metadata_validation(
        :class:`CanonicalUniquenessViolation`.  It runs AFTER the reject arm
        above: malformed metadata is refused on shape before any live-state
        probe is spent on it.
+
+    ``baseline`` — JUDGE THE DELTA, NEVER THE CORPUS (task 3523).  The two
+    add paths CREATE a record, so there is no pre-image: they pass no
+    ``baseline`` and every obligation above applies to the whole dict,
+    bit-identically to before this parameter existed.  ``update_memory``
+    AMENDS one, and passes the record's pre-image custom subset.  When it is
+    supplied, obligations 3, 4 and 5 are reduced to what this write actually
+    CHANGED — a violation the record already carried (on a key this write
+    left alone) is neither re-censused nor re-rejected, and the uniqueness
+    probe fires only for a ``canonical``/``topic`` claim the record does not
+    already hold.
+
+    That reduction is not a leniency knob; it is what keeps ``enforce``
+    meaning "reject WRITES" instead of quietly becoming "re-validate the
+    corpus".  Both PRD §9 leaf ε's 2026-08-04 amendment and
+    :func:`_check_canonical_uniqueness` state that model in prose, and task
+    3626's decision to flip ``enforce`` on is measured against it (~20 → ~19
+    false rejections/week).  Validating the full effective dict on every
+    patch would silently invalidate that measurement: legacy records are
+    known fatal-invalid today (``scripts/sweep_toolcall_xml_leak.py``
+    enumerates unknown ``kind``, malformed ``supersedes``, non-bool
+    ``canonical``), so re-tagging exactly those records — including by the
+    repair sweeps that exist to fix them — would start failing the moment
+    the flip landed.  Costs one extra PURE synchronous
+    ``validate_memory_metadata`` call on a shallow copy, and zero I/O; see
+    the block comment at the subtraction for the two-halves forgiveness rule
+    and its ordering constraints.
 
     LIVENESS IS HERE, NOT IN THE REGISTRY, on purpose.  Leaf β made
     ``validate_memory_metadata`` a pure synchronous function taking only a
@@ -819,6 +854,17 @@ async def _check_canonical_uniqueness(
       by ~1/week (~20 → ~19).  Rejections come from NEW writes by writers
       who were never told the rule: ``_MEMORY_INSTRUCTIONS`` still carries
       no slug guidance.  THE REAL PRECONDITION is leaf ι (task 3202).
+
+    STILL TRUE AFTER TASK 3523, and deliberately so.  Wiring this seam into
+    ``update_memory`` added a third write path, but its enforcement is
+    DELTA-scoped: a patch is judged only on the violations and claims it
+    introduces, so amending a record never re-validates what that record
+    already carried.  Had it been full-dict instead, every patch of a legacy
+    record would have become a rejection under ``enforce`` and the ~19/week
+    figure above — the number 3626 flips against — would have silently
+    stopped describing the system.  Guard 3 is the uniqueness half of that
+    rule; see :func:`_apply_memory_metadata_validation`'s ``baseline`` for
+    the shape half.
 
     Task 3626 is the gate that re-measures and decides the flip; it carries
     the full model and the re-measurement recipes.  Do not flip from this
@@ -4998,10 +5044,41 @@ class MemoryService:
         fails those loud before dispatching here — mirroring how ``update_edge``
         splits its boundary checks from its write path.
 
+        METADATA VOCABULARY is the exception, and belongs HERE (task 3523).  A
+        patch runs :func:`_apply_memory_metadata_validation` at this seam, the
+        same one ``add_memory`` and ``add_system_record`` use, for the reason
+        PRD D8 pins enforcement at the service layer: a tools-layer validator
+        leaks past every additional write path, and this was the third one.
+        Placed after the §5(c) existence check and before every journaled
+        backend call, so a rejection cannot leave a journal row, a partial
+        write, or a pending mem0 intent behind.
+
+        Two properties of that check are deliberate and easy to "simplify" away:
+
+        * It is DELTA-scoped — only violations and ``canonical`` claims NEW
+          relative to the record's pre-image are judged.  Amending a record
+          never re-validates the record.  See ``baseline`` on the seam.
+        * A CONTENT-ONLY amend does not run it at all.  Such a write leaves the
+          metadata byte-identical, so there is nothing it is responsible for;
+          validating anyway would make a legacy record's TEXT uncorrectable
+          under ``enforce`` — blocking the very repair sweeps
+          (``scripts/sweep_toolcall_xml_leak.py``) that exist to fix it.
+
         Returns the ``{'status': 'updated', 'store': 'mem0', 'id': memory_id,
         ...}`` envelope on success, or a structured ``{'error_type': ...}``
         rejection. The id is echoed so a caller can assert identity stability
         straight from the response instead of re-fetching.
+
+        A vocabulary rejection is the one outcome that does NOT use that
+        envelope: :class:`MemoryMetadataValidationError` and
+        :class:`CanonicalUniquenessViolation` PROPAGATE from here, exactly as
+        they do from ``add_memory``.  PRD V1 keeps the two deliberately
+        distinguishable at an ``except`` (neither subclasses the other), and
+        flattening them into ``error_type`` strings at this layer would discard
+        their structured fields — the incumbent id a caller needs in order to
+        act.  The MCP tool above converts every exception to an
+        ``{'error', 'error_type'}`` envelope via ``@mcp_tool_errors()``, and
+        does so identically for all three write paths.
 
         *emit_event* forces a ``memory_updated`` event on a metadata-only route,
         which is otherwise silent (a patch leaves the record saying the same
