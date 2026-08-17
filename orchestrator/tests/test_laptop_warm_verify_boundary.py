@@ -442,17 +442,27 @@ def _read_direct_children(pid: int) -> set[int] | None:
       the OSError escape would turn a leader exiting mid-poll into an
       unhandled error inside the timeout diagnostic.
 
-    Any OSError anywhere in the read -- and an empty ``task`` listing, which
-    means the same thing -- collapses to ``None``.  Distinguishing "no
-    CONFIG_PROC_CHILDREN" from "this thread just exited" would buy nothing:
-    both answers are "don't trust the probe on this tick", and the fallback
-    they select is precisely this helper's pre-4014 behaviour.
+    Any OSError anywhere in the read collapses to ``None``.  Distinguishing
+    "no CONFIG_PROC_CHILDREN" from "this thread just exited" would buy
+    nothing: both answers are "don't trust the probe on this tick", and the
+    fallback they select is precisely this helper's pre-4014 behaviour.
+
+    The empty-``task``-listing branch below is DEFENSIVE-ONLY, and therefore
+    deliberately uncovered: a live ``/proc/<pid>/task`` always holds at least
+    one tid, and a dead one makes ``iterdir()`` itself raise OSError, which
+    the handler already maps to ``None``.  It is retained rather than deleted
+    because falling THROUGH it would return the cheap negative ``set()`` --
+    "leader is live and has forked nothing" -- for a listing that in fact told
+    us nothing, and that is the single answer which makes the caller skip its
+    walk every tick and spin to the timeout.
     """
     children: set[int] = set()
     try:
         tid_dirs = list((Path('/proc') / str(pid) / 'task').iterdir())
         if not tid_dirs:
-            return None  # raced the leader's exit; the /proc entry emptied out
+            # Defensive only (see docstring): not reachable on a live or a dead
+            # /proc entry, so never trust an empty listing as a cheap negative.
+            return None
         for tid_dir in tid_dirs:
             raw = (tid_dir / 'children').read_text()
             children.update(int(token) for token in raw.split())
@@ -1075,14 +1085,26 @@ def test_discovery_ceiling_env_override_parses_and_pins():
                 {'ORCH_TEST_DISCOVERY_CEILING_SECS': bad}
             ) is None, f'{bad!r} must be rejected, not pinned'
 
-    # The consequence the rejection above exists to prevent: whatever the
-    # resolver returns must survive the int() the module performs on it at
-    # import time.  Asserting on the derivation (not just on None) is what
-    # keeps this test honest if the guard is ever moved or loosened.
-    for value in (_resolve_ceiling_override({'ORCH_TEST_DISCOVERY_CEILING_SECS': '7.5'}),
-                  _resolve_ceiling_override({})):
-        ceiling = ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE if value is None else value
-        assert int(2 * _ROW_WORST_CASE_FIXED_SECS + 2 * ceiling) > 0
+    # The consequence the rejection above exists to prevent, asserted against
+    # the module's OWN import-time constants -- the values THIS process is
+    # actually running under, whatever env it was collected with.  A local
+    # re-derivation would have been vacuous twice over: every value the
+    # resolver accepts is finite and positive by construction, and a copy of
+    # the derivation cannot notice the MODULE's derivation being loosened.
+    assert math.isfinite(ROW_DISCOVERY_CEILING_MAX_SECS) and ROW_DISCOVERY_CEILING_MAX_SECS > 0, (
+        f'ROW_DISCOVERY_CEILING_MAX_SECS resolved to '
+        f'{ROW_DISCOVERY_CEILING_MAX_SECS} -- a non-finite or non-positive '
+        f'ceiling reached import, so the finiteness guard above is being bypassed'
+    )
+    for name, derived in (
+        ('ROW_PER_TEST_TIMEOUT_SECS', ROW_PER_TEST_TIMEOUT_SECS),
+        ('ROW5_PER_TEST_TIMEOUT_SECS', ROW5_PER_TEST_TIMEOUT_SECS),
+    ):
+        assert derived > 0, (
+            f'{name} derived to {derived} -- the per-test timeouts are int() of a '
+            f'sum containing the ceiling, so this is what a non-finite ceiling '
+            f'looks like on the far side of the derivation'
+        )
 
     assert row_discovery_ceiling_secs(_override=7.5, _loadavg=6400.0, _cpu_count=32) == 7.5
     assert row_discovery_ceiling_secs(_override=7.5, _loadavg=0.0, _cpu_count=32) == 7.5
@@ -1167,13 +1189,57 @@ _SCALED_DISCOVERY_HELPERS: frozenset[str] = frozenset(
     {'wait_for_pgid_file', 'wait_subtree_live'}
 )
 
-#: Private seams that mean "this call never touches real /proc" -- see
-#: :func:`_scaled_discovery_call_count`.
+#: The seams that TOGETHER mean "this call never touches real /proc" -- see
+#: :func:`_scaled_discovery_call_count`.  BOTH are required: either one alone
+#: leaves the other half of the poll tick reading real /proc.
 _DISCOVERY_SEAM_KWARGS: frozenset[str] = frozenset({'_probe_children', '_ppid_map'})
 
-#: orchestrator/pyproject.toml's ``timeout = 60`` / ``timeout_method = "thread"``,
-#: inherited by every test here that carries no timeout mark of its own.
-_INHERITED_INI_TIMEOUT_SECS: float = 60.0
+#: Last-resort stand-in for pytest-timeout's ``timeout`` ini value, used ONLY
+#: when the live config cannot supply it (plugin absent / key unregistered).
+#: The real value is read from the running config by
+#: :func:`_inherited_ini_timeout_secs` -- hardcoding
+#: orchestrator/pyproject.toml's ``timeout = 60`` would make this guard reason
+#: from exactly the kind of unreachable literal its closing assertion bans.
+_INHERITED_INI_TIMEOUT_FALLBACK_SECS: float = 60.0
+
+
+def _inherited_ini_timeout_secs(config) -> float:
+    """The per-test timeout budget an UNMARKED test in this module inherits.
+
+    Read from the live pytest config (``timeout`` ini, paired with
+    ``timeout_method = "thread"``) rather than duplicated as a literal, so a
+    change to orchestrator/pyproject.toml cannot leave the sweep below
+    reasoning from -- and misreporting -- a stale number.
+
+    Falling back to the literal is WARNED, not silent: the fallback means the
+    sweep is once again reasoning from a duplicated constant, which is the
+    defect this function exists to remove.  Warning rather than raising keeps a
+    missing/renamed ini key from failing the guard outright -- the sweep's real
+    subject is the marked call sites, and today every swept test carries an
+    explicit mark, so the inherited budget is a backstop for a future unmarked
+    one.
+    """
+    try:
+        raw = config.getini('timeout')
+    except (ValueError, KeyError) as exc:  # pytest-timeout not registered
+        warnings.warn(
+            f'pytest-timeout ini key "timeout" unavailable ({exc!r}); the '
+            f'discovery-wait sweep is falling back to the duplicated literal '
+            f'{_INHERITED_INI_TIMEOUT_FALLBACK_SECS}s for unmarked tests',
+            stacklevel=2,
+        )
+        return _INHERITED_INI_TIMEOUT_FALLBACK_SECS
+    try:
+        return float(raw)
+    except (TypeError, ValueError):  # key registered but unset ('') or non-numeric
+        warnings.warn(
+            f'pytest-timeout ini "timeout" is {raw!r}, not a number; the '
+            f'discovery-wait sweep is falling back to the duplicated literal '
+            f'{_INHERITED_INI_TIMEOUT_FALLBACK_SECS}s for unmarked tests',
+            stacklevel=2,
+        )
+        return _INHERITED_INI_TIMEOUT_FALLBACK_SECS
+
 
 #: Anti-vacuity floor for the sweep below: an AST matcher that silently stops
 #: matching is a guard reporting PASS while guarding nothing.
@@ -1195,12 +1261,23 @@ def _scaled_discovery_call_count(func_node) -> int:
     ``row_discovery_ceiling_secs()``.  An explicit unscaled value (e.g.
     ``timeout=30.0``) does not count -- it cannot exceed what it names.
 
-    Calls passing a private ``_probe_children``/``_ppid_map`` seam are
-    EXEMPT, and that rule is load-bearing: a seam-injected call never touches
-    real /proc and returns in microseconds at ``interval=0``.  Without it the
-    three deterministic helper tests below would each be told to carry a 240s
-    mark -- the guard would push this module toward SLOWER tests rather than
-    safer ones.
+    A call passing the FULL private seam set (``_probe_children`` AND
+    ``_ppid_map``) is EXEMPT, and that rule is load-bearing: a fully
+    seam-injected call never touches real /proc and returns in microseconds at
+    ``interval=0``.  Without it the three deterministic helper tests below
+    would each be told to carry a 240s mark -- the guard would push this module
+    toward SLOWER tests rather than safer ones.
+
+    Requiring BOTH is equally load-bearing, in the other direction.  A PARTIAL
+    injection is not exempt, because it still reads real /proc every tick:
+    ``_ppid_map=`` alone still runs the real :func:`_read_direct_children`
+    probe, and ``_probe_children=`` alone still runs the real
+    ``read_ppid_map()`` full walk on every non-negative tick.  Either can also
+    still run the poll loop to the full ``row_discovery_ceiling_secs()``
+    deadline if the injected half never yields a descendant -- exactly the
+    truncatable wait this sweep exists to catch.  No call site does this today;
+    exempting on ANY seam would have left the hole open for the first one that
+    does.
     """
     count = 0
     for node in ast.walk(func_node):
@@ -1211,7 +1288,8 @@ def _scaled_discovery_call_count(func_node) -> int:
             and node.func.id in _SCALED_DISCOVERY_HELPERS
         ):
             continue
-        if {kw.arg for kw in node.keywords} & _DISCOVERY_SEAM_KWARGS:
+        # Superset, not intersection: the FULL seam set must be injected.
+        if {kw.arg for kw in node.keywords} >= _DISCOVERY_SEAM_KWARGS:
             continue
         timeout_arg = next(
             (kw.value for kw in node.keywords if kw.arg == 'timeout'), None
@@ -1231,7 +1309,7 @@ def _timeout_mark_argument(func_node):
     """The single argument node of *func_node*'s ``@pytest.mark.timeout(...)``.
 
     Returns None when the function carries no such decorator (it then
-    inherits :data:`_INHERITED_INI_TIMEOUT_SECS`).
+    inherits the ini budget -- see :func:`_inherited_ini_timeout_secs`).
     """
     for decorator in func_node.decorator_list:
         if not isinstance(decorator, ast.Call):
@@ -1300,14 +1378,15 @@ def test_row5_per_test_timeout_covers_its_own_bounded_work():
     )
 
 
-def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark():
+def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request):
     """No test may perform more discovery waiting than its own mark allows.
 
     Enumeration-free sweep of this module's own AST (see the banner above).
     For every ``test_*`` function it counts the LOAD-SCALED discovery waits
     the source actually contains, resolves the EFFECTIVE pytest-timeout
-    budget that test runs under, and asserts the budget covers those waits at
-    the widest ceiling they can reach.
+    budget that test runs under -- from the LIVE config for unmarked tests,
+    never from a duplicated ini literal -- and asserts the budget covers those
+    waits at the widest ceiling they can reach.
 
     It additionally BANS a literal timeout mark on any test performing such a
     wait.  That kills the root cause directly rather than the symptom: task
@@ -1333,12 +1412,13 @@ def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark():
         f'nothing (matched: {sorted(swept)})'
     )
 
+    inherited = _inherited_ini_timeout_secs(request.config)
     under_budget: list[str] = []
     literal_marked: list[str] = []
     for name, (n_scaled, func_node) in sorted(swept.items()):
         arg = _timeout_mark_argument(func_node)
         if arg is None:
-            effective = _INHERITED_INI_TIMEOUT_SECS
+            effective = inherited
         elif isinstance(arg, ast.Name) and arg.id in globals():
             effective = float(globals()[arg.id])
         else:
@@ -1346,7 +1426,7 @@ def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark():
             effective = (
                 float(arg.value)
                 if isinstance(arg, ast.Constant) and isinstance(arg.value, int | float)
-                else _INHERITED_INI_TIMEOUT_SECS
+                else inherited
             )
         required = n_scaled * ROW_DISCOVERY_CEILING_MAX_SECS
         if effective < required:
@@ -1581,6 +1661,92 @@ def test_wait_subtree_live_falls_back_to_the_full_walk_when_children_unreadable(
         'a pid that does not exist must probe as None (cannot probe), not raise -- '
         'a leader exiting mid-poll must not turn the timeout path into an OSError'
     )
+
+
+#: A child that stays alive but is never waited on -- killed by the test that
+#: spawns it.  ``sys.executable`` rather than ``sleep`` so nothing depends on
+#: PATH; the probe only needs the fork, not a finished exec.
+_DURABLE_CHILD_ARGV = [sys.executable, '-c', 'import time; time.sleep(30)']
+
+
+def test_read_direct_children_sees_a_real_fork_including_off_main_thread():
+    """The real probe's POSITIVE path, against the real kernel interface.
+
+    The three tests above all inject ``_probe_children``, so they pin
+    :func:`wait_subtree_live`'s gate LOGIC and never execute
+    :func:`_read_direct_children` itself; the only unmocked assertion on it is
+    the negative (``None``) case immediately above.  A regression in the
+    positive path -- a wrong ``/proc`` path segment, iterating only the main
+    tid, a broken ``int(token)`` parse -- would return ``set()`` for a leader
+    that HAS forked.  Every deterministic test in this module would stay green
+    while all five real rows failed with "no descendant appeared within Ns":
+    the exact flake task 4014 exists to remove, made permanent.
+
+    Two halves, both with ZERO real timing -- no sleeps, no polling.
+    ``Popen`` has already forked when it returns and the kernel lists the child
+    from that moment, so there is nothing to wait for (the ``Event`` waits in
+    (b) are handoff barriers, not timing assertions).
+
+    (a) A child forked from THIS thread must be listed.  Pins path
+        construction and token parsing.
+
+    (b) A child forked from a SECONDARY thread, probed while that thread is
+        still alive, must also be listed.  This is the half that pins the
+        per-thread ``task/*/`` iteration the helper's docstring justifies:
+        ``children`` is a PER-THREAD file, so a bare
+        ``/proc/<pid>/task/<pid>/children`` read would MISS this child.  The
+        forking thread is held alive until after the probe precisely because a
+        thread that EXITS has its children re-parented onto the group leader,
+        which would let a main-tid-only implementation pass and make this half
+        vacuous.
+    """
+    child = subprocess.Popen(_DURABLE_CHILD_ARGV)
+    try:
+        probed = _read_direct_children(os.getpid())
+        assert probed is not None, (
+            'probing this live test process must not report "cannot probe" -- '
+            'either the /proc path is built wrong or this kernel lacks '
+            'CONFIG_PROC_CHILDREN (in which case every row silently runs on the '
+            'full-walk fallback and task 4014 buys nothing)'
+        )
+        assert child.pid in probed, (
+            f'just-forked direct child {child.pid} is missing from the probe '
+            f'{sorted(probed)} -- a probe that cannot see a fork returns the cheap '
+            f'NEGATIVE forever, so wait_subtree_live never spends the confirming '
+            f'walk and every real row fails with "no descendant appeared"'
+        )
+    finally:
+        child.kill()
+        child.wait()
+
+    forked: dict[str, subprocess.Popen] = {}
+    spawned = threading.Event()
+    release = threading.Event()
+
+    def fork_off_main_thread() -> None:
+        forked['proc'] = subprocess.Popen(_DURABLE_CHILD_ARGV)
+        spawned.set()
+        release.wait(timeout=30.0)  # stay alive so the child stays MINE
+
+    thread = threading.Thread(target=fork_off_main_thread, daemon=True)
+    thread.start()
+    try:
+        assert spawned.wait(timeout=30.0), 'the helper thread never forked its child'
+        off_main = forked['proc']
+        probed = _read_direct_children(os.getpid())
+        assert probed is not None and off_main.pid in probed, (
+            f'child {off_main.pid}, forked from a still-live secondary thread, is '
+            f'missing from the probe {probed if probed is None else sorted(probed)} '
+            f'-- children is a PER-THREAD file, so this is what a regression to a '
+            f'single /proc/<pid>/task/<pid>/children read looks like'
+        )
+    finally:
+        release.set()
+        thread.join(timeout=30.0)
+        off_main = forked.get('proc')
+        if off_main is not None:
+            off_main.kill()
+            off_main.wait()
 
 
 # ---------------------------------------------------------------------------
