@@ -114,6 +114,73 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     mp.delenv('QUEUE_DATA_DIR', raising=False)
 
 
+# ---------------------------------------------------------------------------
+# Mocked MCP wire envelopes (task 3952)
+#
+# ONE definition of each of the three envelopes a mocked MCP server returns.
+# Both consumers build from these: the cold-session response LIST below, and
+# every test module's ``_PerPortHandler`` / ``_SessionAwareHandler``, which
+# import these rather than redefining them.  That single source is the point —
+# these envelopes encode what ``dashboard.data.memory.McpSession`` accepts
+# (the negotiated ``protocolVersion``, the ``mcp-session-id`` header, the
+# ``result.content[0].text`` JSON-in-text nesting), so were they duplicated
+# per module a change on the McpSession side could be applied to some copies
+# and not others, leaving half the suite green against a stale envelope.
+# ---------------------------------------------------------------------------
+
+MCP_SESSION_ID = 'test-session-id'
+"""The ``mcp-session-id`` every mocked response carries.
+
+McpSession reads this off the initialize response and echoes it on subsequent
+posts; tests that assert on session reuse match against this exact value.
+"""
+
+
+def mcp_init_response(request_id: int = 1) -> httpx.Response:
+    """The ``initialize`` result a mocked MCP server returns."""
+    return httpx.Response(
+        200,
+        json={
+            'jsonrpc': '2.0',
+            'id': request_id,
+            'result': {
+                'protocolVersion': '2025-03-26',
+                'capabilities': {'tools': {}},
+                'serverInfo': {'name': 'test', 'version': '0.1'},
+            },
+        },
+        headers={'mcp-session-id': MCP_SESSION_ID},
+    )
+
+
+def mcp_notify_response() -> httpx.Response:
+    """The 202 Accepted a mocked MCP server returns for ``notifications/*``.
+
+    Bodiless by protocol — a notification has no id and takes no result.
+    """
+    return httpx.Response(202, headers={'mcp-session-id': MCP_SESSION_ID})
+
+
+def mcp_tool_response(inner: dict, request_id: int = 1) -> httpx.Response:
+    """A ``tools/call`` result carrying *inner* as JSON text content.
+
+    MCP nests the tool's own payload as a JSON *string* inside
+    ``result.content[0].text``, so *inner* is serialized, not embedded — which
+    is exactly the double-encoding the dashboard readers have to undo.
+    """
+    return httpx.Response(
+        200,
+        json={
+            'jsonrpc': '2.0',
+            'id': request_id,
+            'result': {
+                'content': [{'type': 'text', 'text': json.dumps(inner)}],
+            },
+        },
+        headers={'mcp-session-id': MCP_SESSION_ID},
+    )
+
+
 def cold_session_responses(
     inner: dict, url: str = 'http://localhost:8000',
 ) -> list[httpx.Response]:
@@ -125,33 +192,17 @@ def cold_session_responses(
     attaches ``.request``, so each response needs it set by hand or
     ``raise_for_status()`` raises RuntimeError even on a 200.
 
-    Builds its own init/notify/tools-call response bodies rather than
-    delegating to any test module's local ``_mcp_response``/``_init_response``
-    builders (task 3952): those stay module-local since each is also used
-    independently (e.g. by a module's ``_PerPortHandler``), while this one
-    function — the one with the easy-to-drop ``resp.request`` line — was
-    copy-pasted byte-for-byte across four test modules with no other user.
+    The envelopes come from the three builders above — the same ones the mock
+    handlers serve — so an AsyncMock-driven test and a MockTransport-driven
+    test can never be asserting against different wire shapes.  What this
+    function adds over calling them directly is the ordering and the
+    ``resp.request`` attachment, which is the easy-to-drop part that was
+    copy-pasted byte-for-byte across four test modules.
     """
-    init_body = {
-        'jsonrpc': '2.0',
-        'id': 1,
-        'result': {
-            'protocolVersion': '2025-03-26',
-            'capabilities': {'tools': {}},
-            'serverInfo': {'name': 'test', 'version': '0.1'},
-        },
-    }
-    mcp_body = {
-        'jsonrpc': '2.0',
-        'id': 1,
-        'result': {
-            'content': [{'type': 'text', 'text': json.dumps(inner)}],
-        },
-    }
     responses = [
-        httpx.Response(200, json=init_body, headers={'mcp-session-id': 'test-session-id'}),
-        httpx.Response(202, headers={'mcp-session-id': 'test-session-id'}),
-        httpx.Response(200, json=mcp_body, headers={'mcp-session-id': 'test-session-id'}),
+        mcp_init_response(),
+        mcp_notify_response(),
+        mcp_tool_response(inner),
     ]
     for resp in responses:
         resp.request = httpx.Request('POST', f'{url.rstrip("/")}/mcp')

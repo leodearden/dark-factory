@@ -8,48 +8,14 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from _dashboard_helpers import cold_session_responses
+from _dashboard_helpers import (
+    cold_session_responses,
+    mcp_init_response,
+    mcp_notify_response,
+    mcp_tool_response,
+)
 
 from dashboard.data.memory import get_curator_state
-
-
-def _make_mcp_response(inner_dict: dict, request_id: int = 1) -> httpx.Response:
-    """Build a mock MCP JSON-RPC response wrapping *inner_dict*."""
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'content': [
-                {'type': 'text', 'text': json.dumps(inner_dict)},
-            ]
-        },
-    }
-    return httpx.Response(
-        200, json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_init_response(request_id: int = 1) -> httpx.Response:
-    """Build a mock MCP initialize response."""
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'protocolVersion': '2025-03-26',
-            'capabilities': {'tools': {}},
-            'serverInfo': {'name': 'test', 'version': '0.1'},
-        },
-    }
-    return httpx.Response(
-        200, json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_notify_response() -> httpx.Response:
-    """Build a 202 Accepted response for notifications."""
-    return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
 
 
 class _SessionAwareHandler:
@@ -90,17 +56,17 @@ class _SessionAwareHandler:
         self.calls.append(body)
 
         if method == 'initialize':
-            return _make_init_response(request_id)
+            return mcp_init_response(request_id)
 
         if method.startswith('notifications/'):
-            return _make_notify_response()
+            return mcp_notify_response()
 
         # tools/call
         if self.error_on_tool:
             raise self.error_on_tool
         if self.error_status:
             return httpx.Response(self.error_status, text='Server Error')
-        return _make_mcp_response(self.tool_response, request_id)
+        return mcp_tool_response(self.tool_response, request_id)
 
 
 class TestSessionAwareHandler:
@@ -252,10 +218,10 @@ class TestMcpToolCall:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response({'ok': True}, rid)
+                return mcp_notify_response()
+            return mcp_tool_response({'ok': True}, rid)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -280,7 +246,7 @@ class TestDashboardClientOpIdInjection:
         from dashboard.data.memory import McpSession
 
         session = McpSession('http://localhost:8000')
-        resp = _make_mcp_response({'ok': True})
+        resp = mcp_tool_response({'ok': True})
         # MockTransport normally attaches the request; set it here since we
         # bypass the transport and return the response from a mocked client.
         resp.request = httpx.Request('POST', 'http://localhost:8000/mcp')
@@ -302,7 +268,7 @@ class TestDashboardClientOpIdInjection:
         from dashboard.data.memory import McpSession
 
         session = McpSession('http://localhost:8000')
-        resp = _make_mcp_response({'ok': True})
+        resp = mcp_tool_response({'ok': True})
         resp.request = httpx.Request('POST', 'http://localhost:8000/mcp')
         mock_client = AsyncMock()
         mock_client.post.return_value = resp
@@ -584,10 +550,10 @@ class TestMcpHeaders:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response({'ok': True}, rid)
+                return mcp_notify_response()
+            return mcp_tool_response({'ok': True}, rid)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -611,10 +577,10 @@ class TestMcpHeaders:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
-            return _make_mcp_response({'ok': True}, rid)
+                return mcp_notify_response()
+            return mcp_tool_response({'ok': True}, rid)
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
@@ -842,9 +808,9 @@ class TestMalformedResponse:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
+                return mcp_notify_response()
             return httpx.Response(
                 200,
                 json={'jsonrpc': '2.0', 'id': rid, 'result': {}},
@@ -866,9 +832,9 @@ class TestMalformedResponse:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
+                return mcp_notify_response()
             return httpx.Response(
                 200,
                 json={'jsonrpc': '2.0', 'id': rid, 'result': {'content': []}},
@@ -897,9 +863,9 @@ class TestMcpToolCallLogging:
             method = body.get('method', '')
             rid = body.get('id', 1)
             if method == 'initialize':
-                return _make_init_response(rid)
+                return mcp_init_response(rid)
             if method.startswith('notifications/'):
-                return _make_notify_response()
+                return mcp_notify_response()
             return httpx.Response(
                 200,
                 json={
