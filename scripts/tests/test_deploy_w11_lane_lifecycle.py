@@ -340,6 +340,44 @@ def _run_script(worktree_base, *args, env=None):
 
 
 # ---------------------------------------------------------------------------
+# Fixture-unit-name containment (task 3799, extended to this harness by 3950).
+# ---------------------------------------------------------------------------
+
+
+def test_run_script_rejects_a_real_unit_name(tmp_path):
+    """`_run_script` must refuse a genuinely installed unit name.
+
+    TWO COPIES, one per root: scripts/tests/ and tests/scripts/ cannot import
+    each other's test modules, so each root must prove its OWN seam validates
+    -- a green test in one says nothing about the other's. What they share is
+    the rule itself, df_pytest_isolation.assert_synthetic_units. The siblings
+    are test_fake_systemctl_rejects_a_real_unit_name (restart-all), this
+    file's twin in scripts/tests/test_restart_orchestrator.py, and
+    test_boundary_fake_systemctl_rejects_a_real_unit_name (watchdog).
+
+    THIS FILE HAS AN EXTRA HOP: deploy-w11-lane-lifecycle.sh does not call
+    systemctl itself -- it `exec`s restart-orchestrator.sh, and `exec`
+    replaces the process image while PRESERVING the environment. So
+    ORCH_RESTART_UNIT set here in `_run_script` reaches the delegate that
+    actually issues the restart, which is why the guard belongs at this seam
+    and why no knob had to be re-plumbed through the outer script.
+
+    `--check` with an EMPTY lane list so the guard is proven to fire BEFORE
+    any subprocess work: the rejection must happen at construction, not after
+    a script run.
+    """
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _run_script(
+            _build_worktree_base(tmp_path, []),
+            "--check",
+            unit="orchestrator-dark-factory.service",
+        )
+    message = str(excinfo.value)
+    assert "orchestrator-dark-factory.service" in message, message
+    assert "_run_script" in message, message
+
+
+# ---------------------------------------------------------------------------
 # step-1: RED -- executable bit + empty-base --check smoke
 # ---------------------------------------------------------------------------
 
