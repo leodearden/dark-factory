@@ -367,6 +367,39 @@ def main(argv: Sequence[str], *, probe_runner=None) -> int:
             "moved (the paths live in UNITS in this script)."
         )
 
+    if overridden:
+        # Worded apart from [drift] for the same reason [vanished] is: this is
+        # NOT a directive diff to propagate. The unit files may match exactly;
+        # what the run could not establish is that the EFFECTIVE configuration
+        # matches, because systemd merges these over the unit at load time.
+        # It shares exit 1 because "I could not verify" belongs with "I found
+        # a difference", not with the benign "not installed here" that 2
+        # denotes — reporting parity here would overstate what was checked.
+        _log(
+            f"[override] {len(overridden)} unit(s) have drop-in overrides — "
+            "the unit files were compared, but the EFFECTIVE configuration "
+            "was NOT verified by that comparison:"
+        )
+        for name, dropins in overridden:
+            # EVERY applying drop-in, by absolute path. systemd merges all of
+            # them, so naming a count or only the first leaves the operator
+            # fixing half the problem and re-running into the same red.
+            for dropin in dropins:
+                _log(f"  {name}: {dropin}")
+        _log(
+            "[override] systemd merges these over the unit at load time, so a "
+            "directive set here silently wins over the committed value. "
+            "Inspect the merged result with: systemctl --user cat "
+            "lms-arm@<arm>.service"
+        )
+        _log(
+            "[override] Nothing was removed: this checker is read-only BY "
+            "DESIGN, because a drop-in can be load-bearing (task 3750). To "
+            "remove the known worktree drop-in, run "
+            "scripts/remove-lms-arm-worktree-dropin.sh, which gates removal "
+            "behind the preconditions that make it safe."
+        )
+
     if drifts:
         _log(
             f"[drift] {len(drifts)} directive(s) differ between the committed "
