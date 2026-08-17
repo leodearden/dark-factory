@@ -473,3 +473,87 @@ async def test_merge_worker_submit_is_still_none_safe(tmp_path, server, client_f
         await worker._post_submit_tasks([FIX_TASK_ARGS])
 
     assert server.seen == [], 'a None _mcp must produce no HTTP traffic at all'
+
+
+# ---------------------------------------------------------------------------
+# Repo-wide sweep guard (step-13 RED / step-14 GREEN)
+# ---------------------------------------------------------------------------
+
+#: Directories holding raw-POST source.  Scoped, not repo-wide, on purpose.
+SWEEP_DIRS = (
+    'orchestrator/src',
+    'fused-memory/src',
+    'dashboard/src',
+    'scripts',
+    'fused-memory/scripts',
+)
+
+#: The URL-BUILDING form, not bare ``/mcp/``.  Measured before choosing: bare
+#: ``/mcp/`` also matches unrelated prose in merge_queue.py docstrings (the
+#: phrase ``scheduler/mcp/usage_gate/cost_store`` at :1163 and :2467), which
+#: would make this assertion permanently unsatisfiable and would mark a
+#: perfectly correct fix as undelivered.  This form measured 4 hits in
+#: workflow.py + 1 in merge_queue.py + 3 in scripts before the fix and 0 after
+#: — non-vacuous in both directions, which is the property an anchor needs.
+SLASHED_URL_ANCHOR = "}/mcp/'"
+
+#: Files that legitimately contain the anchor and are NOT raw POSTs.
+#: Each is a deliberate exclusion, not an oversight — see the reasons.
+SWEEP_EXCLUSIONS = {
+    # An MCP *config* entry consumed by the Claude CLI's own MCP client, which
+    # follows redirects natively.  A different risk class from a raw POST.
+    'fused-memory/src/fused_memory/reconciliation/stages/base.py',
+    # A log string, not a URL that is ever fetched.
+    'fused-memory/src/fused_memory/server/main.py',
+}
+
+
+def test_no_raw_post_builds_a_trailing_slash_mcp_url():
+    """No source file may build an MCP URL with a trailing slash.
+
+    Implements the "grep the slash, not the flag" rule: the slash is the
+    NECESSARY condition for the silent loss, and ``follow_redirects`` only
+    determines whether the loss is fatal.  A future site can reintroduce this
+    without touching any of the five methods fixed here, so the guard is
+    repo-scoped rather than attached to them.
+
+    DELIBERATELY OUT OF SCOPE: FastMCP ``StreamableHttpTransport(f'{base}/mcp/')``
+    uses under ``escalation/tests/`` and ``fused-memory/tests/``.  ``/mcp/`` is
+    FastMCP's canonical ASGI mount — ``escalation/tests/conftest.py:201``
+    explicitly waits on it to prove the app finished mounting — and that client
+    follows redirects natively, so those sites carry no silent-discard risk.
+    Rewriting live fixtures to chase a cosmetic match would risk breaking
+    readiness gating for zero benefit.
+    """
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+
+    offenders = []
+    for rel_dir in SWEEP_DIRS:
+        for path in sorted((repo_root / rel_dir).rglob('*.py')):
+            rel = path.relative_to(repo_root).as_posix()
+            if rel in SWEEP_EXCLUSIONS:
+                continue
+            for lineno, line in enumerate(
+                path.read_text(encoding='utf-8').splitlines(), start=1
+            ):
+                if SLASHED_URL_ANCHOR in line:
+                    offenders.append(f'{rel}:{lineno}: {line.strip()}')
+
+    assert offenders == [], (
+        'these build an MCP URL with a trailing slash; the server 307-redirects '
+        'it and a bare httpx client discards the payload silently. Use '
+        'shared.mcp_post.mcp_endpoint_url instead:\n  ' + '\n  '.join(offenders)
+    )
+
+
+def test_the_sweep_anchor_is_not_vacuous():
+    """The guard must be able to FAIL — a typo'd anchor would pass forever.
+
+    Pins that the anchor still matches the exact string the defect produced,
+    so the assertion above is testing something real rather than searching for
+    a form that can no longer occur under any spelling.
+    """
+    assert SLASHED_URL_ANCHOR in "await client.post(f'{self.mcp.url}/mcp/', json=payload)"
+    assert SLASHED_URL_ANCHOR not in "await client.post(mcp_endpoint_url(self.mcp.url))"
