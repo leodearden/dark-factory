@@ -52,9 +52,11 @@ codebook from `3e462e1b56^`):
     delta was `0 - 0 = 0` — far under the 120 threshold. Replay of the real
     pre-fix census.py gate reports `tasks-landed: 0 landed since last
     census (threshold 120)`: condition (b) did NOT fire. In the nightly
-    trickle it could not fire at all, since `run_nightly` defaults
-    `status_fetcher=None` (nightly.py:727 -> :901) and (b) is structurally
-    N/A there;
+    trickle of the day it could not fire at all, since `run_nightly`
+    defaulted `status_fetcher` to nothing and (b) was structurally N/A
+    there. That hole is CLOSED: task 4148 made the seam default to
+    `default_status_fetcher(cfg.project_root)`, so (b) is live on the
+    nightly path and the sentence above is history, not current behaviour;
   * but it ARMS (b) the moment the fetch is repaired: with a working
     fetcher the same replay reports `tasks-landed: 2872 landed since last
     census (threshold 120) -> FIRE`, ~24x over. So the root-cause fix below
@@ -97,12 +99,15 @@ it keeps the pure decision core fully unit-testable and makes "a failing
 get_statuses fails SAFE" testable with a raising fake regardless of what is
 listening. (No MCP client library is available in that env either, so a
 hardcoded MCP client could not be exercised there at all.)
-`default_status_fetcher` provides a best-effort glue implementation for the
-standalone CLI, unwrapping the real MCP `tools/call` JSON-RPC envelope via
+`default_status_fetcher` provides the best-effort glue implementation, and
+since task 4148 it is the SHARED production factory for all three
+consumers -- the standalone `evaluate` CLI, `census.py`'s `main()`, and the
+nightly trickle's `run_nightly` (which defaults its `status_fetcher` seam
+to it). It unwraps the real MCP `tools/call` JSON-RPC envelope via
 `_extract_tool_result` (the tool's actual return value lives at
 `result.structuredContent` or `result.content[0].text`, never at the
-envelope's top level); task ε injects the real MCP-backed fetcher. It
-resolves its `project_root` to an ABSOLUTE path before sending it: the MCP
+envelope's top level). It resolves its `project_root` to an ABSOLUTE path
+before sending it: the MCP
 argument is interpreted by the server's cwd, not the client's, and
 fused-memory's `_normalize_project_root` hard-rejects any relative path
 (task 3291). Whatever the fetcher returns is converted to a number by
@@ -312,8 +317,9 @@ def evaluate(
 ) -> Decision:
     """Pure decision core for the §6/§8.5 fire logic. Fires at the earliest
     of condition (a) max_interval_days, (b) tasks_landed_min_days +
-    tasks_landed_threshold, (c) novelty_spike — currently only (a) is
-    implemented; (b)/(c)/the hard floor are added by later steps. No I/O:
+    tasks_landed_threshold, (c) novelty_spike — all three, and the
+    floor_days hard floor that overrides them, are implemented in the body
+    below (`cond_a`, `cond_b`, `cond_c`, `floor_blocks`). No I/O:
     all inputs are plain values so the full §8.5 matrix is testable without
     a filesystem or a live get_statuses call.
     """
@@ -1209,10 +1215,18 @@ def post_mcp_tool_call(
 
 
 def default_status_fetcher(project_root: str | Path):
-    """Return a zero-arg best-effort get_statuses caller for the standalone
-    `evaluate` CLI (task ε injects the real MCP-backed fetcher for the
-    nightly trickle instead -- see module docstring). Reads the fused-memory
-    MCP endpoint from the `FUSED_MEMORY_MCP_URL` env var, defaulting to
+    """Return a zero-arg best-effort get_statuses caller.
+
+    Since task 4148 this is the SHARED production factory for all three
+    consumers -- the standalone `evaluate` CLI below, `census.py`'s `main()`,
+    and the nightly trickle, whose `run_nightly` defaults its
+    `status_fetcher` seam to `default_status_fetcher(cfg.project_root)`.
+    (It previously served the `evaluate` CLI alone: nothing on the nightly
+    path ever built a fetcher, so condition (b) fell through to
+    `compute_tasks_landed`'s `status_fetcher is None` arm on every real run.)
+
+    Reads the fused-memory MCP endpoint from the `FUSED_MEMORY_MCP_URL` env
+    var, defaulting to
     `http://localhost:8002`. `httpx` is imported lazily so importing this
     module for its pure core never needs it, and so tests can substitute a
     stub for the real POST -- not for availability (see module docstring);
