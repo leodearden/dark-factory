@@ -6,14 +6,25 @@ without wondering what it changed.  It aggregates the ledger written by task α
 chains, and the three §5.6 health counters — and renders them as text.
 
 BINDING CONTRACT — READ ONLY.  Nothing in this module opens debt, files a task,
-resolves anything, or escalates.  It reaches only α's public READ API
-(``list_open_debt`` / ``read_occurrences`` / ``read_debt``) and it writes no SQL of its
-own.  One consequence is not obvious and is enforced by :func:`build_report`'s first
-guard: α's readers PROVISION on read (``_open`` does ``parent.mkdir`` → ``connect`` →
-``executescript(_SCHEMA)``), so calling one against a project that has no ledger would
-create ``data/orchestrator/runs.db`` plus its WAL sidecars as a side effect of PRINTING
-a report.  Absence is therefore detected before any read and reported honestly, rather
-than papered over by a freshly-provisioned empty DB.
+resolves anything, or escalates.  All ledger DATA comes from α's public READ API
+(``list_open_debt`` / ``read_occurrences`` / ``read_debt``); the only SQL of its own is
+:func:`probe_ledger`'s single ``sqlite_master`` SELECT, which mutates strictly less than
+those readers do (no DDL, no journal-mode pragma).  One consequence is not obvious and
+is enforced by :func:`build_report`'s guards: α's readers PROVISION on read (``_open``
+does ``parent.mkdir`` → ``connect`` → ``executescript(_SCHEMA)``), so calling one
+against a project that has no ledger would create ``data/orchestrator/runs.db`` plus its
+WAL sidecars as a side effect of PRINTING a report — and calling one against a
+``runs.db`` that has no flake tables yet would CREATE those tables in it.  Absence and
+unreadability are therefore both established BEFORE any read, and reported honestly
+rather than papered over by a freshly-provisioned empty result.
+
+NOT-A-MEASUREMENT IS ITS OWN STATE.  α's readers are B12 entry points: they swallow
+every exception, warn, and return ``[]``.  A corrupt, truncated, or lock-contended
+ledger therefore hands this module the same empty lists a healthy quiet one does, and a
+report that could not tell them apart would print "(no open debt) … status: ok" over a
+database it never actually read — the exact silent degradation the absent-DB guard
+exists to prevent, one layer down.  :func:`probe_ledger` classifies the file first and
+:func:`render_report` says loudly when the counters are not a measurement.
 
 THRESHOLDS ARE PARAMETERS, not hardcoded comparisons.  The ``DEFAULT_*`` constants below
 mirror PRD §10's defaults, and every counter function takes them as keyword arguments.
@@ -30,6 +41,7 @@ echoes it — the same split as ``eval-list-fixtures`` →
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -75,6 +87,65 @@ DEFAULT_SYSTEMIC_WINDOW_MINUTES = 60
 # design — α's module docstring, §11 Q1).  A read that fills this limit is surfaced as
 # truncated rather than silently yielding a rate over an unknown window.
 DEFAULT_OCCURRENCE_READ_LIMIT = 20000
+
+
+# --- ledger reachability -----------------------------------------------------
+#
+# Four states, because collapsing them is how a report starts lying.  α's readers
+# collapse the last three into "[]" all on their own (B12: swallow, warn, return empty),
+# and the CLI prints only the rendered string, so that warning reaches nobody.
+
+# No runs.db at this path at all.
+LEDGER_ABSENT = 'absent'
+# A readable SQLite database carrying both flake tables — the only state in which the
+# counters below are an actual measurement.
+LEDGER_OK = 'ok'
+# A readable SQLite database with no flake tables: the orchestrator's own runs.db exists
+# (run_store.py owns that file too) but nothing has ever written the flake ledger into it.
+LEDGER_NO_TABLES = 'no_flake_tables'
+# The file would not open, or would not answer a trivial query: corrupt, truncated,
+# mid-write, or locked beyond the connection timeout.
+LEDGER_UNREADABLE = 'unreadable'
+
+
+def probe_ledger(db_path: Path) -> str:
+    """Classify the ledger file at *db_path* — one of the ``LEDGER_*`` states above.
+
+    Call only for a path that EXISTS: this opens the file read-write (as α's readers do),
+    so a probe of an absent path would create it.
+
+    The probe is one ``sqlite_master`` SELECT.  It deliberately does NOT run
+    ``PRAGMA quick_check``/``integrity_check``, which walk the whole database — this is
+    an interactive operator command and ``runs.db`` reaches hundreds of megabytes in
+    production (``analyze_modules.py`` measures 136MB).  A header-level corruption or a
+    lock the connection cannot get past both surface on the first query anyway, which is
+    the failure this needs to catch: not "is every page sound" but "did we actually read
+    this database, or are the empty lists downstream a lie".
+
+    Distinguishing :data:`LEDGER_NO_TABLES` from :data:`LEDGER_UNREADABLE` matters twice
+    over.  It is the common benign case (a project whose orchestrator has run but whose
+    flake ledger has never been written), so folding it into "unreadable" would cry wolf
+    — and routing it AWAY from α's readers is what stops the read-only report from
+    running ``executescript(_SCHEMA)`` against a live ``runs.db`` and creating the flake
+    tables in it.
+    """
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('flake_debt', 'flake_occurrence')"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        # Deliberately broad: sqlite3 raises DatabaseError for a corrupt header,
+        # OperationalError for a lock or a permission problem, and the honest answer to
+        # every one of them is the same — this is not a measurement.
+        return LEDGER_UNREADABLE
+    if {'flake_debt', 'flake_occurrence'} <= {row[0] for row in rows}:
+        return LEDGER_OK
+    return LEDGER_NO_TABLES
 
 
 def _parse_stamp(raw: str | None) -> datetime | None:
@@ -475,6 +546,12 @@ class FlakeLedgerReport:
     are different facts, and α's readers cannot distinguish them: they PROVISION on
     read, so reading an absent DB would hand back an empty result set from a database
     this report had just created.
+
+    ``db_status`` carries the same distinction one layer down, for a file that IS present
+    (see :func:`probe_ledger`).  :attr:`measured` is the single predicate every consumer
+    should ask — including task θ, which must not act on counters that were never read.
+    It defaults to :data:`LEDGER_OK` so a hand-built report (the render tests build them
+    directly) means what it looks like it means.
     """
 
     db_path: Path
@@ -486,6 +563,54 @@ class FlakeLedgerReport:
     gate_blind: GateBlindCounter
     non_convergence: NonConvergenceCounter
     systemic: SystemicCounter
+    db_status: str = LEDGER_OK
+
+    @property
+    def measured(self) -> bool:
+        """True only when the counters are an actual reading of an actual ledger."""
+        return self.db_present and self.db_status == LEDGER_OK
+
+
+def _unmeasured_report(
+    db_path: Path,
+    *,
+    db_present: bool,
+    db_status: str,
+    now: datetime,
+    window_hours: int,
+    age_days: int,
+    gate_blind_threshold: float,
+    gate_blind_min_observations: int,
+    systemic_distinct_tests: int,
+    systemic_window_minutes: int,
+) -> FlakeLedgerReport:
+    """An empty report for a ledger that was never read — absent, tableless, unreadable.
+
+    The counters are still built (from empty input) rather than left ``None``: every
+    threshold the operator is being measured against stays visible, and
+    :attr:`FlakeLedgerReport.measured` is what says the numbers are not a reading.
+    """
+    return FlakeLedgerReport(
+        db_path=db_path,
+        db_present=db_present,
+        db_status=db_status,
+        generated_at=now,
+        window_since=None,
+        open_debt=[],
+        chains=[],
+        gate_blind=compute_gate_blind(
+            [],
+            threshold=gate_blind_threshold,
+            min_observations=gate_blind_min_observations,
+            window_hours=window_hours,
+        ),
+        non_convergence=compute_non_convergence([], now, age_days=age_days),
+        systemic=compute_systemic(
+            [],
+            distinct_tests=systemic_distinct_tests,
+            window_minutes=systemic_window_minutes,
+        ),
+    )
 
 
 def build_report(
@@ -502,9 +627,11 @@ def build_report(
 ) -> FlakeLedgerReport:
     """Read the ledger at *db_path* and aggregate it into a :class:`FlakeLedgerReport`.
 
-    Reaches ONLY α's public read API — ``list_open_debt`` / ``read_occurrences`` /
-    ``read_debt`` — and writes no SQL of its own.  *now* defaults to the wall clock and
-    is injectable so the whole report is deterministic under test.
+    All ledger DATA comes from α's public read API — ``list_open_debt`` /
+    ``read_occurrences`` / ``read_debt``; the only SQL of this module's own is
+    :func:`probe_ledger`'s ``sqlite_master`` SELECT, which decides whether those readers
+    are safe to call at all.  *now* defaults to the wall clock and is injectable so the
+    whole report is deterministic under test.
 
     The occurrence read is bounded on BOTH axes: ``since`` (so the counters divide by a
     known window) and ``limit`` (because ``flake_occurrence`` is append-only and
@@ -513,6 +640,22 @@ def build_report(
     that fills the limit is surfaced rather than silently yielding a rate.
     """
     now = now or datetime.now(UTC)
+
+    # Shared by both not-a-measurement exits below, so the thresholds an operator is
+    # being shown stay identical whichever guard fired.
+    def _unmeasured(*, db_present: bool, db_status: str) -> FlakeLedgerReport:
+        return _unmeasured_report(
+            db_path,
+            db_present=db_present,
+            db_status=db_status,
+            now=now,
+            window_hours=window_hours,
+            age_days=age_days,
+            gate_blind_threshold=gate_blind_threshold,
+            gate_blind_min_observations=gate_blind_min_observations,
+            systemic_distinct_tests=systemic_distinct_tests,
+            systemic_window_minutes=systemic_window_minutes,
+        )
 
     # READ-ONLY GUARD — load-bearing, not defensive.  Every one of α's readers routes
     # through `_open`, which does `db_path.parent.mkdir(parents=True, exist_ok=True)`,
@@ -523,26 +666,17 @@ def build_report(
     # report.  Reporting absence is also strictly more informative than reporting an
     # empty ledger, since α's readers cannot tell "no data" from "freshly provisioned".
     if not db_path.exists():
-        return FlakeLedgerReport(
-            db_path=db_path,
-            db_present=False,
-            generated_at=now,
-            window_since=None,
-            open_debt=[],
-            chains=[],
-            gate_blind=compute_gate_blind(
-                [],
-                threshold=gate_blind_threshold,
-                min_observations=gate_blind_min_observations,
-                window_hours=window_hours,
-            ),
-            non_convergence=compute_non_convergence([], now, age_days=age_days),
-            systemic=compute_systemic(
-                [],
-                distinct_tests=systemic_distinct_tests,
-                window_minutes=systemic_window_minutes,
-            ),
-        )
+        return _unmeasured(db_present=False, db_status=LEDGER_ABSENT)
+
+    # SECOND GUARD — an unreadable ledger is not an empty one.  α's readers swallow every
+    # exception and return `[]` (B12), so a corrupt, truncated or lock-contended runs.db
+    # would otherwise render as "(no open debt) … status: ok" with the only trace being a
+    # logger.warning the CLI never surfaces.  The tableless case is routed out here too,
+    # because α's `_open` would CREATE the flake tables in a runs.db that lacks them —
+    # the read-only report writing DDL into a live project database.
+    db_status = probe_ledger(db_path)
+    if db_status != LEDGER_OK:
+        return _unmeasured(db_present=True, db_status=db_status)
 
     since = (now - timedelta(hours=window_hours)).isoformat()
     open_rows = list_open_debt(db_path)
@@ -619,6 +753,20 @@ def render_report(report: FlakeLedgerReport) -> str:
         # Absence is a DIFFERENT fact from an empty ledger, and α's readers cannot tell
         # them apart (they provision on read).  Say which one this is.
         lines.append('  NO LEDGER: this project has no runs.db — nothing has been recorded yet.')
+    elif report.db_status == LEDGER_UNREADABLE:
+        # The loudest line in the report, because it is the one state in which every
+        # number below is fiction: α's readers degrade a corrupt/locked database to `[]`
+        # and warn to a logger the CLI never prints.
+        lines.append(
+            '  *** LEDGER UNREADABLE: this runs.db did not answer a trivial query '
+            '(corrupt, truncated, or locked) — the counters below are NOT a '
+            'measurement. ***'
+        )
+    elif report.db_status == LEDGER_NO_TABLES:
+        lines.append(
+            '  NO FLAKE TABLES: this runs.db carries no flake ledger tables — nothing '
+            'has been recorded yet, and the counters below are NOT a measurement.'
+        )
     else:
         lines.append(f'window since: {report.window_since}')
     if gb.truncated:
@@ -687,7 +835,11 @@ def render_report(report: FlakeLedgerReport) -> str:
         f'({gb.unconfirmable} unconfirmable / {gb.total} observations)  '
         f'threshold={gb.threshold:.2f}'
     )
-    if not gb.sufficient:
+    if not report.measured:
+        # `ok` is a claim about the ledger, and there is no ledger reading to make it
+        # from.  Saying "not measured" is the whole point of the guards in build_report.
+        lines.append('      status: not measured (no ledger reading)')
+    elif not gb.sufficient:
         # DISTINCT from "below threshold": those two states mean opposite things.
         lines.append(
             f'      status: insufficient observations '
@@ -714,6 +866,9 @@ def render_report(report: FlakeLedgerReport) -> str:
         f'      peak distinct tests: {sy.peak_distinct_tests}  threshold={sy.threshold}  '
         f'peak_window_start={sy.peak_window_start or "-"}  peak_psi_cpu_some10={psi_txt}'
     )
-    lines.append(f'      status: {"OVER THRESHOLD" if sy.exceeds_threshold else "ok"}')
+    if not report.measured:
+        lines.append('      status: not measured (no ledger reading)')
+    else:
+        lines.append(f'      status: {"OVER THRESHOLD" if sy.exceeds_threshold else "ok"}')
 
     return '\n'.join(lines)

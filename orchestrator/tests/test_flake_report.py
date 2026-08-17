@@ -33,6 +33,10 @@ from orchestrator.flake_ledger import (
     ensure_schema,
 )
 from orchestrator.flake_report import (
+    LEDGER_ABSENT,
+    LEDGER_NO_TABLES,
+    LEDGER_OK,
+    LEDGER_UNREADABLE,
     DebtReportRow,
     FlakeLedgerReport,
     GateBlindCounter,
@@ -45,6 +49,7 @@ from orchestrator.flake_report import (
     compute_non_convergence,
     compute_systemic,
     format_age,
+    probe_ledger,
     render_report,
 )
 
@@ -850,6 +855,122 @@ class TestReadOnlyContract:
         assert report.db_present is True
         assert len(report.open_debt) == 1
         assert report.gate_blind.total == 1
+
+
+class TestUnreadableLedger:
+    """A ledger that could not be READ must never render as a ledger that is HEALTHY.
+
+    α's readers are B12 entry points: they swallow every exception, log a warning and
+    return ``[]``.  The CLI echoes only the rendered string, so that warning reaches
+    nobody — which means a corrupt, truncated or lock-contended runs.db would otherwise
+    print "(no open debt) … status: ok" over a database nothing ever read.  That is the
+    same silent degradation the absent-DB guard exists to prevent, one layer down.
+    """
+
+    def _corrupt(self, tmp_path: Path) -> Path:
+        db_path = tmp_path / 'runs.db'
+        db_path.write_bytes(b'this is definitely not a sqlite database\n' * 32)
+        return db_path
+
+    def _tableless(self, tmp_path: Path) -> Path:
+        """A runs.db that exists but has never had the flake ledger written into it.
+
+        Not a hypothetical: ``run_store.py`` owns this same file for the orchestrator's
+        own events, so every project that has ever run the orchestrator without the
+        flake subsystem writing is in exactly this state.
+        """
+        db_path = tmp_path / 'runs.db'
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute('CREATE TABLE runs (id INTEGER PRIMARY KEY)')
+            conn.commit()
+        finally:
+            conn.close()
+        return db_path
+
+    def test_a_corrupt_ledger_is_reported_as_unreadable(self, tmp_path):
+        report = build_report(self._corrupt(tmp_path), now=_NOW)
+        assert report.db_present is True
+        assert report.measured is False
+
+    def test_a_corrupt_ledger_does_not_render_as_healthy(self, tmp_path):
+        rendered = render_report(build_report(self._corrupt(tmp_path), now=_NOW))
+        assert 'UNREADABLE' in rendered, rendered
+        assert 'NOT a measurement' in rendered, rendered
+        # The specific lie this prevents: three "status: ok" lines over a database that
+        # was never read.
+        assert 'status: ok' not in rendered, rendered
+
+    def test_a_runs_db_with_no_flake_tables_says_so(self, tmp_path):
+        report = build_report(self._tableless(tmp_path), now=_NOW)
+        assert report.db_present is True
+        assert report.db_status == LEDGER_NO_TABLES
+        assert report.measured is False
+        rendered = render_report(report)
+        assert 'NO FLAKE TABLES' in rendered, rendered
+        assert 'status: ok' not in rendered, rendered
+
+    def test_a_tableless_runs_db_is_never_given_the_flake_schema(self, tmp_path):
+        # α's `_open` runs `executescript(_SCHEMA)` on EVERY read, so an unguarded
+        # "read-only" report would CREATE flake_debt/flake_occurrence inside a live
+        # project's runs.db as a side effect of printing.  Reading is not schema
+        # migration; ι does neither.
+        db_path = self._tableless(tmp_path)
+        build_report(db_path, now=_NOW)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            names = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()}
+        finally:
+            conn.close()
+        assert names == {'runs'}, names
+
+    def test_an_absent_ledger_is_also_not_a_measurement(self, tmp_path):
+        report = build_report(tmp_path / 'nope' / 'runs.db', now=_NOW)
+        assert report.db_status == LEDGER_ABSENT
+        assert report.measured is False
+        assert 'status: ok' not in render_report(report)
+
+    def test_a_healthy_ledger_still_reads_as_measured(self, tmp_path):
+        # The guard must not turn every report into a caveat: a real ledger measures.
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        _seed_occurrence(db_path, test_id='tests/test_a.py::test_one',
+                         observed_at='2026-08-09T12:00:00+00:00')
+        report = build_report(db_path, now=_NOW)
+        assert report.db_status == LEDGER_OK
+        assert report.measured is True
+        rendered = render_report(report)
+        assert 'UNREADABLE' not in rendered, rendered
+        assert 'NOT a measurement' not in rendered, rendered
+        assert 'status: ok' in rendered, rendered
+
+    def test_probe_classifies_each_state(self, tmp_path):
+        good, tableless, corrupt = (tmp_path / n for n in ('good', 'tableless', 'corrupt'))
+        for d in (good, tableless, corrupt):
+            d.mkdir()
+        ensure_schema(good / 'runs.db')
+        assert probe_ledger(good / 'runs.db') == LEDGER_OK
+        assert probe_ledger(self._tableless(tableless)) == LEDGER_NO_TABLES
+        assert probe_ledger(self._corrupt(corrupt)) == LEDGER_UNREADABLE
+
+    def test_the_command_surfaces_an_unreadable_ledger(self, tmp_path):
+        # End to end: the CLI prints only the rendered string, so if the banner is not in
+        # the render the operator gets a clean bill of health over a broken database.
+        import yaml
+
+        project = tmp_path
+        cfg = project / 'dark-factory-orchestrator.yaml'
+        cfg.write_text(yaml.dump({'project_root': str(project)}))
+        db_path = project / 'data' / 'orchestrator' / 'runs.db'
+        db_path.parent.mkdir(parents=True)
+        db_path.write_bytes(b'not a database at all')
+
+        result = CliRunner().invoke(main, ['flake-ledger', '--config', str(cfg)])
+        assert result.exit_code == 0, result.output
+        assert 'UNREADABLE' in result.output, result.output
+        assert 'status: ok' not in result.output, result.output
 
 
 class TestTruncationHonesty:
