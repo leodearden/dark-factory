@@ -1,11 +1,13 @@
 """Tests for git operations — worktree lifecycle."""
 
+import ast
 import asyncio
 import contextlib
 import fcntl
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -18,6 +20,7 @@ from _orch_helpers import (
     git_env_with_ceiling,
 )
 
+from orchestrator import git_ops as git_ops_module
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
@@ -35,6 +38,7 @@ from orchestrator.git_ops import (
     _merge_subject,
     _run,
 )
+from shared.git_async import GitResult
 
 
 @pytest.fixture
@@ -12289,3 +12293,119 @@ class TestDisableSharedRepoAutoMaintenance:
         assert gc_val.strip() == '0'
         assert rc_mt == 0
         assert mt_val.strip() == 'false'
+
+
+# ---------------------------------------------------------------------------
+# task 3778 step-3: _run delegates its spawn to shared.git_async (INV-5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestRunDelegatesToSharedGitAsync:
+    """``_run`` owns the WorktreeMissing taxonomy; ``shared.git_async`` owns the spawn.
+
+    The primitive (``create_subprocess_exec`` + LC_ALL=C child env + optional
+    stdin + the task-2608 kill+reap) grew here and is now needed verbatim by
+    fused-memory's live-workflow probes.  Rather than clone it (INV-5,
+    no-lockstep-duplication) it moved to ``shared/`` and ``_run`` became a thin
+    adapter.  What must NOT change is ``_run``'s own surface: the
+    ``WorktreeMissing`` pre-flight and re-classification, and the
+    ``(returncode, stdout, stderr)`` 3-tuple that git_ops' ~12k lines of call
+    sites destructure.
+    """
+
+    async def test_shared_helper_is_the_single_spawn_seam(self, tmp_path: Path) -> None:
+        """Patching the shared entry point AS BOUND IN git_ops intercepts _run.
+
+        Bare-name binding (``from shared.git_async import run_git``) is what
+        makes ``git_ops.run_git`` the patchable seam; a qualified
+        ``shared.git_async.run_git(...)`` call would leave this patch applying
+        cleanly but no longer intercepting.
+        """
+        sentinel = GitResult(returncode=7, stdout='intercepted', stderr='se')
+        with patch('orchestrator.git_ops.run_git', return_value=sentinel) as spawn:
+            rc, out, err = await _run(['git', 'status'], cwd=tmp_path)
+
+        assert spawn.await_count == 1, 'the spawn did not route through shared.git_async'
+        assert (rc, out, err) == (7, 'intercepted', 'se')
+
+    async def test_returns_the_same_three_tuple_shape(self, tmp_path: Path) -> None:
+        """Not the new GitResult dataclass — no call site changes."""
+        result = await _run(['git', 'init', '-q'], cwd=tmp_path)
+
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+        rc, out, err = result
+        assert isinstance(rc, int)
+        assert isinstance(out, str)
+        assert isinstance(err, str)
+        assert rc == 0
+
+    async def test_cwd_vanishing_between_preflight_and_spawn_is_reclassified(
+        self, tmp_path: Path,
+    ) -> None:
+        """The race the pre-flight alone cannot catch.
+
+        cwd exists when ``_run`` checks it and is gone by the time the child is
+        spawned.  The helper surfaces a plain ``FileNotFoundError``; ``_run``
+        must re-classify it as :class:`WorktreeMissing` so callers still see a
+        deleted worktree as the recoverable race it is.
+        """
+        doomed = tmp_path / 'doomed'
+        doomed.mkdir()
+
+        async def _vanish_then_fail(*args, **kwargs):
+            shutil.rmtree(doomed)
+            raise FileNotFoundError(2, 'No such file or directory')
+
+        with patch('orchestrator.git_ops.run_git', new=_vanish_then_fail):
+            with pytest.raises(WorktreeMissing) as exc:
+                await _run(['git', 'status'], cwd=doomed)
+
+        assert exc.value.path == doomed
+
+    async def test_filenotfound_with_live_cwd_propagates_unchanged(
+        self, tmp_path: Path,
+    ) -> None:
+        """A missing BINARY is a real bug, not a vanished worktree."""
+
+        async def _boom(*args, **kwargs):
+            raise FileNotFoundError(2, 'No such file or directory')
+
+        with patch('orchestrator.git_ops.run_git', new=_boom):
+            with pytest.raises(FileNotFoundError) as exc:
+                await _run(['git', 'status'], cwd=tmp_path)
+
+        assert not isinstance(exc.value, WorktreeMissing)
+
+class TestGitOpsHoldsNoSecondSpawnPrimitive:
+    """Source-level guard against a REGROWN duplicate of the spawn primitive.
+
+    A source scan rather than a behavioural assertion because the failure mode
+    is additive: a future edit that reintroduces a second
+    ``create_subprocess_exec`` into git_ops would leave every behavioural test
+    in the sibling class green while the two copies silently drift apart.
+
+    AST-based, not a substring scan: ``WorktreeMissing``'s docstring
+    legitimately NAMES ``asyncio.create_subprocess_exec`` when explaining where
+    the generic ``FileNotFoundError`` comes from, and prose should not be
+    collateral damage of a guard aimed at calls.
+    """
+
+    def test_git_ops_makes_no_direct_create_subprocess_exec_call(self) -> None:
+        source = Path(git_ops_module.__file__).read_text()
+        tree = ast.parse(source)
+
+        offenders = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'create_subprocess_exec'
+        ]
+
+        assert offenders == [], (
+            f'git_ops calls create_subprocess_exec directly at line(s) {offenders}; '
+            'it must delegate its spawn to shared.git_async instead of keeping a '
+            'second copy of the primitive (INV-5 no-lockstep-duplication)'
+        )
