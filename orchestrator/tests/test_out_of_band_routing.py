@@ -258,6 +258,43 @@ def _build_checkpoint(*, event_store=None, cost_store=None) -> ReviewCheckpoint:
     return cp
 
 
+def test_review_config_project_root_dodges_the_pytest_guard(tmp_path):
+    """``_review_config``'s ``project_root`` stays OUTSIDE pytest's ``tmp_path``.
+
+    The INVERSE of the usual sandbox invariant, and deliberate.  Pinned here so
+    the next sandbox-escape sweep learns why before it "fixes" this and breaks
+    five green tests — which is exactly what task 3551 nearly did.
+    """
+    cfg = _review_config()
+
+    assert '/tmp/pytest' not in str(cfg.project_root), (
+        f'_review_config().project_root must NOT live under pytest tmp_path, got '
+        f'{cfg.project_root} — ReviewCheckpoint._run_review '
+        f"(orchestrator/src/orchestrator/review_checkpoint.py:150-155) OPENS by "
+        f"raising ValueError on any project_root containing '/tmp/pytest' (guard "
+        f'added by commit 7187958699, 2026-03-31, after Harness tests passing '
+        f'tmp_path fired real review agents at empty fixture dirs).  The guard '
+        f'precedes every seam these tests patch, so sandboxing this root cannot '
+        f'be patched around — it just fails five previously-green routing tests '
+        f'with a confusing ValueError'
+    )
+    assert '/tmp/pytest' in str(tmp_path), (
+        f'ANTI-VACUITY: the assertion above only pins anything while pytest '
+        f"actually roots tmp_path under '/tmp/pytest'; got tmp_path={tmp_path}.  "
+        f'If pytest changed its basetemp layout, re-derive the guard-dodging '
+        f'check from review_checkpoint.py rather than deleting this test'
+    )
+    assert str(cfg.project_root) != '/tmp/fake-project', (
+        f'DISTINGUISHABILITY: {cfg.project_root} is spelled identically to the '
+        f"accidental '/tmp/fake-project' sandbox escapes task 3551 retired, so a "
+        f'grep-driven cleanup cannot tell this deliberate guard-dodging '
+        f'workaround from an accident and will "fix" it.  Give it a distinct, '
+        f'commented name (see _REVIEW_PROJECT_ROOT) — same shape as the '
+        f'precedent at test_review_checkpoint_cap.py:27-30 and '
+        f'test_review_checkpoint_full_gate.py:31'
+    )
+
+
 @pytest.mark.asyncio
 class TestDeepReviewerAdoptsResolveRoute:
     """deep_reviewer (`ReviewCheckpoint._run_review`) resolves via the helper.
