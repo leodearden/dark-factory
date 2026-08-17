@@ -802,23 +802,31 @@ def row_discovery_ceiling_secs(
 #: resolved ceiling.  Deleted then; do not add new readers.
 ROW_DISCOVERY_CEILING_SECS: float = ROW_DISCOVERY_CEILING_BASE_SECS
 
-#: Worst-case BOUNDED work in a row on the failure path: both discovery
-#: waits, then one full watchdog window, then both ceiling-bounded
-#: kill-confirmation waits run to their full ceiling.  (Deliberately excludes
-#: _setup_verify_repo's real git work and the finally block's ~5s
-#: child.kill()/wait() tail -- both small next to the >=2x headroom below.)
-_ROW_WORST_CASE_BOUNDED_SECS: float = (
-    2 * ROW_DISCOVERY_CEILING_SECS
-    + ROW_WATCHDOG_WINDOW_SECS
-    + 2 * ROW_TREE_KILL_CEILING_SECS
-)  # 115.0
+#: Worst-case BOUNDED work in a row on the failure path, at the WIDEST
+#: discovery ceiling reachable: both discovery waits, then one full watchdog
+#: window, then both ceiling-bounded kill-confirmation waits run to their
+#: full ceiling.  (Deliberately excludes _setup_verify_repo's real git work
+#: and the finally block's ~5s child.kill()/wait() tail -- both small next to
+#: the headroom below.)  Keyed on ROW_DISCOVERY_CEILING_MAX_SECS, not on the
+#: base: task 4014 made the discovery ceiling load-scaled, and a widened wait
+#: the @pytest.mark.timeout below cannot accommodate would be TRUNCATED by
+#: pytest-timeout's thread-mode os._exit() -- reporting as a worker kill
+#: instead of the row's self-diagnosing AssertionError.
+_ROW_WORST_CASE_FIXED_SECS: float = (
+    ROW_WATCHDOG_WINDOW_SECS + 2 * ROW_TREE_KILL_CEILING_SECS
+)  # 75.0
 
 #: Per-test opt-out from this module's inherited `timeout = 60`
 #: (orchestrator/pyproject.toml:103, thread-mode -- os._exit()s the xdist
-#: worker on expiry).  2x the bounded worst case, because this module's own
-#: comment (~:870-879) records ~15x elasticity on `from orchestrator.cli
-#: import main` under a full-suite storm.
-ROW_PER_TEST_TIMEOUT_SECS: int = int(2 * _ROW_WORST_CASE_BOUNDED_SECS)  # 230
+#: worker on expiry).  2x the FIXED terms, because this module's own comment
+#: (~:870-879) records ~15x elasticity on `from orchestrator.cli import main`
+#: under a full-suite storm and those terms do not track load themselves.
+#: The discovery term is counted ONCE and exempted from that 2x: it now
+#: scales with loadavg-per-core on its own, so applying the storm factor to
+#: it as well would double-count the same elasticity.
+ROW_PER_TEST_TIMEOUT_SECS: int = int(
+    2 * _ROW_WORST_CASE_FIXED_SECS + 2 * ROW_DISCOVERY_CEILING_MAX_SECS
+)  # 390
 # ---------------------------------------------------------------------------
 
 
@@ -996,7 +1004,7 @@ def test_row_per_test_timeout_still_covers_the_max_discovery_ceiling():
         + ROW_WATCHDOG_WINDOW_SECS
         + 2 * ROW_TREE_KILL_CEILING_SECS
     )
-    assert ROW_PER_TEST_TIMEOUT_SECS >= required, (
+    assert required <= ROW_PER_TEST_TIMEOUT_SECS, (
         f'ROW_PER_TEST_TIMEOUT_SECS ({ROW_PER_TEST_TIMEOUT_SECS}) does not cover '
         f'the bounded worst case at the MAX discovery ceiling ({required}) -- '
         f'both discovery waits, one full watchdog window, and both '
