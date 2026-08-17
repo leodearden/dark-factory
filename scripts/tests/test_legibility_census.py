@@ -2719,6 +2719,103 @@ def test_run_census_without_dry_run_files_normally_and_writes_no_payload_file(tm
 
 
 # ---------------------------------------------------------------------------
+# task 4084 SECONDARY item: INTEGRATION/CHARACTERIZATION — EXPECTED TO PASS ON
+# FIRST RUN once the coverage-line fix above has landed; closes a named
+# coverage gap rather than driving a behaviour change. test_main_cost_control_
+# flags_thread_into_run_census (below) monkeypatches run_census away and
+# asserts only argv threading, so the CHAIN this task names -- a capped
+# mining run changes what the verify cap defers, which changes the dry-run
+# payload count -- has never been exercised through the real pipeline.
+# ---------------------------------------------------------------------------
+
+def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, caplog):
+    # Assembled entirely from the existing single-flag precedents' fixtures
+    # (max_batches: test_run_census_max_batches_caps_mining_and_reports_it;
+    # max_verify_clusters: test_run_census_max_verify_clusters_defers_the_
+    # rest_as_pending_candidates; dry_run_payloads_path: test_run_census_
+    # dry_run_filing_writes_payloads_and_files_nothing) -- no new fakes, no
+    # new fixtures.
+    source = _TrackingBatchSource([_happy_batch(f"b{i}") for i in range(3)])
+    payloads_path = tmp_path / "confusion-census-2026-07-14-payloads.json"
+    fake_verify_fn = _make_fake_verify_fn(
+        verified_titles={"Silent no-op subagent contract"},
+        rejected_titles={"Spurious pattern"},
+    )
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=source,
+        verify_fn=fake_verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_poison("submit_fn"),  # dry run -- must never be reached
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(3),
+        commit=_make_fake_commit(),
+        max_batches=1,
+        max_verify_clusters=1,
+        dry_run_payloads_path=payloads_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    # (a) mining stopped at the cap -- batches 1 and 2 never consumed.
+    assert outcome.stop_reason == "capped"
+    assert source.pulled == [0]
+
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    lowered = report_text.lower()
+
+    # (b) the capped coverage line reports the CODED count for the one mined
+    # batch (steps 2/4 above, now observed through the real pipeline rather
+    # than a hand-built MiningResult), and the PARTIAL / never-re-enumerated
+    # disclosures still fire. _happy_batch's 3 digests all code successfully
+    # (none configured to fail to parse), so coded == drawn == 3 here -- no
+    # shortfall clause is expected from THIS combination; step-5's extension
+    # of the storm test already locks that clause separately.
+    coverage_line = _coverage_line(report_text)
+    assert "coded 3 of 3" in coverage_line
+    assert "operator batch cap = 1" in coverage_line
+    assert "failed to code" not in coverage_line.lower()
+    assert "partial" in lowered
+    assert "never re-enumerated" in lowered
+
+    # (c) the verify cap bit only on the clusters capped mining actually
+    # produced. A single _happy_batch always yields exactly two novel
+    # clusters ("Silent no-op subagent contract", "Spurious pattern" --
+    # mirrors test_run_census_max_batches_caps_mining_and_reports_it, which
+    # relies on the same two-cluster shape), so max_verify_clusters=1 (< 2)
+    # really does defer one of them: this is not the "fewer novel clusters
+    # than the cap" case.
+    assert len(fake_verify_fn.calls) == 1
+    verified_clusters = fake_verify_fn.calls[0]["clusters"]
+    assert len(verified_clusters) == 1, "the verify cap must bound what was SENT to verify_fn"
+    assert verified_clusters[0]["title"] == "Silent no-op subagent contract", "first in mining order"
+
+    assert "## Verification" in report_text
+    verification_section = report_text.split("## Verification", 1)[1].split("##", 1)[0]
+    verification_lowered = verification_section.lower()
+    assert "verified 1 of 2 novel clusters" in verification_lowered
+    assert "1 deferred" in verification_lowered
+    assert "pending candidate" in verification_lowered
+
+    # (d) capped mining -> verify cap -> dry-run payload count: the exact
+    # chain this task named. Only the cluster that both survived the verify
+    # cap AND was actually verified ("Silent no-op subagent contract") is
+    # filed; "Spurious pattern" was DEFERRED by the cap (never sent to
+    # verify_fn at all), not rejected, so it must not appear as a payload.
+    assert payloads_path.exists()
+    payloads = json.loads(payloads_path.read_text(encoding="utf-8"))
+    assert len(payloads) == 1
+    assert "Silent no-op subagent contract" in payloads[0]["title"]
+
+    # (e) census-state still advanced under three caps at once, so the
+    # report's re-anchor claim ("NOT PICKED UP LATER") stays honest.
+    assert kwargs["census_state_path"].exists()
+    assert outcome.status == "done"
+
+
+# ---------------------------------------------------------------------------
 # step-21: RED — main(argv) CLI
 # ---------------------------------------------------------------------------
 
