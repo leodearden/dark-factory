@@ -396,3 +396,80 @@ async def test_suggestions_write_client_follows_redirects_and_accepts_json(
 
     client_factory.assert_follows_redirects()
     server.assert_every_request_accepted_json()
+
+
+# ---------------------------------------------------------------------------
+# MergeWorker._post_submit_tasks — the main-health mirror (step-11 / step-12)
+# ---------------------------------------------------------------------------
+#
+# Placed beside the workflow cases deliberately: merge_queue.py's method is a
+# documented COPY of TaskWorkflow._post_submit_tasks, and copies that are
+# tested apart are exactly how these five sites drifted from the already-correct
+# mcp_lifecycle.py pattern in the first place.
+
+
+def _make_merge_worker(tmp_path, mcp_url='http://memory.test:8002'):
+    import asyncio
+
+    from orchestrator.git_ops import GitOps
+    from orchestrator.merge_queue import SpeculativeMergeWorker
+
+    # project_root must be wired: SpeculativeMergeWorker.__init__ reads it and
+    # it is an instance attribute, so a spec-only mock does not carry it (see
+    # test_merge_queue_auto_heal.py:_make_mock_git_ops).
+    git_ops = MagicMock(spec=GitOps)
+    git_ops.project_root = tmp_path
+
+    worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
+    worker._mcp = MagicMock()
+    worker._mcp.url = mcp_url
+    return worker
+
+
+FIX_TASK_ARGS = {
+    'title': 'main is red',
+    'description': 'auto-heal fix task',
+    'priority': 'high',
+}
+
+
+@pytest.mark.asyncio
+async def test_merge_worker_submit_lands_at_the_mcp_endpoint(tmp_path, server, client_factory):
+    """The main-health auto-heal fix task must actually reach the curator."""
+    worker = _make_merge_worker(tmp_path)
+
+    with patch('httpx.AsyncClient', client_factory):
+        await worker._post_submit_tasks([FIX_TASK_ARGS])
+
+    calls = server.tool_calls('submit_task')
+    assert len(calls) == 1, (
+        f'expected 1 submit_task delivered at {MCP_PATH}, got {len(calls)}. '
+        f'redirected={server.redirected!r} not_acceptable={server.not_acceptable!r}'
+    )
+    assert calls[0]['params']['arguments'] == FIX_TASK_ARGS
+    assert server.redirected == []
+
+
+@pytest.mark.asyncio
+async def test_merge_worker_client_follows_redirects_and_accepts_json(
+    tmp_path, server, client_factory,
+):
+    worker = _make_merge_worker(tmp_path)
+
+    with patch('httpx.AsyncClient', client_factory):
+        await worker._post_submit_tasks([FIX_TASK_ARGS])
+
+    client_factory.assert_follows_redirects()
+    server.assert_every_request_accepted_json()
+
+
+@pytest.mark.asyncio
+async def test_merge_worker_submit_is_still_none_safe(tmp_path, server, client_factory):
+    """The documented ``self._mcp is None`` guard must survive the fix."""
+    worker = _make_merge_worker(tmp_path)
+    worker._mcp = None
+
+    with patch('httpx.AsyncClient', client_factory):
+        await worker._post_submit_tasks([FIX_TASK_ARGS])
+
+    assert server.seen == [], 'a None _mcp must produce no HTTP traffic at all'
