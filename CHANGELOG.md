@@ -33,14 +33,20 @@ run refused — `FileExistsError`, which the existing `except OSError` turns int
 `update_task` is called — where previously the earlier snapshot was lost with
 no sign. Move the file aside, or pass a different `--backup-path`.
 
-**Every exit after the write commits now names that snapshot**, including the
-one where the read-back itself crashes. `_fetch_task` on an unexpected payload
-(or `_coerce_metadata` on a non-dict blob) used to unwind out of `main_async`
-as a bare stack trace with the write already committed and UNVERIFIED — the
-recovery pointer was printed only on the reported-drift exit, so it was absent
-from exactly the path where the operator has least to go on. The sentence now has a single
-source (`recovery_pointer`) that both exits print verbatim, and the traceback
-is kept and printed first: the diagnosis is not traded for the instruction.
+**Every exit that leaves the stored row unverified now names that snapshot** —
+the read-back that crashed, and the write call that never returned. Both used
+to unwind out of `main_async` as a bare stack trace: `_fetch_task` on an
+unexpected payload (or `_coerce_metadata` on a non-dict blob), and — the
+likelier one in practice — a transport timeout on the `update_task` POST
+itself, where the client is an `httpx.AsyncClient(timeout=30.0)` and the
+payload is a whole-blob replace of a row that runs to tens of KB, so no reply
+means no way to tell landed from lost. The recovery pointer was printed only on
+the reported-drift exit, so it was absent from exactly the paths where the
+operator has least to go on. The sentence now has a single source
+(`recovery_pointer`) that every such exit prints verbatim, and the traceback is
+kept and printed first: the diagnosis is not traded for the instruction. An
+explicit server REJECTION is deliberately excluded — the server replied and
+refused, nothing committed, and there is nothing to recover.
 
 Extends the SAFETY section added with the script itself in task 3697 (below).
 

@@ -653,7 +653,9 @@ class _FakeClient:
     Every call is recorded on `self.calls`, so a test can assert a write was
     never even attempted. `get_task_script` overrides successive `get_task`
     replies (`None` = serve the live row; a callable is handed a copy of the
-    live row and returns the payload) for the read-back-failure cases.
+    live row and returns the payload) for the read-back-failure cases, and
+    `update_task_error` / `update_task_result` override the write itself for
+    the two post-write exits that never reach the read-back.
     """
 
     def __init__(self, url: str = 'http://fake.invalid', *, row: dict | None = None):
@@ -664,6 +666,12 @@ class _FakeClient:
         # handed a copy of the live row, or None to serve the live row.
         self.get_task_script: list[dict | Callable[[dict], dict] | None] = []
         self._get_task_calls = 0
+        # Raised AFTER the row is mutated: a lost reply on an already-committed
+        # write, which is the state the recovery pointer exists for.
+        self.update_task_error: Exception | None = None
+        # Returned verbatim INSTEAD of writing: a server rejection, where
+        # nothing committed.
+        self.update_task_result: dict | None = None
 
     @property
     def tools_called(self) -> list[str]:
@@ -687,7 +695,11 @@ class _FakeClient:
                 return override(_deep_copy(self.row)) if callable(override) else override
             return _deep_copy(self.row)
         if name == 'update_task':
+            if self.update_task_result is not None:
+                return self.update_task_result
             self.row['metadata'] = json.loads(arguments['metadata'])
+            if self.update_task_error is not None:
+                raise self.update_task_error
             return {
                 'id': self.row['id'],
                 'message': f'Successfully updated task {self.row["id"]}',
@@ -875,6 +887,15 @@ def _apply_args(backup_path, keys: str = 'origin_escalation'):
     ])
 
 
+class _SimulatedTransportFailure(Exception):
+    """Stands in for an `httpx.ReadTimeout` on the write POST.
+
+    Spelled locally rather than raising the real httpx type: this module is
+    deliberately importable with no network stack, and the guard under test
+    catches `Exception`, so the concrete class is not what is being pinned.
+    """
+
+
 def _drop_a_sibling_key(row: dict) -> dict:
     """A read-back row that lost an untouched sibling — `_verify_read_back`'s
     existing `(c) key-set drift` problem, i.e. the post-write exit that ALREADY
@@ -978,3 +999,62 @@ async def test_read_back_exception_still_surfaces_the_underlying_cause(
     err = capsys.readouterr().err
     assert 'get_task returned an unexpected payload' in err
     assert recovery_pointer(backup) in err
+
+
+@pytest.mark.asyncio
+async def test_write_call_that_never_returns_still_prints_the_recovery_pointer(
+    monkeypatch, tmp_path, capsys,
+):
+    """The write POST raised; the server may have committed anyway.
+
+    This is the likeliest real instance of "committed but UNVERIFIED": the
+    sibling client is an `httpx.AsyncClient(timeout=30.0)` and the payload is a
+    whole-blob replace of a ~20 KB row, so a read timeout on a write the server
+    did apply is far more plausible than the malformed read-back payloads the
+    tests above drive. The fake mutates the row BEFORE raising, exactly as a
+    server that committed and then lost the reply.
+    """
+    client = _install_fake_client(monkeypatch, _FakeClient())
+    client.update_task_error = _SimulatedTransportFailure(
+        'ReadTimeout: the server sent no reply within 30.0s',
+    )
+    backup = tmp_path / 'transport-failure.json'
+
+    assert await _mod.main_async(_apply_args(backup)) == 1
+
+    err = capsys.readouterr().err
+    assert recovery_pointer(backup) in err
+    assert 'UNVERIFIED' in err
+    assert 'ReadTimeout' in err, 'the underlying cause must survive the guard too'
+    assert backup.exists(), 'the pointer must not name a file that was never written'
+    assert 'x_origin_escalation' in client.row['metadata'], (
+        'the fake must model the dangerous case: the write DID land'
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_write_does_not_print_the_recovery_pointer(
+    monkeypatch, tmp_path, capsys,
+):
+    """A REJECTION is not a committed write, so it must NOT name the snapshot.
+
+    `assert_write_accepted` fires when the server answers with a
+    `success=False` envelope: it replied, it refused, and the stored row is
+    exactly the one just read. There is nothing to recover, and pointing at the
+    snapshot anyway would teach an operator to discount the sentence on the
+    exits where it is load-bearing.
+    """
+    client = _install_fake_client(monkeypatch, _FakeClient())
+    client.update_task_result = {
+        'success': False,
+        'error': 'metadata replace refused',
+        'error_type': 'ValidationError',
+    }
+    backup = tmp_path / 'rejected.json'
+
+    assert await _mod.main_async(_apply_args(backup)) == 1
+
+    err = capsys.readouterr().err
+    assert 'was REJECTED by the server' in err
+    assert 'recover from there' not in err, 'nothing committed, so nothing to recover'
+    assert client.row['metadata'] == _PENDING_TASK_ROW['metadata'], 'the row is untouched'

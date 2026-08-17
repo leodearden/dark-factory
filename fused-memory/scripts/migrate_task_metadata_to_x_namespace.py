@@ -64,11 +64,15 @@ corpus-wide sweep at a per-task re-run of this script with other ``--keys``:
   pre-migration row, and an already-occupied path is REFUSED rather than
   replaced.
 
-Once that write has committed, EVERY exit names the snapshot — the exit that
-reports read-back drift and the exit where the read-back itself crashed alike
-(:func:`recovery_pointer` is the single source of that sentence). An
-unverified committed write is the situation the artifact exists for, so where
-to find it is the last thing an operator is told.
+Once that write has been SENT, EVERY exit that leaves the stored row
+unverified names the snapshot: the exit that reports read-back drift, the exit
+where the read-back itself crashed, and the exit where the write call never
+returned at all (a transport timeout on a replace the server may well have
+applied). :func:`recovery_pointer` is the single source of that sentence. The
+one post-write exit that does NOT print it is an explicit server REJECTION —
+that is a reply, nothing committed, and nothing to recover. An unverified
+committed write is the situation the artifact exists for, so where to find it
+is the last thing an operator is told.
 
 Idempotent — safe to re-run; an already-migrated task is a no-op. Defaults to
 a dry run: a real write requires an explicit ``--apply``.
@@ -393,12 +397,18 @@ def write_backup(path: Path, before_task: dict) -> Path:
 def recovery_pointer(backup_path: Path) -> str:
     """The one sentence telling an operator where the original row survives.
 
-    Deliberately the single source of that instruction: EVERY exit after the
-    write has committed must print the same words — the exit that reports
-    read-back drift and the exit where the read-back itself crashed alike. The
-    defect this closes was precisely that one of those exits knew about the
-    snapshot and the other did not, so a second hand-written copy of the
-    sentence would restore the asymmetry the moment either copy was edited.
+    Deliberately the single source of that instruction: EVERY exit that
+    leaves an already-sent write unverified must print the same words — the
+    exit that reports read-back drift, the exit where the read-back itself
+    crashed, and the exit where the write call never returned. The defect this
+    closes was precisely that one of those exits knew about the snapshot and
+    the others did not, so a second hand-written copy of the sentence would
+    restore the asymmetry the moment either copy was edited.
+
+    Not printed on a server REJECTION (:class:`WriteRejectedError`): the server
+    replied and refused, so the stored row is the one just read and there is
+    nothing to recover. Printing it there would train an operator to skim past
+    the sentence on the exits where it is load-bearing.
     """
     return (
         f'  The pre-write row (metadata AND description/details) is saved at '
@@ -598,9 +608,33 @@ async def main_async(args: argparse.Namespace) -> int:
             return 1
         print(f'  pre-write snapshot saved: {backup_path}')
 
-        write_result = await client.call_tool(
-            'update_task', build_update_payload(args.task_id, project_root, migrated),
-        )
+        # The write call itself is already past the point of no return: the
+        # sibling client is an `httpx.AsyncClient(timeout=30.0)` and this is a
+        # whole-blob replace of a row that runs to tens of KB, so a read
+        # timeout on a POST the server DID apply is the most plausible way to
+        # reach "committed but UNVERIFIED" at all — likelier than the
+        # malformed read-back payloads guarded below. No reply means no way to
+        # tell landed from lost, so this exit names the snapshot too.
+        try:
+            write_result = await client.call_tool(
+                'update_task', build_update_payload(args.task_id, project_root, migrated),
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            print(
+                f'  [error] the write call did not RETURN: {exc!r}. No reply was '
+                f'received, so the write may or may not have committed — treat the '
+                f'stored row as UNVERIFIED and read it back by hand.',
+                file=sys.stderr,
+            )
+            print(recovery_pointer(backup_path), file=sys.stderr)
+            return 1
+
+        # Deliberately OUTSIDE that guard, and deliberately NOT given the
+        # pointer: a rejection is a reply. The server answered, refused, and
+        # left the stored row exactly as read — there is nothing to recover,
+        # and printing the sentence here would erode it on the exits where it
+        # is load-bearing.
         try:
             assert_write_accepted(write_result)
         except WriteRejectedError as exc:
