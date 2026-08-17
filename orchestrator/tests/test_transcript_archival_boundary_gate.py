@@ -64,7 +64,7 @@ from shared.config_dir import TaskConfigDir
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import SIMPLE_TASK
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow
@@ -598,3 +598,75 @@ class TestE2SurvivesTeardown:
         # Structurally so: the archive root was never a descendant of the
         # removed worktree in the first place.
         assert not _archive_root(git_repo).is_relative_to(cwd)
+
+
+# ---------------------------------------------------------------------------
+# E3 — the teardown backstop is idempotent w.r.t. the producer
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestE3BackstopIdempotent:
+    """E3 — at teardown the β backstop archives what the producer MISSED and
+    leaves what the producer already archived byte-, mtime- and inode-identical.
+
+    Composed over the genuine producer→backstop sequence rather than two helper
+    calls: session A is archived by the REAL producer hook during ``_invoke``,
+    session B is the abandoned-in-flight tail the backstop exists for (a role
+    in flight when the orchestrator died, never resumed), and the REAL
+    ``cleanup_worktree`` sweeps with ``session_id=None`` before removing the
+    worktree.
+    """
+
+    async def test_backstop_archives_the_missing_and_skips_the_present(
+        self, monkeypatch, git_repo, task_assignment
+    ):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = _config(git_repo)
+        # ARMED GitOps — unlike every other row's fixture, this one carries the
+        # live submodel, so the β backstop actually fires at teardown.
+        git_ops = _make_git_ops(
+            git_repo, transcript_archive=TranscriptArchiveConfig()
+        )
+        assert git_ops.transcript_archive is not None
+        assert git_ops.transcript_archive.enabled is True
+
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+
+        a_bytes = b'{"session":"A","n":1}\n'
+        result, sid_a, _src_a = await _producer_invoke(
+            workflow, cwd, payload=a_bytes
+        )
+        assert result.success is True
+        archived_a = _archived(git_repo, sid_a)
+        assert archived_a.exists()
+
+        # Session B: written into the same config dir but NEVER archived — the
+        # abandoned-in-flight tail. Its session id is deliberately not the one
+        # _invoke minted, so only a session_id=None sweep can find it.
+        sid_b = 'sess-B-abandoned-in-flight'
+        b_bytes = b'{"session":"B","n":1}\n{"session":"B","n":2}\n'
+        src_b = _write_transcript(cwd, sid_b, b_bytes)
+        assert not _archived(git_repo, sid_b).exists()
+
+        before_a = _identity(archived_a)
+
+        await git_ops.cleanup_worktree(cwd, TASK_ID)
+
+        # The backstop archived what was missing, byte-verbatim...
+        archived_b = _archived(git_repo, sid_b)
+        assert archived_b.exists()
+        assert archived_b.read_bytes() == b_bytes
+
+        # ...and left the already-archived session alone. st_ino is the
+        # assertion that proves "skipped": _archive_one publishes by
+        # os.replace of a fresh staging sibling, so a re-archive necessarily
+        # allocates a NEW inode, while identical bytes would pass even on a
+        # full rewrite (A's source and this sweep run within one second, which
+        # is exactly the int-truncated skip firing as designed).
+        assert _identity(archived_a) == before_a
+
+        # The teardown really ran, and left no staging debris behind.
+        assert not cwd.exists()
+        assert not src_b.exists()
+        assert str(cwd) not in await _git_worktree_list(git_repo)
+        assert not list(_archive_root(git_repo).rglob('*.archive-tmp'))
