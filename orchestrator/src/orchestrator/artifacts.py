@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from shared import safe_io
+
 from orchestrator.config import TASK_META_DIRNAME
 
 logger = logging.getLogger(__name__)
@@ -1521,13 +1523,47 @@ class TaskArtifacts:
         return False
 
     def _write_json(self, path: Path, data: dict) -> None:
+        """Write *data* to *path* as JSON, ATOMICALLY and DURABLY.
+
+        The single write seam behind every whole-file `.task-meta` artifact
+        (metadata, plan, review_state, reviews, verdicts, agent_session,
+        reconcile_state, the architect's report artifacts), and therefore the
+        single owner of their byte format and their durability guarantees.
+
+        What a concurrent reader may rely on: it observes either the complete
+        OLD contents or the complete NEW contents — never a truncated file,
+        and never a missing one.  ``os.replace`` on a temp written in the
+        destination's own directory is what buys that; ``fsync=True`` extends
+        it from *atomic* to *durable*, syncing both the temp's bytes and the
+        parent directory entry the rename creates, so a crash immediately
+        after this returns cannot leave fully-synced data unreachable under a
+        name that was never persisted.  (The superseded ``path.write_text``
+        was truncate-then-write, and a reader racing it could and did observe
+        a half-written file — see ``TestWriteJsonIsAtomic``.)
+
+        The tmp+rename itself is DELEGATED to ``shared.safe_io`` rather than
+        re-implemented here: that helper is the repo's single blessed home for
+        the pattern (its unique-per-writer O_CREAT|O_EXCL temp, fchmod on the
+        still-open fd, and BaseException-safe cleanup are all things a local
+        copy would have to re-earn), and the consolidation is machine-enforced
+        by ``TestNoRegrownAtomicWriters`` in shared/tests/test_safe_io.py.
+
+        ``append_iteration_log`` is deliberately NOT routed through here: it
+        is genuinely append-only, and tmp+rename would turn an O(1) append
+        into an O(n) rewrite while destroying the partial-read tolerance that
+        makes a truncated log still usable line-by-line.
+        """
         # Tolerate a vanished worktree.  Callers that care about durability
         # (init, plan, base_commit, etc.) check ``self.root`` themselves; the
         # opportunistic writes (reviews, iteration log) just want a no-op
         # when the worktree has been deleted out-of-band.
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(data, indent=2) + '\n')
+            safe_io.atomic_write_text(
+                path,
+                json.dumps(data, indent=2) + '\n',  # byte format UNCHANGED
+                fsync=True,
+                mkdir=True,
+            )
         except FileNotFoundError:
             if not self.root.is_dir():
                 logger.info(
