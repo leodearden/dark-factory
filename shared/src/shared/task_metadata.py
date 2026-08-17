@@ -111,6 +111,15 @@ HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
 # it is still declared here as this key's SINGLE definition codebase-wide
 # (task 3420) — orchestrator.deterministic_runner imports it rather than
 # restating the literal, for the same drift reason as the marker above.
+#
+# A fork of either key is caught BEHAVIOURALLY, by tests that stamp/pass the
+# BARE WIRE SPELLING and then drive real code: this package's parse_metadata
+# blessed-key tests, and TestHumanCuratorGateAdjudicationGuard in
+# orchestrator/tests/test_deterministic_runner.py.  Those bare literals are
+# load-bearing, not sloppiness — do not "clean them up" into imports of these
+# constants, which would rename the test in lockstep with a forked constant and
+# delete the only detector.  An in-process `is`/`id()` check cannot substitute:
+# CPython interns identifier-shaped literals, so it passes either way.
 HUMAN_CURATOR_ADJUDICATED_AT_KEY: str = 'human_curator_adjudicated_at'
 
 

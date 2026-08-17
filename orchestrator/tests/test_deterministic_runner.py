@@ -1137,6 +1137,16 @@ def _curator_gate_task(
         gate_options=gate_options,
         gate_escalated_at=gate_escalated_at,
     )
+    # BARE WIRE LITERALS, DELIBERATELY (task 3420) — here and at the direct-stamp
+    # sites further down this file.  Do NOT "clean these up" into imports of
+    # shared.task_metadata's HUMAN_CURATOR_GATE_KEY /
+    # HUMAN_CURATOR_ADJUDICATED_AT_KEY: stamping the spelling real tasks carry on
+    # the wire and then driving code that reads those shared constants IS the
+    # drift check.  Import the constants and the test renames in lockstep with a
+    # forked/renamed constant, silently deleting the only detector.  An
+    # in-process `is`/`id()` identity check is no substitute — CPython interns
+    # identifier-shaped literals, so it passes either way (see the SINGLE SOURCE
+    # comment block in orchestrator/src/orchestrator/deterministic_runner.py).
     task['metadata']['human_curator_gate'] = marker
     if human_curator_adjudicated_at is not None:
         task['metadata']['human_curator_adjudicated_at'] = human_curator_adjudicated_at
