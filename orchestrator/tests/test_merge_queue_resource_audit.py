@@ -1429,3 +1429,185 @@ class TestResourceAuditEscalationFloor:
         assert worker._resource_audit_escalation_age_secs() == 115.0
         # Per-instance only — the class default is untouched for other tests.
         assert SpeculativeMergeWorker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS != 3.0
+
+
+# ---------------------------------------------------------------------------
+# task 3622 step-5 RED / step-6 GREEN: _check_resource_audit must NOT escalate
+# a leaked worktree that is still inside the periodic reaper's scheduled-
+# reclaim window (esc-__merge_resource_leak__-46/-47 regression).
+# ---------------------------------------------------------------------------
+
+
+class TestCheckResourceAuditReclaimBandSuppression:
+    """The reclaim band: detected + logged, but not yet escalation-worthy.
+
+    A leaked ``_merge-*`` worktree aged between the DETECTION floor
+    (``RESOURCE_AUDIT_WORKTREE_GRACE_SECS``) and the ESCALATION floor
+    (``_resource_audit_escalation_age_secs()``) is a condition
+    ``_maybe_reap_orphaned_merge_worktrees`` is already SCHEDULED to clear.
+    Paging a human about it reports work that is about to happen anyway —
+    which is exactly what produced esc-``__merge_resource_leak__``-46/-47.
+
+    Suppression is applied at the ALARM call site only.  Detection, the
+    WARNING log, the streak counter, and ``snapshot()['resource_audit']`` all
+    keep firing at the lower detection floor, so the leak census stays
+    truthful throughout the band and a tree that crosses the escalation floor
+    mid-streak alarms on the very NEXT poll rather than restarting a
+    3-heartbeat countdown.
+
+    RED until step-6 GREEN partitions the escalation predicate.
+    """
+
+    _NOW = 1_000_000.0
+    # Test-scale floors: detection 100 < destruction 200 < escalation 220
+    # (200 + 2 sweeps x 10 s).  Ages 100..220 are the band under test.
+    _DETECT = 100.0
+    _REAP_AGE = 200.0
+    _REAP_INTERVAL = 10.0
+    _SWEEPS = 2.0
+    _ESCALATION_FLOOR = 220.0
+    _IN_BAND_AGE = 150.0
+    _PAST_FLOOR_AGE = 300.0
+
+    def _worker(self, git_ops: GitOps, fake_eq: _FakeEscalationQueue):
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
+        )
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._DETECT
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._REAP_AGE
+        worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS = self._SWEEPS
+        worker._reap_interval_s = self._REAP_INTERVAL
+        assert worker._resource_audit_escalation_age_secs() == self._ESCALATION_FLOOR
+        assert self._DETECT < self._IN_BAND_AGE < self._ESCALATION_FLOOR
+        return worker
+
+    def test_in_band_leak_is_detected_and_logged_but_never_escalated(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """THE regression. Across more consecutive violating heartbeats than
+        the streak threshold, an in-band leak still warns every time and still
+        drives the streak — but never pages a human.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        wt = _mkdir_worktree(
+            git_ops, '_merge-inband', mtime=self._NOW - self._IN_BAND_AGE,
+        )
+        calls = worker.RESOURCE_AUDIT_ESCALATION_STREAK + 2
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            for i in range(1, calls + 1):
+                worker._check_resource_audit(self._NOW + i)
+
+        # Detection is untouched: the tree is still a reported violation.
+        violations = worker.worktree_ledger_violations(now=self._NOW + calls)
+        assert len(violations) == 1
+        assert str(wt.resolve()) in violations[0]
+
+        # Logging is untouched: one WARNING per violating call.
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == calls, f'expected {calls} WARNINGs, got: {caplog.text}'
+
+        # The streak is untouched: it keeps counting through the band.
+        assert worker._resource_audit_violation_streak == calls
+
+        # ...but nothing pages, even well past the streak threshold.
+        assert fake_eq.submitted == [], (
+            'a worktree still inside its scheduled-reclaim window must not '
+            f'escalate, got: {fake_eq.submitted!r}'
+        )
+
+    def test_leak_past_the_escalation_floor_still_escalates_exactly_once(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The suppression is a delay, not a mute: past the floor the reaper
+        has demonstrably failed and the alarm fires exactly as before.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        wt = _mkdir_worktree(
+            git_ops, '_merge-stuck', mtime=self._NOW - self._PAST_FLOOR_AGE,
+        )
+        n = worker.RESOURCE_AUDIT_ESCALATION_STREAK
+
+        for i in range(1, n + 1):
+            worker._check_resource_audit(self._NOW + i)
+
+        assert len(fake_eq.submitted) == 1, (
+            f'expected exactly one escalation after {n} consecutive violating '
+            f'heartbeats, got {len(fake_eq.submitted)}'
+        )
+        esc = fake_eq.submitted[0]
+        assert esc.category == 'merge_resource_leak'
+        assert esc.severity == 'blocking'
+        assert esc.level == 1
+        assert str(wt.resolve()) in esc.detail
+
+        # Dedup is unchanged: with the L1 now open (as the real queue would
+        # report after the submit above), further violating polls do not
+        # resubmit. Mirrors TestCheckResourceAudit's convention.
+        fake_eq.open_it()
+        worker._check_resource_audit(self._NOW + n + 1)
+        assert len(fake_eq.submitted) == 1, 'must not resubmit while the L1 is open'
+
+    def test_tree_crossing_the_floor_mid_streak_alarms_on_the_next_poll(
+        self, git_ops: GitOps,
+    ) -> None:
+        """No fresh countdown: the streak accrued during the band is retained,
+        so the first poll past the floor is the one that pages.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        _mkdir_worktree(
+            git_ops, '_merge-crossing', mtime=self._NOW - self._IN_BAND_AGE,
+        )
+        n = worker.RESOURCE_AUDIT_ESCALATION_STREAK
+
+        # Exhaust the streak entirely inside the band — no escalation.
+        for i in range(1, n + 1):
+            worker._check_resource_audit(self._NOW + i)
+        assert worker._resource_audit_violation_streak == n
+        assert fake_eq.submitted == []
+
+        # One further poll, late enough that the tree has now outlived the
+        # escalation floor (age = _IN_BAND_AGE + 100 = 250 > 220).
+        worker._check_resource_audit(self._NOW + 100)
+
+        assert len(fake_eq.submitted) == 1, (
+            'a tree that crosses the escalation floor must alarm on the next '
+            'poll without restarting the streak'
+        )
+
+    def test_permit_leak_escalates_unfiltered_alongside_an_in_band_worktree(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Only the worktree arm is age-suppressed.
+
+        Nothing reclaims a leaked speculation permit, so a permit leak is a
+        genuine "nobody is going to clean this up" from its first heartbeat
+        and must keep paging — while the in-band worktree sharing that same
+        heartbeat stays out of the escalation body.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        wt = _mkdir_worktree(
+            git_ops, '_merge-inband-mixed', mtime=self._NOW - self._IN_BAND_AGE,
+        )
+        worker._speculation_slot._value -= 1  # forced, PERSISTING permit leak
+        n = worker.RESOURCE_AUDIT_ESCALATION_STREAK
+
+        for i in range(1, n + 1):
+            worker._check_resource_audit(self._NOW + i)
+
+        assert len(fake_eq.submitted) == 1, (
+            'a permit leak must escalate at the streak threshold regardless '
+            'of any co-occurring in-band worktree'
+        )
+        esc = fake_eq.submitted[0]
+        assert 'speculation' in esc.detail.lower()
+        assert str(wt.resolve()) not in esc.detail, (
+            'the in-band worktree is still inside its reclaim window and must '
+            'not be named in the escalation body'
+        )
