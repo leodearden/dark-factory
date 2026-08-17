@@ -207,7 +207,22 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   more leg the merge gate also runs —
   `fused-memory/scripts/check_bare_magicmock_config.py` over each package's
   `tests/` — so see `lint_command` in `dark-factory-orchestrator.yaml` for
-  the full chain.
+  the full chain. Despite its legacy filename that script now carries **two
+  independent mock-spec-discipline rules**, each with its own suppression
+  code (both take the form
+  `# noqa: <code> — <reason>` on the **preceding** non-blank line; the reason
+  is mandatory and an inline trailing comment is deliberately not honored):
+  - `bare-magicmock` — a config-named variable (`config`, `cfg`, `*_config`,
+    `*_cfg`) assigned an unspecced `MagicMock()`. Remedy: the
+    `mock_orch_config` fixture or `MagicMock(spec_set=pydantic_spec(...))`.
+  - `bare-dataclass-double` — an unspecced `MagicMock` shaped like a
+    registered stdlib dataclass (`VerifyResult` today), flagged in **any**
+    syntactic position including `return MagicMock(...)`. Remedy:
+    `_fake_verify_result(...)` or `MagicMock(spec=VerifyResult)`.
+    Eleven files carry pre-existing debt, grandfathered in the script's
+    `_DATACLASS_DOUBLE_DEBT` baseline. That list is **shrink-only** — entries
+    come off as files are migrated and must never be added. A new offending
+    file is covered by default and will fail the gate.
 - **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
   of the toolchain** and is not enforced anywhere — not in `hooks/pre-commit`,
   not in any `orchestrator.yaml` `lint_command`, not in verify. There is no CI.

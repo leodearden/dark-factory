@@ -1,5 +1,38 @@
 #!/usr/bin/env python3
-"""Lint check: flag bare MagicMock() assigned to config-named variables in test files.
+"""Lint checks: mock-spec discipline in test files.
+
+This script carries TWO INDEPENDENT RULES.  They share only the AST predicates
+(``_is_magicmock_call`` / ``_is_specced``), the exemption-comment contract and the
+output format; they have separate detection pipelines, separate message vocabularies
+and separate ``# noqa`` codes.  Every statement in the "Rule A" section below is
+scoped to Rule A and says nothing about Rule B.
+
+  Rule A — ``bare-magicmock`` (tasks 1339/1372)
+      Config-NAMED bindings only, ``ast.Assign``/``ast.AnnAssign`` positions only.
+      Remedies are pydantic-specific (``mock_orch_config``, ``pydantic_spec``).
+
+  Rule B — ``bare-dataclass-double`` (task 4016)
+      Registry-driven and POSITION-BLIND: any ``ast.Call`` anywhere — including
+      ``return MagicMock(...)``, an argument, a comprehension body — whose literal
+      kwargs match a registered stdlib-dataclass shape (``_DATACLASS_SHAPES``;
+      ``VerifyResult`` today).  The binding name is never consulted.  Remedies are
+      dataclass-specific (``_fake_verify_result``, ``MagicMock(spec=VerifyResult)``).
+      Carries a shrink-only per-file debt baseline (``_DATACLASS_DOUBLE_DEBT``).
+
+WIDEN-NOT-SIBLING RULING (task 4016): Rule B was added here rather than as a sibling
+script.  A sibling would have cost nine wiring edits (seven package ``orchestrator.yaml``
+lint_commands, ``dark-factory-orchestrator.yaml``, ``hooks/project-checks``), a second
+``python3`` process per lint run and a second fleet-lint-coverage entry — all to run the
+same ``ast.parse`` over the same files.  Widening cost zero wiring edits.  Rule A's
+stated non-goals below guard against inflating the CONFIG-NAME set, which would blur one
+rule's boundary; adding a second rule with its own name, vocabulary and noqa code is the
+opposite of that scope creep.  The FILENAME is therefore a deliberately retained legacy
+name — it no longer describes the whole file, and renaming it would touch those same nine
+call sites and break every in-flight branch, for a cosmetic gain.
+
+---------------------------------------------------------------------------
+Rule A — ``bare-magicmock``
+---------------------------------------------------------------------------
 
 Rule: Any assignment of the form ``<config_name> = MagicMock()`` where the call has
 no ``spec``, no ``spec_set`` keyword argument, and no positional argument (MagicMock's
@@ -48,9 +81,43 @@ Preferred alternatives named in the rejection message:
 Origin: Task 1339 (migrate existing bare configs), task 1313/1064 (spec discipline).
 This guard is implemented in task 1372 to prevent regressions after the migration.
 
+---------------------------------------------------------------------------
+Rule B — ``bare-dataclass-double``
+---------------------------------------------------------------------------
+
+Rule: any ``MagicMock(...)`` call, IN ANY POSITION, with no spec/spec_set and no
+positional argument, whose literal keyword names match a shape registered in
+``_DATACLASS_SHAPES`` — unless the preceding non-blank line carries
+``# noqa: bare-dataclass-double — <reason>``, or the file is on the debt baseline.
+
+Matching is ANCHOR + OVERLAP, deliberately NOT "kwargs are a subset of the fields":
+every anchor must be present AND at least ``min_field_matches`` fields must match.
+A kwarg that is not a field is *drift evidence* named in the message, never an
+exemption — a bare MagicMock accepts any keyword silently, so an unrecognised one is
+the strongest signal the double has drifted from the type it impersonates.  A subset
+rule would have missed all ten sites behind task 3980, every one of which passed
+``verify_skipped=`` (a MergeOutcome field, merge_types.py:945).
+
+Why this rule exists: Rule A provably cannot see the shape, for three independent
+reasons, any one of them fatal — it inspects only ``ast.Assign``/``ast.AnnAssign``
+while all ten task-3980 sites were ``return MagicMock(...)``; ``_is_config_name``
+matches only config/cfg/*_config/*_cfg targets; and its remedies read pydantic
+``model_fields`` while ``VerifyResult`` is a stdlib dataclass.
+
+Preferred alternatives named in the rejection message:
+  • ``_fake_verify_result(...)`` (orchestrator/tests/test_merge_queue_concurrent_verify.py:484)
+  • ``MagicMock(spec=VerifyResult)`` seeded from ``dataclasses.fields(VerifyResult)``
+
+Origin: task 3477 (built the factory), task 3980 (migrated ten sites and added a
+file-local guard), task 4016 (this shared, repo-wide guard).
+
+---------------------------------------------------------------------------
+
 This script is intentionally stdlib-only (ast, argparse, pathlib, re, sys, typing) so
 hooks/project-checks can invoke it via plain python3 without uv env-resolution overhead.
-Adding a third-party dependency here would break that fast path.
+Adding a third-party dependency here would break that fast path.  This is why
+``_DATACLASS_SHAPES`` hardcodes field names instead of importing the dataclasses it
+describes: ``import orchestrator.verify`` would need pydantic and break every caller.
 """
 
 from __future__ import annotations
