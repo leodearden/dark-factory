@@ -48,7 +48,7 @@ from pathlib import Path
 import pytest
 
 import df_pytest_isolation
-from df_pytest_isolation import fleet_dir_redirect_violation_reason
+from df_pytest_isolation import fixture_marker, fleet_dir_redirect_violation_reason
 
 from orchestrator.fleet_heartbeat import DEFAULT_FLEET_DIR, resolve_fleet_dir
 
@@ -128,3 +128,77 @@ def test_fleet_dir_is_redirected_away_from_the_live_checkout(
     # the part that is genuinely per-root: it proves THIS rootdir's conftest
     # bound the fixture that set the variable checked above.
     assert Path(_df_fleet_dir_redirect).resolve() == Path(value or '').resolve()
+
+
+class TestBothFixturesAreLiveInThisRun:
+    """The two fixtures are WIRED into THIS rootdir, not merely defined.
+
+    The two tests above would both stay green with only the redirect bound, and
+    every pure-helper test in ``tests/scripts/test_fleet_dir_isolation.py``
+    stays green against a defence that no conftest anywhere ever loads.  That
+    is the difference between a wired defence and a dead one, and a
+    silently-dead guard is the exact failure mode this task family exists to
+    prevent.  Shaped after that module's class of the same name and after the
+    in-root precedent
+    ``test_git_repo_isolation_guard.py::TestSessionCeilingIsLiveInThisSuite``:
+    asserting the fixture *exists* would prove nothing; this asserts it FIRED.
+
+    WHY THE LEAK GUARD IS WIRED HERE AT ALL, given it cannot catch this task's
+    own leak: it is keyed on the SYNTHETIC unit-name prefix
+    (``orchestrator-fake``), so ``unknown-unit.json`` will never match it.  That
+    keying is deliberate and must not be widened — measured during task 3799,
+    the running orchestrators rewrite their heartbeats roughly every 30s, so an
+    "untouched live dir" assertion fails on essentially every run and is
+    indistinguishable from a genuine leak.  The redirect is what closes this
+    leak, by PREVENTING the write; the guard is the sibling defence against a
+    SYNTHETIC-named leak from this root, wired for parity with the two roots
+    that already carry it.
+    """
+
+    @pytest.mark.parametrize('name', [_REDIRECT_NAME, _GUARD_NAME])
+    def test_the_fixture_exists(self, name: str) -> None:
+        assert hasattr(df_pytest_isolation, name), (
+            f'df_pytest_isolation defines no {name}; the pure helpers behind it '
+            'protect nothing on their own.'
+        )
+
+    @pytest.mark.parametrize('name', [_REDIRECT_NAME, _GUARD_NAME])
+    def test_the_fixture_is_session_scoped_and_autouse(self, name: str) -> None:
+        """Both properties pinned STRUCTURALLY, not inferred from behaviour.
+
+        Function scope would miss writes from module-/session-scoped fixtures —
+        which is where expensive harness setup tends to live — and would
+        re-point ``ORCH_FLEET_DIR`` at a fresh directory per test, so a writer
+        and a later reader could disagree about where the heartbeats went.
+        Without ``autouse`` nothing here would ever request either one.
+
+        Read through ``fixture_marker`` rather than ``_pytestfixturefunction``
+        directly: pytest 9 moved that private attribute, and the helper accepts
+        both spellings and fails loudly when neither is found.
+        """
+        marker = fixture_marker(getattr(df_pytest_isolation, name))
+
+        assert marker.scope == 'session', f'{name} scope is {marker.scope!r}'
+        assert marker.autouse is True, f'{name} must be autouse — nothing requests it'
+
+    @pytest.mark.parametrize('name', [_REDIRECT_NAME, _GUARD_NAME])
+    def test_the_fixture_is_registered_in_this_run(self, name: str, request) -> None:
+        """The conftest binding is real WIRING, not a dormant definition.
+
+        pytest only collects fixtures bound into a conftest's namespace, which
+        is why they are imported there under
+        ``# noqa: F401 — the binding IS the wiring``.  Deleting that import
+        breaks nothing visible in this whole module except this assertion.
+        """
+        try:
+            request.getfixturevalue(name)
+        except pytest.FixtureLookupError:
+            pytest.fail(
+                f'{name} is not registered for this rootdir. Wire '
+                'orchestrator/tests/conftest.py to import it from '
+                'df_pytest_isolation (`# noqa: F401 — the binding IS the '
+                'wiring`); the repo-root conftest cannot cover this suite, '
+                'because the verify lane runs `cd orchestrator && uv run pytest '
+                'tests/` and rootdir is therefore the SUBPROJECT.',
+                pytrace=False,
+            )
