@@ -257,3 +257,142 @@ async def test_completion_write_sends_the_mcp_accept_header(
         'the POST was refused 406 for a missing/!json Accept header — the write '
         'still did not land'
     )
+
+
+# ---------------------------------------------------------------------------
+# _write_decisions_to_memory (step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+
+DECISIONS = [
+    {'decision': 'use a shared primitive', 'rationale': 'five copies is how the drift arose'},
+    {'decision': 'anchor on the URL form', 'rationale': 'bare /mcp/ also matches prose'},
+    {'decision': 'warn, never raise', 'rationale': 'every call site is fire-and-forget'},
+]
+
+
+def _workflow_with_decisions(tmp_path, decisions=None):
+    return make_workflow(
+        tmp_path=tmp_path,
+        plan={
+            'analysis': 'because reasons',
+            'design_decisions': DECISIONS if decisions is None else decisions,
+            'steps': [{'status': 'done'}],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_decisions_write_delivers_every_decision_to_the_mcp_endpoint(
+    tmp_path, server, client_factory,
+):
+    """One delivered add_memory per design decision, all landing at /mcp."""
+    wf = _workflow_with_decisions(tmp_path)
+
+    with patch('httpx.AsyncClient', client_factory):
+        await wf._write_decisions_to_memory()
+
+    calls = server.tool_calls('add_memory')
+    assert len(calls) == len(DECISIONS), (
+        f'expected {len(DECISIONS)} delivered add_memory calls, got {len(calls)}. '
+        f'redirected={server.redirected!r} not_acceptable={server.not_acceptable!r}'
+    )
+    assert all(path == MCP_PATH for path, _ in server.delivered)
+    assert server.redirected == []
+    # The decision text must survive the trip, not merely the envelope.
+    delivered_text = ' '.join(c['params']['arguments']['content'] for c in calls)
+    for decision in DECISIONS:
+        assert decision['decision'] in delivered_text
+
+
+@pytest.mark.asyncio
+async def test_decisions_write_uses_the_patched_client_seam(
+    tmp_path, server, client_factory,
+):
+    """The inline ``__import__('httpx')`` site is reached by the same patch seam.
+
+    ``__import__('httpx').AsyncClient`` resolves the attribute at call time, so
+    ``patch('httpx.AsyncClient', ...)`` does intercept it — pinned here so a
+    future rewrite of that import cannot quietly escape this file's coverage.
+    """
+    wf = _workflow_with_decisions(tmp_path)
+
+    with patch('httpx.AsyncClient', client_factory):
+        await wf._write_decisions_to_memory()
+
+    assert client_factory.ctor_kwargs, (
+        'the decisions writer constructed no client through the patched seam — '
+        'its httpx import no longer goes through httpx.AsyncClient'
+    )
+
+
+@pytest.mark.asyncio
+async def test_decisions_write_client_follows_redirects_and_accepts_json(
+    tmp_path, server, client_factory,
+):
+    wf = _workflow_with_decisions(tmp_path)
+
+    with patch('httpx.AsyncClient', client_factory):
+        await wf._write_decisions_to_memory()
+
+    client_factory.assert_follows_redirects()
+    server.assert_every_request_accepted_json()
+
+
+# ---------------------------------------------------------------------------
+# _write_suggestions_to_memory (step-7 RED / step-8 GREEN)
+# ---------------------------------------------------------------------------
+
+
+def _reviews_with(n):
+    """A ``reviews``-shaped stand-in carrying *n* suggestion dicts."""
+    reviews = MagicMock()
+    reviews.suggestions = [
+        {'category': f'cat-{i}', 'description': f'suggestion number {i}'}
+        for i in range(n)
+    ]
+    return reviews
+
+
+@pytest.mark.asyncio
+async def test_suggestions_write_delivers_to_the_mcp_endpoint(
+    tmp_path, server, client_factory,
+):
+    wf = make_workflow(tmp_path=tmp_path)
+
+    with patch('httpx.AsyncClient', client_factory):
+        await wf._write_suggestions_to_memory(_reviews_with(3))
+
+    calls = server.tool_calls('add_memory')
+    assert len(calls) == 3, (
+        f'expected 3 delivered add_memory calls, got {len(calls)}. '
+        f'redirected={server.redirected!r} not_acceptable={server.not_acceptable!r}'
+    )
+    assert all(path == MCP_PATH for path, _ in server.delivered)
+    assert server.redirected == []
+
+
+@pytest.mark.asyncio
+async def test_suggestions_write_caps_at_five_delivered_calls(
+    tmp_path, server, client_factory,
+):
+    """The documented cap is 5 — and it must be a cap on DELIVERED writes."""
+    wf = make_workflow(tmp_path=tmp_path)
+
+    with patch('httpx.AsyncClient', client_factory):
+        await wf._write_suggestions_to_memory(_reviews_with(9))
+
+    assert len(server.tool_calls('add_memory')) == 5
+
+
+@pytest.mark.asyncio
+async def test_suggestions_write_client_follows_redirects_and_accepts_json(
+    tmp_path, server, client_factory,
+):
+    wf = make_workflow(tmp_path=tmp_path)
+
+    with patch('httpx.AsyncClient', client_factory):
+        await wf._write_suggestions_to_memory(_reviews_with(2))
+
+    client_factory.assert_follows_redirects()
+    server.assert_every_request_accepted_json()
