@@ -1909,8 +1909,10 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
         'resolve_session_pid: %s is unset or unusable (%r); the lease pid/liveness '
         'guard is DEGRADED to heartbeat-only staleness. Recording pid 0, which is '
         'never alive, so a crashed holder still ages out and is reaped normally. '
-        'Note: `$$` in a Claude Code Bash tool call is the transient /bin/bash -c '
-        'wrapper, not the session -- use ${CLAUDE_PID:-$PPID}.',
+        'Note: neither `$$` nor `$PPID` substitutes for it -- `$$` in a Claude Code '
+        'Bash tool call is the transient /bin/bash -c wrapper, and `$PPID` is not '
+        'stable across tool calls either. Set $CLAUDE_PID; if you cannot, the lease '
+        'slug is underivable too, so pass an explicit --slug <stable-token>.',
         SESSION_PID_ENV,
         raw,
     )

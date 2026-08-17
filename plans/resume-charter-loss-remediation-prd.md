@@ -253,7 +253,7 @@ All satisfied at authoring time:
 | 3991 | 6 — false-belief + kill-switch remediation | pending | 3983 | all §9 sites corrected; kill-switches decided + documented in OPERATIONS.md; **amended at decompose to add §9 item 9** (escalation-watcher SKILL.md's inverse-differential incident note) |
 | 3992 | 8 — damage audit (scope sign-off first) | pending | 3986 | scoping proposal → human sign-off → audit of ~30 recent breaches first |
 | 3993 | (defence-in-depth) deny `Skill` to watcher-auto | pending | — | `Skill` in `_WATCHER_DISALLOWED_TOOLS` + test |
-| 3994 | (defence-in-depth) lease ownership checks | pending | — | `lease-release`/`heartbeat` require `--slug`; contention message legible |
+| 3994 | (defence-in-depth) lease ownership checks | pending | — | `lease-release`/`heartbeat` enforce holder-only mutation via `--slug`; contention message legible. *(Task 4248 later moved the slug into the CLI — `--slug` is now derived, not required; the ownership check is unchanged.)* |
 
 ### 7b. New leaves (filed by this decompose; Greek labels stamped into the sidecar)
 
