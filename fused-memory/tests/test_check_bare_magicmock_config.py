@@ -947,6 +947,120 @@ class TestDataclassDoubleNegatives:
         )
 
 
+# The verbatim shape task 3980 removed from ten sites (test_merge_speculation.py:4275).
+# Note `verify_skipped=`, which is a MergeOutcome field (merge_types.py:945), NOT a
+# VerifyResult field — a bare MagicMock accepts it without objection. This is the case
+# the "kwargs are a subset of the dataclass's fields" rule would have MISSED.
+_TASK_3980_SHAPE = (
+    'def make():\n'
+    '    return MagicMock(\n'
+    "        passed=False, summary='tests failed', test_output='FAIL',\n"
+    "        lint_output='', type_output='', category='', timed_out=False,\n"
+    '        verify_skipped=False,\n'
+    '    )\n'
+)
+
+
+class TestDataclassDoubleMessage:
+    """Rule B's violation message: names the shape, the drift, the remedy, and its own code."""
+
+    def test_task_3980_shape_is_flagged_despite_a_non_field_kwarg(self):
+        """The verbatim 3980 shape flags — the regression-critical case a subset rule misses.
+
+        ``verify_skipped`` is not a VerifyResult field, so ``kwargs <= fields`` is FALSE
+        here. Under the anchor+overlap rule the non-field kwarg is drift evidence, not
+        an exemption, and the site is correctly flagged.
+        """
+        violations = find_violations(_TASK_3980_SHAPE, 'test_3980.py')
+        assert len(violations) == 1, (
+            'the verbatim task-3980 shape MUST be flagged; a non-field kwarg is drift '
+            f'evidence, never an exemption. got {violations}'
+        )
+
+    def test_message_names_shape_remedy_and_origin_tasks(self):
+        """The message names VerifyResult, both remedies, dataclasses.fields, and 3477/3980."""
+        message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
+        for needle in (
+            'VerifyResult',
+            '_fake_verify_result',
+            'spec=VerifyResult',
+            'dataclasses.fields',
+            '3477',
+            '3980',
+        ):
+            assert needle in message, (
+                f'Rule B message must name {needle!r} so the remedy is actionable '
+                f'without leaving the error; got {message!r}'
+            )
+
+    def test_message_names_the_drift_kwarg(self):
+        """The message calls out `verify_skipped` as not-a-VerifyResult-field.
+
+        Naming the specific unknown kwarg is what turns the message from "this looks
+        wrong" into evidence: it is the strongest signal that the double has drifted
+        from the type it impersonates.
+        """
+        message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
+        assert 'verify_skipped' in message, (
+            f'the drift kwarg must be named as evidence; got {message!r}'
+        )
+
+    def test_message_does_not_leak_rule_a_pydantic_vocabulary(self):
+        """Rule A's pydantic remedies must not appear in a stdlib-dataclass message.
+
+        ``pydantic_spec`` reads ``model_fields`` and requires a BaseModel — it is
+        unusable for VerifyResult. Offering it here would send the reader down a
+        dead end.
+        """
+        message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
+        for forbidden in ('mock_orch_config', 'pydantic_spec'):
+            assert forbidden not in message, (
+                f"Rule A's {forbidden!r} must not leak into Rule B's message — it is "
+                f'unusable for a stdlib dataclass; got {message!r}'
+            )
+
+    def test_message_instructs_the_rule_b_noqa_code(self):
+        """The message tells the reader the correct, rule-specific suppression code."""
+        message = find_violations(_TASK_3980_SHAPE, 'test_3980.py')[0].message
+        assert '# noqa: bare-dataclass-double' in message, (
+            f'the message must instruct the Rule B noqa code verbatim; got {message!r}'
+        )
+
+    def test_rule_b_path_runs_under_isolated_python3_stdlib_only(self, tmp_path: Path):
+        """The registry, walk and message builder add no third-party import.
+
+        Reuses TestStdlibOnlyProof's harness: under ``python3 -I -S`` no venv
+        site-packages are on sys.path, so any accidental third-party import in the
+        Rule B path would raise ModuleNotFoundError at startup instead of reporting.
+        """
+        if shutil.which('python3') is None:
+            pytest.skip('python3 not found on PATH — cannot verify hook runtime assumption')
+
+        bad_file = tmp_path / 'test_bad_double.py'
+        bad_file.write_text(_TASK_3980_SHAPE)
+        result = subprocess.run(
+            ['python3', '-I', '-S', str(SCRIPT_PATH), str(bad_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1, (
+            f'Rule B should exit 1 under python3 -I -S, got {result.returncode}:\n'
+            f'  stdout: {result.stdout!r}\n'
+            f'  stderr: {result.stderr!r}'
+        )
+        for needle in (
+            str(bad_file),
+            'VerifyResult',
+            '_fake_verify_result',
+            'verify_skipped',
+            'bare-dataclass-double',
+        ):
+            assert needle in result.stdout, (
+                f'Expected {needle!r} in Rule B stdout under python3 -I -S, '
+                f'got: {result.stdout!r}'
+            )
+
+
 class TestFusedMemoryTestsDirectoryClean:
     """Regression guard: fused-memory/tests must have zero bare MagicMock() config sites.
 
