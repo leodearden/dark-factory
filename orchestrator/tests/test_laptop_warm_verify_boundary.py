@@ -414,14 +414,26 @@ def wait_subtree_live(
     Raises AssertionError on timeout -- a live sleeper never appearing means
     the harness itself is broken, not a seam defect under test.
 
-    NOTE: "has a live descendant" fires on the FIRST child the CLI forks --
-    for a not-yet-materialised persistent worktree that is a transient ``git``
-    subprocess (``git worktree add`` / ``git reset`` / ``git clean`` inside
-    ``acquire_host_verify_worktree``), not necessarily the eventual build
-    shell.  Callers that need to observe a build-produced artifact (e.g. a
-    marker file the build's shell command touches) must poll for that
-    artifact directly -- see :func:`wait_for_marker` -- rather than treating
-    "subtree live" as a proxy for "build has started".
+    Each tick runs a cheap ``/proc/<pgid>/task/*/children`` probe and pays
+    the ~2700x more expensive ``collect_descendants(pgid, read_ppid_map())``
+    rescan ONLY when that probe reports a direct child -- task 4014; see
+    :func:`_read_direct_children`.  A positive probe whose confirming walk
+    comes back EMPTY does not end the poll: the child the probe saw exited in
+    between, and the loop keeps going.  So the returned set is always
+    NON-EMPTY and, in practice, converges on a child durable enough to
+    survive one rescan.
+
+    NOTE: "has a live descendant" still fires on an EARLY child the CLI forks
+    -- for a not-yet-materialised persistent worktree that is a transient
+    ``git`` subprocess (``git worktree add`` / ``git reset`` / ``git clean``
+    inside ``acquire_host_verify_worktree``), not necessarily the eventual
+    build shell.  The skip-the-vanished rule above biases toward the durable
+    sleeper but does not GUARANTEE it (a transient slow enough to survive a
+    rescan is still returnable).  So callers that need to observe a
+    build-produced artifact (e.g. a marker file the build's shell command
+    touches) must still poll for that artifact directly -- see
+    :func:`wait_for_marker` -- rather than treating "subtree live" as a proxy
+    for "build has started".
 
     *proc* is the already-spawned leader (or, for a caller observing a
     SEPARATE dispatcher process, that dispatcher) whose ``stdout``/``stderr``
@@ -461,7 +473,12 @@ def wait_subtree_live(
         # Cheap probe FIRST: pay the ~50ms full-/proc rescan only on the tick
         # that can actually yield a descendant set (task 4014).
         if probe(pgid):
-            return collect_descendants(pgid, ppid_map())
+            descendants = collect_descendants(pgid, ppid_map())
+            if descendants:
+                return descendants
+            # Positive probe, empty walk: the child the probe saw exited in
+            # between (a transient `git` setup subprocess).  Keep polling
+            # rather than hand back an empty set -- see the NOTE above.
         time.sleep(interval)
     message = f'pgid {pgid}: no descendant appeared within {timeout}s'
     if proc is not None:
