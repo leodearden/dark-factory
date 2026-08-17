@@ -80,6 +80,30 @@ def _make_hanging_proc():
     return proc, call_count
 
 
+def _make_delayed_success_proc(delay_secs, stdout_bytes=b'{"type":"result","subtype":"success"}'):
+    """Return a proc whose communicate() sleeps *delay_secs* then succeeds once.
+
+    Mirrors ``TestRunSubprocessWorkingRegimeProgressExtension._make_delayed_success_proc``
+    (test_cli_invoke.py:4056).  Used where a test must observe the watchdog POLL
+    reads in isolation: the run leaves the loop via ``comm_task in done`` and
+    never enters the ``except TimeoutError:`` handler, so the handler's own
+    one-shot re-read cannot land in the recorded-ident list.
+    """
+
+    async def communicate_side_effect(input=None):  # noqa: A002
+        await asyncio.sleep(delay_secs)
+        return (stdout_bytes, b'')
+
+    proc = MagicMock()
+    proc.communicate = communicate_side_effect
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+    proc.returncode = 0
+    proc.pid = 12345
+    return proc
+
+
 def _fake_exec_returning(proc):
     """An ``asyncio.create_subprocess_exec`` stand-in that yields *proc*."""
 
@@ -115,16 +139,26 @@ class TestStartupRegimePollOffLoop:
     async def test_startup_poll_reads_transcript_off_the_loop_thread(self, tmp_path):
         """Every startup-regime ``count_transcript_turns`` call runs on a worker thread.
 
-        The fake returns None, so the startup-wedge kill never fires (B7
-        conservative degrade) and the run polls at the patched 0.05s cadence
-        until the 0.4s absolute ceiling — giving several recorded idents.
+        The fake returns None, so ``seen_turn`` never latches and every poll
+        takes the ``if not seen_turn`` branch under test; None also means the
+        startup-wedge kill can never fire (B7 conservative degrade), so the run
+        polls at the patched 0.05s cadence for the process's whole 0.3s life.
+
+        The process COMPLETES rather than hanging, deliberately.  The run then
+        leaves the watchdog loop via ``comm_task in done`` and never enters the
+        ``except TimeoutError:`` handler, whose own one-shot re-read
+        (cli_invoke.py:2970) is a DIFFERENT site owned by step-5/step-6 — with a
+        hanging proc that handler's still-on-loop read lands in ``recorded`` and
+        this test would be asserting two sites at once.  The normal-exit path
+        reads via ``read_transcript_records``, a different module global that is
+        not patched here, so it cannot pollute ``recorded`` either.
         """
         loop_ident = threading.get_ident()
         sid = str(uuid.uuid4())
         cfg_dir = tmp_path / 'cfg'
         cfg_dir.mkdir()
 
-        proc, _ = _make_hanging_proc()
+        proc = _make_delayed_success_proc(0.3)
         recorded: list[int] = []
 
         with (
@@ -141,11 +175,11 @@ class TestStartupRegimePollOffLoop:
         ):
             result = await _run_subprocess(
                 ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.4, startup_grace_secs=0.05,
+                timeout_seconds=5.0, startup_grace_secs=0.05,
                 session_id=sid, config_dir=cfg_dir,
             )
 
-        assert result.timed_out is True, 'Expected the ceiling kill to fire'
+        assert result.timed_out is False, 'Expected a normal exit, not a kill'
         assert recorded, 'Expected the startup-regime poll to read the transcript at least once'
         assert loop_ident not in recorded, (
             f'count_transcript_turns ran on the event-loop thread ({loop_ident}) — '
