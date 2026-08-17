@@ -16,6 +16,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -697,4 +698,147 @@ def test_unknown_grace_withholds_restart_while_absent(tmp_path):
     assert ["--user", "restart", UNIT_R] not in state["calls"], (
         f"restart must NOT have been recorded yet; got calls={state['calls']!r} "
         f"stdout={stdout!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 4077: RED -- drain_gate's busy->idle resume path (both the in-loop
+# site at 378-381 and the post-drain_await_fresh site at 388-390) and its
+# stale-during-defer re-classification (382-404), including the deliberate
+# non-reset of the force-fire anchor on a busy<->stale/absent oscillation.
+# ---------------------------------------------------------------------------
+
+_HB_BUSY = {"merge_idle": False}  # fresh + mid-merge
+_HB_IDLE = {"merge_idle": True}  # fresh + drained
+# Aged out no matter when it's actually written -- mirrors
+# test_stale_heartbeat_restarts_after_zero_grace's ts_epoch spelling above.
+# Computed once at import time rather than at write time: it only needs to
+# stay further in the past than any fresh_window this file uses (default
+# 120s), and a plain module-level dict constant (matching _HB_BUSY/_HB_IDLE)
+# can't carry a call-time value.
+_HB_STALE = {"merge_idle": True, "ts_epoch": time.time() - 99999}
+
+
+@contextlib.contextmanager
+def _heartbeat_timeline(fleet_dir, unit, timeline):
+    """Rewrite <fleet_dir>/<unit>.json on a schedule while `_run_script` blocks.
+
+    `drain_check.py` classifies a verdict purely from the on-disk heartbeat
+    JSON (scripts/drain_check.py `classify`), so a single static file can
+    never exercise a mid-poll verdict CHANGE -- busy->idle, busy->stale->idle,
+    or a stale<->busy oscillation. This helper drives those transitions by
+    rewriting the file on a schedule while the spawned script polls it.
+
+    `timeline` is an ordered ``(label, delay_secs, overrides)`` sequence. Each
+    entry arms one ``threading.Timer(delay_secs, ...)``, all started together
+    at context entry so every delay is an offset from the SAME t0 -- callers'
+    timings are relative to script start, and `_run_script` must be invoked
+    INSIDE this block. ``overrides`` is forwarded to `_write_heartbeat` as
+    kwargs; ``overrides is None`` instead UNLINKS <fleet_dir>/<unit>.json
+    (missing_ok=True), driving the verdict to "absent".
+
+    Yields a `fired` list that each transition appends its label to on
+    success -- callers' non-vacuity handle in BOTH directions: a transition a
+    test depends on asserts its label IS in `fired`; a counterfactual "trap"
+    transition the correct code must never reach asserts its label is NOT in
+    `fired`.
+
+    Cancels and joins every timer on the way out, and asserts that no
+    transition raised -- collected into a list rather than left to escape
+    silently on a background thread, so a failed rewrite can never masquerade
+    as a passing test.
+
+    Rewriting real heartbeat JSON, rather than shimming a fake `python3` onto
+    PATH to script drain_check.py's own output, is deliberate: this module's
+    own docstring records that drain_check.py is NOT mocked here -- it runs
+    for real against heartbeat files the tests write -- and a scripted-verdict
+    shim would stop exercising classify()'s fresh-window arithmetic. It would
+    also collide with `_make_fake_systemctl`'s fake, whose shebang is
+    `#!/usr/bin/env python3`: bin_dir is already first on PATH, so a fake
+    `python3` placed there would shadow it too.
+    """
+    fired = []
+    errors = []
+
+    def _apply(label, overrides):
+        try:
+            if overrides is None:
+                (Path(fleet_dir) / f"{unit}.json").unlink(missing_ok=True)
+            else:
+                _write_heartbeat(fleet_dir, unit, **overrides)
+            fired.append(label)
+        except Exception as exc:  # collected, not raised -- see docstring
+            errors.append((label, exc))
+
+    timers = []
+    for label, delay_secs, overrides in timeline:
+        timer = threading.Timer(delay_secs, _apply, args=(label, overrides))
+        timer.daemon = True
+        timers.append(timer)
+    for timer in timers:
+        timer.start()
+
+    try:
+        yield fired
+    finally:
+        for timer in timers:
+            timer.cancel()
+        for timer in timers:
+            timer.join(timeout=5)
+        assert not errors, (
+            f"heartbeat timeline transition(s) raised: {errors!r}"
+        )
+
+
+def test_busy_unit_that_drains_mid_defer_resumes_and_restarts(tmp_path):
+    """The ordinary successful outcome of a --drain redeploy: drain_gate's
+    IN-LOOP idle verdict (scripts/restart-all-orchestrators.sh:378-381). A
+    unit that goes busy, then drains WHILE deferred, must resume the restart
+    from inside the poll loop rather than waiting out the full busy grace."""
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, **_HB_BUSY)
+
+    # ONE binding feeding both the grace and the timeout -- see
+    # test_defer_withholds_restart_while_busy. Here the grace is a
+    # MUST-NEVER-BE-REACHED bound rather than a wait-proving one: if the
+    # in-loop resume regresses, the run silently consumes the spawn timeout
+    # instead of force-firing early and looking like a pass.
+    spawn_timeout = 15
+
+    with _heartbeat_timeline(fleet_dir, UNIT_R, [("idle", 2.0, _HB_IDLE)]) as fired:
+        result = _run_script(
+            bin_dir, state_path, fleet_dir, "--drain",
+            env={
+                "RESTART_VERIFY_TIMEOUT": "5",
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
+                    wait_proof_grace_secs(spawn_timeout)
+                ),
+                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            },
+            timeout=spawn_timeout,
+        )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    # Non-vacuity: proves the gate really deferred first, rather than sailing
+    # through an idle first read.
+    assert f"deferring restart of {UNIT_R}: mid-merge" in result.stdout, (
+        f"expected a defer line before the resume; got stdout={result.stdout!r}"
+    )
+    assert f"resuming restart of {UNIT_R}: drained" in result.stdout, (
+        f"expected the in-loop idle resume line; got stdout={result.stdout!r}"
+    )
+    assert "force-restarting" not in result.stdout.lower(), (
+        f"expected a resume, not a force-fire; got stdout={result.stdout!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
+    )
+    assert "idle" in fired, (
+        f"the scheduled idle transition never landed: fired={fired!r}"
     )
