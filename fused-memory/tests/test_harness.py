@@ -7081,6 +7081,88 @@ class TestHarnessFilteredTaskTreeWiring:
         # _fetch_filtered_task_tree must be called with the threaded project_root value.
         harness._fetch_filtered_task_tree.assert_called_once_with('/my/project')  # type: ignore[attr-defined]
 
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_threads_the_pre_stage_tree_read_instant_into_remediation(
+        self,
+        journal,
+        event_buffer,
+        mock_memory_service,
+    ):
+        """run_full_cycle must capture the tree-read instant BEFORE the
+        S1->S2->S3 stage loop and thread it into _run_remediation_pass as
+        filtered_task_tree_fetched_at (task 4115).
+
+        The stage loop is minutes of LLM work in production and the
+        live-workflow gate's heartbeat TTL is only 10 minutes (see
+        TestRemediationSnapshotClockPinnedToTreeRead, which pins the
+        consumption half of this fix), so an implementation that re-stamps a
+        fresh now() at remediation time — rather than reusing the instant the
+        tree was actually read at — reintroduces the bug this task exists to
+        fix. run_full_cycle computes its own instant and it cannot be
+        injected from the outside the way _run_remediation_pass's can, so
+        this test instead proves the ORDERING invariant that distinguishes a
+        correct implementation from a buggy one: the threaded instant must be
+        >= the moment the fetch returned and strictly < a timestamp recorded
+        inside the stage loop that follows it, using a real (unpatched) 50ms
+        sleep to manufacture a measurable, jitter-proof gap.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        tree = self._make_tree()
+        fetch_state: dict = {}
+
+        async def _fetch(_root):
+            fetch_state['fetched_returned_at'] = datetime.now(UTC)
+            return tree
+
+        harness._fetch_filtered_task_tree = _fetch
+
+        stage_state: dict = {}
+
+        async def _record_stage_ran(stage):
+            stage_state['stage_ran_at'] = datetime.now(UTC)
+            await asyncio.sleep(0.05)
+
+        _mock_stage_run(harness.stages[0], before_return=_record_stage_ran)
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(
+            harness.stages[2],
+            items_flagged=[_make_finding_with_cited_task('599')],
+        )
+
+        harness._run_remediation_pass = AsyncMock()
+
+        await event_buffer.push(_make_event())
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+        assert harness._run_remediation_pass.await_count == 1, (  # type: ignore[attr-defined]
+            f'Expected _run_remediation_pass to be awaited exactly once (the '
+            f"actionable finding must survive _maybe_remediate's filters); "
+            f'got {harness._run_remediation_pass.await_count} awaits'  # type: ignore[attr-defined]
+        )
+        kwargs = harness._run_remediation_pass.await_args.kwargs  # type: ignore[union-attr]
+
+        assert kwargs['filtered_task_tree'] is tree, (
+            f"Expected filtered_task_tree threaded through to be the fetched "
+            f"tree; got {kwargs['filtered_task_tree']!r}"
+        )
+        fetched_at = kwargs['filtered_task_tree_fetched_at']
+        assert fetched_at is not None, (
+            'Expected run_full_cycle to thread a non-None '
+            'filtered_task_tree_fetched_at into _run_remediation_pass'
+        )
+        assert fetched_at >= fetch_state['fetched_returned_at'], (
+            f"Expected the threaded instant ({fetched_at!r}) to be taken at or "
+            f"after _fetch_filtered_task_tree returned "
+            f"({fetch_state['fetched_returned_at']!r})"
+        )
+        assert fetched_at < stage_state['stage_ran_at'], (
+            f"Expected the threaded instant ({fetched_at!r}) to predate the "
+            f"S1->S3 stage loop ({stage_state['stage_ran_at']!r}) — an "
+            f"implementation that re-stamps a fresh now() at remediation time "
+            f"fails this ordering check"
+        )
+
 
 class TestConfigureTaskSync:
     """Unit tests for the _configure_task_sync staticmethod on ReconciliationHarness."""
