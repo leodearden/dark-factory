@@ -171,6 +171,15 @@ logger = logging.getLogger(__name__)
 # value (relative to ``now``) counts as evidence of an active workflow.
 DEFAULT_MAX_COMMIT_AGE_HOURS: float = 6.0
 
+# Default age threshold for the worktree-staleness signal (task 3947) — 28x
+# the 6 h recent-commit threshold above.  This is the DEFAULT, not merely a
+# suggested value: no production caller overrides it, so it must default ON
+# for a lingering worktree registration to ever resolve into a stale verdict
+# without caller wiring.  ``None`` or any non-positive value disables the
+# staleness check entirely (fail-safe toward live — see
+# `_worktree_age_exceeded`).
+DEFAULT_MAX_WORKTREE_AGE_HOURS: float = 168.0  # 7 days
+
 # Orchestrator branch naming convention: ``task/<id>``.
 DEFAULT_BRANCH_PREFIX: str = 'task/'
 
@@ -253,6 +262,16 @@ class WorkflowLiveness:
             ``is_live=False`` so ``if is_live`` consumers stop treating the task
             as owned, permitting the stranded-remediation path. Always False
             unless the gate fired.
+        worktree_stale: True only when a LIVE (non-prunable) worktree is
+            registered for ``branch``, the branch carries commits of its own
+            beyond ``base_branch``, and its newest commit is older than
+            ``max_worktree_age_hours`` (task 3947). ``worktree_registered``
+            itself is NEVER rewritten by this signal — it keeps reporting
+            exactly what git reports; staleness is a separate,
+            policy-thresholded judgement about the branch. Positive-evidence
+            only: an absent/unparseable tip timestamp, an unknown own-commit
+            count, or a disabled threshold (``None`` or non-positive) all
+            fail safe to False. Always False unless every conjunct holds.
     """
 
     is_live: bool
@@ -262,6 +281,7 @@ class WorkflowLiveness:
     branch: str
     last_commit_at: datetime | None
     indeterminate: bool = False
+    worktree_stale: bool = False
 
 
 def detect_live_workflow(
@@ -270,6 +290,7 @@ def detect_live_workflow(
     *,
     now: datetime | None = None,
     max_commit_age_hours: float = DEFAULT_MAX_COMMIT_AGE_HOURS,
+    max_worktree_age_hours: float | None = DEFAULT_MAX_WORKTREE_AGE_HOURS,
     branch_prefix: str = DEFAULT_BRANCH_PREFIX,
     base_branch: str = DEFAULT_BASE_BRANCH,
     status: str | None = None,
@@ -381,8 +402,14 @@ def detect_live_workflow(
 
     worktree_present, worktree_prunable = _check_worktree_registered(root, branch)
     worktree_registered = worktree_present and not worktree_prunable
+    # Hoisted once so the recent-commit and worktree-staleness age checks
+    # (task 3947) share one instant, rather than risking a skew where the two
+    # age computations straddle a `datetime.now` boundary. `_check_recent_commit`
+    # already performs exactly this None-resolution internally, so passing
+    # `reference` in here is behaviour-preserving.
+    reference = now if now is not None else datetime.now(UTC)
     last_commit_at, recent_commit = _check_recent_commit(
-        root, branch, now=now, max_commit_age_hours=max_commit_age_hours
+        root, branch, now=reference, max_commit_age_hours=max_commit_age_hours
     )
     # branch_bare: branch carries zero commits of its own beyond base_branch
     # (its tip is just the base-branch commit — reify#5245's shape). An
@@ -405,6 +432,18 @@ def detect_live_workflow(
         own_commit_count = _branch_own_commit_count(root, base_branch, branch)
         branch_bare = own_commit_count == 0
     recent_commit = recent_commit and not branch_bare
+
+    # worktree_stale (task 3947): a LIVE worktree is registered, there is no
+    # recent commit, and the branch's tip predates max_worktree_age_hours.
+    # worktree_registered is NOT rewritten here — it keeps reporting the raw
+    # git fact; staleness is a separate, policy-thresholded companion signal.
+    # Step-4 (task 3947) layers a bare-branch confirmation on top of this age
+    # check; for now this is age-only.
+    worktree_stale = (
+        worktree_registered
+        and not recent_commit
+        and _worktree_age_exceeded(last_commit_at, reference, max_worktree_age_hours)
+    )
     # orchestrator_live is the project-level lock signal (True when the
     # orchestrator process holds an active lock for this project_root, regardless
     # of which task it is currently dispatching).  Pre-computed callers may pass
@@ -466,6 +505,7 @@ def detect_live_workflow(
         branch=branch,
         last_commit_at=last_commit_at,
         indeterminate=indeterminate,
+        worktree_stale=worktree_stale,
     )
 
 
@@ -860,6 +900,29 @@ def _check_recent_commit(
     age = reference - last_commit_at
     recent_commit = age <= timedelta(hours=max_commit_age_hours)
     return last_commit_at, recent_commit
+
+
+def _worktree_age_exceeded(
+    last_commit_at: datetime | None,
+    reference: datetime,
+    max_worktree_age_hours: float | None,
+) -> bool:
+    """Return True iff *last_commit_at* is older than *max_worktree_age_hours*.
+
+    Fail-safe toward live (task 3947): returns False (not stale) unless ALL of
+    the following hold as POSITIVE evidence — ``max_worktree_age_hours`` is
+    not ``None`` and is strictly positive (``None`` or a non-positive value
+    disables the check entirely), ``last_commit_at`` is not ``None`` (the tip
+    timestamp parsed successfully), and the elapsed age STRICTLY exceeds the
+    threshold. The comparison is strict (``>``, not ``>=``) to mirror
+    :func:`_check_recent_commit`'s ``age <= timedelta(...)`` boundary, so a
+    tip exactly at the threshold is not yet considered stale.
+    """
+    if max_worktree_age_hours is None or max_worktree_age_hours <= 0:
+        return False
+    if last_commit_at is None:
+        return False
+    return reference - last_commit_at > timedelta(hours=max_worktree_age_hours)
 
 
 def _branch_own_commit_count(project_root: str, base_branch: str, branch: str) -> int | None:
