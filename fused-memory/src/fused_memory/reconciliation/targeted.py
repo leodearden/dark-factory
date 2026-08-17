@@ -682,7 +682,36 @@ class TargetedReconciler:
                     context=f'Task details: {task.get("details") or description}',
                     scope_hints=_extract_scope_hints(task),
                 )
-                if verification.verdict in ('confirmed', 'contradicted'):
+                # Task 4343: an agent that never produced a parseable verdict
+                # returns the caller-supplied default ('inconclusive'), which
+                # collides with a legitimate healthy verdict — so this branch
+                # MUST be tested before any branch that reads `verdict`, and
+                # MUST read the structured `agent_failed` flag rather than
+                # sniffing the 'agent-failed:' prefix out of `summary` prose
+                # (INV-2 structured-facts-at-failure).
+                if verification.agent_failed:
+                    logger.warning(
+                        'verification_agent_failed task=%s token=%s summary=%s',
+                        task_id, verification.failure_token, verification.summary,
+                    )
+                    result['actions'].append({
+                        'type': 'verification_agent_failed',
+                        'failure_token': verification.failure_token,
+                    })
+                    # Symmetric durable audit row for the failure path — mirrors
+                    # the task-1184 precedent below (:947-960), where the
+                    # non-raising rejection path got its own row under a distinct
+                    # action_type verb so operators can compute cardinality with a
+                    # plain WHERE clause instead of parsing detail JSON.  Here the
+                    # verb is 'verify' and the outcome is in `operation`.
+                    await self.journal.add_run_action(
+                        run_id, 'verify', 'codebase', 'agent_failed',
+                        {'task_id': task_id,
+                         'failure_token': verification.failure_token,
+                         'verdict': str(verification.verdict)},
+                        causation_id=run_id,
+                    )
+                elif verification.verdict in ('confirmed', 'contradicted'):
                     written = await self._fenced_add_memory(
                         content=f"Completed task '{title}': {verification.summary}",
                         category='observations_and_summaries',
@@ -707,6 +736,21 @@ class TargetedReconciler:
                     )
             except Exception as e:
                 logger.warning(f'Verification failed for task {task_id}: {e}')
+                # Task 4343: the RAISED failure path is the live one —
+                # agent_llm_provider defaults to 'claude_cli' and _call_llm_cli
+                # raises RuntimeError(build_failure_message(...)) when the CLI
+                # reports failure — and until now it left nothing durable.
+                # add_run_action swallows its own exceptions internally
+                # (journal.py:828+), so recording here cannot escalate a verify
+                # failure into a crash.  The try boundary above is deliberately
+                # NOT widened: _fenced_add_memory stays inside it and keeps
+                # failing closed exactly as before.
+                result['actions'].append({'type': 'verification_error', 'error': str(e)[:200]})
+                await self.journal.add_run_action(
+                    run_id, 'verify', 'codebase', 'error',
+                    {'task_id': task_id, 'error': str(e)[:500]},
+                    causation_id=run_id,
+                )
 
         # 3. Check dependent tasks — are they unblocked?
         try:
