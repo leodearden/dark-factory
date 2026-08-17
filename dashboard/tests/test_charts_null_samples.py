@@ -36,6 +36,21 @@ on its MEASURED branch, where it is what stops a real 0 — ``height: 0%``, whic
 paints nothing — from rendering exactly like a hole.  What was wrong was
 flooring the slot rather than the measurement.)
 
+THE LAST ONE IN THE FILE (task 3681) — ``HBarChart`` is the row-shaped
+primitive: its input is rows of OBJECTS behind a ``valueKey``/``labelKey``
+indirection rather than a bare values array, and its PRIMARY value was never
+guarded at all even though its segments were scrubbed with the same
+``(r[s.key] || 0)`` hole-as-zero conflation banned for StackedAreaChart above.
+It carried one failure the other five did not: the raw value went straight into
+the CALLER's formatter (``formatVal(r[valueKey])``), and both live call sites
+pass ``v => `$${v.toFixed(2)}``` (tabs.jsx), so a row missing the key threw a
+TypeError DURING RENDER and unmounted the whole Costs tab — a hole took out the
+page rather than one bar.  It now projects its rows to a values array at the
+call site and reuses ``plottableMax`` + ``barFractions`` unchanged, and the SAME
+fraction-is-null decision drives both the absent bar and the em-dash in the
+value cell, so a row's text and its bar can never disagree about whether it was
+measured.
+
 WHY THE PROBES ARE PER COMPONENT — the components' folds differ textually
 (LineChart's poisoning fold is ``Math.max(...all``, BarChart's is
 ``Math.max(...values``, StackedAreaChart's is ``Math.max(...totals``), so a
@@ -189,6 +204,26 @@ _HIST_BAR_BANNED = (
     # the pre-fix body by its own control.
 )
 
+_HBAR_CHART_BANNED = (
+    (
+        'Math.max(...rows.map',
+        'folds the axis maximum over the RAW row values, so ONE row missing '
+        'the key poisons max to NaN and EVERY row width becomes "NaN%" — an '
+        'invalid CSS length, so all the bars vanish silently, not just the '
+        'missing one',
+    ),
+    (
+        '(r[valueKey] / max) * 100',
+        'scales the raw primary value directly, so a null/missing row becomes '
+        'a zero-width bar indistinguishable from a measured zero',
+    ),
+    (
+        'r[s.key] || 0',
+        'scrubs a MISSING segment to a measured zero — the same scrub banned '
+        'for StackedAreaChart, in the last primitive still carrying it',
+    ),
+)
+
 _CONTRACTS: dict[str, _Contract] = {
     'Sparkline': _Contract(builders=('sparkSmoothPaths',), banned=_SPARKLINE_BANNED),
     'StepSpark': _Contract(builders=('sparkStepPaths',), banned=_SPARKLINE_BANNED),
@@ -217,6 +252,15 @@ _CONTRACTS: dict[str, _Contract] = {
     'HistBar': _Contract(
         builders=('plottableMax', 'barFractions'),
         banned=_HIST_BAR_BANNED,
+    ),
+    # HBarChart takes rows of OBJECTS, so it projects them to a values array at
+    # the call site (`rows.map(r => r[valueKey])`) and then uses the SAME pair
+    # the other two bar primitives do — no key-projecting export of its own.
+    # It calls barFractions TWICE by design: once for the primary values and
+    # once per row for that row's segments, both scaled against the same max.
+    'HBarChart': _Contract(
+        builders=('plottableMax', 'barFractions'),
+        banned=_HBAR_CHART_BANNED,
     ),
 }
 
@@ -736,12 +780,54 @@ _PRE_FIX_HIST_BAR = """{
   );
 }"""
 
+_PRE_FIX_HBAR_CHART = """{
+  // rows: [{ label, total, ...segments? }]; segments: [{ key, color, label }]
+  const max = Math.max(...rows.map(r => r[valueKey]), 1);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {rows.map((r, i) => {
+        const w = (r[valueKey] / max) * 100;
+        if (segments) {
+          let cum = 0;
+          return (
+            <div key={i}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
+                <span style={{ color: 'var(--fg-1)' }}>{r[labelKey]}</span>
+                <span className="mono" style={{ color: 'var(--fg-2)' }}>{formatVal(r[valueKey])}</span>
+              </div>
+              <div style={{ display: 'flex', height: 14, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
+                {segments.map(s => {
+                  const segW = ((r[s.key] || 0) / max) * 100;
+                  cum += segW;
+                  return <div key={s.key} title={`${s.label}: ${formatVal(r[s.key] || 0)}`} style={{ width: `${segW}%`, background: s.color }} />;
+                })}
+              </div>
+            </div>
+          );
+        }
+        return (
+          <div key={i}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
+              <span style={{ color: 'var(--fg-1)' }}>{r[labelKey]}</span>
+              <span className="mono" style={{ color: 'var(--fg-2)' }}>{formatVal(r[valueKey])}</span>
+            </div>
+            <div style={{ height: 6, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
+              <div style={{ width: `${w}%`, height: '100%', background: PALETTE.accent }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}"""
+
 _PRE_FIX_BODIES: dict[str, str] = {
     'Sparkline': _PRE_FIX_SPARKLINE,
     'LineChart': _PRE_FIX_LINE_CHART,
     'StackedAreaChart': _PRE_FIX_STACKED_AREA,
     'BarChart': _PRE_FIX_BAR_CHART,
     'HistBar': _PRE_FIX_HIST_BAR,
+    'HBarChart': _PRE_FIX_HBAR_CHART,
 }
 
 
