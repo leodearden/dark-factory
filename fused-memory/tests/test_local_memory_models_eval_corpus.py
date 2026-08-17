@@ -2743,6 +2743,41 @@ class _StdoutWithAFailingFlush(io.StringIO):
         raise self._exc
 
 
+class _StdoutWithAFailingWrite(io.StringIO):
+    """A stdout whose LARGE writes fail outright — the IN-BAND half of the pair above.
+
+    ``_StdoutWithAFailingFlush`` accepts every write and defers the failure to
+    the flush, which is what a *block-buffered* full disk does. A real
+    ``> /full/disk/report.txt`` also fails the other way: once the write is big
+    enough to reach the device — over the 8 KiB buffer, or on any write at all
+    when unbuffered — the ``write()`` itself raises, mid-run, with no flush
+    involved. Same errno, different frame, different handler needed.
+
+    *min_length* gates which writes fail, so the double stays usable for the
+    rest of the run rather than exploding on the first character. MEASURED on
+    ``--n 20 --dry-run``: the four stdout writes are 759, 0, 70 and 1
+    characters — the ``render_report`` body, then the ``dry-run: ...`` line and
+    its newline — so any threshold between 71 and 759 fails exactly the report
+    write. 200 is used, comfortably clear of both edges.
+
+    Keeps ``_StdoutWithAFailingFlush``'s ``io.StringIO`` base for the same
+    second job: ``StringIO.fileno()`` raises ``io.UnsupportedOperation``, so
+    this re-pins the handler's fd guard — a stream with no real descriptor must
+    not turn the reported failure into a different traceback out of the code
+    meant to prevent the first one.
+    """
+
+    def __init__(self, exc: OSError, *, min_length: int):
+        super().__init__()
+        self._exc = exc
+        self._min_length = min_length
+
+    def write(self, s: str) -> int:
+        if len(s) >= self._min_length:
+            raise self._exc
+        return super().write(s)
+
+
 class TestAStdoutFailureThatIsNotAClosedPipeIsAlsoReported:
     """``build_corpus.py --dry-run > /full/disk/report.txt``: ENOSPC is not a traceback either.
 
@@ -2751,6 +2786,14 @@ class TestAStdoutFailureThatIsNotAClosedPipeIsAlsoReported:
     ``BrokenPipeError`` keeps it for the ``| head`` shape and breaks it for the
     disk-full and disconnected-tty ones — at least as likely for a builder
     whose report is routinely redirected to a file.
+
+    Both frames a full disk can surface in are covered here, because a handler
+    on one is not a handler on the other — the same split the closed-pipe tests
+    above already make between a deferred flush and an in-band raise:
+
+    * DEFERRED — every write is accepted into the buffer and the flush fails.
+    * IN-BAND — the report write is large enough to reach the device and raises
+      from ``print`` itself, inside ``main()``, where no flush guard can see it.
     """
 
     def test_a_full_disk_on_the_final_flush_exits_run_failed_and_names_the_errno(
@@ -2778,9 +2821,56 @@ class TestAStdoutFailureThatIsNotAClosedPipeIsAlsoReported:
         assert 'No space left on device' in err
         assert 'closed the output pipe' not in err
 
+    def test_a_full_disk_on_the_report_write_itself_exits_run_failed_the_same_way(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The IN-BAND leg: ENOSPC raised by ``print``, not by a later flush.
+
+        ``_run_build``'s ``print(render_report(...), end='')`` is the one write
+        in this CLI large enough to reach the device on its own. When it fails,
+        the error is raised inside ``main()`` — which catches only
+        ``BrokenPipeError`` and ``CorpusBuildError`` — and then passes ``_cli``,
+        which catches only ``BrokenPipeError`` and ``SystemExit``. Nothing on
+        that path is looking for a plain ``OSError``, so it reaches the
+        interpreter as a raw traceback.
+
+        Asserted to land on the SAME outcome as the deferred-flush case above:
+        one handler, one message shape, one exit code, whichever frame the disk
+        filled up in. A reader comparing the two tests should see the failure
+        site differ and nothing else.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        monkeypatch.setattr(
+            sys,
+            'stdout',
+            _StdoutWithAFailingWrite(
+                OSError(errno.ENOSPC, 'No space left on device'), min_length=200
+            ),
+        )
+        capsys.readouterr()
+        code, _ = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run',
+            entry=_mod._cli,
+        )
+        monkeypatch.undo()
+        err = capsys.readouterr().err
+
+        assert code == _mod.EXIT_RUN_FAILED
+        err_lines = [line for line in err.splitlines() if line.strip()]
+        assert len(err_lines) == 1, err
+        assert err_lines[0].startswith('error: ')
+        assert 'No space left on device' in err
+        assert 'closed the output pipe' not in err
+        # --dry-run writes nothing, so the report must not claim an artifact.
+        assert not out.exists()
+
 
 def _spawn(
-    *argv, closed_stdout: bool, unbuffered: bool, closed_stderr: bool = False
+    *argv,
+    closed_stdout: bool,
+    unbuffered: bool,
+    closed_stderr: bool = False,
+    full_stdout: bool = False,
 ) -> tuple[int, str, str]:
     """Run build_corpus.py in a CHILD process and return (exit status, stdout, stderr).
 
@@ -2803,6 +2893,16 @@ def _spawn(
     stderr is then empty by construction — the exit status is the only
     observable, and the only one that matters there.
 
+    With *full_stdout*, fd 1 is ``/dev/full``, which accepts the ``open`` and
+    fails EVERY write with ``ENOSPC``: the ``> /full/disk/report.txt`` shape at
+    the process level. It is a distinct parameter rather than another flavour
+    of *closed_stdout* because a closed pipe can only ever produce ``EPIPE`` —
+    i.e. a ``BrokenPipeError``, the one stdout failure this CLI already had a
+    handler for. ``/dev/full`` is the only way to make a REAL child process
+    produce a non-``BrokenPipeError`` stdout failure, which is what separates
+    "the pipe handler catches it" from "any stdout failure is handled". Linux
+    only; callers guard with a skipif rather than assuming the device exists.
+
     *unbuffered* is set EXPLICITLY rather than inherited, and that is the whole
     point of the parameter: ``PYTHONUNBUFFERED`` decides WHERE a closed-pipe
     write fails (in-band inside ``argparse`` when unbuffered, at a later flush
@@ -2813,6 +2913,7 @@ def _spawn(
     under the harness. Pinning it here makes each regime its own case.
     """
     assert closed_stdout or not closed_stderr, 'closed_stderr shares stdout closed pipe'
+    assert not (closed_stdout and full_stdout), 'stdout gets exactly one shape'
     env = {**os.environ}
     if unbuffered:
         env['PYTHONUNBUFFERED'] = '1'
@@ -2820,7 +2921,15 @@ def _spawn(
         env.pop('PYTHONUNBUFFERED', None)
     cmd = [sys.executable, str(SCRIPT_PATH), *argv]
 
-    if not closed_stdout:
+    if full_stdout:
+        write_fd = os.open('/dev/full', os.O_WRONLY)
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=write_fd, stderr=subprocess.PIPE, env=env
+            )
+        finally:
+            os.close(write_fd)  # the child holds its own dup of the device
+    elif not closed_stdout:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     else:
         read_fd, write_fd = os.pipe()
@@ -2960,6 +3069,60 @@ class TestArgparseOutputIntoAClosedPipeExitsCleanlyToo:
         # Still reported: the usage error goes to stderr, which is NOT the
         # closed stream, so a closed stdout must not cost the diagnostic.
         assert 'unrecognized' in closed_err
+
+
+@pytest.mark.skipif(
+    not os.path.exists('/dev/full'),
+    reason='/dev/full is Linux-specific; no portable way to fail every stdout write',
+)
+class TestArgparseOutputOntoAFullDiskExitsCleanlyToo:
+    """``--help > /full/disk/help.txt``: the same leg, failing a way the pipe handler misses.
+
+    The class above pins ``--help`` into a CLOSED PIPE, whose only possible
+    errno is ``EPIPE`` — so every fix it can force is a fix to the
+    ``BrokenPipeError`` path. ``/dev/full`` fails the identical write with
+    ``ENOSPC`` instead, and that one distinction is what separates a handler
+    for one stdout failure from a handler for stdout failures.
+
+    Both buffering regimes again, because they still fail in different frames
+    and the difference is still load-bearing — MEASURED before this test was
+    written:
+
+    * BLOCK-buffered — the help text fits the buffer, ``parse_args`` raises
+      nothing, and ``_cli``'s explicit flush finds the ENOSPC. Already handled
+      by ``_flush_stdout``'s widened ``except OSError``, so this id is a
+      CONTROL that must stay green.
+    * UNBUFFERED — the write reaches ``/dev/full`` during ``parse_args``,
+      ``_LoudArgumentParser.print_help`` re-raises it, and it arrives at
+      ``_cli`` as a plain ``OSError`` where only ``BrokenPipeError`` and
+      ``SystemExit`` are being caught. This id is the RED: measured as a full
+      argparse traceback with NO ``error: `` line, which falsifies both the
+      README's "never a traceback" guarantee and the class docstring above.
+
+    So the two ids assert the same contract from opposite sides of the fix, and
+    a remedy that only widened the flush guard would leave the unbuffered one
+    red.
+    """
+
+    @_BUFFERING
+    def test_help_onto_a_full_disk_exits_run_failed_without_a_traceback(self, unbuffered):
+        code, _, err = _spawn('--help', full_stdout=True, closed_stdout=False,
+                              unbuffered=unbuffered)
+        assert code == _mod.EXIT_RUN_FAILED
+        assert 'Traceback' not in err, err
+        assert 'Exception ignored' not in err, err
+        # Counted, not merely present: the failure is legitimately observable
+        # at more than one frame on the way out, and the contract is ONE line.
+        # Counting only `error: `-prefixed lines rather than all of stderr, for
+        # the reason the class above gives — a child interpreter's stderr is
+        # not fully under this test's control, and an unrelated warning is a
+        # real signal rather than a reason to go red.
+        reported = [line for line in err.splitlines() if line.startswith('error: ')]
+        assert len(reported) == 1, err
+        # The errno text survives, because "no space left" and "the reader went
+        # away" are different remedies for the operator.
+        assert 'No space left on device' in reported[0]
+        assert 'closed the output pipe' not in err
 
 
 class TestBuilderScriptSatisfiesTheDeliveredCheck:
