@@ -589,12 +589,19 @@ abandoned work is recorded as a successful run."""
 # skills/unblock/SKILL.md, adapted for a commit-SHA subject rather than a
 # branch-ref subject: no rc=128 merge-marker search here, since that arm only
 # makes sense for a ref that merge-lane cleanup can delete out from under you.
-# It also diverges by echoing the captured rc (`echo "ancestry rc=$rc"`), which
-# the SKILL.md blocks' `cmd; rc=$?` form does not: a compound command's own
-# exit status is that of its LAST statement, so `cmd; rc=$?` always reports
-# exit 0 to the calling tool no matter what `cmd` did. The SKILL.md blocks
-# carry this identical silent-rc gap (confirmed against real git during task
-# 3406's step-8 amendment) but fixing them is outside this task's file scope.
+# It also echoes the captured rc (`echo "ancestry rc=$rc"`) -- necessary
+# because a compound command's own exit status is that of its LAST statement,
+# so `cmd; rc=$?` always reports exit 0 to the calling tool no matter what
+# `cmd` did. The SKILL.md blocks had this same silent-rc gap, but it is now
+# CLOSED: skills/merge-queue/SKILL.md and skills/unblock/SKILL.md's own `git
+# merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"`
+# lines both now carry the same echo, back-ported by task 3467 (commit
+# 45d19bf899) -- so this is a shared convention across all three blocks, not a
+# roles.py-only divergence. One divergence remains: unlike the SKILL.md
+# blocks, this block's rc=1 arm (task 4107) explicitly forbids `git fetch`
+# and points at `mcp__escalation__merge_status` instead, because a spurious
+# rc=1 here is fixed temporally -- only the merge worker's own local ref
+# write ever advances the shared `main` this block checks against.
 ANCESTRY_CHECK_INSTRUCTIONS = """\
     git -C <project_root> merge-base --is-ancestor <sha> main; rc=$?; echo "ancestry rc=$rc"
     # The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
@@ -606,12 +613,34 @@ ANCESTRY_CHECK_INSTRUCTIONS = """\
     # it away.
     # rc=0   -> <sha> IS on main. Proceed with the set_task_status call.
     # rc=1   -> <sha> resolves here but is NOT reachable from the `main` ref as it
-    #           stands in THIS checkout. Usually the SHA is wrong (it is only on a
-    #           feature branch) -- but this checkout's `main` can also simply be
-    #           behind (a just-submitted merge, an unfetched <project_root>). If
-    #           that is plausible, run `git -C <project_root> fetch --all` and
-    #           re-run once before concluding. Still rc=1 after that -> the SHA
-    #           really is off main; re-derive the landing commit.
+    #           stands in THIS checkout. Usually the SHA is wrong (only on a feature
+    #           branch) -- but the other real cause is that the merge has not landed
+    #           YET. `refs/heads/main` moves only via the merge worker's own local CAS,
+    #           `git update-ref refs/heads/main <new> <old>` in `GitOps.advance_main`;
+    #           every worktree reads that one shared ref out of the common `.git` dir,
+    #           so a landed advance is visible here immediately, with no sync step.
+    #           Do NOT run `git fetch` / `git fetch --all` here for THIS rc=1
+    #           comparison -- verified no-op: fetch writes only `refs/remotes/*`
+    #           and the object store, so it cannot move `refs/heads/main`, and
+    #           re-running afterward reproduces the same rc=1, the exact false
+    #           "really off main" verdict this block exists to prevent. (fetch
+    #           remains the right move under rc=128 below -- there the missing
+    #           thing is an unresolvable OBJECT, not a ref position.) More
+    #           generally, no local sync/advance operation helps THIS
+    #           comparison -- only the merge worker's own ref write does -- and
+    #           two of them are actively dangerous, not merely useless: `git
+    #           pull` WOULD move `refs/heads/main` (it merges origin/main into
+    #           the checked-out branch), racing the merge worker's own CAS `git
+    #           update-ref refs/heads/main <new> <old>` in `GitOps.advance_main`;
+    #           `fetch origin main:main` fails HARD instead (git refuses to
+    #           write a ref checked out in a worktree). Never run either in an
+    #           orchestrator checkout. If a merge may still be in flight,
+    #           confirm instead with `mcp__escalation__merge_status(request_id=
+    #           <from merge_request>)`, or `merge_status(task_id=<task>)` /
+    #           `merge_status(branch=<branch>)` when you have no request_id,
+    #           then re-run this same check once it reports the merge landed.
+    #           Still rc=1 after that -> the SHA really is off main; re-derive
+    #           the landing commit.
     # rc=128 -> git cannot resolve <sha> (or `main`) in this checkout: "fatal: Not a
     #           valid object name". This is NOT "not on main" -- it is "not yet
     #           confirmed". Usually a stale/unfetched <project_root>, a wrong -C path,
@@ -1652,6 +1681,15 @@ convert it into a task candidate and then close it:
         'mcp__escalation__get_escalation',
         'mcp__escalation__get_pending_escalations',
         'mcp__escalation__merge_request',
+        # Read-only merge-state query. Required, not optional: the rc=1 arm of
+        # ANCESTRY_CHECK_INSTRUCTIONS (spliced into this prompt at both
+        # "Marking tasks done" call sites) forbids `git fetch` as a remedy --
+        # it cannot move `refs/heads/main` -- and directs the steward to
+        # confirm an in-flight merge via `merge_status` instead. allowed_tools
+        # is passed to the SDK as an allowlist (steward.py), so omitting this
+        # would leave the block's only prescribed rc=1 remedy behind a
+        # permission denial, with the fetch fallback already forbidden.
+        'mcp__escalation__merge_status',
         *_STEWARD_MEMORY_TOOLS,
         *_JCODEMUNCH_TOOLS,
     ],
