@@ -1148,6 +1148,17 @@ class TestAddFindingWrapperActionableDefault:
         )
         assert actionable is True
 
+    @pytest.mark.asyncio
+    async def test_explicit_false_with_normal_task_id_stays_false(self):
+        """The wrapper path is where an explicit False is most likely to be
+        mis-serialized (e.g. bool coercion, or a static default overriding
+        the None sentinel), so pin it end-to-end through call_tool."""
+        state, mcp = self._make()
+        actionable = await self._actionable_via_call_tool(
+            state, mcp, actionable=False, task_id='456', flag_type='orphaned_knowledge',
+        )
+        assert actionable is False
+
 
 # ---------------------------------------------------------------------------
 # step-17: _build_recon_report_components helper in main.py — RED until step-18
