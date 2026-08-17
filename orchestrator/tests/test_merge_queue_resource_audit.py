@@ -755,6 +755,111 @@ class TestWorktreeLedgerViolations:
 
         assert worker.worktree_ledger_violations(now=self._NOW) == []
 
+    # -- task 3622: the reclaim DISPOSITION carried in the violation string --
+    #
+    # Detection now fires well before escalation does, so an operator reading
+    # the WARNING log or snapshot()['resource_audit']['worktree_ledger'] sees
+    # violations that are self-healing and violations that are stuck, with
+    # nothing to tell them apart. The string itself carries the distinction —
+    # it is the single value that flows to all three consumers (log line,
+    # snapshot census, escalation body), so annotating it once reaches every
+    # consumer with no snapshot key churn (those are pinned by exact dict
+    # equality in three places).
+
+    _REAP_AGE = 200.0  # test-scale PERIODIC_REAP_MIN_AGE_SECS (destruction floor)
+
+    def test_leak_inside_the_reclaim_window_is_marked_as_scheduled(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._REAP_AGE
+        wt = _mkdir_worktree(git_ops, '_merge-inband', mtime=self._NOW - 150.0)
+
+        violations = worker.worktree_ledger_violations(now=self._NOW)
+
+        assert len(violations) == 1
+        v = violations[0]
+        assert 'scheduled for automatic reclaim' in v
+        # Names the age at which reclaim comes due, so the reader can tell how
+        # long the self-healing window still has to run.
+        assert '200s' in v, f'expected the destruction floor named, got: {v!r}'
+        assert 'overdue' not in v
+
+    def test_leak_past_the_destruction_floor_is_marked_overdue(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._REAP_AGE
+        _mkdir_worktree(git_ops, '_merge-stuck', mtime=self._NOW - 300.0)
+
+        violations = worker.worktree_ledger_violations(now=self._NOW)
+
+        assert len(violations) == 1
+        v = violations[0]
+        assert 'reclaim overdue' in v
+        assert 'scheduled for automatic reclaim' not in v
+
+    def test_annotated_string_preserves_the_path_and_age_grace_figures(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The annotation is APPENDED — the pre-existing leading text is
+        byte-identical, so the substring/count assertions elsewhere in this
+        suite and in the reaper/lifecycle gates keep holding.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._REAP_AGE
+
+        inband = _mkdir_worktree(git_ops, '_merge-a', mtime=self._NOW - 150.0)
+        stuck = _mkdir_worktree(git_ops, '_merge-b', mtime=self._NOW - 300.0)
+
+        violations = worker.worktree_ledger_violations(now=self._NOW)
+        assert len(violations) == 2
+        by_path = {p: v for p in (inband, stuck) for v in violations if str(p.resolve()) in v}
+        assert len(by_path) == 2, f'each path must appear in exactly one violation: {violations!r}'
+
+        for path, v in by_path.items():
+            assert v.startswith(
+                f'unregistered on-disk merge worktree {path.resolve()} '
+            ), f'leading text must be unchanged, got: {v!r}'
+            assert f'grace {self._GRACE:.0f}s' in v
+            assert 'absent from owned ledger — possible leak' in v
+
+    def test_snapshot_census_carries_the_same_annotated_strings(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The disposition reaches snapshot()['resource_audit'] through the
+        string, with no new sub-key (those are pinned by exact dict equality).
+        """
+        import time
+
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._REAP_AGE
+        # snapshot() calls the audit with no `now`, so back-date off the real
+        # clock to land the tree inside the reclaim window.
+        _mkdir_worktree(git_ops, '_merge-snap', mtime=time.time() - 150.0)
+
+        census = worker.snapshot()['resource_audit']['worktree_ledger']
+
+        assert len(census) == 1
+        assert 'scheduled for automatic reclaim' in census[0]
+        # Still structurally identical to a direct call (the pin at
+        # test_resource_audit_is_additive_and_matches_direct_audit_calls).
+        assert set(worker.snapshot()['resource_audit']) == {
+            'speculation_accounting', 'worktree_ledger',
+        }
+
     # -- task 3622: the `grace_secs` floor override ------------------------
     #
     # Mirrors reap_orphaned_merge_worktrees' `min_age_secs` idiom (same
