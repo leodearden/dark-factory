@@ -145,10 +145,17 @@ mismatches the binding its first SessionStart stamped -- and reading that as
 spawn-claude.sh's converged one at ``running``, re-introducing the exact
 task-2511 split for any spawned session the user ``/clear``s.
 
-These two discriminate because they have no command-line spelling: only the
-process already holding the session can produce them. On them the ownership
-probe adopts anyway and ``run_session_start`` RE-binds the fresh id, so the
-record keeps tracking the session it belongs to.
+These two have no command-line spelling, so the emitter is always a process
+that already holds a session. That is NECESSARY but NOT SUFFICIENT: it
+proves the emitter holds *a* session, not *this* one. A nested ``claude``
+holds a session too, and automatic compaction fires ``source='compact'``
+with no user action at all, so any nested ``claude -p`` that runs long
+enough emits one (task 4193 review). Membership here is therefore only the
+FIRST of two conditions -- ``_env_slug_is_owned`` additionally requires the
+event's owning process pid to equal the ``claude_owner_pid`` bound on the
+record. Both together mean the re-mint really did happen inside the owning
+process, and ``run_session_start`` RE-binds the fresh id so the record keeps
+tracking the session it belongs to.
 
 ``'resume'`` is deliberately EXCLUDED even though it is also a re-mint:
 Claude Code emits it for ``--resume``/``--continue`` as well as an
@@ -159,6 +166,13 @@ inheritor RE-bind its spawner's record to itself -- inverting ownership
 without any hook fault. A spawned session ``/resume``d in place forks onto
 its own record and recovers on its next ``/clear``/compact -- the fail-safe
 direction, and strictly better than the inversion.
+
+Note ``'compact'`` is NOT dropped for the same reason, because it is
+automatic: dropping it would fork the OWNER's own record on every routine
+auto-compaction, re-introducing the task-2511 split for a far more common
+event than the inversion it would prevent. Measured both ways before
+choosing (task 4193 review) -- the pid condition fixes both directions
+instead of trading one for the other.
 """
 
 
@@ -238,9 +252,23 @@ def _env_slug_is_owned(
         return True
     if bound == hook_session_id:
         return True
-    # Not an inheritor if only the owning PROCESS could have fired this
-    # event: Claude Code re-mints session_id in place on /clear.
-    return allow_remint and _is_owner_only_session_start(hook_input)
+    # A re-mint is forgiven only when the OWNING PROCESS is the one
+    # presenting it. The `source` string alone proves the emitter holds *a*
+    # session, not *this* one -- and automatic compaction fires
+    # source='compact' with no user action, so any nested `claude -p` that
+    # runs long enough reaches this branch (task 4193 review). The pid bound
+    # at stamp time is the discriminator: /clear and compaction happen
+    # inside the owning process and keep its pid; a nested claude cannot.
+    if not (allow_remint and _is_owner_only_session_start(hook_input)):
+        return False
+    owner_pid = record.claude_owner_pid
+    if owner_pid is None:
+        # Legacy record bound before the pid existed, or a bind where it
+        # could not be resolved. Ownership is unprovable, so take the
+        # fail-safe direction the module already prefers: fork onto our own
+        # record rather than risk inverting the spawner's.
+        return False
+    return owner_pid == _owning_claude_pid()
 
 
 def _resolve_hook_slug(
@@ -382,6 +410,12 @@ def _bind_claude_session_id(
     if bound and not allow_rebind:
         return False
     record.claude_session_id = hook_session_id
+    # Stamp the owning process alongside the id, in the same mutation: the
+    # pid is what lets a later re-mint (/clear, automatic compaction) be
+    # told apart from a nested claude presenting a different id. None when
+    # it cannot be resolved -- recorded honestly rather than guessed, and
+    # read back as "cannot prove ownership".
+    record.claude_owner_pid = _owning_claude_pid()
     return True
 
 
@@ -479,6 +513,31 @@ def _parent_pid_of(pid: int) -> int | None:
                 return int(line.split()[1])
     except (OSError, ValueError, IndexError):
         return None
+    return None
+
+
+def _owning_claude_pid() -> int | None:
+    """The pid of the ``claude`` process that fired THIS hook event, or None.
+
+    The hook process tree is ``claude -> <hook>.sh -> python``, so this
+    process's grandparent IS the claude that fired the event -- the same
+    resolution ``_nested_claude_liveness_pid`` already relies on, reused here
+    as an OWNERSHIP discriminator rather than a liveness one.
+
+    Note what this is NOT: an ancestry test. "Is this process a descendant of
+    the spawn launcher" cannot discriminate, because a nested ``claude`` is
+    also a descendant (task 4193 detail item 4). This is an EQUALITY test on
+    one specific process's identity: a ``/clear`` or an automatic compaction
+    happens INSIDE the owning process, which keeps its pid, whereas a nested
+    ``claude`` is a different process and can never present the same one.
+
+    Returns None -- never raises -- wherever the grandparent cannot be
+    resolved (no ``/proc``, a mid-read race, a reparented hook). Callers
+    treat None as "cannot prove ownership" and take the fail-safe branch.
+    """
+    grandparent = _parent_pid_of(os.getppid())
+    if grandparent is not None and grandparent > 1:
+        return grandparent
     return None
 
 

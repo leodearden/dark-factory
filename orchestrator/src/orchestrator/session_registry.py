@@ -199,6 +199,21 @@ class Question:
         return cls(text=data['text'], asked_at=data['asked_at'])
 
 
+def _coerce_owner_pid(value: Any) -> int | None:
+    """Read ``claude_owner_pid`` from a record body, tolerating junk.
+
+    A bool is rejected before the int check (``bool`` IS an ``int`` in
+    Python, and ``True`` would silently become pid 1). Anything else that is
+    not a positive int -- absent, null, a string, a float, 0, a negative --
+    reads as None, i.e. "no owner pid bound". Never raises: this is on
+    ``from_dict``'s path, and a hand-edited or older record body must not be
+    what breaks a session hook.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
 @dataclass
 class SessionRecord:
     """One session-registry record — ``<fleet_root>/sessions/<slug>/record.json``.
@@ -240,6 +255,15 @@ class SessionRecord:
         ``session_hooks.hook_session_slug`` compares it against the current
         hook's stdin session_id to tell the session spawn-claude.sh launched
         from a nested claude that merely inherited CLAUDE_SPAWN_SESSION_ID.
+    claude_owner_pid: pid of the ``claude`` PROCESS that bound
+        ``claude_session_id``, stamped at the same moment, or None for a
+        record bound before this field existed (or where the pid could not
+        be resolved). Claude Code RE-MINTS ``session_id`` in place on
+        ``/clear`` and on automatic compaction, so a session_id mismatch
+        alone cannot tell "the owner re-minted" from "a nested claude
+        inherited the env var". The owning process keeps its pid across a
+        re-mint; a nested ``claude`` never shares it. See
+        ``session_hooks._env_slug_is_owned``.
     """
 
     session_slug: str
@@ -262,6 +286,7 @@ class SessionRecord:
     display: Display | None = field(default=None, kw_only=True)
     question: Question | None = field(default=None, kw_only=True)
     claude_session_id: str | None = field(default=None, kw_only=True)
+    claude_owner_pid: int | None = field(default=None, kw_only=True)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain, JSON-scalar-only dict (status as its wire string)."""
@@ -286,6 +311,7 @@ class SessionRecord:
             'display': self.display.to_dict() if self.display is not None else None,
             'question': self.question.to_dict() if self.question is not None else None,
             'claude_session_id': self.claude_session_id,
+            'claude_owner_pid': self.claude_owner_pid,
         }
 
     @classmethod
@@ -313,6 +339,7 @@ class SessionRecord:
             display=Display.from_dict(display_data) if isinstance(display_data, dict) else None,
             question=Question.from_dict(question_data) if isinstance(question_data, dict) else None,
             claude_session_id=data.get('claude_session_id'),
+            claude_owner_pid=_coerce_owner_pid(data.get('claude_owner_pid')),
         )
 
     def to_json(self) -> str:

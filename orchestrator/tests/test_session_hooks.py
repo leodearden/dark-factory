@@ -1127,10 +1127,14 @@ def test_bind_claude_session_id_ignores_a_blank_stdin_session_id() -> None:
 
 def test_hook_session_slug_adopts_env_slug_when_a_clear_remints_the_session_id(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # /clear mints a new session_id in the SAME process, so the owning
     # session's own SessionStart legitimately mismatches its binding.
     # Reading that as an inheritor would re-introduce the task-2511 split.
+    # "SAME process" is load-bearing and now checked: the bound
+    # claude_owner_pid must match the pid resolved for this event.
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 424_242)
     slug = 'session-cockpit-3215080'
     sr.write_record(
         sr.SessionRecord(
@@ -1138,6 +1142,7 @@ def test_hook_session_slug_adopts_env_slug_when_a_clear_remints_the_session_id(
             status=sr.Status.RUNNING,
             launcher_pid=3215080,
             claude_session_id='uuid-before-clear',
+            claude_owner_pid=424_242,
         ),
         root=tmp_path,
     )
@@ -1183,10 +1188,18 @@ def test_hook_session_slug_does_not_forgive_a_resume_remint(tmp_path: Path) -> N
 @pytest.mark.parametrize('source', ['clear', 'compact'])
 def test_run_session_start_rebinds_on_an_owner_only_source(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     source: str,
 ) -> None:
     # ... and the record is RE-bound to the new id, so the session stays
     # discriminable from a nested claude on every subsequent event.
+    #
+    # claude_owner_pid is stamped to the SAME process this hook resolves,
+    # which is what makes the re-mint provably the owner's. Source alone is
+    # not enough: auto-compaction fires source='compact' unprompted, so a
+    # nested claude reaches this path too and must NOT be forgiven -- see
+    # test_nested_compact_cannot_invert_ownership.
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 424_242)
     slug = f'session-cockpit-321508{["clear", "compact"].index(source) + 1}'
     sr.write_record(
         sr.SessionRecord(
@@ -1194,6 +1207,7 @@ def test_run_session_start_rebinds_on_an_owner_only_source(
             status=sr.Status.RUNNING,
             launcher_pid=3215081,
             claude_session_id='uuid-before',
+            claude_owner_pid=424_242,
         ),
         root=tmp_path,
     )
@@ -2797,3 +2811,82 @@ def test_session_start_sh_converges_onto_pre_written_launching_record(tmp_path: 
     dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
     assert len(dirs) == 1
     assert dirs[0].name == slug
+
+
+def test_nested_compact_cannot_invert_ownership(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Automatic compaction fires SessionStart source='compact' with NO user
+    # action, so any nested `claude -p` that runs long enough reaches the
+    # remint path. Source alone proves the emitter holds *a* session, not
+    # *this* one -- so without the pid condition a nested compact REBOUND the
+    # spawner's record to itself and forced the true owner to fork, i.e. a
+    # full ownership inversion plus the task-2511 split, reached by routine
+    # agent behaviour with no hook fault.
+    slug = 'session-cockpit-4400010'
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=4400010,
+            result_file='/tmp/result-4400010.md',
+        ),
+        root=tmp_path,
+    )
+    owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'}
+    sh.run_session_start(owner, env, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).claude_owner_pid is not None
+
+    # A DIFFERENT process (the nested claude) presenting an auto-compact.
+    monkeypatch.setattr(sh, '_owning_claude_pid', lambda: 999_001)
+    nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory', 'source': 'compact'}
+    sh.run_session_start(nested, env, root=tmp_path)
+
+    spawner = sr.read_record(slug, root=tmp_path)
+    assert spawner.claude_session_id == 'uuid-owner'      # NOT rebound
+    assert spawner.result_file == '/tmp/result-4400010.md'
+    forked = sr.read_record(sh.hook_session_slug(nested, env, root=tmp_path), root=tmp_path)
+    assert forked.claude_session_id == 'uuid-nested'
+
+
+def test_owner_auto_compact_still_converges_on_its_own_record(tmp_path: Path) -> None:
+    # The other direction, and the reason 'compact' is not simply dropped
+    # from the owner-only set: auto-compaction is routine, so forking on it
+    # would re-introduce the task-2511 split for the OWNER on a far more
+    # common event than the inversion it would prevent. Same process => same
+    # pid => the re-mint is forgiven and the record stays converged.
+    slug = 'session-cockpit-4400011'
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    sr.write_record(
+        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=4400011),
+        root=tmp_path,
+    )
+    sh.run_session_start({'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'}, env, root=tmp_path)
+
+    remint = {'session_id': 'uuid-owner-2', 'cwd': '/home/leo/src/dark-factory', 'source': 'compact'}
+    sh.run_session_start(remint, env, root=tmp_path)
+
+    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-owner-2'
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+
+
+def test_legacy_record_without_owner_pid_forks_rather_than_reinverting(
+    tmp_path: Path,
+) -> None:
+    # A record bound before claude_owner_pid existed cannot prove ownership.
+    # Unprovable must take the fail-safe direction the module already
+    # prefers -- fork onto our own record -- never "adopt anyway", which is
+    # exactly the inversion this condition exists to stop.
+    slug = 'session-cockpit-4400012'
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug, status=sr.Status.RUNNING, launcher_pid=4400012,
+            claude_session_id='uuid-owner',  # bound, but no owner pid
+        ),
+        root=tmp_path,
+    )
+    remint = {'session_id': 'uuid-other', 'cwd': '/home/leo/src/dark-factory', 'source': 'compact'}
+    sh.run_session_start(remint, env, root=tmp_path)
+
+    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-owner'
+    assert sr.read_record(
+        sh.hook_session_slug(remint, env, root=tmp_path), root=tmp_path
+    ).claude_session_id == 'uuid-other'
