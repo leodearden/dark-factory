@@ -243,3 +243,148 @@ def test_a_run_that_compares_nothing_never_reports_parity(
     out = capsys.readouterr().out
     assert rc != 0
     assert "[ok] parity" not in out
+
+
+# ---------------------------------------------------------------------------
+# The DROP-IN layer  (step-5 / step-6)
+# ---------------------------------------------------------------------------
+#
+# These encode the task's core finding. In every test below the two unit files
+# are BYTE-IDENTICAL, so the file layer above has nothing to say — which is
+# exactly the silent pass that let an override survive reinstallation
+# unreported.
+
+# The real observed instance, verbatim in shape: a drop-in pinning
+# WorkingDirectory at a worktree that has since landed and been deleted, so the
+# arms would serve a frozen tree while everyone believed they ran merged main.
+_WORKTREE_DROPIN = (
+    "[Service]\nWorkingDirectory=/home/leo/src/dark-factory/.worktrees/3713\n"
+)
+
+
+def _plant_dropin(
+    installed_dir: pathlib.Path, name: str, text: str
+) -> pathlib.Path:
+    """Write a drop-in under ``<installed-dir>/lms-arm@.service.d/``."""
+    dropin_dir = installed_dir / f"{UNIT_NAME}.d"
+    dropin_dir.mkdir(parents=True, exist_ok=True)
+    dropin = dropin_dir / name
+    dropin.write_text(text, encoding="utf-8")
+    return dropin
+
+
+def test_a_dropin_over_an_identical_unit_is_not_parity(
+    tmp_path: pathlib.Path, capsys
+):
+    """BYTE-IDENTICAL unit files plus a drop-in must NOT report parity.
+
+    This is the behavioural claim the whole task rests on. `systemctl --user
+    edit` never modifies the unit file; it writes `<unit>.d/override.conf`,
+    which systemd merges OVER the unit at load time. So every compared
+    directive can match character for character while the EFFECTIVE
+    WorkingDirectory is a frozen worktree — the exact silent pass the old
+    file-presence self-verify gave.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+    dropin = _plant_dropin(installed_dir, "10-worktree-3713.conf", _WORKTREE_DROPIN)
+
+    # Precondition: the file layer genuinely has nothing to report.
+    assert (installed_dir / UNIT_NAME).read_bytes() == (
+        repo_root / REPO_RELPATH
+    ).read_bytes()
+
+    rc = checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=_clean_probe(repo_root),
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[override]" in out
+    assert str(dropin) in out
+    assert "[ok] parity" not in out
+
+
+def test_every_applying_dropin_is_named_by_path(tmp_path: pathlib.Path, capsys):
+    """EVERY applying drop-in is named, not just a count and not just the first.
+
+    systemd merges all of them, so a report naming one leaves the operator
+    fixing half the problem and re-running into the same red.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+    first = _plant_dropin(installed_dir, "10-worktree-3713.conf", _WORKTREE_DROPIN)
+    second = _plant_dropin(
+        installed_dir, "20-limits.conf", "[Service]\nTimeoutStartSec=60\n"
+    )
+
+    rc = checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=_clean_probe(repo_root),
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert str(first) in out
+    assert str(second) in out
+
+
+def test_dropin_report_is_worded_apart_from_drift(tmp_path: pathlib.Path, capsys):
+    """The [override] block is not phrased as a directive diff.
+
+    Same wording discipline check_dashboard_unit_parity applies, for the same
+    reason: an operator sent hunting for a directive diff that does not exist
+    wastes the trip. The unit files matched; what could not be established is
+    that the EFFECTIVE configuration matches. So the block must say that, and
+    must name how to inspect the merged result.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+    _plant_dropin(installed_dir, "10-worktree-3713.conf", _WORKTREE_DROPIN)
+
+    checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=_clean_probe(repo_root),
+    )
+
+    out = capsys.readouterr().out
+    override_lines = [line for line in out.splitlines() if "[override]" in line]
+    assert override_lines
+
+    override_text = "\n".join(override_lines)
+    assert "EFFECTIVE" in override_text
+    assert "systemctl --user cat" in override_text
+    # The unit files DID match, so the override block must not be phrased as a
+    # directive difference between them.
+    assert "[drift]" not in out
+
+
+def test_a_dropin_is_never_removed_by_the_checker(tmp_path: pathlib.Path, capsys):
+    """Reporting an override never deletes it. Fail loud, do not "fix".
+
+    Task 3750's finding is that the observed drop-in was LOAD-BEARING while
+    its worktree was unmerged: removing it then would have pointed every arm
+    at a directory with no launcher. Removal has a correct owner already,
+    scripts/remove-lms-arm-worktree-dropin.sh, which gates it behind
+    preconditions a general-purpose parity checker has no business
+    re-implementing.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+    dropin = _plant_dropin(installed_dir, "10-worktree-3713.conf", _WORKTREE_DROPIN)
+
+    rc = checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=_clean_probe(repo_root),
+    )
+    capsys.readouterr()
+
+    assert rc == 1
+    assert dropin.is_file()
+    assert dropin.read_text(encoding="utf-8") == _WORKTREE_DROPIN
+    assert dropin.parent.is_dir()
