@@ -4937,6 +4937,39 @@ async def test_validate_done_provenance_operational_verified_rejects_recon_stage
     assert 'recon' in err['reason'].lower()
 
 
+@pytest.mark.asyncio
+async def test_validate_done_provenance_missing_kind_lists_every_valid_kind(tmp_path):
+    """The kind-is-required message must enumerate EVERY kind the Literal
+    declares, derived — an agent that omits kind reads this message to pick
+    one, and a hardcoded subset misdirects it (task 2273 / 2490)."""
+    from typing import get_args
+
+    from fused_memory.middleware.task_interceptor import (
+        _DONE_PROVENANCE_KINDS_TEXT,
+        _validate_done_provenance,
+    )
+    from shared.task_metadata import DoneProvenance
+
+    # Non-empty dict WITHOUT 'kind' -> the kind-is-None branch. ({} would take
+    # the earlier missing-provenance branch instead.)
+    err, resolved = await _validate_done_provenance(
+        '1', {'commit': 'deadbeef'}, str(tmp_path), require=False,
+    )
+
+    assert resolved is None
+    assert err is not None
+    assert err['error'] == 'done_provenance_invalid'
+    # Structural: the list is INTERPOLATED, so re-hardcoding fails here even
+    # if the hardcoded copy happens to be complete on the day it is written.
+    assert _DONE_PROVENANCE_KINDS_TEXT in err['reason']
+    # Semantic, and self-extending: an 8th kind added to the Literal is
+    # covered with no test edit. Quoting makes each check exact —
+    # '"deterministic-deploy"' is not a substring of
+    # '"deterministic-deploy-scheduled"'.
+    for kind in get_args(DoneProvenance.model_fields['kind'].annotation):
+        assert f'"{kind}"' in err['reason'], f'{kind} missing from: {err["reason"]}'
+
+
 # ── Task 3455: honest git-probe rejection wording ───────────────────────
 #
 # These tests pin the message prefix `_validate_done_provenance` emits for
