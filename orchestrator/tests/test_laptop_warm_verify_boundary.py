@@ -391,11 +391,37 @@ def _read_direct_children(pid: int) -> set[int] | None:
     the arrange-phase discovery gate.  The descendant set actually returned
     (and every kill assertion in this module) still comes from the production
     walkers ``collect_descendants``/``read_ppid_map``.
+
+    TRI-STATE, and the third state is load-bearing:
+
+    * ``set()``  -- leader is live and has forked nothing yet.  A cheap
+      NEGATIVE: the caller can skip the expensive walk this tick.
+    * ``{pid, ...}`` -- direct children exist; worth confirming with the
+      production walker.
+    * ``None``   -- CANNOT probe.  Either the ``children`` files are absent
+      (a kernel built without ``CONFIG_PROC_CHILDREN``) or ``/proc/<pid>``
+      itself is gone (the leader exited mid-poll).  The caller must fall back
+      to the full walk for that tick; conflating this with the cheap negative
+      would make the poll spin to its timeout on such a kernel, and letting
+      the OSError escape would turn a leader exiting mid-poll into an
+      unhandled error inside the timeout diagnostic.
+
+    Any OSError anywhere in the read -- and an empty ``task`` listing, which
+    means the same thing -- collapses to ``None``.  Distinguishing "no
+    CONFIG_PROC_CHILDREN" from "this thread just exited" would buy nothing:
+    both answers are "don't trust the probe on this tick", and the fallback
+    they select is precisely this helper's pre-4014 behaviour.
     """
     children: set[int] = set()
-    for tid_dir in (Path('/proc') / str(pid) / 'task').iterdir():
-        raw = (tid_dir / 'children').read_text()
-        children.update(int(token) for token in raw.split())
+    try:
+        tid_dirs = list((Path('/proc') / str(pid) / 'task').iterdir())
+        if not tid_dirs:
+            return None  # raced the leader's exit; the /proc entry emptied out
+        for tid_dir in tid_dirs:
+            raw = (tid_dir / 'children').read_text()
+            children.update(int(token) for token in raw.split())
+    except OSError:
+        return None
     return children
 
 
@@ -471,8 +497,11 @@ def wait_subtree_live(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         # Cheap probe FIRST: pay the ~50ms full-/proc rescan only on the tick
-        # that can actually yield a descendant set (task 4014).
-        if probe(pgid):
+        # that can actually yield a descendant set (task 4014).  `None` means
+        # the probe could not answer (no CONFIG_PROC_CHILDREN, or the leader
+        # exited) -- fall through to the full walk, i.e. pre-4014 behaviour.
+        direct = probe(pgid)
+        if direct is None or direct:
             descendants = collect_descendants(pgid, ppid_map())
             if descendants:
                 return descendants
