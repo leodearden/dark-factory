@@ -17650,11 +17650,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             return
         try:
             import httpx as httpx_mod
-            async with httpx_mod.AsyncClient() as client:
+            from shared.mcp_post import (
+                MCP_POST_HEADERS,
+                check_mcp_post_response,
+                mcp_endpoint_url,
+            )
+            async with httpx_mod.AsyncClient(follow_redirects=True) as client:
                 for arguments in arguments_list:
                     try:
-                        await client.post(
-                            f'{self._mcp.url}/mcp/',
+                        resp = await client.post(
+                            mcp_endpoint_url(self._mcp.url),
+                            headers=MCP_POST_HEADERS,
                             json={
                                 'jsonrpc': '2.0',
                                 'id': 1,
@@ -17665,6 +17671,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 },
                             },
                             timeout=10,
+                        )
+                        check_mcp_post_response(
+                            resp, context='main-health fix task submit',
                         )
                     except Exception as exc:
                         logger.warning(
