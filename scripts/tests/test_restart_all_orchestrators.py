@@ -842,3 +842,83 @@ def test_busy_unit_that_drains_mid_defer_resumes_and_restarts(tmp_path):
     assert "idle" in fired, (
         f"the scheduled idle transition never landed: fired={fired!r}"
     )
+
+
+@pytest.mark.parametrize(
+    "verdict_label, overrides", [("stale", _HB_STALE), ("absent", None)],
+    ids=["stale", "absent"],
+)
+def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
+    tmp_path, verdict_label, overrides,
+):
+    """A unit that stops heartbeating WHILE deferred (e.g. it crashed
+    mid-merge) must drop into the shorter bounded stale/absent grace instead
+    of waiting out the rest of the busy grace -- drain_gate's in-loop
+    stale/absent re-classification (scripts/restart-all-orchestrators.sh:
+    382-404) and its else arm (400-402). Parametrized over the two ways a
+    dead unit stops reporting: its heartbeat ages out ("stale") or its file
+    disappears entirely ("absent") -- drain_gate treats both identically.
+
+    The busy grace (60s, via wait_proof_grace_secs) and the unknown grace (0s)
+    are deliberately asymmetric, and that asymmetry IS the assertion: this
+    run only completes in a few seconds because ORCH_DRAIN_UNKNOWN_GRACE_SECS
+    is 0. A regression that kept waiting out the 60s busy grace instead would
+    still eventually restart with the same "proceeding" text, but only after
+    consuming the whole busy grace -- which is exactly what the RED proof
+    (mutant MB) demonstrates via `_run_script`'s own timeout.
+    """
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, **_HB_BUSY)
+
+    # ONE binding feeding both the grace and the timeout -- see
+    # test_defer_withholds_restart_while_busy. Deliberately unreachable here:
+    # the point is that the run finishes long before this busy grace would.
+    spawn_timeout = 15
+
+    with _heartbeat_timeline(
+        fleet_dir, UNIT_R, [(verdict_label, 2.0, overrides)],
+    ) as fired:
+        result = _run_script(
+            bin_dir, state_path, fleet_dir, "--drain",
+            env={
+                "RESTART_VERIFY_TIMEOUT": "5",
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
+                    wait_proof_grace_secs(spawn_timeout)
+                ),
+                "ORCH_DRAIN_UNKNOWN_GRACE_SECS": "0",
+                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            },
+            timeout=spawn_timeout,
+        )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    # THE LOAD-BEARING ASSERTION: the top-level stale/absent path (line 359)
+    # prints a byte-identical "proceeding" line but returns BEFORE any defer
+    # line, so this is what proves the IN-LOOP re-classification block ran,
+    # not the top-level path with the unit simply starting stale/absent.
+    assert f"deferring restart of {UNIT_R}: mid-merge" in result.stdout, (
+        f"expected a defer line before the re-classification; got "
+        f"stdout={result.stdout!r}"
+    )
+    assert (
+        f"proceeding with restart of {UNIT_R}: heartbeat {verdict_label} "
+        "after 0s grace"
+    ) in result.stdout, (
+        f"expected the shorter-grace proceed line; got stdout={result.stdout!r}"
+    )
+    assert "force-restarting" not in result.stdout.lower(), (
+        f"expected the shorter unknown grace, not the busy grace; got "
+        f"stdout={result.stdout!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
+    )
+    assert verdict_label in fired, (
+        f"the scheduled {verdict_label} transition never landed: fired={fired!r}"
+    )
