@@ -81,6 +81,7 @@ from fused_memory.utils.referent_resolution import (
     REFERENT_SOURCES,
     ReferentResolution,
     ReferentSet,
+    resolve_referents,
 )
 from fused_memory.utils.task_naming import canonicalize_task_node_name
 from fused_memory.utils.validation import require_full_uuid
@@ -3128,6 +3129,32 @@ class MemoryService:
 
         # Graphiti: enqueue via durable queue (async, but durably persisted)
         if write_graphiti:
+            # Resolve WHICH referents this write is about (task 3670, PRD leaf
+            # epsilon), so leaf zeta can verify the resulting edges against it.
+            #
+            # Placement is load-bearing at BOTH ends:
+            #   INSIDE `if write_graphiti:` — a Mem0-only write never reaches
+            #   Graphiti, so it pays for no scan;
+            #   OUTSIDE the `try:` below, which degrades to `_graphiti_error`
+            #   and DROPS the Graphiti write. gamma raises InputValidationError
+            #   on structural inputs (a non-str content or group_id) precisely
+            #   so a wiring bug is loud; resolving inside that try would
+            #   convert that loud signal into a silently skipped Graphiti
+            #   write.
+            #
+            # `meta` is read AFTER _normalize_task_id_metadata has coerced
+            # task_id to a scalar str, which is the contract gamma's metadata
+            # bridge documents itself against.
+            #
+            # declared=None: leaf delta owns the `entities` parameter and its
+            # `_entities_gate`, and THIS CALL is the single seam it fills. No
+            # declared referents can exist until it lands.
+            resolution = resolve_referents(
+                declared=None,
+                metadata=meta,
+                content=content,
+                group_id=scope.graphiti_group_id,
+            )
             try:
                 assert self.durable_queue is not None
                 await self.durable_queue.enqueue(
@@ -3141,6 +3168,8 @@ class MemoryService:
                         'source_description': f'add_memory:{resolved_category.value}',
                         '_causation_id': causation_id,
                         '_write_op_id': write_op_id,
+                        # Popped and decoded by _execute_graphiti_write.
+                        'referents': _encode_referents(resolution),
                     },
                     callback_type='refresh_entity_summaries',
                 )
