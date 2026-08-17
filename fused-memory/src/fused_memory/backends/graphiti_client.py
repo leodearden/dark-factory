@@ -484,6 +484,31 @@ async def _paged_ro_query(
     data, so there is no injection surface.  They are coerced to int before
     formatting so a non-int can never reach the template.
 
+    The read fails CLOSED on four independent paths, each logging a WARNING
+    that names the numbers as structured facts rather than prose:
+
+      STRUCTURAL (fires on the numbers alone, before any evidence)
+        1. ``page_size >= resultset_size`` — refuse to enumerate at all and
+           return NO rows.  See the guard body for why a partial list is worse
+           than none.
+        2. ``max_pages`` exhausted while the last page was still full.
+
+      EMPIRICAL (compares fetched against what the server says exists)
+        3. The census probe returned no usable count.
+        4. ``rows_seen < expected_rows`` — the enumeration is SHORT.
+
+    BOTH kinds are kept, and neither subsumes the other.  ``resultset_size``
+    is an assumption about server configuration; if the live server is ever
+    configured BELOW it, the structural check passes and the short-page break
+    lies exactly as an unpaginated query does today — the identical silent
+    truncation, undetected — and only the census catches it.  Conversely the
+    structural check fails FAST, before any query, with a specific operator
+    action.  They fail differently and usefully.
+
+    Completeness is ``rows_seen >= expected_rows``, NOT ``==``: a corpus that
+    grew between the census probe and the last page is not a truncation, and
+    on a graph under continuous write, growth is the common case.
+
     Args:
         graph: FalkorDB graph handle exposing ``async ro_query(cypher, params)``.
         page_template: Page query with ``{skip}``/``{limit}`` placeholders.
@@ -494,32 +519,99 @@ async def _paged_ro_query(
         max_pages: Hard bound on pages fetched.
 
     Returns:
-        PagedRead. See the guards in the body for when ``complete`` is False.
+        PagedRead. ``reason`` is None exactly when ``complete`` is True.
     """
     page_size = int(page_size)
     resultset_size = int(resultset_size)
     max_pages = int(max_pages)
 
+    # Guard 1 (structural). At or above the cap there is nothing trustworthy
+    # to return, so return nothing. The short-page break reasons "this page
+    # was not full, therefore the data is exhausted" — sound only while the
+    # server cannot be what shortened it. At or above the cap those two causes
+    # are indistinguishable, and a partial list would simply invite the caller
+    # to use it anyway, recreating the silently-short-collection defect one
+    # layer up. The comparison is >= and not > deliberately: equality is
+    # arithmetically safe on a server configured at exactly _RESULTSET_SIZE,
+    # but that constant is an assumption, so equality leaves zero margin and a
+    # server configured one row lower silently re-opens the truncation.
+    if page_size >= resultset_size:
+        reason = (
+            f'page_size={page_size} is at or above the assumed server '
+            f'resultset_size={resultset_size}, so a short page cannot be '
+            f'distinguished from a server-truncated one; refusing to '
+            f'enumerate. Re-run with a page size well below the cap '
+            f'(default {_DEFAULT_READ_PAGE_SIZE}).'
+        )
+        logger.warning('_paged_ro_query: %s', reason)
+        return PagedRead(
+            rows=[], complete=False, rows_seen=0, expected_rows=None, reason=reason
+        )
+
+    # Census FIRST, before paging, so the target is fixed up front rather than
+    # inferred from the same pages whose completeness is in question.
     expected = await _census_count(graph, census_cypher, params)
+    if expected is None:
+        # Guard 3 (empirical). An unavailable proof is not a passing proof —
+        # but keep paging: the rows are still worth returning, only the proof
+        # is missing.
+        logger.warning(
+            '_paged_ro_query: census probe returned no usable count '
+            '(cypher=%r); the enumeration cannot be proven complete and will '
+            'be reported incomplete even if every row was fetched',
+            census_cypher,
+        )
 
     rows: list[list] = []
     skip = 0
+    paged_to_the_end = False
     for _ in range(max_pages):
         page_cypher = page_template.format(skip=int(skip), limit=int(page_size))
         result = await graph.ro_query(page_cypher, params)
         page = list(getattr(result, 'result_set', None) or [])
         rows.extend(page)
         if len(page) < page_size:
+            paged_to_the_end = True
             break
         skip += len(page)
 
     rows_seen = len(rows)
+
+    reason: str | None = None
+    if not paged_to_the_end:
+        # Guard 2 (structural). Hitting the page cap on a still-full page is
+        # REPORTED, never swallowed: a page cap that truncated in silence
+        # would just be this module's own defect, one layer up.
+        reason = (
+            f'max_pages={max_pages} exhausted at page_size={page_size} with '
+            f'rows_seen={rows_seen} and the last page still full, so more '
+            f'rows almost certainly remain unread'
+        )
+        logger.warning('_paged_ro_query: %s', reason)
+    elif expected is None:
+        reason = (
+            f'census probe returned no usable count, so the {rows_seen} rows '
+            f'fetched cannot be proven to be all of them'
+        )
+    elif rows_seen < expected:
+        # Guard 4 (empirical). Name BOTH candidate causes: an operator reading
+        # this log must not be misled into chasing a phantom truncation when
+        # the graph was simply written to mid-read.
+        reason = (
+            f'enumeration is SHORT: fetched rows_seen={rows_seen} but the '
+            f'census reports expected_rows={expected}. Most likely a server '
+            f'result-set cap below the assumed resultset_size={resultset_size}; '
+            f'the benign alternative is concurrent invalidation of edges '
+            f'between the census probe and the last page'
+        )
+        logger.warning('_paged_ro_query: %s', reason)
+
     return PagedRead(
         rows=rows,
-        complete=True,
+        complete=reason is None,
         rows_seen=rows_seen,
         expected_rows=expected,
-        reason=None,
+        reason=reason,
     )
 
 
