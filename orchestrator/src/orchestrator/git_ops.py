@@ -3304,7 +3304,15 @@ class GitOps:
            concurrent in-process holder would be libelled, most sharply
            :meth:`task_verify_lease`, which by design never writes the
            rendezvous layer 3 reads.  This layer gets strictly more important
-           as in-process holds widen.
+           as in-process holds widen — and task 4189 is that widening made
+           concrete: :meth:`merge_verify_lease` on an EPHEMERAL
+           ``_merge-<hash>`` lane now also declines to write the rendezvous,
+           so layer 3 no longer vetoes there and this registry is what keeps a
+           healthy ephemeral hold (a cold-shadow verify, a drift check, the
+           DF-2822 cross-check) from being libelled as a self-owned leak.
+           :meth:`_acquire_lane_flock_off_thread` registers every won fd on its
+           OWN worker thread (task 3783), so the registry never lags the
+           kernel and this substitution is exact.
         3. **Liveness** — no live recorded verify
            (:meth:`_merge_verify_lease_active`, reused unchanged with its
            fail-OPEN semantics).  A genuine long verify holding the lane past
@@ -3782,6 +3790,17 @@ class GitOps:
           hold) and would spuriously gate merge-lane resets/GC. The per-lane
           flock alone is the cross-process mechanism reify consults, so the
           rendezvous stays single-purpose to the merge lane.
+
+          As of task 4189 this is no longer a CONTRAST on non-persistent
+          lanes: :meth:`merge_verify_lease` records the rendezvous only for
+          the PERSISTENT merge lane, so on an ephemeral ``_merge-<hash>``
+          speculation lane the two leases now agree — flock held, rendezvous
+          untouched. The stomp rationale written just above was the reason
+          this lease never wrote it, and is now the SHARED justification for
+          both; the ephemeral merge lane hit exactly that shape (a cold-shadow
+          compare's finally clearing the next merge's live persistent-lane
+          hold). What still diverges is the fail-mode (fail-OPEN below vs.
+          :meth:`merge_verify_lease`'s raise) and the timeout constant.
         * **fail-OPEN on contention** — on acquire timeout (a racing reseed
           held the lane lock past ``_TASK_VERIFY_LEASE_WAIT_SECS``) it logs a
           WARNING and yields WITHOUT the hold, rather than raising. The hold is
