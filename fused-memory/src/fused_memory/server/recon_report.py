@@ -1088,6 +1088,26 @@ class ReconReportState:
         canonicalized form, since only ``None`` coerces to ``None``); the
         prefix check uses the POST-truncation ``category``.
 
+        Prefix breadth: the ``category.startswith('cross_project')`` check
+        is a deliberately broad PREFIX match, not an allowlist of specific
+        informational category names. A future category you introduce that
+        starts with ``'cross_project'`` but is a genuinely actionable
+        finding (e.g. a real human-actionable cross-project blocker, not an
+        informational routing note) must still pass actionable=True
+        explicitly — omitting it silently resolves to ``False`` purely from
+        the prefix match, regardless of whether that specific category is
+        meant to be informational. Narrowing this to an exact allowlist was
+        considered and rejected: it would reintroduce the mirror-image
+        failure (a differently-named future informational category
+        silently defaulting to ``actionable=True``), which is the exact bug
+        class this default exists to close. As of this writing,
+        ``'cross_project_routing'`` is the only production category
+        matching the prefix — filed with an explicit ``actionable=False``
+        by ``autopilot_video.py`` and the Stage 2 prompt template, and by
+        the Stage 3 prompt template without an explicit ``actionable``
+        (relying on this computed default, correctly, since that finding
+        shape is genuinely informational).
+
         A null/missing ``flag_type`` on a re-raise of an already-flagged
         ``task_id`` inherits that task's single established flag_type before
         the signature lookup runs (task-2318), so an under-specified re-raise
@@ -2580,7 +2600,11 @@ Usage pattern (per PRD §9.2):
                   'warnings' entry on the response, never rejected.
                   actionable defaults to False when task_id is None or
                   category starts with 'cross_project'; True otherwise. An
-                  explicit actionable=True/False is always honored.
+                  explicit actionable=True/False is always honored. This is
+                  a PREFIX match, not an allowlist: if you are filing a
+                  genuinely actionable finding under a NEW category that
+                  happens to start with 'cross_project', pass
+                  actionable=True explicitly -- do not rely on the default.
 3. set_stat / inc_stat — track numeric metrics during the run.
 4. complete — stamp the summary and close the report; idempotent.
 5. delete_finding(run_id, finding_id) — IRREVERSIBLE retraction of a
@@ -2647,7 +2671,11 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         a null task_id or a cross_project* category, True otherwise — see
         ReconReportState.add_finding's docstring. The `None` sentinel is
         passed through unchanged so the state method's computed default
-        applies; an explicit True/False is always honored.
+        applies; an explicit True/False is always honored. This is a prefix
+        match, not an allowlist -- a NEW 'cross_project'-prefixed category
+        that is genuinely actionable must still pass actionable=True
+        explicitly (see ReconReportState.add_finding's docstring for the
+        full rationale).
         """
         return state.add_finding(
             run_id=run_id,
