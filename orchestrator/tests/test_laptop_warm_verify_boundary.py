@@ -858,6 +858,42 @@ def test_row_discovery_ceiling_scales_with_load_and_clamps():
     )
 
 
+def test_discovery_ceiling_env_override_parses_and_pins():
+    """ORCH_TEST_DISCOVERY_CEILING_SECS parses safely and beats load scaling.
+
+    Two halves, both deterministic -- the parser takes an environ MAPPING
+    rather than reading os.environ, so neither half monkeypatches import-time
+    state or races import order.
+
+    (a) Parsing.  A good value parses; an absent one is None; a typo'd one is
+        None AND warns.  Warning rather than raising is deliberate: this
+        constant is resolved at IMPORT, so raising would fail COLLECTION for
+        the whole module -- every row and every helper test taken down by one
+        mistyped debugging knob, which is a strictly worse and far more
+        confusing failure than the one being guarded against.  Silently
+        ignoring it would be worse still (the project's no-silent-fail-soft
+        norm), hence the warning.
+
+    (b) Pinning.  An explicit operator pin wins in BOTH directions -- it must
+        override load scaling upward and downward alike, or "pin it to 7.5 to
+        reproduce the timeout quickly" silently does nothing on a busy box.
+
+    The knob is namespaced ORCH_TEST_*, not bare ORCH_*: subprocess_env()
+    copies os.environ into every spawned verify-merge, and the ORCH_*
+    namespace there is production knobs the CLI actually reads.
+    """
+    assert _resolve_ceiling_override({'ORCH_TEST_DISCOVERY_CEILING_SECS': '7.5'}) == 7.5
+    assert _resolve_ceiling_override({}) is None
+
+    with pytest.warns(UserWarning, match='ORCH_TEST_DISCOVERY_CEILING_SECS'):
+        assert _resolve_ceiling_override(
+            {'ORCH_TEST_DISCOVERY_CEILING_SECS': 'banana'}
+        ) is None
+
+    assert row_discovery_ceiling_secs(_override=7.5, _loadavg=6400.0, _cpu_count=32) == 7.5
+    assert row_discovery_ceiling_secs(_override=7.5, _loadavg=0.0, _cpu_count=32) == 7.5
+
+
 # ---------------------------------------------------------------------------
 # Task 2819 -- deterministic unit coverage for wait_for_marker_stable, the
 # create+utimensat settle helper that de-flakes the Row 5 marker-retention
