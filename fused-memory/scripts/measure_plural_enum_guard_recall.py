@@ -48,9 +48,10 @@ from __future__ import annotations
 
 import re
 import sys
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 # The probe IMPORTS the shipped regex and guard rather than re-spelling
 # them. This is load-bearing, not stylistic: a copied pattern measures a
@@ -393,3 +394,73 @@ def simulate_candidate(name: str, facts: Iterable[str]) -> CandidateResult:
         recovered=recovered,
         unchanged=unchanged,
     )
+
+
+# ---------------------------------------------------------------------------
+# Edge enumeration
+# ---------------------------------------------------------------------------
+
+# FalkorDB's server-wide RESULTSET_SIZE is 10000 and nothing in this repo
+# overrides it, so ANY single query returning more rows than that is
+# SILENTLY truncated — no error, no warning, no partial-result flag.
+#
+# Measured on the live dark_factory graph (task 3949 planning):
+#   get_all_valid_edges' exact query      -> 24902 rows, 10000 returned
+#   distinct valid edges actually exposed -> 6376 of 12488 (51%)
+#
+# Default page size is therefore well under the cap, so a page that comes
+# back short really is the end of the data rather than the server's ceiling.
+DEFAULT_PAGE_SIZE = 5000
+
+# The same MATCH pattern GraphitiBackend.get_all_valid_edges uses, so this
+# measures the corpus the production sweep is aimed at — but issued with
+# SKIP/LIMIT instead of unpaginated. This is DELIBERATELY not a call to
+# get_all_valid_edges: inheriting that function's truncation would make the
+# headline zero meaningless. The truncation is a real latent coverage bug in
+# the production sweep, but it lives in graphiti_client.py, outside this
+# task's scope — it is filed as a follow-up and noted in the report rather
+# than fixed here.
+_EDGE_PAGE_CYPHER = (
+    'MATCH (n:Entity)-[e:RELATES_TO]-() '
+    'WHERE e.invalid_at IS NULL '
+    'RETURN DISTINCT e.uuid, e.fact '
+    'SKIP {skip} LIMIT {limit}'
+)
+
+
+async def enumerate_valid_edge_facts(
+    query_fn: Callable[[str], Awaitable[Sequence[Sequence[Any]]]],
+    *,
+    page_size: int = DEFAULT_PAGE_SIZE,
+) -> tuple[dict[str, str], bool]:
+    """Enumerate every valid RELATES_TO edge's fact text, keyed on edge uuid.
+
+    Pages with SKIP/LIMIT until a page comes back short or empty. Dedupes on
+    edge uuid: the undirected MATCH attributes each directed edge to BOTH of
+    its endpoints, so the same edge uuid legitimately arrives more than once
+    (documented on get_all_valid_edges). A NULL fact is coerced to ''.
+
+    Returns ``(facts_by_uuid, complete)``. The flag is the fail-closed hook:
+    an under-enumerated corpus must be reported as a FAILURE rather than as a
+    smaller report, because the headline result is a zero and a truncated
+    zero is worthless.
+    """
+    facts: dict[str, str] = {}
+    skip = 0
+    while True:
+        page = await query_fn(
+            _EDGE_PAGE_CYPHER.format(skip=skip, limit=page_size),
+        )
+        rows = list(page or [])
+        for row in rows:
+            edge_uuid = row[0]
+            if edge_uuid is None or edge_uuid in facts:
+                continue
+            facts[edge_uuid] = row[1] or ''
+        if len(rows) < page_size:
+            # Short (or empty) page: the data is exhausted. A FULL page can
+            # never prove that, which is exactly why the loop continues.
+            break
+        skip += len(rows)
+
+    return facts, True
