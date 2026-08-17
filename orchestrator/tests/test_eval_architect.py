@@ -1606,6 +1606,7 @@ async def _run_architect_eval_hermetic(
     reference_diff: str = '--- a/x\n+++ b/x\n+ landed change\n',
     usage_gate=None,
     usage_gate_error=None,
+    task_timeout_minutes=None,
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary patched.
 
@@ -1706,6 +1707,13 @@ async def _run_architect_eval_hermetic(
     orch_stub.usage_cap = UsageCapConfig(enabled=False)
     orch_stub.prices = orch_prices if orch_prices is not None else {}
 
+    # ``timeout_minutes`` rides in on the TASK dict (where it is untyped data)
+    # rather than the ``timeout_override: int | None`` parameter, so a test can
+    # ask for a sub-minute bound without lying to pyright about that signature.
+    _task_def = _arch_task() if task_override is None else task_override
+    if task_timeout_minutes is not None:
+        _task_def['timeout_minutes'] = task_timeout_minutes
+
     gate_factory = None
     if usage_gate is not None or usage_gate_error is not None:
         orch_stub.usage_cap = UsageCapConfig(enabled=True)
@@ -1737,9 +1745,7 @@ async def _run_architect_eval_hermetic(
         p(patch('orchestrator.evals.judge.judge_plan_quality', mock_judge))
         p(patch('orchestrator.evals.runner.save_result', mock_save))
         p(patch('orchestrator.evals.runner.load_task',
-                MagicMock(return_value=(
-                    _arch_task() if task_override is None else task_override
-                ))))
+                MagicMock(return_value=_task_def)))
         p(patch('orchestrator.verify.run_verification', mock_verify))
         result = await runner.run_architect_eval(
             Path('/fake/task.json'), cfg, base_config=MagicMock(),
@@ -4177,3 +4183,145 @@ class TestArchitectEvalCapPatience:
         assert mocks['judge'].await_count == 0
         assert result.metrics['judge_invocations'] == 0
         assert result.metrics['judge_cost_usd'] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# The MUST-NOT-CHANGE taint semantics, re-pinned under the NEW seam
+# (eval-revival φ). These assert nothing novel — they assert that routing the
+# architect through invoke_with_cap_retry changed the TRANSPORT and nothing
+# else. If one of them fails, the implementation is wrong; the pin is not.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPinnedTaintSemanticsSurviveTheCapRetrySeam:
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_timeout_through_the_gated_seam_is_still_kept_not_tainted(self):
+        """A TimeoutError still reaches the runner through the wrapper.
+
+        The pre-existing timeout tests all run gate-ABSENT, where
+        ``invoke_with_cap_retry`` degrades to a single pass-through invoke.
+        This runs the same scenario down the newly reachable GATED path, where
+        the real ``invoke_slot`` context manager wraps the invoke, and pins
+        that the wrapper still swallows nothing: a timeout arrives at the
+        runner as a ``TimeoutError`` and keeps its deliberate asymmetry —
+        MARKED (so the cell is legible) but NOT tainted (candidate-
+        attributable, so it keeps scoring on content).
+
+        Note this does NOT pin WHERE the timeout is applied — a mutation that
+        bounds the whole retry loop instead of each attempt still passes here,
+        because the exception originates in the mocked invoke rather than from
+        a real deadline. That property is pinned by
+        ``test_the_operator_timeout_bounds_each_attempt_not_the_retry_loop``.
+        """
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            usage_gate=_two_account_gate(),
+            invoke_side_effect=TimeoutError(),
+        )
+
+        # Unchanged from the gate-absent pins above: a timeout is
+        # CANDIDATE-attributable, so it is MARKED but keeps scoring on content.
+        assert result.outcome == 'timeout'
+        assert result.metrics['cap_tainted'] is False
+        assert result.metrics['plan_quality'] is not None
+        marker = result.metrics['invocation_error']
+        assert isinstance(marker, str) and marker.startswith('architect:')
+        assert 'timeout' in marker.lower()
+
+    async def test_gate_absent_path_is_byte_identical(self):
+        """usage_cap disabled is a real deployment, and it must be untouched.
+
+        With no gate the wrapper degrades to num_accounts=1 and a single
+        invoke, so a 429 is classified by detect_invocation_error exactly as it
+        was pre-φ — one invocation, marked, tainted. No retry, no failover, no
+        second call the operator did not opt into.
+        """
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan={},
+            arch_result=_cap_agent_result(),
+        )
+
+        assert mocks['invoke'].await_count == 1
+        assert result.metrics['cap_tainted'] is True
+        assert result.metrics['plan_quality'] is None
+        marker = result.metrics['invocation_error']
+        assert isinstance(marker, str) and marker.startswith('architect:')
+
+    async def test_healthy_architect_with_a_stepless_plan_still_scores_a_kept_zero(self):
+        """A genuine 0.0 must stay a 0.0 — the anti-fabrication floor is intact.
+
+        Gate present, architect healthy, plan empty. Nothing about the cap seam
+        may promote a CONTENT failure into an infra exclusion: the model was
+        asked, it answered, and it produced nothing worth scoring. That cell is
+        kept and scored 0.0, and the LLM judge is not spent on an unjudgeable
+        artifact.
+        """
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan={},
+            usage_gate=_two_account_gate(),
+            arch_result=_healthy_agent_result(),
+        )
+
+        assert result.metrics['cap_tainted'] is False
+        assert result.metrics['invocation_error'] is None
+        assert result.metrics['plan_quality'] == 0.0
+        assert mocks['judge'].await_count == 0
+
+    async def test_the_operator_timeout_bounds_each_attempt_not_the_retry_loop(self):
+        """The real differential guard on WHERE the operator's --timeout lives.
+
+        The tempting wrong implementation keeps the pre-φ shape —
+        ``asyncio.wait_for(invoke_with_cap_retry(...), timeout=...)`` — instead
+        of moving the bound inside the per-attempt ``_timed_invoke`` closure.
+        It is wrong because the retry loop's wall clock is dominated by cap
+        COOLDOWNS, which the candidate under test is not responsible for: once
+        a cap wait outlasts --timeout, the cell surfaces as
+        ``outcome='timeout'`` → NOT tainted → a cap-starved cell scored a
+        fabricated 0.0 and INCLUDED in the mean. That is precisely the
+        differential-exclusion bias φ exists to remove, re-created one layer up.
+
+        Every other test in this file passes under that mutation (verified),
+        because they mock ``shared.cli_invoke.asyncio.sleep`` — so no wall
+        clock ever advances during a cap wait and the outer deadline never
+        fires. This test closes that hole with the one thing the mutation
+        cannot survive: a wrapper call that genuinely outlasts --timeout. The
+        patched wrapper never invokes ``invoke_fn``, so under the CORRECT
+        implementation no deadline applies to it at all.
+        """
+        import asyncio
+
+        # The REAL sleep, captured before the helper runs. ``_run_architect_
+        # eval_hermetic`` patches ``shared.cli_invoke.asyncio.sleep`` — and
+        # since ``shared.cli_invoke.asyncio`` IS the asyncio module, that patch
+        # is GLOBAL for its duration. A plain ``await asyncio.sleep(0.2)`` in
+        # here would resolve to that AsyncMock and return instantly, making
+        # this test vacuous (verified: it passed under the mutation).
+        real_sleep = asyncio.sleep
+
+        async def _slow_wrapper(*_args, **_kwargs):
+            # ~6x the 30 ms budget below — far outside scheduler jitter.
+            await real_sleep(0.2)
+            return _healthy_agent_result()
+
+        with patch('orchestrator.evals.runner.invoke_with_cap_retry', _slow_wrapper):
+            result, _mocks = await _run_architect_eval_hermetic(
+                self._cfg(),
+                produced_plan=_well_formed_plan(),
+                usage_gate=_two_account_gate(),
+                task_timeout_minutes=0.0005,  # 30 ms
+            )
+
+        # The wrapper outlived --timeout by 6x and the cell is STILL healthy:
+        # the operator's budget bounds one attempt, never the retry loop.
+        assert result.outcome == 'done'
+        assert result.metrics['cap_tainted'] is False
+        assert result.metrics['invocation_error'] is None
