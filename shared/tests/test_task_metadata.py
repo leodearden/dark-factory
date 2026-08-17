@@ -1794,6 +1794,8 @@ class TestParseMetadataFailurePolicy:
         'before_done_verified_at': '2026-01-01T00:00:00+00:00',
         'before_done_verified_pid': 123,
         'origin_finding_id': 'f1',
+        'source_finding_id': 'f1',
+        'stage1_finding_id': 'f2',
         'spawned_from': 'task-1',
         'program': 'p1',
         'program_stream': 's1',
@@ -1933,6 +1935,63 @@ class TestParseMetadataFailurePolicy:
         ]
         assert offending == [], (
             f'Expected no unknown_key warning for last_blocked_at; got: {offending}'
+        )
+
+    def test_finding_provenance_metadata_keys_are_blessed(self):
+        """The finding-provenance family must not census-warn (esc-3796-1, 2026-08-17).
+
+        `source_finding_id` is ratified as the CANONICAL key naming the finding
+        a task was spawned from, and `stage1_finding_id` as the distinct
+        canonical key naming a Stage-1 finding specifically. The ruling is a
+        corpus-DOMINANCE one, measured over .taskmaster/tasks by exact JSON
+        key: source_finding_id=120 tasks, stage1_finding_id=33,
+        origin_finding_id=30, with source-x-origin overlap 0 (the populations
+        are cleanly disjoint, so this is a vocabulary split, not double
+        tagging). Write volume since 2026-08-01 runs 46 vs 2 in favour of the
+        canonical spelling — a 23:1 margin.
+
+        The unusual part, and the reason this docstring is long: NEITHER key
+        has any code reader or writer. The whole family is an LLM prose
+        convention, so `origin_finding_id` never met the "already relied on by
+        real writers" Tier-A criterion it was blessed under
+        (docs/task-authoring.md:830-832). Ratifying the dominant spelling is
+        therefore the cheapest way to stop 120 tasks' worth of unknown_key
+        census noise, and blessing stays reversible if a later ruling
+        consolidates the family differently (precedent: commit 84e3b4cd75
+        un-blessed curator_adjudicated_at).
+
+        `origin_finding_id` is asserted here too, pinning the RETIRED alias's
+        continued blessing: 30 landed tasks carry it, most terminal and
+        mechanically un-rewritable, and task 3796 rejected data migration — so
+        a later cleanup must not silently un-bless it and manufacture exactly
+        the census noise this change exists to remove.
+
+        RED until 'source_finding_id' and 'stage1_finding_id' are added to
+        _BLESSED_METADATA_KEYS.
+        """
+        _, warnings = parse_metadata(
+            {'source_finding_id': 'f1', 'stage1_finding_id': 'f2'}, direction='read'
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'source_finding_id' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for source_finding_id; got: {sorted(unknown_key_fields)}'
+        )
+        assert 'stage1_finding_id' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for stage1_finding_id; got: {sorted(unknown_key_fields)}'
+        )
+
+        # The retired alias stays blessed by design (esc-3796-1 / task 3796
+        # rejected migration); parsed separately so a regression names which
+        # spelling broke rather than collapsing into the assertions above.
+        _, retired_warnings = parse_metadata({'origin_finding_id': 'f1'}, direction='read')
+        retired_offending = [
+            w
+            for w in retired_warnings
+            if w.code == 'unknown_key' and w.field == 'origin_finding_id'
+        ]
+        assert retired_offending == [], (
+            'origin_finding_id must stay blessed as the documented-as-retired alias '
+            f'(30 landed tasks carry it); got: {retired_offending}'
         )
 
     def test_deterministic_invariant_violation_write_enforce_raises(self):
