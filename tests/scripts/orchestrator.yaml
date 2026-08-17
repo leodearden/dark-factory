@@ -169,11 +169,36 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # gives — "ruff is not on PATH at the worktree root, only inside each member
 # venv"; verify.py's _FALLBACK_UV_PROJECT = 'shared' encodes the same choice.
 #
-# uv run --project shared pyright (task 3842, esc-3473-2): switched off npx,
-# which resolved through the shared, mutable, concurrently-written npm cache
-# under $HOME and once turned a clean (0-error) type leg red on a transient
-# npm-cache write failure that cost esc-3473-2 a full investigation cycle
-# before the steward reproduced it clean and found no standing outage.
+# uv run --project shared pyright (task 3842, esc-3473-2): switched off the
+# bare `npx pyright` invocation, which re-resolved through the shared,
+# mutable, concurrently-written npm cache under $HOME on EVERY run and once
+# turned a clean (0-error) type leg red on a transient npm-cache write
+# failure (npm could not write ~/.npm/_logs) that cost esc-3473-2 a full
+# investigation cycle before the steward reproduced it clean and found no
+# standing outage.
+#
+# NARROWED, NOT ELIMINATED (amendment pass, task 3842). The `pyright`
+# resolved here is pyright-python (PyPI, installed into the shared venv),
+# which does not bundle the type checker itself: its install_pyright()
+# (site-packages/pyright/_utils.py) npm-installs into a version-keyed
+# ~/.cache/pyright-python/<version>/node_modules the FIRST time that
+# version runs, and skips npm on every run after — so a WARM run (the
+# steady state, and what the 1.1.408/1.1.411 measurements below reflect) is
+# npm-free, which is the real gain. A COLD one — e.g. the first run after
+# `uv lock --upgrade` bumps pyright-python past shared/pyproject.toml's
+# unpinned `pyright>=1.1.404` floor — still shells out to the same `npm`
+# binary and the same global $HOME state (~/.npm/_logs, the exact path
+# esc-3473-2's failure named, is npm-global, not per-project), so it is not
+# immune to that failure class, only far less exposed to it: once per
+# version bump instead of on every invocation. Lines 122-130 above already
+# document `scripts` and `tests/scripts` being gathered CONCURRENTLY in one
+# worktree with no dedupe by command; a cold-cache run of this command can
+# in principle land in that same window. Recorded per this file's own
+# standard (lines 144-146) rather than left a silent hazard to rediscover;
+# not closed here — closing it would mean pinning PYRIGHT_PYTHON_CACHE_DIR
+# per worktree or the pyright-python version, and task 3842 was scoped to
+# the invocation switch only.
+#
 # --project shared mirrors this file's own test_command/lint_command pairing
 # above (no --directory, so cwd stays at the worktree root and this directory
 # argument still resolves) and was confirmed by the steward to run clean at
@@ -181,6 +206,19 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # extraPaths from the root pyproject.toml, which is what lets
 # `from orchestrator.config import ...` resolve in these tests — pyright reads
 # that config from cwd regardless of which venv's pyright binary runs it.
+#
+# MATCHES ALL SEVEN WORKSPACE-MEMBER CONFIGS (shared, dashboard, cockpit,
+# escalation, fused-memory, orchestrator, sampler), every one already on
+# `uv run --project <member> ... pyright src/ tests/`. The closest
+# structural sibling, scripts/orchestrator.yaml:275 (`npx pyright scripts/`),
+# is now the LAST module config still npx-fronted, carrying the exposure
+# this change narrows — left on npx here deliberately: task 3842 is scoped
+# to tests/scripts/orchestrator.yaml only (this file's own module list), and
+# switching scripts/ needs its own measurement and its own comment fix
+# (scripts/orchestrator.yaml's "matches the sibling tests/scripts/
+# invocation style exactly" line, ~line 239, is now stale). Filed as a
+# follow-up from this task's review pass (not yet assigned a task id as of
+# this comment — see task 3842's iteration log for the tracking ticket).
 #
 # Note both run VERBATIM (not file-scoped) under merge-role
 # merge_verify_breadth=full, and type_check widens to this directory form when a
