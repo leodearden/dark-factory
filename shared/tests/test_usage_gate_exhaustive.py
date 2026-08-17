@@ -2525,26 +2525,8 @@ class TestLeaseIsCurrent:
         assert lease.generation != acct.generation
 
     async def test_stale_when_account_removed_from_account_list(self):
-        """Covers lease_is_current's second staleness signal: the leased
-        account is no longer present in gate._accounts at all, as opposed
-        to merely having re-transitioned.
-
-        Note: no current code path actually removes an account from
-        gate._accounts — _on_sighup_async (usage_gate.py:1609-1641) reloads
-        each account's token in place and force-transitions it, but never
-        rebuilds the account list — so this does not reproduce a live
-        SIGHUP scenario. The `acct is not None` guard is defensive-in-depth
-        on a public method; this test pins it against a refactor that
-        would drop the guard and let a vanished account raise
-        AttributeError instead of returning False.
-
-        Uses a two-account gate and removes only the leased account (by
-        name) so a live sibling remains in gate._accounts. That way the
-        test can only pass if the per-account lookup fails specifically
-        for the removed lease's account — a single-account gate would also
-        satisfy a hypothetical "if not self._accounts: return False"
-        short-circuit that does not actually pin this guard.
-        """
+        """Pins the `acct is not None` branch: a lease naming an account
+        no longer in `gate._accounts` is stale."""
         gate = make_gate(['a', 'b'])
         async with gate.invoke_slot() as slot:
             lease = slot.lease
