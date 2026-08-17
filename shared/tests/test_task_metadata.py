@@ -1768,10 +1768,17 @@ class TestParseMetadataFailurePolicy:
         assert warnings[0].field == 'mystery_field'
         assert model.model_dump()['mystery_field'] == 'v'
 
-    # A representative spread of the 42 Tier-A blessed conventional keys
-    # (see _BLESSED_METADATA_KEYS), plus one genuine control key
-    # (mystery_zzz) that must still warn. RED: none of the blessed keys are
-    # skipped yet, so each one currently emits its own unknown_key warning.
+    # A representative spread of the Tier-A blessed conventional keys (see
+    # _BLESSED_METADATA_KEYS), plus one genuine control key (mystery_zzz)
+    # that must still warn. RED: none of the blessed keys are skipped yet, so
+    # each one currently emits its own unknown_key warning.
+    #
+    # Deliberately a PARTIAL sample, and deliberately carrying no count of
+    # the allowlist: full per-key coverage is the parametrized test below,
+    # which reads the frozenset directly. A newly blessed key belongs there
+    # (for free) and in its own dedicated test (for the rationale) — adding
+    # it here too is a third copy that carries no incremental signal and
+    # forces a hand re-count on every future blessing.
     _BLESSED_SAMPLE_BLOB = {
         'source': 'x',
         'modules': ['a'],
@@ -1794,8 +1801,6 @@ class TestParseMetadataFailurePolicy:
         'before_done_verified_at': '2026-01-01T00:00:00+00:00',
         'before_done_verified_pid': 123,
         'origin_finding_id': 'f1',
-        'source_finding_id': 'f1',
-        'stage1_finding_id': 'f2',
         'spawned_from': 'task-1',
         'program': 'p1',
         'program_stream': 's1',
@@ -1822,12 +1827,12 @@ class TestParseMetadataFailurePolicy:
         assert dumped['prd_path'] == blob['prd_path']
 
     # Table-driven over the FULL _BLESSED_METADATA_KEYS frozenset (imported
-    # directly), rather than the hand-maintained partial sample above (which
-    # only covers 27 of the 42 entries). Every key gets its own parametrized
-    # case, so a typo'd or accidentally-unskipped entry fails immediately
-    # instead of silently reappearing as unknown_key census noise, and the
-    # test stays in lockstep as the allowlist grows -- no manual sample to
-    # update.
+    # directly), rather than the hand-maintained partial sample above. Every
+    # key gets its own parametrized case, so a typo'd or accidentally-
+    # unskipped entry fails immediately instead of silently reappearing as
+    # unknown_key census noise, and the test stays in lockstep as the
+    # allowlist grows -- no manual sample to update, and no sample-vs-set
+    # cross-count to re-derive by hand.
     @pytest.mark.parametrize(
         'blessed_key', sorted(task_metadata_module._BLESSED_METADATA_KEYS)
     )
