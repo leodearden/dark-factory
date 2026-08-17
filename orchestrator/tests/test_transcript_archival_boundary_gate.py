@@ -505,3 +505,62 @@ class TestE6ResumeReArchives:
         # while identical bytes would pass even on a full rewrite.
         assert _identity(archived) == before
         assert archived.read_bytes() == original
+
+
+# ---------------------------------------------------------------------------
+# E2 — the archive survives worktree teardown
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestE2SurvivesTeardown:
+    """E2 — the user-observable claim of PRD §1.1: run a task to done, let the
+    worktree be removed, and confirm the transcripts remain.
+
+    This is the row with no prior coverage anywhere. It composes E1's producer
+    run with a REAL ``cleanup_worktree`` — real ``git worktree remove``, never a
+    mock — over a GitOps built WITHOUT ``transcript_archive``, so the β backstop
+    is inert and what survives destruction is unambiguously the PRODUCER's
+    archive.
+    """
+
+    async def test_producer_archive_outlives_the_worktree(
+        self, monkeypatch, git_repo, git_ops, task_assignment
+    ):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = _config(git_repo)
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        transcript_bytes = b'{"type":"user"}\n{"type":"assistant"}\n'
+
+        result, sid, src = await _producer_invoke(
+            workflow, cwd, payload=transcript_bytes
+        )
+        assert result.success is True
+
+        archived = _archived(git_repo, sid)
+        assert archived.exists()
+        before = _identity(archived)
+        config_dir = _config_dir(cwd)
+        assert config_dir.exists()
+        assert src.exists()
+
+        # The β backstop is inert on this GitOps — nothing but the producer's
+        # earlier archive can be responsible for what survives below.
+        assert git_ops.transcript_archive is None
+
+        await git_ops.cleanup_worktree(cwd, TASK_ID)
+
+        # The destruction really happened: worktree, per-task config dir and
+        # the whole projects/ tree beneath it are gone.
+        assert not cwd.exists()
+        assert not config_dir.exists()
+        assert not src.exists()
+
+        # ...and the durable archive is untouched — same bytes, same mtime,
+        # same inode.
+        assert archived.exists()
+        assert archived.read_bytes() == transcript_bytes
+        assert _identity(archived) == before
+
+        # Structurally so: the archive root was never a descendant of the
+        # removed worktree in the first place.
+        assert not _archive_root(git_repo).is_relative_to(cwd)
