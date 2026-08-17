@@ -1846,6 +1846,47 @@ class TestResolveCheckExitCode:
             report_violated, max_backlog=0, fail_on_blind_spot=True,
         ) == 1
 
+    # -----------------------------------------------------------------
+    # Armed-by-default properties (task 3923)
+    # -----------------------------------------------------------------
+
+    def test_opting_out_relaxes_only_the_vacuity_check_not_the_backlog(self):
+        """The escape hatch must never MASK a real finding.
+
+        --no-fail-on-blind-spot exists for an ad-hoc census, where an
+        operator wants the plain backlog number without the vacuity
+        veto. It must not become a blanket 'exit 0' — a residual backlog
+        over the ceiling is a substantive violation that the opt-out has
+        no business suppressing.
+        """
+        report = self._blind_spot_report(blind_spot=True, total_source=7)
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=False,
+        ) == 1
+
+    def test_failed_probe_never_fails_the_gate_under_the_armed_default(self):
+        """ANTI-FLAP, asserted with NO keyword so the new default is what
+        is under test rather than assumed to have survived the flip.
+
+        run() already forces blind_spot=False whenever the adjacent
+        population could not be observed, so a transient Qdrant blip
+        yields 'unobservable', not 'observed blind spot'. Arming the
+        default must not convert missing evidence into a failure — the
+        gate escalates on observed divergence only.
+        """
+        report = self._blind_spot_report(blind_spot=False, probe_failed=True)
+        assert _mod._resolve_check_exit_code(report, max_backlog=0) == 0
+
+    def test_report_without_cross_check_block_resolves_under_armed_default(self):
+        """A report shape predating the cross_check block (task 3897) must
+        still resolve through the backlog path rather than raising, now
+        that the blind-spot branch is reached by default. Asserted with no
+        keyword: the .get chain is what keeps the armed default safe on an
+        older/cached report."""
+        assert _mod._resolve_check_exit_code(
+            {'before': {'total_source': 0, 'total_with_kind': 0}}, max_backlog=0,
+        ) == 0
+
 
 # ===========================================================================
 # Tests: _build_parser (task 2596 CLI surface)
@@ -2012,6 +2053,65 @@ class TestParseArgs:
         assert _mod._parse_args(['--apply', '--terminal-drain']).apply is True
         assert _mod._parse_args(['--check', '--max-backlog', '5']).max_backlog == 5
 
+    # -----------------------------------------------------------------
+    # --no-fail-on-blind-spot escape hatch + armed default (task 3923)
+    # -----------------------------------------------------------------
+
+    def test_nightly_sweep_argv_still_parses_under_the_armed_default(self):
+        """THE REGRESSION GUARD THIS WHOLE SENTINEL EXISTS FOR.
+
+        This is the exact argv scripts/fused-memory-flag-marker-sweep.sh
+        passes from the nightly systemd service. Implementing task 3923's
+        armed default the naive way — flipping argparse's default from
+        False to True — would make the pre-existing requires---check
+        validation fire on this shape, rejecting EVERY nightly run with
+        exit 2 and turning a working timer into a permanent systemd
+        `failed` state. That is the perpetual-failure footgun
+        docs/flag-marker-sweep-recurring.md's "Why no --check in the
+        recurring service" section exists to prevent.
+
+        The resolved default is True here but reaches nothing: main()
+        consults _resolve_check_exit_code only under --check, which this
+        invocation does not pass.
+        """
+        args = _mod._parse_args(['--apply', '--terminal-drain'])
+        assert args.check is False
+        assert args.fail_on_blind_spot is True
+
+    def test_opt_out_with_check_parses(self):
+        """--no-fail-on-blind-spot is the ad-hoc-census escape hatch: it
+        yields exactly False, not the None sentinel, so an explicit opt-out
+        is distinguishable from 'nobody asked'."""
+        args = _mod._parse_args(['--check', '--no-fail-on-blind-spot', '--max-backlog', '5'])
+        assert args.check is True
+        assert args.fail_on_blind_spot is False
+        assert args.max_backlog == 5
+
+    def test_opt_out_without_check_is_also_rejected_with_exit_2(self, capsys):
+        """The rejection is symmetric across BOTH spellings.
+
+        --no-fail-on-blind-spot without --check is just as inert as the
+        opt-in spelling: it reaches an exit code only through the --check
+        verdict path. Accepted silently it would hand an operator the
+        impression they had relaxed a gate that was never running — the
+        same silent-no-op class the opt-in rejection already covers, so it
+        errors out rather than no-op'ing.
+        """
+        with pytest.raises(SystemExit) as exc_info:
+            _mod._parse_args(['--no-fail-on-blind-spot'])
+        assert exc_info.value.code == 2
+        stderr = capsys.readouterr().err
+        # Assert the CROSS-FLAG error specifically, not merely exit 2:
+        # argparse's own 'unrecognized arguments' also exits 2 and echoes
+        # the flag name, so a laxer assertion would pass today (before the
+        # flag exists) and could never detect the flag being dropped later.
+        assert 'requires --check' in stderr, (
+            f'Expected the cross-flag rejection, not an unknown-flag error: {stderr!r}'
+        )
+        assert '--no-fail-on-blind-spot' in stderr, (
+            f'Expected an error naming the spelling actually passed, got: {stderr!r}'
+        )
+
 
 # ===========================================================================
 # Tests: main() report -> exit-code wiring (task 3897 amendment,
@@ -2080,6 +2180,21 @@ class TestMainExitCode:
         assert self._run_main(
             monkeypatch, ['--check'], self._BLIND_SPOT_REPORT,
         ) == 1
+
+    def test_opt_out_returns_to_the_plain_backlog_verdict(self, monkeypatch, capsys):
+        """The escape hatch, end to end (task 3923).
+
+        An operator taking an ad-hoc census with
+        `--check --no-fail-on-blind-spot` still gets the plain backlog
+        verdict — 0 on this report, whose total_source is 0. Paired with
+        test_check_alone_now_fails_on_the_same_report, this pins that the
+        SAME report resolves differently based solely on the opt-out
+        reaching the verdict, which is what proves main() forwards the
+        parsed value rather than re-deriving a default.
+        """
+        assert self._run_main(
+            monkeypatch, ['--check', '--no-fail-on-blind-spot'], self._BLIND_SPOT_REPORT,
+        ) == 0
 
     def test_opt_in_without_check_never_reaches_the_sweep(self, monkeypatch, capsys):
         """Rejection happens at parse time, before any live service is built
