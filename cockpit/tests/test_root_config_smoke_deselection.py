@@ -16,6 +16,34 @@ of the deselect are wired: the smoke tests are excluded by default, and the
 `smoke` marker is registered (no PytestUnknownMarkWarning). `--collect-only`
 runs no fixtures, so it spawns zero windows/tmux and is safe to run on a live
 host.
+
+WHAT IS ASSERTED NOW (task 4060, review finding recovered from task 2300):
+the deselect run must exit pytest.ExitCode.NO_TESTS_COLLECTED (5, NOT 0 --
+every smoke test is deselected so nothing remains to run) AND print a
+`(N deselected)` summary with N >= 1, on top of the two original substring
+checks (`_deselection_problems`). Both original assertions were substring
+checks against captured output, so ANY run where collection never happened
+satisfied both -- e.g. running this file's own subprocess command under an
+interpreter without pytest installed measured rc=1 with stderr
+`No module named pytest`, and BOTH original assertions passed against that
+output. That was a false green reporting the X11 safety net as wired when
+collection never ran. The happy path, for contrast: rc=5 with
+`no tests collected (3 deselected)`.
+
+THE POSITIVE CONTROL (`_collection_problems`,
+test_smoke_tests_are_collectible_when_root_addopts_is_overridden): the
+deselection guard alone cannot distinguish "deselected" from "never
+present" -- smoke tests that were deleted or renamed would satisfy it just
+as well. The positive control re-runs the same target with the root
+addopts marker filter overridden and requires the smoke tests to actually
+appear.
+
+STILL NON-LIVE: every subprocess is `--collect-only` (runs no fixtures),
+and the two guard-rejection tests
+(test_deselection_guard_rejects_a_run_where_collection_never_ran,
+test_positive_control_guard_rejects_a_run_that_collected_nothing) feed
+hand-built subprocess.CompletedProcess stubs and spawn no subprocess at
+all, so the whole file remains safe to run on a live DISPLAY=:0 desktop.
 """
 
 from __future__ import annotations
