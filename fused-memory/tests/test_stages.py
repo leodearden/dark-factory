@@ -142,37 +142,6 @@ def make_configured_task_knowledge_sync_stage(
 _TKS_LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
 
 
-def _emit_foreign_log_noise() -> None:
-    """Emit two foreign log records that reproduce this file's caplog flake (task 4329).
-
-    pytest's caplog installs its LogCaptureHandler on the ROOT logger, so
-    ``caplog.at_level(level, logger=X)`` scopes the LEVEL threshold (on logger
-    X and on the handler) but NOT which loggers get captured — a record from
-    ANY logger that propagates to root and clears the level threshold lands
-    in ``caplog.records``. In production, a leaked httpx.AsyncClient finalized
-    nondeterministically on the same xdist worker emits
-    ``ERROR asyncio: Task exception was never retrieved`` at an unpredictable
-    moment, which a level-only ``r.levelno >= logging.WARNING`` filter counts
-    right alongside this module's own WARNING — turning an exact-count or
-    absence assertion flaky (sibling flake class: tasks 1851/2819/3510/3927).
-
-    Emits exactly two records so a single call is RED-effective regardless of
-    comparison operator:
-      - ``logging.getLogger('asyncio').error(...)`` — the exact observed
-        offender; breaks ``>= logging.WARNING`` filters (levelno 40).
-      - ``logging.getLogger('httpx').warning(...)`` — a foreign record at
-        exactly WARNING; breaks ``== logging.WARNING`` filters and
-        ``not any(... == logging.WARNING ...)`` absence assertions, which the
-        asyncio ERROR alone (levelno 40 != 30) would not trip.
-
-    Neither logger is ``_TKS_LOGGER``, so a name-scoped filter
-    (``r.name == _TKS_LOGGER``) excludes both — which is what every call
-    site below relies on.
-    """
-    logging.getLogger('asyncio').error('Task exception was never retrieved')
-    logging.getLogger('httpx').warning('mock httpx noise injected for task 4329 caplog de-flake')
-
-
 class TestMockTypesConstant:
     """Validate the _MOCK_TYPES constant that TestProjectIdValidation depends on."""
 
@@ -3508,14 +3477,14 @@ class TestInvariantAfterTask643:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             payload = await stage.assemble_payload([], watermark, [])
 
         # The warning must be emitted…
         assert any(
             rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and 'cancelled_count' in rec.message
             and 'cancelled_tasks' in rec.message
             for rec in caplog.records
@@ -3561,13 +3530,13 @@ class TestInvariantAfterTask643:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await stage.assemble_payload([], watermark, [])
 
         assert any(
             rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and 'done_count' in rec.message
             and 'done_tasks' in rec.message
             for rec in caplog.records
@@ -3599,7 +3568,7 @@ class TestInvariantAfterTask643:
         )
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             stage._check_filtered_tree_invariant(violating_tree)
 
@@ -3629,7 +3598,7 @@ class TestInvariantAfterTask643:
         )
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             stage._check_filtered_tree_invariant(violating_tree)
 
@@ -3660,10 +3629,9 @@ class TestInvariantAfterTask643:
         )
         with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             stage._check_filtered_tree_invariant(ok_tree)
-            _emit_foreign_log_noise()  # task 4329: RED-drive the absence assertion below
 
         assert not any(
-            rec.name == _TKS_LOGGER and rec.levelno == logging.WARNING for rec in caplog.records
+            rec.name == _TKS_LOGGER and rec.levelno >= logging.WARNING for rec in caplog.records
         )
 
     def test_check_filtered_tree_invariant_no_warning_when_ok(self, mock_deps, caplog):
@@ -3680,10 +3648,9 @@ class TestInvariantAfterTask643:
         )
         with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             stage._check_filtered_tree_invariant(ok_tree)
-            _emit_foreign_log_noise()  # task 4329: RED-drive the absence assertion below
 
         assert not any(
-            rec.name == _TKS_LOGGER and rec.levelno == logging.WARNING for rec in caplog.records
+            rec.name == _TKS_LOGGER and rec.levelno >= logging.WARNING for rec in caplog.records
         )
 
     def test_filter_task_tree_invariant_cancelled_count_and_cancelled_tasks_populated_together(self):
@@ -3921,13 +3888,13 @@ class TestFormatFlaggedCharBudget:
         items = [{'description': f'small-{i}', 'severity': 'minor'} for i in range(10)]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             _format_flagged(items)
 
         assert not any(
             rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             for rec in caplog.records
         ), (
             'Expected no WARNING for 10 small items; '
@@ -3963,14 +3930,14 @@ class TestFormatFlaggedCharBudget:
         items = [{'description': 'x' * 300, 'index': i} for i in range(200)]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             _format_flagged(items)  # result not needed here; warning is what we check
 
         warning_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1, (
             f'Expected exactly 1 WARNING; got {len(warning_records)}: '
@@ -4016,7 +3983,7 @@ class TestFormatFlaggedFirstItemEdgeCase:
         items = [{'description': 'y' * 50_000, 'severity': 'critical'}]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             text = _format_flagged(items)
 
@@ -4036,7 +4003,7 @@ class TestFormatFlaggedFirstItemEdgeCase:
         warning_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1, (
             f'Expected exactly 1 WARNING for oversized single item; got {len(warning_records)}'
@@ -4051,7 +4018,7 @@ class TestFormatFlaggedFirstItemEdgeCase:
         ]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             text = _format_flagged(items)
 
@@ -4070,14 +4037,14 @@ class TestFormatFlaggedFirstItemEdgeCase:
         items = [{'description': 'y' * 50_000, 'severity': 'critical'}]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             _format_flagged(items)
 
         warning_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and rec.message == 'reconciliation.flagged_items_truncated'
         ]
         assert len(warning_records) == 1, (
@@ -4105,7 +4072,7 @@ class TestFormatFlaggedFirstItemEdgeCase:
         ]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             text = _format_flagged(items)
 
@@ -4117,7 +4084,7 @@ class TestFormatFlaggedFirstItemEdgeCase:
         warning_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and rec.message == 'reconciliation.flagged_items_truncated'
         ]
         assert len(warning_records) == 1
@@ -4186,7 +4153,7 @@ class TestStage2HandoffShortfallWarning:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await stage.assemble_payload([], watermark, [stage1_report])
 
@@ -4194,7 +4161,7 @@ class TestStage2HandoffShortfallWarning:
         truncation_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and 'reconciliation.flagged_items_truncated' in rec.getMessage()
             and getattr(rec, 'run_stage', None) == 'stage2'
         ]
@@ -4236,14 +4203,14 @@ class TestStage2HandoffShortfallWarning:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await stage.assemble_payload([], watermark, [stage1_report])
 
         truncation_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and 'flagged_items_truncated' in rec.getMessage()
             and getattr(rec, 'run_stage', None) == 'stage2'
         ]
@@ -4356,7 +4323,7 @@ class TestBriefingKnownGapsRefresh:
 
         with patch('asyncio.create_subprocess_exec', return_value=mock_proc), caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
@@ -4364,7 +4331,7 @@ class TestBriefingKnownGapsRefresh:
         warning_records = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and r.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1
         # The warning must use the canonical message key and carry the exit code in extra.
@@ -4546,7 +4513,7 @@ class TestBriefingKnownGapsRefresh:
             ),
             caplog.at_level(
                 logging.INFO,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             await stage.run(
@@ -4653,7 +4620,7 @@ class TestBriefingKnownGapsRefresh:
             ),
             caplog.at_level(
                 logging.WARNING,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             report = await stage.run(
@@ -4668,7 +4635,7 @@ class TestBriefingKnownGapsRefresh:
         warning_records = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and r.name == _TKS_LOGGER
             and 'briefing_refresh_hook_failed' in r.getMessage()
         ]
         assert len(warning_records) == 1
@@ -4699,7 +4666,7 @@ class TestBriefingKnownGapsRefresh:
             side_effect=TimeoutError,
         ), caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
@@ -4708,7 +4675,7 @@ class TestBriefingKnownGapsRefresh:
         warning_records = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and r.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1
         assert 'briefing_known_gaps_script_timeout' in warning_records[0].getMessage()
@@ -4736,7 +4703,7 @@ class TestBriefingKnownGapsRefresh:
             return_value=mock_proc,
         ), caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _run_briefing_known_gaps_script(ProjectRoot(str(tmp_path)))
 
@@ -4744,7 +4711,7 @@ class TestBriefingKnownGapsRefresh:
         warning_records = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and r.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1
         assert 'briefing_known_gaps_script_bad_json' in warning_records[0].getMessage()
@@ -4766,7 +4733,7 @@ class TestBriefingKnownGapsRefresh:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
@@ -4776,7 +4743,7 @@ class TestBriefingKnownGapsRefresh:
         warning_records = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and r.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1
         assert 'briefing_refresh_add_task_failed' in warning_records[0].getMessage()
@@ -4810,7 +4777,7 @@ class TestBriefingKnownGapsRefresh:
 
         with caplog.at_level(
             logging.INFO,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
@@ -4824,7 +4791,7 @@ class TestBriefingKnownGapsRefresh:
 
         our_records = [
             r for r in caplog.records
-            if r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            if r.name == _TKS_LOGGER
         ]
         failed_warnings = [
             r for r in our_records
@@ -4885,7 +4852,7 @@ class TestBriefingKnownGapsRefresh:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
@@ -4899,7 +4866,7 @@ class TestBriefingKnownGapsRefresh:
         warning_records = [
             r for r in caplog.records
             if r.levelno == logging.WARNING
-            and r.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and r.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1
         assert 'briefing_refresh_add_task_unexpected_shape' in warning_records[0].getMessage()
@@ -4934,7 +4901,7 @@ class TestBriefingKnownGapsRefresh:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
@@ -5950,12 +5917,12 @@ class TestQueryStage2Flags:
         from fused_memory.reconciliation.stages.task_knowledge_sync import _query_stage2_flags
         memory_service = AsyncMock()
         memory_service.search.side_effect = RuntimeError('Mem0 unavailable')
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             current_flags, stale_missing_ids, stale_mismatched_ids, _rescued = await _query_stage2_flags(memory_service, 'reify', 'r-current')
         assert current_flags == []
         assert stale_missing_ids == []
         assert stale_mismatched_ids == []
-        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert any(r.name == _TKS_LOGGER and r.levelno >= logging.WARNING for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_calls_search_with_project_id(self):
@@ -6092,7 +6059,7 @@ class TestQueryStage2Flags:
         ]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await _query_stage2_flags(memory_service, 'reify', 'r-now')
 
@@ -6127,7 +6094,7 @@ class TestQueryStage2Flags:
         ]
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await _query_stage2_flags(memory_service, 'reify', 'r-now')
 
@@ -6484,7 +6451,7 @@ class TestQueryStage2Flags:
             ),
         ]
         with caplog.at_level(logging.INFO,
-                             logger='fused_memory.reconciliation.stages.task_knowledge_sync'):
+                             logger=_TKS_LOGGER):
             await _query_stage2_flags(
                 memory_service, 'reify', 'r-current', run_window_start=run_window_start
             )
@@ -6972,7 +6939,6 @@ class TestSweepStalePersistenceMarkers:
 
         with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             result = await _sweep_stale_persistence_markers(memory_service, 'reify', run_id='r1')
-            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         assert result == 0
         memory_service.delete_memory.assert_not_awaited()
@@ -7026,7 +6992,6 @@ class TestSweepStalePersistenceMarkers:
             result = await _sweep_stale_persistence_markers(
                 memory_service, 'reify', run_id='r1', now=fixed_now,
             )
-            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         assert result == 1
         warning_records = [
@@ -7063,7 +7028,6 @@ class TestSweepStalePersistenceMarkers:
             await _sweep_stale_persistence_markers(
                 memory_service, 'reify', run_id='r1', now=fixed_now, scroll_limit=3,
             )
-            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         warning_records = [
             r for r in caplog.records
@@ -7354,7 +7318,6 @@ class TestSweepStaleMem0FlagMarkers:
 
         with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             result = await _sweep_stale_mem0_flag_markers(memory_service, 'reify', run_id='r1')
-            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         assert result == 0
         memory_service.delete_memory.assert_not_awaited()
@@ -7408,7 +7371,6 @@ class TestSweepStaleMem0FlagMarkers:
             result = await _sweep_stale_mem0_flag_markers(
                 memory_service, 'reify', run_id='r1', now=fixed_now,
             )
-            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         assert result == 1
         warning_records = [
@@ -7445,7 +7407,6 @@ class TestSweepStaleMem0FlagMarkers:
             await _sweep_stale_mem0_flag_markers(
                 memory_service, 'reify', run_id='r1', now=fixed_now, scroll_limit=3,
             )
-            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         warning_records = [
             r for r in caplog.records
@@ -8209,7 +8170,7 @@ class TestSweepStaleMem0FlagForStage2Markers:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             result = await _sweep_stale_mem0_flag_for_stage2_markers(
                 memory_service, 'reify', run_id='r1',
@@ -8221,7 +8182,7 @@ class TestSweepStaleMem0FlagForStage2Markers:
         drift_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             and 'flag_for_stage2' in rec.getMessage()
             and "'true'" in rec.getMessage()
         ]
@@ -8259,7 +8220,7 @@ class TestWarnOnFlagForStage2TypeDrift:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
 
@@ -8271,7 +8232,7 @@ class TestWarnOnFlagForStage2TypeDrift:
         warning_records = [
             rec for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
         ]
         assert len(warning_records) == 1
         assert '3' in warning_records[0].getMessage()
@@ -8287,13 +8248,13 @@ class TestWarnOnFlagForStage2TypeDrift:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
 
         assert not any(
             rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             for rec in caplog.records
         )
 
@@ -8314,7 +8275,7 @@ class TestWarnOnFlagForStage2TypeDrift:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             # Must not raise.
             await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
@@ -8323,7 +8284,7 @@ class TestWarnOnFlagForStage2TypeDrift:
             rec
             for rec in caplog.records
             if rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
         ]
         # Exactly one fail-safe warning naming the swallowed probe failure;
         # the string-variant drift warning must NOT fire (the probe never
@@ -8345,13 +8306,13 @@ class TestWarnOnFlagForStage2TypeDrift:
 
         with caplog.at_level(
             logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+            logger=_TKS_LOGGER,
         ):
             await _warn_on_flag_for_stage2_type_drift(memory_service, 'reify', 'r1')
 
         assert not any(
             rec.levelno == logging.WARNING
-            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and rec.name == _TKS_LOGGER
             for rec in caplog.records
         )
 
@@ -8468,11 +8429,11 @@ class TestTrackFlagPersistence:
         memory_service.count_memories_by_metadata.side_effect = RuntimeError('Mem0 down')
         memory_service.add_memory.return_value = {'memory_ids': []}
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             result = await _track_flag_persistence(memory_service, 'proj', 'run-4', ['flag-D'])
 
         assert result == {'flag-D': 1}
-        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert any(r.name == _TKS_LOGGER and r.levelno >= logging.WARNING for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_add_memory_failure_still_returns_count(self, caplog):
@@ -8483,11 +8444,11 @@ class TestTrackFlagPersistence:
         memory_service.count_memories_by_metadata.return_value = 1
         memory_service.add_memory.side_effect = RuntimeError('write failed')
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             result = await _track_flag_persistence(memory_service, 'proj', 'run-5', ['flag-E'])
 
         assert result == {'flag-E': 2}  # 1 prior + 1
-        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert any(r.name == _TKS_LOGGER and r.levelno >= logging.WARNING for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_empty_flag_ids_returns_empty_no_calls(self):
@@ -8534,13 +8495,13 @@ class TestFilterAlreadyEscalatedFlags:
         memory_service = AsyncMock()
         memory_service.count_memories_by_metadata.side_effect = RuntimeError('Mem0 down')
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             newly, already = await _filter_already_escalated_flags(
                 memory_service, 'proj', ['flag-X'],
             )
         assert newly == ['flag-X']
         assert already == []
-        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert any(r.name == _TKS_LOGGER and r.levelno >= logging.WARNING for r in caplog.records)
 
 
 class TestWriteEscalationMarkers:
@@ -8573,10 +8534,10 @@ class TestWriteEscalationMarkers:
         memory_service = AsyncMock()
         memory_service.add_memory.side_effect = RuntimeError('write down')
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             await _write_escalation_markers(memory_service, 'proj', 'run-8', ['flag-Z'])
 
-        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert any(r.name == _TKS_LOGGER and r.levelno >= logging.WARNING for r in caplog.records)
 
 
 class TestTaskKnowledgeSyncActiveQueryFlags:
@@ -10461,7 +10422,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             ),
             caplog.at_level(
                 logging.INFO,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             report = await stage.run(
@@ -10519,7 +10480,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             ),
             caplog.at_level(
                 logging.INFO,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             report = await stage.run(
@@ -10566,7 +10527,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             ),
             caplog.at_level(
                 logging.INFO,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             report = await stage.run(
@@ -10616,7 +10577,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             ),
             caplog.at_level(
                 logging.INFO,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             report = await stage.run(
@@ -10679,7 +10640,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
             ),
             caplog.at_level(
                 logging.INFO,
-                logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+                logger=_TKS_LOGGER,
             ),
         ):
             report = await stage.run(
@@ -14491,7 +14452,6 @@ class TestSweepStaleMem0PoolProtectsMirrorRecords:
                 log_name='_sweep_stale_mem0_flag_markers',
                 now=fixed_now,
             )
-            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         deleted_ids = {
             call.kwargs.get('memory_id')
