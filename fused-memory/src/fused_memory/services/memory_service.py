@@ -460,6 +460,7 @@ async def _apply_memory_metadata_validation(
     parent_lookup: Callable[[str, str], Awaitable[dict | None]],
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
+    baseline: dict | None = None,
 ) -> None:
     """Validate the Mem0 metadata vocabulary at the write boundary, in place.
 
@@ -580,6 +581,57 @@ async def _apply_memory_metadata_validation(
             violations.append(
                 parent_liveness_violation(meta['parent_id'], code=liveness_code)
             )
+
+    # DELTA SCOPING (task 3523) — judge what this write CHANGED, never the
+    # record at rest.  Supplied only by `update_memory`, which is amending an
+    # existing record; the two add paths create one and so have no pre-image,
+    # pass no baseline, and are bit-identical to before.
+    #
+    # Reducing the set here, ONCE, is what makes the rule uniform: all three
+    # arms below — census, storm detector, enforce-reject — then operate on
+    # NEW violations only.  Re-censusing a pre-existing violation on every
+    # patch would inflate the census stream the task-3626 flip is measured
+    # from and trip false unknown-key storms off a long tail that was already
+    # counted; re-rejecting one would quietly restate `enforce` from "rejects
+    # WRITES" to "re-validates the corpus", which is the model both
+    # `_check_canonical_uniqueness`'s docstring and PRD §9 leaf ε's
+    # 2026-08-04 amendment state and measure against.
+    #
+    # AFTER the liveness block on purpose: that block gates its round-trip on
+    # `parent_id` carrying no shape violation, so subtracting first would let
+    # a pre-existing `invalid_parent_id_shape` spend a lookup on an id no
+    # store could resolve and then census `dead_parent_id` for it — blaming
+    # the wrong rule, which leaf δ explicitly forbids.  Liveness codes are
+    # never in the baseline set anyway: `validate_memory_metadata` is pure
+    # and structurally cannot produce them.
+    #
+    # Forgiven only when BOTH halves hold: the baseline already carried this
+    # (key, code) AND the write left that key's value alone.  (key, code)
+    # alone is not enough — swapping one bad slug for a DIFFERENT bad slug
+    # repeats the pair while being entirely this write's doing, and would
+    # earn a free pass.  "Judge what the write CHANGED" is about the KEY's
+    # value, not about which rule happens to fire.
+    #
+    # Compared against the NORMALIZED baseline copy, not the raw pre-image:
+    # `validate_memory_metadata` mutates in place, so a record whose stored
+    # `supersedes` is a legacy scalar would otherwise read as "changed" on
+    # every patch that never mentioned it.
+    #
+    # One extra PURE synchronous call on a shallow COPY, and zero I/O.
+    if baseline is not None:
+        _unset = object()
+        before = dict(baseline)
+        already = {
+            (v.key, v.code)
+            for v in validate_memory_metadata(
+                before, enforce_kind_registry=config.enforce_kind_registry
+            )
+        }
+        violations = [
+            v for v in violations
+            if (v.key, v.code) not in already
+            or meta.get(v.key, _unset) != before.get(v.key, _unset)
+        ]
 
     # NOTE: this is `if violations:`, not an early `return` — the canonical
     # uniqueness re-check below must still run for metadata that is
@@ -5028,6 +5080,9 @@ class MemoryService:
                 parent_lookup=self.get_memory_by_id,
                 count_canonical=self.count_memories_by_metadata,
                 find_canonical=self.get_memories_by_metadata,
+                # The record's PRE-IMAGE, free from the §5(c) read leg above.
+                # Only violations NEW relative to it are this write's problem.
+                baseline=existing_custom,
             )
 
         scope = Scope(project_id=project_id)
