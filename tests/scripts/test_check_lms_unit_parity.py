@@ -159,6 +159,121 @@ def test_a_drifted_timeout_is_reported_with_both_values(
     assert "[ok] parity" not in out
 
 
+def test_a_lost_present_only_directive_is_drift(tmp_path: pathlib.Path, capsys):
+    """An installed copy that LOST ExecStop is drift, naming the missing side.
+
+    This is the half of the UnitSpec design the value comparison structurally
+    cannot reach. ExecStop embeds an absolute host path (/usr/bin/docker), so
+    value-comparing it would fire on every machine whose docker lives
+    elsewhere — a gate that is red everywhere gets switched off. Presence is
+    still a real claim though: without ExecStop the arm's container keeps the
+    GPU after the unit stops, with no unit left to show for it.
+
+    The report must say which SIDE lost the directive. "ExecStop differs" sends
+    the operator to diff two files; "absent from the installed copy" tells them
+    the installed copy is the stale one.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(
+        tmp_path,
+        repo_root,
+        text="\n".join(
+            line
+            for line in COMMITTED_TEMPLATE.splitlines()
+            if not line.startswith("ExecStop=")
+        ),
+    )
+
+    rc = checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=_clean_probe(repo_root),
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[drift]" in out
+    assert "ExecStop" in out
+    assert "<absent>" in out
+    assert "absent from the installed copy" in out
+    assert "[ok] parity" not in out
+
+
+def test_a_present_only_directive_the_committed_copy_lacks_is_drift(
+    tmp_path: pathlib.Path, capsys
+):
+    """The SYMMETRIC case: the installed copy declares one the template does not.
+
+    Comparison is symmetric on purpose. An installed-only directive is how a
+    unit acquires behaviour that is in no committed file — the same class of
+    invisibility as a drop-in, just written into the unit itself — so it must
+    be reported, and reported as belonging to the INSTALLED side.
+    """
+    checker = _load_checker()
+    without_documentation = "\n".join(
+        line
+        for line in COMMITTED_TEMPLATE.splitlines()
+        if not line.startswith("Documentation=")
+    )
+    repo_root = _fake_repo(tmp_path, text=without_documentation)
+    # The installed copy keeps the Documentation= line the template lost.
+    installed_dir = _installed_from(tmp_path, repo_root, text=COMMITTED_TEMPLATE)
+
+    rc = checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=_clean_probe(repo_root),
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[drift]" in out
+    assert "Documentation" in out
+    assert "absent from the committed copy" in out
+    assert "[ok] parity" not in out
+
+
+def test_present_only_directives_with_different_values_are_not_drift(
+    tmp_path: pathlib.Path, capsys
+):
+    """A differently-spelled host path is NOT drift. This is the whole point.
+
+    Every present_only key embeds an absolute host path — the uv binary and the
+    repo root in ExecStart, the docker binary in ExecStop, the PRD file:// URL
+    in Documentation. Value-comparing them would report drift on every machine
+    that is not this one, and a gate that fires unconditionally is a gate that
+    gets switched off, taking the real findings with it.
+
+    So this asserts the PROPERTY that distinguishes present_only from compared,
+    which is the only thing making the two lists a design rather than two
+    spellings of one list.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    other_host = (
+        COMMITTED_TEMPLATE.replace(
+            "ExecStart=/home/leo/.local/bin/uv", "ExecStart=/usr/local/bin/uv"
+        )
+        .replace("ExecStop=/usr/bin/docker", "ExecStop=/opt/bin/docker")
+        .replace("Documentation=file:///home/leo", "Documentation=file:///srv")
+    )
+    installed_dir = _installed_from(tmp_path, repo_root, text=other_host)
+
+    # Precondition: the fixture really did change all three values.
+    assert other_host != COMMITTED_TEMPLATE
+    for changed in ("/usr/local/bin/uv", "/opt/bin/docker", "file:///srv"):
+        assert changed in other_host
+
+    rc = checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=_clean_probe(repo_root),
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "[drift]" not in out
+    assert "[ok] parity" in out
+
+
 def test_an_absent_installed_unit_is_the_benign_skip(
     tmp_path: pathlib.Path, capsys
 ):
@@ -543,6 +658,89 @@ def test_dropinpaths_reported_by_systemd_fails_the_run(
     assert rc == 1
     assert elsewhere in out
     assert "[ok] parity" not in out
+
+
+def test_a_dropin_systemd_spells_differently_is_named_once(
+    tmp_path: pathlib.Path, capsys
+):
+    """One file found by BOTH layers is reported ONCE, not once per spelling.
+
+    The two layers spell paths differently by construction: find_dropins builds
+    them from --installed-dir verbatim, systemd reports its own canonical path.
+    So the same file arrives twice whenever the two spellings differ while
+    denoting one file — a symlinked $HOME being the live case on any host whose
+    home is a symlink.
+
+    Listing it twice damages precisely the property the [override] block exists
+    for: every applying drop-in, named exactly once, so the operator fixes all
+    of them and can tell how many there are. A duplicate reads as two files.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+    dropin = _plant_dropin(installed_dir, "10-worktree-3713.conf", _WORKTREE_DROPIN)
+    declared = _declared_working_directory(repo_root)
+
+    # The SAME file, reached through a symlinked parent — a different string,
+    # the same inode. Nothing lexical about it, so a normalisation that only
+    # collapsed '//' and '/./' would still double-report.
+    link = tmp_path / "installed-via-link"
+    link.symlink_to(installed_dir, target_is_directory=True)
+    systemd_spelling = str(link / f"{UNIT_NAME}.d" / dropin.name)
+    assert systemd_spelling != str(dropin)
+    assert pathlib.Path(systemd_spelling).resolve() == dropin.resolve()
+
+    rc = checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=lambda argv: (
+            0,
+            f"WorkingDirectory={declared}\nDropInPaths={systemd_spelling}\n",
+        ),
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[override]" in out
+    naming = [line for line in out.splitlines() if dropin.name in line]
+    assert len(naming) == 1, out
+
+
+def test_a_partial_probe_answer_is_unverifiable_not_parity(
+    tmp_path: pathlib.Path, capsys
+):
+    """A reply carrying only WorkingDirectory answered HALF the question.
+
+    DropInPaths absent from the reply is not "no drop-ins" — it is no answer.
+    The two probed keys are two separate questions, and the drop-in half is the
+    one this whole task exists for, so a run that got no answer to it must not
+    print the affirmative "merges no drop-in" line. Treating a missing key as
+    its clean default would be a green claim over a question never asked: this
+    task's own bug, one level up.
+
+    Both one-sided replies are exercised, because the two halves fail
+    differently — the missing-DropInPaths one still has a MATCHING
+    WorkingDirectory, so it is the shape that would otherwise reach parity.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+    declared = _declared_working_directory(repo_root)
+
+    partials = {
+        "WorkingDirectory only": f"WorkingDirectory={declared}\n",
+        "DropInPaths only": "DropInPaths=\n",
+    }
+
+    for label, stdout in partials.items():
+        rc = checker.main(
+            ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+            probe_runner=lambda argv, _stdout=stdout: (0, _stdout),
+        )
+        out = capsys.readouterr().out
+        assert rc == 1, label
+        assert "could not verify" in out.lower(), label
+        assert "[ok] parity" not in out, label
+        assert "merges no drop-in" not in out, label
 
 
 def test_effective_workingdirectory_elsewhere_fails_the_run(

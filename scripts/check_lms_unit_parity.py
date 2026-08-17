@@ -126,6 +126,29 @@ def _log(message: str, *, stream=None) -> None:
     print(f"[{LOG_TAG}] {message}", file=stream if stream is not None else sys.stdout)
 
 
+def _same_file_key(path: str | pathlib.Path) -> str:
+    """Return a spelling-INDEPENDENT identity for *path*.
+
+    Used only to decide whether a drop-in systemd named is one the filesystem
+    glob already found. The two sides arrive spelled differently by
+    construction: ``find_dropins`` builds paths from ``--installed-dir``
+    verbatim, while systemd reports its own canonical path. So a symlinked
+    ``$HOME``, an ``XDG_CONFIG_HOME`` with a trailing slash, or a doubled
+    separator makes one file arrive under two names, and a raw string compare
+    would append it a second time — listing the same drop-in TWICE in a report
+    whose entire value is that every applying drop-in is named exactly once. An
+    operator reading a duplicate cannot tell whether there are two files or
+    one, and "fix all of these" is the instruction the report exists to give.
+
+    ``resolve()`` (not ``absolute()``) because the symlink case is the one that
+    actually differs beyond lexical normalisation; pathlib already collapses
+    ``//`` and ``/./`` at construction. Never used for REPORTING — the paths
+    printed stay the ones their source named, so the operator sees the spelling
+    their own tools will show them.
+    """
+    return str(pathlib.Path(path).resolve())
+
+
 # ---------------------------------------------------------------------------
 # Drift records and unit specs
 # ---------------------------------------------------------------------------
@@ -375,24 +398,38 @@ def read_effective_config(template_name: str, probe_runner) -> EffectiveConfig:
 
     working_directory: str | None = None
     dropin_paths: tuple[str, ...] = ()
-    saw_key = False
+    # Tracked PER KEY, not as one "saw something" flag. Each probed key is a
+    # separate question, and an answer to one establishes nothing about the
+    # other: DropInPaths defaults to (), which is indistinguishable from
+    # systemd's CLEAN answer, so a reply carrying only WorkingDirectory would
+    # otherwise parse "successfully" and — on a matching WorkingDirectory —
+    # print the affirmative "merges no drop-in" line for a question systemd
+    # never answered. That is a green claim over an unasked half, which is this
+    # task's own bug one level up. Reachable in practice: a systemd version
+    # that does not expose one property, truncated stdout, or a later argv edit
+    # that narrows to a single -p (test_probe_command_is_the_documented_one
+    # pins the argv, but a pin on the SEND side cannot vouch for the reply).
+    seen: set[str] = set()
     for line in stdout.splitlines():
         key, sep, value = line.partition("=")
-        if not sep or key.strip() not in _PROBE_KEYS:
+        key = key.strip()
+        if not sep or key not in _PROBE_KEYS:
             continue
-        saw_key = True
-        if key.strip() == "WorkingDirectory":
+        seen.add(key)
+        if key == "WorkingDirectory":
             working_directory = value.strip()
         else:
             # systemd renders DropInPaths as a space-separated list, empty when
             # nothing is merged.
             dropin_paths = tuple(value.split())
 
-    if not saw_key:
-        # Includes the empty-stdout case, which is exactly what an unhandled
-        # subcommand returns from the fake systemctl in the installer tests.
+    unanswered = [key for key in _PROBE_KEYS if key not in seen]
+    if unanswered:
+        # Includes the empty-stdout case (exactly what an unhandled subcommand
+        # returns from the fake systemctl in the installer tests) and every
+        # PARTIAL answer. Both are UNVERIFIABLE, never a default.
         return EffectiveConfig(
-            None, (), f"`{rendered}` reported neither {' nor '.join(_PROBE_KEYS)}"
+            None, (), f"`{rendered}` did not report {' or '.join(unanswered)}"
         )
 
     return EffectiveConfig(working_directory, dropin_paths)
@@ -548,8 +585,17 @@ def main(argv: Sequence[str], *, probe_runner=None) -> int:
     # is therefore a real drop-in from outside the directory we read.
     for name, paths in systemd_dropins:
         merged = dict(overridden)
-        known = {str(p) for p in merged.get(name, [])}
-        fresh = [pathlib.Path(p) for p in paths if p not in known]
+        # Compared by resolved identity, not by raw string: see _same_file_key.
+        # `known` is also EXTENDED as fresh paths are accepted, so two spellings
+        # of one file WITHIN systemd's own list collapse the same way.
+        known = {_same_file_key(p) for p in merged.get(name, [])}
+        fresh: list[pathlib.Path] = []
+        for raw in paths:
+            key = _same_file_key(raw)
+            if key in known:
+                continue
+            known.add(key)
+            fresh.append(pathlib.Path(raw))
         if not fresh:
             continue
         for index, (existing_name, existing) in enumerate(overridden):
