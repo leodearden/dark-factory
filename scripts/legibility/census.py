@@ -836,13 +836,29 @@ def render_report(
         coded = sum(stats.succeeded for stats in mining_result.batch_stats)
         drawn = sum(stats.total for stats in mining_result.batch_stats)
         if mining_result.stop_reason == "capped":
-            lines.append(
+            coverage_line = (
                 f"- coverage: coded {coded} of {drawn} session digest(s) drawn across "
                 f"{len(mining_result.batch_stats)} batch(es); operator batch cap = "
                 f"{mining_result.max_batches} batch(es) -- mining was BOUNDED BY THE CAP, "
                 "not run to saturation: sessions beyond the cap were NOT mined, so this "
                 "census is PARTIAL coverage, not a full sweep."
             )
+            # Gated on the count discrepancy itself, not on any batch's
+            # status == "failure": sub-storm coding failures (below the >50%
+            # threshold, PRD §8.6) still make coded < drawn and still
+            # overstate coverage if left unsaid, and this line's job is the
+            # count, not the storm classification (run_census reports storm
+            # indices separately). Kept inside the same coverage line so the
+            # shortfall can never be read apart from the claim it qualifies;
+            # a healthy capped run (coded == drawn) renders no clause at all
+            # -- a line trained to be ignored is a line that will be ignored
+            # on the run that matters.
+            if drawn > coded:
+                coverage_line += (
+                    f" {drawn - coded} digest(s) FAILED TO CODE and contributed no "
+                    "signal (see the per-batch tallies below)."
+                )
+            lines.append(coverage_line)
             # PARTIAL is not the same as "the rest comes later" -- say which
             # one this is. run_census always calls advance_census_state, and
             # _census_window_dates anchors the NEXT window at last_census_at,
