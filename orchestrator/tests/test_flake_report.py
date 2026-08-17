@@ -21,7 +21,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
+from orchestrator.cli import main
 from orchestrator.flake_ledger import (
     UNKNOWN_TEST_ID,
     DebtRow,
@@ -819,3 +821,71 @@ class TestRenderReport:
         assert '/proj/data/orchestrator/runs.db' in render_report(_report())
         absent = render_report(_report(db_present=False)).lower()
         assert 'no ledger' in absent or 'not present' in absent, absent
+
+
+class TestFlakeLedgerCommand:
+    """`orchestrator flake-ledger` end to end.  All sync — the report path has no async."""
+
+    def _project(self, tmp_path: Path, *, seed: bool = True) -> tuple[Path, Path]:
+        """Write a config YAML pointing at a tmp project; optionally seed its ledger."""
+        import yaml
+
+        project = tmp_path / 'project'
+        project.mkdir()
+        cfg = tmp_path / 'dark-factory-orchestrator.yaml'
+        cfg.write_text(yaml.dump({'project_root': str(project)}))
+        if seed:
+            db_path = project / 'data' / 'orchestrator' / 'runs.db'
+            db_path.parent.mkdir(parents=True)
+            ensure_schema(db_path)
+            _seed_debt(db_path, test_id='tests/test_a.py::test_one',
+                       opened_at='2026-08-06T12:00:00+00:00', owner_task_id='4242')
+            _seed_occurrence(db_path, test_id='tests/test_a.py::test_one',
+                             observed_at='2026-08-09T12:00:00+00:00')
+        return cfg, project
+
+    def test_the_command_is_registered(self):
+        assert 'flake-ledger' in main.commands
+
+    def test_it_prints_the_report_and_exits_zero(self, tmp_path):
+        cfg, _ = self._project(tmp_path)
+        result = CliRunner().invoke(main, ['flake-ledger', '--config', str(cfg)])
+        assert result.exit_code == 0, result.output
+        assert 'OPEN DEBT' in result.output, result.output
+        assert 'RECURRENCE CHAINS' in result.output, result.output
+        assert 'HEALTH COUNTERS' in result.output, result.output
+        assert 'tests/test_a.py::test_one' in result.output, result.output
+        assert '4242' in result.output, result.output
+
+    def test_no_config_and_no_env_exits_one_with_an_error(self, tmp_path, monkeypatch):
+        # OPERATIONS.md §3's no-auto-discovery rule: the orchestrator never guesses the
+        # target project from cwd, and this command is no exception.
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        result = CliRunner().invoke(main, ['flake-ledger'])
+        assert result.exit_code == 1, result.output
+        assert 'Error:' in result.output, result.output
+
+    def test_a_project_with_no_data_dir_is_never_provisioned(self, tmp_path):
+        cfg, project = self._project(tmp_path, seed=False)
+        assert not (project / 'data').exists()
+        result = CliRunner().invoke(main, ['flake-ledger', '--config', str(cfg)])
+        assert result.exit_code == 0, result.output
+        assert 'NO LEDGER' in result.output, result.output
+        assert not (project / 'data' / 'orchestrator' / 'runs.db').exists(), result.output
+        assert not (project / 'data').exists(), result.output
+
+    def test_every_writer_booby_trapped_and_the_command_still_succeeds(
+        self, tmp_path, monkeypatch
+    ):
+        # cli.py lazy-imports inside command bodies, so patching at the SOURCE module
+        # path is what actually intercepts.  Plain sync raisers even though
+        # open_debt/resolve_debt are `async def`: the assertion is that they are never
+        # awaited, which an AsyncMock would only be needed to permit.
+        def _boom(*args, **kwargs):
+            raise AssertionError('the flake-ledger command reached a ledger WRITE path')
+
+        for writer in ('record_flake_occurrence', 'open_debt', 'resolve_debt'):
+            monkeypatch.setattr(f'orchestrator.flake_ledger.{writer}', _boom)
+        cfg, _ = self._project(tmp_path)
+        result = CliRunner().invoke(main, ['flake-ledger', '--config', str(cfg)])
+        assert result.exit_code == 0, result.output
