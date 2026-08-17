@@ -925,6 +925,83 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     return last_launch_idx != -1 and last_launch_idx > last_reap_idx
 
 
+def detect_resumable_progress(records: list[dict] | None) -> bool:
+    """Return True when the transcript *records* hold work worth CONTINUING.
+
+    The question the cap-hit resume branch must answer after "can I reach the
+    transcript?": does that transcript record anything to continue?  A session
+    capped before it did any work has a perfectly reachable transcript holding
+    only a statement of intent, and resuming it injects CAP_HIT_RESUME_PROMPT
+    ("continue where you left off") pointing at nothing (the 4396db7a RCA).
+
+    "Progress" = at least one assistant ``tool_use`` block, OR more than one
+    assistant turn.  tool_use is the only durable evidence in a transcript that
+    the agent DID something rather than narrated an intention; the second
+    disjunct deliberately protects prose-only workers (synthesis, judge, review
+    agents) whose accumulated reasoning IS the thing worth resuming.
+
+    Contract — the False case is narrow BY CONSTRUCTION.  Returns False only
+    when emptiness is affirmatively PROVEN: *records* is a non-None list AND it
+    contains zero assistant ``tool_use`` blocks AND at most one assistant
+    record.  Returns True in every other case.
+
+    FAIL-SAFE DIRECTION (load-bearing, and the inverse of
+    :func:`detect_ended_awaiting_background`'s).  This predicate can only ever
+    cause a resume→fresh DOWNGRADE, and a wrong downgrade DISCARDS REAL AGENT
+    WORK — strictly worse than the confusing-but-harmless prompt it exists to
+    prevent.  So every ambiguity resolves to True (resume, today's behaviour):
+
+    - ``None`` records (unreadable/absent transcript) → True;
+    - non-dict records, non-list content, non-dict blocks, blocks missing
+      ``type``, unknown block types, unknown nestings → skipped as
+      unclassifiable, never raise, and never counted as evidence of emptiness.
+
+    Tolerant to both transcript content nestings:
+    ``record['message']['content']`` (the real CLI shape) and a flat
+    ``record['content']`` — mirroring
+    :func:`detect_ended_awaiting_background`'s walk.
+    """
+    if records is None:
+        return True
+    ambiguous = False
+    assistant_count = 0
+    tool_use_count = 0
+    for record in records:
+        if not isinstance(record, dict):
+            # Unclassifiable: this could itself have been an assistant turn, so
+            # it can never contribute to a proof of emptiness.
+            ambiguous = True
+            continue
+        if record.get('type') != 'assistant':
+            continue
+        assistant_count += 1
+        message = record.get('message')
+        if isinstance(message, dict) and isinstance(message.get('content'), list):
+            blocks = message['content']
+        elif isinstance(record.get('content'), list):
+            blocks = record['content']
+        else:
+            # An assistant record whose content shape we do not recognise may
+            # well contain tool calls we cannot see.
+            ambiguous = True
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                ambiguous = True
+                continue
+            btype = block.get('type')
+            if btype == 'tool_use':
+                tool_use_count += 1
+            elif btype != 'text':
+                # Any block type this predicate does not model (a missing
+                # 'type', a future 'server_tool_use'/'thinking' shape) might be
+                # work; only a plain text block is positive evidence of prose.
+                ambiguous = True
+    if ambiguous:
+        return True
+    return not (tool_use_count == 0 and assistant_count <= 1)
+
+
 def ended_awaiting_background_for_session(
     config_dir: Path,
     session_id: str,

@@ -27,10 +27,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from shared.cli_invoke import (
-    detect_resumable_progress,
-    resumable_progress_for_session,
-)
+from shared.cli_invoke import detect_resumable_progress
 
 # ── Fixture builders ────────────────────────────────────────────────────────
 # Hand-authored transcript record dicts mirroring the on-disk JSONL shape: an
