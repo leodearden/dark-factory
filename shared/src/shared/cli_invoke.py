@@ -3475,7 +3475,17 @@ async def _run_subprocess(
                             last_progress_turns = n
                             last_progress_monotonic = time.monotonic()
                 elif extension_engaged and config_dir and session_id:
-                    n = count_transcript_turns(config_dir, session_id)
+                    # OFF-LOOP (task 3925) — same rationale as the branch above,
+                    # and this is the higher-frequency site in production:
+                    # workflow.py passes BOTH working_idle_secs and
+                    # absolute_cap_secs for every role, so extension_engaged
+                    # latches for every agent and this read fires every
+                    # _WATCHDOG_WORKING_POLL_SECS for the agent's entire working
+                    # lifetime (20-40 min is routine), against a transcript that
+                    # only grows.  The branches are kept separate on purpose: a
+                    # merged read would also fire on iterations where neither
+                    # branch applies.
+                    n = await asyncio.to_thread(count_transcript_turns, config_dir, session_id)
                     if n is None:
                         if not unreadable_escape_fired:
                             unreadable_escape_fired = note_unreadable_transcript(
