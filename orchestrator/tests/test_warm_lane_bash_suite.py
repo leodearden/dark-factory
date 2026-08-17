@@ -429,14 +429,22 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
             # `shared.proc_group.terminate_process_group` step 1 and
             # `deterministic_runner._terminate_process_tree`.
             #
-            # `Popen.communicate(timeout=...)` does not reap on timeout, so
-            # `poll()` is normally None here and this changes nothing in
-            # practice.  It is written anyway so both sites this task closed
-            # enforce the SAME two-part rule the killpg guard's failure message
-            # states -- a reader comparing them should not find the repo's
-            # stated contract and one of its two remaining killpg sites
-            # disagreeing.
-            if proc.poll() is None:
+            # `Popen.communicate(timeout=...)` deliberately does NOT reap on
+            # timeout, so `returncode` is normally None here and the kill still
+            # dispatches.  Read `returncode` (a plain attribute) and NOT
+            # `poll()`: `poll()` is not a read of existing state, it calls
+            # `waitpid(WNOHANG)` and REAPS an exited leader — which would then
+            # suppress the very killpg this path exists for.  That matters
+            # concretely: a suite whose bash leader exits while a backgrounded
+            # helper (`( flock -x 9 && ... sleep 300 ) &`) still holds the stdout
+            # pipe open times out with the leader an unreaped zombie whose pid
+            # the kernel cannot recycle — so the frozen pgid is still valid and
+            # the group must be killed, or the helper holds a lane flock for
+            # minutes and turns one timeout into a cascade.  This spelling is a
+            # literal mirror of `deterministic_runner._terminate_process_tree`,
+            # so both sites this task closed enforce the same two-part rule the
+            # killpg guard's failure message states.
+            if proc.returncode is None:
                 try:
                     os.killpg(pgid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):  # pragma: no cover
