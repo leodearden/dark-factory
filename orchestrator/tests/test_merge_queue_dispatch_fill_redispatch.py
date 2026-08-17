@@ -133,6 +133,16 @@ def _drive_fill(worker: SpeculativeMergeWorker, allocator: HostAllocator) -> _Fi
         )
 
     async def _fake_finalize_inflight(entry: InflightEntry) -> bool:
+        # _fake_dispatch_item (above) always builds entries with a real
+        # verify_task -- this stub never produces a passthrough
+        # (verify_task=None) entry -- so narrow loudly rather than silently
+        # no-op on a None this harness should never produce (matches the
+        # `if entry.verify_task is not None:` narrowing the real
+        # _finalize_inflight uses for its passthrough case).
+        assert entry.verify_task is not None, (
+            '_fake_dispatch_item always sets a real verify_task; a None here '
+            'means the harness constructed an unexpected passthrough entry'
+        )
         await entry.verify_task
         if entry.lease is not None:
             await allocator.release(entry.lease)
