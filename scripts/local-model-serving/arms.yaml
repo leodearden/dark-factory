@@ -29,13 +29,16 @@
 # POINTER STYLE.  The rule is BIDIRECTIONAL: neither this file nor the PRD
 # cites the other by LINE NUMBER.  Every cross-reference is a STABLE LOCATOR --
 # a section heading plus a row/arm name going that way, an arm_id plus a field
-# or a quoted comment phrase coming this way.  Both files are edited by every
-# pass of this drift-correction class, so a number is invalid in both
-# directions: the PRD grows a new amendment banner at the TOP (invalidating
-# every number below it at once), and this file grows comment blocks in the
-# MIDDLE (shifting everything after them).
+# or a quoted comment phrase coming this way.  A quoted comment phrase must fit
+# on ONE PHYSICAL LINE of this file: grep matches a line, not a wrapped
+# paragraph, and this file wraps comments at ~80 columns, so a phrase that
+# straddles a wrap point is not a working locator even though it is accurate
+# prose.  Both files are edited by every pass of this drift-correction class,
+# so a number is invalid in both directions: the PRD grows a new amendment
+# banner at the TOP (invalidating every number below it at once), and this
+# file grows comment blocks in the MIDDLE (shifting everything after them).
 #
-# Task 3973 converted all seven pointers this file previously carried into the
+# Task 3973 converted all eight pointers this file previously carried into the
 # PRD -- they had all drifted, first by task 3748's amendment banner and again
 # by task 3804's, so each landed a reader in unrelated amendment prose -- plus
 # the two reciprocal PRD->here pointers, one of which (`arms.yaml:97-101`, for
@@ -46,10 +49,10 @@
 #
 # FIVE SIBLING files still carry `PRD line 134` / `PRD line 127` pointers with
 # the same defect -- lms_healthcheck.py, lms_manifest.py,
-# tests/test_lms_manifest.py, tests/test_lms_healthcheck.py and
-# tests/test_lms_vram.py.  Those files were outside task 3973's declared scope
-# and are named here so their staleness is on the record rather than mistaken
-# for correctness; a follow-up carries them.
+# scripts/tests/test_lms_manifest.py, scripts/tests/test_lms_healthcheck.py and
+# scripts/tests/test_lms_vram.py.  Those files were outside task 3973's
+# declared scope and are named here so their staleness is on the record rather
+# than mistaken for correctness; task 4346 carries them.
 
 port_block: [8410, 8417]
 
