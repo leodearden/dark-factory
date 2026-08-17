@@ -240,11 +240,14 @@ class TestParseConfigCommandUvWrapper:
     def test_uv_run_with_project_and_directory_sets_both(self):
         """--project and --directory can both appear on one `uv run` wrapper.
 
-        Real per-subproject commands (orchestrator.yaml) carry both flags
-        together, e.g. `uv run --project orchestrator --directory
-        orchestrator pyright src/ tests/` — --project selects the venv,
-        --directory shifts cwd. Both must be captured, not just the first
-        one peeled.
+        BACK-COMPAT/ROBUSTNESS coverage, not a mirror of the live configs:
+        task 3830 retired the `--project X --directory X` pairing from every
+        module orchestrator.yaml, which now carries `--directory X` alone.
+        The parser must still capture both, because uv still ACCEPTS the
+        pairing, other projects' configs may still carry it, and a DIFFERING
+        pair (`--project shared --directory scripts`) stays legitimate —
+        --project selects the venv, --directory shifts cwd. Both must be
+        captured, not just the first one peeled.
         """
         cmd = parse_config_command(
             'uv run --project orchestrator --directory orchestrator pyright src/ tests/'

@@ -65,8 +65,13 @@ def _materialize(worktree: Path, *relpaths: str) -> None:
 
 
 def _module_config(prefix: str) -> ModuleConfig:
-    """A subproject whose commands mirror dark_factory's real per-subproject
+    """A subproject whose commands mirror dark_factory's per-subproject
     shape (``uv run --project X --directory X pytest ...``).
+
+    Retains the PAIRED spelling deliberately: task 3830 retired that pairing
+    from the live orchestrator.yaml files (now ``--directory X`` alone), but
+    uv still accepts it and this fixture exercises the parser's both-flags
+    path, so it is real coverage rather than a stale mirror.
     """
     return ModuleConfig(
         prefix=prefix,

@@ -1016,9 +1016,14 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
         idx += 3
 
     # Peel a `uv run [--project X] [--directory X]` wrapper — both flags may
-    # appear together (in either order; real per-subproject commands carry
-    # both: `uv run --project orchestrator --directory orchestrator pyright
-    # ...`), so this loops rather than peeling at most one. uv_project is
+    # appear together (in either order), so this loops rather than peeling at
+    # most one. The live per-subproject commands no longer pair them: task
+    # 3830 retired `--project X --directory X` (uv resolves `--project X`
+    # against the cwd `--directory X` just established, looking for X/X) and
+    # they now carry `--directory X` alone. The loop still handles the pairing
+    # because uv still ACCEPTS it, other projects' configs may still use it,
+    # and a differing pair (`--project shared --directory scripts`) remains
+    # legitimate. uv_project is
     # tri-state: None = no uv wrapper at all; '' = bare `uv run <tool>`
     # (uv-wrapped, no explicit project — see reproject()); non-empty = an
     # explicit --project was given.

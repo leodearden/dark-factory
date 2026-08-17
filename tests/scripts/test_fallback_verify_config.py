@@ -820,7 +820,7 @@ class TestWorkspacePyrightInterpreterPinned:
     covered only the 3 directories ``type_check_command`` happened to ``cd``
     into, leaving the hole one config edit away from reopening: ``shared`` and
     ``escalation`` were type-checked only through their own
-    ``<sub>/orchestrator.yaml`` ``uv run --project X --directory X pyright``
+    ``<sub>/orchestrator.yaml`` ``uv run --directory X pyright``
     commands, where uv (not ``[tool.pyright]``) supplies the interpreter, and
     ``sampler``/``cockpit``/``dashboard`` weren't in the fleet chain at all.
     Task 3397 extended the fleet chain to all 7 workspace members, so today

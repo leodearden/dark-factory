@@ -1548,7 +1548,12 @@ class TestModuleConfigOpaqueChainScoping:
         touched = 'fused-memory/tests/test_harness.py'
         (tmp_path / touched).write_text('def test_harness(): pass\n')
 
-        # Verbatim fused-memory/orchestrator.yaml:11.
+        # The pre-task-3830 PAIRED spelling of
+        # fused-memory/orchestrator.yaml::lint_command (the live config now
+        # carries `--directory fused-memory` alone). Kept paired on purpose:
+        # uv still accepts it, and the expectation below is recomputed from
+        # this same literal, so it exercises the parser rather than mirroring
+        # the config.
         lint_command = (
             'uv run --project fused-memory --directory fused-memory ruff check src/ tests/ '
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests '

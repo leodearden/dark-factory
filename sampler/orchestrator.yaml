@@ -3,7 +3,11 @@
 # file, sampler is the only subproject the orchestrator never discovers, so its verify
 # falls back to a root-cwd __fallback__ config whose pyright cannot resolve sampler's
 # src-layout editable install (false reportMissingImports). Mirrors the sibling
-# subprojects' --project <member> --directory <member> convention.
+# subprojects' --directory <member> convention (task 3830 retired the former
+# --project <member> --directory <member> pairing: uv resolved --project
+# against the cwd --directory had just established, looking for <member>/<member>).
+# --directory is the one kept because cwd is load-bearing for pyright's
+# per-module [tool.pyright] venvPath/venv pin.
 
 # Verification commands
 test_command: "uv run --directory sampler pytest tests/ --tb=short -q --timeout=300"
