@@ -19,9 +19,16 @@ Covers:
   of tasks carrying ``metadata.operational_mode == 'gate'``.
 - build_gate_resolution_flag: pure builder for the Stage-1 flag dict Stage 2
   consumes to close the resolved gate.
+- sweep_resolved_curator_gates: best-effort async orchestrator that counts
+  each gate's ``curator_gate_{id}`` Mem0 entries via a deterministic Qdrant
+  payload filter and emits one flag per resolved gate.
 """
 
 from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from fused_memory.reconciliation.cli_stage_runner import FINDING_ITEM_SCHEMA
 from fused_memory.reconciliation.curator_gate_resolution_sweep import (
@@ -29,6 +36,7 @@ from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     build_gate_resolution_flag,
     curator_gate_source,
     extract_open_gate_task_ids,
+    sweep_resolved_curator_gates,
 )
 from fused_memory.reconciliation.flag_dedup import compute_flag_signature
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
@@ -277,3 +285,130 @@ class TestBuildGateResolutionFlag:
         assert signature == ('5561', 'task_completed_not_reflected'), (
             f'unexpected dedup signature: {signature!r}'
         )
+
+
+def _make_memory_service(*, counts=None, memories=None) -> MagicMock:
+    """MagicMock memory_service with AsyncMock metadata readers.
+
+    Mirrors ``_make_memory_service`` in test_degenerate_task_node_sweep.py.
+    *counts*/*memories* map a ``curator_gate_{id}`` source key to that key's
+    count / memory list, defaulting to 0 / [].
+    """
+    counts = counts or {}
+    memories = memories or {}
+    memory_service = MagicMock()
+    memory_service.count_memories_by_metadata = AsyncMock(
+        side_effect=lambda project_id, filters: counts.get(filters.get('source'), 0),
+    )
+    memory_service.get_memories_by_metadata = AsyncMock(
+        side_effect=lambda project_id, filters: memories.get(filters.get('source'), []),
+    )
+    memory_service.search = AsyncMock(return_value=[])
+    return memory_service
+
+
+class TestSweepResolvedCuratorGates:
+    """sweep_resolved_curator_gates emits one flag per gate with curator evidence."""
+
+    @pytest.mark.asyncio
+    async def test_zero_count_yields_no_flag_and_no_fetch(self):
+        """A gate with no curator entry is left alone — and costs only the count call."""
+        memory_service = _make_memory_service(counts={'curator_gate_5561': 0})
+
+        stats = await sweep_resolved_curator_gates(memory_service, 'reify', ['5561'])
+
+        assert stats['flags'] == [], f'no evidence must mean no flag, got {stats["flags"]!r}'
+        assert stats['resolved'] == 0
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_positive_count_yields_one_flag_with_that_tasks_citations(self):
+        """A gate with curator entries yields exactly one flag citing those memories."""
+        memory_service = _make_memory_service(
+            counts={'curator_gate_5561': 2},
+            memories={'curator_gate_5561': [{'id': 'mem-a'}, {'id': 'mem-b'}]},
+        )
+
+        stats = await sweep_resolved_curator_gates(memory_service, 'reify', ['5561'])
+
+        assert len(stats['flags']) == 1, f'expected exactly one flag, got {stats["flags"]!r}'
+        flag = stats['flags'][0]
+        assert flag['task_id'] == '5561'
+        assert flag['flag_type'] == 'task_completed_not_reflected'
+        assert flag['cited_memories'] == [
+            {'memory_id': 'mem-a', 'store': 'mem0'},
+            {'memory_id': 'mem-b', 'store': 'mem0'},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_count_filter_is_the_exact_source_key_and_never_semantic_search(self):
+        """The count is a deterministic payload-filter read, not a semantic search."""
+        memory_service = _make_memory_service(counts={'curator_gate_5563': 0})
+
+        await sweep_resolved_curator_gates(memory_service, 'reify', ['5563'])
+
+        memory_service.count_memories_by_metadata.assert_awaited_once_with(
+            project_id='reify', filters={'source': 'curator_gate_5563'},
+        )
+        memory_service.search.assert_not_awaited()
+        memory_service.search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_filter_contains_only_the_source_key(self):
+        """No task_id key is ANDed in — Qdrant ANDs conditions, so it can only lose recall.
+
+        A curator entry whose writer omitted metadata.task_id would be missed,
+        and the source key already encodes the id, so the extra condition buys
+        nothing. Missing a resolved gate is the exact failure this sweep exists
+        to fix.
+        """
+        memory_service = _make_memory_service(
+            counts={'curator_gate_5561': 1},
+            memories={'curator_gate_5561': [{'id': 'mem-a'}]},
+        )
+
+        await sweep_resolved_curator_gates(memory_service, 'reify', ['5561'])
+
+        for call in (
+            *memory_service.count_memories_by_metadata.await_args_list,
+            *memory_service.get_memories_by_metadata.await_args_list,
+        ):
+            filters = call.kwargs['filters']
+            assert set(filters) == {'source'}, (
+                f'the payload filter must contain ONLY the source key, got {filters!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_returns_counter_dict_with_flags_matching_resolved(self):
+        """Stats shape is {'flags', 'scanned', 'resolved', 'errors'}; len(flags) == resolved."""
+        memory_service = _make_memory_service(
+            counts={'curator_gate_5561': 1, 'curator_gate_5563': 3, 'curator_gate_9999': 0},
+            memories={
+                'curator_gate_5561': [{'id': 'mem-a'}],
+                'curator_gate_5563': [{'id': 'mem-b'}, {'id': 'mem-c'}, {'id': 'mem-d'}],
+            },
+        )
+
+        stats = await sweep_resolved_curator_gates(
+            memory_service, 'reify', ['5561', '5563', '9999'],
+        )
+
+        assert set(stats) == {'flags', 'scanned', 'resolved', 'errors'}, (
+            f'unexpected stats shape: {sorted(stats)!r}'
+        )
+        assert stats['scanned'] == 3
+        assert stats['resolved'] == 2
+        assert stats['errors'] == 0
+        assert len(stats['flags']) == stats['resolved']
+        assert {f['task_id'] for f in stats['flags']} == {'5561', '5563'}
+
+    @pytest.mark.asyncio
+    async def test_empty_task_ids_short_circuits_with_no_backend_calls(self):
+        """No gates -> zero stats, empty flag list, and not one backend round trip."""
+        memory_service = _make_memory_service()
+
+        stats = await sweep_resolved_curator_gates(memory_service, 'reify', [])
+
+        assert stats == {'flags': [], 'scanned': 0, 'resolved': 0, 'errors': 0}
+        memory_service.count_memories_by_metadata.assert_not_awaited()
+        memory_service.get_memories_by_metadata.assert_not_awaited()
