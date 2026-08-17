@@ -29,6 +29,7 @@ from orchestrator.flake_ledger import (
 )
 from orchestrator.flake_report import (
     _parse_stamp,
+    build_chains,
     compute_gate_blind,
     compute_non_convergence,
     compute_systemic,
@@ -336,3 +337,92 @@ class TestSystemicCounter:
         assert counter.peak_distinct_tests == 0
         assert counter.peak_window_start is None
         assert counter.exceeds_threshold is False
+
+
+class TestChains:
+    """Per-test recurrence chains — the union of open debt and windowed occurrences."""
+
+    @staticmethod
+    def _lookup(rows: dict[str, DebtRow]):
+        """An injected debt_lookup, so the chain unit tests need no DB."""
+        return lambda test_id: rows.get(test_id)
+
+    def test_a_test_with_occurrences_but_no_debt_row_still_appears(self):
+        # This is what makes task κ's signal observable: a CHRONIC-FLAKY marker produces
+        # an occurrence BEFORE any debt exists, and κ's acceptance is that it appears in
+        # THE REPORT (and files no second de-flake task).
+        occurrences = [_occ(test_id='tests/test_new.py::test_x')]
+        chains = build_chains(occurrences, [], self._lookup({}))
+        assert [c.test_id for c in chains] == ['tests/test_new.py::test_x']
+        assert chains[0].debt is None
+        assert chains[0].occurrence_count == 1
+
+    def test_call_site_counts_separate_chronic_marker_from_the_gates(self):
+        occurrences = [
+            _occ(test_id='t', call_site=FlakeCallSite.chronic_marker, row_id=1,
+                 observed_at='2026-08-08T12:00:00+00:00'),
+            _occ(test_id='t', call_site=FlakeCallSite.merge_gate, row_id=2,
+                 observed_at='2026-08-08T12:01:00+00:00'),
+            _occ(test_id='t', call_site=FlakeCallSite.merge_gate, row_id=3,
+                 observed_at='2026-08-08T12:02:00+00:00'),
+            _occ(test_id='t', call_site=FlakeCallSite.main_probe, row_id=4,
+                 observed_at='2026-08-08T12:03:00+00:00'),
+        ]
+        chains = build_chains(occurrences, [], self._lookup({}))
+        assert chains[0].call_site_counts == {
+            'chronic_marker': 1,
+            'merge_gate': 2,
+            'main_probe': 1,
+        }
+        assert chains[0].occurrence_count == 4
+
+    def test_sentinel_occurrences_produce_no_chain(self):
+        # A sentinel names no test, so it can own no chain — open_debt itself REFUSES it
+        # for the same reason.  It still counts toward the gate-blind rate (TestGateBlind).
+        occurrences = [_occ(test_id=UNKNOWN_TEST_ID, verdict=FlakeVerdict.unconfirmable)]
+        assert build_chains(occurrences, [], self._lookup({})) == []
+
+    def test_open_debt_with_no_windowed_occurrences_still_appears(self):
+        debt = _debt(test_id='quiet', open_count=2, prior_resolved_at='2026-07-01T00:00:00+00:00',
+                     prior_resolving_commit='abc1234')
+        chains = build_chains([], [debt], self._lookup({'quiet': debt}))
+        assert [c.test_id for c in chains] == ['quiet']
+        assert chains[0].occurrence_count == 0
+        assert chains[0].debt is not None
+        assert chains[0].debt.open_count == 2
+        assert chains[0].debt.prior_resolved_at == '2026-07-01T00:00:00+00:00'
+        assert chains[0].debt.prior_resolving_commit == 'abc1234'
+
+    def test_a_currently_resolved_test_with_occurrences_still_shows_its_chain(self):
+        # The motivating case: test_spawn_claude.py, 7 de-flake tasks in 7 weeks, must
+        # read as ONE chain even between cycles.  list_open_debt filters on
+        # resolved_at IS NULL, so a chain built from it alone goes blank exactly when
+        # each fix appears to have worked.
+        resolved = _debt(test_id='chronic', resolved_at='2026-08-01T00:00:00+00:00',
+                         open_count=7, prior_resolved_at='2026-07-25T00:00:00+00:00',
+                         prior_resolving_commit='deadbee')
+        chains = build_chains([_occ(test_id='chronic')], [], self._lookup({'chronic': resolved}))
+        assert [c.test_id for c in chains] == ['chronic']
+        assert chains[0].debt is not None
+        assert chains[0].debt.open_count == 7
+        assert chains[0].debt.prior_resolving_commit == 'deadbee'
+
+    def test_ordering_is_deterministic_recurrence_first_then_test_id(self):
+        occurrences = [
+            _occ(test_id='zzz', row_id=1),
+            _occ(test_id='aaa', row_id=2),
+            _occ(test_id='mmm', row_id=3),
+        ]
+        lookup = self._lookup({'mmm': _debt(test_id='mmm', open_count=5)})
+        chains = build_chains(occurrences, [], lookup)
+        assert [c.test_id for c in chains] == ['mmm', 'aaa', 'zzz']
+        # Byte-stability of the rendered report depends on this being repeatable.
+        assert [c.test_id for c in build_chains(occurrences, [], lookup)] == ['mmm', 'aaa', 'zzz']
+
+    def test_last_observed_at_is_the_most_recent_occurrence(self):
+        occurrences = [
+            _occ(test_id='t', observed_at='2026-08-08T12:00:00+00:00', row_id=1),
+            _occ(test_id='t', observed_at='2026-08-09T09:00:00+00:00', row_id=2),
+        ]
+        chains = build_chains(occurrences, [], self._lookup({}))
+        assert chains[0].last_observed_at == '2026-08-09T09:00:00+00:00'
