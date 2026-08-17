@@ -5375,17 +5375,15 @@ async def _validate_done_provenance(
     if kind is None:
         return _done_provenance_error(
             task_id,
-            'done_provenance.kind is required (must be "merged", '
-            '"found_on_main", "deterministic-deploy", or '
-            '"deterministic-deploy-scheduled"). Use kind="merged" '
-            'with commit=<merge-sha> after a successful merge_request, '
-            'kind="found_on_main" with note=<explanation> when the '
-            'implementation is already on main from a sibling task, '
-            'kind="deterministic-deploy" for a cross-unit service-restart '
-            'deploy (no commit required), or '
-            'kind="deterministic-deploy-scheduled" for an own-unit '
-            'self-restart that was scheduled but not yet verified (no '
-            'commit required).',
+            f'done_provenance.kind is required (must be {_DONE_PROVENANCE_KINDS_TEXT}). '
+            'Use kind="merged" with commit=<merge-sha> after a successful '
+            'merge_request; kind="found_on_main" with commit=<sha> and '
+            'note=<explanation> when the implementation is already on main '
+            'from a sibling task; or kind="operational-verified" with '
+            'escalation_id=<id> and note=<text> for a no-code operational ask '
+            'closed via a resolved escalation. The deterministic-* kinds are '
+            'stamped by DeterministicRunner, not supplied by hand — see the '
+            'per-kind table in docs/task-authoring.md.',
         ), None
     if kind not in _DONE_PROVENANCE_KINDS:
         return _done_provenance_error(
