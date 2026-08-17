@@ -1946,30 +1946,22 @@ class TestParseMetadataFailurePolicy:
         """The finding-provenance family must not census-warn (esc-3796-1, 2026-08-17).
 
         `source_finding_id` is ratified as the CANONICAL key naming the finding
-        a task was spawned from, and `stage1_finding_id` as the distinct
-        canonical key naming a Stage-1 finding specifically. The ruling is a
-        corpus-DOMINANCE one, measured over .taskmaster/tasks by exact JSON
-        key: source_finding_id=120 tasks, stage1_finding_id=33,
-        origin_finding_id=30, with source-x-origin overlap 0 (the populations
-        are cleanly disjoint, so this is a vocabulary split, not double
-        tagging). Write volume since 2026-08-01 runs 46 vs 2 in favour of the
-        canonical spelling — a 23:1 margin.
+        a task was spawned from; `stage1_finding_id` is a distinct canonical
+        key naming a Stage-1 finding specifically, NOT an alias of it.
 
-        The unusual part, and the reason this docstring is long: NEITHER key
-        has any code reader or writer. The whole family is an LLM prose
-        convention, so `origin_finding_id` never met the "already relied on by
-        real writers" Tier-A criterion it was blessed under
-        (docs/task-authoring.md:830-832). Ratifying the dominant spelling is
-        therefore the cheapest way to stop 120 tasks' worth of unknown_key
-        census noise, and blessing stays reversible if a later ruling
-        consolidates the family differently (precedent: commit 84e3b4cd75
-        un-blessed curator_adjudicated_at).
+        `origin_finding_id` is asserted here too because it is the RETIRED
+        alias that nonetheless STAYS blessed: task 3796 rejected data
+        migration, so the landed tasks carrying it cannot be rewritten and
+        un-blessing it would manufacture exactly the unknown_key census noise
+        this change exists to remove. A later cleanup must not drop it
+        silently.
 
-        `origin_finding_id` is asserted here too, pinning the RETIRED alias's
-        continued blessing: 30 landed tasks carry it, most terminal and
-        mechanically un-rewritable, and task 3796 rejected data migration — so
-        a later cleanup must not silently un-bless it and manufacture exactly
-        the census noise this change exists to remove.
+        The ruling is a corpus-DOMINANCE one, and unusually for a Tier-A entry
+        this family has no code reader and no code writer. Basis and census
+        figures: esc-3796-1 (2026-08-17), transcribed once beside the entries
+        in shared/src/shared/task_metadata.py and deliberately not restated
+        here — a point-in-time measurement kept in three places ages into two
+        stale copies.
 
         RED until 'source_finding_id' and 'stage1_finding_id' are added to
         _BLESSED_METADATA_KEYS.
@@ -1996,7 +1988,7 @@ class TestParseMetadataFailurePolicy:
         ]
         assert retired_offending == [], (
             'origin_finding_id must stay blessed as the documented-as-retired alias '
-            f'(30 landed tasks carry it); got: {retired_offending}'
+            f'(esc-3796-1; task 3796 rejected migration); got: {retired_offending}'
         )
 
     @pytest.mark.parametrize(

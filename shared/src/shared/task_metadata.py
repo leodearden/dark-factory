@@ -916,6 +916,12 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # means `origin_finding_id` never met the "already relied on by real
         # writers" criterion it was originally blessed under.
         #
+        # Those figures are a point-in-time census (2026-08-17), not an
+        # invariant, so this comment is deliberately their SINGLE in-repo copy:
+        # docs/task-authoring.md §8 and the dedicated test's docstring cite
+        # esc-3796-1 instead of restating them. A re-census updates here and
+        # the ruling — nowhere else.
+        #
         # The retired alias STAYS because 30 landed tasks carry it, most
         # terminal and mechanically un-rewritable (task 3796 rejected data
         # migration). Removing it would manufacture exactly the unknown_key

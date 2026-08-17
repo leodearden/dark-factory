@@ -851,10 +851,13 @@ The finding-provenance trio (`source_finding_id`, `stage1_finding_id`,
 `origin_finding_id`) is the one Tier-A family that does **not** meet the
 "already relied on by real writers" criterion stated above: it has no code
 reader and no code writer, and is a pure LLM prose convention. It was
-blessed by `esc-3796-1` (2026-08-17) on corpus-dominance grounds instead —
-120 / 33 / 30 tasks respectively — because leaving the dominant spellings
-unblessed is what manufactures the census noise the scan exists to surface.
-See Tier-B below for which spelling to use in new writes.
+blessed by `esc-3796-1` (2026-08-17) on corpus-dominance grounds instead,
+because leaving the dominant spellings unblessed is what manufactures the
+census noise the scan exists to surface. The per-key census behind that
+ruling is a point-in-time measurement rather than an invariant, so it is
+transcribed in one place only — the comment beside the entries in
+`shared/src/shared/task_metadata.py` — and cited by id everywhere else. See
+Tier-B below for which spelling to use in new writes.
 
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
 (§3.2.1): auto-set by the fused-memory submit path when a task's
@@ -955,21 +958,23 @@ fixed to use the canonical spelling — with one documented exception,
 **The finding-provenance row splits into two classes** (ruling:
 `esc-3796-1`, 2026-08-17). `origin_finding_id` is the **retired** alias and
 is the exception to the paragraph above: it stays Tier-A blessed and
-therefore stays **silent**, because 30 landed tasks carry it and most are
-terminal, and task 3796 **rejected data migration** — so no landed task is
-being rewritten, and un-blessing it would manufacture exactly the census
-noise this ruling removes. It is documented-as-retired, not un-blessed; do
-not expect drift lines for it, and use `source_finding_id` in new writes.
-The remaining near-miss family — `origin_finding`,
-`origin_stage1_finding_id`, `source_finding`, `finding_id` — is unblessed
-and does still emit `unknown_key` exactly as the paragraph describes
-(re-measured 2026-08-17: none is a typed `TaskMetadata` field or a blessed
-key).
+therefore stays **silent**, because the landed tasks carrying it are mostly
+terminal and so mechanically un-rewritable, and task 3796 **rejected data
+migration** — so no landed task is being rewritten, and un-blessing it would
+manufacture exactly the census noise this ruling removes. It is
+documented-as-retired, not un-blessed; do not expect drift lines for it, and
+use `source_finding_id` in new writes. The remaining near-miss family —
+`origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id`
+— is unblessed and does still emit `unknown_key` exactly as the paragraph
+describes. That is not just documented: it is pinned by
+`test_finding_provenance_near_miss_aliases_still_warn`
+(`shared/tests/test_task_metadata.py`), so blessing one of these spellings
+fails the suite instead of silently voiding this table's drift signal.
 
 **`stage1_finding_id` is not an alias.** It is a distinct canonical Tier-A
-key in its own right (33 tasks), naming the Stage-1 finding specifically,
-and is deliberately **not** something to migrate to `source_finding_id` —
-only the `origin_`-prefixed near-miss `origin_stage1_finding_id` is drift.
+key in its own right, naming the Stage-1 finding specifically, and is
+deliberately **not** something to migrate to `source_finding_id` — only the
+`origin_`-prefixed near-miss `origin_stage1_finding_id` is drift.
 
 ### Tier-C: ad-hoc keys
 
