@@ -727,43 +727,68 @@ class TestE7FailureIsSoftAndLoud:
         blocker = archive_root / TASK_ID
         blocker.write_bytes(b'not a directory\n')
 
-        # The counter is a process-global; start from a known value.
+        # The counter is a process-global shared with every other test in this
+        # process, so it is reset before AND after — the finally below is what
+        # stops one failing row leaking a non-zero count into the rest of
+        # orchestrator/tests/. This is the file's ONLY cross-test coupling.
         _reset_archival_failures()
+        try:
+            assert _archival_failures() == 0
 
-        with caplog.at_level(logging.WARNING):
-            result, sid, src = await _producer_invoke(
-                workflow, cwd, payload=b'{"type":"user"}\n'
-            )
+            with caplog.at_level(logging.WARNING):
+                result, sid, src = await _producer_invoke(
+                    workflow, cwd, payload=b'{"type":"user"}\n'
+                )
 
-        # SOFT — the task completed. Archival must never break a task.
-        assert result.success is True
-        assert workflow._last_invoke_session_id == sid
+            # SOFT — the task completed. Archival must never break a task.
+            assert result.success is True
+            assert workflow._last_invoke_session_id == sid
 
-        # LOUD (machine-readable half) — the failure was counted.
-        assert _archival_failures() == 1
+            # LOUD (machine-readable half) — the failure was counted.
+            assert _archival_failures() == 1
 
-        # LOUD (human half) — exactly one structured WARNING from the archiver,
-        # naming the source transcript and carrying path/task_id/errno.
-        archiver_warnings = [
-            r for r in caplog.records
-            if r.name == 'shared.transcript_archive' and r.levelno == logging.WARNING
-        ]
-        assert len(archiver_warnings) == 1
-        record = archiver_warnings[0]
-        assert str(src) in record.getMessage()
-        assert record.path == str(src)
-        assert record.task_id == TASK_ID
-        assert record.errno == errno.ENOTDIR
+            # LOUD (human half) — exactly one structured WARNING from the
+            # archiver, naming the source transcript and carrying
+            # path/task_id/errno.
+            archiver_warnings = [
+                r for r in caplog.records
+                if r.name == 'shared.transcript_archive'
+                and r.levelno == logging.WARNING
+            ]
+            assert len(archiver_warnings) == 1
+            record = archiver_warnings[0]
+            assert str(src) in record.getMessage()
+            assert record.path == str(src)
+            assert record.task_id == TASK_ID
+            assert record.errno == errno.ENOTDIR
 
-        # DIVISION OF LABOUR — the helper is TOTAL, so the OSError was absorbed
-        # inside it and the producer's own `except Exception` never fired.
-        assert not [
-            r for r in caplog.records if _PRODUCER_HOOK_WARNING in r.getMessage()
-        ]
+            # DIVISION OF LABOUR — the helper is TOTAL, so the OSError was
+            # absorbed inside it and the producer's own `except Exception`
+            # never fired.
+            assert not [
+                r for r in caplog.records
+                if _PRODUCER_HOOK_WARNING in r.getMessage()
+            ]
 
-        # NOTHING PUBLISHED — no staging debris, and the blocker is untouched
-        # (no directory was created over it, no partial written beside it).
-        assert blocker.is_file()
-        assert blocker.read_bytes() == b'not a directory\n'
-        assert not list(archive_root.rglob('*.archive-tmp'))
-        assert {p.name for p in archive_root.iterdir()} == {TASK_ID}
+            # NOTHING PUBLISHED — no staging debris, and the blocker is
+            # untouched (no directory created over it, no partial beside it).
+            assert blocker.is_file()
+            assert blocker.read_bytes() == b'not a directory\n'
+            assert not list(archive_root.rglob('*.archive-tmp'))
+            assert {p.name for p in archive_root.iterdir()} == {TASK_ID}
+
+            # COUNTER-ISOLATION CONTROL — a second failing invocation takes the
+            # count 1 -> 2. The counter ACCRUES across the process; it is not
+            # re-derived per call. That is the property a future health/digest
+            # consumer samples to render a climbing failure rate, and a
+            # per-call counter would report a flat 1 during a systemic
+            # breakage (disk full -> every archive failing) — indistinguishable
+            # from a single unlucky file.
+            with caplog.at_level(logging.WARNING):
+                result2, _sid2, _src2 = await _producer_invoke(
+                    workflow, cwd, payload=b'{"type":"user","turn":2}\n'
+                )
+            assert result2.success is True
+            assert _archival_failures() == 2
+        finally:
+            _reset_archival_failures()
