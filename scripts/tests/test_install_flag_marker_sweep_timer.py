@@ -236,8 +236,9 @@ def test_install_fails_loud_when_timer_absent_from_list_timers(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# task 4061 step-1: RED -- the self-verify must run before the one-time
-# drain kick, and must still run (and stay loud) when the drain kick fails
+# task 4061 step-1/step-3: RED -- the self-verify must run before the
+# one-time drain kick and must still run (and stay loud, with the failure
+# attributed to the drain specifically) when the drain kick fails
 # ---------------------------------------------------------------------------
 
 def test_self_verify_runs_even_when_drain_kick_fails(tmp_path):
@@ -266,4 +267,23 @@ def test_self_verify_runs_even_when_drain_kick_fails(tmp_path):
     assert result.returncode != 0, (
         f"Expected a failing drain kick to still exit non-zero; "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    # step-3: the failure must be attributed to the drain kick by the
+    # SCRIPT itself, not just visible via the fake systemctl's generic
+    # 'Job for <unit> failed...' message (which is already in stderr today
+    # and would make a bare `SERVICE_NAME in result.stderr` check a false
+    # GREEN).
+    assert "one-time drain kick failed" in result.stderr, (
+        f"Expected the script's own stderr to attribute the failure to "
+        f"the one-time drain kick, distinct from the fake systemctl's "
+        f"generic 'Job for ... failed' message; stderr={result.stderr!r}"
+    )
+    drain_failure_lines = [
+        line for line in result.stderr.splitlines()
+        if "one-time drain kick failed" in line
+    ]
+    assert drain_failure_lines and SERVICE_NAME in drain_failure_lines[0], (
+        f"Expected the script's own drain-kick-failed message to name "
+        f"{SERVICE_NAME!r}; stderr={result.stderr!r}"
     )
