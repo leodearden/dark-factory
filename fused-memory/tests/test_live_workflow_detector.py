@@ -16,6 +16,7 @@ import pytest
 import fused_memory.services.live_workflow_detector as detector_module
 from fused_memory.services.live_workflow_detector import (
     DEFAULT_HEARTBEAT_TTL,
+    DEFAULT_MAX_WORKTREE_AGE_HOURS,
     WorkflowLiveness,
     _routing_decided_after_restart,
     _task_in_scheduler_holders_or_parks,
@@ -1277,6 +1278,190 @@ class TestBareStrandedOrchestratorSuppression:
 
         assert result.orchestrator_live is True
         assert result.is_live is True
+
+
+class TestWorktreeStaleSignal:
+    """detect_live_workflow.worktree_stale (task 3947) — a companion signal that
+    fires ONLY on positive evidence that a registered worktree's branch has
+    gone stale: no recent commit, and the branch's newest commit predates
+    `max_worktree_age_hours`. `worktree_registered` itself is never rewritten —
+    it keeps reporting exactly what `git worktree list --porcelain` says;
+    staleness is a separate, policy-thresholded judgement about the branch.
+    """
+
+    _NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=UTC)
+
+    def _side_effect(
+        self,
+        *,
+        worktree_stdout: str,
+        log_rc: int = 0,
+        log_stdout: str = '',
+        log_raises: bool = False,
+        revlist_stdout: str = '3',
+        revlist_rc: int = 0,
+    ):
+        """Three-way subprocess.run dispatch: porcelain / rev-list / git log.
+
+        `revlist_stdout` defaults to `'3'` (branch has own commits) throughout
+        this class — these cases probe the age dimension only, not the
+        bare-branch guard (see TestWorktreeStaleBareBranchGuard).
+        """
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=worktree_stdout, stderr='',
+                )
+            if 'rev-list' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=revlist_rc, stdout=revlist_stdout, stderr='',
+                )
+            # git log call
+            if log_raises:
+                raise subprocess.TimeoutExpired(cmd=args, timeout=10)
+            return subprocess.CompletedProcess(
+                args=args, returncode=log_rc, stdout=log_stdout, stderr='',
+            )
+        return side_effect
+
+    def test_default_max_worktree_age_hours_is_168(self):
+        assert DEFAULT_MAX_WORKTREE_AGE_HOURS == 168.0
+
+    def test_stale_fires_on_old_tip_with_registered_worktree(self, tmp_path):
+        """A 30-day-old tip on a registered worktree => worktree_stale True, with
+        the raw worktree_registered/recent_commit/last_commit_at signals
+        preserved (not rewritten by the new companion signal)."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is True
+        assert result.worktree_registered is True
+        assert result.recent_commit is False
+        assert result.last_commit_at is not None
+
+    def test_fresh_tip_not_stale(self, tmp_path):
+        """A 1-hour-old tip is well within any staleness window."""
+        ts = (self._NOW - timedelta(hours=1)).isoformat()
+        side_effect = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+
+    def test_tip_older_than_recent_commit_threshold_not_yet_stale(self, tmp_path):
+        """A 10-hour-old tip is older than the 6h recent-commit threshold (so
+        recent_commit is False) but far newer than the 168h staleness default —
+        the two thresholds are independent."""
+        ts = (self._NOW - timedelta(hours=10)).isoformat()
+        side_effect = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.recent_commit is False
+        assert result.worktree_stale is False
+
+    def test_no_worktree_registered_not_stale(self, tmp_path):
+        """Staleness is a statement ABOUT a registered worktree — with none
+        registered, worktree_stale is False regardless of tip age."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect = self._side_effect(
+            worktree_stdout=_worktree_porcelain_no_branch(),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+
+    def test_prunable_worktree_not_stale(self, tmp_path):
+        """A prunable (reaped) worktree registration is already handled by task
+        2767's worktree_registered=False; it must not ALSO be double-reported
+        as stale."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect = self._side_effect(
+            worktree_stdout=_worktree_porcelain_prunable(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_registered is False
+        assert result.worktree_stale is False
+
+    def test_threshold_disabled_via_none(self, tmp_path):
+        """max_worktree_age_hours=None is the explicit opt-out."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, max_worktree_age_hours=None,
+            )
+
+        assert result.worktree_stale is False
+
+    @pytest.mark.parametrize('threshold', [0, 0.0, -1.0])
+    def test_non_positive_threshold_is_inert(self, tmp_path, threshold):
+        """A non-positive threshold would mark every registered worktree stale
+        instantly; treat it as disabled — fail-safe toward live."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, max_worktree_age_hours=threshold,
+            )
+
+        assert result.worktree_stale is False
+
+    @pytest.mark.parametrize(
+        'log_rc, log_stdout, log_raises',
+        [
+            (1, '', False),  # branch missing / git log error
+            (0, '', False),  # empty stdout
+            (0, 'not-a-timestamp', False),  # unparseable
+            (0, '', True),  # subprocess.TimeoutExpired
+        ],
+    )
+    def test_unknown_tip_age_never_stale(self, tmp_path, log_rc, log_stdout, log_raises):
+        """An unknown tip age (missing branch, empty/unparseable output, or a
+        raised TimeoutExpired) is never positive evidence of staleness."""
+        side_effect = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=log_rc, log_stdout=log_stdout, log_raises=log_raises,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+
+    def test_default_field_value_on_plain_live_result(self, tmp_path):
+        """A plain live result (registered worktree, fresh tip) has
+        worktree_stale default False."""
+        ts = (self._NOW - timedelta(hours=1)).isoformat()
+        side_effect = self._side_effect(
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            log_rc=0, log_stdout=ts,
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
 
 
 # ---------------------------------------------------------------------------
