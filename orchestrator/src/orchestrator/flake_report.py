@@ -250,3 +250,81 @@ def compute_non_convergence(
         oldest_age=oldest,
         age_threshold_days=age_days,
     )
+
+
+# --- §5.6 class 3: systemic host pressure -----------------------------------
+
+
+@dataclass(frozen=True)
+class SystemicCounter:
+    """The peak number of DISTINCT tests suppressed inside any one window."""
+
+    peak_distinct_tests: int
+    peak_window_start: str | None
+    peak_window_psi: float | None
+    exceeds_threshold: bool
+    threshold: int
+    window_minutes: int
+
+
+def compute_systemic(
+    occurrences: Sequence[FlakeOccurrenceRow],
+    *,
+    distinct_tests: int = DEFAULT_SYSTEMIC_DISTINCT_TESTS,
+    window_minutes: int = DEFAULT_SYSTEMIC_WINDOW_MINUTES,
+) -> SystemicCounter:
+    """Find the busiest suppression window and report its distinct-test count.
+
+    §5.6's discriminator between class 2 and class 3 is DISTINCTNESS, not volume: one
+    test suppressed six times in an hour is a single non-converging test, while six
+    different tests suppressed in the same hour is the host, not the tests.  Counting
+    distinct ``test_id``s per window is what keeps those two apart.
+
+    Only ``passes_in_isolation`` rows count — a ``fails_in_isolation`` verdict is a real
+    red, and folding those in would manufacture a pressure signal out of ordinary
+    breakage.  Rows whose ``observed_at`` will not parse are dropped rather than being
+    given a default position on the timeline.
+
+    ``peak_window_psi`` is the max NON-NULL ``psi_cpu_some10`` in the peak window, and
+    stays ``None`` when no row in it carried a reading.  α binds a missing PSI to SQL
+    NULL specifically so it never becomes ``0.0``; rendering ``0.0`` here would say "the
+    host was idle" when the truth is "the host was not measured".
+
+    COMPLEXITY: this is a quadratic scan over the occurrence list, which is acceptable
+    ONLY because the caller passes a ``since``-filtered, ``limit``-capped read (see
+    :func:`build_report`).  Do not "optimise" it into an unbounded streaming form
+    without first re-establishing that bound — and do not remove the bound on the
+    grounds that the scan got cheaper.
+    """
+    window = timedelta(minutes=window_minutes)
+    events: list[tuple[datetime, str, float | None]] = []
+    for row in occurrences:
+        if row.verdict != FlakeVerdict.passes_in_isolation:
+            continue
+        stamp = _parse_stamp(row.observed_at)
+        if stamp is None:
+            continue
+        events.append((stamp, row.test_id, row.psi_cpu_some10))
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    peak_count = 0
+    peak_start: str | None = None
+    peak_psi: float | None = None
+    for start, _, _ in events:
+        end = start + window
+        in_window = [e for e in events if start <= e[0] <= end]
+        distinct = {e[1] for e in in_window}
+        if len(distinct) > peak_count:
+            peak_count = len(distinct)
+            peak_start = start.isoformat()
+            psis = [e[2] for e in in_window if e[2] is not None]
+            peak_psi = max(psis) if psis else None
+
+    return SystemicCounter(
+        peak_distinct_tests=peak_count,
+        peak_window_start=peak_start,
+        peak_window_psi=peak_psi,
+        exceeds_threshold=peak_count >= distinct_tests,
+        threshold=distinct_tests,
+        window_minutes=window_minutes,
+    )
