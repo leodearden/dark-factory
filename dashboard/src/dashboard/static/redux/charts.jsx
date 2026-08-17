@@ -325,13 +325,37 @@ function BarChart({ labels, values, height = 160, color = PALETTE.accent, format
 
 function HBarChart({ rows, valueKey = 'total', labelKey = 'label', segments, formatVal = v => v, height }) {
   // rows: [{ label, total, ...segments? }]; segments: [{ key, color, label }]
-  const max = Math.max(...rows.map(r => r[valueKey]), 1);
+  //
+  // The only primitive here whose input is rows of OBJECTS, so the values are
+  // PROJECTED out from behind the valueKey indirection ONCE, above the map, and
+  // then handed to the same plottableMax + barFractions pair BarChart and
+  // HistBar already use — no key-projecting export of its own (task 3681).
+  //
+  // Pre-fix this folded `Math.max(...rows.map(r => r[valueKey]), 1)` over the
+  // RAW rows, so ONE row missing the key poisoned max to NaN and every row's
+  // width became "NaN%" — an invalid CSS length, so ALL the bars vanished
+  // silently, not just the missing one — and then scaled each row with
+  // `(r[valueKey] / max) * 100`, which rendered a null as a zero-width bar
+  // indistinguishable from a measured zero.
+  //
+  // The `1` seed is preserved verbatim from that fold: this is a null-handling
+  // fix, not a re-scaling, exactly as LineChart/BarChart record for their seeds.
+  const values = rows.map(r => r[valueKey]);
+  const max = plottableMax(values, 1);
+  const { fractions } = barFractions(values, max);
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       {rows.map((r, i) => {
-        const w = (r[valueKey] / max) * 100;
+        const f = fractions[i];
         if (segments) {
-          let cum = 0;
+          // Each segment scaled against the SAME max, through the same helper,
+          // so a key the payload never asserted a value for stays MISSING
+          // instead of being scrubbed to a measured zero by `(r[s.key] || 0)` —
+          // the last hole-as-zero scrub in this file, and character-for-
+          // character the one banned for StackedAreaChart. The live case is
+          // real: tabs.jsx unions model keys across all rows, so a project that
+          // never used a model simply lacks that key.
+          const segFractions = barFractions(segments.map(s => r[s.key]), max).fractions;
           return (
             <div key={i}>
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
@@ -339,10 +363,14 @@ function HBarChart({ rows, valueKey = 'total', labelKey = 'label', segments, for
                 <span className="mono" style={{ color: 'var(--fg-2)' }}>{formatVal(r[valueKey])}</span>
               </div>
               <div style={{ display: 'flex', height: 14, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
-                {segments.map(s => {
-                  const segW = ((r[s.key] || 0) / max) * 100;
-                  cum += segW;
-                  return <div key={s.key} title={`${s.label}: ${formatVal(r[s.key] || 0)}`} style={{ width: `${segW}%`, background: s.color }} />;
+                {segments.map((s, si) => {
+                  const sf = segFractions[si];
+                  // No measurement for this key -> no <div> at all. A rendering
+                  // no-op today (a 0%-width div is invisible and has no hover
+                  // target); what it removes is the scrub.
+                  return sf === null ? null : (
+                    <div key={s.key} title={`${s.label}: ${formatVal(r[s.key])}`} style={{ width: `${sf * 100}%`, background: s.color }} />
+                  );
                 })}
               </div>
             </div>
@@ -355,7 +383,13 @@ function HBarChart({ rows, valueKey = 'total', labelKey = 'label', segments, for
               <span className="mono" style={{ color: 'var(--fg-2)' }}>{formatVal(r[valueKey])}</span>
             </div>
             <div style={{ height: 6, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
-              <div style={{ width: `${w}%`, height: '100%', background: PALETTE.accent }} />
+              {/* No measurement here -> NO fill div, while the row keeps its
+                  label, its value cell and its background track. An absent bar
+                  in a labelled row reads as "not measured"; a zero-width one
+                  reads as a measured zero, which is what the pre-fix code drew.
+                  A real 0 still gets its honest zero-width fill. Mirrors
+                  BarChart's absent-rect guard above. */}
+              {f !== null && <div style={{ width: `${f * 100}%`, height: '100%', background: PALETTE.accent }} />}
             </div>
           </div>
         );
