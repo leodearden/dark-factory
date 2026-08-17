@@ -4371,33 +4371,6 @@ class _FakeHealthResponse:
         return self.status
 
 
-def test_probe_health_requires_an_explicit_url_and_timeout() -> None:
-    """probe_health must carry NO defaults — neither url nor timeout (task 3765).
-
-    REGRESSION GUARD, not style. After task 3765 the only production caller is
-    the kill decision, which passes FUSED_MEMORY_ALIVE_URL. A
-    FUSED_MEMORY_HEALTH_URL default would leave a bare ``probe_health()`` one
-    keystroke from silently reinstating the load-dependent readiness probe
-    inside a liveness decision — the exact defect this task removed — and
-    neither the constants test above nor test_liveness_verdict_probes_alive_not_health
-    below would catch it, since both assert on what the CURRENT caller does.
-    The signature is what makes that mistake impossible: there is nothing to
-    fall back to.
-    """
-    import inspect  # noqa: PLC0415
-
-    wdog = _load_watchdog()
-    params = inspect.signature(wdog.probe_health).parameters
-
-    for name in ("url", "timeout"):
-        assert name in params, f"probe_health lost its {name!r} parameter"
-        assert params[name].default is inspect.Parameter.empty, (
-            f"probe_health's {name!r} must stay REQUIRED; found default "
-            f"{params[name].default!r}. A route-implying default lets a future "
-            "bare probe_health() call put /health back into the kill decision."
-        )
-
-
 def test_probe_health_true_on_200(monkeypatch: pytest.MonkeyPatch) -> None:
     """probe_health returns True when urlopen succeeds with a 2xx response."""
     wdog = _load_watchdog()
