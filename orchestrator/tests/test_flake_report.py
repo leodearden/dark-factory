@@ -16,7 +16,9 @@ this file carries ``@pytest.mark.asyncio``.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -26,10 +28,12 @@ from orchestrator.flake_ledger import (
     FlakeCallSite,
     FlakeOccurrenceRow,
     FlakeVerdict,
+    ensure_schema,
 )
 from orchestrator.flake_report import (
     _parse_stamp,
     build_chains,
+    build_report,
     compute_gate_blind,
     compute_non_convergence,
     compute_systemic,
@@ -37,6 +41,71 @@ from orchestrator.flake_report import (
 )
 
 _NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
+
+
+def _seed_occurrence(
+    db_path: Path,
+    *,
+    test_id: str,
+    observed_at: str,
+    verdict: str = FlakeVerdict.passes_in_isolation,
+    call_site: str = FlakeCallSite.merge_gate,
+    psi: float | None = None,
+) -> None:
+    """Insert one flake_occurrence row with raw sqlite3.
+
+    Deliberately NOT via record_flake_occurrence: test_flake_ledger.py's header
+    establishes the raw-sqlite convention for on-disk truth, and here it additionally
+    keeps ι's suite off the write paths tasks ζ and η are concurrently rewriting.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            'INSERT INTO flake_occurrence '
+            '(observed_at, test_id, project_id, verdict, call_site, runner, '
+            ' merge_sha, task_id, psi_cpu_some10, detail) '
+            "VALUES (?, ?, 'dark_factory', ?, ?, 'local', NULL, NULL, ?, '{}')",
+            (observed_at, test_id, str(verdict), str(call_site), psi),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_debt(
+    db_path: Path,
+    *,
+    test_id: str,
+    opened_at: str,
+    resolved_at: str | None = None,
+    owner_task_id: str | None = '3552',
+    open_count: int = 1,
+    prior_resolved_at: str | None = None,
+    prior_resolving_commit: str | None = None,
+    last_occurrence_at: str | None = None,
+) -> None:
+    """Insert one flake_debt row with raw sqlite3 (never through open_debt/resolve_debt)."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            'INSERT INTO flake_debt '
+            '(test_id, project_id, opened_at, resolved_at, owner_task_id, open_count, '
+            ' prior_resolved_at, prior_resolving_commit, last_occurrence_at) '
+            "VALUES (?, 'dark_factory', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                test_id,
+                opened_at,
+                resolved_at,
+                owner_task_id,
+                open_count,
+                prior_resolved_at,
+                prior_resolving_commit,
+                last_occurrence_at or opened_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _occ(
@@ -426,3 +495,95 @@ class TestChains:
         ]
         chains = build_chains(occurrences, [], self._lookup({}))
         assert chains[0].last_observed_at == '2026-08-09T09:00:00+00:00'
+
+
+class TestBuildReport:
+    """build_report against a real on-disk ledger, seeded with raw sqlite3."""
+
+    def _seeded(self, tmp_path: Path) -> Path:
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        # Two open debt rows, deliberately out of insertion order relative to opened_at
+        # so the pinned `opened_at, test_id` print order is actually exercised.
+        _seed_debt(db_path, test_id='tests/test_b.py::test_two',
+                   opened_at='2026-08-09T12:00:00+00:00', owner_task_id='4001')
+        _seed_debt(db_path, test_id='tests/test_a.py::test_one',
+                   opened_at='2026-08-06T12:00:00+00:00', owner_task_id='4000', open_count=3,
+                   prior_resolved_at='2026-07-20T00:00:00+00:00',
+                   prior_resolving_commit='cafe123')
+        for i in range(6):
+            _seed_occurrence(db_path, test_id='tests/test_a.py::test_one',
+                             observed_at=f'2026-08-09T1{i}:00:00+00:00')
+        for i in range(3):
+            _seed_occurrence(db_path, test_id=UNKNOWN_TEST_ID,
+                             observed_at=f'2026-08-09T0{i}:00:00+00:00',
+                             verdict=FlakeVerdict.unconfirmable)
+        _seed_occurrence(db_path, test_id='tests/test_b.py::test_two',
+                         observed_at='2026-08-09T20:00:00+00:00',
+                         verdict=FlakeVerdict.fails_in_isolation)
+        return db_path
+
+    def test_report_sees_the_db(self, tmp_path):
+        report = build_report(self._seeded(tmp_path), now=_NOW)
+        assert report.db_present is True
+
+    def test_open_debt_rows_carry_owner_and_age_in_pinned_order(self, tmp_path):
+        report = build_report(self._seeded(tmp_path), now=_NOW)
+        # α pins list_open_debt's `opened_at, test_id` ordering as contractual because
+        # ι prints this list; relied on directly rather than re-sorted here.
+        assert [r.debt.test_id for r in report.open_debt] == [
+            'tests/test_a.py::test_one',
+            'tests/test_b.py::test_two',
+        ]
+        assert [r.debt.owner_task_id for r in report.open_debt] == ['4000', '4001']
+        assert report.open_debt[0].age == timedelta(days=4)
+        assert report.open_debt[1].age == timedelta(days=1)
+
+    def test_chains_cover_both_seeded_tests(self, tmp_path):
+        report = build_report(self._seeded(tmp_path), now=_NOW)
+        assert {c.test_id for c in report.chains} == {
+            'tests/test_a.py::test_one',
+            'tests/test_b.py::test_two',
+        }
+        by_id = {c.test_id: c for c in report.chains}
+        assert by_id['tests/test_a.py::test_one'].occurrence_count == 6
+        assert by_id['tests/test_a.py::test_one'].debt is not None
+        assert by_id['tests/test_a.py::test_one'].debt.open_count == 3
+        assert by_id['tests/test_a.py::test_one'].debt.prior_resolving_commit == 'cafe123'
+
+    def test_all_three_counters_are_populated(self, tmp_path):
+        report = build_report(self._seeded(tmp_path), now=_NOW)
+        # 3 unconfirmable + 7 confirmed == 10 observations, rate 0.3, over the floor of 8.
+        assert report.gate_blind.unconfirmable == 3
+        assert report.gate_blind.confirmed == 7
+        assert report.gate_blind.rate == pytest.approx(0.3)
+        assert report.gate_blind.sufficient is True
+        assert report.gate_blind.exceeds_threshold is True
+        # Class 2: one recurrent (open_count 3), one over the 3d age bound.
+        assert report.non_convergence.open_tests == 2
+        assert report.non_convergence.recurrent_tests == 1
+        assert report.non_convergence.over_age_tests == 1
+        assert report.non_convergence.unowned_tests == 0
+        # Class 3: one test suppressed six times is NOT systemic.
+        assert report.systemic.peak_distinct_tests == 1
+        assert report.systemic.exceeds_threshold is False
+
+    def test_window_since_is_derived_from_now_and_window_hours(self, tmp_path):
+        report = build_report(self._seeded(tmp_path), now=_NOW, window_hours=24)
+        since = _parse_stamp(report.window_since)
+        assert since == _NOW - timedelta(hours=24)
+
+    def test_an_occurrence_older_than_the_window_is_excluded_from_the_counters(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        _seed_debt(db_path, test_id='tests/test_old.py::test_x',
+                   opened_at='2026-01-01T00:00:00+00:00')
+        # Far outside any window: 2025.
+        _seed_occurrence(db_path, test_id='tests/test_old.py::test_x',
+                         observed_at='2025-01-01T00:00:00+00:00')
+        report = build_report(db_path, now=_NOW, window_hours=168)
+        assert report.gate_blind.total == 0, 'a pre-window occurrence must not be counted'
+        # ...but its test still resolves a debt row, so the chain remains visible.
+        assert [c.test_id for c in report.chains] == ['tests/test_old.py::test_x']
+        assert report.chains[0].debt is not None
+        assert report.chains[0].occurrence_count == 0
