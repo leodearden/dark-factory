@@ -43,9 +43,16 @@ guarded at all even though its segments were scrubbed with the same
 ``(r[s.key] || 0)`` hole-as-zero conflation banned for StackedAreaChart above.
 It carried one failure the other five did not: the raw value went straight into
 the CALLER's formatter (``formatVal(r[valueKey])``), and both live call sites
-pass ``v => `$${v.toFixed(2)}``` (tabs.jsx), so a row missing the key threw a
-TypeError DURING RENDER and unmounted the whole Costs tab — a hole took out the
-page rather than one bar.  It now projects its rows to a values array at the
+pass ``v => `$${v.toFixed(2)}``` (tabs.jsx), so a row missing the key would
+throw a TypeError DURING RENDER and take the whole Costs tab down rather than
+one bar.  That is what the component's CONTRACT permits — it reads rows through
+a caller-supplied ``valueKey`` — and NOT an observed outage: today's
+``shape_costs`` (redux_api.py:536, :566) emits an explicit ``total`` on every
+by_project and by_role row, so no live payload reaches it.  The probes below
+ban the arithmetic anyway, for the reason the rest of this file exists: a
+primitive that cannot say "not measured" is one payload change away from
+saying something false, and here it would say it by throwing.  It now projects
+its rows to a values array at the
 call site and reuses ``plottableMax`` + ``barFractions`` unchanged, and the SAME
 fraction-is-null decision drives both the absent bar and the em-dash in the
 value cell, so a row's text and its bar can never disagree about whether it was
@@ -225,14 +232,17 @@ _HBAR_CHART_BANNED = (
         'for StackedAreaChart, in the last primitive still carrying it',
     ),
     # The worse half of this component's defect, and the one no other primitive
-    # had: the raw value went into the CALLER's formatter, so a hole did not
-    # merely render wrong, it threw.
+    # had: the raw value went into the CALLER's formatter, so a hole would not
+    # merely render wrong, it would throw.
     (
         'formatVal(r[valueKey])',
         "hands the RAW primary value to the caller's formatter — BOTH live "
         'call sites pass ``v => `$${v.toFixed(2)}``` (tabs.jsx:1145, '
         'tabs.jsx:1156), so a row lacking the key throws a TypeError DURING '
-        'RENDER and takes out the whole Costs tab, not just one row',
+        'RENDER and takes out the whole Costs tab, not just one row. Rows '
+        'lacking the key are what this component\'s contract permits (it '
+        'reads them through a caller-supplied valueKey), not what the API '
+        'emits today — redux_api.py always supplies `total`',
     ),
     (
         'formatVal(r[s.key]',
@@ -635,7 +645,8 @@ def _hbar_hole_contract_violations(body: str) -> list[str]:
             'row with no measurement has nothing to show but the result of '
             'calling formatVal on a hole. Both live call sites pass '
             '`v => `$${v.toFixed(2)}``, which throws a TypeError on undefined '
-            'and unmounts the whole Costs tab.'
+            '— during render, so the whole Costs tab goes down rather than '
+            'one row.'
         )
 
     # 2. A width must come from a fraction, never from arithmetic on a raw row
@@ -672,8 +683,12 @@ def test_hbar_chart_renders_a_hole_as_an_em_dash_rather_than_throwing(
     The load-bearing part is NOT the placeholder — it is that ``formatVal`` is
     never INVOKED on a hole.  Both live call sites pass
     ``v => `$${v.toFixed(2)}```, so calling it on ``undefined`` throws a
-    TypeError during render and unmounts the entire tab.  A blank bar degrades;
-    a throw does not.  So the component needs a placeholder to render instead,
+    TypeError during render and takes the entire tab down.  A blank bar
+    degrades; a throw does not.  (A hole is what this component's contract
+    permits rather than what the API emits: ``shape_costs`` supplies ``total``
+    on every row today.  The guard is for the contract, which is the only
+    thing this component can actually see.)  So it needs a placeholder to
+    render instead,
     every width has to come from a fraction rather than from raw row
     arithmetic, and the hole has to be an explicit branch off the SAME
     ``barFractions`` null the bar already uses — one hole decision per row means
