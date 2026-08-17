@@ -1,8 +1,10 @@
 """Tests for task artifacts management."""
 
 import copy
+import errno
 import json
 import os
+import stat
 import sys
 import threading
 from datetime import datetime
@@ -2571,3 +2573,89 @@ class TestWriteJsonIsAtomic:
             f'pre-write nor the post-write one: {[sorted(u) for u in unexpected[:2]]}'
         )
         assert observations, 'the readers observed nothing at all'
+
+
+class TestWriteJsonPreservesMode:
+    """An artifact's permission bits survive the atomic replace.
+
+    The superseded ``Path.write_text`` TRUNCATED an existing file, so its
+    mode was never touched.  tmp+rename does not inherit that for free — the
+    destination takes the TEMP's bits — so without explicit preservation the
+    first write after the migration would silently re-mode every
+    `.task-meta` artifact: an invisible, permanent mutation performed as a
+    side effect of a routine write.  This is the semantic
+    ``plan_tools._target_file_mode`` existed for, asserted at the layer that
+    now owns it.
+    """
+
+    @pytest.mark.parametrize('mode', [0o600, 0o640, 0o664])
+    def test_an_existing_targets_mode_survives_the_write(
+        self, artifacts: TaskArtifacts, mode: int
+    ):
+        target = artifacts.root / 'plan.json'
+        target.write_text('{}')
+        os.chmod(target, mode)
+
+        artifacts.write_plan({'task_id': 'task-1', 'title': 'kept', 'steps': []})
+
+        assert stat.S_IMODE(target.stat().st_mode) == mode, (
+            f'expected {mode:#o}, got '
+            f'{stat.S_IMODE(target.stat().st_mode):#o} — the replace re-moded '
+            'a pre-existing artifact'
+        )
+        # A no-op write would satisfy the mode assertion vacuously.
+        assert json.loads(target.read_text())['title'] == 'kept'
+
+    def test_a_new_targets_mode_matches_what_write_text_would_produce(
+        self, artifacts: TaskArtifacts, tmp_path: Path
+    ):
+        """A not-yet-existing artifact gets the umask-derived mode.
+
+        The expectation is derived from a LIVE reference file created in this
+        same test rather than hard-coded to 0o644, so the assertion holds
+        under any umask the suite happens to run with.
+        """
+        reference = tmp_path / 'reference.json'
+        reference.write_text('{}')
+
+        target = artifacts.root / 'plan.json'
+        assert not target.exists()
+
+        artifacts.write_plan({'task_id': 'task-1', 'title': 'fresh', 'steps': []})
+
+        assert stat.S_IMODE(target.stat().st_mode) == stat.S_IMODE(
+            reference.stat().st_mode
+        ), (
+            'a newly created artifact must land with the same bits '
+            'Path.write_text would have given it'
+        )
+        assert json.loads(target.read_text())['title'] == 'fresh'
+
+    def test_a_non_missing_stat_failure_propagates(
+        self, artifacts: TaskArtifacts, monkeypatch
+    ):
+        """Only the missing-file case is benign.
+
+        The mode lookup must swallow FileNotFoundError ONLY — an EACCES /
+        ELOOP / ENAMETOOLONG on the target's ``stat()`` is a genuine failure
+        and must surface, not be misread as "this file is new, use the
+        umask".  Ports ``test_target_file_mode_propagates_a_non_missing_file_os_error``
+        from the plan-tools suite, whose whole point this is.
+        """
+        target = artifacts.root / 'plan.json'
+        real_stat = Path.stat
+
+        # Scoped to *target*, falling back to the real stat() for every other
+        # path: a blanket raise would break unrelated machinery (pytest's own
+        # bookkeeping calls Path.stat via Path.exists).
+        def boom(self, *args, **kwargs):
+            if self == target:
+                raise OSError(errno.EACCES, 'Permission denied')
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'stat', boom)
+
+        with pytest.raises(OSError) as excinfo:
+            artifacts.write_plan({'task_id': 'task-1', 'steps': []})
+
+        assert excinfo.value.errno == errno.EACCES
