@@ -10794,12 +10794,43 @@ def _mm_configure_project_root(svc, root):
     return str(root)
 
 
+#: The pre-image staged for the ``update_memory`` arm of :func:`_mm_write`.
+#:
+#: mem0-OWNED keys only (``MEM0_MANAGED_METADATA_KEYS``), so the record's
+#: CUSTOM subset — the half ``split_managed_metadata`` hands to the seam — is
+#: vocabulary-EMPTY.  That emptiness is load-bearing, not incidental: the
+#: update seam judges a patch against the record's pre-image (task 3523), so
+#: an empty pre-image makes the baseline subtraction a NO-OP and every shared
+#: case below asserts exactly what it asserts on the two add paths.  Staging a
+#: pre-image that carried violations would silently mask half of them and the
+#: suite would still look green.
+_MM_UPDATE_PRE_IMAGE = {
+    'data': 'original content',
+    'hash': 'abc123hash',
+    'created_at': '2026-01-01T00:00:00+00:00',
+    'updated_at': '2026-01-02T00:00:00+00:00',
+    'user_id': 'darkfactory',
+}
+
+_MM_UPDATE_POINT_ID = 'mm-point-1'
+
+
 async def _mm_write(svc, entry_point, *, metadata, category='observations_and_summaries',
                     project_id='dark_factory', agent_id='claude-task-3195'):
-    """Drive one write through either seam.
+    """Drive one write through any of the three seams.
 
     D8/§2 pin enforcement at the SERVICE seam precisely so
     ``add_system_record`` cannot bypass it, so every case runs against both.
+    Task 3523 adds ``update_memory`` — the THIRD write path — for the same
+    reason: an entry point the shared cases do not reach is an entry point
+    that can drift away from the seam without failing anything.
+
+    ``category`` rides in the PATCH on the update arm.  The two add paths
+    stamp ``meta['category'] = resolved_category.value`` themselves because
+    they are creating the record; an update has no category to resolve (the
+    record already carries one), so the harness supplies it explicitly rather
+    than leaving the shared "caller keys survive alongside category"
+    assertion to pass vacuously on two seams and fail on the third.
     """
     if entry_point == 'add_memory':
         return await svc.add_memory(
@@ -10808,6 +10839,15 @@ async def _mm_write(svc, entry_point, *, metadata, category='observations_and_su
             project_id=project_id,
             agent_id=agent_id,
             metadata=metadata,
+            causation_id='c1',
+        )
+    if entry_point == 'update_memory':
+        svc.mem0.get_point_by_id = AsyncMock(return_value=dict(_MM_UPDATE_PRE_IMAGE))
+        return await svc.update_memory(
+            memory_id=_MM_UPDATE_POINT_ID,
+            project_id=project_id,
+            agent_id=agent_id,
+            metadata_patch={'category': category, **metadata},
             causation_id='c1',
         )
     svc.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
@@ -10822,12 +10862,26 @@ async def _mm_write(svc, entry_point, *, metadata, category='observations_and_su
 
 
 def _mm_backend_mock(svc, entry_point):
-    return svc.mem0.add if entry_point == 'add_memory' else svc.mem0.add_system_record
+    """The backend write primitive this entry point must reach — or not.
+
+    ``update_memory``'s metadata-only route with a patch and no delete keys
+    lands on ``set_payload`` (the Qdrant server-side-merge fast path), which
+    is what ``_mm_write`` above drives.
+    """
+    return {
+        'add_memory': svc.mem0.add,
+        'update_memory': svc.mem0.set_payload,
+        'add_system_record': svc.mem0.add_system_record,
+    }[entry_point]
 
 
 def _mm_backend_meta(svc, entry_point):
     """The metadata dict the backend actually received."""
-    return _mm_backend_mock(svc, entry_point).call_args.kwargs['metadata']
+    call = _mm_backend_mock(svc, entry_point).call_args
+    if entry_point == 'update_memory':
+        # set_payload(memory_id, payload, scope) — positional, no metadata=.
+        return call.args[1]
+    return call.kwargs['metadata']
 
 
 def _mm_census_codes(caplog):
@@ -10842,7 +10896,17 @@ def _mm_census_codes(caplog):
     return codes
 
 
-_MM_ENTRY_POINTS = ['add_memory', 'add_system_record']
+_MM_ENTRY_POINTS = ['add_memory', 'add_system_record', 'update_memory']
+
+#: The two CREATE paths only.  Used by the single case whose subject is the
+#: ordering of the add path's server-side tagging helpers
+#: (``_apply_cycle_summary_metadata_tagging``), which an in-place amendment
+#: deliberately does not run: those stamps were applied when the record was
+#: created, and re-deriving `recon_pool`/`run_id` on every patch would rewrite
+#: provenance the patch never mentioned.  Scoped explicitly rather than by
+#: shrinking ``_MM_ENTRY_POINTS``, so the default for a new shared case stays
+#: "runs against all three".
+_MM_ADD_ENTRY_POINTS = ['add_memory', 'add_system_record']
 
 
 class TestMemoryMetadataValidationAtSeam:
@@ -11002,7 +11066,7 @@ class TestMemoryMetadataValidationAtSeam:
         assert _mm_census_codes(caplog) == []
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    @pytest.mark.parametrize('entry_point', _MM_ADD_ENTRY_POINTS)
     async def test_validation_runs_after_the_existing_tagging_helpers(
         self, service, entry_point, caplog
     ):
