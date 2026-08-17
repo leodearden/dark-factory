@@ -200,6 +200,27 @@ def gate_backlog_fingerprint_key(esc: Escalation) -> str | None:
     yields ``'None:645'`` on BOTH sides.  Reproducing ``str(project_id)``
     byte-for-byte is exactly what makes parent and child keys agree.
 
+    ACCEPTED COST — a legacy parent kept alive here keeps its STALE SUMMARY.
+    ``attach_dedupe_child`` increments ``dedupe_count`` but never rewrites
+    ``summary``/``detail``, and the records this adapter rescues were filed
+    before task 3520 replaced the relative-age phrasing (``'Gate task 166 has
+    awaited a human decision for 48.7h'``) with an absolute ``since <ISO>``
+    anchor.  A compact drain projects ``summary`` and drops ``detail``
+    (``_COMPACT_ESCALATION_FIELDS``, escalation/server.py), so a steward
+    triaging a gate that has now been open 400h still reads ``48.7h``, with
+    only ``dedupe_count`` hinting that it recurred.  This is NOT a regression
+    introduced by folding — under the ``has_open_l1`` skip this adapter
+    replaced, the same record was equally permanent and equally stale, since
+    a fresher filing was suppressed outright rather than merged.  The
+    alternative (let each legacy record be superseded once by a correctly
+    anchored one) trades a permanent duplicate-shaped blip for a truthful
+    summary; it was rejected only because it re-pins ``dedupe_count`` at 0 for
+    every gate in the backlog, which is the defect this task exists to remove.
+    Re-anchoring a legacy parent in place means mutating live production
+    escalation records from inside a key-resolution helper, so it is
+    deliberately left to a separately reviewable operator action (see
+    plan.json design_decisions for task 3522).
+
     Returns the stamped fingerprint, the recomputed one, or ``None`` (never
     fold) when the record's identity cannot be recovered.
     """
@@ -230,8 +251,17 @@ def gate_backlog_fingerprint_key(esc: Escalation) -> str | None:
     # Identical construction to the child's stamp in stage1_stall_detector, so
     # parent and child keys agree by construction rather than by a second,
     # drift-prone formula.
+    #
+    # ``esc.category`` rather than the literal category string: every record
+    # reaching this line is already known to carry it — submit_or_dedupe gates
+    # the candidate on ``config.infra_dedupe_categories`` and find_dedupe_parent
+    # skips any parent whose category differs — so reading it off the record is
+    # correct by construction, whereas a repeated literal would silently stop
+    # matching stage1's _GATE_BACKLOG_ESCALATION_CATEGORY if that constant were
+    # ever renamed (folding would fail open into duplicates, with no test that
+    # catches it).
     return compute_content_fingerprint(
-        'reconciliation_stale_gate_backlog', '', [f'{project_id}:{task_id}'], ''
+        esc.category, '', [f'{project_id}:{task_id}'], ''
     )
 
 

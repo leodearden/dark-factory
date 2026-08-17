@@ -870,9 +870,9 @@ class TestDedupeConfigForGateBacklog:
 
         ``key_fn`` is ``gate_backlog_fingerprint_key`` — a superset of
         ``content_fingerprint_key`` that also recovers pre-stamp parents.  See
-        ``TestGateBacklogFingerprintKey`` for why the plain stamped-only adapter
-        is insufficient here (it would mint a duplicate for all 78 live legacy
-        records).
+        that function's docstring for the live-queue measurement showing why the
+        plain stamped-only adapter is insufficient here (it would mint a
+        duplicate for every legacy record in the backlog).
         """
         from escalation.dedupe import DedupeConfig, gate_backlog_fingerprint_key
 
@@ -972,13 +972,15 @@ class TestGateBacklogFingerprintKey:
     """gate_backlog_fingerprint_key(esc) — tolerates LEGACY unstamped parents.
 
     Every ``reconciliation_stale_gate_backlog`` record filed before the stamp
-    landed carries ``dedupe_fingerprint: None`` (78 such records measured on the
-    live queue at ``data/reconciliation/escalations/``).  With the plain
-    ``content_fingerprint_key`` those parents key to None, ``find_dedupe_parent``
-    short-circuits, and the very first post-change cycle mints a SECOND pending
-    record per stalled gate at ``dedupe_count 0`` — the exact defect this task
-    exists to remove.  This adapter recovers the parent's identity from its own
-    ``detail`` so the backlog migrates itself with no operator step.
+    landed carries ``dedupe_fingerprint: None`` — see the adapter's own
+    docstring for the live-queue measurement that motivates this (kept in one
+    place, since any point-in-time census goes stale as records fold and
+    resolve).  With the plain ``content_fingerprint_key`` those parents key to
+    None, ``find_dedupe_parent`` short-circuits, and the very first post-change
+    cycle mints a SECOND pending record per stalled gate at ``dedupe_count 0``
+    — the exact defect this task exists to remove.  This adapter recovers the
+    parent's identity from its own ``detail`` so the backlog migrates itself
+    with no operator step.
     """
 
     _CATEGORY = 'reconciliation_stale_gate_backlog'
@@ -1069,13 +1071,14 @@ class TestGateBacklogFingerprintKey:
     def test_same_task_id_different_projects_do_not_collide(self):
         """REGRESSION: the fallback keys on (category, project_id, task_id).
 
-        The escalation queue is SHARED ACROSS PROJECTS (7 observed live:
-        dark_factory 37, reify 27, autopilot_video 5, know_live 3,
-        solar_challenge_platform 2, pump_web_ui 2, solar_challenge 2) and task
-        ids are small per-project integers.  A ``(category, task_id)`` fallback
-        would cross-fold two different projects' gates into one record and
-        silently discard an escalation a human is waiting on.  Today's snapshot
-        has 78 distinct task_ids by coincidence, not by invariant.
+        The escalation queue is SHARED ACROSS PROJECTS and task ids are small
+        per-project integers, so a ``(category, task_id)`` fallback would
+        cross-fold two different projects' gates into one record and silently
+        discard an escalation a human is waiting on.  See
+        ``gate_backlog_fingerprint_key``'s docstring for the live-queue
+        project/record census behind that claim; the absence of a collision in
+        any given snapshot is a coincidence of that backlog, not an invariant,
+        which is why this is pinned as a test rather than left to observation.
         """
         from escalation.dedupe import gate_backlog_fingerprint_key
 
@@ -1116,6 +1119,29 @@ class TestGateBacklogFingerprintKey:
         esc = self._legacy_esc('esc-x-1', task_id='166')
         esc.task_id = ''
         assert gate_backlog_fingerprint_key(esc) is None
+
+    def test_recompute_reads_the_records_own_category(self):
+        """REGRESSION: the recompute derives the category from the record, not a literal.
+
+        ``submit_or_dedupe`` gates the candidate on
+        ``config.infra_dedupe_categories`` and ``find_dedupe_parent`` skips any
+        parent whose category differs, so every record reaching the recompute
+        already carries the gate-backlog category — reading it off the record is
+        correct by construction.  A hardcoded copy of the string would instead
+        have to be kept in sync by hand with the emitter's
+        ``_GATE_BACKLOG_ESCALATION_CATEGORY`` across a package boundary; a rename
+        there would produce a key that can never match a new child's stamp,
+        folding would stop, and duplicates would silently reappear.  This test is
+        the thing that would catch that drift.
+        """
+        from escalation.dedupe import compute_content_fingerprint, gate_backlog_fingerprint_key
+
+        esc = self._legacy_esc('esc-166-1', task_id='166', project_id='dark_factory')
+        esc.category = 'renamed_gate_backlog_category'
+
+        assert gate_backlog_fingerprint_key(esc) == compute_content_fingerprint(
+            'renamed_gate_backlog_category', '', ['dark_factory:166'], ''
+        )
 
     def test_none_detail_returns_none(self):
         """detail=None (defensive) must not raise — it fails closed like empty."""
