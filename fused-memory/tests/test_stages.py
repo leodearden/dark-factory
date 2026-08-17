@@ -11150,7 +11150,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         live_task = {'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'}
         other_task = {'id': int(not_live_task_id), 'title': 'Other task', 'status': 'pending'}
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             if str(task_id) == live_task_id:
                 return WorkflowLiveness(
                     is_live=True,
@@ -11202,7 +11202,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
 
         not_live_task = {'id': 100, 'title': 'Other task', 'status': 'pending'}
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             return WorkflowLiveness(
                 is_live=False,
                 worktree_registered=False,
@@ -11241,7 +11241,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
 
         live_task_id = '4321'
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             return WorkflowLiveness(
                 is_live=True,
                 worktree_registered=True,
@@ -11847,8 +11847,10 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
 
         monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
         with patch(
-            'subprocess.run',
-            side_effect=self._git_side_effect(worktree_for_branch=worktree_for_branch),
+            'fused_memory.services.live_workflow_detector.run_git',
+            side_effect=as_async_run_git(
+                self._git_side_effect(worktree_for_branch=worktree_for_branch)
+            ),
         ):
             return await _render_live_workflow_section(
                 [task], ProjectRoot(str(tmp_path)), now=self._NOW
@@ -14281,7 +14283,7 @@ class TestRenderLiveWorkflowSectionCapsFanOut:
         """
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
-        def fake(task_id, project_root, **kwargs):
+        async def fake(task_id, project_root, **kwargs):
             probed.append(str(task_id))
             return WorkflowLiveness(
                 is_live=True,

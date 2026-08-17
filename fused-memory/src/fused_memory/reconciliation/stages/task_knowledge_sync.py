@@ -2657,7 +2657,7 @@ async def _write_escalation_markers(
             )
 
 
-def _render_live_workflow_section(
+async def _render_live_workflow_section(
     tasks: list[dict],
     project_root: ProjectRoot,
     *,
@@ -2749,6 +2749,12 @@ def _render_live_workflow_section(
     repeated but *identical* every time, and which blocked the event loop for
     its whole duration.
 
+    The first three are batched behind ONE ``asyncio.to_thread`` hop.  They are
+    small local file reads, but this coroutine exists to STOP occupying the
+    event loop, and removing the blocking git loop while leaving stray
+    synchronous file I/O behind would just shrink the stall rather than end it.
+    One hop rather than three keeps the thread-pool churn flat.
+
     All four are wrapped fail-safe.  For the worktree index specifically,
     ``None`` is :func:`worktree_index_for`'s "unknown" sentinel and restores
     exactly the pre-hoist behaviour (each task probes for itself), while ``{}``
@@ -2836,10 +2842,25 @@ def _render_live_workflow_section(
     # project_root (one lock file regardless of how many tasks are inspected).
     # Swallow any detector errors here — the per-task detect_live_workflow calls
     # will gracefully degrade on subsequent orchestrator checks.
-    try:
-        project_orch_live: bool | None = is_orchestrator_live_for(project_root)
-    except Exception:
-        project_orch_live = None  # let detect_live_workflow derive it per-task
+    def _read_local_hoists() -> tuple[bool | None, dict | None, datetime | None]:
+        # Three small local-file reads, batched into ONE thread hop below.
+        try:
+            orch_live: bool | None = is_orchestrator_live_for(project_root)
+        except Exception:
+            orch_live = None  # let detect_live_workflow derive it per-task
+        try:
+            sched: dict | None = read_scheduler_state(Path(project_root))
+        except Exception:
+            sched = None
+        try:
+            started: datetime | None = orchestrator_started_at(project_root)
+        except Exception:
+            started = None
+        return orch_live, sched, started
+
+    project_orch_live, scheduler_state, orch_started = await asyncio.to_thread(
+        _read_local_hoists
+    )
 
     kwargs: dict = {} if now is None else {'now': now}
     if project_orch_live is not None:
@@ -2853,14 +2874,6 @@ def _render_live_workflow_section(
     # that corroboration signal cannot fire — never a raise). now_eff is the
     # reference time threaded into the claimant-freshness check.
     now_eff = now or datetime.now(UTC)
-    try:
-        scheduler_state: dict | None = read_scheduler_state(Path(project_root))
-    except Exception:
-        scheduler_state = None
-    try:
-        orch_started: datetime | None = orchestrator_started_at(project_root)
-    except Exception:
-        orch_started = None
 
     # Hoist the whole-repo worktree list (task 3778) — the FOURTH per-render
     # invariant and by far the most expensive. See the docstring's "Per-render
@@ -2870,7 +2883,7 @@ def _render_live_workflow_section(
     # "unknown" sentinel and restores exactly the pre-hoist per-task probe;
     # `{}` is a real answer (no registered worktrees) and is threaded through.
     try:
-        worktree_index: dict[str, bool] | None = worktree_index_for(str(project_root))
+        worktree_index: dict[str, bool] | None = await worktree_index_for(str(project_root))
     except Exception:
         logger.warning(
             'reconciliation._render_live_workflow_section: '
@@ -2919,7 +2932,7 @@ def _render_live_workflow_section(
                 corroborated = None
 
         try:
-            liveness = detect_live_workflow(
+            liveness = await detect_live_workflow(
                 task_id, project_root,
                 status=task.get('status'), task_kind=task_kind,
                 pure_gate=pure_gate,
@@ -3698,7 +3711,7 @@ class TaskKnowledgeSync(BaseStage):
         # Empty string when no active tasks are live (keeps the payload tight).
         live_workflow_section = ''
         if filtered.active_tasks:
-            live_workflow_section = _render_live_workflow_section(
+            live_workflow_section = await _render_live_workflow_section(
                 filtered.active_tasks,
                 self.scope.project_root,
             )

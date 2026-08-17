@@ -793,7 +793,7 @@ class MemoryConsolidator(BaseStage):
         task_count_census_section = self._build_task_count_census_section()
 
         # 7c. Live-Workflow Signals (task 1977 — mirrors Stage 2's task 1655)
-        live_workflow_section = self._build_live_workflow_section()
+        live_workflow_section = await self._build_live_workflow_section()
 
         # 8. Format
         episodes_str, ep_n = _format_episodes(new_episodes)
@@ -888,7 +888,7 @@ Review the above data and perform memory consolidation:
         task_count_census_section = self._build_task_count_census_section()
 
         # Live-Workflow Signals (task 1977 — mirrors Stage 2's task 1655)
-        live_workflow_section = self._build_live_workflow_section()
+        live_workflow_section = await self._build_live_workflow_section()
 
         ctx_str, ctx_n = _format_context_items(ap.context_items)
         self._entity_summary_snapshot_lines_stripped = ctx_n
@@ -939,7 +939,7 @@ Review the above data and perform memory consolidation:
             return ''
         return '\n' + format_filtered_task_tree(self.filtered_task_tree) + '\n'
 
-    def _build_live_workflow_section(self) -> str:
+    async def _build_live_workflow_section(self) -> str:
         """Return the Live-Workflow Signals prompt section, or empty string if inapplicable.
 
         Mirrors Stage 2's guard/source exactly (task 1655): renders over
@@ -959,7 +959,7 @@ Review the above data and perform memory consolidation:
         """
         if not (self.filtered_task_tree and self.filtered_task_tree.active_tasks):
             return ''
-        section = _render_live_workflow_section(
+        section = await _render_live_workflow_section(
             self.filtered_task_tree.active_tasks,
             self.scope.project_root,
         )
