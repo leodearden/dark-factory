@@ -630,3 +630,79 @@ class TestReferentSourceCounter:
         counts = service.referent_source_counts()
         assert counts['derived'] == 1
         assert counts['none'] == 1
+
+
+@pytest.fixture
+def journaling_service(service):
+    """`service`, plus a write journal whose backend-op rows are observable."""
+    service._write_journal = MagicMock()
+    service._write_journal.log_backend_op = AsyncMock()
+    return service
+
+
+def _backend_op_payload(svc):
+    return svc._write_journal.log_backend_op.call_args[1]['payload']
+
+
+class TestReferentSourceIsJournaled:
+    """The DURABLE half of the telemetry split.
+
+    The in-process counter is unconditional but process-local; this row is
+    per-group_id and time-windowed, which is what leaf iota actually needs to
+    read.  Both sinks consume the SAME values from the ONE decode, so they
+    cannot drift — this is not lockstep duplication.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_new_format_row_journals_its_source_and_count(self, journaling_service):
+        await journaling_service._execute_graphiti_write(
+            'add_episode',
+            _graphiti_payload(referents=_encoded(
+                'derived', Referent(number='3127'), Referent(number='2500'),
+            )),
+        )
+
+        payload = _backend_op_payload(journaling_service)
+        assert payload['referent_source'] == 'derived'
+        assert payload['referent_count'] == 2
+
+    @pytest.mark.asyncio
+    async def test_an_old_format_row_journals_none_and_zero(self, journaling_service):
+        await journaling_service._execute_graphiti_write(
+            'add_episode', _graphiti_payload(),
+        )
+
+        payload = _backend_op_payload(journaling_service)
+        assert payload['referent_source'] == 'none'
+        assert payload['referent_count'] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_blob_journals_none_and_zero(self, journaling_service):
+        """The durable channel and the in-process counter agree because both
+        read the same decode — a malformed blob is 'none' in both."""
+        await journaling_service._execute_graphiti_write(
+            'add_episode', _graphiti_payload(referents='garbage'),
+        )
+
+        payload = _backend_op_payload(journaling_service)
+        assert payload['referent_source'] == 'none'
+        assert payload['referent_count'] == 0
+        assert journaling_service.referent_source_counts()['none'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_existing_journal_keys_are_unchanged(self, journaling_service):
+        """Additive: content stays truncated to 200 and group_id stays put."""
+        await journaling_service._execute_graphiti_write(
+            'add_episode',
+            _graphiti_payload(
+                content='x' * 500,
+                group_id='dark_factory',
+                referents=_encoded('metadata', Referent(number='3129')),
+            ),
+        )
+
+        payload = _backend_op_payload(journaling_service)
+        assert payload['content'] == 'x' * 200
+        assert payload['group_id'] == 'dark_factory'
+        assert payload['referent_source'] == 'metadata'
+        assert payload['referent_count'] == 1
