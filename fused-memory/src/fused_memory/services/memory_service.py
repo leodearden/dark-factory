@@ -1535,6 +1535,26 @@ class MemoryService:
         # likely to be noticed any other way.
         self._mem0_update_storm_counters: dict[str, StormCounter] = {}
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
+        # INV-4 storm escape for the referent-set queue channel (task 3670, PRD
+        # leaf epsilon). `_decode_referents` degrades an unreadable or absent
+        # blob to ('none') rather than raising — losing the memory over a
+        # telemetry field would be worse — so that degradation MUST be counted
+        # rather than silently fallen through. Constructed UNCONDITIONALLY, for
+        # the same reason the two counters above are: an alarm that only exists
+        # when `_write_journal` is configured would vanish in exactly the
+        # degraded configuration where a referent-less write storm is least
+        # likely to be noticed any other way.
+        #
+        # Bucketed by ALL FOUR sources, not just 'none', because leaf iota needs
+        # a DENOMINATOR: "sustained 100% none" is a rate, and an absolute
+        # none-count alone cannot distinguish a broken producer from a quiet
+        # system. Keyed off gamma's exported REFERENT_SOURCES so the vocabulary
+        # lives at ONE site (that constant's stated purpose) and a fifth source
+        # cannot escape the counter.
+        #
+        # Bounded by that four-member closed vocabulary, so unlike the per-agent
+        # storm counters above it needs no pruning.
+        self._referent_source_counts: dict[str, int] = dict.fromkeys(REFERENT_SOURCES, 0)
         # Test seam for the injectable-clock convention: a 3600s window has to
         # be exercised by advancing a fake clock, not by sleeping.
         self._mem0_update_storm_time_provider: Callable[[], float] = time.time
@@ -2624,6 +2644,30 @@ class MemoryService:
         )
         return stats
 
+    def referent_source_counts(self) -> dict[str, int]:
+        """How many Graphiti writes resolved to each referent source.
+
+        The INV-4 storm escape for the referent-set queue channel (task 3670,
+        PRD leaf epsilon), and the read side of ``_referent_source_counts``.
+
+        Emitted at the CONSUMER (``_execute_graphiti_write``), not at the three
+        producers, deliberately: the regression this exists to detect is "the
+        plumbing breaks, every row arrives referent-less, and the feature
+        no-ops in total silence", and that failure lives on the PRODUCER side —
+        a counter emitted there would go dark in exactly that scenario. Only
+        the consumer sees both new-format and old-format rows.
+
+        Buckets ALL FOUR sources rather than only 'none', because leaf iota
+        needs a denominator: "sustained 100% none" is a RATE, and an absolute
+        none-count alone cannot distinguish a broken producer from a quiet
+        system.
+
+        Returns a COPY, so a caller cannot mutate the escape hatch's own state.
+        Process-lifetime totals, never reset — a monotonic counter a reader
+        samples and differences, matching the uptime-baseline convention above.
+        """
+        return dict(self._referent_source_counts)
+
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
     ) -> Any:
@@ -2654,6 +2698,11 @@ class MemoryService:
         # is what keeps an old-format row byte-identical.
         referents: ReferentSet
         referents, referent_source = _decode_referents(payload)
+        # INV-4 escape: EVERY Graphiti write is bucketed, so the absent and
+        # degraded paths are counted rather than silently falling through. See
+        # `_referent_source_counts` in __init__ for why this is unconditional
+        # and why all four sources are bucketed. Leaf iota reads it.
+        self._referent_source_counts[referent_source] += 1
         reference_time_iso = payload.pop('reference_time', None)
         reference_time = None
         if reference_time_iso is not None:
