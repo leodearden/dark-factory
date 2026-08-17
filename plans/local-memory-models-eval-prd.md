@@ -117,58 +117,42 @@ not counted as G1 consumers of anything here.
 > task** (`dependencies: [3804]`, added 2026-08-10), so that sequencing is enforced by the scheduler
 > rather than only asserted in prose.
 
-> **Amendment 2026-08-17 (task 3973)** — refreshed the "Est. VRAM" column against
-> `scripts/local-model-serving/arms.yaml`'s declared `est_vram_gib` admission floors, derived from
-> vLLM's 2026-08-06 measurement of 11.21 GiB of weights (the drift flagged, and deliberately not
-> fixed, by the 3804 amendment above). Two arms checked:
-> - **Qwen3.5-9B — was stale, now corrected.** `~6GB` → **12.0 GiB** (arms.yaml's `est_vram_gib`, the
->   admission-floor figure vLLM's own measurement corrected it to on 2026-08-06 — weights alone are
->   11.21 GiB; 12.0 adds the non-KV allowance). The original ~6GB was a parameter-count guess, ~2x
->   below the measured weights.
-> - **Phi-4 14B — checked, not stale.** `~9GB` matches arms.yaml's `est_vram_gib: 9.0` exactly (that
->   file's own comment block confirms this arm's figure sits *above* its 8.51 GiB of on-disk weights,
->   the opposite of Qwen3.5-9B's defect) — left unchanged.
+> **Amendment 2026-08-17 (task 3973)** — refreshed the "Est. VRAM" column and D10's Consequence
+> paragraph against `scripts/local-model-serving/arms.yaml` (authoritative; this PRD is the
+> narrative record of it), fixed the dead "line 127" pointer in arms.yaml's dropped-Mistral comment,
+> and — after review found more of the same defect — converted every remaining stale line-number
+> cross-reference between this PRD and arms.yaml into a stable locator. Five commits, three review
+> rounds landed this; see the git log for the pass-by-pass history, not repeated here.
 >
-> Sites touched: the candidate-slate table (Qwen3.5-9B row); the "Reading the Est. VRAM column"
-> footnote immediately below it; D10's Consequence paragraph, which restates the same two arms on a
-> different, **weights-only** basis (~11.2, ~8.3 GiB) rather than these declared admission floors.
-> `scripts/local-model-serving/arms.yaml` remains authoritative; this PRD is the narrative record of
-> it, same relationship as the 3804 amendment established for slate composition.
+> **Est. VRAM figures, checked against arms.yaml's declared `est_vram_gib` admission floors**
+> (weights plus a non-KV allowance — the figure `arm_fits` actually admits an arm on — derived from
+> vLLM's 2026-08-06 measurement of 11.21 GiB of Qwen3.5-9B weights):
+> - **Qwen3.5-9B — was stale, now corrected.** `~6GB` → **12.0 GiB**. The original `~6GB` was a
+>   parameter-count guess, ~2x below the measured weights.
+> - **Phi-4 14B — checked, not stale.** `~9GB` (reformatted to `9.0 GiB`) already matched arms.yaml's
+>   declared `est_vram_gib: 9.0`, which sits *above* its ~8.27–8.51 GiB of weights — the opposite of
+>   Qwen3.5-9B's defect — so no correction was due.
 >
-> **Second pass, same amendment (review round 1):** the first pass above substituted these declared
-> admission floors (12.0, 9.0) into D10's Consequence paragraph and mislabelled them "measured" —
-> `est_vram_gib` and weights-only are two distinct quantities, and D10's MoE comparison specifically
-> needs the weights-only one. Restored there to ~11.2, ~8.3 GiB; see the note at that paragraph.
+> **Two bases, deliberately not unified** — see the "Reading the Est. VRAM column" footnote at the
+> candidate slate and the note at D10 for the full accounting. The candidate-slate table reports
+> arms.yaml's declared admission floors (12.0 / 9.0 for the two dense arms); D10's Consequence
+> paragraph reports the same two arms **weights-only** (~11.2, ~8.3 GiB) instead, because its MoE
+> comparison needs every comparator on one basis. The MoE stretch row is the same split: its
+> **13.27 GiB, fits** is α step 22's weights figure, while arms.yaml's declared admission floor for
+> `moe-stretch` is **14.5 GiB**. `est_vram_gib` (declared) and weights-only (measured or derived) are
+> two different quantities — seeing both numbers for the same arm at different sites in this
+> document is that distinction, not fresh drift.
 >
-> **Third pass, same amendment (review round 2) — the dead-pointer sweep is now file-wide, not
-> one-row.** This task's item 2 was filed against a single stale pointer in
-> `scripts/local-model-serving/arms.yaml` ("The PRD commissioned it (line 127)"), and the first pass
-> fixed exactly that one — while **six more** line-number pointers into this PRD survived in the same
-> file, all of them broken by the same two amendment banners, and one of them (`PRD line 127`)
-> byte-identical to the pointer that pass claimed to have removed. All seven are now stable locators
-> (§Candidate slate plus a row or arm name), and that file carries a **POINTER STYLE** header note
-> stating the rule and why a line number cannot hold here: this PRD grows a new banner at the top on
-> every amendment, invalidating every number below it at once. The reciprocal pointer *from* this
-> document *into* arms.yaml (D10's MoE-basis footnote, previously "arms.yaml lines 248-255") is
-> converted for the same reason. **Named, not silently left:** five sibling files —
-> `lms_healthcheck.py`, `lms_manifest.py`, `tests/test_lms_manifest.py`,
-> `tests/test_lms_healthcheck.py`, `tests/test_lms_vram.py` — still carry `PRD line 134` /
-> `PRD line 127` pointers with the identical defect. They are outside this task's declared file scope
-> and are recorded in arms.yaml's header note and in a follow-up rather than fixed here.
->
-> **Fourth pass, same amendment (review round 3) — this task broke its own rule, in the direction it
-> had just declared.** The third pass converted the PRD→arms.yaml pointer and wrote that a line
-> number "cannot hold here", while D10's Consequence note — added by the *first* pass and never
-> re-read against the rule the third pass introduced — cited `arms.yaml:97-101` for the 0.972x load
-> ratio. That pointer was wrong when written and wrong now: 97-101 is the admission-floor rationale,
-> and the ratio derivation lives ~16 lines further down, in the `(Calibration, if a ratio is
-> wanted: …)` parenthetical. Converted to that stable locator. **The rule is BIDIRECTIONAL and is
-> now stated that way** in arms.yaml's POINTER STYLE note: neither file cites the other by line
-> number, because *both* are edited by every pass of this drift-correction class — the PRD grows a
-> banner at the top, and arms.yaml grows comment blocks in the middle. A whole-branch grep for
-> surviving `arms.yaml:NN` / `lines NN-NN` pointers returns this one and nothing else; the remaining
-> `line 127` / `line 134` strings in the banners above are **quotations of the broken pointers being
-> described**, not live references, and are correct as such.
+> **Stable locators, bidirectionally.** Every cross-reference between this PRD and
+> `scripts/local-model-serving/arms.yaml`, in both directions, is now a section/row/arm-name locator
+> or a quoted comment fragment that fits on one physical line of its target file — never a line
+> number. Both files are edited by every pass of this drift-correction class: this PRD grows a new
+> amendment banner at the top (invalidating every number below it at once) and arms.yaml grows
+> comment blocks in the middle (shifting everything after them). See arms.yaml's **POINTER STYLE**
+> header note for the rule. Five sibling files (`lms_healthcheck.py`, `lms_manifest.py`,
+> `scripts/tests/test_lms_manifest.py`, `scripts/tests/test_lms_healthcheck.py`,
+> `scripts/tests/test_lms_vram.py`) still carry the identical defect, are outside this task's
+> declared file scope, and are recorded in arms.yaml's header note; task 4346 carries them.
 
 ## Goal
 
@@ -286,9 +270,9 @@ llama.cpp only, see hazard):
 
 | Arm | Size / quant | Est. VRAM | Basis (cited in research appendix) |
 |---|---|---|---|
-| Qwen3.5-9B | dense, Q4/AWQ | ~~`~6GB`~~ → **12.0 GiB** (arms.yaml declared admission floor; 11.21 GiB weights, vLLM-measured 2026-08-06) | IFEval 91.5, BFCL-V4 66.1 (official card) — best published conformance-adjacent scores; huge KV headroom |
+| Qwen3.5-9B | dense, Q4/AWQ | ~~`~6GB`~~ → **12.0 GiB** (arms.yaml declared admission floor; 11.21 GiB weights, vLLM-measured 2026-08-06) | IFEval 91.5, BFCL-V4 66.1 (official card) — best published conformance-adjacent scores; 32k context and the slate's highest max_num_seqs remain affordable at the corrected 12.0 GiB floor, but no longer the roomiest KV margin on the slate |
 | ~~Mistral-Small-3.2-24B~~ **DROPPED 2026-08-06** | ~~dense, AWQ~~ | ~~`~14GB`~~ | **Dropped by α after live measurement (Leo's ruling, esc-3713-10): a vision-language model whose quantized repo's tokenizer encodes vLLM's startup `[IMG]` probe to zero image tokens against a text count of one, so the engine never reaches weight loading.** Original basis: mature quant ecosystem; release targeted stronger function calling |
-| Phi-4 14B | dense, Q4 | ~9GB | SOB Value Accuracy 0.798 (top small model); **16K ctx — screening must verify graphiti's longest prompts fit** |
+| Phi-4 14B | dense, Q4 | 9.0 GiB | SOB Value Accuracy 0.798 (top small model); **16K ctx — screening must verify graphiti's longest prompts fit** |
 | MoE stretch: ~~Qwen3.6-35B-A3B or~~ **Gemma-4-26B-A4B-it (QAT)** | ~~GGUF IQ4/Q4~~ **`UD-Q4_K_XL`** | ~~≈17GB (Qwen IQ4 — real, but 16.51 GiB of weights before KV, so it does not fit the measured 16.4 GiB)~~ → **13.27 GiB, fits** (α step 22, Open Q3; `task/3713` @ `a161c2858b`, not yet on `main`) | 115–133 tok/s on a 3090 (6× dense-on-vLLM) — but llama.cpp silently falls back to *unconstrained* output on Pydantic `$ref`/`$defs` schemas (llama.cpp #21228), so this arm runs `json_object` mode + a hard client-side validator; tightest VRAM |
 
 *Reading the **Est. VRAM** column: those were 2026-08-05 research-time **estimates**. Task 3973
@@ -299,7 +283,8 @@ measurement rather than itself being a measurement. Qwen3.5-9B's `~6GB` was stal
 **12.0 GiB** (arms.yaml's declared admission floor, derived from vLLM's 2026-08-06 measurement of
 11.21 GiB of weights). Phi-4 14B's `~9GB` was checked too: it coincides with arms.yaml's declared
 `est_vram_gib: 9.0`, which sits above its ~8.27–8.51 GiB of weights — the opposite of Qwen3.5-9B's
-defect — so it stands unchanged.*
+defect — so the figure needed no correction; reformatted to **9.0 GiB** in the table above to match
+the other entries' declared-floor precision.*
 
 *This column does not sit on one basis, which is deliberate rather than fresh drift. The MoE stretch
 row's **13.27 GiB, fits** is α step 22's **weights** figure, not a declared floor: arms.yaml's own
@@ -407,10 +392,11 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
       embedding arms fit inside ~16.4 GiB; the MoE stretch arm as then specified (~17GB, i.e.
       Qwen3.6-35B-A3B at IQ4) does not. **Note on the `~11.2, ~8.3` figures, marked here at the point
       of use:** both are weights, not `est_vram_gib`. Qwen3.5-9B's **11.21 GiB** is vLLM-reported,
-      measured 2026-08-06 (arms.yaml's `qwen3.5-9b` comment: "vLLM reports 11.21 GiB FOR WEIGHTS ALONE
-      at this quant"); Phi-4 14B's **~8.27 GiB** is derived, not itself measured — arms.yaml, the
-      `qwen3.5-9b` arm's `est_vram_gib` comment block, its "(Calibration, if a ratio is wanted: …)"
-      parenthetical, scales phi-4's 8.51 GiB of on-disk safetensors by the 0.972x vLLM load ratio the
+      measured 2026-08-06 (arms.yaml's `qwen3.5-9b` comment: "WEIGHTS ALONE at this quant" — a
+      single-line quote fragment per that file's POINTER STYLE note, not the full sentence); Phi-4
+      14B's **~8.27 GiB** is derived, not itself measured — arms.yaml, the `qwen3.5-9b` arm's
+      `est_vram_gib` comment block, its Calibration parenthetical (quote fragment: "a ratio is
+      wanted"), scales phi-4's 8.51 GiB of on-disk safetensors by the 0.972x vLLM load ratio the
       qwen snapshot calibrated (11.21 / 11.53 GiB). arms.yaml's `est_vram_gib` (12.0 for qwen3.5-9b, 9.0 for
       phi-4-14b) is a **different, stricter** quantity — a **declared** ADMISSION FLOOR, weights plus
       a non-KV allowance (~0.79 GiB for qwen; 8.27 + 0.79 = 9.06, i.e. exactly phi-4's declared 9.0) —
