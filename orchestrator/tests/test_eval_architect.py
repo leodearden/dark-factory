@@ -4049,3 +4049,131 @@ class TestArchitectEvalCapFailover:
         assert 'disallowed_tools' in kw
         assert 'env_overrides' in kw
         assert kw['mcp_config'] is not None
+
+
+def _one_account_gate():
+    """A REAL single-account UsageGate — the pool that CANNOT fail over.
+
+    The failover test above is the happy path: a cap costs a retry because a
+    healthy account exists. This is the other end of the same story — every
+    account capped, nowhere left to rotate to.
+    """
+    from _orch_helpers import build_usage_gate
+    from shared.config_models import AccountConfig
+
+    return build_usage_gate(
+        [AccountConfig(name='max-only', oauth_token_env='CLAUDE_OAUTH_ONLY')],
+        ['tok-only'],
+    )
+
+
+# ---------------------------------------------------------------------------
+# BOUNDED patience and a LOUD, correctly-labelled exhaustion (eval-revival φ)
+#
+# Failover is only half the contract. The other half is what happens when it
+# runs out: the campaign must never hang on the shared 14-day default, and the
+# resulting failure must land in the EXISTING cap_tainted backstop stamped as a
+# transport refusal — not as a harness crash of our own.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestArchitectEvalCapPatience:
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_cap_patience_is_eval_bounded_not_the_fourteen_day_default(self):
+        from shared.cli_invoke import _DEFAULT_CAP_WAIT_SANITY_SECS
+
+        from orchestrator.evals import runner
+
+        # An eval campaign is a bounded, queue-blocking job, so it takes the
+        # house 30-min bound rather than the 14-day patient-AFK default a
+        # per-task implementer legitimately inherits.
+        assert 1800 <= runner._EVAL_CAP_WAIT_SANITY_SECS <= 3600
+        assert runner._EVAL_CAP_WAIT_SANITY_SECS < _DEFAULT_CAP_WAIT_SANITY_SECS
+
+        # …and it actually REACHES the wrapper. A constant that is defined but
+        # never passed would leave the campaign on the 14-day default while
+        # both assertions above stayed happily green.
+        wrapper = AsyncMock(return_value=_healthy_agent_result())
+        with patch('orchestrator.evals.runner.invoke_with_cap_retry', wrapper):
+            await _run_architect_eval_hermetic(
+                self._cfg(),
+                produced_plan=_well_formed_plan(),
+                usage_gate=_one_account_gate(),
+            )
+
+        assert wrapper.await_count == 1
+        assert (
+            wrapper.call_args.kwargs['cap_wait_sanity_secs']
+            == runner._EVAL_CAP_WAIT_SANITY_SECS
+        )
+
+    async def test_fully_capped_pool_fails_loud_into_cap_tainted(self):
+        from orchestrator.evals import runner
+
+        # `arch_result` (not a side_effect LIST) means EVERY attempt caps, and
+        # the patched bound trips on the first hit — so the pool is genuinely
+        # exhausted and the test still runs in milliseconds.
+        with patch.object(runner, '_EVAL_CAP_WAIT_SANITY_SECS', 0.0):
+            result, _mocks = await _run_architect_eval_hermetic(
+                self._cfg(),
+                produced_plan={},
+                usage_gate=_one_account_gate(),
+                arch_result=_cap_agent_result(),
+            )
+
+        # It RETURNED. That is the requirement being pinned: a fully-capped
+        # pool must FAIL, not hang a campaign waiting for a reset 14 days out.
+        assert result.outcome == 'blocked'
+
+        # …into the pre-existing backstop, unchanged: no scorable plan landed,
+        # so every available number would be fabricated and the cell is
+        # excluded rather than scored 0.0.
+        assert result.metrics['cap_tainted'] is True
+        assert result.metrics['plan_quality'] is None
+
+        # …and labelled as what it IS. Stamping a provider cap `harness_error:`
+        # would charge OUR crash for a transport refusal and collapse two rows
+        # of the docstring's taint table that exist precisely to stay distinct.
+        marker = result.metrics['invocation_error']
+        assert marker.startswith('architect:')
+        assert 'cap' in marker
+        assert 'harness_error' not in marker
+
+    async def test_cap_exhaustion_that_left_a_scorable_plan_is_not_tainted(self):
+        from orchestrator.evals import runner
+        from orchestrator.evals.judge import score_plan_structure
+
+        with patch.object(runner, '_EVAL_CAP_WAIT_SANITY_SECS', 0.0):
+            result, mocks = await _run_architect_eval_hermetic(
+                self._cfg(),
+                produced_plan=_well_formed_plan(),
+                usage_gate=_one_account_gate(),
+                arch_result=_cap_agent_result(),
+            )
+
+        # The architect wrote a real plan through plan-tools BEFORE the pool ran
+        # dry — the common shape of a cap landing mid-campaign. Discarding it
+        # would turn a scorable cell into an exclusion, re-opening the
+        # differential-exclusion hazard from the other side. Cap EXHAUSTION
+        # therefore obeys the SAME taint-table row an inline mid-run 429 obeys.
+        assert result.metrics['cap_tainted'] is False
+        assert result.metrics['plan_quality'] == score_plan_structure(
+            _well_formed_plan()
+        )
+
+        # Still MARKED, so a reader knows why the LLM judge was skipped…
+        marker = result.metrics['invocation_error']
+        assert marker.startswith('architect:')
+        assert 'cap' in marker
+
+        # …and it really WAS skipped, carrying 3629's honest zeros rather than
+        # spend for a call that never happened.
+        assert mocks['judge'].await_count == 0
+        assert result.metrics['judge_invocations'] == 0
+        assert result.metrics['judge_cost_usd'] == 0.0
