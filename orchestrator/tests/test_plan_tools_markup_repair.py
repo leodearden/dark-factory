@@ -40,7 +40,11 @@ from pathlib import Path
 import pytest
 from shared.toolcall_markup import ENVELOPE_LITERALS, detect
 
-from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
+from orchestrator.artifacts import (
+    PLAN_SCHEMA_VERSION,
+    ArtifactWriteError,
+    TaskArtifacts,
+)
 from orchestrator.mcp import plan_tools
 
 #: What a failed atomic write may raise. The helper's own declared error, plus
@@ -2291,10 +2295,12 @@ class TestReadPlanRepaired:
         """
         _seed_mixed_plan(plan_artifacts)
 
-        def boom(_path, _plan):
-            raise plan_tools.PlanWriteError('disk on fire')
+        # Patched at the writer plan-tools now delegates to, so the contract
+        # is still exercised after the module's own writer was retired.
+        def boom(self, plan):
+            raise ArtifactWriteError('disk on fire')
 
-        monkeypatch.setattr(plan_tools, '_atomic_write_plan', boom)
+        monkeypatch.setattr(TaskArtifacts, 'write_plan', boom)
 
         with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
             plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2302,6 +2308,9 @@ class TestReadPlanRepaired:
         assert plan['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
         assert any(f['outcome'] == 'repaired' for f in facts)
         assert 'disk on fire' in caplog.text, 'the write failure must be LOUD'
+        assert plan_tools._MARKUP_WRITE_FAILED_EVENT in caplog.text, (
+            'the failure must be a STRUCTURED fact, not just prose'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3037,3 +3046,99 @@ class TestQuotedSiblingTagIsNeverTruncated:
 
         assert repaired['reuse'][0]['how'] == _SELF_NAME_HOW_PROSE
         assert repaired['design_decisions'][0]['rationale'] == _QUOTED_SIBLING_PROSE
+
+
+# ---------------------------------------------------------------------------
+# task 3957 step-7 — plan-tools persists a repaired plan THROUGH TaskArtifacts,
+# and keeps no second plan.json writer of its own.
+# ---------------------------------------------------------------------------
+
+
+class TestRepairWriteBackDelegatesToTaskArtifacts:
+    """`TaskArtifacts.write_plan` is the SINGLE owner of the plan.json write.
+
+    plan-tools used to carry `_atomic_write_plan` — a parallel implementation
+    of the same byte format and the same durability contract, kept only
+    because `TaskArtifacts._write_json` was truncate-then-write.  It is not
+    any more (task 3957 steps 1-6), so the duplicate has no reason to exist
+    and the write-back goes through the public writer.
+    """
+
+    @staticmethod
+    def _spy_on_write_plan(monkeypatch) -> list[dict]:
+        """A DELEGATING spy: records the call, then performs the real write.
+
+        Delegating rather than stubbing is what keeps the on-disk assertions
+        meaningful — a stub would prove the call happened while quietly
+        turning every "and the bytes landed" check vacuous.
+        """
+        calls: list[dict] = []
+        real_write_plan = TaskArtifacts.write_plan
+
+        def spy(self, plan):
+            calls.append(plan)
+            return real_write_plan(self, plan)
+
+        monkeypatch.setattr(TaskArtifacts, 'write_plan', spy)
+        return calls
+
+    def test_repair_write_back_goes_through_task_artifacts_write_plan(
+        self, plan_artifacts, monkeypatch
+    ):
+        _seed_mixed_plan(plan_artifacts)
+        calls = self._spy_on_write_plan(monkeypatch)
+
+        repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert any(f['outcome'] == 'repaired' for f in facts)
+        assert len(calls) == 1, (
+            f'expected exactly one write_plan call, got {len(calls)} — the '
+            'repair write-back must go through TaskArtifacts'
+        )
+        assert calls[0] == repaired
+        # And the delegation really wrote: the bytes on disk are the repair.
+        assert _on_disk(plan_artifacts) == repaired
+
+    def test_a_clean_plan_still_writes_nothing(self, plan_artifacts, monkeypatch):
+        """Consolidating the writer must not convert a read into a write."""
+        plan_artifacts.write_plan(corrupt_plan())
+        calls = self._spy_on_write_plan(monkeypatch)
+
+        _, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert facts == []
+        assert calls == []
+
+    def test_an_all_refusal_plan_still_writes_nothing(
+        self, plan_artifacts, monkeypatch
+    ):
+        """Nothing changed, so nothing is written — the 2939 prose plan stays."""
+        plan = corrupt_plan()
+        plan['design_decisions'][0]['decision'] = PROSE_QUOTED
+        plan_artifacts.write_plan(plan)
+        before_bytes = (plan_artifacts.root / 'plan.json').read_bytes()
+        calls = self._spy_on_write_plan(monkeypatch)
+
+        _, facts = plan_tools._read_plan_repaired(plan_artifacts)
+
+        assert [f['outcome'] for f in facts] == ['unrepairable']
+        assert calls == []
+        assert (plan_artifacts.root / 'plan.json').read_bytes() == before_bytes
+
+    @pytest.mark.parametrize(
+        'name',
+        ['_atomic_write_plan', '_target_file_mode', '_verify_plan_json',
+         'PlanWriteError'],
+    )
+    def test_plan_tools_defines_no_second_plan_writer(self, name):
+        """The CODE-REUSE deliverable stated as a check, not as a docstring.
+
+        This is what stops a parallel byte-format / durability contract
+        silently re-growing in this module the next time someone needs a
+        plan.json write here.
+        """
+        assert not hasattr(plan_tools, name), (
+            f'plan_tools.{name} is back — plan.json has two writers again. '
+            'TaskArtifacts.write_plan owns the byte format and the '
+            'atomic/durable guarantee; call it instead.'
+        )
