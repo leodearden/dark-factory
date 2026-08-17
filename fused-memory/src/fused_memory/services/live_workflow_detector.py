@@ -411,6 +411,17 @@ def detect_live_workflow(
     last_commit_at, recent_commit = _check_recent_commit(
         root, branch, now=reference, max_commit_age_hours=max_commit_age_hours
     )
+    # Single-shot memo for the branch's own-commit count (`git rev-list --count
+    # <base_branch>..<branch>`), shared by the branch_bare computation below
+    # and the worktree_stale confirmation (task 3947) so the subprocess call
+    # never runs more than once per detect_live_workflow invocation.
+    _own_count: list[int | None] = []
+
+    def _own_commit_count() -> int | None:
+        if not _own_count:
+            _own_count.append(_branch_own_commit_count(root, base_branch, branch))
+        return _own_count[0]
+
     # branch_bare: branch carries zero commits of its own beyond base_branch
     # (its tip is just the base-branch commit — reify#5245's shape). An
     # unknown count (missing branch, rev-list error) is NOT bare (fail-safe
@@ -429,7 +440,7 @@ def detect_live_workflow(
     if worktree_registered and not recent_commit:
         branch_bare = False
     else:
-        own_commit_count = _branch_own_commit_count(root, base_branch, branch)
+        own_commit_count = _own_commit_count()
         branch_bare = own_commit_count == 0
     recent_commit = recent_commit and not branch_bare
 
@@ -437,13 +448,27 @@ def detect_live_workflow(
     # recent commit, and the branch's tip predates max_worktree_age_hours.
     # worktree_registered is NOT rewritten here — it keeps reporting the raw
     # git fact; staleness is a separate, policy-thresholded companion signal.
-    # Step-4 (task 3947) layers a bare-branch confirmation on top of this age
-    # check; for now this is age-only.
-    worktree_stale = (
+    #
+    # The rev-list confirmation below is a REQUIRED third conjunct, not an
+    # optimization: `last_commit_at` is the branch's TIP timestamp, and for a
+    # bare branch (zero commits beyond base_branch) that tip IS the
+    # base-branch commit — its age describes base_branch, not this worktree.
+    # Without this check an old `main` tip could mark a freshly-created
+    # worktree stale instantly. It is evaluated LAST, only once the cheap age
+    # conjuncts have already passed, and reuses the memoized
+    # _own_commit_count() above, so the common already-live path (and the
+    # common not-yet-stale path) pays no extra subprocess call.
+    worktree_stale = False
+    if (
         worktree_registered
         and not recent_commit
         and _worktree_age_exceeded(last_commit_at, reference, max_worktree_age_hours)
-    )
+    ):
+        own = _own_commit_count()
+        # own is None: unknown count (missing branch, rev-list error/timeout,
+        # unparseable output). own == 0: bare branch. Both fail safe to False
+        # — an unknown or bare count is never positive evidence of staleness.
+        worktree_stale = own is not None and own > 0
     # orchestrator_live is the project-level lock signal (True when the
     # orchestrator process holds an active lock for this project_root, regardless
     # of which task it is currently dispatching).  Pre-computed callers may pass
