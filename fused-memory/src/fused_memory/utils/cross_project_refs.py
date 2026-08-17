@@ -58,7 +58,7 @@ any future reconciliation sweep without import cycles.
 from __future__ import annotations
 
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from fused_memory.utils.canonical_labels import Referent, scan_content
 
@@ -98,20 +98,36 @@ class CrossProjectRef:
 
 @dataclass(frozen=True)
 class CrossProjectRefScan:
-    """The result of scanning one episode body."""
+    """The result of scanning one episode body.
+
+    Frozen for the same reason :class:`CrossProjectRef` is: a scan is
+    evidence for destructive graph surgery, not a mutable accumulator.
+
+    The two fields are TUPLES rather than lists, which is what makes that
+    claim true. ``frozen=True`` only blocks attribute REBINDING, so list
+    fields would leave ``scan.refs.append(...)`` wide open — a consumer could
+    quietly add a ref the scanner refused to infer and the frozen-ness would
+    not notice. Tuples also make the scan hashable, which a frozen dataclass
+    holding lists silently is not.
+    """
 
     #: Refs safe to act on, in first-seen order, de-duplicated on
     #: (project_id, task_number).
-    refs: list[CrossProjectRef] = field(default_factory=list)
+    refs: tuple[CrossProjectRef, ...] = ()
     #: Refs whose task number ALSO appears as a bare 'task N' mention in the
     #: same content. Such content is genuinely ambiguous about which facts
     #: belong to the foreign task and which to the local one, so the consumer
     #: must refuse to split it and say so loudly rather than guess.
-    ambiguous: list[CrossProjectRef] = field(default_factory=list)
+    ambiguous: tuple[CrossProjectRef, ...] = ()
 
 
-def _foreign_refs(referents: Sequence[Referent]) -> list[CrossProjectRef]:
+def _foreign_refs(referents: Sequence[Referent]) -> tuple[CrossProjectRef, ...]:
     """Map FOREIGN referents to CrossProjectRefs, preserving order.
+
+    Returns a tuple — not a list — so the immutability
+    :class:`CrossProjectRefScan` promises is established once, here, at the
+    point that produces the values, rather than by a second wrapping pass at
+    the call site.
 
     The ``if r.project_id`` filter is what makes this module's output mean
     'cross-project'. Own-project referents — which canonical_labels reports
@@ -123,11 +139,11 @@ def _foreign_refs(referents: Sequence[Referent]) -> list[CrossProjectRef]:
     because extraction collapsing it onto 'Task 5181' inside its own graph is
     correct, not a bug.
     """
-    return [
+    return tuple(
         CrossProjectRef(project_id=r.project_id, task_number=r.number)
         for r in referents
         if r.project_id
-    ]
+    )
 
 
 def find_cross_project_task_refs(
