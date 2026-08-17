@@ -1979,3 +1979,189 @@ class TestCorroborationGate:
             result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
         assert result.is_live is True
         assert result.indeterminate is False
+
+
+class TestWorktreeStaleGate:
+    """detect_live_workflow's is_live downgrade gate for a stale worktree
+    registration (task 3947) -- the behaviour that actually closes the
+    reported gap: `worktree_registered` alone can never expire (only
+    `git worktree remove`/prune clears it), so a standing policy waiting for
+    it to resolve on its own could wait forever. `worktree_stale AND NOT
+    orchestrator_live` closes that gap: a stale registration downgrades
+    `is_live` to False and flags `indeterminate` True, exactly mirroring the
+    task-2963 corroboration gate's semantics (a signal existed but was not
+    trustworthy evidence of liveness) -- the two gates are ORed together and
+    cannot conflict, since both produce identical (is_live=False,
+    indeterminate=True) output.
+    """
+
+    _NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=UTC)
+
+    def _side_effect(
+        self,
+        *,
+        worktree_branch: bool = True,
+        log_rc: int = 0,
+        log_stdout: str = '',
+        revlist_stdout: str = '3',
+        revlist_rc: int = 0,
+    ):
+        """Three-way dispatch identical to TestWorktreeStaleSignal. Defaults
+        to a registered, non-bare (`revlist_stdout='3'`) worktree; each test
+        supplies the git-log tip explicitly via `log_stdout`/`log_rc`.
+        """
+        worktree_stdout = (
+            _worktree_porcelain_with_branch(_BRANCH)
+            if worktree_branch
+            else _worktree_porcelain_no_branch()
+        )
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=worktree_stdout, stderr='',
+                )
+            if 'rev-list' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=revlist_rc, stdout=revlist_stdout, stderr='',
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=log_rc, stdout=log_stdout, stderr='',
+            )
+        return side_effect
+
+    def test_gate_fires_when_stale_is_sole_signal(self, tmp_path):
+        """A stale worktree with no live orchestrator downgrades is_live to
+        False and flags indeterminate True; the raw signals are preserved."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect = self._side_effect(log_rc=0, log_stdout=ts)
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_registered is True
+        assert result.worktree_stale is True
+        assert result.recent_commit is False
+        assert result.orchestrator_live is False
+        assert result.is_live is False
+        assert result.indeterminate is True
+
+    def test_live_orchestrator_lock_overrides_staleness(self, tmp_path):
+        """A stale worktree never overrides a live project-wide orchestrator
+        lock -- the signal is still reported honestly, but is_live stays
+        True and indeterminate stays False."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect = self._side_effect(log_rc=0, log_stdout=ts)
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, _orchestrator_live=True,
+            )
+
+        assert result.worktree_stale is True
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    def test_deferred_task_with_stale_worktree_finally_resolves(self, tmp_path):
+        """The know_live-598 deferral shape: a deferred task with a lingering
+        worktree registration and old commits under a (still-running) live
+        orchestrator. _orchestrator_signal_ineligible rule 1 zeroes
+        orchestrator_live for a deferred status, so the stale gate then
+        fires -- this is the exact gap the task closes. The companion
+        max_worktree_age_hours=None assertion shows the signal could never
+        resolve on its own without this task's threshold."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect = self._side_effect(log_rc=0, log_stdout=ts)
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='deferred', _orchestrator_live=True,
+            )
+            result_disabled = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='deferred', _orchestrator_live=True, max_worktree_age_hours=None,
+            )
+
+        assert result.orchestrator_live is False
+        assert result.worktree_stale is True
+        assert result.is_live is False
+        assert result.indeterminate is True
+
+        assert result_disabled.is_live is True
+
+    def test_fresh_worktree_stays_live(self, tmp_path):
+        """A 1-hour-old tip is well within any staleness window."""
+        ts = (self._NOW - timedelta(hours=1)).isoformat()
+        side_effect = self._side_effect(log_rc=0, log_stdout=ts)
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.worktree_stale is False
+        assert result.is_live is True
+        assert result.indeterminate is False
+
+    def test_tip_inside_staleness_window_stays_live(self, tmp_path):
+        """Regression guard: the 6h recent-commit threshold must not leak
+        into the 168h staleness threshold."""
+        ts = (self._NOW - timedelta(hours=10)).isoformat()
+        side_effect = self._side_effect(log_rc=0, log_stdout=ts)
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.recent_commit is False
+        assert result.worktree_stale is False
+        assert result.is_live is True
+
+    def test_genuine_not_live_is_not_indeterminate(self, tmp_path):
+        """Preserves the task-2963 semantic distinction between 'never had a
+        signal' and 'had a signal that was downgraded'."""
+        side_effect = self._side_effect(
+            worktree_branch=False, log_rc=1, log_stdout='', revlist_stdout='1',
+        )
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.is_live is False
+        assert result.indeterminate is False
+        assert result.worktree_stale is False
+
+    def test_coexists_with_corroboration_gate(self, tmp_path):
+        """Both gates agree on a stale, uncorroborated in-progress task --
+        ORing them together must not produce a contradiction."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect = self._side_effect(log_rc=0, log_stdout=ts)
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=False,
+            )
+
+        assert result.is_live is False
+        assert result.indeterminate is True
+
+    def test_corroboration_gate_fires_without_staleness(self, tmp_path):
+        """Pins that the pre-existing task-2963 gate is untouched: with
+        staleness disabled and no tip at all, it alone still downgrades
+        is_live."""
+        side_effect = self._side_effect(log_rc=1, log_stdout='')
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                status='in-progress', corroborated=False, max_worktree_age_hours=None,
+            )
+
+        assert result.is_live is False
+        assert result.indeterminate is True
+        assert result.worktree_stale is False
+
+    def test_wrapper_passthrough(self, tmp_path):
+        """The convenience wrapper threads max_worktree_age_hours through
+        **kwargs."""
+        ts = (self._NOW - timedelta(days=30)).isoformat()
+        side_effect = self._side_effect(log_rc=0, log_stdout=ts)
+        with patch('subprocess.run', side_effect=side_effect):
+            live = is_workflow_live_for_task(_TASK_ID, str(tmp_path), now=self._NOW)
+            live_disabled = is_workflow_live_for_task(
+                _TASK_ID, str(tmp_path), now=self._NOW, max_worktree_age_hours=None,
+            )
+
+        assert live is False
+        assert live_disabled is True
