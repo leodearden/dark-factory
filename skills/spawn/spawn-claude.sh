@@ -228,9 +228,12 @@ fi
 #   * the discriminator survives /clear. Claude Code re-mints session_id in
 #     place there, so the owning session's own SessionStart would look like a
 #     mismatch -- session_hooks keys off the SessionStart-only `source` field
-#     ('clear'/'resume'/'compact', which a nested claude can never report,
-#     since it is always a fresh process reporting 'startup') and RE-binds
-#     this record instead of forking it.
+#     ('clear'/'compact', which have no command-line spelling and so can only
+#     be produced by the process already holding the session) and RE-binds
+#     this record instead of forking it. 'resume' is deliberately NOT in that
+#     set: --resume/--continue make a brand-new nested process report it too,
+#     so honouring it would let an inheritor rebind THIS spawn's record to
+#     itself.
 spawn_id_export=""
 parent_id_export=""
 if [ -n "$SESSION_RECORD_DIR" ]; then
