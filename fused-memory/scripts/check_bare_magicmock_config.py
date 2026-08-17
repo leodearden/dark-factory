@@ -207,10 +207,37 @@ _VIOLATION_MSG = (
 )
 
 
-_DATACLASS_VIOLATION_MSG = (
-    'unspecced MagicMock shaped like a registered dataclass.'
-    ' To suppress: add # noqa: bare-dataclass-double — <reason> on the preceding non-blank line.'
-)
+def _dataclass_violation_msg(shape: _DataclassShape, kwargs: set[str]) -> str:
+    """Build Rule B's rejection message for *shape* matched by *kwargs*.
+
+    Deliberately shares NO vocabulary with ``_VIOLATION_MSG``: Rule A's remedies
+    (``mock_orch_config`` / ``pydantic_spec``) read ``model_fields`` and require a
+    pydantic BaseModel, so they are unusable for a stdlib dataclass.  Offering them
+    here would send the reader down a dead end.
+
+    Any kwarg that is not a field of *shape* is reported as drift evidence: a bare
+    MagicMock accepts any keyword without objection, so an unrecognised one is the
+    single strongest signal that the double has drifted from the type it impersonates.
+    """
+    drift = sorted(kwargs - shape.fields)
+    drift_clause = ''
+    if drift:
+        names = ', '.join(drift)
+        drift_clause = (
+            f' It also passes {names} — not {"a field" if len(drift) == 1 else "fields"}'
+            f' of {shape.name}, which a bare MagicMock accepts silently.'
+        )
+    return (
+        f'unspecced MagicMock shaped like {shape.module}.{shape.name}'
+        f' (matched {shape.name} fields: {", ".join(sorted(kwargs & shape.fields))}).'
+        ' Reading an absent attribute on it auto-vivifies a truthy child Mock instead'
+        f' of raising AttributeError.{drift_clause}'
+        f' Use the {shape.factory}(...) helper, or MagicMock(spec={shape.name}) seeded'
+        f' from dataclasses.fields({shape.name}), so unknown-attribute reads raise'
+        ' (tasks 3477/3980 built the factory; task 4016 added this guard).'
+        ' To suppress: add # noqa: bare-dataclass-double — <reason> on the preceding'
+        ' non-blank line.'
+    )
 
 
 def _literal_kwarg_names(call: ast.Call) -> set[str]:
@@ -284,7 +311,7 @@ def _find_dataclass_double_violations(
                 filename=filename,
                 lineno=node.lineno,
                 col_offset=node.col_offset,
-                message=_DATACLASS_VIOLATION_MSG,
+                message=_dataclass_violation_msg(shape, kwargs),
             )
         )
     return violations
