@@ -236,16 +236,79 @@ lint_command: "uv run --project shared ruff check scripts/"
 # symptom — `import config` in scripts/legibility/census.py resolving to the
 # WRONG module — and the extraPaths entries fixed those for free.
 #
-# WHY `npx pyright scripts/` AND NOT A NARROWER FORM. It matches the sibling
-# tests/scripts/ invocation style exactly, and it runs FROM THE REPO ROOT, so
-# it resolves against the ROOT [tool.pyright] table — which is why those two
-# extraPaths entries are load-bearing for this command rather than a general
-# config preference, and why they are pinned by
-# tests/scripts/test_scripts_module_config.py::
+# WHY `uv run --project shared pyright scripts/` AND NOT A NARROWER FORM. It
+# runs FROM THE REPO ROOT — no --directory, so cwd stays at the worktree root
+# and the bare `scripts/` argument still resolves — which is why it resolves
+# against the ROOT [tool.pyright] table, why those two extraPaths entries are
+# load-bearing for this command rather than a general config preference, and
+# why they are pinned by tests/scripts/test_scripts_module_config.py::
 # test_root_pyright_extrapaths_resolves_scripts_imports. Remove either entry
 # and this gate goes red for reasons unrelated to any diff, which is how a
 # gate gets suppressed and dies. This command is guarded by
-# test_scripts_diff_is_type_gated in that same file.
+# test_scripts_diff_is_type_gated in that same file, and its invocation STYLE
+# additionally by test_type_gates_resolve_pyright_without_npx (task 4358),
+# which sweeps both non-member configs.
+#
+# The claim this paragraph used to make — "it matches the sibling tests/scripts/
+# invocation style exactly" — WAS TRUE WHEN WRITTEN, WENT FALSE, AND IS TRUE
+# AGAIN FOR A DIFFERENT REASON. Recorded rather than silently rewritten, per
+# this block's own corrected-rather-than-deleted standard above. Task 3842
+# switched the sibling to `uv run --project shared pyright tests/scripts/` and
+# left this line asserting a match that no longer held; 3842's own comment
+# flagged the staleness at the time rather than concealing it. Task 4358 landed
+# the same switch here, so the two match again — but the match is now a
+# CONSEQUENCE of both configs using the uv-resolved form, not the reason to
+# prefer it. Do not restore "matches the sibling" as the justification: if the
+# sibling moves again, that phrasing goes stale again, whereas the reasons below
+# (npm-cache exposure, PATH resolution) stand on their own.
+#
+# WHY UV AND NOT NPX (task 4358, mirroring task 3842 / esc-3473-2). The old
+# `npx pyright scripts/` re-resolved through the shared, mutable,
+# concurrently-written npm cache under $HOME on EVERY invocation, and once
+# turned a clean (0-error) type leg RED on a transient npm-cache write failure
+# (npm could not write ~/.npm/_logs) with no real type errors in the tree —
+# costing esc-3473-2 a full investigation cycle before the steward reproduced it
+# clean and found no standing outage. That is a fleet-wide false-red rather than
+# a local flake, for the reason the LINT block above gives: run_full_verification
+# asyncio-gathers over ALL module_configs.values() and the repo root sets
+# merge_verify_breadth: "full", so a red leg here blocks every merge, review
+# checkpoint and main-tip sweep repo-wide, on branches with no defect.
+#
+# `--project shared` selects only the ENVIRONMENT pyright is resolved from, for
+# the same PATH reason the lint_command block above records for ruff (pyright is
+# not on PATH at the worktree root, only inside a member venv; verify.py's
+# _FALLBACK_UV_PROJECT = 'shared' encodes the same pairing). It does NOT make
+# shared's config apply to files outside shared/ — the root [tool.pyright] table
+# still governs, which is exactly what keeps the extraPaths dependency above
+# intact. This pairs byte-for-byte with this file's OWN lint_command
+# (`uv run --project shared ruff check scripts/`), so the module's two
+# non-test gates are now invoked identically.
+#
+# THIS WAS THE LAST NPX-FRONTED MODULE CONFIG. All nine discovered module
+# configs are now uv-resolved: the seven workspace members (shared, dashboard,
+# cockpit, escalation, fused-memory, orchestrator, sampler) always were, task
+# 3842 moved tests/scripts/, and this task moved scripts/.
+#
+# RESIDUAL, stated in ONE place. npm is NOT invoked at all under this repo's
+# default configuration — the bundled-dist branch of pyright-python's
+# install_pyright() is taken before `cache_dir`/npm is ever reached. The real
+# residual is one soft-failing HTTPS GET to pypi.org from
+# `_should_warn_version()` (timeout=1, @lru_cache'd per process, returns None on
+# any exception), which cannot fail this leg and writes nothing under $HOME;
+# it is observable today at rc=0 as the stdout line "WARNING: there is a new
+# pyright version available (v1.1.408 -> v1.1.411)." The FULL derivation — the
+# code paths read, the empirical ~/.cache/pyright-python evidence, and the
+# explicit refutation of the superseded "NARROWED, NOT ELIMINATED" claim — is
+# in tests/scripts/orchestrator.yaml under the heading "NPM IS NOT INVOKED AT
+# ALL". Read it there; do not restate it here, or the two will drift. In
+# particular do NOT re-introduce the refuted claim that pyright-python does not
+# bundle the checker and that a cold run npm-installs into
+# ~/.cache/pyright-python: it was re-measured false in this worktree
+# (`uv run --project shared which pyright` -> <worktree>/.venv/bin/pyright, the
+# workspace-ROOT .venv since shared/.venv does not exist;
+# pyright._version.__pyright_version__ == '1.1.408'; site-packages/pyright/dist
+# EXISTS; no PYRIGHT_PYTHON_* variable set anywhere in this repo or
+# environment).
 #
 # THE BURN-DOWN, measured. 395 errors was 98 distinct (file, line) sites, not
 # 395 edit sites — pyright re-reports a union-typed expression once per union
