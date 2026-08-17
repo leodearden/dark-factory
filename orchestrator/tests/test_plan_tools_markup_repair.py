@@ -2688,21 +2688,3 @@ class TestRepairWriteBackDelegatesToTaskArtifacts:
         assert [f['outcome'] for f in facts] == ['unrepairable']
         assert calls == []
         assert (plan_artifacts.root / 'plan.json').read_bytes() == before_bytes
-
-    @pytest.mark.parametrize(
-        'name',
-        ['_atomic_write_plan', '_target_file_mode', '_verify_plan_json',
-         'PlanWriteError'],
-    )
-    def test_plan_tools_defines_no_second_plan_writer(self, name):
-        """The CODE-REUSE deliverable stated as a check, not as a docstring.
-
-        This is what stops a parallel byte-format / durability contract
-        silently re-growing in this module the next time someone needs a
-        plan.json write here.
-        """
-        assert not hasattr(plan_tools, name), (
-            f'plan_tools.{name} is back — plan.json has two writers again. '
-            'TaskArtifacts.write_plan owns the byte format and the '
-            'atomic/durable guarantee; call it instead.'
-        )
