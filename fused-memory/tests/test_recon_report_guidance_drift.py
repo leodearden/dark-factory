@@ -65,7 +65,9 @@ from fused_memory.reconciliation.prompts.stage2 import (
 )
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.server.recon_report import (
+    HARNESS_CALLED_REPORT_TOOLS,
     RECON_REPORT_INSTRUCTIONS,
+    STAGE_GATED_REPORT_TOOLS,
     get_recon_report_tool_signatures,
 )
 
@@ -166,6 +168,88 @@ class TestEveryRegisteredToolIsDocumented:
             '(server/recon_report.py) — a registered tool absent from '
             'RECON_REPORT_INSTRUCTIONS is invisible to any MCP client that reads the '
             'server instructions — add it there.'
+        )
+
+
+class TestReportToolClassificationPartitionsTheLiveToolSet:
+    """HARNESS_CALLED / STAGE_GATED / (the rest = shared guidance) partition the live tools.
+
+    Every registered recon-report tool belongs to exactly one of three buckets:
+
+    - **harness-called** — the harness calls it for the agent (``start_report``);
+      it must never be rendered as a call example.
+    - **stage-gated** — held by some stages but denied in others, so it must not
+      appear in the STAGE-AGNOSTIC guidance block that is interpolated into all
+      three stage prompts.
+    - **shared guidance** — everything else, i.e. the derived remainder.
+
+    The remainder is DERIVED rather than declared, which is what makes the split
+    a genuine partition with no unclassified leftovers by construction: a
+    newly-registered tool lands in shared guidance automatically and is rendered,
+    rather than being silently dropped for want of a hand-maintained entry.
+    """
+
+    def test_classified_tools_are_all_still_registered(self):
+        sigs = set(get_recon_report_tool_signatures())
+        stale = (HARNESS_CALLED_REPORT_TOOLS | STAGE_GATED_REPORT_TOOLS) - sigs
+        assert not stale, (
+            f'Classified tool(s) {stale} are no longer registered on the live recon_report '
+            'server — remove them from HARNESS_CALLED_REPORT_TOOLS / '
+            'STAGE_GATED_REPORT_TOOLS in server/recon_report.py.'
+        )
+
+    def test_the_two_declared_buckets_are_disjoint(self):
+        overlap = HARNESS_CALLED_REPORT_TOOLS & STAGE_GATED_REPORT_TOOLS
+        assert not overlap, (
+            f'Tool(s) {overlap} are classified as BOTH harness-called and stage-gated — '
+            'each registered tool must be classified into exactly one of '
+            '{shared guidance, harness-called, stage-gated}.'
+        )
+
+    def test_harness_called_is_exactly_start_report(self):
+        assert set(HARNESS_CALLED_REPORT_TOOLS) == {'start_report'}, (
+            'start_report is the only tool the harness calls on the agent\'s behalf. If '
+            'another tool became harness-called, the guidance block and the stage prompts '
+            'both need reviewing — this is not a mechanical addition.'
+        )
+
+    def test_shared_guidance_remainder_is_non_empty(self):
+        sigs = set(get_recon_report_tool_signatures())
+        shared = sigs - HARNESS_CALLED_REPORT_TOOLS - STAGE_GATED_REPORT_TOOLS
+        assert shared, (
+            'Every live recon-report tool is classified as harness-called or stage-gated, '
+            'leaving no shared-guidance tools at all — the guidance block would be empty. '
+            'Classify each registered tool into exactly one of {shared guidance, '
+            'harness-called, stage-gated}.'
+        )
+
+    def test_stage_gated_matches_the_real_enforcement_surface(self):
+        """Cross-check the classification against the list that actually gates the stages.
+
+        This is the one assertion here that compares two genuinely INDEPENDENT
+        sources of truth. DISALLOW_RECON_REPORT_LEDGER_WRITES is what the stage
+        runner actually passes to ``--disallowed-tools``; without this check
+        STAGE_GATED_REPORT_TOOLS would just be a third hand-maintained list,
+        vulnerable to exactly the drift this task exists to fix. Pinning them
+        together means gating a tool without classifying it (or classifying it
+        without gating it) fails loudly here.
+        """
+        from fused_memory.reconciliation.cli_stage_runner import (
+            DISALLOW_RECON_REPORT_LEDGER_WRITES,
+        )
+
+        gated = {
+            name.removeprefix('mcp__recon-report__')
+            for name in DISALLOW_RECON_REPORT_LEDGER_WRITES
+        }
+        assert set(STAGE_GATED_REPORT_TOOLS) == gated, (
+            'STAGE_GATED_REPORT_TOOLS (server/recon_report.py) and '
+            'DISALLOW_RECON_REPORT_LEDGER_WRITES (reconciliation/cli_stage_runner.py) '
+            f'disagree: classified={set(STAGE_GATED_REPORT_TOOLS)}, actually gated={gated}. '
+            'A recon-report tool that is denied in some stages must be classified '
+            'stage-gated so it stays out of the stage-agnostic guidance block, and a tool '
+            'classified stage-gated must actually be gated. Classify each registered tool '
+            'into exactly one of {shared guidance, harness-called, stage-gated}.'
         )
 
 
