@@ -24,8 +24,11 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
+from _fm_helpers import poll_until
 from graphiti_core.nodes import EpisodeType
 
+from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_resolution import ReferentResolution
@@ -795,3 +798,98 @@ class TestReplayFromStoreStampsReferents:
         assert item['payload']['group_id'] == 'dark_factory'
         assert item['payload']['source_description'] == 'replay_from_mem0:temporal_facts'
         assert json.loads(json.dumps(item['payload'])) == item['payload']
+
+
+class TestReferentsSurviveTheRealQueue:
+    """End-to-end over a REAL DurableWriteQueue on a tmp_path SQLite file.
+
+    The mocked-`durable_queue` fixtures above structurally cannot exercise the
+    `json.dumps` -> SQLite TEXT -> `json.loads` round trip the blob actually
+    makes in production.  This is the only level that can.
+    """
+
+    @pytest_asyncio.fixture
+    async def real_queue(self, tmp_path, service):
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=service._execute_durable_write,
+            workers_per_group=1,
+            semaphore_limit=2,
+            max_attempts=1,
+            retry_base_seconds=0.05,
+            write_timeout_seconds=5.0,
+        )
+        await q.initialize()
+        service.durable_queue = q
+        yield q
+        await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_new_format_row_survives_the_sqlite_round_trip(
+        self, real_queue, service,
+    ):
+        await real_queue.enqueue(
+            group_id='dark_factory',
+            operation='add_episode',
+            payload=_graphiti_payload(
+                group_id='dark_factory',
+                referents=_encoded(
+                    'derived', Referent(number='3127'), Referent(number='2500'),
+                ),
+            ),
+        )
+
+        await poll_until(
+            lambda: service.referent_source_counts()['derived'] == 1,
+            message='the derived bucket never incremented',
+        )
+        assert service.graphiti.add_episode.call_count == 1
+        stats = await real_queue.get_stats()
+        assert stats['counts'].get('completed') == 1
+
+    @pytest.mark.asyncio
+    async def test_an_old_format_row_still_executes_end_to_end(
+        self, real_queue, service,
+    ):
+        """The load-bearing back-compat signal, all the way through: a row
+        written before task 3670 drains to 'completed' and counts only 'none'."""
+        await real_queue.enqueue(
+            group_id='dark_factory',
+            operation='add_episode',
+            payload=_graphiti_payload(group_id='dark_factory'),
+        )
+
+        await poll_until(
+            lambda: service.referent_source_counts()['none'] == 1,
+            message='the none bucket never incremented',
+        )
+        counts = service.referent_source_counts()
+        assert counts['derived'] == 0
+        stats = await real_queue.get_stats()
+        assert stats['counts'].get('completed') == 1
+
+    @pytest.mark.asyncio
+    async def test_the_callback_still_sees_the_key_the_executor_popped(
+        self, real_queue, service,
+    ):
+        """Pins the durable_queue._process_item contract that makes popping
+        safe: the executor gets one parsed_payload() and the callback a SECOND,
+        FRESH one.  A future queue refactor that reused one dict would silently
+        starve _dual_write_callback, and only this test would notice."""
+        seen: list[dict] = []
+
+        async def _spy(callback_type, result, payload):
+            seen.append(payload)
+
+        real_queue.register_callback('dual_write_episode', _spy)
+        blob = _encoded('derived', Referent(number='3127'))
+
+        await real_queue.enqueue(
+            group_id='dark_factory',
+            operation='add_episode',
+            payload=_graphiti_payload(group_id='dark_factory', referents=blob),
+            callback_type='dual_write_episode',
+        )
+
+        await poll_until(lambda: seen, message='the callback never fired')
+        assert seen[0]['referents'] == blob
