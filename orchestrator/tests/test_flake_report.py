@@ -18,7 +18,40 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from orchestrator.flake_report import _parse_stamp, format_age
+import pytest
+
+from orchestrator.flake_ledger import (
+    UNKNOWN_TEST_ID,
+    FlakeCallSite,
+    FlakeOccurrenceRow,
+    FlakeVerdict,
+)
+from orchestrator.flake_report import _parse_stamp, compute_gate_blind, format_age
+
+
+def _occ(
+    *,
+    test_id: str = 'tests/test_a.py::test_one',
+    verdict: str = FlakeVerdict.passes_in_isolation,
+    observed_at: str = '2026-08-08T12:00:00+00:00',
+    call_site: str = FlakeCallSite.merge_gate,
+    psi: float | None = None,
+    row_id: int = 1,
+) -> FlakeOccurrenceRow:
+    """A hand-built occurrence row — the pure counter tests need no DB at all."""
+    return FlakeOccurrenceRow(
+        id=row_id,
+        observed_at=observed_at,
+        test_id=test_id,
+        project_id='dark_factory',
+        verdict=str(verdict),
+        call_site=str(call_site),
+        runner='local',
+        merge_sha=None,
+        task_id=None,
+        psi_cpu_some10=psi,
+        detail='{}',
+    )
 
 
 class TestStampAndAge:
@@ -66,3 +99,81 @@ class TestStampAndAge:
         rendered = format_age(None)
         assert 'unknown' in rendered, rendered
         assert rendered != '0d 0h'
+
+
+class TestGateBlindCounter:
+    """§5.6 class 1 — the unconfirmable rate, i.e. "the gate has gone blind"."""
+
+    def test_rate_over_a_mixed_window(self):
+        rows = [
+            _occ(verdict=FlakeVerdict.unconfirmable, test_id=UNKNOWN_TEST_ID, row_id=i)
+            for i in range(3)
+        ] + [
+            _occ(
+                verdict=(
+                    FlakeVerdict.passes_in_isolation if i % 2 else FlakeVerdict.fails_in_isolation
+                ),
+                test_id=f'tests/test_a.py::test_{i}',
+                row_id=10 + i,
+            )
+            for i in range(9)
+        ]
+        counter = compute_gate_blind(rows)
+        assert counter.unconfirmable == 3
+        assert counter.confirmed == 9
+        assert counter.total == 12
+        assert counter.rate == pytest.approx(0.25)
+
+    def test_empty_window_has_a_none_rate_never_zero(self):
+        # α's read_occurrences docstring names the hazard directly: a zero-row answer
+        # "reads as 'healthy' rather than as a broken query".  0.00 for an empty window
+        # is precisely the silent degradation this PRD exists to end.
+        counter = compute_gate_blind([])
+        assert counter.rate is None
+        assert counter.total == 0
+        assert counter.exceeds_threshold is False
+
+    def test_below_the_observation_floor_is_insufficient(self):
+        two_rows = [
+            _occ(verdict=FlakeVerdict.unconfirmable, row_id=1),
+            _occ(verdict=FlakeVerdict.passes_in_isolation, row_id=2),
+        ]
+        assert compute_gate_blind(two_rows).sufficient is False
+
+    def test_at_or_above_the_observation_floor_is_sufficient(self):
+        twelve_rows = [_occ(row_id=i) for i in range(12)]
+        assert compute_gate_blind(twelve_rows).sufficient is True
+
+    def test_sentinel_test_id_rows_still_count(self):
+        # The sentinel IS the class-1 signal (§5.6: "6 unconfirmable lines sat at INFO
+        # for a month").  Dropping these rows because they name no test would reproduce
+        # exactly the blindness this counter exists to measure.
+        rows = [
+            _occ(verdict=FlakeVerdict.unconfirmable, test_id=UNKNOWN_TEST_ID, row_id=i)
+            for i in range(4)
+        ]
+        counter = compute_gate_blind(rows)
+        assert counter.unconfirmable == 4
+        assert counter.total == 4
+
+    def test_exceeds_threshold_requires_sufficiency(self):
+        # 1-of-2 unconfirmable is rate 0.5 — well over the 0.25 threshold — but the §10
+        # min_observations floor exists precisely so the class cannot fire on it.
+        rows = [
+            _occ(verdict=FlakeVerdict.unconfirmable, row_id=1),
+            _occ(verdict=FlakeVerdict.passes_in_isolation, row_id=2),
+        ]
+        counter = compute_gate_blind(rows)
+        assert counter.rate == pytest.approx(0.5)
+        assert counter.sufficient is False
+        assert counter.exceeds_threshold is False
+
+    def test_exceeds_threshold_when_sufficient_and_over_rate(self):
+        rows = [
+            _occ(verdict=FlakeVerdict.unconfirmable, test_id=UNKNOWN_TEST_ID, row_id=i)
+            for i in range(6)
+        ] + [_occ(verdict=FlakeVerdict.fails_in_isolation, row_id=10 + i) for i in range(6)]
+        counter = compute_gate_blind(rows)
+        assert counter.sufficient is True
+        assert counter.rate == pytest.approx(0.5)
+        assert counter.exceeds_threshold is True
