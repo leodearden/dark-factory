@@ -1082,9 +1082,12 @@ async def _gc_recon_markers(
             Defaults to ``datetime.now(UTC)``; tests inject a fixed value.
             Normalized via :func:`_assume_utc` and rendered with
             ``.isoformat()`` to match the writer format used by
-            ``flag_dedup._persist_flag_marker``, so the ledger's
-            lexicographic TEXT comparison against stored ``expires_at``
-            values is correct.
+            ``flag_dedup.dedup_flags`` (the marker write is inlined there,
+            not in a separate helper — see the ``now = datetime.now(UTC)`` /
+            ``expires_at=(now + timedelta(days=14)).isoformat()`` pair
+            around flag_dedup.py:879-889), so the ledger's lexicographic
+            TEXT comparison against stored ``expires_at`` values is
+            correct.
 
     Returns:
         Number of rows deleted by the ``gc()`` pass (``0`` on any failure or
