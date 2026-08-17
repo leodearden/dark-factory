@@ -21,11 +21,20 @@ tautology.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 from unittest.mock import MagicMock
 
 import pytest
+import pytest_asyncio
+from _fm_helpers import (
+    FALKOR_HOST,
+    FALKOR_PORT,
+    falkor_skipif,
+    unique_graph_name,
+)
+from falkordb.asyncio import FalkorDB
 
 _LOGGER_NAME = 'fused_memory.backends.graphiti_client'
 
@@ -699,3 +708,226 @@ class TestGetAllValidEdgesBehaviourPreserved:
         assert grouped['A'] == [{'uuid': 'e1', 'fact': 'f', 'name': 'n'}]
         assert total_attributions(grouped) == 3  # ...and the repeat collapsed
         assert paged.complete is True
+
+
+# ---------------------------------------------------------------------------
+# step-9: enumerate_entity_nodes, and list_entity_nodes as its shim
+# ---------------------------------------------------------------------------
+#
+# list_entity_nodes was NOT named in this task, but the re-check the task asked
+# for ("any other unpaginated ro_query in graphiti_client.py") measured it
+# returning 10000 of 16038 nodes on dark_factory (62%) and 10000 of 23589 on
+# reify (42%).
+#
+# It is not merely another instance. detect_stale_with_edges calls
+# list_entity_nodes and get_all_valid_edges on CONSECUTIVE lines, and the two
+# truncations are INDEPENDENT: an entity that survives the node cut can still
+# lose every one of its edges to the edge cut, producing a bogus "stale, zero
+# valid facts" verdict that rebuild_entity_from_edges then WRITES BACK into
+# n.summary. That makes the pair corrupting rather than merely
+# under-reporting, which is why it is fixed here and not deferred.
+
+
+def make_entity_node_corpus(rows: int = _LIVE_ENTITY_NODES) -> list[list]:
+    """Build ``rows`` Entity node rows in the live shape: (uuid, name, summary)."""
+    return [[f'node-{i:07d}', f'name-{i}', f'summary-{i}'] for i in range(rows)]
+
+
+class TestListEntityNodesPagination:
+    """The second measured truncation: 10000 of 16038 nodes, silently."""
+
+    @pytest.mark.asyncio
+    async def test_control_unpaginated_read_is_truncated_by_the_cap(self):
+        graph = FakeCappedGraph(make_entity_node_corpus())
+        result = await graph.ro_query('MATCH (n:Entity) RETURN n.uuid, n.name, n.summary')
+        assert len(result.result_set) == _LIVE_RESULTSET_CAP
+        assert len(graph.corpus) == _LIVE_ENTITY_NODES
+
+    @pytest.mark.asyncio
+    async def test_every_entity_node_is_returned(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        graph = _wire(backend, FakeCappedGraph(make_entity_node_corpus()))
+        nodes = await backend.list_entity_nodes(group_id='test')
+        assert len(nodes) == _LIVE_ENTITY_NODES
+        # The LAST node specifically: a silently-reordered or short final page
+        # would still produce a plausible-looking count on a resumed read.
+        assert nodes[-1]['uuid'] == graph.corpus[-1][0]
+        assert {n['uuid'] for n in nodes} == {r[0] for r in graph.corpus}
+
+    @pytest.mark.asyncio
+    async def test_enumerate_reports_complete_on_a_full_corpus(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph(make_entity_node_corpus()))
+        nodes, paged = await backend.enumerate_entity_nodes(group_id='test')
+        assert paged.complete is True
+        assert paged.reason is None
+        assert paged.rows_seen == _LIVE_ENTITY_NODES
+        assert paged.expected_rows == _LIVE_ENTITY_NODES
+        assert len(nodes) == _LIVE_ENTITY_NODES
+
+    @pytest.mark.asyncio
+    async def test_enumerate_reports_incomplete_but_still_returns_the_nodes(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        _wire(
+            backend,
+            FakeCappedGraph(
+                make_entity_node_corpus(), census_override=_LIVE_ENTITY_NODES + 4000
+            ),
+        )
+        nodes, paged = await backend.enumerate_entity_nodes(group_id='test')
+        assert paged.complete is False
+        assert isinstance(paged.reason, str) and paged.reason
+        assert len(nodes) == _LIVE_ENTITY_NODES
+
+    @pytest.mark.asyncio
+    async def test_shim_warns_when_the_enumeration_is_incomplete(
+        self, mock_config, make_backend, caplog
+    ):
+        backend = make_backend(mock_config)
+        _wire(
+            backend,
+            FakeCappedGraph(
+                make_entity_node_corpus(), census_override=_LIVE_ENTITY_NODES + 4000
+            ),
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            nodes = await backend.list_entity_nodes(group_id='test')
+        assert len(nodes) == _LIVE_ENTITY_NODES
+        messages = _warnings(caplog)
+        assert any('list_entity_nodes' in m for m in messages)
+        assert any(str(_LIVE_ENTITY_NODES) in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_shim_is_silent_on_a_complete_enumeration(
+        self, mock_config, make_backend, caplog
+    ):
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph(make_entity_node_corpus()))
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            await backend.list_entity_nodes(group_id='test')
+        assert _warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_null_name_and_summary_coerced(self, mock_config, make_backend):
+        """Existing contract preserved: NULL properties still become ''."""
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph([['u1', None, None]]))
+        nodes = await backend.list_entity_nodes(group_id='test')
+        assert nodes == [{'uuid': 'u1', 'name': '', 'summary': ''}]
+
+
+class TestListEntityNodesEmittedCypher:
+    """The node page query keeps its shape and gains a total order."""
+
+    @pytest.fixture
+    def emitted(self, mock_config, make_backend):
+        async def _run():
+            backend = make_backend(mock_config)
+            graph = _wire(backend, FakeCappedGraph(make_entity_node_corpus()))
+            await backend.list_entity_nodes(group_id='test')
+            return graph
+
+        return _run
+
+    @pytest.mark.asyncio
+    async def test_page_query_keeps_the_match_return_shape(self, emitted):
+        graph = await emitted()
+        page = graph.page_queries[0]
+        assert 'MATCH (n:Entity)' in page
+        assert 'RETURN n.uuid, n.name, n.summary' in page
+
+    @pytest.mark.asyncio
+    async def test_page_query_orders_by_uuid(self, emitted):
+        """``n.uuid`` alone IS a total order here — one row per node, uuids unique."""
+        graph = await emitted()
+        page = graph.page_queries[0]
+        assert 'ORDER BY' in page
+        assert 'n.uuid' in page.split('ORDER BY', 1)[1]
+
+    @pytest.mark.asyncio
+    async def test_census_matches_the_page_population(self, emitted):
+        graph = await emitted()
+        census = graph.census_queries[0]
+        assert 'MATCH (n:Entity)' in census
+        assert 'count(*)' in census
+        assert 'SKIP' not in census.upper()
+
+    @pytest.mark.asyncio
+    async def test_reads_use_ro_query_only(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        graph = _wire(backend, FakeCappedGraph(make_entity_node_corpus()))
+        await backend.list_entity_nodes(group_id='test')
+        assert graph.queries
+        assert len(graph.queries) == len(graph.census_queries) + len(graph.page_queries)
+
+
+# ---------------------------------------------------------------------------
+# step-9: live corroboration against a REAL FalkorDB
+# ---------------------------------------------------------------------------
+#
+# The strongest available regression test, because it exercises the ACTUAL
+# truncation mechanism rather than a model of it. The fake-driven tests above
+# are what keep this step RED-able in a serverless environment; this one skips
+# cleanly when no FalkorDB is reachable and never blocks verify.
+
+
+@pytest_asyncio.fixture
+async def pagination_live_graph():
+    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, clean up."""
+    graph_name = unique_graph_name('4340_read_pagination')
+    client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+    with contextlib.suppress(Exception):
+        stale = client.select_graph(graph_name)
+        await stale.delete()
+    graph = client.select_graph(graph_name)
+    try:
+        yield graph_name, graph
+    finally:
+        with contextlib.suppress(Exception):
+            await graph.delete()
+        with contextlib.suppress(Exception):
+            await client.aclose()
+
+
+@falkor_skipif()
+@pytest.mark.timeout(60)
+@pytest.mark.integration
+class TestListEntityNodesLiveFalkorDB:
+    """Prove the truncation is real, and that pagination actually clears it."""
+
+    LIVE_NODE_COUNT = 12000  # comfortably above the 10000 cap
+
+    @pytest.mark.asyncio
+    async def test_pagination_recovers_nodes_the_server_cap_hides(
+        self, mock_config, make_backend, pagination_live_graph
+    ):
+        _, graph = pagination_live_graph
+        await graph.query(
+            f'UNWIND range(0, {self.LIVE_NODE_COUNT - 1}) AS i '
+            "CREATE (:Entity {uuid: 'u' + toString(i), name: 'n' + toString(i)})"
+        )
+
+        # (a) The REAL server cap, not a fake: an unpaginated read is short.
+        raw = await graph.ro_query('MATCH (n:Entity) RETURN n.uuid')
+        assert len(raw.result_set) == _LIVE_RESULTSET_CAP, (
+            f'expected the server to truncate at {_LIVE_RESULTSET_CAP}; got '
+            f'{len(raw.result_set)}. If this server is configured with a '
+            f'different RESULTSET_SIZE, _RESULTSET_SIZE needs re-measuring.'
+        )
+
+        # (b) The paginated read sees every node.
+        backend = make_backend(mock_config)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        nodes = await backend.list_entity_nodes(group_id='test')
+        assert len(nodes) == self.LIVE_NODE_COUNT
+        assert {n['uuid'] for n in nodes} == {
+            f'u{i}' for i in range(self.LIVE_NODE_COUNT)
+        }
+
+        _, paged = await backend.enumerate_entity_nodes(group_id='test')
+        assert paged.complete is True
+        assert paged.expected_rows == self.LIVE_NODE_COUNT
