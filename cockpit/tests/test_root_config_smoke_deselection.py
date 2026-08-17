@@ -20,15 +20,27 @@ host.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# The probed smoke-test FUNCTION name. A function name (not the filename)
+# rules out a hypothetical collection-ERROR line printing the path and
+# producing a false pass. Shared between the deselection guard and the
+# positive control so the two cannot drift apart.
+SMOKE_TEST_NAME = 'test_wm_focus_raises_exactly_the_disposable_window'
 
-def test_repo_root_pytest_config_deselects_smoke_and_registers_marker() -> None:
-    result = subprocess.run(
+_DESELECTED_RE = re.compile(r'\((\d+) deselected\)')
+
+
+def _collect_only(*extra_args: str) -> subprocess.CompletedProcess[str]:
+    """`pytest --collect-only` over cockpit's smoke dir, bound to the ROOT config."""
+    return subprocess.run(
         [
             sys.executable,
             '-m',
@@ -40,28 +52,61 @@ def test_repo_root_pytest_config_deselects_smoke_and_registers_marker() -> None:
             '-q',
             '-p',
             'no:cacheprovider',
+            *extra_args,
         ],
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        timeout=120,
     )
+
+
+def _deselection_problems(result: subprocess.CompletedProcess[str]) -> list[str]:
+    """Every reason `result` fails to prove a REAL collection deselected the smoke tests."""
     combined = result.stdout + result.stderr
+    problems = []
 
-    # DESELECTED -- a smoke test FUNCTION name appears in --collect-only
-    # output only when the test is actually SELECTED/collected; a function
-    # name (not the filename) rules out a hypothetical collection-ERROR line
-    # printing the path producing a false pass.
-    assert 'test_wm_focus_raises_exactly_the_disposable_window' not in combined, (
-        f'smoke tests were collected under the root pytest config -- '
-        f'not deselected by default:\n{combined}'
-    )
+    # (1) a real run that selected nothing. rc is 5 (NOT 0): all smoke tests
+    # are deselected so pytest reports NO_TESTS_COLLECTED. A collection
+    # error, a broken conftest, or an interpreter without pytest lands on
+    # some other rc and is rejected here.
+    if result.returncode != pytest.ExitCode.NO_TESTS_COLLECTED:
+        problems.append(
+            f'expected exit code {int(pytest.ExitCode.NO_TESTS_COLLECTED)} '
+            f'(NO_TESTS_COLLECTED), got {result.returncode} -- collection '
+            f'may never have run'
+        )
 
-    # MARKER REGISTERED -- no unknown-mark warning for @pytest.mark.smoke.
-    assert 'PytestUnknownMarkWarning' not in combined, (
-        f'the `smoke` marker is not registered under the root pytest config:\n{combined}'
-    )
-    assert 'Unknown pytest.mark.smoke' not in combined, (
-        f'the `smoke` marker is not registered under the root pytest config:\n{combined}'
+    # (2) collection actually walked the smoke dir and found tests to
+    # filter. Necessary alongside (1): an empty/missing smoke dir also
+    # exits 5 but prints no `deselected` clause.
+    m = _DESELECTED_RE.search(combined)
+    if m is None or int(m.group(1)) < 1:
+        problems.append(
+            'expected a `(N deselected)` summary with N >= 1 in the collection '
+            'output, found none -- collection may not have walked the smoke dir'
+        )
+
+    # (3) DESELECTED -- a smoke test FUNCTION name appears in --collect-only
+    # output only when the test is actually SELECTED/collected.
+    if SMOKE_TEST_NAME in combined:
+        problems.append(
+            'smoke tests were collected under the root pytest config -- '
+            'not deselected by default'
+        )
+
+    # (4) MARKER REGISTERED -- no unknown-mark warning for @pytest.mark.smoke.
+    if 'PytestUnknownMarkWarning' in combined or 'Unknown pytest.mark.smoke' in combined:
+        problems.append('the `smoke` marker is not registered under the root pytest config')
+
+    return problems
+
+
+def test_repo_root_pytest_config_deselects_smoke_and_registers_marker() -> None:
+    result = _collect_only()
+    problems = _deselection_problems(result)
+    assert not problems, (
+        '\n'.join(problems) + f'\n\nfull output:\n{result.stdout + result.stderr}'
     )
 
 
