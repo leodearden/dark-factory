@@ -10842,14 +10842,33 @@ async def _mm_write(svc, entry_point, *, metadata, category='observations_and_su
             causation_id='c1',
         )
     if entry_point == 'update_memory':
-        svc.mem0.get_point_by_id = AsyncMock(return_value=dict(_MM_UPDATE_PRE_IMAGE))
-        return await svc.update_memory(
-            memory_id=_MM_UPDATE_POINT_ID,
-            project_id=project_id,
-            agent_id=agent_id,
-            metadata_patch={'category': category, **metadata},
-            causation_id='c1',
-        )
+        # The §5(c) existence check and leaf δ's parent-liveness lookup share
+        # ONE backend primitive on this path — both run through
+        # ``get_memory_by_id`` → ``mem0.get_point_by_id``. Route the record's
+        # OWN id to the staged pre-image and delegate every OTHER id (i.e. the
+        # parent) to whatever the case staged, then restore. Without the split
+        # a case staging ``return_value=None`` would fail the existence check
+        # and never reach the seam at all, one staging a ``TimeoutError`` would
+        # die in the read leg, and every ``get_point_by_id.assert_awaited_once``
+        # would be counting the existence check rather than the parent lookup.
+        staged = svc.mem0.get_point_by_id
+
+        async def _routed(point_id, scope, *args, **kwargs):
+            if point_id == _MM_UPDATE_POINT_ID:
+                return dict(_MM_UPDATE_PRE_IMAGE)
+            return await staged(point_id, scope, *args, **kwargs)
+
+        svc.mem0.get_point_by_id = _routed
+        try:
+            return await svc.update_memory(
+                memory_id=_MM_UPDATE_POINT_ID,
+                project_id=project_id,
+                agent_id=agent_id,
+                metadata_patch={'category': category, **metadata},
+                causation_id='c1',
+            )
+        finally:
+            svc.mem0.get_point_by_id = staged
     svc.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
     return await svc.add_system_record(
         content='some content',

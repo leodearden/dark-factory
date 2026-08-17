@@ -4996,6 +4996,28 @@ class MemoryService:
             metadata_mode=metadata_mode,
         )
 
+        # Mem0 metadata vocabulary validation on the THIRD write path (task
+        # 3523). PRD D8/§2 pin enforcement at this seam precisely because a
+        # second write path leaks past a tools-layer validator; update_memory
+        # is a third one and reproduced exactly that leak.
+        #
+        # Placement mirrors add_memory's (see the note at its call site):
+        # AFTER the §5(c) read leg's existence check and the delta, so the
+        # EFFECTIVE post-patch custom subset is what gets judged; BEFORE
+        # `scope` and every _journaled_backend_call below, so a rejection can
+        # never leave a journal row or a half-applied patch behind.
+        await _apply_memory_metadata_validation(
+            new_custom,
+            project_id=project_id,
+            agent_id=agent_id,
+            config=self.config.memory_metadata,
+            storm_detector=self._metadata_storm_detector,
+            project_root=self._memory_metadata_project_root(),
+            parent_lookup=self.get_memory_by_id,
+            count_canonical=self.count_memories_by_metadata,
+            find_canonical=self.get_memories_by_metadata,
+        )
+
         scope = Scope(project_id=project_id)
 
         if content is not None:
