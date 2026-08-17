@@ -413,6 +413,51 @@ a page cap that truncates in silence would just be the defect this module
 exists to fix, moved one layer up.
 """
 
+# The four fail-closed paths of ``_paged_ro_query``, as a typed discriminator
+# on ``PagedRead.incomplete_kind``.  PUBLIC (no leading underscore, unlike
+# ``_RESULTSET_SIZE``): a caller reads these off a returned PagedRead to learn
+# WHY a read was incomplete, so they are part of the contract.
+#
+# They exist so nobody has to sniff ``PagedRead.reason``, which is diagnostic
+# prose written for an operator reading a log and is deliberately NOT a stable
+# interface — any wording improvement would silently break a substring match,
+# and the branch it broke is the one that stops a fabricated empty from being
+# written back over real summaries.
+
+INCOMPLETE_STRUCTURAL_REFUSAL = 'structural_refusal'
+"""Guard 1: ``page_size >= resultset_size``. Zero queries issued, zero rows.
+
+The returned emptiness is FABRICATED — no read was attempted — which is why
+it must never be confused with a genuinely empty corpus.
+"""
+
+INCOMPLETE_PAGE_CAP = 'page_cap'
+"""Guard 2: ``max_pages`` exhausted while the last page was still full.
+
+The rows are a PREFIX of the corpus in ``ORDER BY`` order, not a sample.
+"""
+
+INCOMPLETE_CENSUS_UNAVAILABLE = 'census_unavailable'
+"""Guard 3: no usable count. The rows were fetched; only the PROOF is missing."""
+
+INCOMPLETE_SHORT_READ = 'short_read'
+"""Guard 4: ``rows_seen < expected_rows`` — the enumeration is SHORT."""
+
+INCOMPLETE_STRUCTURAL_KINDS = frozenset(
+    {INCOMPLETE_STRUCTURAL_REFUSAL, INCOMPLETE_PAGE_CAP}
+)
+"""The DETERMINISTIC, non-transient incompleteness kinds.
+
+Both are fully determined by configuration and code: they reproduce exactly
+on retry and can never be caused by a concurrent write.  That is what makes
+them safe to RAISE on (see the shims), where the empirical kinds are not — a
+census disagreeing by a handful of rows is the expected signature of a live
+graph being written to mid-read.
+
+Callers should branch on membership in this set rather than on a specific
+kind, so a future fifth structural path is covered by construction.
+"""
+
 # --------------------------------------------------------------------------- #
 # RESULT-SET CAP AUDIT — every read in this file, re-checked 2026-08-17
 # (task 4340).  Recorded so the next person does not have to redo it, and
@@ -519,6 +564,19 @@ class PagedRead:
     ``reason`` is None exactly when ``complete`` is True.  ``expected_rows`` is
     None when the census probe could not produce a usable count — an
     unavailable proof, which is itself a reason to report incomplete.
+
+    ``incomplete_kind`` is one of the four module-level ``INCOMPLETE_*``
+    constants, and is None exactly when ``complete`` is True.  It exists so a
+    caller can branch on WHY a read was incomplete without parsing ``reason``,
+    whose wording is diagnostic prose aimed at an operator reading a log and
+    is deliberately NOT a stable interface.  The distinction matters most for
+    ``INCOMPLETE_STRUCTURAL_REFUSAL``, where the returned emptiness is
+    fabricated rather than read: without a typed discriminator that is
+    indistinguishable from a genuinely empty graph, and the difference decides
+    whether a caller writes an empty summary back over a real one.
+
+    The field is last and defaulted so the five original fields — none of
+    which have defaults — keep working under positional construction.
     """
 
     rows: list[list]
@@ -526,6 +584,7 @@ class PagedRead:
     rows_seen: int
     expected_rows: int | None
     reason: str | None
+    incomplete_kind: str | None = None
 
 
 async def _census_count(graph, cypher: str, params: dict | None = None) -> int | None:
@@ -607,6 +666,37 @@ async def _paged_ro_query(
     grew between the census probe and the last page is not a truncation, and
     on a graph under continuous write, growth is the common case.
 
+    WHY THE TWO KINDS ARE NAMED SEPARATELY on ``PagedRead.incomplete_kind``,
+    and why callers branch on ``INCOMPLETE_STRUCTURAL_KINDS`` rather than on
+    an individual kind: the split is not a taxonomy for its own sake, it is
+    the line between "safe to raise on" and "must not raise on".
+
+      The STRUCTURAL kinds are DETERMINISTIC and non-transient.  They are
+      properties of the configuration and of this code — a page size at or
+      above the cap, a page budget too small for the corpus.  They reproduce
+      exactly on retry, they can never be caused by a concurrent write, and
+      neither is reachable at the shipped defaults.  A caller that treats
+      them as fatal will never be woken by a passing graph.
+
+      The EMPIRICAL kinds are transient-capable.  A census disagreeing by a
+      handful of rows is the *expected* signature of a live graph being
+      written to mid-read, not evidence of a defect, which is precisely why
+      the design warns rather than raises on them: raising would take down
+      the reconciliation rebuild for something that self-heals next cycle.
+
+    KNOWN RESIDUAL, left open deliberately (task 4340).  A materially-short
+    ``INCOMPLETE_SHORT_READ`` still returns a partial collection, and the
+    ``force=True`` rebuild path (memory_service.py, ``rebuild_entity_summaries``)
+    will write ``''`` back over the summary of any entity whose edges fell in
+    the missing remainder.  Tightening this guard into a raise is the WRONG
+    fix and must not be done here: guard 4 fires on any shortfall at all,
+    including a single concurrently-invalidated edge, so raising would take
+    down the live rebuild for exactly the transient described above.  The
+    right fix is a policy on *how short is too short*, applied at the
+    consumer, where the destructive write is actually decided — the same
+    place ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH (wire the completeness signal
+    through to consumers) has to touch.
+
     Args:
         graph: FalkorDB graph handle exposing ``async ro_query(cypher, params)``.
         page_template: Page query with ``{skip}``/``{limit}`` placeholders.
@@ -643,7 +733,12 @@ async def _paged_ro_query(
         )
         logger.warning('_paged_ro_query: %s', reason)
         return PagedRead(
-            rows=[], complete=False, rows_seen=0, expected_rows=None, reason=reason
+            rows=[],
+            complete=False,
+            rows_seen=0,
+            expected_rows=None,
+            reason=reason,
+            incomplete_kind=INCOMPLETE_STRUCTURAL_REFUSAL,
         )
 
     # Census FIRST, before paging, so the target is fixed up front rather than
@@ -676,10 +771,12 @@ async def _paged_ro_query(
     rows_seen = len(rows)
 
     reason: str | None = None
+    kind: str | None = None
     if not paged_to_the_end:
         # Guard 2 (structural). Hitting the page cap on a still-full page is
         # REPORTED, never swallowed: a page cap that truncated in silence
         # would just be this module's own defect, one layer up.
+        kind = INCOMPLETE_PAGE_CAP
         reason = (
             f'max_pages={max_pages} exhausted at page_size={page_size} with '
             f'rows_seen={rows_seen} and the last page still full, so more '
@@ -687,6 +784,7 @@ async def _paged_ro_query(
         )
         logger.warning('_paged_ro_query: %s', reason)
     elif expected is None:
+        kind = INCOMPLETE_CENSUS_UNAVAILABLE
         reason = (
             f'census probe returned no usable count, so the {rows_seen} rows '
             f'fetched cannot be proven to be all of them'
@@ -695,6 +793,7 @@ async def _paged_ro_query(
         # Guard 4 (empirical). Name BOTH candidate causes: an operator reading
         # this log must not be misled into chasing a phantom truncation when
         # the graph was simply written to mid-read.
+        kind = INCOMPLETE_SHORT_READ
         reason = (
             f'enumeration is SHORT: fetched rows_seen={rows_seen} but the '
             f'census reports expected_rows={expected}. Most likely a server '
@@ -710,6 +809,7 @@ async def _paged_ro_query(
         rows_seen=rows_seen,
         expected_rows=expected,
         reason=reason,
+        incomplete_kind=kind,
     )
 
 
