@@ -13,6 +13,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).parent.parent / "restart-orchestrator.sh"
 # A CONTRACT PIN, not a fixture input — deliberately NOT renamed to a synthetic
 # `orchestrator-fake*` name by task 3799, which audited this whole fake-systemctl
@@ -193,6 +195,56 @@ def test_invokes_systemctl_restart_on_correct_unit(tmp_path):
         f"Expected a `systemctl --user restart {UNIT}` call; "
         f"got calls={state['calls']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Fixture-unit-name containment (task 3799, extended to this harness by 3950).
+#
+# The mirrors of this test live in scripts/tests/test_restart_all_orchestrators.py
+# as test_fake_systemctl_rejects_a_real_unit_name and in
+# tests/scripts/test_orchestrator_watchdog.py as
+# test_boundary_fake_systemctl_rejects_a_real_unit_name. Copies rather than a
+# shared test because scripts/tests/ and tests/scripts/ cannot import each
+# other's test modules, so each root must prove its OWN seam validates. What
+# they share is the rule itself -- df_pytest_isolation.assert_synthetic_units.
+# ---------------------------------------------------------------------------
+
+
+def test_run_script_rejects_a_real_unit_name(tmp_path):
+    """`_run_script` must refuse a genuinely installed unit name.
+
+    THE SEAM IS `_run_script` HERE, NOT THE FAKE FACTORY -- a deliberate
+    divergence from the other three harnesses in this family, which check in
+    their `_make_fake_systemctl`. This fake is unit-AGNOSTIC by construction:
+    it parses argv and discards the unit token outright (see the `# unit name
+    or unrecognized flag -- not needed by the fake` branch above), so the name
+    never reaches `_make_fake_systemctl` at all. It reaches the real bash
+    subprocess through ORCH_RESTART_UNIT, which `_run_script` sets -- in the
+    same function that puts the fake's bin_dir on PATH. Checking the factory
+    here would guard a value the factory never sees.
+
+    THE HAZARD, verbatim from the family: the fake shadows `systemctl` only
+    for as long as its tmpdir sits on PATH. A poll loop that outlives the test
+    -- task 3798 measured orphans surviving 27.8 HOURS, well past pytest's
+    tmpdir GC -- resolves /usr/bin/systemctl instead and issues a REAL restart
+    of whatever unit name it was handed. `orchestrator-dark-factory.service`
+    is INSTALLED on this box, so that worst case is a real restart of the live
+    orchestrator. One mitigating bound is specific to THIS script: it is
+    entirely FOREGROUND -- its verify loop runs in the script's own process,
+    with no `&` -- so no poll loop of its own can outlive the test. The guard
+    stands anyway; the bound is a property of today's script, not a contract.
+
+    pytest.raises(pytest.fail.Exception) rather than AssertionError --
+    pytest.fail raises Failed, a BaseException, deliberately so a fixture's
+    own `except Exception` cannot swallow it.
+    """
+    bin_dir, state_path = _make_fake_systemctl(tmp_path)
+
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _run_script(bin_dir, state_path, unit="orchestrator-dark-factory.service")
+    message = str(excinfo.value)
+    assert "orchestrator-dark-factory.service" in message, message
+    assert "_run_script" in message, message
 
 
 # ---------------------------------------------------------------------------
