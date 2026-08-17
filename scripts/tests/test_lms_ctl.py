@@ -36,7 +36,10 @@ _FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 """Fake `systemctl` recording every invocation (minus --user) as JSON.
 
 `list-units` echoes $FAKE_SYSTEMCTL_LIST_UNITS verbatim so a test can pin the
-exact column layout it must parse.  Everything else succeeds.
+exact column layout it must parse.  `show` echoes $FAKE_SYSTEMCTL_SHOW the same
+way, because the installer's parity gate asks systemd what the EFFECTIVE
+configuration is and an unanswered probe is (correctly) unverifiable rather
+than clean.  Everything else succeeds.
 """
 import json
 import os
@@ -55,6 +58,8 @@ def main(argv):
 
     if args and args[0] == "list-units":
         sys.stdout.write(os.environ.get("FAKE_SYSTEMCTL_LIST_UNITS", ""))
+    if args and args[0] == "show":
+        sys.stdout.write(os.environ.get("FAKE_SYSTEMCTL_SHOW", ""))
     if args and args[0] == "status":
         return int(os.environ.get("FAKE_SYSTEMCTL_STATUS_RC", "0"))
     return 0
@@ -869,17 +874,54 @@ def test_wait_ready_returns_false_when_health_never_goes_green(install_fake_http
 # ---------------------------------------------------------------------------
 
 
+def _template_working_directory():
+    """The `[Service] WorkingDirectory` the COMMITTED template declares.
+
+    Read from the template rather than hardcoded.  A literal here could drift
+    away from the shipped unit and make the fake systemctl fabricate a clean
+    answer the parity gate would then believe — a fake that lies in the
+    direction of success is worse than no fake at all.
+    """
+    for line in UNIT_TEMPLATE.read_text().splitlines():
+        if line.startswith('WorkingDirectory='):
+            return line.partition('=')[2].strip()
+    raise AssertionError(f'{UNIT_TEMPLATE} declares no WorkingDirectory')
+
+
+def _clean_show_output():
+    """The `systemctl show` answer meaning "the template is what applies"."""
+    return f'WorkingDirectory={_template_working_directory()}\nDropInPaths=\n'
+
+
 def _run_installer(tmp_path, shim, extra_env=None):
     env = dict(os.environ)
     env['PATH'] = f'{shim.bin_dir}{os.pathsep}{env["PATH"]}'
     env['FAKE_SYSTEMCTL_STATE'] = str(shim.state_path)
     env['XDG_CONFIG_HOME'] = str(tmp_path / 'config')
+    # The installer's parity gate probes `systemctl show`, and the shim answers
+    # every unhandled subcommand with EMPTY stdout — which the checker reads
+    # (correctly) as "could not verify" rather than as clean.  Without a
+    # default here every installer test would go red for a reason unrelated to
+    # what it asserts.  Derived from the template, and overridable through the
+    # existing extra_env seam, so a test that wants a dirty answer just says so.
+    env['FAKE_SYSTEMCTL_SHOW'] = _clean_show_output()
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
         ['bash', str(INSTALLER)],
         env=env, capture_output=True, text=True, timeout=60,
     )
+
+
+def _plant_dropin(tmp_path, text='[Service]\nWorkingDirectory=/home/leo/src/dark-factory/.worktrees/3713\n'):
+    """Plant a drop-in under the installer's XDG_CONFIG_HOME unit dir."""
+    dropin_dir = (
+        tmp_path / 'config' / 'systemd' / 'user' / 'lms-arm@.service.d'
+    )
+    dropin_dir.mkdir(parents=True, exist_ok=True)
+    dropin = dropin_dir / '10-worktree-3713.conf'
+    dropin.write_text(text)
+    return dropin
 
 
 def test_installer_copies_the_unit_template_verbatim(tmp_path, fake_systemctl):
@@ -930,6 +972,145 @@ def test_installer_never_pipes_systemctl_into_grep():
         if line.strip().startswith('#'):
             continue
         assert not ('systemctl' in line and '| grep' in line), line
+
+
+def test_the_installer_probe_default_is_read_from_the_committed_template(
+    tmp_path, monkeypatch,
+):
+    """The clean-probe default is DERIVED, and must not decay into a literal.
+
+    A hardcoded `/home/leo/src/dark-factory` would keep passing after someone
+    moved the template's WorkingDirectory, feeding the parity gate a clean
+    answer for a value the template no longer declares.  Pointing the module's
+    template constant at a rewritten copy must move the default with it.
+    """
+    rewritten = tmp_path / 'lms-arm@.service'
+    rewritten.write_text(
+        UNIT_TEMPLATE.read_text().replace(
+            'WorkingDirectory=/home/leo/src/dark-factory',
+            'WorkingDirectory=/somewhere/else',
+        )
+    )
+    monkeypatch.setitem(globals(), 'UNIT_TEMPLATE', rewritten)
+
+    assert _template_working_directory() == '/somewhere/else'
+    assert _clean_show_output() == (
+        'WorkingDirectory=/somewhere/else\nDropInPaths=\n'
+    )
+
+
+def test_installer_confirms_the_template_is_the_effective_configuration(
+    tmp_path, fake_systemctl,
+):
+    """A clean install AFFIRMS what it verified, rather than just not complaining.
+
+    The old self-verify checked the file was THERE.  File presence is exactly
+    what a drop-in leaves untouched, so "installed" was never the claim an
+    operator needed — "the committed template is what systemd will apply" is.
+    """
+    result = _run_installer(tmp_path, fake_systemctl)
+
+    assert result.returncode == 0, result.stderr
+    combined = result.stdout + result.stderr
+    assert 'effective' in combined.lower()
+    assert _template_working_directory() in combined
+
+
+def test_installer_fails_when_a_dropin_is_in_effect(tmp_path, fake_systemctl):
+    """A drop-in present at install time FAILS the install, by path.
+
+    This is the headline finding: the drop-in pins WorkingDirectory at a
+    worktree, every byte of the unit file still matches the template, and the
+    old installer reported success.
+    """
+    dropin = _plant_dropin(tmp_path)
+
+    result = _run_installer(tmp_path, fake_systemctl)
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert str(dropin) in combined
+    assert '[ok] parity' not in combined
+
+
+def test_installer_does_not_remove_a_dropin_it_does_not_own(
+    tmp_path, fake_systemctl,
+):
+    """Failing loud never means deleting someone else's file.
+
+    Task 3750's finding is that the observed drop-in was LOAD-BEARING while
+    its worktree was unmerged: removing it then would have pointed every arm
+    at a directory with no launcher.  Removal stays
+    scripts/remove-lms-arm-worktree-dropin.sh's job, behind preconditions an
+    installer does not check.
+    """
+    dropin = _plant_dropin(tmp_path)
+    original = dropin.read_text()
+
+    result = _run_installer(tmp_path, fake_systemctl)
+
+    assert result.returncode != 0
+    assert dropin.is_file()
+    assert dropin.read_text() == original
+    assert dropin.parent.is_dir()
+
+
+def test_reinstalling_over_a_dropin_still_fails(tmp_path, fake_systemctl):
+    """Re-running the documented installer must not silently inherit an override.
+
+    The whole reported failure mode is that reinstallation LOOKED like a fix.
+    Both runs are asserted, because a gate that only fires on a fresh install
+    would leave the second run reporting the success the first one denied.
+    """
+    _plant_dropin(tmp_path)
+
+    first = _run_installer(tmp_path, fake_systemctl)
+    second = _run_installer(tmp_path, fake_systemctl)
+
+    assert first.returncode != 0
+    assert second.returncode != 0
+
+
+def test_installer_fails_when_the_effective_workingdirectory_is_elsewhere(
+    tmp_path, fake_systemctl,
+):
+    """No drop-in on disk, yet systemd resolves elsewhere => still a failure.
+
+    The case file presence provably cannot catch, and the reason the check had
+    to move to the effective configuration: systemd also merges drop-ins from
+    /etc/systemd/user/ and /run/systemd/user/, which the installer's own unit
+    directory never sees.
+    """
+    result = _run_installer(
+        tmp_path,
+        fake_systemctl,
+        extra_env={
+            'FAKE_SYSTEMCTL_SHOW': (
+                'WorkingDirectory=/home/leo/src/dark-factory/.worktrees/3713\n'
+                'DropInPaths=\n'
+            ),
+        },
+    )
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert '/home/leo/src/dark-factory/.worktrees/3713' in combined
+
+
+def test_installer_fails_when_the_probe_itself_fails(tmp_path, fake_systemctl):
+    """A probe that answered nothing is unverifiable, never success.
+
+    Deliberately asserted rather than left as an accident of the shim: an
+    installer that shrugged when the probe came back empty and printed success
+    would reproduce this task's own bug one level up — a green claim covering
+    nothing.
+    """
+    result = _run_installer(
+        tmp_path, fake_systemctl, extra_env={'FAKE_SYSTEMCTL_SHOW': ''},
+    )
+
+    assert result.returncode != 0
+    assert 'could not verify' in (result.stdout + result.stderr).lower()
 
 
 def test_wait_ready_gives_up_once_the_unit_has_failed(monkeypatch, install_fake_httpx):
