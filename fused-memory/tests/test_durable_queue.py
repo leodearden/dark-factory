@@ -1889,6 +1889,62 @@ class TestTerminalHook:
             await q.close()
 
     @pytest.mark.asyncio
+    async def test_get_dead_items_reports_whether_the_write_already_landed(
+        self, tmp_path
+    ):
+        """The replay decision should read a boolean, not parse an error string.
+
+        get_dead_items is what the ``get_dead_letters`` MCP tool serves to
+        operators, and "did this already land?" was recoverable only by
+        string-matching POST_EXECUTE_DEAD_PREFIX against free-text error
+        prose. That is the one fact a replay decision turns on, so it gets a
+        structured field.
+
+        Two items, one per polarity: a landed write killed by its callback,
+        and a plain execute failure that never reached the backend.
+        """
+        async def exploding_callback(_ctype, _result, _payload):
+            raise RuntimeError('callback keeps failing')
+
+        async def _execute(operation, payload):
+            if payload.get('content') == 'landed':
+                return {'episode_uuid': 'ep-1'}
+            raise RuntimeError('never reached the backend')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=_execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        q.register_callback('dual_write_episode', exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='landed-grp', operation='add_episode',
+                payload={'content': 'landed', '_write_op_id': 'W11'},
+                callback_type='dual_write_episode',
+            )
+            await q.enqueue(
+                group_id='never-grp', operation='add_episode',
+                payload={'content': 'never', '_write_op_id': 'W12'},
+                callback_type='dual_write_episode',
+            )
+            await _poll_until_dead(q, group_id='landed-grp', expected_dead=1, timeout=20.0)
+            await _poll_until_dead(q, group_id='never-grp', expected_dead=1, timeout=20.0)
+
+            landed = (await q.get_dead_items(group_id='landed-grp'))[0]
+            never = (await q.get_dead_items(group_id='never-grp'))[0]
+
+            assert landed['executed'] is True, 'this write landed — replaying duplicates it'
+            assert never['executed'] is False, 'this write never landed — safe to replay'
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
     async def test_callback_still_sees_journal_metadata_popped_by_execute(
         self, tmp_path
     ):
