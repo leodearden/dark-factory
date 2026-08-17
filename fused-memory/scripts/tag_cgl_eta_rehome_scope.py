@@ -86,6 +86,10 @@ from fused_memory.maintenance.rehome_scope_tag import (
     scope_tag_for,
 )
 from fused_memory.models.scope import Scope
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 
 logger = logging.getLogger('tag_cgl_eta_rehome_scope')
 
@@ -420,6 +424,35 @@ async def run(
     # Apply or dry-run.
     applied_ids: set[str] = set()
     if args.apply:
+        # Fail-CLOSED capability preflight, one probe per run, BEFORE the tagging.
+        #
+        # Sited at this EXISTING gate rather than the top of ``run`` on
+        # purpose: ``run`` aborts above on an unknown --project-id without
+        # mutating anything, and hoisting the probe would turn that clear
+        # "unknown --project-id" message into an unrelated store-capability
+        # refusal for anyone diagnosing a typo'd flag from a sandbox. This
+        # block runs at most once per run, so the one-probe-per-run property
+        # still holds. It is also kept OUT of ``apply_tags``: that helper's
+        # per-record ``except Exception`` swallows ``RuntimeError``, which
+        # ``StoreMutationUnavailable`` subclasses, so a probe inside it would
+        # be downgraded into N warnings while the updates proceeded.
+        try:
+            assert_store_mutation_allowed(operation='tag_cgl_eta_rehome_scope --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'tag_cgl_eta_rehome_scope: --apply NOT started (fail-closed) '
+                "-- this process cannot write mem0's history directory, so "
+                'each tag would rewrite a record and then fail to record the '
+                'change, leaving the rehome pool half-tagged and its '
+                'provenance metadata unreconstructable. No record was tagged '
+                'and nothing was mutated. Route the tagging through the '
+                'fused-memory MCP server (the unsandboxed owner of the '
+                'store), or re-run from an unsandboxed operator shell. To '
+                'obtain the tag report safely from anywhere, re-run without '
+                '--apply.'
+            )
+            raise
+
         applied_ids = await apply_tags(memory, decisions_by_project, records_by_project)
 
     report = build_tag_report(
