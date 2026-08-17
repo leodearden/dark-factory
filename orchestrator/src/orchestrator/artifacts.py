@@ -40,6 +40,7 @@ class ArtifactWriteError(OSError):
     ``except FileNotFoundError`` tolerance cannot accidentally swallow it.
     """
 
+
 # Matches one-or-more leading ``[COMMITTED <hex>]`` provenance tags (with any
 # trailing whitespace) at the START of a step description.  Used by
 # :meth:`TaskArtifacts.mark_step_committed` to strip a stale tag before
@@ -61,8 +62,8 @@ def _existing_mode(target: Path) -> int | None:
     ``None`` for a target that does not exist yet lets ``atomic_write_text``
     create the temp 0o666 and have the KERNEL apply the process umask —
     exactly what ``write_text`` produces for a new file, and free of the
-    non-thread-safe ``os.umask(os.umask(0))`` read-back that the superseded
-    ``plan_tools._target_file_mode`` needed to compute the same answer.
+    non-thread-safe ``os.umask(os.umask(0))`` read-back that plan-tools'
+    superseded (now deleted) mode helper needed to compute the same answer.
 
     Swallows ONLY FileNotFoundError.  EACCES/ELOOP/ENAMETOOLONG on the stat
     are genuine failures and must surface, not be papered over as "new file".
