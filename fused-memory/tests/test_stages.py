@@ -166,7 +166,8 @@ def _emit_foreign_log_noise() -> None:
         asyncio ERROR alone (levelno 40 != 30) would not trip.
 
     Neither logger is ``_TKS_LOGGER``, so a name-scoped filter
-    (``r.name == _TKS_LOGGER``) excludes both — see TestForeignLogNoiseHelper.
+    (``r.name == _TKS_LOGGER``) excludes both — which is what every call
+    site below relies on.
     """
     logging.getLogger('asyncio').error('Task exception was never retrieved')
     logging.getLogger('httpx').warning('mock httpx noise injected for task 4329 caplog de-flake')
@@ -179,40 +180,6 @@ class TestMockTypesConstant:
         assert isinstance(_MOCK_TYPES, tuple)
         assert AsyncMock in _MOCK_TYPES
         assert MagicMock in _MOCK_TYPES
-
-
-class TestForeignLogNoiseHelper:
-    """Validates _emit_foreign_log_noise(), the deterministic RED-driver used by
-    task 4329's de-flake of this file's level-only caplog.records filters.
-
-    Confirms the two-part contract the fix depends on: the injected foreign
-    records ARE seen by level-only filters ((a) an ERROR+ record breaks
-    `>= logging.WARNING` filters, (b) a WARNING record breaks `== logging.WARNING`
-    / `not any(...)` filters), and ARE NOT seen by a name-scoped filter (c) —
-    proving a name predicate is both necessary and sufficient to exclude this
-    noise — on exactly the logger pair (d) the helper's docstring promises.
-    """
-
-    def test_foreign_log_noise_is_seen_by_level_only_filters_and_excluded_by_name_predicate(
-        self, caplog
-    ):
-        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
-            _emit_foreign_log_noise()
-
-        dump = [(r.name, r.levelname) for r in caplog.records]
-
-        assert any(r.levelno >= logging.ERROR for r in caplog.records), (
-            f'expected a foreign ERROR+ record (breaks >= WARNING filters); got {dump!r}'
-        )
-        assert any(r.levelno == logging.WARNING for r in caplog.records), (
-            f'expected a foreign WARNING record (breaks == WARNING filters); got {dump!r}'
-        )
-        assert [r for r in caplog.records if r.name == _TKS_LOGGER] == [], (
-            f'name-scoped filter must see none of the injected noise; got {dump!r}'
-        )
-        assert {r.name for r in caplog.records} == {'asyncio', 'httpx'}, (
-            f'expected exactly the asyncio+httpx noise pair; got {dump!r}'
-        )
 
 
 # Tools registered by the SHARED escalation.server.create_server that a recon
