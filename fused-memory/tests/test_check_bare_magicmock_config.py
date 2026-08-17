@@ -1294,3 +1294,53 @@ class TestFusedMemoryTestsDirectoryClean:
             f'with MagicMock(spec_set=pydantic_spec(FusedMemoryConfig)).\n'
             f'Violations:\n{result.stdout}'
         )
+
+
+class TestAllScannedTestDirsClean:
+    """Non-regression gate for all nine call sites: every scanned tests/ dir stays clean.
+
+    The checker is wired into seven package ``orchestrator.yaml`` lint_commands,
+    ``dark-factory-orchestrator.yaml``, and ``hooks/project-checks``.  Adding Rule B
+    put a hot, position-blind rule in front of all of them at once, so a single
+    unhandled site turns a package's lint_command red and stalls the merge lane
+    repo-wide.
+
+    This test proves the widening left every one of those callers green.  It is the
+    counterpart to TestDataclassDoubleDebtBaseline: that class pins WHAT is
+    grandfathered, this one pins that nothing else was missed.
+    """
+
+    _SCANNED_DIRS = (
+        'shared/tests',
+        'escalation/tests',
+        'fused-memory/tests',
+        'orchestrator/tests',
+        'dashboard/tests',
+        'sampler/tests',
+        'cockpit/tests',
+    )
+
+    def test_every_scanned_tests_directory_exits_zero(self):
+        """The checker exits 0 over every directory the nine call sites scan."""
+        present = [d for d in self._SCANNED_DIRS if (_REPO_ROOT / d).is_dir()]
+        assert present, (
+            f'No scanned tests/ directory found under {_REPO_ROOT} — the repo-root '
+            'reach (Path(__file__).parent.parent.parent) is probably wrong'
+        )
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), *(str(_REPO_ROOT / d) for d in present)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            'check_bare_magicmock_config found violations in the directories scanned '
+            'by the nine configured call sites (seven package orchestrator.yaml '
+            'lint_commands, dark-factory-orchestrator.yaml, hooks/project-checks). '
+            'Any non-zero exit here means at least one package lint_command is RED.\n'
+            'Remedy depends on the rule:\n'
+            '  bare-magicmock       → mock_orch_config / MagicMock(spec_set=pydantic_spec(...))\n'
+            '  bare-dataclass-double → _fake_verify_result(...) / MagicMock(spec=VerifyResult)\n'
+            f'Scanned: {present}\n'
+            f'Violations:\n{result.stdout}\n'
+            f'stderr:\n{result.stderr}'
+        )
