@@ -998,3 +998,88 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(tmp_p
     assert fired == ["stale", "idle"], (
         f"expected both scheduled transitions to land in order; got fired={fired!r}"
     )
+
+
+def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_path):
+    """The deliberate NON-reset of `start_secs` in drain_gate's
+    busy-resumption arm (scripts/restart-all-orchestrators.sh:391-399, the
+    arm carrying the "anchored once ... can't defer the forced restart
+    indefinitely" comment): a unit that goes busy -> stale -> busy again
+    must NOT get a fresh force-fire deadline on the second busy reading --
+    the deadline is anchored to when the unit FIRST went busy.
+
+    A scheduled idle "trap" at t=12 is what makes this a TEXT-level
+    assertion rather than a wall-clock one, which is deliberately NOT
+    "simplified" into a timing check:
+      - Anchor PRESERVED (correct): the busy reading lands at t~8, and the
+        very next top-of-loop check sees elapsed(8) >= FORCE_FIRE(6) and
+        force-fires BEFORE any further sleep. The script exits at ~9.6s and
+        never reads the heartbeat again, so the t=12 trap is unreachable --
+        `fired` stays ["stale", "busy"].
+      - Anchor RESET (the regression): start_secs restarts at t~8, so the
+        loop keeps polling, reaches the trap at t=12, and prints
+        "resuming restart of <unit>: drained" with NO force line (its own
+        deadline would not have been until t~14).
+    The two counterfactuals differ in OUTPUT, not merely in duration, so the
+    assertions below are text-level: exactly two defer lines (the initial
+    one plus the re-defer after the stale interlude -- itself independent
+    corroboration that the oscillation happened), a force line present, a
+    resume line absent, and "idle-trap" absent from `fired`.
+    """
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, **_HB_BUSY)
+
+    # ORCH_DRAIN_UNKNOWN_GRACE_SECS is a must-never-elapse bound here (the
+    # unit resumes busy on its own at t=8, well inside it).
+    spawn_timeout = 20
+
+    with _heartbeat_timeline(
+        fleet_dir, UNIT_R,
+        [
+            ("stale", 2.0, _HB_STALE),
+            ("busy", 8.0, _HB_BUSY),
+            ("idle-trap", 12.0, _HB_IDLE),
+        ],
+    ) as fired:
+        result = _run_script(
+            bin_dir, state_path, fleet_dir, "--drain",
+            env={
+                "RESTART_VERIFY_TIMEOUT": "5",
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "6",
+                "ORCH_DRAIN_UNKNOWN_GRACE_SECS": str(
+                    wait_proof_grace_secs(spawn_timeout)
+                ),
+                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            },
+            timeout=spawn_timeout,
+        )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    defer_count = result.stdout.count(f"deferring restart of {UNIT_R}: mid-merge")
+    assert defer_count == 2, (
+        f"expected exactly two defer lines (initial + re-defer after the "
+        f"stale interlude), which also independently catches a disabled "
+        f"stale/absent handoff; got count={defer_count} stdout={result.stdout!r}"
+    )
+    assert f"force-restarting {UNIT_R}" in result.stdout, (
+        f"expected the anchor to force-fire once elapsed(8) >= 6; got "
+        f"stdout={result.stdout!r}"
+    )
+    # THE ANCHOR PROOF -- see the docstring's two counterfactuals.
+    assert f"resuming restart of {UNIT_R}: drained" not in result.stdout, (
+        f"expected NO resume line -- one here means start_secs was reset "
+        f"on the busy-resumption arm; got stdout={result.stdout!r}"
+    )
+    assert "idle-trap" not in fired, (
+        f"the idle-trap transition fired, meaning the script was still "
+        f"running at t=12 -- the anchor must have been reset: fired={fired!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
+    )
