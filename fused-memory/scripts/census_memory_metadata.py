@@ -558,9 +558,23 @@ def build_report(
         # are DISCLOSED rather than rendered as an all-zero (or perfect) score.
         registry_error = registry_error or 'no topic registry supplied'
     else:
-        registry_coverage, registry_error = _build_registry_coverage(
-            project_totals, registry,
-        )
+        # SCORING is guarded as well as LOADING. `topic_registry_loader` is
+        # lazily memoized and `load_registry_or_error` catches everything, so
+        # an unloadable probe already degrades to `registry_error` -- but the
+        # scoring below reaches `entry.project_id` / `entry.topic` by attribute
+        # on objects owned by ANOTHER script's dataclass. A `RegistryEntry`
+        # field rename raised straight out of build_report and took the whole
+        # nightly census with it (no report, no markdown, no trend row) from a
+        # block the design says is OPTIONAL. Same disclosure, same shape as
+        # every other registry failure (INV-2: disclose the shortfall, never
+        # escalate it into a total loss).
+        try:
+            registry_coverage, registry_error = _build_registry_coverage(
+                project_totals, registry,
+            )
+        except Exception as exc:  # noqa: BLE001 - the gauge is never fatal
+            registry_coverage = None
+            registry_error = f'{type(exc).__name__}: {exc}'
 
     report = {
         # v2: value tables are the complete population (v1 capped them at
@@ -999,14 +1013,34 @@ def _build_topic_coverage(
     }
 
 
-#: The canonical-partition fields of a ``topic_coverage`` block, i.e. exactly
-#: those whose meaning is fixed by 3198's per-(project, topic) invariant.
-#: Everything else in the block is a legitimate corpus-wide rollup.
-_UNIQUENESS_GRAIN_FIELDS: tuple[str, ...] = (
+#: The SCALAR canonical-partition columns, re-graded by summing the
+#: per-project cells. Iterated directly by
+#: :func:`_regrade_uniqueness_at_project_grain` -- this tuple IS the loop's
+#: subject, not a parallel description of it, so the two cannot drift.
+#: (``column``, not ``field``: the module imports ``dataclasses.field``.)
+_UNIQUENESS_GRAIN_SCALARS: tuple[str, ...] = (
     'topics_with_one_canonical',
     'topics_with_zero_canonical',
     'topics_with_multiple_canonical',
-    'multiple_canonical_topics',
+)
+
+#: The named-violator list, re-graded by UNION rather than by sum -- a
+#: different operation, hence a separate name rather than a fourth scalar.
+_UNIQUENESS_GRAIN_NAMED_LIST = 'multiple_canonical_topics'
+
+#: The canonical-partition fields of a ``topic_coverage`` block, i.e. exactly
+#: those whose meaning is fixed by 3198's per-(project, topic) invariant.
+#: Everything else in the block is a legitimate corpus-wide rollup.
+#: DERIVED from the two above, never restated: an earlier spelling listed the
+#: columns here AND again as a literal inside the regrade loop, so a field
+#: added to this constant would have been documented as grain-fixed while
+#: nothing re-graded it -- the corpus-wide block would headline a
+#: merged-across-projects number again, the exact defect the regrade exists
+#: to fix. Pinned by ``test_the_regrade_touches_exactly_the_fields_the_
+#: constant_names``, in both directions.
+_UNIQUENESS_GRAIN_FIELDS: tuple[str, ...] = (
+    *_UNIQUENESS_GRAIN_SCALARS,
+    _UNIQUENESS_GRAIN_NAMED_LIST,
 )
 
 
@@ -1049,9 +1083,7 @@ def _regrade_uniqueness_at_project_grain(
         for project_id in sorted(projects)
     ]
 
-    # `column`, not `field`: the module imports dataclasses.field at line 97.
-    for column in ('topics_with_one_canonical', 'topics_with_zero_canonical',
-                   'topics_with_multiple_canonical'):
+    for column in _UNIQUENESS_GRAIN_SCALARS:
         regraded[column] = sum(block.get(column) or 0 for _, block in blocks)
 
     # The union of the per-project named lists, each row carrying the project
@@ -1062,9 +1094,9 @@ def _regrade_uniqueness_at_project_grain(
     merged: list[dict[str, Any]] = [
         {'project_id': project_id, **row}
         for project_id, block in blocks
-        for row in (block.get('multiple_canonical_topics') or [])
+        for row in (block.get(_UNIQUENESS_GRAIN_NAMED_LIST) or [])
     ]
-    regraded['multiple_canonical_topics'] = sorted(
+    regraded[_UNIQUENESS_GRAIN_NAMED_LIST] = sorted(
         merged,
         key=lambda row: (-row['canonical_count'], row['topic'], row['project_id']),
     )
@@ -1086,8 +1118,12 @@ DEFAULT_HISTORY_OUT = str(
 
 #: Retention bound on the committed history. The file is written by a
 #: NIGHTLY timer, so it is bounded in runs as well as in per-run size: ~90
-#: rows is a quarter of nightly history, enough to see a season's trend at
-#: roughly a hundred KB. Dropping is DISCLOSED in ``retention.dropped_runs``
+#: rows is a quarter of nightly history, enough to see a season's trend.
+#: COST, measured on the committed file rather than estimated (10,736 bytes
+#: for 2 runs at the current two-project shape): ~5.2 KiB per run, so a full
+#: retention window steady-states at **~470 KiB**. An earlier spelling here
+#: said "roughly a hundred KB", which was ~4.5x low; OPERATIONS.md §12 quotes
+#: the same two figures. Dropping is DISCLOSED in ``retention.dropped_runs``
 #: -- a silently truncated history reads as a corpus that only ever had
 #: ``max_runs`` runs, the same no-silent-truncation rule the JSON value
 #: tables already follow.

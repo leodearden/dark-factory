@@ -1010,6 +1010,71 @@ class TestUniquenessViolationsAreNamedAndReadable:
         assert grand['slug_non_conforming'] == 1
         assert [r['topic'] for r in grand['non_conforming_topics']] == [legacy]
 
+    def test_the_regrade_touches_exactly_the_fields_the_constant_names(self):
+        """`_UNIQUENESS_GRAIN_FIELDS` is authoritative, in BOTH directions.
+
+        The constant documents itself as "exactly those fields whose meaning
+        is fixed by 3198's per-(project, topic) invariant", and the regrade's
+        docstring says its scope is "only :data:`_UNIQUENESS_GRAIN_FIELDS`".
+        Neither claim was checked, and the implementation carried its own
+        duplicate literal of the scalar columns -- so the constant could grow
+        a field that nothing re-graded (the corpus-wide block would silently
+        headline a merged-across-projects number again, the exact defect the
+        regrade exists to fix), or the implementation could grow a re-grade
+        the constant does not name.
+
+        Asserted as a SET EQUALITY over the keys whose values actually change,
+        so it fails on either drift. The reverse half is load-bearing on its
+        own: `distinct_topics` and the slug axes are distinct-VALUE series
+        that gate 3626's recipe item 3 tracks across runs (98 -> 103), and
+        re-graining one of them to a cell count would step that series
+        discontinuously while every existing assertion stayed green.
+        """
+        # Sentinels on EVERY key, grain-fixed or not: a key that still holds
+        # its sentinel was left alone, one that does not was re-graded.
+        grand_block = {
+            'topics_with_one_canonical': -101,
+            'topics_with_zero_canonical': -102,
+            'topics_with_multiple_canonical': -103,
+            'multiple_canonical_topics': [{'topic': 'sentinel',
+                                           'canonical_count': -104}],
+            'distinct_topics': -105,
+            'slug_conforming': -106,
+            'slug_non_conforming': -107,
+            'non_conforming_topics': [{'topic': 'sentinel-slug'}],
+            'records': -108,
+            'topic_present': -109,
+            'topic_coverage_pct': -110.0,
+        }
+        projects = {
+            'dark_factory': {'topic_coverage': {
+                'topics_with_one_canonical': 2,
+                'topics_with_zero_canonical': 3,
+                'topics_with_multiple_canonical': 1,
+                'multiple_canonical_topics': [{'topic': 'dupe',
+                                               'canonical_count': 2}],
+            }},
+            'reify': {'topic_coverage': {
+                'topics_with_one_canonical': 5,
+                'topics_with_zero_canonical': 7,
+                'topics_with_multiple_canonical': 0,
+                'multiple_canonical_topics': [],
+            }},
+        }
+
+        regraded = _mod._regrade_uniqueness_at_project_grain(grand_block, projects)
+
+        changed = {k for k, v in regraded.items() if v != grand_block[k]}
+        assert changed == set(_mod._UNIQUENESS_GRAIN_FIELDS)
+        # And the re-grade is the per-project sum, not a passthrough that
+        # merely happens to differ from a sentinel.
+        assert regraded['topics_with_one_canonical'] == 7
+        assert regraded['topics_with_zero_canonical'] == 10
+        assert regraded['topics_with_multiple_canonical'] == 1
+        assert [r['topic'] for r in regraded['multiple_canonical_topics']] == ['dupe']
+        # PURE: the caller's dict is not mutated.
+        assert grand_block['topics_with_one_canonical'] == -101
+
 
 class TestEnforceFlipPreconditionCitations:
     """The report says what stands between here and flipping ``enforce``.
@@ -1480,6 +1545,52 @@ class TestRegistryCoverageGauge:
         report = self._report(cells, _FakeRegistry([_FakeEntry('a', 'dark_factory')]))
         assert report['registry_error'] is None
         assert report['registry_coverage']['registry_topics_total'] == 1
+
+    def test_a_registry_of_the_wrong_SHAPE_is_disclosed_not_fatal(self):
+        """A loaded-but-misshapen registry degrades like every other failure.
+
+        The load path is already careful -- `topic_registry_loader` is lazily
+        memoized and `load_registry_or_error` catches everything -- precisely
+        so the optional gauge cannot take the measurement down with it. But
+        SCORING happens after the load, reaching `entry.project_id` /
+        `entry.topic` by attribute on objects owned by ANOTHER script's
+        dataclass. A `RegistryEntry` field rename (or a loader that starts
+        returning dicts) therefore raised straight out of `build_report`:
+        no report, no markdown, no trend row, from a block the design says
+        is optional.
+
+        This is not hypothetical reach: the registry, its loader and its
+        models all live in `memory_eval_retrieval_probe.py`, a file this task
+        does not own and does not test, and the census reuses them by import
+        exactly so they stay single-homed. Reuse across that seam is right;
+        inheriting an abort from it is not.
+        """
+        class _ShapelessEntry:
+            project_id = 'dark_factory'
+            # No `.topic` -- the shape a field rename in the probe produces.
+
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a', 'canonical': True}])}}
+        report = self._report(cells, _FakeRegistry([_ShapelessEntry()]))
+
+        assert report['registry_coverage'] is None
+        assert 'AttributeError' in report['registry_error']
+        # The MEASUREMENT survived intact -- that is the whole claim.
+        assert report['projects']['dark_factory']['topic_coverage'][
+            'topics_with_one_canonical'] == 1
+
+    def test_a_registry_that_is_not_iterable_at_all_is_disclosed_not_fatal(self):
+        """The same guard, reached through a different failure shape."""
+        class _HostileRegistry:
+            @property
+            def entries(self):
+                raise RuntimeError('probe module changed under us')
+
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a'}])}}
+        report = self._report(cells, _HostileRegistry())
+
+        assert report['registry_coverage'] is None
+        assert 'RuntimeError' in report['registry_error']
+        assert report['projects']['dark_factory']['topic_coverage']['records'] == 1
 
     def test_gauge_is_json_serialisable_and_deterministic(self):
         cells = {'dark_factory': {OBS: _census([{'topic': 'a', 'canonical': True}])}}
