@@ -413,6 +413,65 @@ a page cap that truncates in silence would just be the defect this module
 exists to fix, moved one layer up.
 """
 
+# --------------------------------------------------------------------------- #
+# RESULT-SET CAP AUDIT — every read in this file, re-checked 2026-08-17
+# (task 4340).  Recorded so the next person does not have to redo it, and
+# stated as claims with reasons so it can be FALSIFIED rather than trusted.
+#
+# Measured live against localhost:6379, RESULTSET_SIZE=10000:
+#
+#     graph          Entity nodes   valid-edge rows   an unpaginated read saw
+#     dark_factory       16083            25040                10000
+#     reify              23616            31659                10000
+#
+# FIXED HERE — both were measurably truncated, and they COMPOUND:
+# ``detect_stale_with_edges`` calls them on consecutive lines and the two
+# truncations were INDEPENDENT, so an entity surviving the node cut could
+# still lose every edge to the edge cut, yielding a bogus "stale, zero valid
+# facts" verdict that ``rebuild_entity_from_edges`` then WROTE BACK into
+# ``n.summary``.  Corrupting, not merely under-reporting.
+#   - get_all_valid_edges  -> enumerate_all_valid_edges
+#   - list_entity_nodes    -> enumerate_entity_nodes
+#
+# STILL UNPAGINATED and assessed AT RISK.  Left out of 4340 only because they
+# are separable — different call chains, no shared verdict, no write-back —
+# and folding them in would have doubled the diff.  Follow-up: see
+# FOLLOWUP-4340-1 below.
+#   - query_stale_node_embeddings: ~16083 rows on dark_factory.  A truncated
+#     read makes an embedding-dimension migration look COMPLETE when it is
+#     not — the worst shape of this bug, because the operator's evidence of
+#     success is the very thing being truncated.
+#   - query_stale_edge_embeddings: ~15242/22392 rows.  No ``invalid_at``
+#     filter, so it includes superseded edges and its row count runs ahead of
+#     the valid-edge census above.
+#   - query_edges_by_time_range: bounded only by the caller's window width;
+#     any window wide enough to span >10000 edges truncates.
+#   - retrieve_episodes: reaches the same server through graphiti-core's
+#     ``get_by_group_ids(limit=None)`` rather than ``ro_query``, so it is not
+#     fixable with ``_paged_ro_query`` as-is.  Its existing comment reasons
+#     about transfer COST and about ``last_n`` being capped in tools.py;
+#     neither protects against server-side truncation.  Truncation is worse
+#     than slowness here: the Python-side ``sorted(...)[:last_n]`` would be
+#     selecting the most-recent of a truncated 10000, i.e. silently returning
+#     the wrong episodes rather than merely fewer of them.
+#
+# ASSESSED SAFE, with the reason (a bare list would not be checkable):
+#   - every uuid-keyed lookup: the key is unique, so the result is 0 or 1 rows.
+#   - every exact-name lookup: bounded by the duplicate-name count, which
+#     ``find_duplicate_entity_nodes`` reports in single digits.
+#   - every single-row aggregate: one row by construction.
+#   - server-side grouped/filtered aggregates that SCAN the whole graph but
+#     whose RESULT set is small — the cap applies to rows RETURNED, not rows
+#     scanned, so a ``count``/``collect`` folding 20k rows into a handful is
+#     safe.
+#   - ``CALL db.indexes()``: one row per index, single digits.
+#   - every per-node neighbourhood read.  ``get_valid_edges_for_node`` is
+#     called out by name because task 4340 asked about it specifically: its
+#     row count is ONE node's valid degree, and a single node would have to
+#     hold >10000 of the graph's ~12506 valid edges to reach the cap.  It is
+#     left unpaginated deliberately, not by oversight.
+# --------------------------------------------------------------------------- #
+
 
 # Page/census pairs for the paginated whole-graph reads. Each pair shares an
 # IDENTICAL MATCH/WHERE so the two numbers describe the same population and

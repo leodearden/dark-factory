@@ -108,6 +108,21 @@ rate; do not re-open them:
    unfiltered ``MATCH`` (no entity-type, label, or episode filter),
    reproduced end-to-end scanning every missed edge and dropping it at
    extraction — every gap was lexical, not a query-scope gap.
+
+   AMENDED, task 4340 (2026-08-17).  The lexical findings above STAND and
+   are unaffected; what does not stand is the scope of the ruling-out.
+   Those grounds covered query FILTERS only and were silent about
+   server-side TRUNCATION.  Task 4340 measured a FalkorDB
+   ``RESULTSET_SIZE=10000`` cap silently truncating that very query:
+   10000 of 24938 rows on dark_factory, i.e. 6376 of 12506 distinct valid
+   edges — 51%.  So at the time of the task-2613 investigation this sweep
+   saw roughly HALF the valid-edge corpus, and the miss rate was computed
+   against a truncated denominator.  ``get_all_valid_edges`` is paginated
+   as of task 4340 and the truncation is gone, but the RATE has not been
+   recomputed: a re-measurement against the now-complete corpus is
+   warranted, and the residuals list above is calibrated against the old
+   figure.  Filed as FOLLOWUP-4340-3.  Do not re-open the LEXICAL
+   hypothesis; do not treat the old rate as measured on a whole corpus.
 2. A shared blind spot with ``task_count_verification``: that function is
    an aggregate census-vs-tree consistency check (``task_filter``), not a
    per-task edge sweep at all — its 'healthy' report was correct, not
@@ -117,9 +132,18 @@ Why a regex in this module gets a performance test at all:
 ``sweep_stale_status_snapshot_edges`` calls
 ``extract_snapshot_edge_task_ids`` once per valid edge from an UNGUARDED
 dict comprehension with no per-edge timeout, over the whole group's edge
-set (~5868 edges in the task-3042 record). Extractor cost is therefore a
-whole-cycle LIVENESS property — one pathological fact stalls the entire
-reconciliation cycle — not a micro-optimisation. (amendment, task 3079)
+set (~12506 edges on dark_factory, ~15871 on reify, measured 2026-08-17).
+Extractor cost is therefore a whole-cycle LIVENESS property — one
+pathological fact stalls the entire reconciliation cycle — not a
+micro-optimisation. (amendment, task 3079)
+
+The figure was ~5868 in the task-3042 record; that number is consistent
+with a truncated enumeration and has been corrected upward by task 4340's
+live census (see the amendment to ruled-out hypothesis 1 above). The
+LIVENESS argument gets STRONGER, not weaker: with the truncation removed
+the per-edge extractor now runs over roughly twice as many edges per
+cycle, so the per-edge cost this test guards matters more than the
+original number implied, not less. (amendment, task 4340)
 """
 
 from __future__ import annotations
