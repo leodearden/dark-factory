@@ -3206,6 +3206,15 @@ class ReconciliationHarness:
 
         # Fetch filtered task tree once for the whole cycle (ref: task 455)
         filtered_task_tree = await self._fetch_filtered_task_tree(project_root)
+        # Task 4115: the instant every heartbeat_at in filtered_task_tree was
+        # read. Stamped HERE, immediately after the fetch returns — not later,
+        # e.g. at the _maybe_remediate call below — because the S1->S3 stage
+        # loop that follows is minutes of LLM work and the remediation
+        # live-workflow gate's heartbeat TTL is only 10 minutes (task 2964).
+        # Threaded through to _maybe_remediate -> _run_remediation_pass so the
+        # gate ages a cited task's heartbeat against the actual read, not a
+        # fresh clock taken well after it.
+        filtered_task_tree_fetched_at = datetime.now(UTC)
 
         # Fetch authoritative task-count census and cross-verify against tree (task 1785)
         statuses = await self._fetch_task_count_census(project_root)
@@ -3414,10 +3423,13 @@ class ReconciliationHarness:
                     await self._spawn_judge(run_id, project_id)
 
                 # Remediation pass: thread scope resolved above (task 1163) and pass
-                # pre-fetched tree to avoid a redundant fetch (ref: task 478).
+                # pre-fetched tree to avoid a redundant fetch (ref: task 478), plus
+                # the instant it was read so the live-workflow gate ages heartbeats
+                # against that read, not a fresh clock (task 4115).
                 await self._maybe_remediate(project_id, run_id, run, tier,
                                             scope=scope,
-                                            filtered_task_tree=filtered_task_tree)
+                                            filtered_task_tree=filtered_task_tree,
+                                            filtered_task_tree_fetched_at=filtered_task_tree_fetched_at)
 
                 logger.info(
                     'reconciliation.run_completed',
