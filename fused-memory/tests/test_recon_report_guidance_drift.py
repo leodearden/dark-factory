@@ -64,7 +64,25 @@ from fused_memory.reconciliation.prompts.stage2 import (
     build_stage2_system_prompt,
 )
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
-from fused_memory.server.recon_report import get_recon_report_tool_signatures
+from fused_memory.server.recon_report import (
+    RECON_REPORT_INSTRUCTIONS,
+    get_recon_report_tool_signatures,
+)
+
+
+def _live_report_tool_names() -> tuple[str, ...]:
+    """Every tool NAME registered on the live recon_report server, in registration order.
+
+    Module-level helper (rather than a fixture) so it can drive
+    ``@pytest.mark.parametrize``: pytest then reports one test id per tool,
+    e.g. ``[write_entity_standing_decision]``, instead of collapsing every
+    undocumented tool into a single aggregate failure that names only the
+    first one it hits.
+    """
+    return tuple(get_recon_report_tool_signatures())
+
+
+_LIVE_REPORT_TOOL_NAMES = _live_report_tool_names()
 
 # Agent-called report tools (excludes start_report — harness-called).
 _AGENT_CALLED_REPORT_TOOLS = (
@@ -124,6 +142,31 @@ class TestReconReportGuidanceDrift:
         result = render_recon_report_tool_guidance()
         assert isinstance(result, str)
         assert result
+
+
+class TestEveryRegisteredToolIsDocumented:
+    """Every live-registered recon-report tool is named in RECON_REPORT_INSTRUCTIONS.
+
+    RECON_REPORT_INSTRUCTIONS is the SERVER-level listing FastMCP hands to any
+    MCP client on connect — it is stage-agnostic, so it is the one surface that
+    must cover ALL registered tools regardless of which stage may call them.
+    Unlike the generated guidance block, it is hand-written prose that is never
+    generated from the signatures, which makes this assertion fully independent
+    of the renderer (contrast the candour in this module's docstring about the
+    generated path's tautological assertions).
+    """
+
+    @pytest.mark.parametrize(
+        'tool_name', _LIVE_REPORT_TOOL_NAMES, ids=list(_LIVE_REPORT_TOOL_NAMES)
+    )
+    def test_tool_is_named_in_server_instructions(self, tool_name):
+        assert tool_name in RECON_REPORT_INSTRUCTIONS, (
+            f'The tool `{tool_name}` is registered on the live recon_report server but '
+            'is not named anywhere in RECON_REPORT_INSTRUCTIONS '
+            '(server/recon_report.py) — a registered tool absent from '
+            'RECON_REPORT_INSTRUCTIONS is invisible to any MCP client that reads the '
+            'server instructions — add it there.'
+        )
 
 
 # Fully assembled stage-prompt texts to scan for inline report-tool call examples.
