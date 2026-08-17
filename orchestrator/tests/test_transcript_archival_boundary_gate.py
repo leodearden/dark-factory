@@ -379,7 +379,9 @@ class TestE1ArchivedAtCompletion:
         # Integrated half of E4: the credential written beside projects/ did
         # not follow the transcript into the archive.
         assert _archive_files(git_repo) == {f'{TASK_ID}/{ENC}/{sid}.jsonl'}
-        assert (workflow._config_dir.path / '.credentials.json').exists()
+        config_dir = workflow._config_dir
+        assert config_dir is not None
+        assert (config_dir.path / '.credentials.json').exists()
 
     async def test_kill_switch_leaves_the_archive_root_uncreated(
         self, monkeypatch, git_repo, git_ops, task_assignment
