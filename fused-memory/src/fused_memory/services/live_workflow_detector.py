@@ -190,12 +190,12 @@ Injectable ``now`` for deterministic tests.
 from __future__ import annotations
 
 import logging
-import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from shared.git_async import run_git
 from shared.task_claimant import has_live_claimant
 from shared.task_metadata import RoutingState
 
@@ -322,7 +322,7 @@ class WorkflowLiveness:
     worktree_stale: bool = False
 
 
-def detect_live_workflow(
+async def detect_live_workflow(
     task_id: str,
     project_root: str | Path,
     *,
@@ -468,7 +468,7 @@ def detect_live_workflow(
     root = str(project_root)
 
     if worktree_index is None:
-        worktree_present, worktree_prunable = _check_worktree_registered(root, branch)
+        worktree_present, worktree_prunable = await _check_worktree_registered(root, branch)
     else:
         worktree_present, worktree_prunable = _registration_from_index(worktree_index, branch)
     worktree_registered = worktree_present and not worktree_prunable
@@ -478,7 +478,7 @@ def detect_live_workflow(
     # already performs exactly this None-resolution internally, so passing
     # `reference` in here is behaviour-preserving.
     reference = now if now is not None else datetime.now(UTC)
-    last_commit_at, recent_commit = _check_recent_commit(
+    last_commit_at, recent_commit = await _check_recent_commit(
         root, branch, now=reference, max_commit_age_hours=max_commit_age_hours
     )
     # Single-shot memo for the branch's own-commit count (`git rev-list --count
@@ -487,9 +487,9 @@ def detect_live_workflow(
     # never runs more than once per detect_live_workflow invocation.
     _own_count: list[int | None] = []
 
-    def _own_commit_count() -> int | None:
+    async def _own_commit_count() -> int | None:
         if not _own_count:
-            _own_count.append(_branch_own_commit_count(root, base_branch, branch))
+            _own_count.append(await _branch_own_commit_count(root, base_branch, branch))
         return _own_count[0]
 
     # branch_bare: branch carries zero commits of its own beyond base_branch
@@ -510,7 +510,7 @@ def detect_live_workflow(
     if worktree_registered and not recent_commit:
         branch_bare = False
     else:
-        own_commit_count = _own_commit_count()
+        own_commit_count = await _own_commit_count()
         branch_bare = own_commit_count == 0
     recent_commit = recent_commit and not branch_bare
 
@@ -526,7 +526,7 @@ def detect_live_workflow(
         and not recent_commit
         and _worktree_age_exceeded(last_commit_at, reference, max_worktree_age_hours)
     ):
-        own = _own_commit_count()
+        own = await _own_commit_count()
         # own is None: unknown count (missing branch, rev-list error/timeout,
         # unparseable output). own == 0: bare branch. Both fail safe to False
         # — an unknown or bare count is never positive evidence of staleness.
@@ -619,7 +619,7 @@ def detect_live_workflow(
     )
 
 
-def is_workflow_live_for_task(
+async def is_workflow_live_for_task(
     task_id: str,
     project_root: str | Path,
     **kwargs,
@@ -629,7 +629,8 @@ def is_workflow_live_for_task(
     Accepts the same keyword arguments as :func:`detect_live_workflow`,
     including the ``_orchestrator_live`` performance hint.
     """
-    return detect_live_workflow(task_id, project_root, **kwargs).is_live
+    liveness = await detect_live_workflow(task_id, project_root, **kwargs)
+    return liveness.is_live
 
 
 # ---------------------------------------------------------------------------
@@ -957,7 +958,7 @@ def parse_worktree_index(stdout: str) -> dict[str, bool]:
     return index
 
 
-def worktree_index_for(project_root: str) -> dict[str, bool] | None:
+async def worktree_index_for(project_root: str) -> dict[str, bool] | None:
     """Run ``git worktree list --porcelain`` ONCE and return the parsed index.
 
     This is the hoisting entry point for task 3778: the worktree list is
@@ -981,13 +982,11 @@ def worktree_index_for(project_root: str) -> dict[str, bool] | None:
     - ``{...}`` → *known*. Use it directly.
     """
     try:
-        result = subprocess.run(
+        result = await run_git(
             ['git', '-C', project_root, 'worktree', 'list', '--porcelain'],
-            capture_output=True,
-            text=True,
             timeout=_GIT_TIMEOUT,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         logger.debug('live_workflow_detector: worktree list failed: %s', exc)
         return None
 
@@ -1009,7 +1008,7 @@ def _registration_from_index(index: Mapping[str, bool], branch: str) -> tuple[bo
     return True, index[ref]
 
 
-def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bool]:
+async def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bool]:
     """Return ``(registered, prunable)`` for the git worktree tracking *branch*.
 
     Runs the porcelain probe for THIS branch alone and reads the answer out of
@@ -1023,13 +1022,13 @@ def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bo
     :func:`detect_live_workflow` as ``worktree_index`` — the whole point of
     task 3778.
     """
-    index = worktree_index_for(project_root)
+    index = await worktree_index_for(project_root)
     if index is None:
         return False, False
     return _registration_from_index(index, branch)
 
 
-def _check_recent_commit(
+async def _check_recent_commit(
     project_root: str,
     branch: str,
     *,
@@ -1043,13 +1042,11 @@ def _check_recent_commit(
     of *now* (or ``datetime.now(UTC)`` when *now* is ``None``).
     """
     try:
-        result = subprocess.run(
+        result = await run_git(
             ['git', '-C', project_root, 'log', '-1', '--format=%cI', branch],
-            capture_output=True,
-            text=True,
             timeout=_GIT_TIMEOUT,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         logger.debug('live_workflow_detector: git log failed for %s: %s', branch, exc)
         return None, False
 
@@ -1101,7 +1098,7 @@ def _worktree_age_exceeded(
     return reference - last_commit_at > timedelta(hours=max_worktree_age_hours)
 
 
-def _branch_own_commit_count(project_root: str, base_branch: str, branch: str) -> int | None:
+async def _branch_own_commit_count(project_root: str, base_branch: str, branch: str) -> int | None:
     """Return the number of commits *branch* carries beyond *base_branch*.
 
     Runs ``git -C <root> rev-list --count <base_branch>..<branch>``.  A result
@@ -1113,13 +1110,11 @@ def _branch_own_commit_count(project_root: str, base_branch: str, branch: str) -
     ``0``/bare by callers).
     """
     try:
-        result = subprocess.run(
+        result = await run_git(
             ['git', '-C', project_root, 'rev-list', '--count', f'{base_branch}..{branch}'],
-            capture_output=True,
-            text=True,
             timeout=_GIT_TIMEOUT,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         logger.debug(
             'live_workflow_detector: rev-list failed for %s..%s: %s',
             base_branch, branch, exc,
