@@ -161,12 +161,15 @@ measurements above, not merely declined:
   *live recurring* gate and arming it would fail forever and train operators
   to ignore it. It is also moot: there is no live gate to rewire.
 - **(c) Re-point the gate at a population that varies and is meant to trend
-  to zero — refuted; no such population exists.** `source` and `kind` are 0
-  everywhere probed. The only varying population, `{flag_for_stage2: True}`,
-  is a healthy rolling window drained in-cycle by task 2966 while new markers
-  are minted per run — legitimately never zero, so a `--max-backlog 0` gate
-  on it would fail forever. The DELETE path must never be pointed at it
-  either (see "Why the relay pool is censused, never deleted").
+  to zero — refuted; no such population exists.** Per the census table
+  above: the `source` filter is 0 in every project probed, and `kind` is 0
+  except for the single `know_live` record (`a5732b3b`, open task 3915) —
+  which `total_source` cannot see, so it cannot move the verdict either. The
+  only varying population, `{flag_for_stage2: True}`, is a healthy rolling
+  window drained in-cycle by task 2966 while new markers are minted per run
+  — legitimately never zero, so a `--max-backlog 0` gate on it would fail
+  forever. The DELETE path must never be pointed at it either (see "Why the
+  relay pool is censused, never deleted").
 
 **Why arming the default is not option (b).** Arming a verdict path with
 *zero consumers* means nothing fails forever, because nothing runs it. Its
@@ -179,6 +182,16 @@ held was deterministic — hence a code-level guard rather than a comment. A
 gate that reads as passing from a census that saw nothing is exactly the
 silent fail-soft the repo's loud-over-silent-degradation and
 no-silent-fail-soft invariants forbid.
+
+**If you trip it — the remediation path.** An rc=1 citing
+`cross_check.blind_spot` is not a backlog finding; it says the gate is
+keyed on a filter that sees nothing, so **fix the `source`/`kind`
+enumeration to match how markers are actually tagged (or drop the gate, as
+here) before wiring anything on it** — with `source` structurally 0 and
+`flag_for_stage2` legitimately never empty, that failure is permanent until
+the enumeration is corrected. Silencing it with `--no-fail-on-blind-spot`
+restores exactly the vacuous pass this change exists to eliminate: that
+flag is **census-only, never a gate configuration**.
 
 Whether `sweep_orphan_flag_markers.py` should survive at all remains **task
 3498**'s call; this decision answers its stated precondition ("check for
