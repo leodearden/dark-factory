@@ -90,6 +90,7 @@ from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     detect_live_workflow,
     is_pure_gate_metadata,
+    worktree_index_for,
 )
 from fused_memory.services.orchestrator_detector import (
     is_orchestrator_live_for,
@@ -2729,6 +2730,33 @@ def _render_live_workflow_section(
     hoist); both are fail-safe → ``None``.  Non-in-progress tasks pass
     ``corroborated=None`` so the gate stays inert (behavior unchanged).
 
+    PER-RENDER HOISTS.  Four inputs to :func:`detect_live_workflow` are
+    invariant across every task in one render, so each is computed ONCE here
+    and threaded down through ``kwargs``:
+
+    1. :func:`is_orchestrator_live_for` — one lock file per project_root.
+    2. :func:`read_scheduler_state` — one snapshot per project_root.
+    3. :func:`orchestrator_started_at` — one restart boundary per project_root.
+    4. :func:`worktree_index_for` — the whole-repo ``git worktree list
+       --porcelain``.
+
+    The fourth is the expensive one and the reason task 3778 exists.  The
+    first three are local file reads; the fourth forks git and parses its
+    entire output, and it was being re-run inside the detector for EVERY task.
+    Measured on the dark_factory repo at ~513 registered worktrees: ~40 ms per
+    call x ~500 tasks ≈ 20 s of a 29.2 s render — work that is not merely
+    repeated but *identical* every time, and which blocked the event loop for
+    its whole duration.
+
+    All four are wrapped fail-safe.  For the worktree index specifically,
+    ``None`` is :func:`worktree_index_for`'s "unknown" sentinel and restores
+    exactly the pre-hoist behaviour (each task probes for itself), while ``{}``
+    is a real answer ("this repo has no registered worktrees") and IS threaded
+    through — see that function's three-valued contract.  A hoist failure is
+    logged at WARNING rather than swallowed: it silently costs ~20 s per
+    render, which is precisely the class of degradation this task was filed to
+    make visible.
+
     Args:
         tasks: Task dicts from the active/proactive-sample pool.  Only tasks
             with a parseable ``id`` are inspected (non-int ids are skipped).
@@ -2775,6 +2803,25 @@ def _render_live_workflow_section(
         orch_started: datetime | None = orchestrator_started_at(project_root)
     except Exception:
         orch_started = None
+
+    # Hoist the whole-repo worktree list (task 3778) — the FOURTH per-render
+    # invariant and by far the most expensive. See the docstring's "Per-render
+    # hoists" paragraph: this one `git worktree list --porcelain` was running
+    # inside detect_live_workflow for EVERY task, ~40 ms x ~500 tasks ≈ 20 s of
+    # a measured 29 s render. Fail-safe → None, which is worktree_index_for's
+    # "unknown" sentinel and restores exactly the pre-hoist per-task probe;
+    # `{}` is a real answer (no registered worktrees) and is threaded through.
+    try:
+        worktree_index: dict[str, bool] | None = worktree_index_for(str(project_root))
+    except Exception:
+        logger.warning(
+            'reconciliation._render_live_workflow_section: '
+            'worktree-index hoist failed; falling back to a per-task probe',
+            exc_info=True,
+        )
+        worktree_index = None
+    if worktree_index is not None:
+        kwargs['worktree_index'] = worktree_index
 
     live_lines: list[str] = []
 
