@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import logging
 import sys
 import types
 from pathlib import Path
@@ -39,6 +40,29 @@ def _load_module() -> types.ModuleType:
 
 
 _mod = _load_module()
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
+    tags (task 4293). That probe touches the real filesystem, so without this
+    fixture every ``--apply`` test would pass or fail according to whether the
+    machine running pytest happens to be able to write mem0's history
+    directory -- and it genuinely cannot inside an agent sandbox, which is the
+    whole reason the guard exists. This suite is deliberately MOCK-unit (a
+    MagicMock mem0 backend, no live Qdrant), so the environment must not be an
+    input to it.
+
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+
+    Deliberately NOT ``raising=False``: if the guard is ever removed from the
+    script this fixture must break loudly rather than silently no-op.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
 
 
 def _rehome_record(
@@ -449,3 +473,241 @@ class TestArgparse:
         assert args.project_id is None
         assert isinstance(args.scan_limit, int)
         assert args.scan_limit > 0
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``apply_tags`` mutates through a bare ``memory.mem0.update(...)`` on the
+    RAW backend -- deliberately bypassing MemoryService, per this script's own
+    docstring -- so a grep for the usual mutation spellings does not find it.
+    That call sits in a sequential loop behind a best-effort
+    ``except Exception`` that logs a warning per record and keeps going, and
+    ``StoreMutationUnavailable`` subclasses ``RuntimeError``, so a probe inside
+    the helper would be swallowed into N warnings while ``run`` still returned
+    a normal report. Only a run-wide probe ahead of the tagging bounds that.
+    """
+
+    def _records(self) -> list[dict]:
+        """TWO taggable records, so one-probe-per-RUN is distinguishable from
+        one-probe-per-record."""
+        return [
+            _rehome_record('m-taggable-1'),
+            _rehome_record('m-taggable-2', src_entity='task 949'),
+        ]
+
+    def _make_memory(self, records: list[dict] | None = None) -> MagicMock:
+        """Mirror of ``TestRun._make_memory``."""
+        memory = MagicMock()
+        mem0 = MagicMock()
+        all_records = self._records() if records is None else records
+        mem0.scroll_by_metadata = AsyncMock(return_value=all_records)
+        mem0.count_by_metadata = AsyncMock(return_value=len(all_records))
+        mem0.update = AsyncMock(return_value={'message': 'Memory updated successfully!'})
+        memory.mem0 = mem0
+        return memory
+
+    def _args(self, apply=True, project_id='dark_factory', scan_limit=10000):
+        """Mirror of ``TestRun._args``."""
+        return argparse.Namespace(
+            apply=apply, project_id=project_id, scan_limit=scan_limit,
+        )
+
+    def _known_map(self, pid='dark_factory') -> dict:
+        return {pid: '/some/path'}
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @staticmethod
+    def _fail_closed_records(caplog) -> list:
+        """The guard site's OWN diagnosis.
+
+        ``main`` has no handler at all here, so the refusal exits as an
+        uncaught traceback and this ERROR record is the ONLY place the operator
+        is told what was refused and what to do instead. Pinned on the
+        fail-closed marker and the remedy noun ONLY, so every other word of the
+        message stays free to reword.
+
+        Asserting on message CONTENT is deliberate, and is the narrow exception
+        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
+        this test is about is defined BY its content -- mere record-existence
+        would still pass if the whole diagnosis were replaced by "boom",
+        precisely the regression this exists to catch. Verified non-vacuous:
+        mutating the marker in the script turns this assertion red (task 4127
+        amendment).
+        """
+        return [
+            rec for rec in caplog.records
+            if rec.name == 'tag_cgl_eta_rehome_scope'
+            and rec.levelname == 'ERROR'
+            and 'NOT started (fail-closed)' in rec.getMessage()
+            and 'MCP server' in rec.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete.
+
+        The mutation asserted here is the raw ``memory.mem0.update`` a pattern
+        sweep provably misses -- it is the ONLY write this script performs.
+        """
+        self._deny(monkeypatch)
+        memory = self._make_memory()
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            await _mod.run(
+                self._args(apply=True),
+                memory=memory,
+                known_projects_map=self._known_map(),
+            )
+
+        memory.mem0.update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_the_tagging(self, monkeypatch):
+        """The scan already ran -- the probe gates only the write half.
+
+        Unlike the other guarded scripts this one probes at the ``--apply``
+        gate rather than the top of ``run``, so the scroll IS paid for. That is
+        the deliberate trade for keeping the unknown---project-id abort below
+        probe-free; what must hold is that nothing was TAGGED.
+        """
+        self._deny(monkeypatch)
+        memory = self._make_memory()
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(
+                self._args(apply=True),
+                memory=memory,
+                known_projects_map=self._known_map(),
+            )
+
+        memory.mem0.update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate -- the tag report stays obtainable from anywhere, with the
+        deny still installed."""
+        self._deny(monkeypatch)
+        memory = self._make_memory()
+
+        report = await _mod.run(
+            self._args(apply=False),
+            memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        assert report['dry_run'] is True
+        assert report['totals']['taggable'] == 2
+        assert report['totals']['tagged'] == 0
+        memory.mem0.update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment tags exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        memory = self._make_memory()
+
+        report = await _mod.run(
+            self._args(apply=True),
+            memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        assert report['dry_run'] is False
+        assert report['totals']['tagged'] == 2
+        assert memory.mem0.update.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode -- and with TWO taggable
+        records in the scroll it is still probed once for the RUN."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        memory = self._make_memory()
+
+        report = await _mod.run(
+            self._args(apply=True),
+            memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        assert report['totals']['tagged'] == 2
+        assert len(calls) == 1, 'probed ONCE per run, not once per record'
+        assert 'tag_cgl_eta_rehome_scope' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    @pytest.mark.asyncio
+    async def test_the_unknown_project_id_abort_never_probes(self, monkeypatch):
+        """A run that aborts before reaching the tagging must not be gated on
+        write capability -- it mutates nothing.
+
+        This is the test that pins the placement at the ``if args.apply:`` gate
+        rather than the top of ``run``: hoisting the probe would turn a clear
+        "unknown --project-id" abort into an unrelated store-capability
+        refusal for anyone diagnosing a typo'd flag from a sandbox.
+        """
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        memory = self._make_memory()
+
+        report = await _mod.run(
+            self._args(apply=True, project_id='no-such-project'),
+            memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        assert report['aborted'] is True
+        assert calls == [], 'an abort that mutates nothing must not probe'
+        memory.mem0.update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_loud(self, monkeypatch, caplog):
+        """The guard site logs its own fail-closed diagnosis before raising.
+
+        Nothing downstream will: this script's ``main`` has no blanket handler,
+        so without this record the operator sees a bare traceback naming an
+        exception class and no remedy.
+        """
+        self._deny(monkeypatch)
+        memory = self._make_memory()
+
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(_mod.StoreMutationUnavailable),
+        ):
+            await _mod.run(
+                self._args(apply=True),
+                memory=memory,
+                known_projects_map=self._known_map(),
+            )
+
+        assert self._fail_closed_records(caplog), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
+        memory.mem0.update.assert_not_awaited()
