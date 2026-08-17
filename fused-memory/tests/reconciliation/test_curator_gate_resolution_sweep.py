@@ -26,6 +26,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -287,6 +288,11 @@ class TestBuildGateResolutionFlag:
         )
 
 
+def _raise(exc):
+    """Raise *exc* from inside a lambda side_effect."""
+    raise exc
+
+
 def _make_memory_service(*, counts=None, memories=None) -> MagicMock:
     """MagicMock memory_service with AsyncMock metadata readers.
 
@@ -412,3 +418,109 @@ class TestSweepResolvedCuratorGates:
         assert stats == {'flags': [], 'scanned': 0, 'resolved': 0, 'errors': 0}
         memory_service.count_memories_by_metadata.assert_not_awaited()
         memory_service.get_memories_by_metadata.assert_not_awaited()
+
+
+class TestSweepResolvedCuratorGatesFailSafe:
+    """A backend failure is tallied, never mistaken for evidence either way.
+
+    The fail-safe direction is asymmetric and deliberate: an errored read must
+    never be recorded as "this gate is resolved", because acting on that flag
+    would close a still-open human decision gate. It must also never abort the
+    sweep for the remaining gates.
+    """
+
+    @pytest.mark.asyncio
+    async def test_count_failure_tallies_error_and_loop_continues(self):
+        """One gate's count raising leaves it unflagged; a later healthy gate still flags."""
+        memory_service = _make_memory_service(
+            memories={'curator_gate_5563': [{'id': 'mem-b'}]},
+        )
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=lambda project_id, filters: (
+                _raise(RuntimeError('qdrant down'))
+                if filters['source'] == 'curator_gate_5561'
+                else 1
+            ),
+        )
+
+        stats = await sweep_resolved_curator_gates(
+            memory_service, 'reify', ['5561', '5563'],
+        )
+
+        assert stats['errors'] == 1, f'the failed count must be tallied, got {stats!r}'
+        assert stats['scanned'] == 2
+        assert stats['resolved'] == 1, 'an errored read is never "resolved"'
+        assert [f['task_id'] for f in stats['flags']] == ['5563'], (
+            f'the loop must continue past the failure, got {stats["flags"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_count_timeout_is_not_read_as_no_curator_entry(self):
+        """A Qdrant read-timeout PROPAGATES out of count_memories_by_metadata.
+
+        It is not returned as 0, so it must be caught as an error here rather
+        than silently recorded as "no curator entry" (or as "resolved").
+        """
+        memory_service = _make_memory_service(
+            memories={'curator_gate_5563': [{'id': 'mem-b'}]},
+        )
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=lambda project_id, filters: (
+                _raise(TimeoutError('qdrant read timed out'))
+                if filters['source'] == 'curator_gate_5561'
+                else 1
+            ),
+        )
+
+        stats = await sweep_resolved_curator_gates(
+            memory_service, 'reify', ['5561', '5563'],
+        )
+
+        assert stats['errors'] == 1
+        assert stats['resolved'] == 1
+        assert [f['task_id'] for f in stats['flags']] == ['5563']
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_after_positive_count_emits_no_flag(self):
+        """Uncertain evidence must never become a "this gate is resolved" claim."""
+        memory_service = _make_memory_service(
+            counts={'curator_gate_5561': 2, 'curator_gate_5563': 1},
+            memories={'curator_gate_5563': [{'id': 'mem-b'}]},
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(
+            side_effect=lambda project_id, filters: (
+                _raise(RuntimeError('scroll failed'))
+                if filters['source'] == 'curator_gate_5561'
+                else [{'id': 'mem-b'}]
+            ),
+        )
+
+        stats = await sweep_resolved_curator_gates(
+            memory_service, 'reify', ['5561', '5563'],
+        )
+
+        assert stats['errors'] == 1, f'the failed fetch must be tallied, got {stats!r}'
+        assert [f['task_id'] for f in stats['flags']] == ['5563'], (
+            'a gate whose citation fetch failed must not be flagged resolved, got '
+            f'{stats["flags"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exc', [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+    async def test_cancellation_from_count_is_reraised(self, exc):
+        """CancelledError/KeyboardInterrupt/SystemExit are never swallowed as best-effort."""
+        memory_service = _make_memory_service()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=exc)
+
+        with pytest.raises(exc):
+            await sweep_resolved_curator_gates(memory_service, 'reify', ['5561'])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('exc', [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+    async def test_cancellation_from_fetch_is_reraised(self, exc):
+        """Same for the citation fetch after a positive count."""
+        memory_service = _make_memory_service(counts={'curator_gate_5561': 1})
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=exc)
+
+        with pytest.raises(exc):
+            await sweep_resolved_curator_gates(memory_service, 'reify', ['5561'])
