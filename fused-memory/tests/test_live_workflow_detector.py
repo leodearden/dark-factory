@@ -2219,3 +2219,200 @@ class TestWorktreeStaleGate:
 
         assert result.is_live is False
         assert 'stale-worktree downgrade' in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# task 3778 step-5: the worktree-list hoist
+# ---------------------------------------------------------------------------
+
+
+def _counting_git_side_effect(worktree_stdout: str):
+    """A `_git_side_effect` that additionally tallies calls PER git subcommand.
+
+    Returns ``(side_effect, counts)`` where ``counts`` carries a
+    ``'worktree_list'`` key.  The hoist's whole point is that this particular
+    tally stops scaling with the number of tasks probed, so it has to be
+    countable independently of the other two legs.
+    """
+    counts = {'worktree_list': 0, 'log': 0, 'rev_list': 0}
+
+    def side_effect(args, **kwargs):
+        if '--porcelain' in args:
+            counts['worktree_list'] += 1
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=worktree_stdout, stderr='',
+            )
+        if 'rev-list' in args:
+            counts['rev_list'] += 1
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout='3', stderr='',
+            )
+        counts['log'] += 1
+        return subprocess.CompletedProcess(args=args, returncode=1, stdout='', stderr='')
+
+    return side_effect, counts
+
+
+class TestParseWorktreeIndex:
+    """`parse_worktree_index` is the SINGLE home of the stanza/prunable semantics.
+
+    `_check_worktree_registered` is re-expressed on top of it, so the porcelain
+    grammar cannot drift between the per-task probe and the hoisted index.
+    """
+
+    def test_matching_stanza_without_prunable_line_is_not_prunable(self):
+        index = detector_module.parse_worktree_index(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        assert index[f'refs/heads/{_BRANCH}'] is False
+
+    def test_matching_stanza_with_prunable_line_is_prunable(self):
+        index = detector_module.parse_worktree_index(
+            _worktree_porcelain_prunable(_BRANCH)
+        )
+
+        assert index[f'refs/heads/{_BRANCH}'] is True
+
+    def test_absent_branch_is_absent_from_the_map(self):
+        index = detector_module.parse_worktree_index(_worktree_porcelain_no_branch())
+
+        assert f'refs/heads/{_BRANCH}' not in index
+        assert index['refs/heads/main'] is False
+
+    @pytest.mark.parametrize(
+        'stdout',
+        ['', '\n', '\n\n\n', '   \n  \n', 'garbage without any branch line\n',
+         'worktree /x\nHEAD abc\n\n'],
+        ids=['empty', 'newline', 'blank-stanzas', 'whitespace', 'garbage', 'detached'],
+    )
+    def test_malformed_or_empty_input_yields_empty_map_never_raises(self, stdout):
+        assert detector_module.parse_worktree_index(stdout) == {}
+
+    def test_multiple_stanzas_all_indexed(self):
+        stdout = (
+            _worktree_porcelain_no_branch()
+            + _worktree_porcelain_prunable(_BRANCH)
+        )
+
+        index = detector_module.parse_worktree_index(stdout)
+
+        assert index == {'refs/heads/main': False, f'refs/heads/{_BRANCH}': True}
+
+
+@pytest.mark.usefixtures('_patch_orchestrator_live_default')
+class TestDetectLiveWorkflowWorktreeIndexHoist:
+    """`worktree_index` short-circuits the per-task `git worktree list` probe.
+
+    Three-valued contract, deliberately:
+      ``None``  -> unknown (probe failed, or no hoist) -> probe per task
+      ``{}``    -> known: the repo has no registered worktrees -> no probe
+      ``{...}`` -> known: use it
+
+    Collapsing `None` into `{}` would turn a transient git glitch into a
+    project-wide "nothing is live" verdict — precisely the false negative the
+    exemption rules exist to prevent.
+    """
+
+    _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    def test_injected_index_issues_no_worktree_list_subprocess(self, tmp_path):
+        side_effect, counts = _counting_git_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                worktree_index={f'refs/heads/{_BRANCH}': False},
+            )
+
+        assert counts['worktree_list'] == 0, 'the hoisted index must skip the probe'
+        assert result.worktree_registered is True
+        # The other two legs are untouched by this hoist and still run.
+        assert counts['log'] + counts['rev_list'] > 0
+
+    def test_default_none_is_todays_behaviour_one_probe_per_detect(self, tmp_path):
+        side_effect, counts = _counting_git_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert counts['worktree_list'] == 1
+        assert result.worktree_registered is True
+
+    def test_empty_map_means_known_empty_not_unknown(self, tmp_path):
+        """`{}` is a POSITIVE answer, distinct from `None` — still no probe."""
+        side_effect, counts = _counting_git_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        with patch('subprocess.run', side_effect=side_effect):
+            result = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, worktree_index={},
+            )
+
+        assert counts['worktree_list'] == 0
+        assert result.worktree_registered is False
+
+    def test_injected_prunable_entry_is_not_registered(self, tmp_path):
+        """Fail-safe parity: prunable => not registered, same as the subprocess path."""
+        side_effect, counts = _counting_git_side_effect(
+            _worktree_porcelain_prunable(_BRANCH)
+        )
+
+        with patch('subprocess.run', side_effect=side_effect):
+            hoisted = detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                worktree_index={f'refs/heads/{_BRANCH}': True},
+            )
+            probed = detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert counts['worktree_list'] == 1, 'only the un-hoisted call may probe'
+        assert hoisted.worktree_registered is False
+        assert probed.worktree_registered is False
+
+
+class TestWorktreeIndexFor:
+    """`worktree_index_for` is the one place the hoisted subprocess happens."""
+
+    def test_returns_parsed_index_on_success(self, tmp_path):
+        side_effect, counts = _counting_git_side_effect(
+            _worktree_porcelain_with_branch(_BRANCH)
+        )
+
+        with patch('subprocess.run', side_effect=side_effect):
+            index = detector_module.worktree_index_for(str(tmp_path))
+
+        assert index == {f'refs/heads/{_BRANCH}': False}
+        assert counts['worktree_list'] == 1
+
+    def test_returns_none_on_subprocess_error(self, tmp_path):
+        """`None`, NOT `{}` — an error must not read as "no worktrees exist"."""
+        with patch('subprocess.run', side_effect=OSError('boom')):
+            assert detector_module.worktree_index_for(str(tmp_path)) is None
+
+    def test_returns_none_on_timeout(self, tmp_path):
+        with patch(
+            'subprocess.run',
+            side_effect=subprocess.TimeoutExpired(cmd=['git'], timeout=10),
+        ):
+            assert detector_module.worktree_index_for(str(tmp_path)) is None
+
+    def test_returns_none_on_nonzero_returncode(self, tmp_path):
+        def _fail(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=128, stdout='', stderr='not a git repository',
+            )
+
+        with patch('subprocess.run', side_effect=_fail):
+            assert detector_module.worktree_index_for(str(tmp_path)) is None
+
+    def test_returns_empty_map_for_a_repo_with_no_matching_worktrees(self, tmp_path):
+        """Success with nothing to report is `{}` — a real answer, not `None`."""
+        side_effect, _ = _counting_git_side_effect('')
+
+        with patch('subprocess.run', side_effect=side_effect):
+            assert detector_module.worktree_index_for(str(tmp_path)) == {}
