@@ -45,6 +45,7 @@ __all__ = [
     'ServerError',
     'ZeroOutputWedge',
     'Failure',
+    'auth_failure_reason',
     'classify_invocation',
 ]
 
@@ -92,6 +93,23 @@ class AuthFailed(InvocationOutcome):
     # ``slot.report(outcome)``. Optional-with-a-default on purpose: every existing
     # bare ``AuthFailed(status=...)`` construction site keeps working.
     body: str = ''
+
+
+def auth_failure_reason(outcome: AuthFailed) -> str:
+    """Render the reason string handed to ``UsageGate._handle_auth_failure``.
+
+    SINGLE definition site on purpose: this string has two callers —
+    production ``usage_gate.InvokeSlot.report`` and the shipped mock-gate
+    mirror ``shared.testing.make_gate_mock`` — whose own docstring requires
+    them to stay byte-for-byte in step. It was a trivial f-string until the
+    body snippet made it conditional, and two hand-maintained copies of a
+    conditional is exactly the drift this module's single-source ethos
+    (``TestSingleSourceOwnership``) exists to prevent.
+
+    An empty ``body`` yields the bare ``HTTP {status}`` produced before the
+    snippet was restored — no trailing separator.
+    """
+    return f'HTTP {outcome.status}: {outcome.body}' if outcome.body else f'HTTP {outcome.status}'
 
 
 @dataclass(frozen=True)
