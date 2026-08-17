@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from shared.cli_invoke import AgentResult, invoke_with_cap_retry
 from shared.usage_gate import UsageGate
 
 from orchestrator.agents.briefing import BriefingAssembler
@@ -697,6 +698,10 @@ async def run_architect_eval(
     # (run_eval convention — the CLI threads the same --timeout to both); without
     # this a hung architect run would block indefinitely, bounded only by
     # max_budget_usd.
+    #
+    # Since eval-revival φ this bounds each ATTEMPT, not the whole cap-retry
+    # loop — see _timed_invoke below for why the distinction is load-bearing
+    # rather than incidental.
     timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
     # Hoisted out of the try so its PRICE TABLE survives to the cost resolution
     # after the finally. A harness crash before it is built leaves an explicit
@@ -734,11 +739,7 @@ async def run_architect_eval(
         usage_gate: UsageGate | None = None
         if orch_config.usage_cap.enabled:
             try:
-                # noqa is TEMPORARY and must be deleted by the call-site swap
-                # below: until the architect invoke is routed through
-                # invoke_with_cap_retry, this gate has no consumer and F841 is
-                # telling the truth.
-                usage_gate = UsageGate(orch_config.usage_cap)  # noqa: F841
+                usage_gate = UsageGate(orch_config.usage_cap)
             except Exception as exc:
                 logger.warning(f'Failed to create UsageGate for eval: {exc} — running without failover')
 
@@ -765,22 +766,56 @@ async def run_architect_eval(
         # strict_mcp_config stays default False so the ambient .mcp.json
         # escalation/fused-memory servers still merge, mirroring _invoke.
         mcp_config = _inject_plan_tools_mcp(None, worktree)
-        result = await asyncio.wait_for(
-            invoke_agent(
-                prompt=prompt,
-                system_prompt=ARCHITECT.system_prompt,
-                cwd=worktree,
-                model=config.model,
-                max_turns=task.get('max_architect_turns', 50),
-                max_budget_usd=config.max_budget_usd,
-                allowed_tools=ARCHITECT.allowed_tools or None,
-                disallowed_tools=ARCHITECT.disallowed_tools or None,
-                effort=config.effort or 'high',
-                backend=config.backend,
-                env_overrides=config.env_overrides or None,
-                mcp_config=mcp_config,
-            ),
-            timeout=timeout_minutes * 60,
+
+        async def _timed_invoke(**kwargs) -> AgentResult:
+            """Bound ONE attempt by the operator's --timeout.
+
+            The timeout deliberately lives HERE, per attempt, rather than
+            wrapped around ``invoke_with_cap_retry`` as a whole. Wrapping the
+            retry loop would make a cap WAIT surface as ``TimeoutError`` →
+            ``outcome='timeout'`` → NOT tainted (the deliberate timeout
+            asymmetry in the docstring above) → a cap-starved cell scored a
+            fabricated 0.0 and INCLUDED in the mean. That is exactly the
+            differential-exclusion bias φ exists to remove, and it would fire
+            whenever the operator's --timeout is shorter than the cap patience
+            bound.
+
+            Per-attempt keeps the two clocks orthogonal and each one's meaning
+            intact: candidate-attributable slowness → ``TimeoutError`` →
+            ``outcome='timeout'``, kept and scored on content; infra cap
+            starvation → ``AllAccountsCappedException`` → the cap backstop.
+            Worst-case wall clock stays bounded in practice because a
+            cap-classified attempt is by construction near-instant and
+            zero-cost, so an attempt that burns the full timeout is never the
+            one being retried.
+            """
+            return await asyncio.wait_for(
+                invoke_agent(**kwargs), timeout=timeout_minutes * 60,
+            )
+
+        # Account failover (eval-revival φ): all retry/resume/backoff behaviour
+        # comes from the shared wrapper — this call site adds none of its own.
+        # With usage_gate=None it degrades to a single invocation, i.e. exactly
+        # the pre-φ behaviour, so a deployment with usage_cap disabled is
+        # unchanged. `backend` moves to the wrapper's own keyword-only
+        # parameter, which forwards it into the dispatched call because a
+        # custom invoke_fn is supplied.
+        result = await invoke_with_cap_retry(
+            usage_gate,
+            f'Architect eval {task_id} × {config.name}',
+            invoke_fn=_timed_invoke,
+            backend=config.backend,
+            prompt=prompt,
+            system_prompt=ARCHITECT.system_prompt,
+            cwd=worktree,
+            model=config.model,
+            max_turns=task.get('max_architect_turns', 50),
+            max_budget_usd=config.max_budget_usd,
+            allowed_tools=ARCHITECT.allowed_tools or None,
+            disallowed_tools=ARCHITECT.disallowed_tools or None,
+            effort=config.effort or 'high',
+            env_overrides=config.env_overrides or None,
+            mcp_config=mcp_config,
         )
         arch_cost_usd = result.cost_usd
         # ``or 0``, not a bare read: AgentResult declares both ``int | None``,
