@@ -5063,10 +5063,12 @@ class MemoryService:
         # metadata-only path — a caller must get the same resulting metadata
         # whether or not it also amended the content.
         #
-        # The set_payload / delete_payload fast paths deliberately do NOT read
-        # it: they hand the raw patch / key list to Qdrant and let it apply
-        # merge and delete SERVER-side, which is the entire reason those routes
-        # can skip a read-modify-write. So the INV-5 single-home claim is
+        # The set_payload / delete_payload fast paths read it for VALUES only
+        # (task 3523 — so the seam's `supersedes` scalar→list normalization is
+        # not lost on this route), never for merge / delete SEMANTICS: they
+        # still name only the patch keys / key list and let Qdrant apply the
+        # merge and the delete SERVER-side, which is the entire reason those
+        # routes can skip a read-modify-write. So the INV-5 single-home claim is
         # narrower than "every arm calls _apply_metadata_delta": merge and
         # delete semantics have two implementations that have to agree — this
         # one and Qdrant's primitives. ``TestMetadataFastPathEquivalence`` pins
@@ -5195,8 +5197,21 @@ class MemoryService:
             elif metadata_patch:
                 # Qdrant merges server-side, so unlisted pre-existing keys
                 # survive without this layer reconstructing the whole payload.
+                #
+                # The VALIDATED values for the patch keys, not the raw patch
+                # (task 3523): the vocabulary seam normalizes in place —
+                # `supersedes` scalar→list, PRD D2 — and writing the raw patch
+                # here would persist the legacy scalar on this route while the
+                # overwrite and content arms persisted a list. Restricted to
+                # the patch keys, so the fast path keeps its whole point:
+                # Qdrant still merges server-side and no pre-image key the
+                # caller did not name is rewritten.
                 operation = 'update_memory_set_payload'
-                coro = self.mem0.set_payload(memory_id, dict(metadata_patch), scope)
+                coro = self.mem0.set_payload(
+                    memory_id,
+                    {k: new_custom[k] for k in metadata_patch if k in new_custom},
+                    scope,
+                )
             else:
                 operation = 'update_memory_delete_payload'
                 coro = self.mem0.delete_payload(
