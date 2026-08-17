@@ -371,3 +371,42 @@ def serve_escalation_mcp():
             'bound -- event loop stop is hung or the server task is stuck in a '
             'non-cancellable await (task 2741)'
         )
+
+
+@pytest.fixture
+def escalation_conftest():
+    """This conftest module itself, for tests that need its RAW attributes.
+
+    The fixtures above auto-resolve by name, but some of this module's
+    contents are not fixtures at all (``_mcp_handshake_ready``,
+    ``_free_escalation_port``) and some tests need the UNDECORATED generator
+    behind ``serve_escalation_mcp`` via ``__wrapped__``, so that one server's
+    startup and teardown can be observed in isolation. Handing the module over
+    through a fixture is how those tests reach it; see
+    ``test_serve_escalation_mcp_fixture.py``.
+
+    ``sys.modules[__name__]`` rather than a bare ``import conftest`` in the
+    test module, and the two are NOT interchangeable. A module's ``__name__``
+    is by definition the key it is registered under in ``sys.modules``, so this
+    lookup returns THIS module whatever name pytest assigned it. That matters
+    because under the repo-wide ``--import-mode=importlib`` addopts pytest
+    names a conftest BY COLLISION: measured, this file is ``'conftest'`` under
+    ``cd escalation && pytest tests/...`` but ``'escalation.tests.conftest'``
+    once the repo-root ``conftest.py`` shim claims the bare name first (any
+    repo-root multi-package run). A bare ``import conftest`` asks for a name
+    another package's conftest may already own, and binds whatever won it.
+
+    Two measured properties callers rely on:
+
+    * The object is ``is``-identical to
+      ``request.config.pluginmanager.get_plugin(str(Path(__file__)))`` -- the
+      live module pytest itself loaded, not a second import of the same file
+      (pinned by ``test_the_conftest_reference_is_resolved_by_identity_...``).
+    * Because it is that live module, ``monkeypatch.setattr`` against it really
+      does patch what ``serve_escalation_mcp``'s body reads (verified: the
+      fixture picked up a patched ``_free_escalation_port``).
+
+    Function-scoped deliberately -- it holds no state and is cheap, so it
+    imposes no scope floor on the tests that request it.
+    """
+    return sys.modules[__name__]
