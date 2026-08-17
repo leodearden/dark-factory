@@ -1,11 +1,24 @@
-"""Shared systemd unit parser for the unit-parity checkers.
+"""Shared helpers for the unit-parity checkers.
 
-Holds no CLI and no policy of its own — just the parser
-(``_join_continuations`` + ``parse_unit_directives``) that turns a unit file
-into ``{section: {key: [value, ...]}}``. It exists because a SECOND consumer
-appeared: ``scripts/check_dashboard_unit_parity.py`` wrote the parser, and
+Holds no CLI and no policy of its own — just the pieces every
+``check_*_unit_parity.py`` needs: the parser (``_join_continuations`` +
+``parse_unit_directives``) that turns a unit file into
+``{section: {key: [value, ...]}}``, and ``find_dropins``, which reports the
+``.conf`` files systemd would layer over a unit.
+
+The parser landed first, because a SECOND consumer appeared:
+``scripts/check_dashboard_unit_parity.py`` wrote it, and
 ``scripts/check_orchestrator_unit_parity.py`` needs exactly it and nothing
 else from that module.
+
+``find_dropins`` is the SECOND lift, and it arrived here in worse shape than
+the parser did: it was ALREADY duplicated, code-identical, in both of those
+checkers (only the docstrings' example directives differed). So this move
+collapses an existing fork rather than pre-empting a hypothetical one. What
+forced it was a THIRD consumer, ``scripts/check_lms_unit_parity.py``, whose
+whole subject is a drop-in that survives reinstallation — writing a third
+pasted copy to detect silent overrides would have been the same silent
+duplication one level up.
 
 Lifting rather than duplicating follows the precedent
 ``tests/scripts/systemd_unit_invariants.py`` set, which task 3408 moved out of
@@ -50,9 +63,14 @@ both contexts these scripts run in:
   mode pytest deliberately does NOT perform the ``sys.path`` mutation the
   prepend/append modes do.
 
-Stdlib-only and import-free by design, so both checkers stay runnable under a
-plain ``python3`` with no environment set up.
+Stdlib-only by design, so every checker stays runnable under a plain
+``python3`` with no environment set up. ``pathlib`` — required by
+``find_dropins`` — is the module's ONE import, and it should stay that way:
+anything needing more than the stdlib's most boring corner does not belong
+here.
 """
+
+import pathlib
 
 
 def _join_continuations(text: str) -> list[str]:
@@ -138,3 +156,31 @@ def parse_unit_directives(text: str) -> dict[str, dict[str, list[str]]]:
             continue
         sections[current].setdefault(key.strip(), []).append(value.strip())
     return sections
+
+
+def find_dropins(installed_dir: pathlib.Path, unit_name: str) -> list[pathlib.Path]:
+    """Return the ``.conf`` drop-ins systemd would layer over *unit_name*.
+
+    ``systemctl --user edit`` does not modify the unit file; it writes
+    ``<unit>.d/override.conf`` beside it, and systemd merges that over the
+    unit at load time.  Reading only ``<installed-dir>/<unit>`` is therefore
+    blind to it: a drop-in redeclaring a single directive leaves every
+    compared directive matching while the RUNNING configuration is not the
+    committed one — the precise claim these gates exist to make checkable.
+
+    Not hypothetical on this host: ``~/.config/systemd/user/
+    orchestrator-reify.service.d/`` exists, so the mechanism is already in
+    live use here.
+
+    Returns the sorted ``.conf`` files, or ``[]`` when the directory is absent
+    or holds none (systemd ignores non-``.conf`` files there, so this counts
+    exactly what would take effect — counting a stray ``override.conf.bak``
+    would report an override that has no effect at all).
+
+    Consulted EVEN WHEN the unit file itself is at parity; see each consumer's
+    main().
+    """
+    dropin_dir = installed_dir / f"{unit_name}.d"
+    if not dropin_dir.is_dir():
+        return []
+    return sorted(p for p in dropin_dir.glob("*.conf") if p.is_file())
