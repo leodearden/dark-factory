@@ -1108,6 +1108,30 @@ class ReconReportState:
         (relying on this computed default, correctly, since that finding
         shape is genuinely informational).
 
+        Ripple with task-1654 read-time suppression: :meth:`get_assembled_report`
+        already drops any ``actionable=False`` finding whose citations trace
+        exclusively to a same-run ``memory_consolidator`` finding's
+        citations (see that method's docstring and
+        :func:`_traces_exclusively_to_stage1`). A caller that previously
+        omitted ``actionable`` on a null-task_id or ``cross_project*``
+        finding — and relied on the old hardcoded ``True`` default to
+        survive that filter — now gets the computed ``False`` default
+        instead, which satisfies that predicate's necessary condition and
+        makes the finding newly eligible to be dropped from flagged_items at read time.
+        The finding is not deleted or made unreachable: the
+        row remains in ``_state``/``_run_finding_index``, so cross-stage
+        ``cite_*`` resolution and :meth:`get_findings_for_run` are
+        unaffected — only the ``flagged_items`` projection omits it.
+        Suppression is not unconditional either: it is skipped entirely
+        when ``stage == 'memory_consolidator'``, and it also requires at
+        least one citation whose identity set is a subset of the same-run
+        Stage-1 identity union. This is the intended tightening — marking
+        these findings non-actionable by default is the whole point of
+        this computed default — but it is a behaviour change existing
+        callers must know about: an omitted-actionable finding of this
+        shape can no longer be assumed to appear in flagged_items. Pass an
+        explicit ``actionable=True`` if it must still surface there.
+
         A null/missing ``flag_type`` on a re-raise of an already-flagged
         ``task_id`` inherits that task's single established flag_type before
         the signature lookup runs (task-2318), so an under-specified re-raise
@@ -2605,6 +2629,12 @@ Usage pattern (per PRD §9.2):
                   genuinely actionable finding under a NEW category that
                   happens to start with 'cross_project', pass
                   actionable=True explicitly -- do not rely on the default.
+                  Also note: a non-actionable finding whose citations trace
+                  exclusively to a same-run memory_consolidator finding's
+                  citations is dropped from flagged_items at read time
+                  (task-1654, see get_assembled_report) -- pass
+                  actionable=True if a null-task_id/cross_project* finding
+                  must still surface there.
 3. set_stat / inc_stat — track numeric metrics during the run.
 4. complete — stamp the summary and close the report; idempotent.
 5. delete_finding(run_id, finding_id) — IRREVERSIBLE retraction of a
@@ -2675,7 +2705,12 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         match, not an allowlist -- a NEW 'cross_project'-prefixed category
         that is genuinely actionable must still pass actionable=True
         explicitly (see ReconReportState.add_finding's docstring for the
-        full rationale).
+        full rationale).  Note: an actionable=False finding (whether
+        explicit or defaulted) whose citations trace exclusively to a
+        same-run memory_consolidator finding's citations is
+        dropped from flagged_items at read time (task-1654, see
+        get_assembled_report) -- pass actionable=True if a
+        null-task_id/cross_project* finding must still surface there.
         """
         return state.add_finding(
             run_id=run_id,
