@@ -855,13 +855,19 @@ The workflow for each step is:
 
 ## Scope Boundary
 
-Your write access is restricted to the files assigned to this task. If you attempt
-to modify files outside these directories, you will get a permission error. This is
-intentional — it prevents cross-task interference during concurrent execution.
+The sandbox enforces worktree containment, not per-file plan scope. Writes
+outside this worktree — the main checkout, sibling task worktrees, other
+tasks' `.task-meta/` directories, `git update-ref refs/heads/main`,
+`~/.claude` — fail with EACCES or EROFS. But every file inside this
+worktree is writable, including files never listed in the plan's assigned
+scope. Nothing in the sandbox stops you from editing outside scope, and
+nothing else detects it either.
 
-If you genuinely need to modify files outside your assigned scope, this indicates
-the task's scope needs expansion. Use the escalate_blocker tool to request scope
-expansion rather than trying to work around the restriction.
+Staying within the plan's assigned files is therefore your responsibility,
+not the sandbox's. If you genuinely need to modify files outside your
+assigned scope, that is the ONLY mechanism to request it: call
+`escalate_blocker` with `category='scope_violation'` BEFORE making the
+edit, rather than widening scope on your own.
 
 ## Important
 
@@ -920,13 +926,19 @@ still ends up staged.
 
 ## Scope Boundary
 
-Your write access is restricted to the files assigned to this task. If you attempt
-to modify files outside these directories, you will get a permission error. This is
-intentional — it prevents cross-task interference during concurrent execution.
+The sandbox enforces worktree containment, not per-file plan scope. Writes
+outside this worktree — the main checkout, sibling task worktrees, other
+tasks' `.task-meta/` directories, `git update-ref refs/heads/main`,
+`~/.claude` — fail with EACCES or EROFS. But every file inside this
+worktree is writable, including files never listed in the plan's assigned
+scope. Nothing in the sandbox stops you from editing outside scope, and
+nothing else detects it either.
 
-If you genuinely need to modify files outside your assigned scope, this indicates
-the task's scope needs expansion. Use the escalate_blocker tool to request scope
-expansion rather than trying to work around the restriction.
+Staying within the plan's assigned files is therefore your responsibility,
+not the sandbox's. If you genuinely need to modify files outside your
+assigned scope, that is the ONLY mechanism to request it: call
+`escalate_blocker` with `category='scope_violation'` BEFORE making the
+edit, rather than widening scope on your own.
 
 ## Important
 
@@ -1918,9 +1930,16 @@ git add -- .
 
 ## Scope Boundary
 
-Your write access is restricted to the files assigned to this task. If you
-need to modify files outside scope, that's a signal the task does not fit
-the simple path — stop and let the architect take over.
+The sandbox enforces worktree containment, not per-file plan scope: writes
+outside this worktree fail with EACCES or EROFS, but every file INSIDE
+it is writable, including files never listed in the plan's assigned scope.
+Nothing stops you from editing outside scope, and nothing else detects it
+either — staying within the plan's assigned files is your responsibility.
+
+If you need to modify files outside scope, that's a signal the task does
+not fit the simple path. Call `escalate_blocker` with
+`category='scope_violation'` — it is the only mechanism to request scope
+expansion — then stop and let the architect take over.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash',
