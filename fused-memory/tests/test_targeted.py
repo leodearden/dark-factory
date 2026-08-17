@@ -4003,3 +4003,194 @@ async def test_reopen_then_redone_cites_fresh_provenance(
 
     metadata = first_call.kwargs.get('metadata') or {}
     assert metadata.get('echo_used_provenance') is True
+
+
+# ── Task 4343: verification-failure audit rows ──────────────────────────
+#
+# The defect: reconciliation's codebase-verification branch recorded a
+# durable row ONLY for confirmed/contradicted.  A verifier whose agent never
+# produced a parseable verdict returned the caller-supplied default
+# ('inconclusive') and fell straight through the gate, leaving nothing behind
+# — byte-identical to a healthy "I looked and found nothing either way".
+# The raised-failure path only logged.  Across 20,490 runs the task measured
+# ZERO rows matching '%no_tool_calls%', '%agent-failed%' or '%Claude CLI
+# agent%'.
+#
+# These tests assert through the REAL ReconciliationJournal fixture
+# (get_recent_runs -> get_run_actions), so they exercise the actual SQLite
+# run_actions table whose emptiness was measured — not a mock call.
+
+
+def _verify_rows(actions: list[dict]) -> list[dict]:
+    """The verify/codebase audit rows from a run's action list."""
+    return [
+        a for a in actions
+        if a['action_type'] == 'verify' and a['target'] == 'codebase'
+    ]
+
+
+async def _run_done_transition(reconciler, task_id: str = '1') -> dict:
+    """Drive a done-transition through the sparse-knowledge verify branch.
+
+    mock_memory_service.search defaults to [], so len(related) < 2 and the
+    verification branch opens with no extra setup.
+    """
+    return await reconciler.reconcile_task(
+        task_id=task_id, transition='done', project_id='test-project',
+        project_root='/tmp/test',
+        task_before={'id': task_id, 'title': 'Test', 'status': 'in-progress'},
+    )
+
+
+class TestVerificationFailureAudit:
+    """A failed verifier must leave a durable, distinguishable record."""
+
+    @pytest.mark.asyncio
+    async def test_agent_failure_records_durable_run_action(
+        self, reconciler, journal, mock_memory_service, caplog
+    ):
+        """An agent failure lands a verify/codebase/agent_failed row.
+
+        The row is what an operator can query months later; the WARNING alone
+        is not, which is why 20,490 runs of evidence turned up nothing.
+        """
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=VerificationVerdict.inconclusive,
+            confidence=0.0,
+            evidence=[],
+            summary='agent-failed:no_tool_calls',
+            agent_failed=True,
+            failure_token='cli_output_empty',
+        ))
+
+        with caplog.at_level(logging.WARNING):
+            result = await _run_done_transition(reconciler)
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        assert len(runs) == 1
+        actions = await journal.get_run_actions(runs[0].id)
+
+        rows = [a for a in _verify_rows(actions) if a['operation'] == 'agent_failed']
+        assert len(rows) == 1, (
+            f'Expected exactly one verify/codebase/agent_failed row, got '
+            f'{[(a["action_type"], a["target"], a["operation"]) for a in actions]}'
+        )
+        assert rows[0]['detail'].get('failure_token') == 'cli_output_empty', (
+            f'Expected the specific token in detail, got {rows[0]["detail"]!r}'
+        )
+        assert rows[0]['detail'].get('task_id') == '1', (
+            f'Expected task_id in detail, got {rows[0]["detail"]!r}'
+        )
+
+        assert any(a['type'] == 'verification_agent_failed' for a in result.get('actions', [])), (
+            f'Expected a verification_agent_failed action, got {result.get("actions")}'
+        )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('cli_output_empty' in r.getMessage() and '1' in r.getMessage()
+                   for r in warnings), (
+            f'Expected a WARNING naming the token and the task, got '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+        # A failed verifier must NOT write a completion claim.
+        assert not [a for a in result.get('actions', [])
+                    if a['type'] in ('knowledge_captured', 'knowledge_deferred')], (
+            f'A failed verifier must not capture knowledge, got {result.get("actions")}'
+        )
+        verification_writes = [
+            a for a in actions
+            if a['operation'] == 'add_memory' and a['detail'].get('type') == 'verification'
+        ]
+        assert not verification_writes, (
+            f'A failed verifier must not write a verification memory, got '
+            f'{verification_writes!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_agent_failure_is_distinguishable_from_honest_inconclusive(
+        self, reconciler, journal, caplog
+    ):
+        """The test that names the bug: the two records must NOT be identical.
+
+        Both runs carry verdict='inconclusive' — on the failure path that
+        value is merely the caller-supplied default_verdict, which collides
+        with the legitimate healthy verdict.  Only a separate signal can tell
+        "the agent never answered" from "the agent answered: unclear".
+        """
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=VerificationVerdict.inconclusive, confidence=0.0, evidence=[],
+            summary='agent-failed:no_tool_calls',
+            agent_failed=True, failure_token='no_tool_calls',
+        ))
+        with caplog.at_level(logging.WARNING):
+            await _run_done_transition(reconciler, task_id='failed-1')
+        failed_warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        failed_ops = {a['operation'] for a in _verify_rows(await journal.get_run_actions(runs[0].id))}
+
+        caplog.clear()
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=VerificationVerdict.inconclusive, confidence=0.4, evidence=[],
+            summary='no evidence either way',
+            agent_failed=False, failure_token='',
+        ))
+        with caplog.at_level(logging.WARNING):
+            await _run_done_transition(reconciler, task_id='honest-1')
+        honest_warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        honest_ops = {a['operation'] for a in _verify_rows(await journal.get_run_actions(runs[0].id))}
+
+        assert 'agent_failed' in failed_ops, (
+            f'Expected an agent_failed verify row for the failed run, got {failed_ops!r}'
+        )
+        assert failed_ops != honest_ops, (
+            f'The two runs recorded identical verify rows ({failed_ops!r}) — that '
+            f'indistinguishability IS the defect'
+        )
+        assert any('no_tool_calls' in r.getMessage() for r in failed_warnings), (
+            f'Expected a WARNING on the failure run, got {[r.getMessage() for r in failed_warnings]}'
+        )
+        assert not any('agent-failed' in r.getMessage() or 'agent_failed' in r.getMessage()
+                       for r in honest_warnings), (
+            f'An honest inconclusive is not an error and must not warn, got '
+            f'{[r.getMessage() for r in honest_warnings]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_verify_exception_records_durable_run_action(
+        self, reconciler, journal, caplog
+    ):
+        """The RAISED failure path must also leave a row.
+
+        This path is the live one: agent_llm_provider defaults to 'claude_cli'
+        and _call_llm_cli raises RuntimeError(build_failure_message(...)) when
+        the CLI reports failure.  Today it only logs, which is why the task's
+        sweep found zero rows matching '%Claude CLI agent%'.
+        """
+        reconciler.verifier.verify = AsyncMock(
+            side_effect=RuntimeError('Claude CLI agent failed: error_max_turns')
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await _run_done_transition(reconciler)
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        actions = await journal.get_run_actions(runs[0].id)
+        rows = [a for a in _verify_rows(actions) if a['operation'] == 'error']
+        assert len(rows) == 1, (
+            f'Expected exactly one verify/codebase/error row, got '
+            f'{[(a["action_type"], a["target"], a["operation"]) for a in actions]}'
+        )
+        assert 'error_max_turns' in rows[0]['detail'].get('error', ''), (
+            f'Expected the raised message in detail, got {rows[0]["detail"]!r}'
+        )
+
+        assert any('Verification failed for task' in r.getMessage()
+                   for r in caplog.records if r.levelno == logging.WARNING), (
+            'The pre-existing Verification-failed WARNING must still fire'
+        )
+        # Containment preserved: the exception does not propagate.
+        assert 'task_id' in result
