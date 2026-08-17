@@ -3874,8 +3874,15 @@ class TestArchitectEvalUsageGate:
 
     async def test_gate_is_constructed_from_usage_cap_when_enabled(self):
         from shared.config_models import UsageCapConfig
+        from shared.testing import make_gate_mock
 
-        gate = MagicMock()
+        # A UsageGate-SHAPED gate, not a bare MagicMock: since the call-site
+        # swap the gate has a real consumer, and invoke_with_cap_retry reads
+        # `account_count` and drives `invoke_slot()` for real. A bare mock
+        # returns a Mock for account_count and blows up on the `>` compare.
+        # One healthy account is enough — this test pins CONSTRUCTION; failover
+        # is TestArchitectEvalCapFailover's job.
+        gate = make_gate_mock()
         result, mocks = await _run_architect_eval_hermetic(
             self._cfg(), produced_plan=_well_formed_plan(), usage_gate=gate,
         )
