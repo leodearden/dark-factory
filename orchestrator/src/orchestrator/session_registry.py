@@ -3380,6 +3380,34 @@ def main(argv: list[str] | None = None) -> int:
     # An explicit --slug always wins: it stays the operator's override.
     if args.verb in ('lease-claim', 'lease-heartbeat', 'lease-release'):
         args.slug = args.slug or default_lease_slug(args.name)
+        # FAIL LOUDLY, never silently. default_lease_slug returns None only
+        # when $CLAUDE_PID is unresolvable, and it refuses to synthesize
+        # `<name>-0` because that token is IDENTICAL for two concurrently-
+        # degraded sessions -- each would then pass the other's
+        # _is_lease_owner check, reopening 3994 defect 1. So we stop here.
+        #
+        # This is NOT a breach of _run_lease_claim's fail-open contract.
+        # Fail-open covers lease-SUBSTRATE faults (a corrupt lease body, an
+        # unwritable leases_dir) -- conditions the caller cannot fix and must
+        # not be blocked by. An underivable slug is a CALLER/ENVIRONMENT INPUT
+        # error, exactly the class argparse already exits 2 for, and it is
+        # fixable at the call site (`--slug`). Note also that pre-4248 a
+        # slug-less lease verb exited 2 as well: the undeterminable case KEEPS
+        # its current exit code, and only the derivable case gained a default.
+        #
+        # parser.error raises SystemExit -- a BaseException -- so it
+        # deliberately escapes main()'s `except Exception`, which swallows
+        # faults and returns 0. That escape is the point: this must reach the
+        # shell as a nonzero exit, not as a silently-successful no-op.
+        if not args.slug:
+            parser.error(
+                f'cannot derive the lease slug for --name {args.name}: ${SESSION_PID_ENV} is '
+                'unset or unusable, so this session has no stable identity to claim, '
+                'heartbeat or release a lease with. Refusing to invent one -- a synthesized '
+                'token would collide with every other degraded session and let each act on '
+                "the other's lease. Fix the environment, or pass an explicit "
+                '--slug <stable-token> that this session will re-use on every later lease verb.'
+            )
 
     try:
         if args.verb == 'launching':
