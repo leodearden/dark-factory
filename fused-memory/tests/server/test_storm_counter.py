@@ -21,8 +21,9 @@ place this identity is checked unconditionally.
 
 from __future__ import annotations
 
-import fused_memory.server.storm_counter
 import shared.storm_counter
+
+import fused_memory.server.storm_counter
 
 
 def test_the_old_import_path_still_resolves_to_the_promoted_class():
