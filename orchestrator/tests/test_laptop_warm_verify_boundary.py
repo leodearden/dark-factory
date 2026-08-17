@@ -364,8 +364,14 @@ class HeartbeatWriter:
 # ---------------------------------------------------------------------------
 
 
-def wait_for_pgid_file(path: Path, *, timeout: float = 20.0, interval: float = 0.05) -> int:
-    """Poll for a pgid file (written by verify-merge --request-id) and return its int value."""
+def wait_for_pgid_file(path: Path, *, timeout: float | None = None, interval: float = 0.05) -> int:
+    """Poll for a pgid file (written by verify-merge --request-id) and return its int value.
+
+    *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
+    the wait actually STARTS rather than at import, so a row beginning
+    mid-storm gets the load-scaled deadline the storm warrants.
+    """
+    timeout = row_discovery_ceiling_secs() if timeout is None else timeout
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
@@ -431,7 +437,7 @@ def wait_subtree_live(
     *,
     proc: subprocess.Popen | None = None,
     proc_label: str = 'leader',
-    timeout: float = 20.0,
+    timeout: float | None = None,
     interval: float = 0.05,
     _probe_children=None,
     _ppid_map=None,
@@ -486,6 +492,10 @@ def wait_subtree_live(
     raise.  The tail (not head) is kept -- see :func:`stderr_tail` -- since
     the actionable line is at the END.
 
+    *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
+    the wait actually STARTS rather than at import, so a row beginning
+    mid-storm gets the load-scaled deadline the storm warrants.
+
     *_probe_children* / *_ppid_map* are private injectable seams (defaulting
     to :func:`_read_direct_children` and
     :func:`~orchestrator.verify_cancel.read_ppid_map`) so this poll loop can
@@ -493,6 +503,7 @@ def wait_subtree_live(
     subprocess -- the same pattern :func:`wait_for_marker_stable`'s
     ``_read_mtime_ns`` seam established (task 2819).
     """
+    timeout = row_discovery_ceiling_secs() if timeout is None else timeout
     probe = _probe_children or _read_direct_children
     ppid_map = _ppid_map or read_ppid_map
     deadline = time.monotonic() + timeout
@@ -796,11 +807,6 @@ def row_discovery_ceiling_secs(
     unpinned_max = ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
     return min(unpinned_max, max(ROW_DISCOVERY_CEILING_BASE_SECS, scaled))
 
-
-#: TRANSITIONAL: the pre-4014 flat name, still read by the worst-case
-#: derivation and the row call sites below until both are rewired onto the
-#: resolved ceiling.  Deleted then; do not add new readers.
-ROW_DISCOVERY_CEILING_SECS: float = ROW_DISCOVERY_CEILING_BASE_SECS
 
 #: Worst-case BOUNDED work in a row on the failure path, at the WIDEST
 #: discovery ceiling reachable: both discovery waits, then one full watchdog
@@ -1768,12 +1774,12 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
         extra_env=ROW_WATCHDOG_ENV,
     )
     try:
-        pgid_val = wait_for_pgid_file(pgf, timeout=ROW_DISCOVERY_CEILING_SECS)
+        pgid_val = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
         # Row 1 owns the DISPATCHER process, not the leader -- the leader's
         # own stdout/stderr aren't piped to this test, so pass the dispatcher.
         wait_subtree_live(
             pgid_val, proc=dispatcher, proc_label='dispatcher',
-            timeout=ROW_DISCOVERY_CEILING_SECS,
+            timeout=row_discovery_ceiling_secs(),
         )
 
         dispatcher.kill()
@@ -1843,8 +1849,8 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf, timeout=ROW_DISCOVERY_CEILING_SECS)
-        wait_subtree_live(pgid_val, proc=child, timeout=ROW_DISCOVERY_CEILING_SECS)
+        pgid_val = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        wait_subtree_live(pgid_val, proc=child, timeout=row_discovery_ceiling_secs())
 
         heartbeat.close_stdin()
 
@@ -1927,8 +1933,8 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf, timeout=ROW_DISCOVERY_CEILING_SECS)
-        wait_subtree_live(pgid_val, proc=child, timeout=ROW_DISCOVERY_CEILING_SECS)
+        pgid_val = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        wait_subtree_live(pgid_val, proc=child, timeout=row_discovery_ceiling_secs())
 
         heartbeat.stop_heartbeats()
         assert child.stdin is not None and not child.stdin.closed, (
