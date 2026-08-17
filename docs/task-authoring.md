@@ -942,13 +942,34 @@ after which the resume path nonetheless closed the task.
 
 These aliases are deliberately *not* on the Tier-A allowlist, so each still
 emits `code=unknown_key` as a greppable drift signal until the caller is
-fixed to use the canonical spelling:
+fixed to use the canonical spelling — with one documented exception,
+`origin_finding_id`, noted under the table:
 
 | Canonical | Aliases to avoid |
 |---|---|
 | `prd_path` + `prd_task_label` | `prd`, `prd_ref`, `prd_leaf` |
 | `invariants` | `inv` |
 | `related_tasks` | `related_task`, `related_df_tasks`, `related_task_examples` |
+| `source_finding_id` | `origin_finding_id`, `origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id` |
+
+**The finding-provenance row splits into two classes** (ruling:
+`esc-3796-1`, 2026-08-17). `origin_finding_id` is the **retired** alias and
+is the exception to the paragraph above: it stays Tier-A blessed and
+therefore stays **silent**, because 30 landed tasks carry it and most are
+terminal, and task 3796 **rejected data migration** — so no landed task is
+being rewritten, and un-blessing it would manufacture exactly the census
+noise this ruling removes. It is documented-as-retired, not un-blessed; do
+not expect drift lines for it, and use `source_finding_id` in new writes.
+The remaining near-miss family — `origin_finding`,
+`origin_stage1_finding_id`, `source_finding`, `finding_id` — is unblessed
+and does still emit `unknown_key` exactly as the paragraph describes
+(re-measured 2026-08-17: none is a typed `TaskMetadata` field or a blessed
+key).
+
+**`stage1_finding_id` is not an alias.** It is a distinct canonical Tier-A
+key in its own right (33 tasks), naming the Stage-1 finding specifically,
+and is deliberately **not** something to migrate to `source_finding_id` —
+only the `origin_`-prefixed near-miss `origin_stage1_finding_id` is drift.
 
 ### Tier-C: ad-hoc keys
 
