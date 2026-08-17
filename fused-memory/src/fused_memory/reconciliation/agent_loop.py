@@ -121,7 +121,20 @@ class AgentLoop:
             if not tool_use_blocks:
                 # No tool calls — agent stopped
                 text = ' '.join(b.text for b in text_blocks) if text_blocks else ''
-                return {'warning': 'no_tool_calls', 'text': text}, self._journal_entries
+                payload: dict = {'warning': 'no_tool_calls', 'text': text}
+                # Task 4343: surface the SPECIFIC failure origin additively.
+                # `warning` stays generic unconditionally — extract_agent_verdict
+                # derives its 'agent-failed:<token>' sentinel from it — while
+                # `warning_origin` carries the actionable diagnosis when one
+                # exists.  getattr with a default (not a bare read) is required:
+                # only _CLIResponseAdapter has `.warning`; the anthropic and
+                # OpenAI adapters do not.  The key is omitted entirely when
+                # there is no origin, rather than emitting an empty string that
+                # would read like a measured value.
+                origin = getattr(response, 'warning', '') or ''
+                if origin:
+                    payload['warning_origin'] = origin
+                return payload, self._journal_entries
 
             tool_results = []
             terminal_result = None
@@ -496,16 +509,22 @@ class _CLIResponseAdapter:
     ``.thinking``, ``.tool_calls``, ``.session_id``, ``.warning``.
 
     Note on ``.warning``: this attribute surfaces the specific CLI-failure
-    token (``'cli_output_unparseable'`` / ``'cli_output_empty'``) to the log
-    and to delegation-level tests.  It is intentionally **not** propagated
-    through ``AgentLoop.run()``'s return value, which emits the generic
-    ``{'warning': 'no_tool_calls'}`` shape regardless of the origin.
-    Site-22's ``extract_agent_verdict`` guard already converts that shape
-    into the loud ``'agent-failed:no_tool_calls'`` sentinel end-to-end, so
-    threading the more specific token through ``run()`` would add surface
-    area (and break existing adapter-independent tests) for no required
-    behaviour change.  Revisit if a downstream caller ever needs to
-    distinguish the two origins.
+    token (``'cli_output_unparseable'`` — the CLI returned junk — versus
+    ``'cli_output_empty'`` — the CLI returned nothing) to the log and to
+    delegation-level tests.  Task 4343 is the revisit this docstring used to
+    invite: ``AgentLoop.run()`` now **does** propagate the token, under the
+    separate ``warning_origin`` key.  ``warning`` itself stays generic
+    (``'no_tool_calls'``) unconditionally, so site-22's
+    ``extract_agent_verdict`` still converts it into the loud
+    ``'agent-failed:no_tool_calls'`` sentinel and the adapter-independent
+    tests that pin that shape stay green — the additive key was chosen
+    precisely to avoid renegotiating either contract.
+
+    The downstream consumer that needed the distinction is targeted.py's
+    ``verify/codebase`` audit row: it stores the token in
+    ``VerificationResult.failure_token`` so an operator reading
+    ``reconciliation.db`` can tell an empty CLI response from an unparseable
+    one without re-running anything.
     """
 
     def __init__(self, structured_output: dict, session_id: str = ''):
