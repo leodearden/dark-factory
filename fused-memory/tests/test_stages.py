@@ -2,6 +2,7 @@
 
 import json
 import logging
+import subprocess
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14086,3 +14087,140 @@ class TestSweepStaleMem0PoolTombstones:
 
         assert result == 0
         tombstone.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# task 3778 step-7: the worktree-list hoist is CONSTANT in the task count
+# ---------------------------------------------------------------------------
+
+
+class TestRenderLiveWorkflowSectionHoistsWorktreeList:
+    """`git worktree list` runs ONCE per render, not once per task.
+
+    The measured defect: `_render_live_workflow_section` already hoists three
+    per-render invariants (`is_orchestrator_live_for`, `read_scheduler_state`,
+    `orchestrator_started_at`) but not the fourth and most expensive one — the
+    whole-repo worktree list, which `detect_live_workflow` re-ran inside
+    `_check_worktree_registered` on every single task. At ~513 worktrees that
+    is ~40 ms x ~500 tasks ≈ 20 s of a measured 29 s render.
+
+    The assertion is deliberately a PER-ITEM PROPERTY — worktree-list count
+    == 1 for every N — and NOT a total-subprocess count. A better
+    implementation (e.g. memoizing the remaining per-task log/rev-list probes)
+    must not read RED here; what is being pinned is that this one call is
+    constant in N rather than proportional to it.
+    """
+
+    _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    @staticmethod
+    def _counting_side_effect(branch_prefix: str = 'task/'):
+        """A `subprocess.run` fake tallying calls per git subcommand.
+
+        Reports every task's worktree as registered so each task stays live and
+        the render actually does its per-task work.
+        """
+        counts = {'worktree_list': 0, 'log': 0, 'rev_list': 0}
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                counts['worktree_list'] += 1
+                stanzas = ''.join(
+                    f'worktree /tmp/wt{i}\nHEAD abc123{i}\n'
+                    f'branch refs/heads/{branch_prefix}{i}\n\n'
+                    for i in range(200)
+                )
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=stanzas, stderr='',
+                )
+            if 'rev-list' in args:
+                counts['rev_list'] += 1
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout='3', stderr='',
+                )
+            counts['log'] += 1
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout='', stderr='',
+            )
+
+        return side_effect, counts
+
+    @staticmethod
+    def _tasks(n: int) -> list[dict]:
+        return [{'id': str(i), 'status': 'pending'} for i in range(n)]
+
+    @pytest.mark.parametrize('n_tasks', [1, 8, 30])
+    def test_worktree_list_probe_count_is_constant_in_task_count(self, n_tasks):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        side_effect, counts = self._counting_side_effect()
+
+        with patch('subprocess.run', side_effect=side_effect):
+            _render_live_workflow_section(
+                tasks=self._tasks(n_tasks),
+                project_root=ProjectRoot('/p'),
+                now=self._NOW,
+            )
+
+        assert counts['worktree_list'] == 1, (
+            f'expected exactly 1 hoisted worktree list for {n_tasks} tasks, '
+            f"got {counts['worktree_list']} — the probe is still per-task"
+        )
+
+    def test_rendered_text_is_unchanged_by_the_hoist(self):
+        """Behaviour preservation: same fixture inputs, same section text.
+
+        Renders once with the hoist active and once with `worktree_index_for`
+        forced to fail (which degrades to exactly the pre-hoist per-task probe
+        path), and pins that the two agree byte-for-byte.
+        """
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        side_effect, _ = self._counting_side_effect()
+        tasks = self._tasks(4)
+
+        with patch('subprocess.run', side_effect=side_effect):
+            hoisted = _render_live_workflow_section(
+                tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
+            )
+
+        side_effect, _ = self._counting_side_effect()
+        with (
+            patch('subprocess.run', side_effect=side_effect),
+            patch.object(tks, 'worktree_index_for', return_value=None),
+        ):
+            per_task = _render_live_workflow_section(
+                tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
+            )
+
+        assert hoisted == per_task
+        assert 'Live-Workflow Signals' in hoisted
+
+    def test_raising_worktree_index_for_degrades_to_the_per_task_probe(self):
+        """Fail-safe: a broken hoist must not delete the section.
+
+        The hoist is an optimisation; if it raises, every task falls back to
+        its own probe and the render is exactly what it was before task 3778.
+        """
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        side_effect, counts = self._counting_side_effect()
+
+        with (
+            patch('subprocess.run', side_effect=side_effect),
+            patch.object(tks, 'worktree_index_for', side_effect=RuntimeError('boom')),
+        ):
+            result = _render_live_workflow_section(
+                tasks=self._tasks(3), project_root=ProjectRoot('/p'), now=self._NOW,
+            )
+
+        assert 'Live-Workflow Signals' in result, 'a broken hoist dropped the section'
+        assert counts['worktree_list'] == 3, 'each task must fall back to its own probe'
