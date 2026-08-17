@@ -776,6 +776,75 @@ class TestDataclassShapeRegistry:
         assert verify_result.factory == '_fake_verify_result'
 
 
+class TestDataclassDoublePositionBlindness:
+    """Rule B flags a VerifyResult-shaped double in ANY syntactic position.
+
+    Position-blindness is the whole point of the widening: Rule A inspects only
+    ast.Assign/ast.AnnAssign, so all ten ``return MagicMock(...)`` sites behind
+    task 3980 were invisible to it.
+    """
+
+    def test_flags_double_in_return_position(self):
+        """return MagicMock(passed=..., summary=...) → 1 violation (the exact 3980 shape)."""
+        source = "def f():\n    return MagicMock(passed=False, summary='x')\n"
+        violations = find_violations(source, 'test_return.py')
+        assert len(violations) == 1, (
+            'A VerifyResult-shaped double in RETURN position must be flagged — this is '
+            f'the exact shape task 3980 removed from ten sites; got {violations}'
+        )
+        v = violations[0]
+        assert v.lineno == 2, f'violation anchors at the MagicMock( line; got {v.lineno}'
+
+    def test_flags_double_assigned_to_a_non_config_name(self):
+        """bare = MagicMock(passed=..., summary=...) → 1 violation (Rule A's name gate bypassed).
+
+        ``bare`` is not config/cfg/*_config/*_cfg, so Rule A ignores it entirely.
+        Rule B does not consult the binding name at all.
+        """
+        source = "bare = MagicMock(passed=False, summary='x')\n"
+        violations = find_violations(source, 'test_nonconfig_name.py')
+        assert len(violations) == 1, (
+            "Rule A's config-name gate must not apply to Rule B; a double bound to a "
+            f'non-config name must still be flagged; got {violations}'
+        )
+
+    def test_flags_double_in_call_argument_position(self):
+        """handler(MagicMock(passed=..., summary=...)) → 1 violation (argument position)."""
+        source = "handler(MagicMock(passed=True, summary='x'))\n"
+        violations = find_violations(source, 'test_argpos.py')
+        assert len(violations) == 1, (
+            f'A double passed directly as a call argument must be flagged; got {violations}'
+        )
+
+    def test_flags_double_inside_comprehension_and_lambda(self):
+        """A double buried in a comprehension body and in a lambda body is still flagged."""
+        comprehension = "doubles = [MagicMock(passed=True, summary='x') for _ in range(3)]\n"
+        violations = find_violations(comprehension, 'test_comprehension.py')
+        assert len(violations) == 1, (
+            f'A double constructed inside a comprehension must be flagged; got {violations}'
+        )
+
+        lam = "make = lambda: MagicMock(passed=False, summary='x')\n"
+        violations = find_violations(lam, 'test_lambda.py')
+        assert len(violations) == 1, (
+            f'A double constructed inside a lambda body must be flagged; got {violations}'
+        )
+
+    def test_return_position_violation_carries_rule_b_remedy_not_rule_a(self):
+        """A Rule B violation speaks Rule B's vocabulary, never _VIOLATION_MSG."""
+        source = "def f():\n    return MagicMock(passed=False, summary='x')\n"
+        violations = find_violations(source, 'test_msg_split.py')
+        assert len(violations) == 1
+        message = violations[0].message
+        assert message != _checker._VIOLATION_MSG, (
+            "Rule B must not reuse Rule A's message — the remedies are unrelated "
+            '(mock_orch_config/pydantic_spec vs _fake_verify_result/spec=VerifyResult)'
+        )
+        assert 'bare-dataclass-double' in message, (
+            f"Rule B's message must name its own noqa code; got {message!r}"
+        )
+
+
 class TestFusedMemoryTestsDirectoryClean:
     """Regression guard: fused-memory/tests must have zero bare MagicMock() config sites.
 
