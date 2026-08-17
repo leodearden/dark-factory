@@ -135,8 +135,11 @@ matches nothing. Two consequences an operator must not misread:
 
 :func:`run` therefore issues a count-only census probe on
 ``FLAG_FOR_STAGE2_FILTERS`` and emits a ``cross_check`` report block plus a
-WARNING when :func:`enumeration_blind_spot` fires. Use ``--fail-on-blind-spot``
-(with ``--check``) to escalate that divergence to a non-zero exit code.
+WARNING when :func:`enumeration_blind_spot` fires. Since task 3923 that
+divergence escalates ``--check`` to a non-zero exit code BY DEFAULT — a
+verdict rendered from an enumeration that matched nothing must not read as a
+pass. Pass ``--no-fail-on-blind-spot`` (with ``--check``) to opt out and get
+the plain backlog verdict for an ad-hoc census.
 
 The adjacent pool is CENSUSED, NEVER DELETED here: the probe counts it and stops,
 never enumerating it, never running a predicate over it, never adding it to the
@@ -939,23 +942,33 @@ def _resolve_check_exit_code(
     ``report['before']['total_source']`` otherwise (a dry-run/``--check``-only
     invocation, which never populates ``'after'``).
 
-    Task 3897 adds the optional blind-spot escalation. It is OPT-IN so the
-    already-wired ``scripts/fused-memory-flag-marker-check.sh`` predicate
-    keeps its exact current contract: by default a blind spot is loud in the
-    log and in the report, but does not by itself change the exit code.
+    Task 3897 added the blind-spot escalation as opt-in, to preserve the
+    contract of the one predicate then wired to
+    ``scripts/fused-memory-flag-marker-check.sh``. Task 3923 ARMS it by
+    default: that consumer (the esc-2866-1 O2 watch, task 2902) was a
+    one-shot dated milestone that fired 2026-07-29 and is now ``done``, and
+    no other ``before_done`` wiring of the wrapper exists, so the
+    backward-compatibility obligation is discharged. A verdict rendered from
+    an enumeration that matched NOTHING must not read as a pass — with zero
+    consumers nothing fails forever, and a future re-wire fails loudly on
+    day one rather than passing silently. Rationale:
+    ``docs/flag-marker-sweep-recurring.md``.
 
     Pure, sync, no I/O.
 
     Args:
         report: The dict returned by :func:`run`.
         max_backlog: Ceiling forwarded to :func:`backlog_verdict`.
-        fail_on_blind_spot: When ``True``, an OBSERVED enumeration blind spot
+        fail_on_blind_spot: Defaults to ``True`` (task 3923). When ``True``,
+            an OBSERVED enumeration blind spot
             (``report['cross_check']['blind_spot']``) resolves to ``1``
             regardless of the backlog verdict. A failed probe never triggers
             this — ``blind_spot`` is ``False`` whenever the adjacent
             population could not be observed (see :func:`run`), so the gate
             escalates on observed divergence only and a transient backend
             blip cannot flap a deterministic ``before_done`` predicate.
+            ``False`` (via ``--no-fail-on-blind-spot``) relaxes ONLY this
+            vacuity check; the backlog verdict still applies.
 
     Returns:
         ``0`` if the resolved count holds, else ``1`` — see
@@ -1088,7 +1101,10 @@ def _build_parser() -> argparse.ArgumentParser:
         '--check', action='store_true', default=False,
         help="Exit 0 if the residual backlog is within --max-backlog, else "
              "1 — usable as a task_kind='deterministic' before_done "
-             'predicate (mirrors scripts/check_merge_flakiness.sh).',
+             'predicate (mirrors scripts/check_merge_flakiness.sh). Also '
+             'exits 1 on an OBSERVED enumeration blind spot, so a verdict '
+             'rendered from a census that matched nothing does not read as '
+             'a pass; opt out with --no-fail-on-blind-spot.',
     )
     parser.add_argument(
         '--max-backlog', dest='max_backlog',
@@ -1112,14 +1128,12 @@ def _build_parser() -> argparse.ArgumentParser:
             'REQUIRES --check (rejected at parse time without it). Escalate '
             'an OBSERVED enumeration blind spot (this sweep matched 0 records '
             "while an adjacent {'flag_for_stage2': True} population is "
-            'non-empty) to exit 1, so a before_done predicate can gate on '
-            'it. OFF by default because that pool is a healthy rolling '
-            '14-day window drained in-cycle by task 2966 — a gate keyed on '
-            'its mere non-emptiness would fail forever, the same footgun '
-            'documented above for --max-backlog 0 against undated markers. '
-            'Without this flag the blind spot is still reported: loudly in '
-            "the log and in the JSON report's cross_check block. Full "
-            'rationale and dated census: docs/flag-marker-sweep-recurring.md.'
+            'non-empty) to exit 1. This is the DEFAULT since task 3923; the '
+            'flag remains accepted as an explicit affirmation of it. A '
+            'failed census probe never trips it, so a transient backend blip '
+            'cannot flap the verdict. The blind spot is reported either way: '
+            "loudly in the log and in the JSON report's cross_check block. "
+            'Full rationale and dated census: docs/flag-marker-sweep-recurring.md.'
         ),
     )
     parser.add_argument(
@@ -1144,30 +1158,42 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     testable without invoking :func:`main` (which builds a live
     ``MemoryService``).
 
-    ``--fail-on-blind-spot`` reaches an exit code only through
-    :func:`_resolve_check_exit_code`, which :func:`main` consults ONLY under
-    ``--check``. Left un-validated, ``--apply --fail-on-blind-spot`` — or a
-    bare ``--fail-on-blind-spot`` dry run — would therefore exit 0 even on an
-    observed blind spot: an operator wiring it as a ``before_done.script``
-    predicate without ``--check`` would get a gate that STRUCTURALLY CANNOT
-    FAIL, which is the exact defect class task 3897 exists to eliminate.
-    Honouring the flag as a silent no-op would also violate the repo's
-    loud-over-silent-degradation norm, so the combination is rejected at
-    parse time (argparse exit code 2) instead.
+    ``--fail-on-blind-spot`` / ``--no-fail-on-blind-spot`` reach an exit code
+    only through :func:`_resolve_check_exit_code`, which :func:`main` consults
+    ONLY under ``--check``. Left un-validated, ``--apply
+    --fail-on-blind-spot`` — or a bare dry run with either spelling — would
+    therefore silently no-op: an operator wiring the opt-in as a
+    ``before_done.script`` predicate without ``--check`` would get a gate
+    that STRUCTURALLY CANNOT FAIL (the exact defect class task 3897 exists to
+    eliminate), and one passing the opt-out would believe they had relaxed a
+    gate that was never running. Honouring either as a silent no-op would
+    violate the repo's loud-over-silent-degradation norm, so the combination
+    is rejected at parse time (argparse exit code 2) instead.
 
     ``scripts/fused-memory-flag-marker-check.sh`` already hardcodes
-    ``--check`` in its ``exec`` line, so passing ``--fail-on-blind-spot``
-    through that wrapper is unaffected.
+    ``--check`` in its ``exec`` line, so passing either spelling through that
+    wrapper is unaffected.
+
+    Task 3923 makes the blind-spot policy a TRI-STATE: argparse leaves it
+    ``None`` when neither spelling is passed, and this function resolves that
+    sentinel to ``True`` (armed) only AFTER the validation above. The
+    ordering is load-bearing — it keys the rejection on the flag having been
+    passed EXPLICITLY, so the nightly ``--apply --terminal-drain`` service
+    (which passes neither, and never reaches the verdict path) keeps parsing
+    cleanly instead of failing with exit 2 under a default it never asked
+    for.
 
     Args:
         argv: Argument list to parse; ``None`` reads ``sys.argv[1:]``.
 
     Returns:
-        The parsed namespace.
+        The parsed namespace, with ``fail_on_blind_spot`` resolved to a
+        concrete ``bool`` (never the ``None`` sentinel).
 
     Raises:
-        SystemExit: Code 2, via ``parser.error``, when
-            ``--fail-on-blind-spot`` is passed without ``--check``.
+        SystemExit: Code 2, via ``parser.error``, when either
+            ``--fail-on-blind-spot`` or ``--no-fail-on-blind-spot`` is passed
+            without ``--check``.
     """
     parser = _build_parser()
     args = parser.parse_args(argv)

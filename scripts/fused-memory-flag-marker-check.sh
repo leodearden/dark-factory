@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 # fused-memory-flag-marker-check.sh -- read-only CHECK counterpart to
 # fused-memory-flag-marker-sweep.sh, exposing sweep_orphan_flag_markers.py's
-# --check/backlog_verdict predicate mode (task 2596) as a runnable
-# before_done.script for task_kind='deterministic',
-# before_done.kind='predicate' watch tasks. Sets up the same service env as
-# the nightly sweep wrapper (a fused-memory maintenance action must run under
-# the SERVICE env, not a bare shell, or the census silently narrows), then
-# passes caller args through -- e.g. --project-id reify --max-backlog 0.
+# --check/backlog_verdict predicate mode (task 2596).
+#
+# THE WATCH GATE IS RETIRED (task 3923). This script was written as a
+# runnable before_done.script for task_kind='deterministic',
+# before_done.kind='predicate' watch tasks. Task 2902 -- the esc-2866-1 O2
+# watch -- was the only task ever wired to it, and it was a ONE-SHOT dated
+# milestone that fired 2026-07-29, exited 0, and is now status=done. A scan
+# of the live task store found no other before_done wiring anywhere in the
+# project, so this wrapper has ZERO consumers. Its remaining role is an
+# ad-hoc, read-only census run by hand.
+#
+# Sets up the same service env as the nightly sweep wrapper (a fused-memory
+# maintenance action must run under the SERVICE env, not a bare shell, or the
+# census silently narrows), then passes caller args through -- e.g.
+# --project-id reify --max-backlog 0.
 # Exit code only: 0 = residual source-tagged backlog within --max-backlog,
 # 1 = violated. The VERDICT is the exit code; the orchestrator parses no
 # output to reach it. It does, however, READ the output: on rc=0 it extracts
@@ -24,16 +33,23 @@
 # before.total_source, which the source filter measures at 0 in every
 # project probed, so backlog_verdict holds unconditionally and this gate
 # structurally cannot fail on its own. cross_check.blind_spot=true is the
-# signal that the 0 is "saw nothing", not "there was nothing" -- read it
-# before treating an rc=0 here as a clean bill of health. Pass
-# --fail-on-blind-spot (opt-in, default off) to turn an OBSERVED blind spot
-# into rc=1; a failed census probe never trips it, so a transient Qdrant
-# blip cannot flap the predicate. It only takes effect alongside --check,
-# which this script's exec line already supplies -- the sweep rejects the
-# flag without it. Do NOT wire it expecting the adjacent flag_for_stage2
-# pool to reach zero: that pool is a healthy rolling window, so a gate keyed
-# on its emptiness fails forever -- the same footgun as --max-backlog 0
-# against undated markers, below. Dated census and full rationale live in
+# signal that the 0 is "saw nothing", not "there was nothing".
+#
+# Since task 3923 you no longer have to remember to read it: an OBSERVED
+# blind spot is rc=1 BY DEFAULT. Because this script's exec line hardcodes
+# --check, that applies to every invocation here -- so re-wiring this
+# wrapper as a before_done predicate today FAILS LOUDLY ON DAY ONE rather
+# than passing silently forever, which is the point. Pass
+# --no-fail-on-blind-spot for an ad-hoc census where you want the plain
+# backlog verdict; it relaxes only the vacuity check, not the backlog
+# ceiling. --fail-on-blind-spot is still accepted as an explicit
+# affirmation of the default. A failed census probe never trips the
+# escalation, so a transient Qdrant blip cannot flap the verdict.
+#
+# Do NOT re-point this at the adjacent flag_for_stage2 pool expecting it to
+# reach zero: that pool is a healthy rolling window, so a gate keyed on its
+# emptiness fails forever -- the same footgun as --max-backlog 0 against
+# undated markers, below. Dated census and full rationale live in
 # docs/flag-marker-sweep-recurring.md (the single copy -- don't restate the
 # numbers here).
 #
@@ -42,8 +58,10 @@
 # are harmless. NOTE the sweep script's own caveat: undated markers can never
 # be drained by age, so a --max-backlog 0 predicate against a population
 # containing undated markers fails forever -- verify the census first or set
-# the ceiling accordingly. First consumer: the esc-2866-1 O2 watch task; see
-# plans/reify-flag-marker-backlog-rca-2026-07-22.md.
+# the ceiling accordingly. First and only consumer: the esc-2866-1 O2 watch
+# task (2902), now done and retired -- see
+# plans/reify-flag-marker-backlog-rca-2026-07-22.md and the task-3923
+# decision in docs/flag-marker-sweep-recurring.md.
 set -euo pipefail
 
 REPO="${REPO:-/home/leo/src/dark-factory}"
