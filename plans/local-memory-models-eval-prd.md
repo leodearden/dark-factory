@@ -139,6 +139,22 @@ not counted as G1 consumers of anything here.
 > admission floors (12.0, 9.0) into D10's Consequence paragraph and mislabelled them "measured" —
 > `est_vram_gib` and weights-only are two distinct quantities, and D10's MoE comparison specifically
 > needs the weights-only one. Restored there to ~11.2, ~8.3 GiB; see the note at that paragraph.
+>
+> **Third pass, same amendment (review round 2) — the dead-pointer sweep is now file-wide, not
+> one-row.** This task's item 2 was filed against a single stale pointer in
+> `scripts/local-model-serving/arms.yaml` ("The PRD commissioned it (line 127)"), and the first pass
+> fixed exactly that one — while **six more** line-number pointers into this PRD survived in the same
+> file, all of them broken by the same two amendment banners, and one of them (`PRD line 127`)
+> byte-identical to the pointer that pass claimed to have removed. All seven are now stable locators
+> (§Candidate slate plus a row or arm name), and that file carries a **POINTER STYLE** header note
+> stating the rule and why a line number cannot hold here: this PRD grows a new banner at the top on
+> every amendment, invalidating every number below it at once. The reciprocal pointer *from* this
+> document *into* arms.yaml (D10's MoE-basis footnote, previously "arms.yaml lines 248-255") is
+> converted for the same reason. **Named, not silently left:** five sibling files —
+> `lms_healthcheck.py`, `lms_manifest.py`, `tests/test_lms_manifest.py`,
+> `tests/test_lms_healthcheck.py`, `tests/test_lms_vram.py` — still carry `PRD line 134` /
+> `PRD line 127` pointers with the identical defect. They are outside this task's declared file scope
+> and are recorded in arms.yaml's header note and in a follow-up rather than fixed here.
 
 ## Goal
 
@@ -274,7 +290,9 @@ defect — so it stands unchanged.*
 *This column does not sit on one basis, which is deliberate rather than fresh drift. The MoE stretch
 row's **13.27 GiB, fits** is α step 22's **weights** figure, not a declared floor: arms.yaml's own
 declared admission floor for `moe-stretch` is **14.5 GiB** (weights plus the ~0.82 GiB of KV its
-sliding-window attention needs at 16k context; arms.yaml lines 248-255), left as α's pin and not
+sliding-window attention needs at 16k context; arms.yaml, the `moe-stretch` arm's `est_vram_gib` and
+the note beneath it — a stable locator, not a line number, for the reason given in that file's
+POINTER STYLE header note), left as α's pin and not
 edited here. D10's Consequence paragraph below re-quotes the two dense arms on a third,
 **weights-only** basis (~11.2, ~8.3 GiB), because its own MoE comparison needs everything on one
 basis — so **12.0 GiB** here and **~11.2 GiB** there are two different quantities for the same arm,
