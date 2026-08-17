@@ -336,6 +336,7 @@ def detect_live_workflow(
     pure_gate: bool | None = None,
     corroborated: bool | None = None,
     _orchestrator_live: bool | None = None,
+    worktree_index: Mapping[str, bool] | None = None,
 ) -> WorkflowLiveness:
     """Detect whether a live workflow is active for *task_id*.
 
@@ -444,6 +445,21 @@ def detect_live_workflow(
             parameter is only for performance hoisting, not test isolation.
             Ignored when :func:`_orchestrator_signal_ineligible` returns True
             for the given *status*/*task_kind* pair.
+        worktree_index: Pre-computed ``{ref: prunable}`` map from
+            :func:`worktree_index_for`.  When provided, skips this call's
+            ``git worktree list --porcelain`` subprocess entirely — use this to
+            hoist the whole-repo worktree list out of a per-task loop (task
+            3778; it was ~20 s of a measured 29 s render).  Like
+            *_orchestrator_live* this parameter is for performance hoisting
+            only, not test isolation — tests monkeypatch the module attributes
+            directly.
+
+            THREE-VALUED, matching :func:`worktree_index_for`'s contract:
+            ``None`` (the default) means "unknown" and triggers this call's own
+            probe, so behaviour is byte-for-byte unchanged for callers that do
+            not pass it; ``{}`` means "known: the repo has no registered
+            worktrees" and suppresses the probe, yielding
+            ``worktree_registered=False``; a populated map is used directly.
 
     Returns:
         A :class:`WorkflowLiveness` dataclass with all signals populated.
@@ -451,7 +467,10 @@ def detect_live_workflow(
     branch = f'{branch_prefix}{task_id}'
     root = str(project_root)
 
-    worktree_present, worktree_prunable = _check_worktree_registered(root, branch)
+    if worktree_index is None:
+        worktree_present, worktree_prunable = _check_worktree_registered(root, branch)
+    else:
+        worktree_present, worktree_prunable = _registration_from_index(worktree_index, branch)
     worktree_registered = worktree_present and not worktree_prunable
     # Hoisted once so the recent-commit and worktree-staleness age checks
     # (task 3947) share one instant, rather than risking a skew where the two
@@ -895,27 +914,71 @@ def _orchestrator_signal_ineligible(
     return branch_bare and not worktree_registered and not recent_commit
 
 
-def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bool]:
-    """Return ``(registered, prunable)`` for the git worktree tracking *branch*.
+def parse_worktree_index(stdout: str) -> dict[str, bool]:
+    """Parse ``git worktree list --porcelain`` output into ``{ref: prunable}``.
 
-    Parses ``git -C <root> worktree list --porcelain`` output into
-    blank-line-delimited stanzas (one per registered worktree). ``registered``
-    is True iff some stanza contains a line equal to ``branch refs/heads/<branch>``;
-    ``prunable`` is True iff that SAME stanza also contains a line starting with
-    ``prunable`` — git's marker for a worktree whose directory has been removed
-    or reaped, but whose registration has not yet been pruned (reify#5245's
-    shape: a stale worktree entry survives after the directory itself is gone).
+    THE SINGLE HOME OF THE PORCELAIN GRAMMAR. Both the per-task probe
+    (:func:`_check_worktree_registered`) and the hoisted whole-repo index
+    (:func:`worktree_index_for`) are expressed on top of this function, so the
+    stanza/prunable semantics cannot drift between them.
 
-    Any subprocess error or unexpected output silently returns ``(False, False)``
-    (fail-safe).
+    The output is blank-line-delimited stanzas, one per registered worktree.
+    A stanza contributes an entry keyed on its ``branch <ref>`` line's ref
+    (e.g. ``refs/heads/task/4321``); the value is True iff that SAME stanza
+    also contains a line starting with ``prunable`` — git's marker for a
+    worktree whose directory has been removed or reaped but whose registration
+    has not yet been pruned (reify#5245's shape: a stale worktree entry
+    survives after the directory itself is gone). Detached-HEAD stanzas carry
+    no ``branch`` line and so contribute nothing.
+
+    Malformed, empty or blank-only input yields ``{}`` and never raises — this
+    is a pure text parse with no error channel of its own; I/O failures are
+    the caller's to classify (see :func:`worktree_index_for`, which is careful
+    to return ``None`` rather than ``{}`` for them).
 
     Note: git only started emitting the ``prunable`` porcelain annotation in
     git 2.36 (2022). On an older git binary, a reaped worktree's directory can
-    be gone yet no ``prunable`` line is ever produced, so ``prunable`` silently
+    be gone yet no ``prunable`` line is ever produced, so the value silently
     stays False and a reaped worktree keeps counting as registered — the same
     silent-degradation shape reify#5245 hardened against, just one layer down
     in the toolchain. If a stale/reaped-worktree false positive resists this
     fix, check ``git --version`` on the host running this detector first.
+    """
+    index: dict[str, bool] = {}
+    for stanza in stdout.split('\n\n'):
+        lines = [line.strip() for line in stanza.splitlines()]
+        ref = next(
+            (line[len('branch '):] for line in lines if line.startswith('branch ')),
+            None,
+        )
+        if not ref:
+            continue
+        index[ref] = any(line.startswith('prunable') for line in lines)
+    return index
+
+
+def worktree_index_for(project_root: str) -> dict[str, bool] | None:
+    """Run ``git worktree list --porcelain`` ONCE and return the parsed index.
+
+    This is the hoisting entry point for task 3778: the worktree list is
+    invariant across every task in a reconciliation render, but was being
+    re-run inside :func:`_check_worktree_registered` on every
+    :func:`detect_live_workflow` call. Measured on the dark_factory repo at
+    ~513 worktrees, that is ~40 ms x ~500 tasks ≈ 20 s of an observed 29 s
+    render — the dominant term of the event-loop stall this task fixes.
+
+    THREE-VALUED CONTRACT — the return type is load-bearing:
+
+    - ``None``  → *unknown*. The probe failed (I/O error, timeout, non-zero
+      rc). Callers must fall back to the per-task probe. Returning ``{}`` here
+      instead would report every task as ``worktree_registered=False`` from a
+      hoisted ERROR, turning a transient git glitch into a project-wide
+      "nothing is live" verdict — exactly the false negative the detector's
+      exemption rules exist to prevent.
+    - ``{}``    → *known empty*. The probe succeeded and the repo genuinely has
+      no registered worktrees. No per-task probe is needed. Collapsing this
+      into ``None`` would waste the entire hoist on the commonest cheap case.
+    - ``{...}`` → *known*. Use it directly.
     """
     try:
         result = subprocess.run(
@@ -926,22 +989,44 @@ def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bo
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.debug('live_workflow_detector: worktree list failed: %s', exc)
-        return False, False
+        return None
 
     if result.returncode != 0:
         logger.debug(
             'live_workflow_detector: worktree list returned %d: %s',
             result.returncode, result.stderr.strip(),
         )
-        return False, False
+        return None
 
-    target = f'branch refs/heads/{branch}'
-    for stanza in result.stdout.split('\n\n'):
-        lines = [line.strip() for line in stanza.splitlines()]
-        if target in lines:
-            prunable = any(line.startswith('prunable') for line in lines)
-            return True, prunable
-    return False, False
+    return parse_worktree_index(result.stdout)
+
+
+def _registration_from_index(index: Mapping[str, bool], branch: str) -> tuple[bool, bool]:
+    """Look *branch* up in a parsed worktree index, returning ``(registered, prunable)``."""
+    ref = f'refs/heads/{branch}'
+    if ref not in index:
+        return False, False
+    return True, index[ref]
+
+
+def _check_worktree_registered(project_root: str, branch: str) -> tuple[bool, bool]:
+    """Return ``(registered, prunable)`` for the git worktree tracking *branch*.
+
+    Runs the porcelain probe for THIS branch alone and reads the answer out of
+    :func:`parse_worktree_index`. Any subprocess error or unexpected output
+    silently returns ``(False, False)`` (fail-safe) — note this deliberately
+    differs from :func:`worktree_index_for`, which distinguishes failure
+    (``None``) from emptiness; here the caller has no third state to express.
+
+    Callers fanning this out across many tasks should hoist
+    :func:`worktree_index_for` instead and pass its result to
+    :func:`detect_live_workflow` as ``worktree_index`` — the whole point of
+    task 3778.
+    """
+    index = worktree_index_for(project_root)
+    if index is None:
+        return False, False
+    return _registration_from_index(index, branch)
 
 
 def _check_recent_commit(
