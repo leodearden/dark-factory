@@ -2980,6 +2980,26 @@ class MemoryService:
 
         assert self.durable_queue is not None
 
+        # Resolve WHICH referents this episode is about (task 3670, PRD leaf
+        # epsilon) BEFORE the try below, for the same loud-over-silent reason
+        # add_memory's call sits outside its own try: gamma raises
+        # InputValidationError on a structural wiring bug, and that must not be
+        # absorbed by an enqueue-failure handler.
+        #
+        # metadata=None is not an oversight: add_episode deliberately never
+        # persists a metadata argument — the same fact that forced task 3142's
+        # `unverified_claim` onto this payload channel — so the bridge has
+        # nothing to read and the derived scan is the only live source here.
+        #
+        # declared=None: leaf delta owns the `entities` parameter; this is the
+        # seam it fills.
+        resolution = resolve_referents(
+            declared=None,
+            metadata=None,
+            content=content,
+            group_id=scope.graphiti_group_id,
+        )
+
         success = True
         error_msg = None
         try:
@@ -3003,6 +3023,7 @@ class MemoryService:
                     'temporal_context': temporal_context,
                     'unverified_claim': unverified_claim,
                     'reference_time': reference_time.isoformat() if reference_time is not None else None,
+                    'referents': _encode_referents(resolution),
                 },
                 callback_type='dual_write_episode',
             )
