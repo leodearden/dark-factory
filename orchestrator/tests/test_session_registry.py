@@ -3900,6 +3900,43 @@ def test_main_lease_claim_explicit_pid_still_overrides_the_env(
     assert sr.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
 
 
+def test_main_lease_claim_without_slug_writes_the_derived_lease_slug(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`--slug` is now optional on lease-claim and defaults like `--pid` does.
+
+    Same shape as the `--pid` pair above, on purpose: the two CLI-owned tokens
+    should read as ONE pattern rather than two conventions.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    # Deliberately NOT this process's own pid, so an env-blind implementation
+    # (e.g. one reaching for os.getpid()) cannot pass by coincidence.
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df'])
+
+    assert rc == 0
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert (
+        sr.LeaseHolder.from_json(lease_path.read_text()).session_slug
+        == f'watcher-df-{_DEAD_PID}'
+    )
+
+
+def test_main_lease_claim_explicit_slug_still_overrides_the_derived_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-OPERATOR'])
+
+    assert rc == 0
+    # An explicit --slug remains a deliberate operator override, never shadowed.
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert sr.LeaseHolder.from_json(lease_path.read_text()).session_slug == 'watcher-df-OPERATOR'
+
+
 # --- CLI ownership on the mutating verbs (task 3994 defect 1) -------------
 
 
