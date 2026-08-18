@@ -412,7 +412,7 @@ async def _shape_one_project(
     max_cancelled_per_project: int = 0,
     now: datetime | None = None,
     runtime: TaskRuntimeSnapshot | None = None,
-) -> tuple[list[dict], bool, int]:
+) -> tuple[list[dict], bool, int | None]:
     """Build ``(active_tasks, offline, done_count)`` for a single project root.
 
     *offline* is True when the MCP fetch failed for this project; the
@@ -464,8 +464,17 @@ async def _shape_one_project(
     task completing between the two calls can shift the window by a row.
 
     If the compact map read fails while the active fetch succeeded, the project
-    is NOT declared offline — *done_count* degrades to a count over the fetched
-    rows and a WARNING is logged.  Only an offline ACTIVE fetch means offline.
+    is NOT declared offline — the active rows are still good.  Two things
+    degrade together, because both depend on the map and on nothing else:
+    *done_count* is returned as ``None`` (UNKNOWN — not zero, and not
+    offline; the caller omits the project from ``DONE_COUNTS``), and the
+    terminal window is SKIPPED entirely, so no done/cancelled row is emitted
+    for that render.  Skipping is required, not merely tidy: the window's
+    offset is computed from the map's terminal population, so without the map
+    the offset collapses to 0 and — since ``page_size``/``offset`` slice an
+    ASCENDING-id list — would select the OLDEST terminal rows and present them
+    as the tab's most recent.  A WARNING is logged.  Only an offline ACTIVE
+    fetch means offline.
 
     When *max_done_per_project* > 0, the most-recent N done tasks
     (sorted by ``updated_at`` descending, then ``id`` descending) are
@@ -507,7 +516,17 @@ async def _shape_one_project(
         else {k: v for k, v in status_map.items() if isinstance(k, int)}
     )
 
-    wants_terminal = max_done_per_project > 0 or max_cancelled_per_project > 0
+    # The window is POSITIONED by n_terminal (see below), which only the
+    # compact map can supply. Without it the offset collapses to 0, and since
+    # page_size/offset slice an ASCENDING-id list, offset 0 selects the OLDEST
+    # terminal rows — which are then sorted by updated_at desc and emitted as
+    # the tab's "most recent" done list. Showing months-old rows as the newest
+    # is a worse failure than showing none, so an unpositionable window is not
+    # fetched at all.
+    wants_terminal = (
+        (max_done_per_project > 0 or max_cancelled_per_project > 0)
+        and not map_offline
+    )
     if wants_terminal:
         n_terminal = sum(1 for s in status_map.values() if s in _TERMINAL_STATUSES)
         window = _TERMINAL_FETCH_WINDOW
@@ -538,15 +557,20 @@ async def _shape_one_project(
 
     if map_offline:
         # Degrade honestly rather than declaring an otherwise-healthy project
-        # offline: the active fetch succeeded, so its rows are still good; only
-        # the count loses its authoritative source and falls back to counting
-        # whatever rows this render happened to pull.
-        done_count = sum(1 for t in tasks if t.get('status') == 'done')
+        # offline: the active fetch succeeded, so its rows are still good.
+        # The count, though, loses its ONLY authoritative source. Counting the
+        # fetched rows instead would now be a fabricated zero — the terminal
+        # window was skipped just above, so no done row was fetched at all —
+        # so the count is reported as UNKNOWN (None) and the caller omits the
+        # project from DONE_COUNTS, the same not-zero-and-not-offline channel
+        # the budget-degraded path uses.
+        done_count = None
         logger.warning(
-            'project %s: compact status map unavailable — done_count degraded '
-            'to a count over the %d fetched rows (%d), which undercounts when '
-            'the terminal window truncates',
-            project, len(tasks), done_count,
+            'project %s: compact status map unavailable — done_count is '
+            'UNKNOWN for this render (not zero, and not offline), and the '
+            'terminal window was skipped because it cannot be positioned '
+            'without the map, so no done/cancelled row is emitted',
+            project,
         )
     else:
         done_count = sum(1 for s in status_map.values() if s == 'done')
@@ -747,8 +771,13 @@ async def collect_tasks_with_counts(
             continue
         if offline:
             offline_projects.append(label)
-        else:
+        elif done_count is not None:
             done_counts[label] = done_count
+        # done_count is None => the compact status map read failed for an
+        # otherwise-healthy project. Omitting the label (rather than writing a
+        # fabricated 0) is the established UNKNOWN channel: the front end
+        # treats a missing DONE_COUNTS entry as "no authoritative count" and
+        # falls back to its own row count. See _shape_one_project's docstring.
         all_active.extend(active)
 
     if resolve_external:

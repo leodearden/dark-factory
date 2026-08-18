@@ -2360,13 +2360,135 @@ class TestShapeOneProjectNarrowing:
 
         assert offline is False, 'the active fetch succeeded — the project is not offline'
         assert [r['title'] for r in active if r.get('status') == 'in-progress'] == ['task 1']
-        assert done_count == 1, 'done_count degrades to a count over returned rows'
+        assert done_count is None, (
+            'done_count must be UNKNOWN, not a fabricated 0: the terminal window '
+            'is skipped when the map is unavailable, so counting the fetched rows '
+            'would report zero done tasks for a project that has them'
+        )
         assert any(
             r.name == 'dashboard.data.active_tasks'
             and r.levelno >= logging.WARNING
             and 'dark-factory' in r.getMessage()
             for r in caplog.records
         ), 'the degraded count must be logged, not silent'
+
+    async def test_offline_status_map_omits_the_project_from_done_counts(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """An UNKNOWN done_count must not reach the payload as an authoritative 0.
+
+        The front end treats a MISSING ``DONE_COUNTS`` entry as "no
+        authoritative count" and falls back to its own row count
+        (``DF_T.DONE_COUNTS[p.id] != null`` in tab_tasks.jsx).  Writing a 0
+        would instead assert, with authority, that the project has completed
+        nothing.
+        """
+        import httpx
+
+        from dashboard.data.active_tasks import collect_tasks_with_counts
+
+        rows = [_raw_row(1, 'in-progress'), _raw_row(100, 'done')]
+
+        async def _statuses_fail(client, url, tool, args, **_kw):
+            if tool == 'get_statuses':
+                raise httpx.ConnectError('refused')
+            statuses = args.get('statuses')
+            return {'tasks': [
+                r for r in rows
+                if statuses is None or r.get('status') in statuses
+            ]}
+
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _statuses_fail)
+
+        config = self._one_project_config(tmp_path)
+        _active, offline_projects, done_counts, degraded = await collect_tasks_with_counts(
+            dummy_client, config,
+            max_done_per_project=50, max_cancelled_per_project=50,
+        )
+
+        assert offline_projects == [], 'the active fetch succeeded — not offline'
+        assert degraded == [], 'the budget was not exceeded — not degraded'
+        assert 'dark-factory' not in done_counts, (
+            'a project whose count is UNKNOWN must be OMITTED from DONE_COUNTS, '
+            f'not written as a fabricated value; got {done_counts!r}'
+        )
+
+    async def test_offline_status_map_never_emits_the_oldest_terminal_rows(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """A failed compact-map read must not repopulate the tab with ANCIENT rows.
+
+        Regression for the review finding on the task-3857 branch.  The
+        terminal window is positioned by ``offset = n_terminal - window``,
+        and ``n_terminal`` comes from the compact map.  When that read failed,
+        ``status_map`` was reset to ``{}`` so ``n_terminal`` was 0 and the
+        offset collapsed to ``max(0, 0 - window) == 0``.  Because
+        ``page_size``/``offset`` slice an ASCENDING-id list, offset 0 selects
+        the OLDEST terminal rows — which were then sorted by ``updated_at``
+        descending and emitted as the Tasks tab's *most recent* done list.
+
+        The previous test at this seam used two rows, so ``n_terminal <=
+        window`` held either way and the case could not fire.  This one uses
+        strictly MORE terminal rows than the window.
+        """
+        import httpx
+
+        import dashboard.data.active_tasks as at_mod
+        from dashboard.data.active_tasks import _shape_one_project
+
+        monkeypatch.setattr(at_mod, '_TERMINAL_FETCH_WINDOW', 3)
+        # 10 done rows; ids 100..109 ascend with age (100 = oldest completion).
+        rows = [_raw_row(1, 'in-progress')]
+        rows += [_raw_row(i, 'done') for i in range(100, 110)]
+
+        calls: list[dict] = []
+
+        async def _statuses_fail(client, url, tool, args, **_kw):
+            calls.append({'tool': tool, 'args': args})
+            if tool == 'get_statuses':
+                raise httpx.ConnectError('refused')
+            statuses = args.get('statuses')
+            selected = [
+                r for r in rows
+                if statuses is None or r.get('status') in statuses
+            ]
+            offset = args.get('offset') or 0
+            page_size = args.get('page_size')
+            selected = selected[offset:offset + page_size] if page_size else selected[offset:]
+            return {'tasks': selected}
+
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _statuses_fail)
+
+        config = self._one_project_config(tmp_path)
+        active, offline, done_count = await _shape_one_project(
+            dummy_client, config, config.project_root,
+            max_done_per_project=50, max_cancelled_per_project=50,
+        )
+
+        assert offline is False, 'the active fetch succeeded — the project is not offline'
+        assert done_count is None, 'the count is UNKNOWN without the map'
+
+        # (1) No unpositionable terminal fetch is issued at all.
+        terminal_calls = [
+            c for c in calls
+            if c['tool'] == 'get_tasks'
+            and 'done' in (c['args'].get('statuses') or [])
+        ]
+        assert terminal_calls == [], (
+            'the terminal window cannot be positioned without the compact map, '
+            f'so it must not be fetched; got {terminal_calls!r}'
+        )
+
+        # (2) And therefore no ancient row is presented as recent.
+        emitted_done = [r for r in active if r.get('status') == 'done']
+        assert emitted_done == [], (
+            'omitting done rows is honest; showing the OLDEST rows as the '
+            f'newest is not. Got ids {[r.get("id") for r in emitted_done]}'
+        )
+
+        # (3) The healthy active row still renders — this is a partial
+        # degradation, not an offline project.
+        assert [r['title'] for r in active if r.get('status') == 'in-progress'] == ['task 1']
 
 
 # ---------------------------------------------------------------------------
