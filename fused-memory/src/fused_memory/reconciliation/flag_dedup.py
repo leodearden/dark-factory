@@ -748,6 +748,72 @@ def _union_cited_tasks(current: Any, prior: Any) -> list[dict[str, Any]]:
     return merged
 
 
+#: Hard ceiling on the number of ``cited_tasks`` entries carried in a
+#: ``stage1_flag_marker`` payload (task 4381 review fix).  This is a bound on
+#: ledger ROW GROWTH, not a functional limit: realistic ``cited_tasks`` lists
+#: are 1-5 entries, so it never bites in normal operation.  It exists solely
+#: because the persisted anchor round-trips through the payload every cycle
+#: (persisted -> read back as ``prior_cited`` -> re-merged by
+#: :func:`_union_cited_tasks` -> re-persisted), so an LLM emitting fresh
+#: distinct citations every cycle would otherwise grow the row without limit.
+_MAX_PERSISTED_CITED_TASKS: int = 32
+
+
+def _persistable_cited_tasks(
+    entries: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """Project :func:`_union_cited_tasks`' output down to what may be PERSISTED.
+
+    This is the persistence projection of the cross-cycle anchor, applied ONLY
+    to the value written into the ``stage1_flag_marker`` payload — never to the
+    in-memory list handed to :func:`_resolve_live_cross_project_fix_task`.
+
+    Two narrowings, both forced by the fact that the persisted value
+    round-trips back into the union on the very next cycle:
+
+    * **Identity-bearing entries only.**  An entry lacking ``project_id`` or
+      ``task_id`` cannot be de-duplicated — :func:`_union_cited_tasks`
+      deliberately appends such an entry without collapsing it against
+      ``seen`` — so persisting one would add a fresh copy every cycle, forever.
+      It is also dead weight as an anchor: the resolver skips any entry it
+      cannot resolve to a project.  An explicit ``None`` counts as absent; the
+      check is ``is None``, NOT truthiness, so a legitimate ``task_id=0`` or
+      ``project_id=''`` survives.
+    * **Capped at** :data:`_MAX_PERSISTED_CITED_TASKS`.  Truncation keeps the
+      FIRST N: ``_union_cited_tasks`` orders the current cycle's citations
+      ahead of the prior anchor's, so the freshest entries are the retained
+      ones.
+
+    Returns ``None`` (never ``[]``) when nothing is persistable, so the
+    caller's ``if persistable:`` gate omits the payload key exactly as it does
+    for ``deduped_against`` and a citation-less flag keeps the historical
+    six-key payload verbatim.
+
+    Input order is preserved and the input is never mutated (a new list is
+    returned).  Pure, sync, no I/O — never raises.
+    """
+    if not isinstance(entries, list) or not entries:
+        return None
+    kept: list[dict[str, Any]] = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and entry.get('project_id') is not None
+        and entry.get('task_id') is not None
+    ]
+    if not kept:
+        return None
+    if len(kept) > _MAX_PERSISTED_CITED_TASKS:
+        logger.debug(
+            'flag_dedup: cited_tasks anchor truncated to %d of %d entries'
+            ' for the persisted marker payload',
+            _MAX_PERSISTED_CITED_TASKS,
+            len(kept),
+        )
+        return kept[:_MAX_PERSISTED_CITED_TASKS]
+    return kept
+
+
 def _is_completion_flag(flag: dict[str, Any]) -> bool:
     """Return True iff *flag* explicitly marks itself as ONE-TIME completed work.
 
