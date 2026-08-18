@@ -1392,3 +1392,169 @@ class TestListEntityNodesLiveFalkorDB:
         _, paged = await backend.enumerate_entity_nodes(group_id='test')
         assert paged.complete is True
         assert paged.expected_rows == self.LIVE_NODE_COUNT
+
+
+# ---------------------------------------------------------------------------
+# step-20: the OUTCOME, not the mechanism
+# ---------------------------------------------------------------------------
+#
+# Steps 16-19 fix the mechanism. This pins the CONSEQUENCE the review asked
+# for — "a structural refusal must not produce stale verdicts / must not blank
+# summaries" — so a future refactor that re-opens the corrupting path fails
+# loudly even if it keeps every mechanism test green.
+#
+# WHY THE NODE READ MUST STAY HEALTHY HERE, and why a simpler test would be
+# worthless: both shims default to the same _DEFAULT_READ_PAGE_SIZE, so a
+# refusal triggered by the page-size-vs-cap comparison fires on BOTH reads in
+# lockstep — list_entity_nodes also refuses, `entities` is empty, and the
+# rebuild loop never runs. A naive test would therefore pass WITHOUT the fix.
+# That lockstep is an ACCIDENT of two defaults being equal, not a designed
+# invariant: it breaks the moment either default is tuned separately, and it
+# does not hold for INCOMPLETE_PAGE_CAP at all, where the node read can page
+# to the end while the edge read returns a prefix. So these tests force the
+# EDGE enumeration to be structurally incomplete while the NODE enumeration
+# SUCCEEDS — the real, unmasked shape of the defect.
+
+
+class DualCorpusGraph:
+    """A graph double answering node reads and edge reads from separate corpora.
+
+    ``FakeCappedGraph`` holds one corpus and cannot represent "the node read
+    succeeded and the edge read did not", which is the only shape in which
+    this defect is visible.
+    """
+
+    def __init__(self, node_rows: list[list], edge_rows: list[list]):
+        self._nodes = FakeCappedGraph(node_rows, resultset_cap=None)
+        self._edges = FakeCappedGraph(edge_rows, resultset_cap=None)
+        self.queries: list[str] = []
+
+    def _delegate(self, cypher: str):
+        return self._edges if 'RELATES_TO' in cypher else self._nodes
+
+    async def ro_query(self, cypher: str, params: dict | None = None):
+        self.queries.append(cypher)
+        return await self._delegate(cypher).ro_query(cypher, params)
+
+    async def query(self, cypher: str, params: dict | None = None):  # pragma: no cover
+        raise AssertionError('read paths must use ro_query, never query')
+
+
+def force_edge_read_only(monkeypatch, **forced):
+    """Force ``_paged_ro_query`` kwargs for the EDGE read alone.
+
+    Dispatches on the page template so the node enumeration runs untouched.
+    Without this the two reads fail in lockstep on the shared default page
+    size, which masks the defect — see the section comment above.
+    """
+    from fused_memory.backends import graphiti_client
+
+    real = graphiti_client._paged_ro_query
+
+    async def dispatching(*args, **kwargs):
+        page_template = args[1] if len(args) > 1 else kwargs.get('page_template', '')
+        if 'RELATES_TO' in page_template:
+            kwargs = {**kwargs, **forced}
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(graphiti_client, '_paged_ro_query', dispatching)
+
+
+def _healthy_entities(count: int = 5) -> list[list]:
+    """Entity rows with NON-EMPTY summaries — the thing that gets blanked."""
+    return [[f'u{i}', f'name-{i}', f'a real summary for {i}'] for i in range(count)]
+
+
+def _healthy_edges(count: int = 5) -> list[list]:
+    """One valid edge per entity, whose fact IS that entity's summary.
+
+    So every entity is up to date and a correct read reports ZERO stale.
+    """
+    return [[f'u{i}', f'e{i}', f'a real summary for {i}', f'edge-{i}']
+            for i in range(count)]
+
+
+class TestStructuralRefusalProducesNoStaleVerdicts:
+    """detect_stale_with_edges must not manufacture verdicts from a non-read."""
+
+    @pytest.mark.asyncio
+    async def test_counterfactual_an_empty_edge_read_reports_everything_stale(
+        self, mock_config, make_backend
+    ):
+        """THE COUNTERFACTUAL, pinned rather than asserted in a comment.
+
+        This is what an edge read returning ``{}`` does, and it is why the
+        refusal had to stop being one: ``_build_stale_entry`` computes
+        ``canonical = '\\n'.join([]) == ''`` for every entity, finds
+        ``summary != canonical`` for every non-empty summary, and reports the
+        ENTIRE graph stale.  ``rebuild_entity_from_edges`` would then write
+        that ``''`` back.
+
+        Here the empty is GENUINE (an empty edge corpus, a complete
+        enumeration of nothing), so it correctly does not raise — and the
+        damage it describes is exactly what a fabricated empty would have
+        caused indistinguishably.  That indistinguishability is the defect.
+        """
+        backend = make_backend(mock_config)
+        _wire(backend, DualCorpusGraph(_healthy_entities(), []))
+        result = await backend.detect_stale_with_edges(group_id='test')
+        assert result.total_count == 5
+        assert len(result.stale) == 5           # every single one, blanked-to-be
+        assert all(s['summary'] for s in result.stale)
+
+    @pytest.mark.asyncio
+    async def test_healthy_reads_report_nothing_stale(
+        self, mock_config, make_backend
+    ):
+        """The control: with both reads intact, the same corpus is entirely fresh.
+
+        Without this the assertion above proves nothing — it would be
+        satisfied by a fixture that reports everything stale regardless.
+        """
+        backend = make_backend(mock_config)
+        _wire(backend, DualCorpusGraph(_healthy_entities(), _healthy_edges()))
+        result = await backend.detect_stale_with_edges(group_id='test')
+        assert result.total_count == 5
+        assert result.stale == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'forced, kind_name',
+        [
+            pytest.param(
+                {'page_size': _LIVE_RESULTSET_CAP,
+                 'resultset_size': _LIVE_RESULTSET_CAP},
+                'INCOMPLETE_STRUCTURAL_REFUSAL',
+                id='refusal',
+            ),
+            pytest.param(
+                {'page_size': 2, 'max_pages': 1},
+                'INCOMPLETE_PAGE_CAP',
+                id='page-cap',
+            ),
+        ],
+    )
+    async def test_structural_edge_read_raises_instead_of_verdicting(
+        self, forced, kind_name, mock_config, make_backend, monkeypatch
+    ):
+        """No StaleSummaryResult is produced at all — the raise precedes verdicts."""
+        from fused_memory.backends import graphiti_client
+
+        backend = make_backend(mock_config)
+        _wire(backend, DualCorpusGraph(_healthy_entities(), _healthy_edges()))
+        force_edge_read_only(monkeypatch, **forced)
+
+        # The node read is genuinely healthy — this is the unmasked shape.
+        nodes, node_paged = await backend.enumerate_entity_nodes(group_id='test')
+        assert node_paged.complete is True
+        assert len(nodes) == 5
+
+        _, edge_paged = await backend.enumerate_all_valid_edges(group_id='test')
+        assert edge_paged.incomplete_kind == getattr(graphiti_client, kind_name)
+
+        sentinel = object()
+        result = sentinel
+        with pytest.raises(graphiti_client.IncompleteEnumerationError):
+            result = await backend.detect_stale_with_edges(group_id='test')
+        # Nothing was returned, so nothing with a non-empty .stale was either.
+        assert result is sentinel
