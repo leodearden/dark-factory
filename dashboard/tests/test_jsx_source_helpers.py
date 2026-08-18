@@ -14,12 +14,18 @@ brace-delimited block of a named `function` declaration, signature excluded,
 and it RAISES on a miss.  Raising rather than returning `''` is load-bearing:
 a silently-empty body makes every downstream ABSENCE assertion pass
 vacuously, which is a permanent false GREEN.
+
+`strip_js_comments` is the companion: every probe in these suites is a plain
+substring or regex search, so without it they also match PROSE — and a
+component is then forbidden from documenting the very expression it stopped
+using.  Its over-reach direction is the dangerous one and is pinned hardest
+here: blanking real code would disarm every absence assertion downstream.
 """
 
 from __future__ import annotations
 
 import pytest
-from _dashboard_helpers import extract_function_body
+from _dashboard_helpers import extract_function_body, strip_js_comments
 
 
 class TestExtractFunctionBody:
@@ -136,3 +142,98 @@ class TestExtractFunctionBody:
 
         with pytest.raises(AssertionError, match='Foo'):
             extract_function_body(src, 'Foo')
+
+
+class TestStripJsComments:
+    """The quote-aware comment stripper's contract.
+
+    Mirrors and extends the contract previously pinned by
+    test_charts_null_samples.py's own `test_strip_comments_*` tests, so
+    nothing that file guarantees today is lost by the consolidation.
+    """
+
+    def test_line_comment_is_blanked_and_the_code_either_side_survives(self) -> None:
+        stripped = strip_js_comments(
+            'const a = 1; // st.values[i] || 0 is the old scrub\nconst b = 2;'
+        )
+
+        assert 'st.values[i] || 0' not in stripped, 'a line comment must not be probed'
+        assert 'const a = 1;' in stripped, 'code before the comment survives'
+        assert 'const b = 2;' in stripped, 'code after the comment survives'
+
+    def test_block_comment_is_blanked_and_the_code_either_side_survives(self) -> None:
+        stripped = strip_js_comments('const a = 1; /* Math.max(...values, 1) */ const b = 2;')
+
+        assert 'Math.max(...values' not in stripped, 'a block comment must not be probed'
+        assert 'const a = 1;' in stripped
+        assert 'const b = 2;' in stripped
+
+    def test_jsx_comment_is_blanked_and_the_markup_survives(self) -> None:
+        stripped = strip_js_comments('<g>{/* (v / max) * 100 */}<rect /></g>')
+
+        assert '(v / max) * 100' not in stripped, 'a JSX comment must not be probed'
+        assert '<rect />' in stripped
+
+    @pytest.mark.parametrize(
+        'literal',
+        ['"https://x/y"', "'https://x/y'", '`https://x/y`'],
+        ids=['double', 'single', 'template'],
+    )
+    def test_a_slash_slash_inside_a_string_literal_is_not_a_comment(self, literal: str) -> None:
+        """The OVER-REACH direction — the one that produces a false GREEN.
+
+        Blanking from a `//` inside a string literal to end-of-line deletes
+        real CODE, and an absence assertion over deleted code passes for the
+        wrong reason, permanently and silently.  All three quote styles are
+        exercised because the retired two-regex variant guarded only the
+        `https:` case and would fail the single-quoted and template rows.
+        """
+        stripped = strip_js_comments(f'const u = {literal}; const h = (v / max) * chartH;')
+
+        assert '(v / max) * chartH' in stripped, (
+            f'a `//` inside the string literal {literal} was treated as a comment, '
+            f'blanking the code after it — that silently disarms every probe on '
+            f'the rest of the line'
+        )
+
+    def test_a_comment_does_not_splice_the_tokens_it_separated(self) -> None:
+        """Each comment becomes a single space, never nothing.
+
+        Removing it outright would join `a` and `b` into `ab` — a token that
+        appears nowhere in the source, so a presence assertion could be
+        satisfied by text the file does not contain.
+        """
+        assert 'ab' not in strip_js_comments('a/* */b')
+
+    def test_an_escaped_quote_does_not_terminate_the_literal_early(self) -> None:
+        r"""`'a\'b // c'` stays one literal, so its `//` is still not a comment.
+
+        Were the escape mishandled, the scanner would consider the string
+        closed at the escaped quote and treat the rest as code — blanking from
+        the `//` onwards, which is the over-reach direction again.
+        """
+        stripped = strip_js_comments(r"const s = 'a\'b // c'; const keep = 1;")
+
+        assert 'const keep = 1;' in stripped, (
+            'an escaped quote closed the literal early, so the `//` inside it '
+            'was treated as a comment and the following code was blanked'
+        )
+
+    def test_composes_with_the_extractor_over_the_same_source(self) -> None:
+        """Stripping first must not cost the extractor the function it needs.
+
+        This is how the real consumers use the pair — extract, then strip, or
+        strip, then extract — so the stripper has to leave declarations, brace
+        structure and line breaks intact.
+        """
+        src = (
+            'function Foo(a) {\n'
+            '  // Math.max(...values, 1) was the old scrub\n'
+            '  const kept = 1;\n'
+            '}\n'
+        )
+
+        body = extract_function_body(strip_js_comments(src), 'Foo')
+
+        assert 'const kept = 1;' in body, 'the code inside the stripped body survives'
+        assert 'Math.max(...values' not in body, 'the comment inside the body is blanked'
