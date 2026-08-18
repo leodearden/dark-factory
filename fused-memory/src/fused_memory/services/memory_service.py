@@ -5328,10 +5328,37 @@ class MemoryService:
                 # the patch keys, so the fast path keeps its whole point:
                 # Qdrant still merges server-side and no pre-image key the
                 # caller did not name is rewritten.
+                #
+                # UNFILTERED on purpose, and LOUD if that ever stops holding.
+                # This branch is reached only for `metadata_mode == 'merge'`
+                # with no delete keys, so `_apply_metadata_delta`'s
+                # `new_custom.update(metadata_patch)` puts every patch key in
+                # and the seam only ever ASSIGNS (`meta['supersedes'] =
+                # members`), never pops — so `missing` is unreachable today.
+                # Were a future normalizer to drop a key, an `if k in
+                # new_custom` filter would silently skip it here while
+                # set_payload merged server-side and LEFT THE OLD VALUE in
+                # Qdrant, whereas the overwrite and content arms would drop
+                # it: the three-route split this whole change closed,
+                # reopened silently. Raising costs the write and names the
+                # divergence, which is the house's loud-over-silent norm; it
+                # happens before the coroutine is built, so no journal row
+                # and no un-awaited coroutine are left behind.
+                missing = [k for k in metadata_patch if k not in new_custom]
+                if missing:
+                    raise RuntimeError(
+                        'update_memory: the metadata vocabulary seam removed '
+                        f'patch key(s) {missing!r} from the effective metadata; '
+                        'the set_payload fast path cannot express a key REMOVAL '
+                        '(Qdrant merges server-side), so this write would leave '
+                        'the stale value in place while the overwrite and '
+                        'content arms would drop it. Route key-removing '
+                        'normalization through the overwrite arm instead.'
+                    )
                 operation = 'update_memory_set_payload'
                 coro = self.mem0.set_payload(
                     memory_id,
-                    {k: new_custom[k] for k in metadata_patch if k in new_custom},
+                    {k: new_custom[k] for k in metadata_patch},
                     scope,
                 )
             else:

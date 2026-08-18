@@ -2013,6 +2013,56 @@ class TestFastPathPersistsSeamNormalizedValues:
         payload = service.mem0.set_payload.await_args.args[1]
         assert payload == {'topic': 'cgl-eta'}
 
+    @pytest.mark.asyncio
+    async def test_the_content_arm_persists_the_identical_value(self, service):
+        """The THIRD route, and the one with the widest blast radius.
+
+        A combined content+metadata call forwards the whole `new_custom` to
+        `mem0.update`, whose backend rebuilds the point payload from scratch.
+        Pinning only the two metadata-only routes would leave the agreement
+        two-thirds established while reading as complete.
+        """
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text',
+            metadata_patch={'supersedes': self._SUPERSEDED},
+        )
+
+        service.mem0.update.assert_awaited_once()
+        metadata = service.mem0.update.await_args.kwargs['metadata']
+        assert metadata['supersedes'] == [self._SUPERSEDED]
+
+    @pytest.mark.asyncio
+    async def test_a_patch_key_the_seam_removes_fails_loudly(
+        self, service, monkeypatch
+    ):
+        """Unreachable today, and it must stay unreachable LOUDLY.
+
+        The seam only ever assigns, never pops, so every patch key survives
+        into `new_custom`. Were a future normalizer to drop one, filtering it
+        out here would silently succeed while `set_payload` merged
+        server-side and LEFT THE STALE VALUE in Qdrant — whereas the
+        overwrite and content arms would drop it. That is the three-route
+        split this change closed, reopened without a single failing test.
+        """
+        from fused_memory.services import memory_service as ms
+
+        real = ms.validate_memory_metadata
+
+        def _dropping(meta, **kwargs):
+            meta.pop('x_dropped', None)
+            return real(meta, **kwargs)
+
+        monkeypatch.setattr(ms, 'validate_memory_metadata', _dropping)
+
+        with pytest.raises(RuntimeError, match='x_dropped'):
+            await service.update_memory(
+                memory_id='point-1', project_id='test',
+                metadata_patch={'x_dropped': 'gone'},
+            )
+
+        service.mem0.set_payload.assert_not_called()
+
 
 class TestMetadataFastPathEquivalence:
     """The two fast paths must agree with ``_apply_metadata_delta``.
@@ -11531,6 +11581,38 @@ class TestUpdateMemoryValidatesTheDeltaNotTheCorpus:
         assert 'dead_parent_id' in {v.code for v in excinfo.value.violations}
         assert lookups == [self._POINT, other_parent]
         service.mem0.set_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_combined_content_and_patch_rejection_writes_nothing(
+        self, service
+    ):
+        """The widest-blast-radius arm, pinned for rejection ORDERING.
+
+        Every other case here drives a metadata-only route, so their
+        `mem0.update.assert_not_called()` passes vacuously — no content was
+        ever supplied. This one supplies it: the content arm rebuilds the
+        point payload from scratch, so a rejection that landed AFTER the
+        write is the one that could leave a record carrying new text with
+        stale metadata. The seam sits before `scope` and every journaled
+        backend call precisely so that cannot happen.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, _MM_LEGACY_INVALID_PRE_IMAGE)
+        journal = _mm_install_journal(service)
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                content='new text',
+                metadata_patch={'topic': 'Not A Slug'},
+            )
+
+        assert 'invalid_topic_slug' in {v.code for v in excinfo.value.violations}
+        service.mem0.update.assert_not_called()
+        journal.log_mem0_intent.assert_not_called()
+        journal.log_write_op.assert_not_called()
 
 
 class TestCanonicalUniquenessAtSeam:
