@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -301,22 +302,54 @@ def _runtime_fields(
     }
 
 
-def _resolve_deps(task: dict, by_id: dict[int, dict], project: str) -> list[dict]:
+def _resolve_deps(
+    task: dict,
+    by_id: dict[int, dict],
+    project: str,
+    *,
+    status_map: Mapping[int, str] | None = None,
+) -> list[dict]:
     """Resolve *task*'s ``dependencies`` ids into ``{id, title, done}`` dicts.
 
-    *by_id* is the full project task lookup (built over every fetched task,
-    regardless of status bucket), so a dependency resolves whether it lives
-    in an active status or a terminal one.
+    *by_id* is the lookup over the rows this render actually fetched.  It used
+    to span the whole tree; since ``_shape_one_project`` bounded the terminal
+    fetch it does not, so a done dependency outside the window would drop out
+    of ``by_id`` and lose its chip entirely.
+
+    Resolution order, most to least informative:
+
+    1. a full row in *by_id* — real title, real status;
+    2. otherwise, an id present in *status_map* — an honest PARTIAL entry:
+       the ``done`` flag is authoritative, the title degrades to ``''``;
+    3. otherwise dropped, unchanged.  The id exists nowhere the dashboard can
+       see, and fabricating a chip for it would be worse than omitting it.
+
+    Why the title degrades rather than being fetched: ``get_tasks`` exposes no
+    ``ids`` filter, so resolving one missing title costs an entire extra tree
+    read — precisely the unbounded fetch this design removed.  The compact
+    status map is the only BOUNDED source available, and the ``done`` flag is
+    the load-bearing half of the chip (it drives the strike-through), so a
+    titleless-but-correct chip beats a missing one.  ``''`` is already what
+    this function emits for a row with no title, so no consumer needs a new
+    guard.
     """
     deps: list[dict] = []
     for dep_id in task.get('dependencies') or []:
         dep_task = by_id.get(dep_id)
-        if dep_task is None:
+        if dep_task is not None:
+            deps.append({
+                'id': _task_uid(project, dep_id),
+                'title': dep_task.get('title') or '',
+                'done': dep_task.get('status') == 'done',
+            })
+            continue
+        dep_status = (status_map or {}).get(dep_id)
+        if dep_status is None:
             continue
         deps.append({
             'id': _task_uid(project, dep_id),
-            'title': dep_task.get('title') or '',
-            'done': dep_task.get('status') == 'done',
+            'title': '',
+            'done': dep_status == 'done',
         })
     return deps
 
@@ -494,7 +527,7 @@ async def _shape_one_project(
         row = _build_task_row(project, task, task_id, rt, uid, now=effective_now)
         # active rows: started from the runtime entry; deps from task tree.
         row['started'] = rt['started']
-        row['deps'] = _resolve_deps(task, by_id, project)
+        row['deps'] = _resolve_deps(task, by_id, project, status_map=status_map)
         active.append(row)
 
     # PRDs with at least one member still in an active status. Done/cancelled
@@ -535,7 +568,10 @@ async def _shape_one_project(
             # terminal rows: no meaningful start time; deps only for live-PRD
             # members (the terminal-member exemption), else unsurfaced.
             row['started'] = 0
-            row['deps'] = _resolve_deps(task, by_id, project) if is_live_member else []
+            row['deps'] = (
+                _resolve_deps(task, by_id, project, status_map=status_map)
+                if is_live_member else []
+            )
             row['completed'] = task.get('updated_at') or ''
             active.append(row)
         if exempted_count > _LIVE_PRD_EXEMPTION_WARN_THRESHOLD:

@@ -1578,8 +1578,15 @@ async def test_collect_active_tasks_includes_deferred_via_active_path(
     by_id = {t['id']: t for t in active}
     row = by_id['proj/T-30']
 
-    # (b) resolved deps via active path — done flag on the dep
-    assert row['deps'] == [{'id': 'proj/T-31', 'title': 'finished dep', 'done': True}], (
+    # (b) resolved deps via active path — done flag on the dep.
+    #
+    # Task 3857: this is the scheduler path (both terminal caps 0), which by
+    # design now fetches NO terminal rows at all, so the done dep's full row
+    # is not available and its title degrades to ''. The done flag — the
+    # load-bearing half of the chip — still resolves, via the compact status
+    # map. Resolving the title would cost an extra whole-tree read, which is
+    # the unbounded fetch this design removed.
+    assert row['deps'] == [{'id': 'proj/T-31', 'title': '', 'done': True}], (
         f"expected deferred row deps with done=True, got: {row.get('deps')}"
     )
 
