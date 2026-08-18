@@ -20,14 +20,17 @@ mirrors ``test_crash_recovery.py``'s.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared import transcript_archive as transcript_archive_module
 from shared.cli_invoke import transcript_exists
 from shared.config_dir import CONFIG_DIR_PREFIX
+from shared.storm_counter import StormCounter
 
 from orchestrator.config import TranscriptArchiveConfig
 from orchestrator.harness import Harness
@@ -71,7 +74,29 @@ def harness(tmp_path: Path, mock_orch_config):
     )
     h.git_ops._is_registered_worktree = AsyncMock(return_value=True)
     h.event_store = MagicMock()
-    return h
+    yield h
+    # Harness.__init__ installs a PROCESS-GLOBAL archival-failure hook bound to
+    # this instance. Left behind, it would feed a later test's failures to a
+    # dead harness (and its escalation-queue mock). _reset_archival_failures
+    # clears both the hook and the counter — the isolation call the shared
+    # suite already standardises on.
+    transcript_archive_module._reset_archival_failures()
+
+
+class _FakeClock:
+    """Injectable monotonic clock — a 600s window is tested by advancing time,
+    never by sleeping (bulk_reset_guard's guard-side convention, which
+    StormCounter takes as ``time_provider``).
+    """
+
+    def __init__(self, now: float = 0.0) -> None:
+        self._now = now
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
 
 
 def _archive_root(harness: Harness) -> Path:
@@ -269,3 +294,195 @@ class TestSweeperWiredIntoCrashRecovery:
 
         harness._sweep_orphaned_transcripts.assert_not_called()
         harness._file_pool_storage_absent_escalation.assert_called_once()
+
+
+class TestArchivalFailureStormEscalation:
+    """INV-4: an archival-failure BURST becomes one deduped L1, not N log lines.
+
+    The counting substrate (``_ARCHIVAL_FAILURES``) and the notification seam
+    (``set_archival_failure_hook``) live in ``shared.transcript_archive``, which
+    is on the PURE_STDLIB_LEAVES contract and has no access to live config.  The
+    POLICY — threshold, window, dedup, filing — lives here, where the config is.
+    Every test below drives the REAL seam (``_record_failure``), not the hook
+    directly, so the two halves are pinned as one path.
+    """
+
+    @staticmethod
+    def _queue() -> MagicMock:
+        q = MagicMock()
+        q.has_open_l1 = MagicMock(return_value=False)
+        q.make_id = MagicMock(return_value='ta-storm')
+        return q
+
+    @staticmethod
+    def _fail(path: str = '/wt/3619/.task/claude-config-3619/projects/e/s.jsonl',
+              task_id: str = '3619',
+              err: int = errno.EACCES) -> None:
+        """Drive one genuine per-file archival failure through the real seam."""
+        transcript_archive_module._record_failure(
+            Path(path), task_id, OSError(err, os.strerror(err)),
+        )
+
+    def test_harness_installs_the_hook_on_the_shared_seam(self, harness: Harness):
+        """(b) The consumer the seam was built for is wired at construction —
+        the same declare-on-callee / install-in-harness pattern as
+        ``_on_pool_storage_absent``.
+        """
+        assert transcript_archive_module._ON_ARCHIVAL_FAILURE is not None
+        assert harness._on_archival_failure == (
+            transcript_archive_module._ON_ARCHIVAL_FAILURE
+        )
+
+    def test_below_threshold_files_nothing_then_threshold_fires_once(
+        self, harness: Harness,
+    ):
+        """(b) N-1 failures are routine and file NOTHING; the Nth fires exactly
+        one L1 naming the failing paths and errnos.
+        """
+        harness.config.transcript_archive.storm_threshold = 3
+        harness.config.transcript_archive.storm_window_secs = 600.0
+        harness._escalation_queue = self._queue()
+
+        self._fail(path='/wt/a.jsonl', task_id='3619')
+        self._fail(path='/wt/b.jsonl', task_id='3620')
+        assert harness._escalation_queue.submit.call_count == 0
+
+        self._fail(path='/wt/c.jsonl', task_id='3621')
+        assert harness._escalation_queue.submit.call_count == 1
+
+        esc = harness._escalation_queue.submit.call_args.args[0]
+        assert esc.severity == 'blocking'
+        assert esc.category == 'infra_issue'
+        assert esc.level == 1
+        # A DEDICATED sentinel/role pair: a shared sentinel lets a reap close
+        # the wrong queue's gate (task 3528).
+        assert esc.task_id == harness._ARCHIVAL_STORM_SENTINEL
+        assert esc.agent_role == harness._ARCHIVAL_STORM_ROLE
+        assert harness._ARCHIVAL_STORM_SENTINEL not in {
+            harness._POOL_STORAGE_ABSENT_SENTINEL,
+            harness._WARM_BASE_HARD_DOWN_SENTINEL,
+            harness._SESSION_RESUME_STORM_SENTINEL,
+        }
+        assert harness._ARCHIVAL_STORM_ROLE not in {
+            harness._POOL_STORAGE_ABSENT_ROLE,
+            harness._WARM_BASE_HARD_DOWN_ROLE,
+            harness._SESSION_RESUME_STORM_ROLE,
+        }
+        # The operator must be able to act without reading the code: which
+        # files, which errno, and where the archive root is.
+        assert 'archiv' in esc.summary.lower()
+        assert '/wt/a.jsonl' in esc.detail
+        assert '/wt/c.jsonl' in esc.detail
+        assert str(errno.EACCES) in esc.detail or 'EACCES' in esc.detail
+
+    def test_rate_limited_within_the_window_and_deduped_across_windows(
+        self, harness: Harness,
+    ):
+        """(c) One incident, one L1.  Inside the window the StormCounter's rate
+        limit suppresses; across windows ``has_open_l1`` does — a runaway
+        emitting hundreds of failures must not file hundreds of escalations.
+        """
+        clock = _FakeClock()
+        harness.config.transcript_archive.storm_threshold = 2
+        harness.config.transcript_archive.storm_window_secs = 100.0
+        harness._escalation_queue = self._queue()
+        harness._archival_storm_counter = StormCounter(time_provider=clock)
+
+        self._fail()
+        self._fail()
+        assert harness._escalation_queue.submit.call_count == 1
+
+        # Same window: rate-limited.
+        clock.advance(10)
+        self._fail()
+        self._fail()
+        assert harness._escalation_queue.submit.call_count == 1
+
+        # Next window, but the first L1 is still open → dedup holds.
+        harness._escalation_queue.has_open_l1 = MagicMock(return_value=True)
+        clock.advance(1000)
+        self._fail()
+        self._fail()
+        assert harness._escalation_queue.submit.call_count == 1
+
+    def test_threshold_and_window_are_read_live_on_every_record(
+        self, harness: Harness,
+    ):
+        """(d) Both knobs are green-tier: a hot reload must take effect without
+        a restart.  Capturing them at construction would make the RELOADABLE
+        registration a lie (StormCounter's documented RELOAD SAFETY contract —
+        pass per ``record()``, never capture).
+        """
+        clock = _FakeClock()
+        harness._escalation_queue = self._queue()
+        harness._archival_storm_counter = StormCounter(time_provider=clock)
+
+        # Threshold read live: 2 failures under a threshold of 10 file nothing.
+        harness.config.transcript_archive.storm_threshold = 10
+        harness.config.transcript_archive.storm_window_secs = 600.0
+        self._fail()
+        self._fail()
+        assert harness._escalation_queue.submit.call_count == 0
+
+        # Operator hot-reloads the leaf down to 3 — the very next failure fires.
+        harness.config.transcript_archive.storm_threshold = 3
+        self._fail()
+        assert harness._escalation_queue.submit.call_count == 1
+
+        # Window read live: the same 3 events, now judged against a 10s window
+        # they have long since aged out of, cannot re-fire.
+        harness._escalation_queue = self._queue()
+        harness.config.transcript_archive.storm_window_secs = 10.0
+        clock.advance(500)
+        self._fail()
+        assert harness._escalation_queue.submit.call_count == 0
+
+    def test_bare_harness_without_a_queue_is_a_silent_noop_that_still_counts(
+        self, harness: Harness,
+    ):
+        """(e) No escalation wiring (unit-test / early-boot shape) must not
+        raise out of a teardown path — but the burst is still COUNTED, so the
+        filer's guard is the only thing suppressed.
+        """
+        harness.config.transcript_archive.storm_threshold = 2
+        harness.config.transcript_archive.storm_window_secs = 600.0
+        harness._escalation_queue = None
+
+        before = transcript_archive_module._archival_failures()
+        self._fail()
+        self._fail()
+
+        assert transcript_archive_module._archival_failures() == before + 2
+        assert harness._archival_storm_counter.prune(600.0) == 2
+
+    def test_slow_drip_across_window_boundaries_never_false_fires(
+        self, harness: Harness,
+    ):
+        """(f) A trickle is not a storm.  Failures spaced wider than the window
+        age out and must never accumulate into a false burst — the property
+        that makes this L1 worth waking someone for.
+        """
+        clock = _FakeClock()
+        harness.config.transcript_archive.storm_threshold = 3
+        harness.config.transcript_archive.storm_window_secs = 100.0
+        harness._escalation_queue = self._queue()
+        harness._archival_storm_counter = StormCounter(time_provider=clock)
+
+        for _ in range(6):
+            self._fail()
+            clock.advance(200)
+
+        assert harness._escalation_queue.submit.call_count == 0
+
+    def test_a_hook_that_cannot_file_never_breaks_archival(self, harness: Harness):
+        """Defence in depth at the consumer end: the seam already swallows a
+        raising hook, and the filer's own blanket guard means a broken
+        escalation queue degrades to a log line rather than an archival outage.
+        """
+        harness.config.transcript_archive.storm_threshold = 1
+        harness._escalation_queue = self._queue()
+        harness._escalation_queue.submit = MagicMock(side_effect=RuntimeError('boom'))
+
+        self._fail()  # must not raise
+
+        assert transcript_archive_module._archival_failures() >= 1
