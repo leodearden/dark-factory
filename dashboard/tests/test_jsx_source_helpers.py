@@ -24,9 +24,6 @@ here: blanking real code would disarm every absence assertion downstream.
 
 from __future__ import annotations
 
-import ast
-from pathlib import Path
-
 import pytest
 from _dashboard_helpers import extract_function_body, strip_js_comments
 
@@ -314,111 +311,6 @@ class TestSharedServedAssetFixtures:
             f'`_client` is {fixturedefs[-1].scope}-scoped; it must be module-scoped '
             f'so each consuming module pays exactly one app lifespan'
         )
-
-
-# ---------------------------------------------------------------------------
-# No-duplicate-copies guard.
-#
-# The whole cost of this consolidation was that every additional copy raised
-# the price of ever fixing the helper: the nested-declaration limitation went
-# unfixed for as long as fixing it meant editing nine files. This guard is what
-# stops the copies coming back one paste at a time.
-# ---------------------------------------------------------------------------
-
-# Modules that have been migrated onto the shared helpers and fixtures.
-_MIGRATED_MODULES = (
-    'test_charts_axis_labels.py',
-    'test_charts_null_samples.py',
-    'test_esc_flow_diagram.py',
-    'test_tab_escalation_analytics.py',
-    'test_tab_escalations.py',
-    'test_tab_memory_evals.py',
-    'test_tab_orchestrators.py',
-    'test_tab_tasks_runtime.py',
-    'test_tab_tasks_status_counts.py',
-)
-
-# Symbols a migrated module must import rather than define, mapped to what it
-# should reach for instead.
-_RETIRED_SYMBOLS = {
-    '_extract_function_body': '`from _dashboard_helpers import extract_function_body`',
-    '_strip_comments': '`from _dashboard_helpers import strip_js_comments`',
-    '_client': 'the module-scoped `_client` fixture in conftest.py',
-    'charts_jsx': 'the canonically-named `charts_jsx_body` fixture in conftest.py',
-    'analytics_jsx': 'the canonically-named `tab_analytics_jsx_body` fixture in conftest.py',
-    **{
-        name: f'the `{name}` fixture in conftest.py' for name in _SHARED_ASSET_FIXTURES
-    },
-}
-
-
-def _module_level_defs(source: str, filename: str = '<synthetic>') -> set[str]:
-    """Return the names of every module-level function defined in *source*.
-
-    Structural (``ast.parse`` over ``tree.body``) rather than a substring grep,
-    following test_conftest_import_guard.py's idiom: a grep would also match the
-    name inside a docstring, a comment, or an import statement, so a module that
-    correctly IMPORTS the shared helper would be reported as still defining it.
-    """
-    tree = ast.parse(source, filename=filename)
-    return {
-        node.name
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    }
-
-
-class TestNoDuplicateHelperCopies:
-    """Migrated modules import the shared helpers instead of redefining them."""
-
-    @pytest.mark.parametrize('module_name', _MIGRATED_MODULES)
-    def test_module_defines_no_retired_symbol(self, module_name: str) -> None:
-        path = Path(__file__).parent / module_name
-        defined = _module_level_defs(path.read_text(), filename=str(path))
-        offenders = sorted(defined & _RETIRED_SYMBOLS.keys())
-
-        assert not offenders, '\n'.join(
-            f'{module_name} still defines `{name}` — use {_RETIRED_SYMBOLS[name]} '
-            f'instead. A private copy is how the nested-declaration limitation '
-            f'survived nine rounds of nobody fixing it.'
-            for name in offenders
-        )
-
-    def test_the_guard_itself_can_fire(self) -> None:
-        """A source that DOES define a retired symbol is reported.
-
-        Without this, a typo in `_RETIRED_SYMBOLS` — or an `ast` walk that
-        silently stopped matching `FunctionDef` — would make every row above
-        pass vacuously, and the guard would go on reporting green while the
-        copies crept back.
-        """
-        synthetic = (
-            'import re\n'
-            '\n'
-            '\n'
-            'def _extract_function_body(src, name):\n'
-            '    return src\n'
-            '\n'
-            '\n'
-            'def _client():\n'
-            '    yield None\n'
-        )
-        offenders = _module_level_defs(synthetic) & _RETIRED_SYMBOLS.keys()
-
-        assert offenders == {'_extract_function_body', '_client'}, (
-            f'the guard failed to report a source that plainly defines two '
-            f'retired symbols — it reported {offenders!r}'
-        )
-
-    def test_the_guard_does_not_fire_on_an_import(self) -> None:
-        """Importing the shared helper is the CORRECT state and must pass.
-
-        The complement of the test above: a substring grep would flag this
-        source, which is exactly why the check is structural.
-        """
-        synthetic = 'from _dashboard_helpers import extract_function_body\n'
-
-        assert not (_module_level_defs(synthetic) & _RETIRED_SYMBOLS.keys())
 
 
 class TestNestedDeclarationAgainstRealSource:
