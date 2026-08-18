@@ -383,11 +383,26 @@ CATEGORIES = [
 # The heavy fields (detail, options, train_state, workflow_state, worktree,
 # dedupe_*) are still dropped to keep the watcher's context small as the pending
 # pile grows during an AFK window; `detail` in particular is the unbounded
-# free-text field that motivated compact mode.  ``root_cause`` (a one-line dedup
-# key) and ``member_ids`` (a short id list) are bounded by construction and are
-# what let a rotating watcher rebuild `already_promoted` from the drain ALONE,
-# with no session memory (task 3997, C1).  ``amendments`` is deliberately NOT
-# projected, so preserved incoming framing never inflates a drain.
+# free-text field that motivated compact mode.  ``root_cause`` and
+# ``member_ids`` are what let a rotating watcher rebuild `already_promoted` from
+# the drain ALONE, with no session memory (task 3997, C1).  ``amendments`` is
+# deliberately NOT projected, so preserved incoming framing never inflates a
+# drain.
+#
+# NEITHER OF THE TWO ADDED FIELDS IS BOUNDED IN PRINCIPLE, and this comment used
+# to claim they were "bounded by construction" — they are not.  ``promote_to_l2``
+# validates only that ``root_cause.strip()`` is non-empty, so an arbitrarily long
+# key rides every compact row, and ``member_ids`` grows with cluster size.  Both
+# are short in PRACTICE (a one-line dedup key; ~20-char ids), which is the actual
+# basis for including them.  Bounding them here was considered and REJECTED in
+# both available forms: truncating ``root_cause`` in the projection would
+# silently break the exact-match rebuild that is C1's entire point, and capping
+# it at mint would either fail a legitimate promote outright or collapse two
+# distinct keys into one L2 — over-folding, the very failure the amendment
+# storm report exists to surface.  The cost is real and named rather than
+# denied: every compact reader pays it, including the dashboard's
+# ``fetch_pins_recovery`` poll (dashboard/.../escalations.py), which asks for
+# ``compact=True`` on a loop and reads nothing but ``pins_recovery``.
 # The triage-ack fields (triaged_at, triaged_by, triage_note, updated_at) are
 # included so a compact drain can decide stamp-then-skip without a per-record
 # get_escalation round-trip.
