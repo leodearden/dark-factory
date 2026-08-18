@@ -8629,6 +8629,59 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # attribute so tests can monkeypatch it small, matching the
     # RESOURCE_AUDIT_*/MAX_* convention above.
     PERIODIC_REAP_MIN_AGE_SECS: float = 21600.0
+    # task 3622: number of periodic reaper SWEEPS (a COUNT, not seconds) of
+    # slack added on top of PERIODIC_REAP_MIN_AGE_SECS to derive the
+    # ESCALATION age floor — see _resource_audit_escalation_age_secs().
+    #
+    # A leaked worktree between the DETECTION floor
+    # (RESOURCE_AUDIT_WORKTREE_GRACE_SECS) and the DESTRUCTION floor
+    # (PERIODIC_REAP_MIN_AGE_SECS) is a condition the periodic sweep
+    # (_maybe_reap_orphaned_merge_worktrees) is already SCHEDULED to clear, so
+    # paging a human about it reports work that is about to happen anyway.
+    # Escalation therefore waits until that scheduled remediation has
+    # demonstrably FAILED, which is what this sweep count buys.
+    #
+    # The count is DERIVED, not picked.  The periodic sweep destroys any
+    # unowned `_merge-*` past PERIODIC_REAP_MIN_AGE_SECS on its NEXT firing,
+    # and it fires at most once per self._reap_interval_s — so ONE interval is
+    # the guaranteed-opportunity bound (the tree is certain to have been
+    # offered to the reaper at least once).  The SECOND interval covers
+    # exactly one fail-open cleanup_merge_worktree failure and its retry (the
+    # 'failed for %s — leaving for a later sweep' continue in
+    # reap_orphaned_merge_worktrees, which logs and moves on rather than
+    # raising).  Reaching the resulting floor means the reaper demonstrably
+    # had >= 2 SCHEDULED opportunities and the tree is STILL on disk — a
+    # genuine "nobody is going to clean this up".
+    #
+    # SCHEDULED, not attempted: two assumptions are stated here rather than
+    # left implicit (task 3622 review).
+    #   1. The sweep is driven ONLY from _heartbeat_loop's _HEARTBEAT_POLL_S
+    #      (30 s) tick, so the real sweep cadence is
+    #      max(_reap_interval_s, _HEARTBEAT_POLL_S).  At the shipped 300 s
+    #      interval the two agree and one interval really is one sweep; a
+    #      deployment that set _reap_interval_s BELOW the poll period would
+    #      get a floor lower than the true two-sweep bound.
+    #   2. _maybe_reap_orphaned_merge_worktrees consumes its rate-limit slot
+    #      (_last_reap_at = now) BEFORE awaiting the sweep, and _heartbeat_loop
+    #      bounds that await with _reap_sweep_timeout_s (120 s) — so a sweep
+    #      that times out or raises burns an opportunity WITHOUT ever reaching
+    #      the tree, logging only 'merge queue heartbeat: periodic reap failed'.
+    # Both err in the same direction: the floor can over-count how many times
+    # the reaper actually TRIED, so escalation may fire somewhat early.  Neither
+    # can suppress an escalation indefinitely, which is the only failure mode
+    # that would matter here (loud-over-silent).  A max(..., _HEARTBEAT_POLL_S)
+    # floor is deliberately NOT applied: it would buy nothing at any shipped
+    # value while forcing every test to run at >= 30 s-per-sweep scale.
+    # _alarm_resource_audit's suggested_action names case 2 explicitly so an
+    # operator does not grep for a cleanup failure that was never logged.
+    #
+    # Expressed in sweeps rather than seconds so it tracks the reaper's
+    # cadence: a deployment that changes _reap_interval_s moves the escalation
+    # floor with it instead of silently changing how many chances the reaper
+    # gets.  Kept as a class attribute so tests can monkeypatch it
+    # per-instance (e.g. worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS = 1.0),
+    # matching the RESOURCE_AUDIT_*/MAX_* convention above.
+    RESOURCE_AUDIT_REAP_GRACE_SWEEPS: float = 2.0
     # MQ-invariants iota (task 1994): number of CONSECUTIVE
     # _check_resource_audit heartbeats a resource-conservation violation
     # (speculation_accounting_violations / worktree_ledger_violations) must
@@ -11690,7 +11743,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         return violations
 
-    def worktree_ledger_violations(self, *, now: float | None = None) -> list[str]:
+    def worktree_ledger_violations(
+        self, *, now: float | None = None, grace_secs: float | None = None,
+    ) -> list[str]:
         """Return I6 worktree-ledger violations as human-readable strings.
 
         Empty list → every on-disk ``_merge-*`` worktree is accounted for.
@@ -11715,6 +11770,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         register/deregister races; a persistent leak eventually trips once
         it outlives the window.
 
+        Each violation string carries its RECLAIM DISPOSITION (task 3622):
+        below :attr:`PERIODIC_REAP_MIN_AGE_SECS` the tree is annotated as
+        scheduled for automatic reclaim by
+        :meth:`_maybe_reap_orphaned_merge_worktrees` (and names the age at
+        which that comes due); at or above it, as overdue.  Since detection
+        fires well before escalation does, this is what lets an operator tell
+        a self-healing leak from a stuck one.  The string is the ONLY channel
+        for the distinction — it is the single value flowing to all three
+        consumers (the WARNING log in :meth:`_check_resource_audit`, the
+        ``snapshot()['resource_audit']`` census, and the escalation body), so
+        annotating it reaches every consumer without adding a snapshot
+        sub-key (``snapshot()`` is under an additive-only freeze and its
+        ``resource_audit`` value is pinned by exact dict equality).  The
+        disposition is computed against
+        :attr:`PERIODIC_REAP_MIN_AGE_SECS`, NOT against the resolved
+        *grace_secs* floor, so a raised-floor caller cannot misreport an
+        in-window tree as overdue.  The leading text is unchanged.
+
         Returns ``[]`` immediately when ``not self._running``: mirrors
         :meth:`speculation_accounting_violations` — ``stop()`` drains and
         cleans up owned worktrees, so auditing during/after shutdown would
@@ -11722,6 +11795,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         *now* is injectable for deterministic tests; defaults to
         ``time.time()``.
+
+        *grace_secs* (task 3622) overrides the age floor for this call only;
+        ``None`` inherits :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`.  Mirrors
+        :meth:`reap_orphaned_merge_worktrees`'s ``min_age_secs`` idiom — same
+        module, same "None means inherit the class default" semantics — so
+        detection and remediation expose the identical override shape.
+        Raising the floor narrows WHICH leaks are reported and changes
+        nothing else: every other exclusion (ownership, ``_merge-`` prefix,
+        the persistent verify worktree, the ``_running`` guard) is orthogonal
+        to it and still applies.  Its consumer is
+        :meth:`_check_resource_audit`'s escalation predicate, which re-asks
+        this question at :meth:`_resource_audit_escalation_age_secs` to find
+        the leaks that have outlived their scheduled reclaim; the default
+        callers (:meth:`snapshot`, and this method's own detection/logging
+        path) keep the lower floor so the census stays truthful.
 
         Pure/synchronous (no await, no git subprocess). Fail-safe: never
         raises; any unexpected exception is caught and surfaced as a
@@ -11736,7 +11824,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if base is None or not base.is_dir():
                 return []
             effective_now = now if now is not None else time.time()
-            grace = self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+            grace = (
+                grace_secs
+                if grace_secs is not None
+                else self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+            )
             owned = {p.resolve() for p in self._owned_merge_worktrees}
             with os.scandir(base) as it:
                 candidates = list(it)
@@ -11755,10 +11847,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     continue
                 age = effective_now - mtime
                 if age > grace:
+                    # Reclaim disposition (task 3622). Compared against the
+                    # DESTRUCTION floor, never against the resolved `grace`
+                    # above — `grace` may have been raised by a *grace_secs*
+                    # caller, which would misreport an in-window tree as
+                    # overdue.
+                    reap_age = self.PERIODIC_REAP_MIN_AGE_SECS
+                    disposition = (
+                        f' — reclaim overdue: already past the periodic '
+                        f'reaper\'s {reap_age:.0f}s destruction floor and '
+                        f'still on disk'
+                        if age >= reap_age
+                        else f' — scheduled for automatic reclaim by the '
+                             f'periodic reaper once it passes age '
+                             f'{reap_age:.0f}s'
+                    )
                     violations.append(
                         f'unregistered on-disk merge worktree {path} '
                         f'(age {age:.0f}s > grace {grace:.0f}s) absent from '
                         f'owned ledger — possible leak'
+                        + disposition
                     )
         except Exception as exc:  # pragma: no cover — defensive
             violations.append(f'worktree_ledger_violations: check raised: {exc}')
@@ -12712,6 +12820,46 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 self._escalation_queue, stuck, event_store=self._event_store,
             )
 
+    def _resource_audit_escalation_age_secs(self) -> float:
+        """Age past which a leaked worktree is genuinely escalation-worthy (task 3622).
+
+        The DETECTION floor (:attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`,
+        9000 s) answers "old enough to be worth REPORTING"; the DESTRUCTION
+        floor (:attr:`PERIODIC_REAP_MIN_AGE_SECS`, 21600 s) answers "old
+        enough that destroying it cannot interrupt live work".  Neither
+        answers "old enough that nobody is going to clean this up" — which is
+        the only question an L1 page to a human should turn on.  This method
+        answers that third question.
+
+        Returns ``PERIODIC_REAP_MIN_AGE_SECS +
+        RESOURCE_AUDIT_REAP_GRACE_SWEEPS * self._reap_interval_s`` (defaults:
+        21600 + 2 x 300 = 22200 s).  Below it, the periodic sweep
+        (:meth:`_maybe_reap_orphaned_merge_worktrees`) is still SCHEDULED to
+        destroy the tree, so the condition is self-healing and not yet a
+        human's problem.  At or above it the reaper has demonstrably had at
+        least :attr:`RESOURCE_AUDIT_REAP_GRACE_SWEEPS` SCHEDULED opportunities
+        and the tree survived them all — the scheduled remediation has failed.
+        Scheduled, not necessarily attempted: a sweep that times out under
+        ``_reap_sweep_timeout_s`` still consumes its rate-limit slot.  See that
+        constant's declaration for the full derivation and both assumptions.
+
+        A METHOD, not a class constant, because ``_reap_interval_s`` is an
+        INSTANCE attribute set in ``__init__``: a class-level constant could
+        neither see a per-instance reap interval nor stay coherent with the
+        many tests that monkeypatch :attr:`PERIODIC_REAP_MIN_AGE_SECS`
+        per-instance.  Recomputed on every call for the same reason — it
+        never caches a stale interval.
+
+        Consumed only by :meth:`_check_resource_audit`'s escalation
+        predicate.  Detection, the WARNING log, and
+        ``snapshot()['resource_audit']`` all keep using the lower detection
+        floor, so the leak census stays truthful throughout the band.
+        """
+        return (
+            self.PERIODIC_REAP_MIN_AGE_SECS
+            + self.RESOURCE_AUDIT_REAP_GRACE_SWEEPS * self._reap_interval_s
+        )
+
     def _check_resource_audit(self, now: float) -> None:
         """Run both resource-conservation audits and alarm on a persisting violation.
 
@@ -12737,11 +12885,42 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         invoked on every further violating call; its own ``has_open_l1``
         dedup (see that function) ensures at most one open L1 regardless of
         how many times this method calls it.
+
+        DETECTION AND ESCALATION USE DIFFERENT AGE FLOORS (task 3622).
+        Detection, the WARNING log, the streak, and
+        ``snapshot()['resource_audit']`` all fire at
+        :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`, so the leak census stays
+        truthful and immediate.  The ESCALATION, however, re-asks the
+        worktree question at the higher
+        :meth:`_resource_audit_escalation_age_secs` floor: a leaked worktree
+        younger than that is still inside the window in which
+        :meth:`_maybe_reap_orphaned_merge_worktrees` is SCHEDULED to destroy
+        it, so paging a human would report work that is about to happen
+        anyway (this is what produced esc-``__merge_resource_leak__``-46/-47).
+        The escalation waits until that scheduled remediation has
+        demonstrably failed.
+
+        Speculation-accounting violations are NEVER age-suppressed: nothing
+        reclaims a leaked permit or cap slot, so that arm is a genuine
+        "nobody is going to clean this up" from its first heartbeat and
+        passes through unfiltered.
+
+        The escalation-floor rescan is skipped outright when the detection
+        pass returned no worktree violations at all — a higher floor can only
+        drop entries, so the rescan's result is a strict subset and would be
+        provably empty.  That keeps a persisting permit leak from re-scanning
+        the worktree base on every poll for as long as it lasts.
+
+        The streak deliberately keeps counting through the suppressed band —
+        its documented meaning is "consecutive violating heartbeats", which
+        stays literally true, and it is the transient/racy-blip filter rather
+        than the escalate-now decision.  Preserving it means a tree that
+        crosses the escalation floor mid-streak alarms on the very next poll
+        instead of restarting a 3-heartbeat countdown.
         """
-        violations = (
-            self.speculation_accounting_violations()
-            + self.worktree_ledger_violations(now=now)
-        )
+        spec_violations = self.speculation_accounting_violations()
+        wt_violations = self.worktree_ledger_violations(now=now)
+        violations = spec_violations + wt_violations
 
         if not violations:
             self._resource_audit_violation_streak = 0
@@ -12756,9 +12935,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._resource_audit_violation_streak += 1
 
         if self._resource_audit_violation_streak >= self.RESOURCE_AUDIT_ESCALATION_STREAK:
-            _alarm_resource_audit(
-                self._escalation_queue, violations, event_store=self._event_store,
+            # Re-ask the worktree arm at the ESCALATION floor. Anything it
+            # still returns has outlived its scheduled reclaim; anything it
+            # drops is self-healing and stays logged-only. The permit arm is
+            # reused as-is — it has no scheduled remediation to wait for.
+            #
+            # Skipped entirely when the detection pass found no worktree
+            # violations. Raising the floor can only ever DROP entries, so the
+            # escalation-floor result is a strict subset of the detection-floor
+            # one and an empty detection pass guarantees an empty rescan —
+            # making the second os.scandir(worktree_base) + per-entry resolve()
+            # pure waste. That is the common case: a persisting PERMIT leak
+            # (which every pre-existing escalation test exercises) would
+            # otherwise re-scan the worktree base on every _HEARTBEAT_POLL_S
+            # tick indefinitely, including while has_open_l1 is already
+            # dropping the resulting alarm on the floor.
+            escalatable = spec_violations + (
+                self.worktree_ledger_violations(
+                    now=now, grace_secs=self._resource_audit_escalation_age_secs(),
+                )
+                if wt_violations
+                else []
             )
+            if escalatable:
+                _alarm_resource_audit(
+                    self._escalation_queue, escalatable,
+                    event_store=self._event_store,
+                )
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
         """Emit a queue-depth heartbeat log line and event if conditions are met.
@@ -18636,6 +18839,16 @@ def _alarm_resource_audit(
         'for multiple consecutive heartbeats:\n\n'
         + '\n'.join(f'- {v}' for v in violations)
         + '\n\n'
+        'AUTOMATIC RECLAIM HAS ALREADY FAILED HERE (task 3622). Any worktree '
+        'named above has outlived PERIODIC_REAP_MIN_AGE_SECS plus at least '
+        'RESOURCE_AUDIT_REAP_GRACE_SWEEPS periodic reaper sweeps, so '
+        '_maybe_reap_orphaned_merge_worktrees has already had multiple '
+        'SCHEDULED opportunities to destroy it and the tree is still on disk '
+        '— this is not a leak that is about to clean itself up. (A leak still inside '
+        'that reclaim window is logged and censused in '
+        "snapshot()['resource_audit'] but deliberately does not escalate.) "
+        'Leaked permits/cap slots have no automatic reclaim at all and '
+        'escalate from their first persisting heartbeat.\n\n'
         'The orchestrator has NOT halted or mutated any pipeline state — '
         'this is observation-only (PRD design decision 4).'
     )
@@ -18653,7 +18866,24 @@ def _alarm_resource_audit(
             "Inspect the merge worker's snapshot()['resource_audit'] key "
             '(speculation_accounting / worktree_ledger sub-lists) to '
             'identify the leaked permit, cap, or worktree; fix the code '
-            'path that failed to release it.'
+            'path that failed to release it. For a WORKTREE violation, start '
+            'by asking why the periodic reaper did not remove it — at least '
+            'two scheduled reaper sweeps have come and gone without it '
+            'disappearing. THREE known reasons: (1) a still-held verify lease '
+            "(remove_merge_worktree_guarded returns 'skipped_lease_held' and "
+            'skips the tree regardless of age — look for the lease holder '
+            'that never released); (2) a fail-open removal error '
+            "(cleanup_merge_worktree logs 'failed for <path> — leaving for a "
+            "later sweep' and continues, so grep the orchestrator log for "
+            'that line and the exception under it); (3) the sweep never '
+            'reached the tree at all — _maybe_reap_orphaned_merge_worktrees '
+            'consumes its rate-limit slot (_last_reap_at = now) BEFORE '
+            'awaiting the sweep, and _heartbeat_loop bounds that await with '
+            'asyncio.wait_for(_reap_sweep_timeout_s, 120s default), so a '
+            'timed-out or raising sweep burns an opportunity silently. Under '
+            '(3) NEITHER of the first two log lines exists; the line to grep '
+            "for is 'merge queue heartbeat: periodic reap failed'. Check (3) "
+            'before concluding the removal path itself is broken.'
         ),
     )
     escalation_queue.submit(esc)
