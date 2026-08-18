@@ -100,6 +100,40 @@ _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
 _MAX_AMENDMENTS = 20
 
 
+def _is_repeat_framing(
+    esc: Escalation, *, root_cause: str, summary: str, evidence: str,
+    options: list[str] | None,
+) -> bool:
+    """True when this framing is byte-identical to the LAST amendment recorded.
+
+    A watcher rotation re-promoting the same cluster with UNCHANGED text has
+    contributed nothing: recording it again would (a) manufacture a spurious
+    ``updated_at`` bump and re-trigger the re-assess protocol on a true no-op —
+    the contract task 3976 pinned — and (b) burn cap budget, so that
+    ``_MAX_AMENDMENTS`` worth of identical rows would push genuinely-distinct
+    earlier framings out via the drop-oldest policy.  Both are the opposite of
+    what preserving framing is for.
+
+    Compared against the LAST amendment only, not all of them: an A -> B -> A
+    reframing genuinely returns to a previous position and IS new relative to
+    what the record currently says.
+
+    ``agent_role`` is deliberately NOT compared — it records WHO said it, not
+    WHAT was said, and two roles submitting identical framing is not new
+    framing.  ``timestamp`` likewise: this method stamps it, so it always
+    differs and would defeat the comparison entirely.
+    """
+    if not esc.amendments:
+        return False
+    last = esc.amendments[-1]
+    return (
+        last.get('root_cause') == root_cause
+        and last.get('summary') == summary
+        and last.get('detail') == evidence
+        and last.get('options') == list(options or [])
+    )
+
+
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
     """Yield all ``esc-*.json`` paths from *escalations_dir* and its archive subtree.
 
@@ -910,7 +944,10 @@ class EscalationQueue:
         The incoming *evidence* is stored under the amendment's ``detail`` key —
         the same field the create path writes that argument into.  Passing no
         framing appends no amendment, so every existing two-positional-arg
-        caller is byte-unchanged.
+        caller is byte-unchanged.  Framing byte-identical to the LAST recorded
+        amendment is likewise not re-recorded (see :func:`_is_repeat_framing`):
+        a re-promote with unchanged text has contributed nothing, so it stays a
+        true no-op and does NOT bump ``updated_at``.
 
         **The list is capped at** :data:`_MAX_AMENDMENTS`.  THIS METHOD is the
         trimmer, at write time, in the same critical section and the same single
@@ -976,7 +1013,10 @@ class EscalationQueue:
             # append, so it lands in the same single _rewrite below — no second
             # write path, no new durability story.
             amendment_recorded = False
-            if incoming_framing:
+            if incoming_framing and not _is_repeat_framing(
+                esc, root_cause=root_cause, summary=summary,
+                evidence=evidence, options=options,
+            ):
                 amendment: Amendment = {
                     'timestamp': datetime.now(UTC).isoformat(),
                     'agent_role': agent_role,

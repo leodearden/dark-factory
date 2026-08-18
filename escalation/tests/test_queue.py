@@ -2898,6 +2898,52 @@ class TestAddMembersToL2:
         )
         assert self._on_disk(queue, l2.id).amendments == []
 
+    def test_repeated_identical_framing_records_one_amendment(self, tmp_path: Path):
+        """Framing identical to the LAST amendment is a true no-op — not re-recorded.
+
+        A rotation re-promoting the same cluster with UNCHANGED text has
+        contributed nothing.  Re-recording it would manufacture a spurious
+        updated_at bump (re-triggering the watcher's re-assess on a no-op — the
+        contract task 3976 pinned) and burn cap budget, so _MAX_AMENDMENTS worth
+        of identical rows would push genuinely-distinct earlier framings out via
+        the drop-oldest policy.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        framing = {
+            'root_cause': 'canonical root cause v2',
+            'evidence': 'evidence text',
+            'summary': 'hypothesis',
+            'options': ['C: third way'],
+            'agent_role': 'escalation-watcher-auto',
+        }
+
+        first = queue.add_members_to_l2(l2.id, [], **framing)
+        assert first is not None and len(first.amendments) == 1
+        bumped_at = first.updated_at
+        assert bumped_at is not None
+
+        again = queue.add_members_to_l2(l2.id, [], **framing)
+
+        assert again is not None
+        assert len(again.amendments) == 1, (
+            f'identical framing must not be re-recorded, got {again.amendments!r}'
+        )
+        assert again.updated_at == bumped_at, (
+            'a framing-identical re-promote is a true no-op and must not bump '
+            f'updated_at, got {bumped_at!r} -> {again.updated_at!r}'
+        )
+
+        # But a genuine reframing — including a return to an EARLIER position —
+        # is new relative to what the record currently says, so it IS recorded.
+        changed = queue.add_members_to_l2(
+            l2.id, [], **{**framing, 'summary': 'a genuinely different hypothesis'},
+        )
+        assert changed is not None
+        assert len(changed.amendments) == 2, (
+            f'a changed framing must be recorded, got {changed.amendments!r}'
+        )
+
     def test_amendment_list_is_capped_and_truncation_is_loud(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):

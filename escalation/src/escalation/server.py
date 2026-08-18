@@ -1617,7 +1617,13 @@ def create_server(
         append RAISES the existing L2's severity when the incoming members (or
         an explicit *severity*) justify it, and never lowers it — an L2's
         severity is monotonically non-decreasing after mint, so a record cannot
-        be quieted out from under a human already looking at it.
+        be quieted out from under a human already looking at it.  An append also
+        APPENDS this call's *root_cause*/*evidence*/*options*/*summary* to the
+        existing L2's ``amendments`` list rather than discarding them (task
+        3997): the record's OWN framing stays immutable, but the framing a fold
+        carried in is no longer lost.  That list is bounded — oldest-shed at
+        ``queue._MAX_AMENDMENTS``, with every drop counted in the record's
+        ``amendments_truncated``.
 
         **Members stay at L1**: the member L1 escalations are referenced but
         NOT promoted; they remain pending at L1 until the L2 is resolved.
@@ -1716,7 +1722,13 @@ def create_server(
         Update (existing pending L2 with same root_cause)::
 
             {'id': <existing_id>, 'status': 'updated', 'members': [<all_members>],
-             'severity': <severity_after_floor>}
+             'severity': <severity_after_floor>,
+             'amendment_recorded': <bool>, 'amendments': <int>}
+
+        ``amendment_recorded`` is True when THIS call's framing was appended
+        (derived from the record's amendment count actually growing, so a
+        framing-free re-promote does not falsely claim a write);
+        ``amendments`` is the resulting list length.
 
         ``severity`` reports what was ACTUALLY filed, which for a caller that
         omitted the argument is how the inherited value becomes visible — and
@@ -1788,10 +1800,24 @@ def create_server(
             # which case add_members_to_l2 leaves the severity untouched.
             # Upward-only inside add_members_to_l2, so an append can never
             # quiet an existing L2.
+            # Pre-call amendment count, so `amendment_recorded` reports what
+            # ACTUALLY grew rather than asserting a write happened.  A record
+            # that could not be read (None) reads as 0, which can only
+            # under-claim.
+            before = queue.get(existing_id)
+            amendments_before = len(before.amendments) if before is not None else 0
             updated = queue.add_members_to_l2(
                 existing_id,
                 list(dict.fromkeys(member_ids)),
                 severity_floor=severity_floor,
+                # The framing this promote carried in is APPENDED to the L2's
+                # `amendments` rather than discarded (task 3997, C2).  The
+                # record's OWN root_cause/detail/options/summary are untouched.
+                root_cause=root_cause,
+                evidence=evidence,
+                options=list(options),
+                summary=summary,
+                agent_role=agent_role,
             )
             if updated is not None:
                 return {
@@ -1801,6 +1827,10 @@ def create_server(
                     # Read off the returned Escalation, so this is the
                     # POST-floor value rather than the argument.
                     'severity': updated.severity,
+                    # Report the preservation, so a caller LEARNS its framing
+                    # landed instead of having to re-read the record to find out.
+                    'amendment_recorded': len(updated.amendments) > amendments_before,
+                    'amendments': len(updated.amendments),
                 }
             # Race: the pending L2 was resolved/archived between find and update.
             # Fall through to the create path so the caller gets a valid result
