@@ -7189,7 +7189,18 @@ class MemoryService:
         silently-wrong clean verdict, which is the exact failure class this
         tool exists to eliminate.
 
-        Returns ``{'matches': [...], 'scanned': int, 'truncated': bool}``.
+        Returns ``{'matches': [...], 'scanned': int, 'truncated': bool,
+        'collection': str}`` — a verbatim passthrough of
+        ``Mem0Backend.scan_payload_text``'s result.
+
+        ``collection`` names the Qdrant collection the backend actually
+        scrolled. It is part of the shape because a scan result is a
+        MEASUREMENT of a collection, and one that does not identify what it
+        measured cannot be audited later (task 3243). Note that the MCP
+        ``scan_memory_content`` tool rebuilds its response from an explicit
+        key whitelist and deliberately does NOT forward this key; direct
+        callers of this method — such as
+        ``scripts/sweep_toolcall_xml_leak.py`` — do receive it.
 
         A Qdrant read-timeout is PROPAGATED (raises ``TimeoutError``), not
         returned as an empty match list — a timed-out scan must never be
