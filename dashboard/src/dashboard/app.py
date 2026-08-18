@@ -837,6 +837,14 @@ async def api_tasks(request: Request) -> JSONResponse:
       (see ``collect_tasks_with_counts``). Their state is UNKNOWN, not bad:
       nothing was proven unreachable, so they never raise the offline flag,
       not even when every root degrades.
+    - ``TASKS_PROJECT_COUNT`` — N: how many roots were fanned out over. The
+      banner's "k of N" phrasing needs a denominator drawn from the SAME
+      population as its numerator, and the client's only other candidate
+      (``PROJECTS``, from /api/v2/dashboard/orchestrators) is a different one —
+      a root with no orchestrator, or an orchestrator with no task root, makes
+      the two diverge and the notice understate the outage. The handler must
+      compute this anyway to decide ``TASKS_OFFLINE``, so emitting it costs
+      nothing and removes a client-side re-derivation that could drift.
 
     ``TASKS_OFFLINE`` used to be ``bool(offline_projects)``. That is what made
     the banner claim a total outage over eight healthy projects' rows carried
@@ -857,12 +865,15 @@ async def api_tasks(request: Request) -> JSONResponse:
     # out over. ``bool(total_roots)`` guards the degenerate no-roots config:
     # 0 == 0 would otherwise declare an outage with nothing configured to fail.
     total_roots = len(_all_project_roots(config))
+    # ...and the same N goes on the wire as TASKS_PROJECT_COUNT, so the banner
+    # denominates over the population its numerator is drawn from.
     return JSONResponse(
         {
             'ACTIVE_TASKS': active,
             'TASKS_OFFLINE': bool(total_roots) and len(offline_projects) == total_roots,
             'TASKS_OFFLINE_PROJECTS': offline_projects,
             'TASKS_DEGRADED_PROJECTS': degraded_projects,
+            'TASKS_PROJECT_COUNT': total_roots,
             'DONE_COUNTS': done_counts,
         }
     )

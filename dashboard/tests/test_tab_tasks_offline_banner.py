@@ -25,11 +25,6 @@ from starlette.testclient import TestClient
 
 _BANNER_SRC = '/static/redux/tasks_offline_banner.js'
 
-# The verbatim global-outage copy. Asserted ABSENT from tab_tasks.jsx: it now
-# lives in the banner module, and a surviving inline copy would mean the JSX
-# can still emit a total-outage claim without going through the decision.
-_GLOBAL_COPY = 'fused-memory offline — task data unavailable'
-
 
 @pytest.fixture(scope='module')
 def _client():
@@ -133,10 +128,17 @@ def test_tab_tasks_renders_through_the_banner_decision(tab_tasks_jsx_code):
         'tab_tasks.jsx must render over tasksBannerNotices() — otherwise the '
         'tested decision is dead code and the tab keeps its own copy logic'
     )
-    assert _GLOBAL_COPY not in tab_tasks_jsx_code, (
-        'the global-outage copy must live only in tasks_offline_banner.js — an '
-        'inline copy in the JSX is a render site that can still claim a total '
-        'outage without consulting the decision'
+    # Deliberately NOT a `GLOBAL_TEXT not in tab_tasks_jsx_code` check: pinning the
+    # exact prose (em dash included) as a duplicated literal here breaks on any
+    # rewording of GLOBAL_TEXT in tasks_offline_banner.js while nothing about
+    # the wiring changed, and it never verified the routing anyway — the
+    # assertion above does that. The structural fact is that there is exactly
+    # ONE render site, so a second one cannot claim a total outage without
+    # consulting the decision.
+    assert tab_tasks_jsx_code.count('tasks-offline-banner') == 1, (
+        'the global-outage banner must have exactly one render site (the '
+        'per-kind testid lookup) — a second one is a path that can claim a '
+        'total outage without consulting the decision'
     )
 
 
@@ -145,6 +147,35 @@ def test_tab_tasks_reads_the_degraded_projects_key(tab_tasks_jsx_code):
     assert 'TASKS_DEGRADED_PROJECTS' in tab_tasks_jsx_code, (
         'TASKS_DEGRADED_PROJECTS is on the wire but unread — a project the '
         'handler ran out of budget for would be invisible on the tab'
+    )
+
+
+def test_banner_denominator_comes_from_the_task_root_count(tab_tasks_jsx_code):
+    """(g) "k of N" must denominate over task ROOTS, not the orchestrator list.
+
+    ``k`` counts ``TASKS_OFFLINE_PROJECTS`` — task project roots, enumerated
+    server-side by ``active_tasks._all_project_roots``.  ``N`` was
+    ``(DF_T.PROJECTS || []).length``, the orchestrator-derived list from
+    /api/v2/dashboard/orchestrators: a DIFFERENT population, which diverges
+    for any root without an orchestrator (or orchestrator without a root) and
+    makes the notice understate the outage — "3 of 5" with nine roots
+    configured.  The handler already computes the right N, so the fix is to
+    read it rather than to re-derive a denominator on the client.
+    """
+    assert re.search(
+        r'totalProjects:\s*DF_T\.TASKS_PROJECT_COUNT', tab_tasks_jsx_code
+    ), (
+        'the banner denominator must be BOUND from the server-computed root '
+        'count — merely mentioning TASKS_PROJECT_COUNT somewhere in the file '
+        'would leave the notice denominating over a different population'
+    )
+    # Asserted on the DENOMINATOR spelling, not on `DF_T.PROJECTS` outright:
+    # the tab legitimately reads that list elsewhere (the project filter), and
+    # a blanket ban would fail for a reason that has nothing to do with the
+    # banner.
+    assert 'PROJECTS || []).length' not in tab_tasks_jsx_code, (
+        'the orchestrator project list must no longer denominate the banner: '
+        'it is not the population TASKS_OFFLINE_PROJECTS is drawn from'
     )
 
 
@@ -170,7 +201,6 @@ def test_banner_testids_distinguish_the_three_notice_kinds(tab_tasks_jsx_code):
         'tasks-partial-banner',
         'tasks-degraded-banner',
     )
-    assert len(set(testids)) == 3, 'the three kinds must not share a testid'
     for testid in testids:
         assert testid in tab_tasks_jsx_code, (
             f'missing distinct testid {testid!r} — without it a partial '

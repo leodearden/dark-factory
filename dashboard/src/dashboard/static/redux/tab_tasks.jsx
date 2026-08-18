@@ -675,13 +675,16 @@ function TasksTab({ projectFilter, search }) {
   // The three-way distinction itself is decided SERVER-SIDE (app.api_tasks)
   // and turned into copy by tasks_offline_banner.js. Nothing here re-derives
   // it: a `k of N` judgement made in the JSX would drift from the one the
-  // handler made. TASKS_PROJECT_COUNT is not on the wire, so the notice's
-  // denominator is the project list this tab already renders against.
+  // handler made. N likewise comes from the server (TASKS_PROJECT_COUNT): the
+  // numerator is a count of task project roots, so the denominator must be
+  // one too — PROJECTS is the orchestrator-derived list, a different
+  // population that diverges whenever a root has no orchestrator (or the
+  // reverse), which made the notice understate how many projects failed.
   const bannerNotices = tasksBannerNotices({
     offline: !!DF_T.TASKS_OFFLINE,
     offlineProjects: DF_T.TASKS_OFFLINE_PROJECTS || [],
     degradedProjects: DF_T.TASKS_DEGRADED_PROJECTS || [],
-    totalProjects: (DF_T.PROJECTS || []).length,
+    totalProjects: DF_T.TASKS_PROJECT_COUNT || 0,
   });
   const bannerTestIds = {
     global: 'tasks-offline-banner',

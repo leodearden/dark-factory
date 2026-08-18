@@ -93,7 +93,7 @@ def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
     body = resp.json()
     assert set(body) == {
         'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'DONE_COUNTS',
+        'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
     }
     assert 'FILE_LOCKS' not in body
     assert isinstance(body['ACTIVE_TASKS'], list)
@@ -165,7 +165,7 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
     # (c) top-level key set unchanged
     assert set(body) == {
         'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'DONE_COUNTS',
+        'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
     }
 
 
@@ -176,10 +176,8 @@ def test_tasks_endpoint_passes_max_cancelled_per_project(client):
     (a) max_cancelled_per_project == _MAX_CANCELLED_PER_PROJECT is passed in call kwargs
     (b) existing kwargs still present: max_done_per_project == _MAX_DONE_PER_PROJECT,
         resolve_external == True
-    (c) top-level payload key-set remains exactly
-        {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-         'TASKS_DEGRADED_PROJECTS', 'DONE_COUNTS'}
-        (no new key added for cancelled)
+    (c) top-level payload key-set is unchanged BY THIS BEHAVIOUR — no new key
+        is added for cancelled (the set itself is stated in the assertion)
 
     RED today: app.py does not yet pass max_cancelled_per_project.
     """
@@ -212,7 +210,7 @@ def test_tasks_endpoint_passes_max_cancelled_per_project(client):
     # (c) payload key-set unchanged
     assert set(body) == {
         'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'DONE_COUNTS',
+        'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
     }
 
 
@@ -328,13 +326,52 @@ def test_tasks_all_roots_degraded_is_still_not_an_outage(client):
     assert body['TASKS_DEGRADED_PROJECTS'] == ['p0', 'p1']
 
 
-def test_tasks_payload_keeps_file_locks_out_and_adds_only_the_degraded_key(client):
-    """The payload gains exactly one key, and FILE_LOCKS stays gone."""
+def test_tasks_payload_carries_the_root_count_the_banner_denominates_with(client):
+    """The "k of N" denominator must come from the SAME population as its k.
+
+    The partial-outage notice reads "k of N projects". ``k`` counts entries in
+    ``TASKS_OFFLINE_PROJECTS`` — task project roots, from
+    ``active_tasks._all_project_roots``. ``N`` was
+    ``(DF_T.PROJECTS || []).length``, the ORCHESTRATOR-derived project list
+    from /api/v2/dashboard/orchestrators — a different population. A root with
+    no orchestrator, or an orchestrator with no task root, makes them diverge,
+    and the notice then prints "3 of 5" with nine roots actually configured.
+    ``countPhrase``'s ``n >= k`` guard prevents an outright "1 of 0" but
+    licenses every understatement below it.
+
+    The handler already computes exactly the right N — it needs it to decide
+    ``TASKS_OFFLINE`` at all — and then threw it away. Putting it on the wire
+    means numerator and denominator come from one enumerator, by construction.
+    """
+    body = _tasks_body(client, offline_projects=['p3'], total_roots=9)
+
+    assert body['TASKS_PROJECT_COUNT'] == 9, (
+        'the banner denominator must be the root count the handler itself '
+        f'fanned out over, got {body.get("TASKS_PROJECT_COUNT")!r}'
+    )
+    # The fact it denominates, in the same payload — so a future change that
+    # decouples them fails here rather than in a screenshot.
+    assert len(body['TASKS_OFFLINE_PROJECTS']) <= body['TASKS_PROJECT_COUNT']
+    assert body['TASKS_OFFLINE'] is False
+
+
+def test_tasks_project_count_is_zero_for_a_degenerate_no_roots_config(client):
+    """No configured roots is 0, not a crash and not a fabricated 1."""
+    body = _tasks_body(client, offline_projects=[], total_roots=0)
+
+    assert body['TASKS_PROJECT_COUNT'] == 0
+    assert body['TASKS_OFFLINE'] is False, (
+        'nothing configured to fail is not an outage'
+    )
+
+
+def test_tasks_payload_keeps_file_locks_out_and_carries_the_banner_facts(client):
+    """The payload carries every banner fact, and FILE_LOCKS stays gone."""
     body = _tasks_body(client, offline_projects=[], total_roots=1)
 
     assert set(body) == {
         'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'DONE_COUNTS',
+        'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
     }
     assert 'FILE_LOCKS' not in body
 
