@@ -46,6 +46,14 @@ _LIVE_ENTITY_NODES = 16038
 _LIVE_RESULTSET_CAP = 10000
 
 _SKIP_LIMIT_RE = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
+# The SAME narrow census pattern conftest.make_graph_mock uses, character for
+# character, so the two graph doubles in this repo cannot disagree about what
+# a census probe IS. A loose `'count(' in cypher` test also captures ordinary
+# queries returning a count as one column among several — e.g.
+# find_duplicate_entity_nodes' `RETURN n.uuid, ..., count(e)` — and hands them
+# a single-column [[n]] row, raising IndexError deep inside the method under
+# test rather than anywhere near the double.
+_CENSUS_RE = re.compile(r'RETURN\s+count\(\*\)\s*$', re.IGNORECASE)
 
 
 class _FakeResult:
@@ -59,10 +67,14 @@ class _FakeResult:
 class FakeCappedGraph:
     """A graph double that reproduces FalkorDB's silent server-side row cap.
 
+    This is the ONLY double in the suite that reproduces the server cap.
+    ``conftest.make_graph_mock`` deliberately does not, so the two cannot
+    drift; it shares this module's census pattern exactly (``_CENSUS_RE``).
+
     Behaviour, keyed off the cypher text:
-      - contains ``count(``      -> ``[[len(corpus)]]``, a single row.  A
-        single-row aggregate can never be truncated by the row cap it is
-        being used to detect, which is what makes the census a proof.
+      - a bare ``RETURN count(*)`` projection -> ``[[len(corpus)]]``, a single
+        row.  A single-row aggregate can never be truncated by the row cap it
+        is being used to detect, which is what makes the census a proof.
       - contains ``SKIP n LIMIT m`` -> ``corpus[n : n + m]``
       - anything else            -> the whole corpus
 
@@ -94,7 +106,7 @@ class FakeCappedGraph:
     # -- query log helpers ------------------------------------------------
     @property
     def census_queries(self) -> list[str]:
-        return [q for q in self.queries if 'count(' in q]
+        return [q for q in self.queries if _CENSUS_RE.search(q.strip())]
 
     @property
     def page_queries(self) -> list[str]:
@@ -109,7 +121,7 @@ class FakeCappedGraph:
     async def ro_query(self, cypher: str, params: dict | None = None) -> _FakeResult:
         self.queries.append(cypher)
         self.params.append(params)
-        if 'count(' in cypher:
+        if _CENSUS_RE.search(cypher.strip()):
             if self._census_result_set_set:
                 return _FakeResult(self._census_result_set)
             count = (
@@ -201,6 +213,43 @@ _CENSUS_CYPHER = (
     'WHERE e.invalid_at IS NULL '
     'RETURN count(*)'
 )
+
+
+class TestFakeCappedGraphCensusDispatch:
+    """The double's census detection must match conftest.make_graph_mock's.
+
+    Two doubles standing in for the same server are two chances to be wrong
+    about it, so this suite keeps only ONE that reproduces the cap and pins
+    the shared behaviour here. The mirror of this test lives in
+    test_conftest_fixtures.py (``test_a_count_column_among_others_is_not_a_census``);
+    if either double loosens its pattern, one of the two goes red.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_count_column_among_others_is_not_a_census(self):
+        """Only a bare ``RETURN count(*)`` projection is a census probe.
+
+        A loose ``'count(' in cypher`` test also captures ordinary queries
+        returning a count as one column among several — find_duplicate_entity_nodes
+        issues ``RETURN n.uuid, ..., count(e)`` — and handing those a
+        single-column ``[[n]]`` row raises IndexError deep inside the method
+        under test, nowhere near the double.
+        """
+        rows = [['dup-uuid-1', 200, 2]]
+        graph = FakeCappedGraph(rows, resultset_cap=None)
+        result = await graph.ro_query(
+            'MATCH (n:Entity {name: $name})-[e:RELATES_TO]-() '
+            'RETURN n.uuid, n.created_at, count(e) AS edge_count'
+        )
+        assert result.result_set == rows
+        assert graph.census_queries == []
+
+    @pytest.mark.asyncio
+    async def test_a_bare_row_count_is_a_census(self):
+        graph = FakeCappedGraph([['a'], ['b']], resultset_cap=None)
+        result = await graph.ro_query('MATCH (n:Entity) RETURN count(*)')
+        assert result.result_set == [[2]]
+        assert len(graph.census_queries) == 1
 
 
 class TestPagedRoQueryHappyPath:

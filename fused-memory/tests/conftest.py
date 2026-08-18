@@ -197,10 +197,13 @@ def make_graph_mock():
     read shape it stands in for is worse than a per-test patch: the next
     person to paginate something rediscovers the same trap.
 
-    ``resultset_cap`` (opt-in, default None) truncates EVERY result set to
-    that many rows before returning it, silently — reproducing FalkorDB's
-    server-wide ``RESULTSET_SIZE`` ceiling so a test can drive the truncation
-    failure mode directly.
+    This fixture deliberately does NOT simulate the server's
+    ``RESULTSET_SIZE`` truncation.  ONE double owns that behaviour —
+    ``test_graph_read_pagination.FakeCappedGraph``, which also carries the
+    stateful query log the truncation tests need — because two doubles that
+    both claim to stand in for the same server drift, and the drift shows up
+    as a test that passes against a fake nothing else agrees with.  A test
+    that needs the cap should use that one.
     """
     skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
     # Deliberately NARROW: only a query whose entire projection is a bare row
@@ -217,7 +220,6 @@ def make_graph_mock():
         ro_rows: list[list] | None = None,
         q_rows: list[list] | None = None,
         header: list | None = None,
-        resultset_cap: int | None = None,
     ) -> MagicMock:
         header_value = header if header is not None else []
         if ro_rows is not None or q_rows is not None:
@@ -241,8 +243,6 @@ def make_graph_mock():
                         result_set = row_data[skip: skip + limit]
                     else:
                         result_set = row_data
-                    if resultset_cap is not None:
-                        result_set = result_set[:resultset_cap]
                 result = MagicMock()
                 result.result_set = result_set
                 result.header = header_value

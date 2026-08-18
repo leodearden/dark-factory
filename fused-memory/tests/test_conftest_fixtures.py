@@ -350,28 +350,6 @@ class TestMakeGraphMockCypherDispatch:
         assert result.result_set == rows
 
     @pytest.mark.asyncio
-    async def test_resultset_cap_reproduces_the_server_truncation(self, make_graph_mock):
-        """``resultset_cap`` is opt-in and truncates EVERY result set, silently."""
-        rows = [[f'n{i}'] for i in range(25)]
-        graph = make_graph_mock(rows, resultset_cap=10)
-        unpaginated = await graph.ro_query('MATCH (n) RETURN n.uuid')
-        assert len(unpaginated.result_set) == 10
-
-        collected: list[list] = []
-        for skip in range(0, 30, 5):
-            page = await graph.ro_query(f'MATCH (n) RETURN n.uuid SKIP {skip} LIMIT 5')
-            collected.extend(page.result_set)
-        assert len(collected) == 25
-
-    @pytest.mark.asyncio
-    async def test_resultset_cap_defaults_to_no_truncation(self, make_graph_mock):
-        """Opt-in: without the kwarg, nothing is capped."""
-        rows = [[f'n{i}'] for i in range(25)]
-        graph = make_graph_mock(rows)
-        result = await graph.ro_query('MATCH (n) RETURN n.uuid')
-        assert len(result.result_set) == 25
-
-    @pytest.mark.asyncio
     async def test_ro_rows_and_q_rows_still_split_the_two_paths(self, make_graph_mock):
         """BACK-COMPAT: .query stays a separate AsyncMock with its own rows."""
         graph = make_graph_mock(ro_rows=[['ro']], q_rows=[['q']])
