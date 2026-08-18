@@ -22,8 +22,13 @@ import pytest
 
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.models import Escalation
-from escalation.queue import EscalationQueue
-from escalation.server import _COMPACT_ESCALATION_FIELDS, create_server
+from escalation.queue import _MAX_AMENDMENTS, EscalationQueue
+from escalation.server import (
+    _AMENDMENT_TRUNCATION_STORM_THRESHOLD,
+    _AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS,
+    _COMPACT_ESCALATION_FIELDS,
+    create_server,
+)
 
 # ---------------------------------------------------------------------------
 # Cross-package orchestrator imports — used by TestMergeStatus.
@@ -2916,6 +2921,183 @@ class TestPromoteToL2FramingPreservation:
         assert after.updated_at is not None and after.updated_at > (before.updated_at or ''), (
             f'new framing is a substantive change and must bump updated_at: '
             f'{before.updated_at!r} -> {after.updated_at!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestAmendmentTruncationStorm: truncation gets a HEARER, not just a log line
+# ---------------------------------------------------------------------------
+
+
+class TestAmendmentTruncationStorm:
+    """Repeated amendment truncation files ONE info escalation per window.
+
+    Steps 8-9 gave amendment truncation a durable per-record counter
+    (``amendments_truncated``) and a WARNING.  A log line has no audience:
+    INV-4 asks WHO hears about it at a rate/streak threshold.  ``promote_to_l2``
+    drives a ``shared.storm_counter.StormCounter`` (the canonical task-1755
+    pattern) and files one info-severity escalation when truncations burst,
+    rate-limited to one fire per window.
+
+    Dedupe is disabled here deliberately: under the stock ``DedupeConfig``
+    (infra_issue, 600 s window) a second storm record would FOLD into the
+    first, so the rate-limit assertion would pass for the wrong reason.  With
+    dedupe off, "still exactly one record" can only be StormCounter's
+    one-fire-per-window contract.
+    """
+
+    @staticmethod
+    async def _fold(server, tag: str) -> dict[str, Any]:
+        """Promote the same root_cause again — always a fold, always framing."""
+        return await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-1'],  # already a member after the first call
+            'evidence': f'fold evidence {tag}',
+            'summary': f'fold summary {tag}',
+        })
+
+    @pytest.mark.asyncio
+    async def test_repeated_truncation_files_one_info_escalation(self, tmp_path: Path):
+        """Below threshold: silent.  At threshold: one info escalation.  Above: rate-limited."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
+        )
+
+        def pending_ids() -> set[str]:
+            return {e.id for e in queue.get_pending()}
+
+        created = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+        l2_id = created['id']
+        known = {l2_id}
+
+        # Fill the amendment list exactly to the cap — no truncation yet, so
+        # nothing may be filed.  Bound derived from the NAME, never the value.
+        for i in range(_MAX_AMENDMENTS):
+            filled = await self._fold(server, f'fill-{i}')
+            assert filled['status'] == 'updated', f'Expected a fold, got {filled}'
+        at_cap = queue.get(l2_id)
+        assert at_cap is not None
+        assert at_cap.amendments_truncated == 0, (
+            f'filling to the cap must not truncate: {at_cap.amendments_truncated}'
+        )
+        assert pending_ids() == known, (
+            'filling to the cap is not a storm and must file nothing'
+        )
+
+        # (a) BELOW threshold — truncation is happening, but not enough of it.
+        for i in range(_AMENDMENT_TRUNCATION_STORM_THRESHOLD - 1):
+            below = await self._fold(server, f'trunc-{i}')
+            assert below['status'] == 'updated', f'Expected a fold, got {below}'
+        rec = queue.get(l2_id)
+        assert rec is not None
+        assert rec.amendments_truncated == _AMENDMENT_TRUNCATION_STORM_THRESHOLD - 1, (
+            f'expected threshold-1 truncations, got {rec.amendments_truncated}'
+        )
+        assert pending_ids() == known, (
+            f'below the threshold nothing may be filed; new ids: '
+            f'{pending_ids() - known}'
+        )
+
+        # (b) AT threshold — exactly ONE additional pending escalation.
+        crossed = await self._fold(server, 'trunc-at-threshold')
+        new_ids = pending_ids() - known
+        assert len(new_ids) == 1, (
+            f'crossing the threshold must file exactly one storm escalation, '
+            f'got {len(new_ids)}: {sorted(new_ids)}'
+        )
+        storm = queue.get(next(iter(new_ids)))
+        assert storm is not None
+        assert storm.severity == 'info', (
+            f'a storm report is a notification, not a page: {storm.severity!r}'
+        )
+        assert storm.category == 'infra_issue', (
+            f'expected an infra-class category, got {storm.category!r}'
+        )
+        blob = f'{storm.summary}\n{storm.detail}'
+        assert l2_id in blob, (
+            f'the reader must be able to attribute the burst to the truncating '
+            f'L2 {l2_id}: {blob!r}'
+        )
+        assert str(_AMENDMENT_TRUNCATION_STORM_THRESHOLD) in blob, (
+            f'the observed count must be named so the burst is legible: {blob!r}'
+        )
+        assert str(_AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS) in blob, (
+            f'the window must be named so the rate is legible: {blob!r}'
+        )
+        known |= new_ids
+
+        # (d) ADDITIVE-NEVER-FATAL — the promote that crossed the threshold
+        # still returned its normal update-path shape; the meta-escalation is a
+        # side effect that cannot fail the tool.
+        assert crossed['status'] == 'updated', f'Expected a fold, got {crossed}'
+        assert crossed['id'] == l2_id
+        assert crossed['amendment_recorded'] is True, f'framing must still land: {crossed}'
+        assert crossed['amendments'] == _MAX_AMENDMENTS, (
+            f'the list stays capped while truncating: {crossed}'
+        )
+        assert crossed['severity'] == 'blocking', f'severity must still report: {crossed}'
+        assert set(crossed['members']) == {'esc-l1-1'}, f'members must still report: {crossed}'
+
+        # (c) RATE-LIMITED — further truncations inside the same window are
+        # counted but file nothing more.
+        for i in range(_AMENDMENT_TRUNCATION_STORM_THRESHOLD + 1):
+            again = await self._fold(server, f'post-{i}')
+            assert again['status'] == 'updated', f'Expected a fold, got {again}'
+        assert pending_ids() == known, (
+            f'StormCounter fires at most once per window; extra records: '
+            f'{pending_ids() - known}'
+        )
+        drained = queue.get(l2_id)
+        assert drained is not None
+        assert drained.amendments_truncated > _AMENDMENT_TRUNCATION_STORM_THRESHOLD, (
+            'the per-record counter keeps counting even while the notification '
+            'is rate-limited (INV-8: the durable fact is on the record)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_storm_counter_is_per_server_instance(self, tmp_path: Path):
+        """A second create_server gets a FRESH counter — no cross-server bleed.
+
+        ``StormCounter`` documents its state as PROCESS-LOCAL and per-instance
+        "so no state bleeds between servers (or between tests)".  A
+        module-level counter would still be inside the first server's
+        rate-limit window here and would fire nothing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        cfg = DedupeConfig(infra_dedupe_enabled=False)
+        server = create_server(queue, dedupe_config=cfg)
+
+        def pending_ids() -> set[str]:
+            return {e.id for e in queue.get_pending()}
+
+        created = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+
+        # Fill to the cap, then burst past the threshold on server #1.
+        for i in range(_MAX_AMENDMENTS + _AMENDMENT_TRUNCATION_STORM_THRESHOLD):
+            await self._fold(server, f'first-{i}')
+        known = pending_ids()
+        assert len(known) == 2, (
+            f'expected the L2 plus one storm record, got {sorted(known)}'
+        )
+
+        # Server #2 over the SAME queue: the amendment list is already at the
+        # cap, so every fold truncates.  A fresh counter fires on its own
+        # threshold-th truncation; a shared one would still be rate-limited.
+        server2 = create_server(queue, dedupe_config=cfg, startup_sweep=False)
+        for i in range(_AMENDMENT_TRUNCATION_STORM_THRESHOLD):
+            await self._fold(server2, f'second-{i}')
+
+        fresh = pending_ids() - known
+        assert len(fresh) == 1, (
+            f'a second server must carry its own counter and fire its own '
+            f'storm report; new ids: {sorted(fresh)}'
         )
 
 
