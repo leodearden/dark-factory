@@ -34,7 +34,6 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_stale_count_snapshot_corrections,
     filter_terminal_metadata_flags,
 )
-from fused_memory.reconciliation.policies import DARK_FACTORY_PROJECT_ID
 from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_pool_map import (
@@ -316,10 +315,12 @@ class MemoryConsolidator(BaseStage):
             # the e61b38f9/1938 false-positive incident: Stage 1 asserted an idea
             # was never converted to a tracked task despite a done dark_factory
             # task already implementing it (which spawned duplicate task 2412).
-            # dark_factory's project_root is resolved from known_projects (the
-            # harness cross-project routing map) rather than a hardcoded path, so
-            # this naturally no-ops when dark_factory is not a registered project.
-            # Uses get_tasks(statuses=['done']) rather than the semantic
+            # The whole cross-project routing map is handed over (task 4381):
+            # the filter fans one get_tasks out per known project and matches on
+            # TEXT coverage, where a same-project match is genuine evidence — so
+            # unlike dedup_flags' foreign-only cited-task gate below, ALL known
+            # projects are queried.  It naturally no-ops when known_projects is
+            # empty.  Uses get_tasks(statuses=...) rather than the semantic
             # search_tasks named in the task description: search_tasks lives only
             # on TaskInterceptor/the MCP wrapper, not on TaskBackendProtocol, so it
             # is unreachable from self.taskmaster (a raw SqliteTaskBackend) here —
@@ -327,7 +328,7 @@ class MemoryConsolidator(BaseStage):
             _before_already_tracked_filter = len(report.items_flagged)
             report.items_flagged = await filter_already_tracked_systemic_patterns(
                 taskmaster=self.taskmaster,
-                dark_factory_root=self.known_projects.get(DARK_FACTORY_PROJECT_ID),
+                known_projects=self.known_projects,
                 flags=report.items_flagged,
             )
             report.stats['systemic_pattern_already_tracked_dropped'] = (

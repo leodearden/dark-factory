@@ -7827,9 +7827,10 @@ class TestAlreadyTrackedSystemicPatternHelpers:
 
 class TestFilterAlreadyTrackedSystemicPatterns:
     """Tests for async filter_already_tracked_systemic_patterns(taskmaster,
-    dark_factory_root, flags) -> list[dict] (task 2416).
+    known_projects, flags) -> list[dict] (task 2416; second parameter widened
+    from a single dark_factory_root to the cross-project map by task 4381).
 
-    Drops a systemic_pattern 'never tracked' finding when a done dark_factory
+    Drops a systemic_pattern 'never tracked' finding when a tracked
     task's title+description already covers its distinctive key terms —
     hardening against the e61b38f9/1938 false-positive incident (a finding
     claiming the 'diff project_status_correction cache vs live get_statuses
@@ -7883,7 +7884,9 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             ],
         })
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [], (
             'systemic_pattern never-tracked finding must be DROPPED when done '
@@ -7914,7 +7917,9 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             ],
         })
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [flag], (
             'Finding must be KEPT when no done task covers its key terms (real '
@@ -7941,7 +7946,9 @@ class TestFilterAlreadyTrackedSystemicPatterns:
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [flag], (
             f'Non-systemic_pattern flag must pass through unchanged; got {result!r}'
@@ -7973,7 +7980,9 @@ class TestFilterAlreadyTrackedSystemicPatterns:
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [flag], (
             f'systemic_pattern flag without never-tracked language must be kept; got {result!r}'
@@ -8010,24 +8019,30 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             ],
         })
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [flag], (
             'A candidate with fewer than min_key_terms distinctive terms must be '
             f'KEPT (cannot match confidently); got {result!r}'
         )
 
-    # ---- done-only + fail-open edge cases (step-7) -------------------------
+    # ---- status-policy + fail-open edge cases (step-7) ---------------------
 
     @pytest.mark.asyncio
-    async def test_get_tasks_called_with_done_status_only(self):
-        """(a) get_tasks must be called with statuses=['done'].
+    async def test_get_tasks_called_once_per_project_with_non_cancelled_statuses(self):
+        """(a) get_tasks must be called once per project, not with the done-only pin.
 
-        Only done/merged tasks can trigger suppression — a PENDING duplicate
-        (like task 2412 in the e61b38f9 incident) must never be able to
-        suppress the finding that motivated filing it.
+        Task 2416 originally pinned ``statuses=['done']`` so a PENDING
+        duplicate (like task 2412 in the e61b38f9 incident) could not suppress
+        the finding that motivated filing it.  Task 4381 SUPERSEDES that under
+        Leo's 2026-08-17 ruling (esc-3841-1): a merely-FILED task now
+        suppresses, because the finding's complaint is that no task was filed.
+        Only ``cancelled`` stays excluded.
         """
         from fused_memory.reconciliation.flag_dedup import (
+            _NON_CANCELLED_TASK_STATUSES,
             filter_already_tracked_systemic_patterns,
         )
 
@@ -8035,9 +8050,13 @@ class TestFilterAlreadyTrackedSystemicPatterns:
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
 
-        await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
-        taskmaster.get_tasks.assert_called_once_with('/df', statuses=['done'])
+        taskmaster.get_tasks.assert_called_once_with(
+            '/df', statuses=_NON_CANCELLED_TASK_STATUSES,
+        )
 
     @pytest.mark.asyncio
     async def test_none_taskmaster_keeps_all_flags(self):
@@ -8048,15 +8067,17 @@ class TestFilterAlreadyTrackedSystemicPatterns:
 
         flag = self._make_never_tracked_flag()
 
-        result = await filter_already_tracked_systemic_patterns(None, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            None, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [flag], (
             f'A None taskmaster must degrade to a no-op KEEP-all; got {result!r}'
         )
 
     @pytest.mark.asyncio
-    async def test_none_dark_factory_root_keeps_all_flags_and_get_tasks_not_called(self):
-        """(c) dark_factory_root is None → no-op KEEP-all, get_tasks NOT called."""
+    async def test_none_known_projects_keeps_all_flags_and_get_tasks_not_called(self):
+        """(c) known_projects is None → no-op KEEP-all, get_tasks NOT called."""
         from fused_memory.reconciliation.flag_dedup import (
             filter_already_tracked_systemic_patterns,
         )
@@ -8065,16 +8086,18 @@ class TestFilterAlreadyTrackedSystemicPatterns:
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, None, [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, None, [flag],
+        )
 
         assert result == [flag], (
-            f'A None dark_factory_root must degrade to a no-op KEEP-all; got {result!r}'
+            f'A None known_projects must degrade to a no-op KEEP-all; got {result!r}'
         )
         taskmaster.get_tasks.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_empty_dark_factory_root_keeps_all_flags_and_get_tasks_not_called(self):
-        """(c) dark_factory_root is '' → no-op KEEP-all, get_tasks NOT called."""
+    async def test_empty_known_projects_keeps_all_flags_and_get_tasks_not_called(self):
+        """(c) known_projects is {} → no-op KEEP-all, get_tasks NOT called."""
         from fused_memory.reconciliation.flag_dedup import (
             filter_already_tracked_systemic_patterns,
         )
@@ -8083,10 +8106,12 @@ class TestFilterAlreadyTrackedSystemicPatterns:
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {}, [flag],
+        )
 
         assert result == [flag], (
-            f"An empty-string dark_factory_root must degrade to a no-op KEEP-all; got {result!r}"
+            f'An empty known_projects must degrade to a no-op KEEP-all; got {result!r}'
         )
         taskmaster.get_tasks.assert_not_called()
 
@@ -8101,7 +8126,9 @@ class TestFilterAlreadyTrackedSystemicPatterns:
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(side_effect=RuntimeError('backend down'))
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [flag], (
             f'get_tasks raising must fail-open to KEEP-all; got {result!r}'
@@ -8120,7 +8147,9 @@ class TestFilterAlreadyTrackedSystemicPatterns:
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value=[])
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [flag], (
             f'A non-dict get_tasks result must degrade to zero done tasks (KEEP-all); got {result!r}'
@@ -8137,7 +8166,9 @@ class TestFilterAlreadyTrackedSystemicPatterns:
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={})
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [flag], (
             f"A result missing 'tasks' must degrade to zero done tasks (KEEP-all); got {result!r}"
@@ -8154,7 +8185,9 @@ class TestFilterAlreadyTrackedSystemicPatterns:
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': None})
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [flag], (
             f"A result of {{'tasks': None}} must degrade to zero done tasks (KEEP-all); got {result!r}"
@@ -8199,7 +8232,9 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             ],
         })
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [], (
             f'A done task covering exactly the 0.75 threshold must DROP; got {result!r}'
@@ -8235,7 +8270,9 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             ],
         })
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [flag], (
             f'A done task covering only 0.5 of the finding terms (below 0.75) must KEEP; got {result!r}'
@@ -8282,7 +8319,9 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             ],
         })
 
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', [flag])
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
 
         assert result == [flag], (
             'A verbose, unrelated done task must not suppress a real systemic '
@@ -8340,7 +8379,9 @@ class TestFilterAlreadyTrackedSystemicPatterns:
         })
 
         flags = [benign1, candidate_a, benign2, candidate_b, benign3]
-        result = await filter_already_tracked_systemic_patterns(taskmaster, '/df', flags)
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, flags,
+        )
 
         assert result == [benign1, benign2, candidate_b, benign3], (
             f'Surviving flags must preserve original relative order; got {result!r}'

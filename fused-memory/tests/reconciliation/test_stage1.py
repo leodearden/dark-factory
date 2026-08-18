@@ -3175,16 +3175,18 @@ class TestAlreadyTrackedSystemicPatternWiring:
         )
 
     @pytest.mark.asyncio
-    async def test_finding_kept_when_dark_factory_not_a_known_project(self):
-        """No-op guard: finding survives when known_projects lacks 'dark_factory'.
+    async def test_finding_kept_when_no_known_projects_are_registered(self):
+        """No-op guard: finding survives when known_projects is empty.
 
-        Exercises the fail-open path when the harness never registers
-        dark_factory (e.g. a single-project test/deployment harness) — the
-        resolved dark_factory_root is None, so the filter must degrade to a
-        pass-through rather than erroring or dropping anything.
+        Exercises the fail-open path when the harness never populates the
+        cross-project routing map (e.g. a single-project test/deployment
+        harness) — the filter is handed an empty known_projects (task 4381
+        widened the parameter from a single resolved dark_factory_root) and
+        must degrade to a pass-through rather than erroring or dropping
+        anything.
         """
         stage = _make_consolidator(project_root='/tmp/reify')
-        stage.known_projects = {}  # dark_factory not registered
+        stage.known_projects = {}  # no cross-project routing map
         assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
         stage.taskmaster.get_tasks = AsyncMock(return_value={
             'tasks': [self._make_matching_done_task()],
@@ -3215,7 +3217,7 @@ class TestAlreadyTrackedSystemicPatternWiring:
             )
 
         assert never_tracked_flag in report.items_flagged, (
-            'Finding must be KEPT when dark_factory is not in known_projects '
+            'Finding must be KEPT when known_projects is empty '
             f'(no-op guard); got items_flagged={report.items_flagged!r}'
         )
 
