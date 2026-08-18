@@ -1188,6 +1188,99 @@ class TestRunApplyAdjudicatesARaisedDelete:
         service.get_memory_by_id.assert_not_awaited()
 
 
+class TestRunAttributesAnEscapeAfterALandedDelete:
+    """The second window with the same consequence: an error escaping AFTER a
+    delete that RETURNED (task 3243).
+
+    ``_repair_record`` handles a raising add and a non-persisting add, but the
+    region between ``add_memory`` RETURNING and ``readd_persisted`` rendering
+    its verdict sits outside both. An escape there leaves a delete that
+    demonstrably landed with no vouched-for replacement — and the module's own
+    doctrine already says "a non-raising add that did not persist is treated
+    IDENTICALLY to a throw". A response the sweep could not even EVALUATE
+    certainly cannot be vouched for, so it belongs in the same bucket.
+
+    ``run()``'s per-record catch-all reads one field — ``delete_landed`` — to
+    cover this window for free: no second probe, and no second classification
+    rule that could drift out of step with ``_repair_record``'s.
+    """
+
+    class _UnreadableResponse:
+        """An ``add_memory`` response whose attribute access blows up.
+
+        A NON-AttributeError, so ``getattr(response, 'memory_ids', None)``
+        PROPAGATES rather than quietly taking its default — modelling a
+        response object the sweep cannot evaluate at all.
+        """
+
+        @property
+        def memory_ids(self):
+            raise RuntimeError('response object is unreadable')
+
+    @pytest.mark.asyncio
+    async def test_an_escape_after_a_returned_delete_is_content_lost(self):
+        service = _service([_match('b', _TAIL_LEAK), _match('c', _DUPLICATE_LEAK)])
+        service.add_memory = AsyncMock(
+            side_effect=[self._UnreadableResponse(), _ok_response()]
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        lost = _record_for(report, 'b')
+        assert lost['delete_landed'] is True
+        assert lost['content_lost_in_flight'] is True
+        assert 'record_error' not in lost
+        assert lost['repaired'] is False
+        # The report remains the only copy of both texts.
+        assert lost['content'] == _TAIL_LEAK
+        assert lost['repaired_content'] == _BODY
+        assert 'unreadable' in lost['error']
+        assert _mod.resolve_exit_code(report) != 0
+        # And one record's failure still never shrinks the sweep.
+        assert _record_for(report, 'c')['repaired'] is True
+
+    @pytest.mark.asyncio
+    async def test_a_failure_before_the_delete_stays_a_record_error(self, monkeypatch):
+        """The negative control that stops the new rule becoming a catch-all.
+
+        Nothing was deleted, so nothing was lost. The record must carry NO
+        ``delete_landed`` key at all — absent is the honest reading when no
+        delete was ever attempted.
+        """
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        def _explode(_payload):
+            raise RuntimeError('pre-flight blew up')
+
+        monkeypatch.setattr(_mod, 'routes_to_mem0', _explode)
+
+        report = await _mod.run(_args(apply=True), service)
+
+        failed = _record_for(report, 'b')
+        assert failed['record_error'] is True
+        assert 'delete_landed' not in failed
+        assert 'content_lost_in_flight' not in failed
+        # The content is untouched in the store: never deleted, never re-added.
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_a_successful_repair_records_the_landing_and_still_exits_zero(self):
+        """``delete_landed`` is EVIDENCE, not an adjudication flag. Every clean
+        repair legitimately carries it, so putting it in
+        ``HUMAN_ADJUDICATION_FLAGS`` would fail every successful ``--apply``."""
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        repaired = _record_for(report, 'b')
+        assert repaired['repaired'] is True
+        assert repaired['delete_landed'] is True
+        assert 'delete_landed' not in _mod.HUMAN_ADJUDICATION_FLAGS
+        assert _mod.resolve_exit_code(report) == 0
+
+
 class TestRunApplyVerifiesPersistence:
     """The failure that ACTUALLY happens: a non-raising add that did not persist.
 
