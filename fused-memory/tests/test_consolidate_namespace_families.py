@@ -1236,85 +1236,206 @@ class TestScrollCollectionPoints:
 # ===========================================================================
 
 class TestMergeCollection:
-    """Tests for async merge_collection(qdrant_client, source, target,
-    canonical_user_id, points, *, capped)."""
+    """Tests for async merge_collection(backend, qdrant_client, source, target,
+    canonical_user_id, *, page_size, max_pages).
+
+    merge_collection now drives its OWN with-vectors drain and upserts in
+    CHUNKS.  Previously the caller drained the whole collection into a list
+    (with vectors) and handed it over, then this built a SECOND full list of
+    PointStructs and issued ONE upsert -- so peak memory and the single
+    request size both scaled with the collection, exactly on the >1-page
+    collections task 3225 first made reachable.
+
+    ``points`` and ``capped`` are GONE from the parameter list: the caller's
+    preflight no longer materialises points, and the delete decision is now
+    owned here (delete only after this function's own drain completes
+    cleanly).
+    """
 
     @pytest.mark.asyncio
-    async def test_upserts_into_target_with_canonical_user_id(self):
-        """upsert is called with collection_name=target and each point's
-        payload user_id rewritten to canonical -- original id/vector preserved."""
-        points = [
-            _make_point('p1', payload={'user_id': 'dark-factory', 'data': 'a'}, vector=[0.1, 0.2]),
-            _make_point('p2', payload={'user_id': 'dark-factory', 'data': 'b'}, vector=[0.3, 0.4]),
-        ]
+    async def test_drives_the_backend_drain_itself_with_vectors(self):
+        """merge_collection performs the sole with-vectors drain.
+
+        with_vectors=True is essential HERE: omitting it drops embeddings from
+        the points, which would silently destroy them once re-upserted into
+        the target collection.  page_size/max_pages are forwarded so the
+        phase-2 drain is bounded by the same budget as the preflight.
+        """
+        calls: list = []
+        backend = _make_backend_pager([[_make_point('p1')]], calls=calls)
         client = _make_qdrant_mock()
 
         await _mod.merge_collection(
-            client, 'fused_dark-factory', 'fused_dark_factory', 'dark_factory',
-            points, capped=False,
+            backend, client, 'reify_reify', 'fused_reify', 'reify',
+            page_size=500, max_pages=7,
         )
 
-        client.upsert.assert_called_once()
-        upsert_kwargs = client.upsert.call_args.kwargs
-        assert upsert_kwargs['collection_name'] == 'fused_dark_factory'
-        upserted = upsert_kwargs['points']
-        assert len(upserted) == 2
-        assert {p.id for p in upserted} == {'p1', 'p2'}
+        assert len(calls) == 1, 'merge_collection drains the source exactly once'
+        collection, kwargs = calls[0]
+        assert collection == 'reify_reify'
+        assert kwargs['with_vectors'] is True
+        assert kwargs['page_size'] == 500
+        assert kwargs['max_pages'] == 7
+
+    @pytest.mark.asyncio
+    async def test_passes_the_collection_name_verbatim_unprefixed(self):
+        """COLLECTION_MERGES holds LEGACY mis-named collections
+        ('reify_reify', 'fused_dark-factory') that a Scope structurally cannot
+        produce -- prefixing or re-deriving would address a collection that
+        does not exist."""
+        calls: list = []
+        backend = _make_backend_pager([[]], calls=calls)
+        client = _make_qdrant_mock()
+
+        await _mod.merge_collection(
+            backend, client, 'fused_dark-factory', 'fused_dark_factory', 'dark_factory',
+        )
+
+        assert calls[0][0] == 'fused_dark-factory'
+
+    @pytest.mark.asyncio
+    async def test_upserts_in_chunks_bounded_by_page_size(self):
+        """THE anti-OOM/anti-oversized-request contract: a multi-page source
+        must produce MORE THAN ONE upsert, and no single request may carry
+        more than page_size points.
+
+        A single upsert of a 200k-point collection is both a multi-GB
+        resident list and one oversized request; chunking bounds peak memory
+        and per-request size at one chunk.
+        """
+        pages = [
+            [_make_point('p1'), _make_point('p2')],
+            [_make_point('p3'), _make_point('p4')],
+            [_make_point('p5')],
+        ]
+        backend = _make_backend_pager(pages)
+        client = _make_qdrant_mock()
+
+        await _mod.merge_collection(
+            backend, client, 'reify_reify', 'fused_reify', 'reify', page_size=2,
+        )
+
+        assert client.upsert.await_count > 1, (
+            'a 5-point source at page_size=2 must not be one single upsert'
+        )
+        for call in client.upsert.call_args_list:
+            assert len(call.kwargs['points']) <= 2, (
+                'no single upsert request may exceed page_size points'
+            )
+
+    @pytest.mark.asyncio
+    async def test_every_point_is_upserted_once_with_canonical_user_id(self):
+        """Summed over all chunks: each source point reaches the target
+        exactly once, with its original id and vector preserved and only its
+        payload user_id rewritten to canonical."""
+        pages = [
+            [
+                _make_point('p1', payload={'user_id': 'dark-factory', 'data': 'a'}, vector=[0.1, 0.2]),
+                _make_point('p2', payload={'user_id': 'dark-factory', 'data': 'b'}, vector=[0.3, 0.4]),
+            ],
+            [
+                _make_point('p3', payload={'user_id': 'dark-factory', 'data': 'c'}, vector=[0.5, 0.6]),
+            ],
+        ]
+        backend = _make_backend_pager(pages)
+        client = _make_qdrant_mock()
+
+        await _mod.merge_collection(
+            backend, client, 'fused_dark-factory', 'fused_dark_factory', 'dark_factory',
+            page_size=2,
+        )
+
+        upserted = []
+        for call in client.upsert.call_args_list:
+            assert call.kwargs['collection_name'] == 'fused_dark_factory'
+            upserted.extend(call.kwargs['points'])
+
+        assert [p.id for p in upserted] == ['p1', 'p2', 'p3'], (
+            'every point exactly once, in stream order'
+        )
         for p in upserted:
             assert p.payload['user_id'] == 'dark_factory'
         by_id = {p.id: p for p in upserted}
         assert by_id['p1'].vector == [0.1, 0.2]
         assert by_id['p1'].payload['data'] == 'a'
         assert by_id['p2'].vector == [0.3, 0.4]
+        assert by_id['p3'].vector == [0.5, 0.6]
+        assert by_id['p3'].payload['data'] == 'c'
 
     @pytest.mark.asyncio
-    async def test_deletes_source_when_not_capped(self):
-        """A fully-drained (not capped) scroll deletes the source collection."""
+    async def test_clean_drain_deletes_source_and_reports_complete(self):
+        """A drain that runs to exhaustion deletes the source exactly once and
+        reports the full tally with enumeration_incomplete False."""
+        backend = _make_backend_pager([[_make_point('p1'), _make_point('p2')], [_make_point('p3')]])
         client = _make_qdrant_mock()
-        points = [_make_point('p1')]
 
-        await _mod.merge_collection(
-            client, 'reify_reify', 'fused_reify', 'reify', points, capped=False,
+        result = await _mod.merge_collection(
+            backend, client, 'reify_reify', 'fused_reify', 'reify', page_size=2,
         )
 
+        assert result == {
+            'points_upserted': 3,
+            'source_deleted': True,
+            'enumeration_incomplete': False,
+        }
         client.delete_collection.assert_called_once_with('reify_reify')
 
     @pytest.mark.asyncio
-    async def test_does_not_delete_source_when_capped(self):
-        """A capped (possibly-incomplete) scroll does NOT delete the source
-        collection -- no data loss on a partial migration."""
+    async def test_empty_source_is_deleted_without_upserting(self):
+        """A source with no points still drains cleanly: no upsert is issued
+        (an empty request would be wasted), and the empty source is deleted."""
+        backend = _make_backend_pager([[]])
         client = _make_qdrant_mock()
-        points = [_make_point('p1')]
 
-        await _mod.merge_collection(
-            client, 'reify_reify', 'fused_reify', 'reify', points, capped=True,
+        result = await _mod.merge_collection(
+            backend, client, 'reify_reify', 'fused_reify', 'reify',
         )
+
+        client.upsert.assert_not_called()
+        assert result == {
+            'points_upserted': 0,
+            'source_deleted': True,
+            'enumeration_incomplete': False,
+        }
+        client.delete_collection.assert_called_once_with('reify_reify')
+
+    @pytest.mark.asyncio
+    async def test_budget_exhaustion_mid_drain_withholds_the_delete(self, caplog):
+        """A drain that dies mid-stream must NEVER authorise deleting the source.
+
+        The chunks that already landed are id-keyed and idempotent, so the
+        target holds a PARTIAL copy while the source stays fully intact -- a
+        re-run with a larger budget completes it, re-upserting the migrated
+        points harmlessly.  Deleting the source here would destroy the
+        un-migrated remainder.
+        """
+        pages = [
+            [_make_point('p1'), _make_point('p2')],
+            [_make_point('p3'), _make_point('p4')],
+            [_make_point('p5')],
+        ]
+        backend = _make_backend_pager(pages, raise_budget_after=3)
+        client = _make_qdrant_mock()
+
+        with caplog.at_level('WARNING'):
+            result = await _mod.merge_collection(
+                backend, client, 'reify_reify', 'fused_reify', 'reify', page_size=2,
+            )
 
         client.delete_collection.assert_not_called()
+        assert result['source_deleted'] is False
+        assert result['enumeration_incomplete'] is True
 
-    @pytest.mark.asyncio
-    async def test_returns_summary_dict(self):
-        """Returns a summary with points_upserted count and source_deleted flag."""
-        client = _make_qdrant_mock()
-        points = [_make_point('p1'), _make_point('p2')]
-
-        result = await _mod.merge_collection(
-            client, 'reify_reify', 'fused_reify', 'reify', points, capped=False,
+        landed = sum(len(c.kwargs['points']) for c in client.upsert.call_args_list)
+        assert landed > 0, 'the chunks before the drain died did land'
+        assert result['points_upserted'] == landed, (
+            'points_upserted must tally what ACTUALLY reached the target, not '
+            'what was enumerated -- an un-flushed buffer is not upserted'
         )
-
-        assert result == {'points_upserted': 2, 'source_deleted': True}
-
-    @pytest.mark.asyncio
-    async def test_capped_summary_reports_source_not_deleted(self):
-        """capped=True summary reports source_deleted=False."""
-        client = _make_qdrant_mock()
-        points = [_make_point('p1')]
-
-        result = await _mod.merge_collection(
-            client, 'reify_reify', 'fused_reify', 'reify', points, capped=True,
+        assert any('reify_reify' in rec.message for rec in caplog.records), (
+            'no-silent-caps: the WARNING must name the collection; got '
+            f'{[r.message for r in caplog.records]}'
         )
-
-        assert result == {'points_upserted': 1, 'source_deleted': False}
 
 
 # ===========================================================================
@@ -1580,6 +1701,7 @@ def _make_run_memory_service(
     qdrant_client: AsyncMock,
     *,
     budget_exhausted: set[str] | None = None,
+    budget_exhausted_on_call: dict[str, int] | None = None,
 ) -> MagicMock:
     """MagicMock memory_service wired the way run() consumes it.
 
@@ -1591,14 +1713,25 @@ def _make_run_memory_service(
     *budget_exhausted* names collections whose paging generator raises
     ``ScrollPageBudgetExhausted`` after yielding everything it has, modelling
     a collection larger than the page budget.
+
+    *budget_exhausted_on_call* maps a collection to the 1-based drain index
+    that must raise, leaving the others clean.  run() now drains a collection
+    TWICE under --apply -- a vectorless counting PREFLIGHT, then
+    merge_collection's own with-vectors drain -- so ``{'c': 2}`` models the
+    case the single-knob set cannot: an uncapped preflight followed by a
+    phase-2 drain that dies mid-merge.
     """
     exhausted = budget_exhausted or set()
+    on_call = dict(budget_exhausted_on_call or {})
+    drain_counts: dict[str, int] = {}
     points_by_collection = getattr(qdrant_client, '_points_by_collection', {}) or {}
 
     async def _scroll_collection_pages(collection, **_kwargs):
+        nth = drain_counts.get(collection, 0) + 1
+        drain_counts[collection] = nth
         for point in points_by_collection.get(collection, []):
             yield point
-        if collection in exhausted:
+        if collection in exhausted or on_call.get(collection) == nth:
             raise _mod.ScrollPageBudgetExhausted(
                 f'collection={collection!r} exhausted its page budget',
             )
@@ -2145,10 +2278,10 @@ class TestRunApply:
         merge_calls: list = []
         real_merge = _mod.merge_collection
 
-        async def _spy_merge(qdrant_client, source, target, canonical_user_id, points, *, capped):
-            merge_calls.append((qdrant_client, source, list(points), capped))
+        async def _spy_merge(backend, qdrant_client, source, target, canonical_user_id, **kwargs):
+            merge_calls.append((backend, qdrant_client, source, dict(kwargs)))
             return await real_merge(
-                qdrant_client, source, target, canonical_user_id, points, capped=capped,
+                backend, qdrant_client, source, target, canonical_user_id, **kwargs,
             )
 
         monkeypatch.setattr(_mod, 'merge_collection', _spy_merge)
@@ -2167,21 +2300,26 @@ class TestRunApply:
 
         # Every COLLECTION_MERGES entry is visited (the other three are empty
         # in this fixture); the one under test is fused_dark-factory.
-        dark_factory_merges = [c for c in merge_calls if c[1] == 'fused_dark-factory']
+        dark_factory_merges = [c for c in merge_calls if c[2] == 'fused_dark-factory']
         assert len(dark_factory_merges) == 1
-        merged_client, source, merged_points, capped = dark_factory_merges[0]
+        merged_backend, merged_client, _source, merge_kwargs = dark_factory_merges[0]
+        assert merged_backend is memory_service.mem0, (
+            'merge_collection drives its own drain, so it takes the BACKEND too'
+        )
         assert merged_client is qdrant_client, (
             'merge_collection still takes the RAW client -- the upsert/delete '
             'path is unchanged and still needs it'
         )
-        assert merged_points == points, 'every page must reach the merge, not just the first'
-        assert capped is False
+        assert merge_kwargs['page_size'] == 2, '--limit is the phase-2 chunk size too'
 
-        upserted = [
+        upsert_calls = [
             c for c in qdrant_client.upsert.call_args_list
             if c.kwargs.get('collection_name') == 'fused_dark_factory'
-        ][0].kwargs['points']
-        assert len(upserted) == 5
+        ]
+        upserted = [p for c in upsert_calls for p in c.kwargs['points']]
+        assert len(upserted) == 5, 'every page must reach the target, not just the first'
+        assert {p.id for p in upserted} == {f'p{i}' for i in range(5)}
+        assert len(upsert_calls) > 1, 'a 5-point source at page_size=2 is chunked'
 
         item = {i['source']: i for i in report['collection_merges']}['fused_dark-factory']
         assert item['point_count'] == 5
@@ -2279,6 +2417,47 @@ class TestRunApply:
         collection_by_source = {item['source']: item for item in report['collection_merges']}
         assert collection_by_source['fused_dark-factory']['disposition'] == 'UNRESOLVED'
         assert _mod.has_unresolved(report) is True, 'an UNRESOLVED item must exit non-zero'
+
+    @pytest.mark.asyncio
+    async def test_apply_merge_drain_exhausting_midway_stays_unresolved_and_undeleted(self, monkeypatch):
+        """A CLEAN preflight followed by a phase-2 merge drain that exhausts
+        must still report UNRESOLVED and leave the source intact.
+
+        Splitting the pass into a counting preflight and a separate
+        with-vectors merge drain opens a window the single-drain design did
+        not have: the preflight can succeed and the merge drain die anyway
+        (a bigger collection by then, a transport hiccup, a tighter budget on
+        the heavier vector-bearing pages).  run() must fold the returned
+        enumeration_incomplete into an UNRESOLVED disposition -- mirroring the
+        graph-family post-merge downgrade -- so the run exits non-zero and no
+        operator reads a partial merge as clean.
+        """
+        _patch_merge_primitives(monkeypatch)
+        points = [_make_point(f'p{i}', payload={'user_id': 'dark-factory'}) for i in range(4)]
+        graphiti = _make_run_graphiti_mock()
+        qdrant_client = _make_run_qdrant_mock(
+            points_by_collection={'fused_dark-factory': points},
+        )
+        memory_service = _make_run_memory_service(
+            graphiti, qdrant_client, budget_exhausted_on_call={'fused_dark-factory': 2},
+        )
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=2)
+
+        item = {i['source']: i for i in report['collection_merges']}['fused_dark-factory']
+        assert item['point_count'] == 4, 'the preflight itself drained cleanly'
+        assert item['enumeration_incomplete'] is True
+        assert item['source_deleted'] is False
+        assert item['disposition'] == 'UNRESOLVED', (
+            'a merge whose drain died mid-stream is not a clean MERGE'
+        )
+        assert _mod.has_unresolved(report) is True, 'an UNRESOLVED item must exit non-zero'
+
+        stale_deletes = [
+            c for c in qdrant_client.delete_collection.call_args_list
+            if c.args and c.args[0] == 'fused_dark-factory'
+        ]
+        assert stale_deletes == [], 'the source must survive a partial merge'
 
     @pytest.mark.asyncio
     async def test_apply_deletes_zero_count_empty_collection_and_leaves_nonzero_unresolved(self, monkeypatch):
