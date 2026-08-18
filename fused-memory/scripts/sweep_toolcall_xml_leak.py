@@ -696,7 +696,32 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
         limit=args.limit,
     )
     matches = scan.get('matches', [])
-    progress['collection'] = scan.get('collection', '')
+    # READ from the scan result, never re-derived here. The alternative --
+    # spelling ``Scope(project_id=...).mem0_collection_name(prefix)`` a second
+    # time inside this script -- would be a second copy of the
+    # scope-to-collection rule, the same duplication the ``_CONTENT_KEYS`` /
+    # ``_MEM0_OWNED_KEYS`` bindings above exist to avoid, and it would go
+    # silently wrong the day that mapping changes. The value the scan actually
+    # swept is the only value worth printing.
+    collection = scan.get('collection') or ''
+    if not collection:
+        # Loud rather than silently degraded: the ``.get(..., '')`` default is
+        # exactly how a whole authoritative 21,089-point live --apply run
+        # emitted a blank field unnoticed, and two committed artifacts under
+        # docs/toolcall-xml-leak-sweep-2026-08-05/ still carry it. A WARNING,
+        # not a raise, because the report must ALWAYS survive -- for a
+        # content_lost_in_flight record it is the only remaining copy of the
+        # original text, so a cosmetic provenance gap must never abort a run.
+        logger.warning(
+            'sweep_toolcall_xml_leak: the scan reported no "collection" -- this '
+            'run report will not say which Qdrant collection it swept, so it '
+            'cannot serve as an auditable measurement of that collection. The '
+            'sweep continues and the field degrades to "". Expected '
+            'MemoryService.scan_memory_content to return a "collection" key '
+            '(Mem0Backend.scan_payload_text supplies it); got keys %s.',
+            sorted(scan),
+        )
+    progress['collection'] = collection
     progress['scanned'] = scan.get('scanned', len(matches))
     progress['truncated'] = bool(scan.get('truncated'))
 

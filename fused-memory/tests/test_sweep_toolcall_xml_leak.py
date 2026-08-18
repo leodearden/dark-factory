@@ -576,7 +576,7 @@ class TestRunReportsWhichCollectionItSwept:
     @staticmethod
     def _blank_warnings(caplog) -> list[str]:
         return [
-            r.message % r.args if r.args else r.message
+            r.getMessage()
             for r in caplog.records
             if r.levelno >= logging.WARNING and 'collection' in str(r.msg)
         ]
