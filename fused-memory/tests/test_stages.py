@@ -7510,6 +7510,7 @@ class TestSweepStaleMem0FlagMarkers:
         assert result == 1
         assert memory_service.delete_memory.await_count == 1
         tombstone.assert_awaited_once()
+        assert tombstone.await_args is not None
         victims = tombstone.await_args.args[2]
         assert len(victims) == 1
         assert victims[0]['id'] == 'canonical-both-keys'
