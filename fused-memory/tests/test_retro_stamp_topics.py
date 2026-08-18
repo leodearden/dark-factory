@@ -438,7 +438,7 @@ class TestComputePatchCanonicalAndSupersedes:
 
         ``normalize_supersedes`` faithfully wraps ANY scalar, so folding this
         sentence would write ``['<prose>']`` — a one-member list whose member
-        fails ``_is_full_uuid``, turning a record that merely has a legacy
+        fails ``is_full_uuid``, turning a record that merely has a legacy
         shape into one that fails ``validate_memory_metadata`` outright.  D2
         offers the fold as a convenience; it does not license manufacturing a
         validation failure.  Leave it, name it, move on.
@@ -492,15 +492,22 @@ class TestComputePatchCanonicalAndSupersedes:
         }
 
     def test_shape_helpers_come_from_the_registry_not_a_local_copy(self):
-        """INV-5 again: the UUID predicate and the fold have one home.
+        """INV-5 again: each shape helper has one home — but not the SAME one.
 
-        Same private-helper reuse ``strip_leaked_control_keys.py`` already
-        establishes for ``_drop_reserved_control_keys``.
+        The ``supersedes`` fold is owned by ``memory_metadata``; the
+        canonical-full-UUID predicate is owned by
+        ``fused_memory.utils.validation`` (task 3132, leaf η), which
+        ``memory_metadata`` merely calls.  Pin each binding against its real
+        owner, so re-expressing either one locally fails a test instead of
+        silently forking the rule.  Same private-helper reuse
+        ``strip_leaked_control_keys.py`` already establishes for
+        ``_drop_reserved_control_keys``.
         """
         from fused_memory import memory_metadata
+        from fused_memory.utils import validation
 
         assert _mod.normalize_supersedes is memory_metadata.normalize_supersedes
-        assert _mod._is_full_uuid is memory_metadata._is_full_uuid
+        assert _mod.is_full_uuid is validation.is_full_uuid
 
 
 # ===========================================================================
@@ -1175,9 +1182,9 @@ class TestDfCuratorGateManifest:
         """
         for entry in _mod.DF_CURATOR_GATE_CLUSTERS:
             for memory_id in entry.member_memory_ids or ():
-                assert _mod._is_full_uuid(memory_id), (entry.gate_task_id, memory_id)
+                assert _mod.is_full_uuid(memory_id), (entry.gate_task_id, memory_id)
             if entry.canonical_memory_id is not None:
-                assert _mod._is_full_uuid(entry.canonical_memory_id), entry
+                assert _mod.is_full_uuid(entry.canonical_memory_id), entry
 
     def test_no_memory_id_is_claimed_by_two_gates(self):
         seen: dict[str, str] = {}
