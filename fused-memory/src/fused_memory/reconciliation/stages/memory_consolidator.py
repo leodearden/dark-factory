@@ -342,6 +342,11 @@ class MemoryConsolidator(BaseStage):
                 project_id=self.project_id,
                 run_id=run_id,
                 flags=report.items_flagged,
+                # Cross-project fix-task suppression (task 4381): without BOTH
+                # of these, dedup_flags' HIT-path gate degrades to a silent
+                # no-op by design.
+                taskmaster=self.taskmaster,
+                known_projects=self.known_projects,
             )
             # One-time completion markers dedup_flags emitted-then-self-deleted this
             # cycle (task-2312) — counts flags annotated completion_marker_self_deleted
@@ -350,11 +355,22 @@ class MemoryConsolidator(BaseStage):
                 1 for f in report.items_flagged
                 if f.get('completion_marker_self_deleted') is True
             )
-            # Signatures dropped specifically by dedup_flags' internal suppression
-            # gate: present before dedup_flags, absent after.  dedup_flags never
-            # drops a flag for any other reason — a HIT or MISS always keeps the
-            # flag (annotated or not) — so this diff isolates suppression drops
-            # without an extra Mem0 search.
+            # Signatures dropped INSIDE dedup_flags: present before, absent
+            # after.  As of task 4381 dedup_flags drops for TWO reasons — its
+            # filter_suppressed gate, and a ledger HIT whose cited_tasks resolve
+            # to a live, non-cancelled fix task in a FOREIGN known project — so
+            # this diff no longer isolates suppression alone.  Both causes are
+            # deliberately folded into `suppressed_signatures` here, and are
+            # therefore EXCLUDED from acknowledge_resolved_flags below.  That is
+            # correct for the same reason the existing suppression carve-out is:
+            # a cross-project fix task that has been FILED has not yet LANDED, so
+            # the marker must retain its recurrence history for the day that task
+            # is cancelled or closed without landing the fix — exactly like "a
+            # suppression means the issue is intentionally hidden, not resolved".
+            # The two causes are distinguishable only via the
+            # `reconciliation.stage1_flag_cross_project_fix_task_suppressed` INFO
+            # log, not a report.stats key: dedup_flags returns only a list, so a
+            # pre/post signature diff cannot tell them apart.
             _post_dedup_signatures = {
                 sig for f in report.items_flagged
                 if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))
