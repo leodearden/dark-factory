@@ -19,7 +19,13 @@ from shared.timestamps import parse_timestamp_or_warn
 
 from escalation import archive
 from escalation.classify import default_resolution_class_for_resolver
+
+# max_severity is aliased to the historical private name ``_max_severity``: the
+# severity ordering now lives in models.py beside the KNOWN_SEVERITIES vocabulary
+# it must stay total over (task 3976), where server.py can share it without a
+# private cross-module import.  The alias keeps this module's call sites unchanged.
 from escalation.models import RESOLUTION_CLASSES, Escalation
+from escalation.models import max_severity as _max_severity
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +77,6 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
     finally:
         os.close(fd)
 
-# Severity rank map for promotion logic.  Alphabetical comparison is wrong
-# ('blocking' < 'info'), so we use an explicit rank.  Unknown severities
-# default to rank 0 (treated as info-level) so malformed input never causes
-# unexpected promotion.
-_SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1}
-
 # Hard cap on EscalationQueue._archive_negative_cache (see _locate_path /
 # _cache_archive_negative).  A polling client hammering many distinct
 # nonexistent ids (typos, stale references, an adversarial sweep) must not
@@ -84,19 +84,6 @@ _SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1}
 # rather than evicted piecemeal (simple, and negative-cache staleness is
 # already bounded by the next self-archival — see _archive_resolved).
 _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
-
-
-def _max_severity(a: str, b: str) -> str:
-    """Return the higher-urgency severity string between *a* and *b*."""
-    for val in (a, b):
-        if val not in _SEVERITY_RANK:
-            logger.warning(
-                '_max_severity: unrecognised severity %r — treating as info-level '
-                '(rank 0). Known values: %s',
-                val,
-                ', '.join(_SEVERITY_RANK),
-            )
-    return a if _SEVERITY_RANK.get(a, 0) >= _SEVERITY_RANK.get(b, 0) else b
 
 
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
