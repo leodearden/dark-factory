@@ -1364,8 +1364,23 @@ def test_type_gates_resolve_pyright_without_npx() -> None:
     than bolted on ahead of them.
     """
     discovered = _discovered()
+
+    # Guarded read, in the .get-based shape _load_root_pyright_config already
+    # uses here. Raw chained indexing raises a bare KeyError naming only the
+    # missing key if the root workspace table is ever restructured, which reads
+    # as a broken test rather than the real finding: the membership check below
+    # has nothing left to check against.
     with open(REPO_ROOT / 'pyproject.toml', 'rb') as fh:
-        members = tomllib.load(fh)['tool']['uv']['workspace']['members']
+        root_pyproject = tomllib.load(fh)
+    members = root_pyproject.get('tool', {}).get('uv', {}).get('workspace', {}).get('members')
+    assert members, (
+        f'the root {REPO_ROOT / "pyproject.toml"} declares no non-empty '
+        '[tool.uv.workspace].members, so `uv run --project <member>` cannot be '
+        'checked against the workspace it names (task 4358). Either the table '
+        'moved and this read needs re-pointing, or the workspace itself is '
+        'gone and every uv-resolved gate in the repo is broken — both are real '
+        'findings, and neither should surface as a bare KeyError'
+    )
 
     for prefix in (MODULE_PREFIX, SIBLING_PREFIX):
         mc = discovered.get(prefix)
@@ -1381,13 +1396,18 @@ def test_type_gates_resolve_pyright_without_npx() -> None:
             'until the gate exists at all (tasks 3456 / 3350)'
         )
 
-        tokens = shlex.split(_segment(cmd, _PYRIGHT))
-        anchor_at = tokens.index(_PYRIGHT)
+        # Position matters to every assertion below, so read the two halves
+        # through the shared helpers rather than re-locating the anchor here —
+        # a hand-rolled `tokens.index(_PYRIGHT)` is the duplication
+        # _anchor_split exists to end.
+        pre = _pre_anchor_tokens(cmd, _PYRIGHT)
+        post = _post_anchor_tokens(cmd, _PYRIGHT)
 
-        # (a) EXACT-TOKEN, not substring: `npx` must not appear anywhere in the
-        # segment. RED for `scripts` before this task, which declared
-        # `npx pyright scripts/`; `tests/scripts` has satisfied it since 3842.
-        assert 'npx' not in tokens, (
+        # (a) EXACT-TOKEN, not substring, and over the WHOLE segment (both
+        # halves; the anchor itself is `pyright`, never `npx`). RED for
+        # `scripts` before this task, which declared `npx pyright scripts/`;
+        # `tests/scripts` has satisfied it since 3842.
+        assert 'npx' not in pre + post, (
             f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
             'which fronts pyright with npx (task 4358). esc-3473-2 measured '
             'bare `npx pyright` re-resolving through the shared, mutable, '
@@ -1403,7 +1423,7 @@ def test_type_gates_resolve_pyright_without_npx() -> None:
 
         # (b) POSITIVELY the uv-resolved form, so (a) cannot be satisfied by
         # dropping to a bare `pyright <dir>` that resolves off PATH or nowhere.
-        assert tokens[:2] == ['uv', 'run'], (
+        assert pre[:2] == ['uv', 'run'], (
             f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
             f'whose pyright segment does not begin `uv run` (task 4358). '
             'Merely removing npx is not the contract: pyright is not on PATH '
@@ -1412,16 +1432,20 @@ def test_type_gates_resolve_pyright_without_npx() -> None:
             "red. verify.py's _FALLBACK_UV_PROJECT = 'shared' encodes the same "
             'environment pairing'
         )
-        assert '--project' in tokens[:anchor_at], (
+        # Both spellings count — `--project shared` and `--project=shared` are
+        # the same uv invocation — so this is not a spelling complaint. See
+        # _uv_project_member for the three no-usable-selector cases it folds
+        # into None.
+        member = _uv_project_member(cmd, _PYRIGHT)
+        assert member is not None, (
             f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
-            'which carries no PRE-anchor `--project` selecting the environment '
-            'pyright is resolved from (task 4358). A post-anchor --project is a '
-            'different thing entirely — it redirects pyright at another CONFIG '
-            'file — and is rejected by test_scripts_diff_is_type_gated '
-            'assertion (d); see the _NARROWING_FLAGS comment on why the two '
-            'are distinguished by position'
+            'which carries no PRE-anchor `--project <member>` selecting the '
+            'environment pyright is resolved from (task 4358). A post-anchor '
+            '--project is a different thing entirely — it redirects pyright at '
+            'another CONFIG file — and is rejected separately below; see the '
+            '_NARROWING_FLAGS comment on why the two are distinguished by '
+            'position'
         )
-        member = tokens[tokens.index('--project') + 1]
         assert member in members, (
             f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
             f'whose `uv run --project {member}` names {member!r}, which is not '
@@ -1431,10 +1455,23 @@ def test_type_gates_resolve_pyright_without_npx() -> None:
             'would fail to start rather than run — the same reports-nothing '
             'outcome a missing command produces, reached a different way'
         )
-        assert tokens.index('--project') < anchor_at, (
+        # The POSITION half, and a real check rather than a restatement of the
+        # one above: a command may carry BOTH a pre-anchor uv selector and a
+        # post-anchor pyright redirect, and every assertion so far passes it.
+        # test_scripts_diff_is_type_gated assertion (d) catches that shape via
+        # _narrowing_flag_args, but only for MODULE_PREFIX — this loop covers
+        # the SIBLING config too, which nothing else checks for it.
+        redirects = [
+            t for t in post if t in ('--project', '-p') or t.startswith(('--project=', '-p='))
+        ]
+        assert not redirects, (
             f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
-            "whose `--project` follows the `pyright` anchor — that is PYRIGHT's "
-            'config-file redirect, not uv\'s environment selector (task 4358)'
+            f'which carries {redirects!r} AFTER the `pyright` anchor — that is '
+            "PYRIGHT's config-file redirect, not uv's environment selector "
+            '(task 4358). It points pyright at another config file, which can '
+            'relax typeCheckingMode, add excludes or drop extraPaths wholesale '
+            'while the declared command still names the directory and still '
+            'exits 0'
         )
 
 
