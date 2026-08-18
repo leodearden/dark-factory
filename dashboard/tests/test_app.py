@@ -86,7 +86,7 @@ def test_orchestrators_returns_orchestrators_and_projects(client):
 def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
     with patch(
         'dashboard.app.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], [], {})),
+        new=AsyncMock(return_value=([], [], {}, [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -103,7 +103,7 @@ def test_tasks_endpoint_includes_done_counts(client):
     """DONE_COUNTS payload carries the per-project done count from collect_tasks_with_counts."""
     with patch(
         'dashboard.app.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], [], {'dark-factory': 7})),
+        new=AsyncMock(return_value=([], [], {'dark-factory': 7}, [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -115,7 +115,7 @@ def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
     """When the tasks collector reports offline projects, the payload sets ``offline=True``."""
     with patch(
         'dashboard.app.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], ['dark-factory'], {})),
+        new=AsyncMock(return_value=([], ['dark-factory'], {}, [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -140,7 +140,7 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
         'status': 'pending',
         'external_deps': [{'id': 'dark_factory:13', 'status': 'done'}],
     }
-    mock = AsyncMock(return_value=([mock_row], [], {}))
+    mock = AsyncMock(return_value=([mock_row], [], {}, []))
 
     with patch('dashboard.app.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -178,7 +178,7 @@ def test_tasks_endpoint_passes_max_cancelled_per_project(client):
     """
     from dashboard.data.active_tasks import _MAX_CANCELLED_PER_PROJECT, _MAX_DONE_PER_PROJECT
 
-    mock = AsyncMock(return_value=([], [], {}))
+    mock = AsyncMock(return_value=([], [], {}, []))
 
     with patch('dashboard.app.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')

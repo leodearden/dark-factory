@@ -319,7 +319,7 @@ async def test_collect_tasks_with_counts_started_uses_provided_now_across_projec
     })
     cfg = DashboardConfig(project_root=df_root, known_project_roots=[reify_root])
 
-    active, _, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
+    active, _, _, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
     started_by_id = {t['id']: t['started'] for t in active}
     assert started_by_id == {'df/T-1': 10, 'reify/T-2': 25}
 
@@ -1112,7 +1112,7 @@ async def test_collect_tasks_with_counts_resolve_external_overwrites_status(
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _fake_ext_statuses)
 
     cfg = DashboardConfig(project_root=root)
-    active, _, _ = await collect_tasks_with_counts(
+    active, _, _, _ = await collect_tasks_with_counts(
         client=dummy_client, config=cfg, resolve_external=True,
     )
     assert len(active) == 1
@@ -1153,7 +1153,7 @@ async def test_collect_tasks_with_counts_resolve_external_false_skips_mcp(
 
     cfg = DashboardConfig(project_root=root)
     # Default resolve_external=False — must NOT call fetch_external_statuses.
-    active, _, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active, _, _, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     # Rows keep 'unknown' sentinel (unresolved).
     assert active[0]['external_deps'] == [{'id': 'dark_factory:13', 'status': 'unknown'}]
 
@@ -1226,7 +1226,7 @@ async def test_collect_tasks_with_counts_resolve_external_skips_call_when_no_dep
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _must_not_be_called)
 
     cfg = DashboardConfig(project_root=root)
-    active, _, _ = await collect_tasks_with_counts(
+    active, _, _, _ = await collect_tasks_with_counts(
         client=dummy_client, config=cfg, resolve_external=True,
     )
     assert active[0]['external_deps'] == []
@@ -1288,7 +1288,7 @@ async def test_collect_tasks_with_counts_resolve_external_skips_done_rows(
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _record_call)
 
     cfg = DashboardConfig(project_root=root)
-    active, _, _ = await collect_tasks_with_counts(
+    active, _, _, _ = await collect_tasks_with_counts(
         client=dummy_client, config=cfg,
         max_done_per_project=5, max_cancelled_per_project=5, resolve_external=True,
     )
@@ -1641,7 +1641,7 @@ async def test_collect_tasks_with_counts_resolve_external_offline_marker(
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _offline_ext_statuses)
 
     cfg = DashboardConfig(project_root=root)
-    active, _, _ = await collect_tasks_with_counts(
+    active, _, _, _ = await collect_tasks_with_counts(
         client=dummy_client, config=cfg, resolve_external=True,
     )
 

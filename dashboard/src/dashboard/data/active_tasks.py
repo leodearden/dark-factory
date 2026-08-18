@@ -642,14 +642,38 @@ async def collect_tasks_with_counts(
     max_cancelled_per_project: int = 0,
     resolve_external: bool = False,
     now: datetime | None = None,
-) -> tuple[list[dict], list[str], dict[str, int]]:
+) -> tuple[list[dict], list[str], dict[str, int], list[str]]:
     """Aggregate active tasks and per-project done counts in a single MCP pass.
 
-    Returns ``(active_tasks, offline_projects, done_counts)`` where:
+    Returns ``(active_tasks, offline_projects, done_counts, degraded_projects)``
+    where:
 
     - *active_tasks* is the list of active (and optionally bounded done) rows
     - *offline_projects* lists project labels whose MCP fetch failed
     - *done_counts* maps project label → total done task count (pre-cap)
+    - *degraded_projects* lists project labels the budget did not deliver
+
+    **Bounded as a whole, not merely per call.**  The walk over project roots
+    is sequential, so without a deadline this function's worst case is the SUM
+    of every project's worst case — unbounded in the number of configured
+    roots, and behind a browser ``fetch`` that aborts at 30 s.  A
+    ``loop.time()`` deadline (``_TASKS_TOTAL_BUDGET``) is taken up front and
+    each project is run under ``asyncio.wait_for`` at
+    ``min(remaining, _TASKS_PER_PROJECT_BUDGET)``, copying ``app.healthz``'s
+    loop shape rather than inventing one.
+
+    Expiry yields a PARTIAL payload with explicit per-project markers, never a
+    truncated-but-confident one: every project that timed out or never got its
+    turn is named in *degraded_projects*, and neither contributes a
+    *done_counts* entry (no count was measured, so none is fabricated — not
+    even a ``0``, which renders as a real "this project has zero done tasks").
+
+    *degraded* and *offline* are DISTINCT FACTS and must never be merged by a
+    consumer: *offline* means the fetch demonstrably failed (the project is
+    proven unreachable), *degraded* means the budget expired first and this
+    project's state is simply UNKNOWN.  Collapsing them tells an operator that
+    fused-memory is down when the only thing that happened is that the handler
+    ran out of time — sending them to restart a healthy service.
 
     When *resolve_external* is ``True``, gathers the deduped union of every
     row's ``external_deps`` ids, issues **one** batched
@@ -675,19 +699,52 @@ async def collect_tasks_with_counts(
     as the ACTIVE_TASKS rows.
     """
     effective_now = resolve_now(now)
+    # The deadline is taken BEFORE the runtime fan-out, so that fan-out is
+    # inside the budget too rather than being free time the projects then pay
+    # for. Same shape as app.healthz's whole-handler deadline.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _TASKS_TOTAL_BUDGET
     runtime_by_label = await fetch_task_runtime(client, config.escalation_urls)
     all_active: list[dict] = []
     offline_projects: list[str] = []
     done_counts: dict[str, int] = {}
+    degraded_projects: list[str] = []
     for root in _all_project_roots(config):
         label = _project_label(root)
-        active, offline, done_count = await _shape_one_project(
-            client, config, root,
-            max_done_per_project=max_done_per_project,
-            max_cancelled_per_project=max_cancelled_per_project,
-            now=effective_now,
-            runtime=runtime_by_label.get(label),
-        )
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            # Never got its turn. A silently missing project reads as "no
+            # active work" on the Tasks tab, which is the same class of
+            # invisible failure the fan-out logging policy was raised to
+            # WARNING to close.
+            degraded_projects.append(label)
+            logger.warning(
+                'project %s: skipped — the %.1fs Tasks budget was already '
+                'spent before this project was reached; its rows and done '
+                'count are UNKNOWN for this render (not zero, and not offline)',
+                label, _TASKS_TOTAL_BUDGET,
+            )
+            continue
+        try:
+            active, offline, done_count = await asyncio.wait_for(
+                _shape_one_project(
+                    client, config, root,
+                    max_done_per_project=max_done_per_project,
+                    max_cancelled_per_project=max_cancelled_per_project,
+                    now=effective_now,
+                    runtime=runtime_by_label.get(label),
+                ),
+                timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET),
+            )
+        except TimeoutError:
+            degraded_projects.append(label)
+            logger.warning(
+                'project %s: exceeded its %.1fs share of the %.1fs Tasks '
+                'budget (%.1fs remained) — its rows and done count are '
+                'UNKNOWN for this render (not zero, and not offline)',
+                label, _TASKS_PER_PROJECT_BUDGET, _TASKS_TOTAL_BUDGET, remaining,
+            )
+            continue
         if offline:
             offline_projects.append(label)
         else:
@@ -705,7 +762,19 @@ async def collect_tasks_with_counts(
                 continue  # skip bounded done rows
             for entry in row.get('external_deps') or []:
                 dep_ids.add(entry['id'])
-        if dep_ids:
+        # Same deadline treatment as the per-project loop: this call runs AFTER
+        # it, so without a check it would overrun the budget the loop just
+        # honoured. Skipping leaves every entry on its existing 'unknown'
+        # sentinel, which is the honest value for a status never read.
+        ext_remaining = deadline - loop.time()
+        if dep_ids and ext_remaining <= 0:
+            logger.warning(
+                'external dep statuses skipped for %d id(s) — the %.1fs Tasks '
+                'budget was spent by the per-project walk; every external dep '
+                "keeps its 'unknown' sentinel for this render",
+                len(dep_ids), _TASKS_TOTAL_BUDGET,
+            )
+        elif dep_ids:
             status_map = await fetch_external_statuses(
                 client, config, sorted(dep_ids),
             )
@@ -719,7 +788,7 @@ async def collect_tasks_with_counts(
                     else:
                         entry['status'] = status_map.get(entry['id'], 'unknown')
 
-    return all_active, offline_projects, done_counts
+    return all_active, offline_projects, done_counts, degraded_projects
 
 
 async def collect_active_tasks(
@@ -749,8 +818,16 @@ async def collect_active_tasks(
 
     Note: callers that also need per-project done counts should use
     ``collect_tasks_with_counts`` to avoid a second MCP round-trip.
+
+    The whole-handler budget applies here too, but its *degraded_projects*
+    marker is absorbed rather than forwarded: this narrower two-element
+    contract has nowhere to put it, and a degraded project is emphatically NOT
+    offline, so reclassifying it into *offline_projects* would be a lie.  It is
+    still logged at WARNING by ``collect_tasks_with_counts``.  Callers that
+    need to distinguish "unknown" from "reachable and empty" must use
+    ``collect_tasks_with_counts`` directly.
     """
-    active, offline, _ = await collect_tasks_with_counts(
+    active, offline, _, _ = await collect_tasks_with_counts(
         client, config,
         max_done_per_project=max_done_per_project,
         max_cancelled_per_project=max_cancelled_per_project,
