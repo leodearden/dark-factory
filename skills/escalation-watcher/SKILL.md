@@ -200,11 +200,21 @@ Check for all pending L2 escalations — **compact** to keep context small:
 mcp__escalation__get_pending_escalations(level=2, compact=True)
 ```
 
-`compact=True` returns the triage fields (`id`, `task_id`, `category`, `severity`, `level`,
-`status`, `summary`, `suggested_action`, `timestamp`) plus the triage-ack annotation fields
-(`triaged_at`, `triaged_by`, `triage_note`, `updated_at` — see "Reading a triage-ack annotation"
-below), and drops the heavy free-text/cluster fields (`detail`, `members`, `options`, `root_cause`,
-`train_state`, …). Triage from that; fetch the full record with `get_escalation(id)` **only** for
+`compact=True` returns the triage fields plus the triage-ack annotation fields (`triaged_at`,
+`triaged_by`, `triage_note`, `updated_at` — see "Reading a triage-ack annotation" below), and
+drops the heavy free-text/cluster fields (`detail`, `options`, `train_state`, …). The tool's own
+docstring carries the authoritative list — read it there rather than trusting a copy in this
+file, which is how this paragraph went stale before.
+
+**`root_cause` and `member_ids` ARE returned** (task 3997) — they were dropped until then.
+Operationally that is what makes a drain self-sufficient: you can rebuild the already-promoted
+set as {`root_cause` of the pending L2s} ∪ {their `member_ids`} from the drain ALONE, so a
+rotation that inherits no session memory does not re-promote a cluster its predecessor already
+promoted. `member_ids` is the projection of the record's `members` list; the raw `members` key
+stays dropped, as does `detail` — the unbounded free-text field compact mode exists to keep out
+of your context.
+
+Triage from that; fetch the full record with `get_escalation(id)` **only** for
 the one item you're about to act on — and prefer doing that full read inside the handling sub-agent
 (see Context Conservation). During an AFK window the pending pile grows, and a full-dict drain every
 cycle is the dominant context sink — `compact=True` is what keeps a long-running session alive.
