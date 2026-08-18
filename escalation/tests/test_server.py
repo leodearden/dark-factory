@@ -2518,6 +2518,133 @@ class TestPromoteToL2SeverityInheritance:
 
 
 # ---------------------------------------------------------------------------
+# TestPromoteToL2SeverityFloorOnUpdate: post-mint monotonicity
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2SeverityFloorOnUpdate:
+    """An L2's severity is monotonically non-decreasing after mint (task 3976).
+
+    The root-cause dedup path appends members to an existing pending L2.  Now
+    that an L2 can be born `info`, that path must raise the record when the
+    incoming members justify it — otherwise the inherited default would trade
+    the old inflation for under-escalation, which is strictly worse.
+    """
+
+    def _seed_l1(
+        self, queue: EscalationQueue, esc_id: str, task_id: str, severity: str,
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity=severity,
+            category='design_concern',
+            summary='L1 cluster member',
+            level=1,
+        )
+        queue.submit(esc)
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_blocking_member_raises_an_info_l2(self, tmp_path: Path):
+        """(h) A blocking member folding into an info L2 raises it to blocking.
+
+        Without the floor this is the under-escalation regression the new
+        inherited default would otherwise introduce.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+        assert queue.get(first['id']).severity == 'info'
+
+        self._seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
+        second = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
+        )
+
+        assert second['status'] == 'updated', f'Expected an append, got: {second}'
+        assert second['id'] == first['id'], 'Same root_cause must reuse the same L2'
+        record = queue.get(first['id'])
+        assert record is not None
+        assert record.severity == 'blocking', (
+            f'A blocking member must raise the L2, got {record.severity!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_info_member_never_demotes_a_blocking_l2(self, tmp_path: Path):
+        """(i) The reverse direction is a no-op — the floor only ever adds attention."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-blk', 'task-1', 'blocking')
+
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
+        )
+        assert queue.get(first['id']).severity == 'blocking'
+
+        self._seed_l1(queue, 'esc-l1-info', 'task-2', 'info')
+        second = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+
+        assert second['status'] == 'updated'
+        record = queue.get(first['id'])
+        assert record is not None
+        assert record.severity == 'blocking', (
+            f'An info member must not demote the L2, got {record.severity!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_severity_raises_but_cannot_demote_post_mint(
+        self, tmp_path: Path,
+    ):
+        """(j) Explicit UP is honoured on an append; explicit DOWN is capped.
+
+        This is the one place the caller's override is capped, and deliberately
+        so: post-mint monotonicity beats the argument, so a record cannot be
+        quieted out from under a human who is already looking at it.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+        assert queue.get(first['id']).severity == 'info'
+
+        # Explicit UP on an append: honoured.
+        self._seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
+        raised = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-b'], 'severity': 'critical'},
+        )
+        assert raised['status'] == 'updated'
+        assert queue.get(first['id']).severity == 'critical', (
+            'An explicit upward override on an append must be honoured'
+        )
+
+        # Explicit DOWN on an append: capped by the monotonic floor.
+        self._seed_l1(queue, 'esc-l1-c', 'task-3', 'info')
+        lowered = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-c'], 'severity': 'info'},
+        )
+        assert lowered['status'] == 'updated'
+        record = queue.get(first['id'])
+        assert record is not None
+        assert record.severity == 'critical', (
+            'Post-mint monotonicity must beat an explicit demotion, got '
+            f'{record.severity!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestPromoteToL2Cascade: end-to-end integration through MCP tools
 # ---------------------------------------------------------------------------
 
