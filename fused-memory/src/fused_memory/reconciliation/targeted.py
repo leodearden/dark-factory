@@ -676,13 +676,63 @@ class TargetedReconciler:
 
         # 2. If sparse knowledge, verify against codebase and write findings
         if len(related) < 2:
+            # Declared OUTSIDE the try so the except arm can always read it:
+            # False means the verifier itself never produced an outcome, True
+            # means the outcome row already landed and any later raise belongs
+            # to a downstream stage (the memory write), not to the verifier.
+            verify_audited = False
             try:
                 verification = await self.verifier.verify(
                     claim=f"Task '{title}' has been completed",
                     context=f'Task details: {task.get("details") or description}',
                     scope_hints=_extract_scope_hints(task),
                 )
-                if verification.verdict in ('confirmed', 'contradicted'):
+                # ── verify/codebase audit row contract (task 4343) ──────────
+                # Exactly ONE *outcome* row per invocation of this branch, so
+                # the record is a complete census by construction:
+                #   action_type='verify', target='codebase'
+                #   operation ∈ {confirmed, contradicted, inconclusive,
+                #                agent_failed}  from here, plus 'error' from
+                #                the except arm below when the verifier itself
+                #                raised before producing any outcome.
+                # The except arm may ALSO emit a non-outcome 'post_verify_error'
+                # row — when the verifier answered and a later stage inside this
+                # same try (the memory write) raised.  So the outcome census is
+                #   SELECT operation, COUNT(*) FROM run_actions
+                #    WHERE action_type='verify' AND operation != 'post_verify_error'
+                # and it stays exact: no invocation is missing, none double-counted.
+                # Recording only the failure outcomes would leave "the agent
+                # failed" distinguishable from "genuinely inconclusive" solely
+                # by a row being present vs absent — and absence already means
+                # "this branch never opened" for the overwhelming majority of
+                # runs.  Mirrors task 1184's distinct-verb precedent below.
+                outcome = 'agent_failed' if verification.agent_failed else str(verification.verdict)
+                audit_detail = {'task_id': task_id, 'verdict': str(verification.verdict)}
+                if verification.failure_token:
+                    audit_detail['failure_token'] = verification.failure_token
+                await self.journal.add_run_action(
+                    run_id, 'verify', 'codebase', outcome, audit_detail,
+                    causation_id=run_id,
+                )
+                verify_audited = True
+
+                # An agent that never produced a parseable verdict returns the
+                # caller-supplied default ('inconclusive'), which collides with
+                # a legitimate healthy verdict — so this branch MUST be tested
+                # before any branch that reads `verdict`, and MUST read the
+                # structured `agent_failed` flag rather than sniffing the
+                # 'agent-failed:' prefix out of `summary` prose (INV-2
+                # structured-facts-at-failure).
+                if verification.agent_failed:
+                    logger.warning(
+                        'verification_agent_failed task=%s token=%s summary=%s',
+                        task_id, verification.failure_token, verification.summary,
+                    )
+                    result['actions'].append({
+                        'type': 'verification_agent_failed',
+                        'failure_token': verification.failure_token,
+                    })
+                elif verification.verdict in ('confirmed', 'contradicted'):
                     written = await self._fenced_add_memory(
                         content=f"Completed task '{title}': {verification.summary}",
                         category='observations_and_summaries',
@@ -705,8 +755,45 @@ class TargetedReconciler:
                          'deferred': not written},
                         causation_id=run_id,
                     )
+                else:
+                    # Honest inconclusive: the agent looked and found nothing
+                    # either way.  No memory write (there is no finding to
+                    # record) and deliberately NO warning — this is a healthy
+                    # outcome, not an error.  The audit row above is what
+                    # separates it from the agent_failed case that used to be
+                    # byte-identical to it.
+                    result['actions'].append({'type': 'verification_inconclusive'})
             except Exception as e:
                 logger.warning(f'Verification failed for task {task_id}: {e}')
+                # Task 4343: the RAISED failure path is the live one —
+                # agent_llm_provider defaults to 'claude_cli' and _call_llm_cli
+                # raises RuntimeError(build_failure_message(...)) when the CLI
+                # reports failure — and until now it left nothing durable.
+                # add_run_action swallows its own exceptions internally
+                # (journal.py:828+), so recording here cannot escalate a verify
+                # failure into a crash.  The try boundary above is deliberately
+                # NOT widened: _fenced_add_memory stays inside it and keeps
+                # failing closed exactly as before.
+                #
+                # But `_fenced_add_memory` is INSIDE this try and genuinely can
+                # raise (unguarded self.memory.add_memory / buffer.defer_write
+                # network calls), so this arm is reachable with the outcome row
+                # already written.  Attributing that to the verifier would both
+                # double-count the census and blame the wrong stage — the
+                # verifier answered 'confirmed'; it was the write that failed.
+                # Hence the distinct operation + explicit 'stage' in detail.
+                if verify_audited:
+                    stage, operation = 'post_verify_write', 'post_verify_error'
+                    action_kind = 'post_verification_error'
+                else:
+                    stage, operation = 'verify', 'error'
+                    action_kind = 'verification_error'
+                result['actions'].append({'type': action_kind, 'error': str(e)[:200]})
+                await self.journal.add_run_action(
+                    run_id, 'verify', 'codebase', operation,
+                    {'task_id': task_id, 'error': str(e)[:500], 'stage': stage},
+                    causation_id=run_id,
+                )
 
         # 3. Check dependent tasks — are they unblocked?
         try:
