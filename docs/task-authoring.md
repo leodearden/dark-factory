@@ -975,6 +975,7 @@ flows) — is exempted from the `unknown_key` scan even though these are not
 (yet) typed `TaskMetadata` fields. This is `_BLESSED_METADATA_KEYS` in
 `shared/src/shared/task_metadata.py`:
 
+<!-- tier-a-blessed-keys-mirror -->
 ```
 source, modules, spawn_context, complexity, force_full_path,
 branch_base_sha, _causation_id, dry_run_proposals, reblock_guard,
@@ -987,8 +988,18 @@ before_done_verified_pid, files_tagged_at, source_finding_id,
 stage1_finding_id, origin_finding_id, spawned_from, program,
 program_stream, stream, cross_repo, cross_repo_project,
 human_curator_gate, human_curator_adjudicated_at, last_blocked_at,
-recurrence
+recurrence, execution_class
 ```
+<!-- /tier-a-blessed-keys-mirror -->
+
+This listing is **machine-checked** against the live frozenset by
+`tests/scripts/test_task_authoring_blessed_keys_drift.py` (task 3780), which
+anchors on the `tier-a-blessed-keys-mirror` markers above — so keep edits
+inside them, and expect a red suite rather than silent drift if a blessing
+lands here but not in code (or vice versa). Before that guard existed this
+copy was hand-maintained prose: task 4372 had to mirror two keys across in a
+separate follow-up commit, and the frozenset's own header comment sat stale
+across two blessings.
 
 `recurrence` (§6.1) is unusual for a Tier-A entry: it is *also* a registered
 submodel, so it is doubly exempt from the `unknown_key` scan (a registered
@@ -1017,6 +1028,28 @@ Tier-B below for which spelling to use in new writes.
 filer is itself registered), and read by **both** the orchestrator's
 dispatch-time cross-repo admission gate (which blocks the task before any
 agent spins up) and its pre-merge narrowing gate.
+
+`execution_class` is blessed on the standard "already relied on by real
+writers" criterion — unlike the finding-provenance trio, which is the
+documented exception. It is machine-read at the fused-memory submit boundary
+by `execution_class_guard`, `operational_routing_guard` (which coerces
+`operational` / `decision` to `task_kind='deterministic'` +
+`always_escalates`, a real dispatch consequence), `routing_intent_guard`,
+`operational_suggestion_guard`, `operational_ask_registry`, the
+`task_interceptor` gate-marker set, and the task curator's decision-cache key.
+
+It is deliberately **not** a typed field, even though `EXECUTION_CLASSES` in
+`recon_self_model` looks like a closed vocabulary — a reader who assumes
+otherwise will re-litigate this. Two reasons, both recorded beside the
+frozenset entry (which also carries the point-in-time census, per the
+one-place rule): its validity rule is conditional on recon-stage **caller
+identity**, which no pydantic field validator can express, so validation
+correctly lives in the boundary guard; and the vocabulary is not closed in the
+data, so a `Literal` would raise on every metadata write to the landed tasks
+carrying an out-of-vocabulary value. Note also that `EXECUTION_CLASSES` is not
+the write-time contract: `operational_routing_guard` and
+`operational_ask_registry` each hardcode their own `{operational, decision}`
+set rather than deriving it.
 
 Two unrelated curators appear in this list, and the prefixes keep them
 apart: `curator_action` / `curator_justification` / `combined_at` are
