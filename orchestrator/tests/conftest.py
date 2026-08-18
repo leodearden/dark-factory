@@ -825,10 +825,11 @@ def make_steward(tmp_path: Path):
     structurally cannot fold in, for three independent reasons — recorded here so
     the next reader does not re-litigate it:
 
-    1. it feeds ``_CapFiringSteward``, a ``TaskSteward`` SUBCLASS (that module's
-       line 722), whereas this fixture returns a constructed ``TaskSteward``;
-    2. that construction passes ``config_dir=`` (line 745), a parameter this
-       fixture does not accept;
+    1. it feeds ``_CapFiringSteward``, a ``TaskSteward`` SUBCLASS that module
+       declares inside ``_make_real_steward_factory``, whereas this fixture
+       returns a constructed ``TaskSteward``;
+    2. that construction passes ``config_dir=``, a parameter this fixture does
+       not accept;
     3. ``_make_real_steward_factory`` returns a CALLBACK the workflow invokes
        later, with a worktree the *workflow* chooses — it is not a fixture and
        cannot request ``tmp_path`` at the moment of construction, whereas this
