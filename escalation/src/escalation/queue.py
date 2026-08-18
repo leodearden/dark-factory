@@ -85,6 +85,20 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
 # already bounded by the next self-archival — see _archive_resolved).
 _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
 
+# Hard cap on Escalation.amendments (see add_members_to_l2, the SOLE writer and
+# sole trimmer).  Worst case is repeated folds of one cluster inside a single AFK
+# window; ~20 entries of framing text is well inside the envelope, and amendments
+# are deliberately NOT in the server's compact projection, so they never inflate a
+# watcher's drain no matter how deep the list gets.  Past the cap the OLDEST are
+# shed — the ORIGINAL framing is never in this list at all (it lives permanently
+# in the record's own immutable root_cause/detail/options/summary), so the oldest
+# amendment is the least-informative entry and a rotation triaging NOW needs the
+# most recent framing.  Each drop increments the record's `amendments_truncated`,
+# so the loss is a durable structured fact rather than log-only.
+# SIZED AGAINST THE POST-CANONICALISATION FOLD RATE (task 3998), which raises the
+# fold rate BY DESIGN — a cap tuned to today's rate would be immediately wrong.
+_MAX_AMENDMENTS = 20
+
 
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
     """Yield all ``esc-*.json`` paths from *escalations_dir* and its archive subtree.
@@ -898,6 +912,18 @@ class EscalationQueue:
         framing appends no amendment, so every existing two-positional-arg
         caller is byte-unchanged.
 
+        **The list is capped at** :data:`_MAX_AMENDMENTS`.  THIS METHOD is the
+        trimmer, at write time, in the same critical section and the same single
+        ``_rewrite`` as the append — so cap enforcement is atomic with it and no
+        over-cap list is ever durable.  It sheds the OLDEST entries, which is
+        safe because the ORIGINAL framing is never in this list at all: it lives
+        permanently in the record's own immutable ``root_cause``/``detail``/
+        ``options``/``summary``.  The oldest amendment is therefore the
+        least-informative thing to shed, and a rotation triaging now needs the
+        most recent framing.  Every dropped entry increments
+        ``amendments_truncated`` and the event logs a WARNING, so the loss is a
+        durable structured fact rather than a silent one.
+
         A severity promotion is a real content change, so it bumps
         ``updated_at`` even when no new member id was appended — the watcher's
         stamp-then-skip protocol keys off ``updated_at > triaged_at``, and a
@@ -961,6 +987,20 @@ class EscalationQueue:
                 }
                 esc.amendments.append(amendment)
                 amendment_recorded = True
+                # Enforce the cap in the SAME critical section, so the trim lands
+                # in the same single _rewrite as the append and there is no
+                # durable window in which an over-cap list exists.
+                if len(esc.amendments) > _MAX_AMENDMENTS:
+                    dropped = len(esc.amendments) - _MAX_AMENDMENTS
+                    del esc.amendments[:dropped]
+                    esc.amendments_truncated += dropped
+                    logger.warning(
+                        'add_members_to_l2: %s shed %d oldest amendment(s) at the '
+                        '_MAX_AMENDMENTS=%d cap (running total truncated=%d); the '
+                        "record's own original framing is unaffected",
+                        escalation_id, dropped, _MAX_AMENDMENTS,
+                        esc.amendments_truncated,
+                    )
 
             if appended or severity_changed or amendment_recorded:
                 esc.members.extend(appended)
