@@ -600,10 +600,10 @@ class TestIncompleteKindDiscriminator:
         )
 
         assert isinstance(INCOMPLETE_STRUCTURAL_KINDS, frozenset)
-        assert INCOMPLETE_STRUCTURAL_KINDS == {
+        assert {
             INCOMPLETE_STRUCTURAL_REFUSAL,
             INCOMPLETE_PAGE_CAP,
-        }
+        } == INCOMPLETE_STRUCTURAL_KINDS
         assert INCOMPLETE_CENSUS_UNAVAILABLE not in INCOMPLETE_STRUCTURAL_KINDS
         assert INCOMPLETE_SHORT_READ not in INCOMPLETE_STRUCTURAL_KINDS
         # None is not a kind: a complete read must never test as structural.

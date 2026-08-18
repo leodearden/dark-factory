@@ -521,9 +521,10 @@ kind, so a future fifth structural path is covered by construction.
 #
 # RESIDUAL LEFT OPEN DELIBERATELY, and not an oversight: a materially-short
 # INCOMPLETE_SHORT_READ still returns a partial collection that the
-# force=True path in MemoryService.rebuild_entity_summaries will write back,
-# blanking the summary of any entity whose edges fell in the missing
-# remainder.  Do NOT close it by tightening the shims — guard 4 fires on any
+# force=True path (memory_service.py:5826-5834, MemoryService.rebuild_entity_summaries)
+# will write back, blanking the summary of any entity whose edges fell in the
+# missing remainder.  That path never consults staleness, so it writes to
+# every entity the node read returned.  Do NOT close it by tightening the shims — guard 4 fires on any
 # shortfall at all, including a single concurrently-invalidated edge, so
 # raising there would take down the live rebuild for exactly the transient
 # the warn-not-raise decision rejected.  The fix belongs at the consumer, as
