@@ -25,6 +25,14 @@ label would let a healthy root's success clear a broken root's streak and
 re-arm its opening WARNING every poll cycle. ``fetch_external_statuses`` is
 parameterized by a ``deps`` list rather than a root, so its fixed label is
 already a correct single key.
+
+Caching: only ``fetch_tasks`` is cached, and its key is the pair
+**(project_root, narrowing)** rather than the root alone — see
+:func:`_fetch_tasks_cache_key`. Four of its five callers need the whole tree
+while ``active_tasks`` narrows, so a root-only key would let one caller's
+status-filtered result be served to the others for up to the TTL window.
+``fetch_statuses`` and ``fetch_external_statuses`` are uncached and return
+live data.
 """
 
 from __future__ import annotations
@@ -91,8 +99,37 @@ _fetch_tasks_cache: TTLCache[list[dict] | dict] = TTLCache(
 
 
 def _fetch_tasks_cache_clear() -> None:
-    """Clear the per-project_root fetch_tasks TTL cache (test/admin hook)."""
+    """Clear the fetch_tasks TTL cache (test/admin hook)."""
     _fetch_tasks_cache.clear()
+
+
+def _fetch_tasks_cache_key(
+    project_root_str: str,
+    statuses: list[str] | None,
+    page_size: int | None,
+    offset: int,
+) -> str:
+    """Compose the ``_fetch_tasks_cache`` key for one (root, narrowing) pair.
+
+    The key must cover the narrowing arguments, not just the root: only ONE
+    of ``fetch_tasks``' five callers narrows, so a root-only key would let
+    ``active_tasks``' status-filtered entry be served to the four full-tree
+    callers (``app._load_task_cards``, ``data.orchestrator``,
+    ``data.merge_queue``, ``data.burndown``) — silently truncating them for
+    up to the TTL window, and doing so non-deterministically depending on
+    which caller raced in first.
+
+    ``statuses=None`` renders as ``*`` and is therefore distinct from
+    ``statuses=[]``, which renders as the empty string: the tool treats them
+    as opposite requests (whole tree vs no tasks at all), so collapsing them
+    onto one key would serve an empty list as if it were the full tree.
+
+    A ``\x1f`` (ASCII unit separator) delimits the statuses so a status
+    string containing the field separators cannot forge another key.
+    """
+    statuses_part = '*' if statuses is None else '\x1f'.join(statuses)
+    page_part = '*' if page_size is None else str(page_size)
+    return f'{project_root_str}|s={statuses_part}|p={page_part}|o={offset}'
 
 
 def _shape_task(task: dict) -> dict | None:
@@ -212,11 +249,19 @@ async def fetch_tasks(
     Returns a ``list[dict]`` on success, or an offline marker
     ``{'offline': True, 'error': str}`` if every configured server fails.
 
-    Results are cached per *project_root* for ``_FETCH_TASKS_TTL_SECONDS``
-    (~20 s) to avoid hammering the MCP server on every render.  All statuses
-    (including done tasks and their completed timestamps) are cached unchanged.
-    Offline/error markers are never cached so a transient failure does not pin
-    empty results for the TTL window.
+    Results are cached per **(project_root, narrowing)** — see
+    :func:`_fetch_tasks_cache_key` — for ``_FETCH_TASKS_TTL_SECONDS`` (~20 s)
+    to avoid hammering the MCP server on every render.  Whatever a given
+    narrowing returns is cached unchanged, and an unnarrowed entry and a
+    narrowed entry for the same root are INDEPENDENT — which is what keeps a
+    narrowed read from serving a status-filtered subset to the full-tree
+    callers.  Offline/error markers are never cached so a transient failure
+    does not pin empty results for the TTL window.
+
+    The key space stays bounded — a small fixed set of narrowings times a
+    small set of roots — which preserves ``TTLCache``'s documented "bounded
+    key space is a caller assumption" contract: it never evicts individual
+    entries, so a high-cardinality key would leak locks and entries forever.
 
     **Copy isolation (list-level only):** returns a shallow ``list()`` copy on
     every call, so list-level mutations (``result.clear()``, ``result.append()``)
@@ -317,7 +362,9 @@ async def fetch_tasks(
         )
 
     result = await _fetch_tasks_cache.get_or_refresh(
-        project_root_str, _refresh, cache_ok=lambda v: isinstance(v, list),
+        _fetch_tasks_cache_key(project_root_str, statuses, page_size, offset),
+        _refresh,
+        cache_ok=lambda v: isinstance(v, list),
     )
     return list(result) if isinstance(result, list) else result
 
