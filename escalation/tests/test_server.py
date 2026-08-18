@@ -2823,6 +2823,103 @@ class TestPromoteToL2SeverityInResponse:
 
 
 # ---------------------------------------------------------------------------
+# TestPromoteToL2FramingPreservation: a fold keeps the framing it carried in
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2FramingPreservation:
+    """A fold APPENDS its incoming framing instead of discarding it (task 3997, C2).
+
+    End-to-end through the MCP tool, which is the surface the auto-watcher
+    actually calls.  Before this, every re-promote of an already-pending cluster
+    threw away the root_cause/evidence/options/summary it carried (measured:
+    336,875 characters), and the caller could not even tell: the response said
+    'updated' either way.
+    """
+
+    @pytest.mark.asyncio
+    async def test_promote_fold_preserves_and_reports_incoming_framing(
+        self, tmp_path: Path,
+    ):
+        """A second promote's framing lands in `amendments` and is REPORTED back."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        created = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+
+        result = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-2'],
+            'evidence': 'SECOND-pass evidence, authored by this promote',
+            'options': ['C: a third way nobody proposed before'],
+            'summary': 'second-pass one-line hypothesis',
+        })
+
+        # (a) the pre-existing response shape is intact — 3976's `severity` key
+        # included; this must ADD to it, never regress it.
+        assert result['status'] == 'updated', f'Expected a fold, got {result}'
+        assert result['id'] == created['id']
+        assert set(result['members']) == {'esc-l1-1', 'esc-l1-2'}
+        assert result['severity'] == 'blocking', (
+            f'the post-floor severity must still be reported: {result}'
+        )
+
+        # (b) the caller LEARNS the framing landed, rather than only seeing
+        # id/status/members/severity and having to guess.
+        assert result['amendment_recorded'] is True, (
+            f'the fold recorded framing but did not report it: {result}'
+        )
+        assert result['amendments'] == 1, f'Expected 1 amendment, got {result}'
+
+        # (c) read the full record back: ORIGINAL framing intact, INCOMING
+        # framing present alongside it — nothing dropped either way.
+        get_tool = await server.get_tool('get_escalation')
+        record = get_tool.fn(escalation_id=created['id'])
+        assert record['root_cause'] == _L2_DEFAULTS['root_cause']
+        assert record['detail'] == _L2_DEFAULTS['evidence'], (
+            'the ORIGINAL evidence must survive the fold'
+        )
+        assert record['options'] == _L2_DEFAULTS['options'], (
+            'the ORIGINAL options must survive the fold'
+        )
+        amendment = record['amendments'][0]
+        assert amendment['detail'] == 'SECOND-pass evidence, authored by this promote'
+        assert amendment['options'] == ['C: a third way nobody proposed before']
+        assert amendment['summary'] == 'second-pass one-line hypothesis'
+        assert amendment['root_cause'] == _L2_DEFAULTS['root_cause']
+        assert amendment['agent_role'] == _L2_DEFAULTS['agent_role'], (
+            f'the submitting role must be attributed: {amendment}'
+        )
+
+        # (d) the zero-new-members fold — the exact case that used to return
+        # early and silently discard everything it was handed.
+        before = queue.get(created['id'])
+        assert before is not None
+        third = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-2'],  # already a member: nothing new to add
+            'evidence': 'THIRD-pass evidence',
+            'summary': 'third-pass hypothesis',
+        })
+
+        assert third['status'] == 'updated', f'Expected a fold, got {third}'
+        assert third['amendment_recorded'] is True, (
+            f'a zero-new-member fold still carries framing worth keeping: {third}'
+        )
+        assert third['amendments'] == 2, f'Expected 2 amendments, got {third}'
+        after = queue.get(created['id'])
+        assert after is not None
+        assert after.members == before.members, 'no new member ids were added'
+        assert after.updated_at is not None and after.updated_at > (before.updated_at or ''), (
+            f'new framing is a substantive change and must bump updated_at: '
+            f'{before.updated_at!r} -> {after.updated_at!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestPromoteToL2SeverityFloorOnUpdate: post-mint monotonicity
 # ---------------------------------------------------------------------------
 
