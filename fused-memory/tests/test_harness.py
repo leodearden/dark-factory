@@ -2132,9 +2132,10 @@ class TestStage2CycleSummaryHarnessBackstop:
     ):
         """Complements the False-return case: if the re-attempt RAISES, the
         optimistic True stamped before the call (needed so a genuinely
-        successful re-attempt's OWN ledger row — serialized synchronously at
-        call time — carries the marker) must be caught and corrected back to
-        False, and the exception must never escape the finally block. The
+        successful re-attempt's OWN ledger row — serialized into payload_json
+        only once the shielded task takes its first step, never synchronously
+        at call time — carries the marker) must be caught and corrected back
+        to False, and the exception must never escape the finally block. The
         cycle itself must still complete; only the best-effort write failed."""
         mock_memory_service.recon_ledger = ledger_store
         mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])

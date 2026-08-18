@@ -3471,11 +3471,18 @@ class ReconciliationHarness:
         resolves the module-level ``write_stage{1,2}_cycle_summary`` global at
         call time, so tests patching that name still intercept the write.
 
-        Marker discipline (task 2734, corrected task 3732 amendment): the
-        writer serializes ``report.stats`` into the ledger row's
-        ``payload_json`` synchronously at call time (see ``write_cycle_summary``'s
-        docstring), so the ``<prefix>_cycle_summary_write_recovered_backstop``
-        marker has to already be on whatever report the writer sees. It is
+        Marker discipline (task 2734, corrected task 3732 amendment):
+        *writer* resolves to an ``async def`` (``write_stage{1,2}_cycle_summary``)
+        — calling it only creates a coroutine, so it serializes
+        ``report.stats`` into the ledger row's ``payload_json`` only once the
+        shielded task below takes its first step, never synchronously at call
+        time (see ``write_cycle_summary``'s docstring). Because that
+        serialization is deferred, the
+        ``<prefix>_cycle_summary_write_recovered_backstop`` marker has to
+        already be on whatever report object the writer was handed when it
+        was called — mutating the live *report* in place instead would not be
+        observed until that later first step, by which point this method may
+        already have "corrected" it back to ``False``. So the writer is
         handed a COPY stamped ``True`` rather than this method mutating the
         live *report* across the ``asyncio.shield`` boundary. That distinction
         is load-bearing on exactly the path the shield exists for: if the
