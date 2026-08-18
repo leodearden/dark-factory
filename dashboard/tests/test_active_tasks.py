@@ -320,7 +320,7 @@ async def test_collect_tasks_with_counts_started_uses_provided_now_across_projec
     })
     cfg = DashboardConfig(project_root=df_root, known_project_roots=[reify_root])
 
-    active, _, _, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
+    active, _, _, _, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg, now=fixed)
     started_by_id = {t['id']: t['started'] for t in active}
     assert started_by_id == {'df/T-1': 10, 'reify/T-2': 25}
 
@@ -1113,7 +1113,7 @@ async def test_collect_tasks_with_counts_resolve_external_overwrites_status(
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _fake_ext_statuses)
 
     cfg = DashboardConfig(project_root=root)
-    active, _, _, _ = await collect_tasks_with_counts(
+    active, _, _, _, _ = await collect_tasks_with_counts(
         client=dummy_client, config=cfg, resolve_external=True,
     )
     assert len(active) == 1
@@ -1154,7 +1154,7 @@ async def test_collect_tasks_with_counts_resolve_external_false_skips_mcp(
 
     cfg = DashboardConfig(project_root=root)
     # Default resolve_external=False — must NOT call fetch_external_statuses.
-    active, _, _, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    active, _, _, _, _ = await collect_tasks_with_counts(client=dummy_client, config=cfg)
     # Rows keep 'unknown' sentinel (unresolved).
     assert active[0]['external_deps'] == [{'id': 'dark_factory:13', 'status': 'unknown'}]
 
@@ -1227,7 +1227,7 @@ async def test_collect_tasks_with_counts_resolve_external_skips_call_when_no_dep
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _must_not_be_called)
 
     cfg = DashboardConfig(project_root=root)
-    active, _, _, _ = await collect_tasks_with_counts(
+    active, _, _, _, _ = await collect_tasks_with_counts(
         client=dummy_client, config=cfg, resolve_external=True,
     )
     assert active[0]['external_deps'] == []
@@ -1289,7 +1289,7 @@ async def test_collect_tasks_with_counts_resolve_external_skips_done_rows(
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _record_call)
 
     cfg = DashboardConfig(project_root=root)
-    active, _, _, _ = await collect_tasks_with_counts(
+    active, _, _, _, _ = await collect_tasks_with_counts(
         client=dummy_client, config=cfg,
         max_done_per_project=5, max_cancelled_per_project=5, resolve_external=True,
     )
@@ -1642,7 +1642,7 @@ async def test_collect_tasks_with_counts_resolve_external_offline_marker(
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _offline_ext_statuses)
 
     cfg = DashboardConfig(project_root=root)
-    active, _, _, _ = await collect_tasks_with_counts(
+    active, _, _, _, _ = await collect_tasks_with_counts(
         client=dummy_client, config=cfg, resolve_external=True,
     )
 
@@ -2454,7 +2454,7 @@ class TestShapeOneProjectNarrowing:
         monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _statuses_fail)
 
         config = self._one_project_config(tmp_path)
-        _active, offline_projects, done_counts, degraded = await collect_tasks_with_counts(
+        _active, offline_projects, done_counts, degraded, _unknown = await collect_tasks_with_counts(
             dummy_client, config,
             max_done_per_project=50, max_cancelled_per_project=50,
         )
@@ -2801,23 +2801,25 @@ class TestCollectTasksBudget:
             'dashboard.data.active_tasks._TASKS_PER_PROJECT_BUDGET', per_project
         )
 
-    async def test_returns_four_element_tuple_with_degraded_projects(
+    async def test_returns_five_element_tuple_with_degraded_and_unknown(
         self, monkeypatch, tmp_path, dummy_client
     ):
-        """(a) the return shape gains a fourth element: degraded_projects."""
+        """(a) the return shape carries degraded_projects AND count_unknown."""
         _register_shaper(monkeypatch, {}, done_counts={'alpha': 3, 'beta': 5})
         config = _budget_config(tmp_path, ['alpha', 'beta'])
 
         result = await collect_tasks_with_counts(client=dummy_client, config=config)
 
-        assert len(result) == 4, (
-            f'expected (active, offline, done_counts, degraded), got {len(result)} '
-            'elements — a project the budget never reached has nowhere to be '
-            'reported without this fourth list'
+        assert len(result) == 5, (
+            'expected (active, offline, done_counts, degraded, count_unknown), '
+            f'got {len(result)} elements — a project the budget never reached '
+            'has nowhere to be reported without the fourth list, and one whose '
+            'status map failed has nowhere without the fifth'
         )
-        _active, offline, counts, degraded = result
+        _active, offline, counts, degraded, count_unknown = result
         assert degraded == []
         assert offline == []
+        assert count_unknown == []
         assert counts == {'alpha': 3, 'beta': 5}
 
     async def test_deadline_expiry_marks_unreached_projects_degraded(
@@ -2842,7 +2844,7 @@ class TestCollectTasksBudget:
             tmp_path, ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
         )
 
-        active, offline, counts, degraded = await collect_tasks_with_counts(
+        active, offline, counts, degraded, _unknown = await collect_tasks_with_counts(
             client=dummy_client, config=config,
         )
 
@@ -2886,7 +2888,7 @@ class TestCollectTasksBudget:
         config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
 
         started = time.monotonic()
-        active, offline, counts, degraded = await collect_tasks_with_counts(
+        active, offline, counts, degraded, _unknown = await collect_tasks_with_counts(
             client=dummy_client, config=config,
         )
         elapsed = time.monotonic() - started
@@ -2918,7 +2920,7 @@ class TestCollectTasksBudget:
         self._tighten(monkeypatch, total=10.0, per_project=0.2)
         config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
 
-        _active, offline, counts, degraded = await collect_tasks_with_counts(
+        _active, offline, counts, degraded, _unknown = await collect_tasks_with_counts(
             client=dummy_client, config=config,
         )
 
@@ -2959,7 +2961,7 @@ class TestCollectTasksBudget:
         )
         config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
 
-        active, offline, counts, degraded = await collect_tasks_with_counts(
+        active, offline, counts, degraded, _unknown = await collect_tasks_with_counts(
             client=dummy_client, config=config,
         )
 
@@ -3073,7 +3075,7 @@ class TestCollectTasksBudget:
         config = _budget_config(tmp_path, ['alpha'])
 
         started = time.monotonic()
-        active, offline, _counts, _degraded = await collect_tasks_with_counts(
+        active, offline, _counts, _degraded, _unknown = await collect_tasks_with_counts(
             client=dummy_client, config=config, resolve_external=True,
         )
         elapsed = time.monotonic() - started
@@ -3104,7 +3106,7 @@ class TestCollectTasksBudget:
         # must hold under the values that actually ship.
         config = _budget_config(tmp_path, ['alpha', 'beta'])
 
-        active, offline, counts, degraded = await collect_tasks_with_counts(
+        active, offline, counts, degraded, _unknown = await collect_tasks_with_counts(
             client=dummy_client, config=config,
         )
 

@@ -86,14 +86,15 @@ def test_orchestrators_returns_orchestrators_and_projects(client):
 def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
     with patch(
         'dashboard.app.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], [], {}, [])),
+        new=AsyncMock(return_value=([], [], {}, [], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     body = resp.json()
     assert set(body) == {
         'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
+        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
     }
     assert 'FILE_LOCKS' not in body
     assert isinstance(body['ACTIVE_TASKS'], list)
@@ -106,7 +107,7 @@ def test_tasks_endpoint_includes_done_counts(client):
     """DONE_COUNTS payload carries the per-project done count from collect_tasks_with_counts."""
     with patch(
         'dashboard.app.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], [], {'dark-factory': 7}, [])),
+        new=AsyncMock(return_value=([], [], {'dark-factory': 7}, [], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -118,7 +119,7 @@ def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
     """When the tasks collector reports offline projects, the payload sets ``offline=True``."""
     with patch(
         'dashboard.app.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], ['dark-factory'], {}, [])),
+        new=AsyncMock(return_value=([], ['dark-factory'], {}, [], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -143,7 +144,7 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
         'status': 'pending',
         'external_deps': [{'id': 'dark_factory:13', 'status': 'done'}],
     }
-    mock = AsyncMock(return_value=([mock_row], [], {}, []))
+    mock = AsyncMock(return_value=([mock_row], [], {}, [], []))
 
     with patch('dashboard.app.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -165,7 +166,8 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
     # (c) top-level key set unchanged
     assert set(body) == {
         'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
+        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
     }
 
 
@@ -183,7 +185,7 @@ def test_tasks_endpoint_passes_max_cancelled_per_project(client):
     """
     from dashboard.data.active_tasks import _MAX_CANCELLED_PER_PROJECT, _MAX_DONE_PER_PROJECT
 
-    mock = AsyncMock(return_value=([], [], {}, []))
+    mock = AsyncMock(return_value=([], [], {}, [], []))
 
     with patch('dashboard.app.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -210,7 +212,8 @@ def test_tasks_endpoint_passes_max_cancelled_per_project(client):
     # (c) payload key-set unchanged
     assert set(body) == {
         'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
+        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
     }
 
 
@@ -233,10 +236,16 @@ def _fake_roots(n):
     return [Path(f'/proj/p{i}') for i in range(n)]
 
 
-def _tasks_body(client, *, offline_projects, degraded_projects=(), total_roots):
+def _tasks_body(
+    client, *, offline_projects, degraded_projects=(),
+    count_unknown_projects=(), total_roots,
+):
     """GET /api/v2/dashboard/tasks with a canned collector result and N roots."""
     collector = AsyncMock(
-        return_value=([], list(offline_projects), {}, list(degraded_projects))
+        return_value=(
+            [], list(offline_projects), {},
+            list(degraded_projects), list(count_unknown_projects),
+        )
     )
     with patch('dashboard.app.collect_tasks_with_counts', new=collector), patch(
         'dashboard.app._all_project_roots', new=lambda config: _fake_roots(total_roots)
@@ -371,7 +380,8 @@ def test_tasks_payload_keeps_file_locks_out_and_carries_the_banner_facts(client)
 
     assert set(body) == {
         'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-        'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
+        'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+        'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
     }
     assert 'FILE_LOCKS' not in body
 

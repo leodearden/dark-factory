@@ -73,16 +73,22 @@ function countPhrase(k, total) {
  *
  *   'global'   — every configured root failed: fused-memory itself is
  *                unreachable. Carries the verbatim outage copy, and SUBSUMES
- *                the other two (its "task data unavailable" already covers
+ *                the other three (its "task data unavailable" already covers
  *                everything they could add).
  *   'partial'  — some roots failed, not all. Deliberately avoids the words
  *                "fused-memory offline": fused-memory is demonstrably
  *                reachable in this state.
  *   'degraded' — the handler ran out of budget before reaching these roots.
- *   'count-unknown' — rows are current but the done count was not measured.
  *                Nothing was proven unreachable, so this never claims an
  *                outage; it says the view is partial. Composes with 'partial'
  *                (a project can fail while a different one times out).
+ *   'count-unknown'
+ *              — the rows for these roots are current, but their compact
+ *                status map failed, so the done count was never measured and
+ *                the terminal window was skipped. Neither offline nor
+ *                degraded, so it never claims an outage either. Without this
+ *                notice such a project renders as healthy with a confident
+ *                "0 done".
  *
  * Every input is optional and defaulted: this runs against window.DF_DATA's
  * pre-fetch defaults on the very first render, so a missing key must produce

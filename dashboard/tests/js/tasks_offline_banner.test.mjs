@@ -232,7 +232,64 @@ test('every notice is a {kind, text} pair with a known kind', () => {
 
   for (const notice of notices) {
     assert.deepEqual(Object.keys(notice).sort(), ['kind', 'text']);
-    assert.ok(['global', 'partial', 'degraded'].includes(notice.kind), notice.kind);
+    assert.ok(
+      ['global', 'partial', 'degraded', 'count-unknown'].includes(notice.kind),
+      notice.kind
+    );
     assert.equal(typeof notice.text, 'string');
   }
+});
+
+test('a count-unknown project is NAMED, and never called offline', () => {
+  // The rows for this root loaded fine — only its compact status map failed.
+  // It is neither offline nor degraded, so before this notice existed it
+  // appeared in NO list at all and rendered as a healthy project with a
+  // confident "0 done": an invisible failure.
+  const notices = tasksBannerNotices({
+    offline: false,
+    offlineProjects: [],
+    degradedProjects: [],
+    countUnknownProjects: ['reify'],
+    totalProjects: 9,
+  });
+
+  assert.deepEqual(kinds(notices), ['count-unknown']);
+  assert.ok(notices[0].text.includes('reify'), notices[0].text);
+  // It must not borrow the outage vocabulary: fused-memory served this root's
+  // rows in the very same response.
+  assert.ok(!/fused-memory offline/.test(notices[0].text), notices[0].text);
+});
+
+test('count-unknown composes with partial and degraded', () => {
+  const notices = tasksBannerNotices({
+    offline: false,
+    offlineProjects: ['a'],
+    degradedProjects: ['b'],
+    countUnknownProjects: ['c'],
+    totalProjects: 9,
+  });
+
+  // Three independent facts about three different roots; none implies another.
+  assert.deepEqual(kinds(notices).sort(), ['count-unknown', 'degraded', 'partial']);
+});
+
+test('a global outage subsumes the count-unknown notice too', () => {
+  const notices = tasksBannerNotices({
+    offline: true,
+    offlineProjects: ['a', 'b'],
+    degradedProjects: [],
+    countUnknownProjects: ['c'],
+    totalProjects: 3,
+  });
+
+  assert.deepEqual(kinds(notices), ['global']);
+});
+
+test('a missing countUnknownProjects key produces no notice', () => {
+  // Same defaulting contract as every other input: this module renders
+  // against DF_DATA's pre-fetch defaults before any response lands.
+  assert.deepEqual(
+    tasksBannerNotices({ offline: false, countUnknownProjects: undefined, totalProjects: 3 }),
+    []
+  );
 });
