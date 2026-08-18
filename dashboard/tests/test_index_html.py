@@ -685,7 +685,12 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 
 # ---------------------------------------------------------------------------
 # Regression guards: the three render-decision helpers extracted by task 4361
-# (task_strand_badge.js, burndown_bands.js, pins_recovery.js)
+# (task_row_cells.js, burndown_bands.js, pins_recovery.js)
+#
+# task_row_cells.js was first spelled task_strand_badge.js; it was renamed in
+# the amendment pass because it owns BOTH task-row claim cells (the stranded
+# badge and the agent cell beside it), not just the badge. Its browser global
+# moved with it: DF_TASK_STRAND_BADGE -> DF_TASK_ROW_CELLS.
 #
 # These modules hold render DECISIONS lifted out of JSX so they could be
 # covered behaviourally by node --test — the substrate decision taken after
@@ -702,55 +707,55 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 # actual HTTP route.
 # ---------------------------------------------------------------------------
 
-_TASK_STRAND_BADGE_PREFIX = '/static/redux/task_strand_badge.js'
+_TASK_ROW_CELLS_PREFIX = '/static/redux/task_row_cells.js'
 _BURNDOWN_BANDS_PREFIX = '/static/redux/burndown_bands.js'
 _PINS_RECOVERY_PREFIX = '/static/redux/pins_recovery.js'
 _TAB_ESCALATIONS_PREFIX = '/static/redux/tab_escalations.jsx'
 _TAB_ESC_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
 
 
-def test_task_strand_badge_js_is_served(client) -> None:
-    """GET /static/redux/task_strand_badge.js returns 200.
+def test_task_row_cells_js_is_served(client) -> None:
+    """GET /static/redux/task_row_cells.js returns 200.
 
     The load-order guards below only inspect the <script> tag's position in
     index.html, so a file that exists in git but is not actually served (a
     packaging or StaticFiles-mount regression) would keep CI green while the
-    browser 404s. Both consumers destructure window.DF_TASK_STRAND_BADGE at top
+    browser 404s. Both consumers destructure window.DF_TASK_ROW_CELLS at top
     level with no `|| {}` fallback, so a 404 here throws at load and blanks the
     Tasks tab and every tab defined in tabs.jsx.
     """
-    resp = client.get(_TASK_STRAND_BADGE_PREFIX)
+    resp = client.get(_TASK_ROW_CELLS_PREFIX)
     assert resp.status_code == 200, (
-        f'expected 200 for {_TASK_STRAND_BADGE_PREFIX}, got {resp.status_code} '
+        f'expected 200 for {_TASK_ROW_CELLS_PREFIX}, got {resp.status_code} '
         '— the module is registered in index.html but not reachable at runtime.'
     )
 
 
-def test_task_strand_badge_js_loads_before_tab_tasks(index_html_body: str) -> None:
-    """task_strand_badge.js must load BEFORE tab_tasks.jsx.
+def test_task_row_cells_js_loads_before_tab_tasks(index_html_body: str) -> None:
+    """task_row_cells.js must load BEFORE tab_tasks.jsx.
 
     tab_tasks.jsx destructures {strandBadgeState, agentCellState} from
-    window.DF_TASK_STRAND_BADGE at top-level execution time with no fallback —
+    window.DF_TASK_ROW_CELLS at top-level execution time with no fallback —
     a later (or missing) tag makes tab_tasks.jsx throw at load, so the whole
     Tasks tab never renders. The destructure is deliberate (loud-over-silent
     degradation); this ordering guard keeps that loudness out of a browser.
     """
     _assert_script_loads_before(
         index_html_body,
-        _TASK_STRAND_BADGE_PREFIX,
+        _TASK_ROW_CELLS_PREFIX,
         _TAB_TASKS_PREFIX,
-        before_label='task_strand_badge.js',
+        before_label='task_row_cells.js',
         after_label='tab_tasks.jsx',
         consumer_note=(
             'tab_tasks.jsx (renderNode and TaskDetail) destructures '
-            'window.DF_TASK_STRAND_BADGE at top level; task_strand_badge.js '
+            'window.DF_TASK_ROW_CELLS at top level; task_row_cells.js '
             'must define it first.'
         ),
     )
 
 
-def test_task_strand_badge_js_loads_before_tabs(index_html_body: str) -> None:
-    """task_strand_badge.js must also load BEFORE tabs.jsx.
+def test_task_row_cells_js_loads_before_tabs(index_html_body: str) -> None:
+    """task_row_cells.js must also load BEFORE tabs.jsx.
 
     The stranded badge has THREE render sites, not one: tab_tasks.jsx's
     renderNode and TaskDetail, and tabs.jsx's OrchTab — the last being where
@@ -760,13 +765,13 @@ def test_task_strand_badge_js_loads_before_tabs(index_html_body: str) -> None:
     """
     _assert_script_loads_before(
         index_html_body,
-        _TASK_STRAND_BADGE_PREFIX,
+        _TASK_ROW_CELLS_PREFIX,
         _TABS_PREFIX,
-        before_label='task_strand_badge.js',
+        before_label='task_row_cells.js',
         after_label='tabs.jsx',
         consumer_note=(
-            'tabs.jsx (OrchTab) destructures window.DF_TASK_STRAND_BADGE at '
-            'top level; task_strand_badge.js must define it first.'
+            'tabs.jsx (OrchTab) destructures window.DF_TASK_ROW_CELLS at '
+            'top level; task_row_cells.js must define it first.'
         ),
     )
 

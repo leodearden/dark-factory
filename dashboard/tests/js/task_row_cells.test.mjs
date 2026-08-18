@@ -1,6 +1,7 @@
-// Module-contract tests for task_strand_badge.js — the pure render DECISION
-// behind the three stranded-badge sites (tab_tasks.jsx renderNode, tab_tasks.jsx
-// TaskDetail, tabs.jsx OrchTab) and the agent cell each of them sits beside.
+// Module-contract tests for task_row_cells.js — the pure render DECISIONS
+// behind the two cells of a task row's claim column: the stranded badge at its
+// three sites (tab_tasks.jsx renderNode, tab_tasks.jsx TaskDetail, tabs.jsx
+// OrchTab) and the agent cell it sits beside at two of them.
 //
 // WHAT THIS SUITE ASSERTS, AND WHAT IT DELIBERATELY DOES NOT. Only the RENDER
 // decision: which descriptor comes back, with what label/title/margin, and when
@@ -14,7 +15,7 @@
 // wrapper; its `**/*.test.mjs` glob auto-discovers this file, so no wrapper
 // change was needed for it).
 //
-// task_strand_badge.js resolves as CommonJS (`module.exports = <object>`)
+// task_row_cells.js resolves as CommonJS (`module.exports = <object>`)
 // because this repo has no package.json. Node's cjs-module-lexer cannot
 // statically detect named exports assigned from a variable, so
 // `import { strandBadgeState } from '...'` would come back undefined. We
@@ -24,22 +25,22 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
-import strand from '../../src/dashboard/static/redux/task_strand_badge.js';
+import cells from '../../src/dashboard/static/redux/task_row_cells.js';
 
-const { strandBadgeState, agentCellState, STRAND_TITLE } = strand;
+const { strandBadgeState, agentCellState, STRAND_TITLE } = cells;
 
-const MODULE_SPECIFIER = '../../src/dashboard/static/redux/task_strand_badge.js';
+const MODULE_SPECIFIER = '../../src/dashboard/static/redux/task_row_cells.js';
 const EXPECTED_FUNCTION_NAMES = ['strandBadgeState', 'agentCellState'];
 const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'STRAND_TITLE'];
 
-test('default-imported module exposes the strand-badge render decisions', () => {
+test('default-imported module exposes the task-row render decisions', () => {
   for (const name of EXPECTED_FUNCTION_NAMES) {
-    assert.equal(typeof strand[name], 'function', `strand.${name} should be a function`);
+    assert.equal(typeof cells[name], 'function', `cells.${name} should be a function`);
   }
-  assert.equal(typeof strand.STRAND_TITLE, 'string', 'strand.STRAND_TITLE should be a string');
+  assert.equal(typeof cells.STRAND_TITLE, 'string', 'cells.STRAND_TITLE should be a string');
 });
 
-test('module also assigns window.DF_TASK_STRAND_BADGE (browser dual-export)', () => {
+test('module also assigns window.DF_TASK_ROW_CELLS (browser dual-export)', () => {
   // Shim a bare browser-like global before requiring the module fresh via
   // CommonJS require, so the module body's `if (typeof window !== 'undefined')`
   // branch executes against our shim. The top-level `import` above has already
@@ -53,14 +54,14 @@ test('module also assigns window.DF_TASK_STRAND_BADGE (browser dual-export)', ()
     delete require.cache[resolved];
     const required = require(MODULE_SPECIFIER);
 
-    assert.ok(globalThis.window.DF_TASK_STRAND_BADGE, 'window.DF_TASK_STRAND_BADGE was not set');
+    assert.ok(globalThis.window.DF_TASK_ROW_CELLS, 'window.DF_TASK_ROW_CELLS was not set');
     assert.deepEqual(
-      Object.keys(globalThis.window.DF_TASK_STRAND_BADGE).sort(),
+      Object.keys(globalThis.window.DF_TASK_ROW_CELLS).sort(),
       EXPECTED_EXPORT_NAMES.slice().sort(),
     );
     assert.deepEqual(Object.keys(required).sort(), EXPECTED_EXPORT_NAMES.slice().sort());
     for (const name of EXPECTED_FUNCTION_NAMES) {
-      assert.equal(typeof globalThis.window.DF_TASK_STRAND_BADGE[name], 'function');
+      assert.equal(typeof globalThis.window.DF_TASK_ROW_CELLS[name], 'function');
     }
   } finally {
     delete globalThis.window;

@@ -1,10 +1,23 @@
-// task_strand_badge.js — the pure render DECISION behind the stranded badge
-// and the agent cell it sits beside, for the Tasks tab (tab_tasks.jsx) and the
-// Orchestrators tab (tabs.jsx).
+// task_row_cells.js — the pure render DECISIONS behind the two cells that make
+// up a task row's claim column, for the Tasks tab (tab_tasks.jsx) and the
+// Orchestrators tab (tabs.jsx):
+//
+//   1. the stranded badge (strandBadgeState), at three sites;
+//   2. the agent cell it sits beside (agentCellState), at two of them.
+//
+// NAMED FOR THE ROW, NOT FOR THE BADGE. The first spelling of this module was
+// task_strand_badge.js, which was a lie by omission: agentCellState decides
+// nothing about the badge — it reads `task.agent`, the field the badge is
+// deliberately independent OF — so a reader looking for the agent-cell rule had
+// no reason to open a file named for the strand badge. The two belong in one
+// module (see agentCellState's own note below: co-located so that a future
+// merge of the two is visible in ONE diff), but the module has to be named for
+// what it actually owns. Renamed in the task-4361 amendment pass; the browser
+// global moved with it, DF_TASK_STRAND_BADGE -> DF_TASK_ROW_CELLS.
 //
 // This is a plain-JS module: no JSX, no Babel. It is loaded two ways:
-//   - In the browser, via a classic `<script src="/static/redux/task_strand_badge.js">`
-//     tag (like task_status_counts.js), which assigns `window.DF_TASK_STRAND_BADGE`.
+//   - In the browser, via a classic `<script src="/static/redux/task_row_cells.js">`
+//     tag (like task_status_counts.js), which assigns `window.DF_TASK_ROW_CELLS`.
 //   - In node (no package.json in this repo, so this file resolves as
 //     CommonJS), via `require`/`import` for the `node --test` suite under
 //     dashboard/tests/js/.
@@ -13,7 +26,7 @@
 // environment it's actually running in.
 //
 // index.html loads this file (classic script, before the Babel JSX tags) so
-// `window.DF_TASK_STRAND_BADGE` is defined before tab_tasks.jsx and tabs.jsx
+// `window.DF_TASK_ROW_CELLS` is defined before tab_tasks.jsx and tabs.jsx
 // execute their top-level destructures of it.
 //
 // ── WHY THIS MODULE EXISTS ────────────────────────────────────────────────
@@ -32,7 +45,7 @@
 // Deleting them was correct and left a real hole. This module closes the part
 // of it that can be closed: the render DECISION now lives in a pure function
 // with genuine behavioural coverage
-// (dashboard/tests/js/task_strand_badge.test.mjs), so deleting a decision arm
+// (dashboard/tests/js/task_row_cells.test.mjs), so deleting a decision arm
 // fails a test instead of nothing.
 //
 // ── WHY NOT A DOM HARNESS (considered and rejected) ───────────────────────
@@ -134,7 +147,15 @@ function strandBadgeState(task, opts) {
 // Kept in this module BECAUSE it must stay distinct from the badge above, not
 // because they share logic: they read different fields and share no output
 // keys, and that separation is the contract. Housing them together is what
-// makes a future merge of the two visible in one diff.
+// makes a future merge of the two visible in one diff. That co-location is
+// also why the module is named for the ROW rather than for the badge — see the
+// header.
+//
+// The two call sites consume this differently ON PURPOSE: TaskDetail honours
+// `muted` by wrapping the placeholder in the dim tertiary colour, OrchTab takes
+// only `.text` and renders its em-dash undimmed. Both are what those sites drew
+// before the extraction, and unifying them is a visual change belonging to a
+// different task — the same reason marginLeft above stayed a parameter.
 function agentCellState(task, opts) {
   const t = task || {};
   const o = opts || {};
@@ -145,13 +166,13 @@ function agentCellState(task, opts) {
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced at
 // runtime by dashboard/tests/js/classic_script_scope.test.mjs. A collision
-// here would leave window.DF_TASK_STRAND_BADGE undefined and break the
+// here would leave window.DF_TASK_ROW_CELLS undefined and break the
 // top-level destructures in tab_tasks.jsx and tabs.jsx.
-const TASK_STRAND_BADGE_API = { strandBadgeState, agentCellState, STRAND_TITLE };
+const TASK_ROW_CELLS_API = { strandBadgeState, agentCellState, STRAND_TITLE };
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = TASK_STRAND_BADGE_API;
+  module.exports = TASK_ROW_CELLS_API;
 }
 if (typeof window !== 'undefined') {
-  window.DF_TASK_STRAND_BADGE = TASK_STRAND_BADGE_API;
+  window.DF_TASK_ROW_CELLS = TASK_ROW_CELLS_API;
 }
