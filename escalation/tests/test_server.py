@@ -106,6 +106,12 @@ async def _get_task_escalations(server, **kwargs: Any) -> list[dict[str, Any]]:
     return tool.fn(**kwargs)
 
 
+async def _get_escalation(server, **kwargs: Any) -> dict[str, Any]:
+    tool = await server.get_tool('get_escalation')
+    # get_escalation is a sync def, so tool.fn(...) returns directly
+    return tool.fn(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # TestBornAtL2: severity-gated born-at-L2 path
 # ---------------------------------------------------------------------------
@@ -2881,8 +2887,7 @@ class TestPromoteToL2FramingPreservation:
 
         # (c) read the full record back: ORIGINAL framing intact, INCOMING
         # framing present alongside it — nothing dropped either way.
-        get_tool = await server.get_tool('get_escalation')
-        record = get_tool.fn(escalation_id=created['id'])
+        record = await _get_escalation(server, escalation_id=created['id'])
         assert record['root_cause'] == _L2_DEFAULTS['root_cause']
         assert record['detail'] == _L2_DEFAULTS['evidence'], (
             'the ORIGINAL evidence must survive the fold'
