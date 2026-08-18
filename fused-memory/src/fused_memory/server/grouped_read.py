@@ -115,6 +115,30 @@ MATCHED_CHILDREN_KEY = 'matched_children'
 #: the write side (leaf γ) should import THIS name rather than re-spell it.
 CONTESTED_METADATA_KEY = f'{EXPERIMENTAL_KEY_PREFIX}contested'
 
+#: The metadata keys, in precedence order, that can name a child's ORIGIN
+#: project.  Emitted (projected, never wholesale) onto every NESTED entry this
+#: module builds, so a consumer holding only the nested entry can still tell
+#: which project the body came from.
+#:
+#: This tuple deliberately MIRRORS ``FOREIGN_PROJECT_TAG_KEYS`` in
+#: ``orchestrator/src/orchestrator/agents/briefing.py`` (:56), whose
+#: ``filter_foreign_project_results`` is the consumer this exists for.  The
+#: coupling is ONE-WAY and by COPY, not by import: orchestrator declares no
+#: runtime dependency on fused-memory (fused-memory appears only in
+#: ``orchestrator/pyproject.toml``'s ``[tool.pyright] extraPaths``, a
+#: type-checking-only reference — see briefing.py:80-85), so neither side can
+#: import the other's constant.  A key added on ONE side must be added HERE
+#: too, or the briefing's nested cross-project safeguard silently stops firing
+#: on it.
+#:
+#: ``dst_project`` is deliberately ABSENT for exactly the reason briefing.py
+#: gives: it names where a rehomed fact was relocated TO, not where it came
+#: FROM, so consulting it would falsely certify a rehomed foreign fact as
+#: local.  No member of ``MEM0_MANAGED_METADATA_KEYS`` appears here either, so
+#: mem0's own ``user_id`` scoping key can never be misread as an origin tag
+#: and cannot cause a false-positive drop.
+ORIGIN_PROJECT_TAG_KEYS = ('src_project', 'project_id', 'group_id', 'project')
+
 #: Marks a ``parent_id`` no store could resolve.  ONE spelling shared by both
 #: surfaces — the search entry (:func:`group_search_results`) and the grouped
 #: block of a point-id read (:func:`group_memory_document`) — so a consumer
@@ -187,6 +211,33 @@ def _digest(text: str) -> str:
     return text[:_DIGEST_CHARS] + _DIGEST_ELLIPSIS
 
 
+def _origin_tags(meta: Mapping[str, Any] | None) -> dict[str, str]:
+    """The origin-project tags present on *meta*, projected for the wire.
+
+    A PROJECTION over :data:`ORIGIN_PROJECT_TAG_KEYS`, never the payload
+    wholesale: only those keys' non-empty string values are copied, so the
+    body (``data``), the content hash and every other mem0-managed key stay
+    out.  That keeps the added wire bulk to a few short strings AND makes the
+    "no managed key can be mistaken for an origin tag" property structural
+    rather than incidental.
+
+    WHY the emitters stop narrowing this away: a nested entry (an amendment
+    digest, a pinned matched child) is agent-visible content that the
+    orchestrator briefing renders verbatim into a dispatched agent's
+    ``# Context`` block.  Its cross-project filter classifies an entry by
+    reading a project tag off that entry's own ``metadata`` — so a nested
+    entry carrying NO ``metadata`` cannot be classified at all, and the
+    deliberate keep-untagged policy keeps every one of them.  Without this
+    projection the safeguard is one that never fires on nested bodies: the
+    task-4008 gap.
+    """
+    return {
+        key: value
+        for key in ORIGIN_PROJECT_TAG_KEYS
+        if isinstance(value := (meta or {}).get(key), str) and value.strip()
+    }
+
+
 def _digest_entry(row: Mapping[str, Any]) -> dict[str, Any]:
     """Build one digest entry from a scrolled child row."""
     payload = row.get('metadata') or {}
@@ -201,6 +252,13 @@ def _digest_entry(row: Mapping[str, Any]) -> dict[str, Any]:
     # Omitted (never False) when uncontested, per the fault-only convention.
     if is_contested_child(payload):
         entry['contested'] = True
+    # The child's ORIGIN project, so a consumer holding only this digest can
+    # still classify the body it carries — see :func:`_origin_tags`.  Omitted
+    # (never ``{}``) when the child carries no tag, matching the
+    # fault-only/omit-when-absent convention ``contested`` and ``truncated``
+    # already follow: the common corpus is untagged and pays no wire cost.
+    if tags := _origin_tags(payload):
+        entry['metadata'] = tags
     return entry
 
 
