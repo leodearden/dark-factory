@@ -742,3 +742,71 @@ def extract_function_body(source: str, func_name: str) -> str:
             if depth == 0:
                 return source[start : j + 1]
     raise _miss('its body brace is never closed')
+
+
+def strip_js_comments(source: str) -> str:
+    """Return *source* with every JS/JSX comment blanked, string literals intact.
+
+    The probes built on these helpers are plain substring/regex searches, so
+    without this they also match PROSE.  That coupling deformed the production
+    source once already: charts.jsx carried a comment whose content was an
+    apology for what it could not say, because naming the very expression the
+    component had just stopped using would fail CI with a message claiming the
+    component "still contains hole-blind scale/path arithmetic" — pointing at a
+    comment.  A comment is exactly where that expression SHOULD be quotable.
+
+    Quote-aware rather than a bare regex: blanking from a ``//`` inside a string
+    literal (a URL, say) to end-of-line would delete real CODE, and an absence
+    assertion over deleted code is a permanent false GREEN.  All three quote
+    styles (``'``, ``"``, backtick) are tracked, and an escaped character inside
+    a literal cannot close it.
+
+    Each comment is replaced by a SINGLE SPACE rather than removed outright, so
+    two previously separated tokens can never be spliced into a new match.
+
+    Deliberately not a full JS lexer: a regex literal containing ``//``, or a
+    quote nested inside a template's ``${...}``, would confuse it.  Neither
+    occurs in the component bodies this is used on, and the negative controls in
+    test_charts_null_samples.py would catch the silent-GREEN direction if one
+    ever did.
+    """
+    out: list[str] = []
+    quote: str | None = None
+    i, n = 0, len(source)
+
+    while i < n:
+        ch = source[i]
+
+        if quote is not None:
+            out.append(ch)
+            if ch == '\\' and i + 1 < n:  # an escaped char cannot close the string
+                out.append(source[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+
+        if ch in '\'"`':
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == '/' and source[i : i + 2] == '//':
+            end = source.find('\n', i)
+            out.append(' ')
+            i = n if end == -1 else end
+            continue
+
+        if ch == '/' and source[i : i + 2] == '/*':
+            end = source.find('*/', i + 2)
+            out.append(' ')
+            i = n if end == -1 else end + 2
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return ''.join(out)
