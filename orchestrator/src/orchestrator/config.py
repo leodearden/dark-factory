@@ -1090,6 +1090,27 @@ class TranscriptArchiveConfig(BaseModel):
         ),
     )
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    storm_threshold: int = Field(
+        default=5,
+        description=(
+            'Archival-failure burst detector (task 3619, INV-4): how many '
+            'per-file archive failures within storm_window_secs constitute a '
+            'storm worth one L1 escalation. One failure is routine and is '
+            'already counted + logged by shared.transcript_archive; a BURST '
+            'is the systemic condition (archive root full, unmounted, or '
+            'permission-denied) an operator has to act on. Harness reads this '
+            'LIVE on every failure, so a hot reload takes effect without a '
+            'restart.'
+        ),
+    )
+    storm_window_secs: float = Field(
+        default=600.0,
+        description=(
+            'Rolling window for storm_threshold, and the rate limit between '
+            'archival-storm escalations — at most one L1 per window, on top '
+            'of the has_open_l1 dedup. Also read LIVE on every failure.'
+        ),
+    )
 
 
 class FusedMemoryConfig(BaseModel):
