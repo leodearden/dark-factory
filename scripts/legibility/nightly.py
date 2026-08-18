@@ -8,10 +8,14 @@ decisions 7/8 (fail-loud contract, liveness probes git history never),
 boundary test §8.8.
 
 Every stage is reached behind a dependency-injection seam (``invoke`` for
-the LLM, ``status_fetcher`` for the census, ``poster`` for escalation,
-``committer`` for git) plus module-level functions a caller can monkeypatch
--- mirrors the established seam convention (coder.py's ``invoke`` override,
-census_trigger.py's injected ``status_fetcher``). This is what the
+the LLM, ``status_fetcher`` for the census -- defaulting to the real
+MCP-backed ``get_statuses`` fetcher for ``cfg.project_root``, ``poster``
+for escalation, ``committer`` for git) plus module-level functions a caller
+can monkeypatch -- mirrors the established seam convention (coder.py's
+``invoke`` override, census_trigger.py's injected ``status_fetcher``).
+Each seam resolves ``None`` to its real implementation, so a production
+entrypoint that injects nothing still gets the real thing rather than
+nothing at all (task 4148). This is what the
 systemd ``legibility-trickle@.service`` template runs nightly, and what
 ``install-trickle-timer.sh``/``check_trickle_liveness.sh`` install and probe.
 """
@@ -578,15 +582,15 @@ def evaluate_census_step(
     ``census trigger: NO-FIRE -- ...`` grammar every consumer of
     ``NightlyResult.census_line`` reads, and returns before the
     entrypoint/launcher block so it can never start a census.
+
+    The decision line is also emitted to the journal at INFO from here --
+    exactly once per run, on every path, and BEFORE any launch (task 4148).
     """
     if entrypoint_exists is None:
         entrypoint_exists = _default_entrypoint_exists
     if launcher is None:
         launcher = _default_census_launcher
 
-    # Returns BEFORE the entrypoint/launcher block below, and that ordering is
-    # a safety property rather than a style choice: an evaluation that failed
-    # has established nothing, so it must never be able to start a census.
     try:
         decision = decide(cfg.project_root, now=now, status_fetcher=status_fetcher)
     except Exception as exc:  # noqa: BLE001 - the census trigger must never fail the run
@@ -603,13 +607,38 @@ def evaluate_census_step(
             'census trigger evaluation failed (%s) -- NO-FIRE; the nightly '
             'run is unaffected', detail,
         )
-        return f'census trigger: NO-FIRE -- trigger evaluation failed ({detail})', False
+        decision = None
+        line = f'census trigger: NO-FIRE -- trigger evaluation failed ({detail})'
+    else:
+        line = 'census trigger: {} -- {}'.format(
+            'FIRE' if decision.fire else 'NO-FIRE', '; '.join(decision.reasons),
+        )
 
-    line = 'census trigger: {} -- {}'.format(
-        'FIRE' if decision.fire else 'NO-FIRE', '; '.join(decision.reasons),
-    )
+    # Task 4148 (amendment). Emitted HERE -- inside this function, before the
+    # entrypoint/launcher block -- rather than at run_nightly's call site,
+    # because on the FIRE path `launcher()` runs the census SYNCHRONOUSLY
+    # (_default_census_launcher -> subprocess.run(census.py), whose stages
+    # carry the 120/900/1800s timeouts in config.py's Timeouts). Logging after
+    # this function returned would withhold the REASON for a running census
+    # until that subprocess finished -- tens of minutes later -- and lose it
+    # entirely if the unit is killed, times out, or the box reboots
+    # mid-census: precisely the FIRE case this line exists to make visible.
+    # An operator tailing `journalctl --user -u legibility-trickle@<project>`
+    # now sees a census start together with the reason it started.
+    #
+    # ONE log site covering both the decided and the failed-evaluation path,
+    # so the journal line and the `census_line` returned on NightlyResult can
+    # never drift. Always-on INFO in the module's established style (cf. the
+    # sampler summary and no-change-night lines in run_nightly); main()'s
+    # config.configure_logging() is what makes INFO visible in the journal at
+    # all (gap (b) of the trickle-legibility incident).
+    logger.info('legibility trickle: %s', line)
 
-    if not decision.fire:
+    # A failed evaluation has established NOTHING, so it must never be able to
+    # start a census -- hence `decision is None` returns here, BEFORE
+    # `entrypoint_exists` is even consulted. That ordering is a safety
+    # property rather than a style choice.
+    if decision is None or not decision.fire:
         return line, False
 
     if not entrypoint_exists():
@@ -996,6 +1025,14 @@ def run_nightly(
     *now* threads through to :func:`evaluate_census_step`'s clock seam and
     to the run-state recorder's ``recorded_at``.
 
+    *status_fetcher* defaults to the real MCP-backed ``get_statuses``
+    fetcher for ``cfg.project_root``
+    (:func:`census_trigger.default_status_fetcher`) -- inject to override.
+    ``None`` means "build the real one", NOT "no fetcher": that asymmetry
+    with every other seam here is what kept the census's tasks-landed
+    condition dead on the production path (task 4148). A test wanting the
+    fail-safe path injects a raising/empty fake instead.
+
     *recorder* (default :func:`trickle_state.record_run`) is the run-state
     seam, alongside the existing ``invoke``/``status_fetcher``/``poster``/
     ``committer`` ones. Called exactly once per run from a ``finally``
@@ -1026,6 +1063,42 @@ def run_nightly(
     if projects_root is None:
         projects_root = DEFAULT_PROJECTS_ROOT
     commit_fn = committer if committer is not None else _git_commit_docs_only
+    # Task 4148. The systemd path is `nightly.py run --project-id %i` ->
+    # main() -> run_nightly, and main() never built a fetcher -- so
+    # `status_fetcher=None` reached `compute_tasks_landed` on every real run
+    # and hit its `status_fetcher is None` arm (census_trigger.py:735-739;
+    # journal 2026-08-10/11/12), leaving condition (b) tasks-landed unable to
+    # fire at all. Every OTHER seam here already resolves None to its real
+    # implementation (committer -> _git_commit_docs_only above, recorder ->
+    # trickle_state.record_run, poster -> _default_poster); status_fetcher
+    # alone resolved to nothing, and that asymmetry is how three prior repairs
+    # of this same code (2953's 406 fix, 3291's baseline fix, 4085's fail-safe
+    # arms) each left the wiring loop open.
+    #
+    # Defaulted HERE rather than in main() because `cfg.project_root` is the
+    # first point in the chain where the ABSOLUTE root is known (config.py's
+    # validator guarantees absolute -- exactly what the MCP wire requires
+    # post-3291) while main() holds only --config/--project-id; and it is the
+    # identical value `evaluate_census_step` hands to `decide`, so the fetcher
+    # and the decision can never disagree about which project they are for.
+    # Deliberately NOT wrapped in try/except: the construction does no I/O
+    # (a resolve, an environ read, a returned closure), and every call-time
+    # failure is already fail-safe inside compute_tasks_landed.
+    #
+    # HAZARD, for whoever writes the next run_nightly test (amendment): this
+    # default is LIVE, so a test that seeds census-state.json with a valid
+    # non-negative `last_census_done_count` and injects no `status_fetcher`
+    # issues a REAL POST to $FUSED_MEMORY_MCP_URL (default localhost:8002) --
+    # and on a dev box where fused-memory is actually up, a stale fixture
+    # baseline against the real done-count can produce a genuine FIRE that
+    # subprocess-launches scripts/legibility/census.py (real LLM spend, real
+    # git writes). Such a test MUST fake httpx (conftest's install_fake_httpx)
+    # AND stub `_default_census_launcher`; see the task-4148 block in
+    # scripts/tests/test_legibility_nightly.py for the worked pattern.
+    status_fetcher = (
+        status_fetcher if status_fetcher is not None
+        else census_trigger.default_status_fetcher(cfg.project_root)
+    )
 
     # One render cache for the whole run: select_digest_sessions renders each
     # candidate to CHARGE it against the byte budget, and build_digests reuses
@@ -1253,6 +1326,19 @@ def run_nightly(
                 'legibility trickle: no-change night: nothing committed (applied=%d)', applied,
             )
 
+        # Task 4148. The decision was computed and returned on NightlyResult
+        # below, but never LOGGED -- so only the census's failure modes
+        # (census_trigger's own WARNINGs, FIRE-WITHOUT-LAUNCH, 4085's
+        # evaluation-failed line) ever reached the journal. With condition (b)
+        # now wired, a healthy evaluation would otherwise be indistinguishable
+        # from the still-dead one in
+        # `journalctl --user -u legibility-trickle@dark_factory` -- the same
+        # channel that diagnosed this task. Deliberately NOT logged here at
+        # the call site (amendment): `evaluate_census_step` LAUNCHES the
+        # census synchronously before returning, so a log line here would only
+        # reach the journal after the whole census subprocess finished -- see
+        # the log site inside that function for the full reasoning. Do not
+        # re-add one here; that would double the line, not advance it.
         census_line, census_fire = evaluate_census_step(cfg, now=now, status_fetcher=status_fetcher)
 
         result = NightlyResult(
