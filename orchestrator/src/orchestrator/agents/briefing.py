@@ -68,6 +68,26 @@ TO, not where it came from.
 """
 
 
+GROUPED_CHILD_KEYS = ('amendments', 'matched_children')
+"""The keys under which fused-memory nests CHILD bodies inside a kept result.
+
+``fused_memory.server.grouped_read.group_search_results`` collapses an
+amendment/sighting hit into its parent and hangs the child data off the
+surviving parent entry at ``entry['grouped']``: truncated bodies under
+``amendments`` (bounded digests) and FULL bodies under ``matched_children``
+(``MATCHED_CHILDREN_KEY`` — where a swallowed matched child is pinned so its
+text stays reachable). Both render verbatim into the ``# Context`` block, so
+both must be walked.
+
+``grouped['parent']`` is deliberately ABSENT from this tuple: it is produced
+only by ``group_memory_document``, which serves the ``get_memory_by_id`` tool,
+and this module never calls that tool (verified — briefing.py contains no
+``get_memory_by_id`` reference; its only memory-tool call is ``search``, in
+:meth:`BriefingAssembler._mcp_search`). A branch for it would be unreachable
+code.
+"""
+
+
 def _canonical_project(value: str) -> str:
     """Canonicalise a project identifier for comparison.
 
@@ -110,6 +130,46 @@ def _result_project(entry: dict) -> tuple[str, str] | None:
     return None
 
 
+def _filter_grouped_children(entry: dict, target: str) -> int:
+    """Drop cross-project CHILD entries nested inside a KEPT result's block.
+
+    Walks :data:`GROUPED_CHILD_KEYS` inside ``entry['grouped']`` and applies
+    the SAME rule the top-level loop applies — :func:`_result_project` for the
+    tag (so the ``src_project`` precedence order is not re-spelled),
+    :func:`_canonical_project` for the comparison, keep-untagged for anything
+    unclassifiable. Returns the number of nested entries dropped; the caller
+    folds that into its own ``dropped`` total.
+
+    Only the child LISTS are rewritten. ``amendment_count`` / ``sighting_count``
+    and every other ``grouped`` key are left exactly as the server sent them.
+    """
+    grouped = entry.get('grouped')
+    if not grouped:
+        return 0
+    dropped = 0
+    for key in GROUPED_CHILD_KEYS:
+        children = grouped.get(key)
+        if not children:
+            continue
+        kept = []
+        for child in children:
+            match = _result_project(child)
+            if match is not None:
+                tag_key, tag = match
+                if _canonical_project(tag) != target:
+                    dropped += 1
+                    logger.debug(
+                        f'filter_foreign_project_results: dropped nested '
+                        f'{child.get("id")!r} under {entry.get("id")!r} '
+                        f'({tag_key}={tag!r})'
+                    )
+                    continue
+            kept.append(child)
+        if len(kept) != len(children):
+            grouped[key] = kept
+    return dropped
+
+
 def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[str, int]:
     """Drop cross-project results from a fused-memory ``search`` JSON payload.
 
@@ -121,6 +181,22 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
     :func:`_canonical_project` normalisation, differs from ``project_id``,
     and kept otherwise — including when ``metadata`` is missing, empty, or
     not a dict.
+
+    GROUPED CHILDREN (task 4008). Reading only each result's TOP-LEVEL tag is
+    not enough: ``fused_memory.server.grouped_read.group_search_results``
+    nests child bodies inside a KEPT parent's entry (see
+    :data:`GROUPED_CHILD_KEYS`), and ``_get_memory_context`` appends this
+    payload verbatim, so a mis-tagged child hanging off a correctly-tagged
+    canonical would render as raw JSON in the agent's ``# Context`` block
+    having bypassed the safeguard entirely. :func:`_filter_grouped_children`
+    therefore descends into every KEPT entry and applies the same rule to its
+    children. Nested drops are counted into the SAME ``dropped`` return, so
+    they reach ``foreign_dropped`` and the ``drop_note`` (already worded in
+    result SLOTS, not results) rather than being silently swallowed by the
+    no-op fast path below. This depends on grouped_read.py's ``_origin_tags``
+    projection actually emitting ``metadata`` on nested entries — without it
+    every nested entry is untagged and the descent is a safeguard that never
+    fires.
 
     Untagged results are deliberately kept rather than dropped: every
     Graphiti-sourced result has ``metadata == {}`` today (verified at
@@ -191,6 +267,9 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
                     f'({key}={tag!r})'
                 )
                 continue
+        # Only for a KEPT entry: a dropped parent takes its whole subtree with
+        # it, so descending into one would double-count what is already gone.
+        dropped += _filter_grouped_children(entry, target)
         kept.append(entry)
 
     if not kept:
