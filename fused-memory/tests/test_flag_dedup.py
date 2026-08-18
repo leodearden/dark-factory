@@ -4465,6 +4465,253 @@ class TestSanitizeCitedTasks:
 
 
 # ---------------------------------------------------------------------------
+# ---- task 4381 step-7 ----
+# RED: dedup_flags' HIT-path cross-project fix-task suppression gate.
+# ---------------------------------------------------------------------------
+
+
+class TestDedupFlagsCrossProjectFixTaskSuppression:
+    """dedup_flags drops a CARRIED-FORWARD flag whose ``cited_tasks`` names a
+    live, non-cancelled fix task in ANOTHER known project (task 4381).
+
+    Suppression is HIT-ONLY (a first-cycle finding is never suppressed),
+    FOREIGN-PROJECT-ONLY, and fail-open in every direction. Both new kwargs
+    are optional, so the ~40 existing call sites keep today's behaviour
+    exactly.
+
+    RED until step-8 widens dedup_flags.
+    """
+
+    PROJECT = 'know_live'
+    FLAG_TYPE = 'remediation_payload_live_workflow_signals_gap'
+    SUBJECT_CITE = {'project_id': 'know_live', 'task_id': '598', 'title': 'subject'}
+    FIX_CITE = {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix'}
+    KNOWN = {'dark_factory': '/df'}
+
+    @staticmethod
+    def _make_flag(cited_tasks=None):
+        flag = {
+            'task_id': 598,
+            'flag_type': TestDedupFlagsCrossProjectFixTaskSuppression.FLAG_TYPE,
+            'description': 'the remediation payload omits live workflow signals',
+        }
+        if cited_tasks is not None:
+            flag['cited_tasks'] = cited_tasks
+        return flag
+
+    @staticmethod
+    def _signature(flag):
+        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+
+        sig = compute_flag_signature(flag)
+        assert sig is not None
+        return sig
+
+    @staticmethod
+    def _taskmaster(*, status='pending', side_effect=None):
+        taskmaster = AsyncMock()
+        if side_effect is not None:
+            taskmaster.get_task = AsyncMock(side_effect=side_effect)
+        else:
+            taskmaster.get_task = AsyncMock(
+                return_value={'id': 3839, 'title': 'Fix', 'status': status}
+            )
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_hit_with_live_foreign_fix_task_is_suppressed(self, ledger_memory_service):
+        """(a) HEADLINE: a carried-forward flag citing a live pending fix task
+        in dark_factory is DROPPED rather than re-asserted."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.FIX_CITE])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1')
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(),
+            known_projects=self.KNOWN,
+        )
+
+        assert result == [], (
+            f'a carried-forward flag with a live foreign fix task must be dropped; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_foreign_fix_task_is_not_suppressed(self, ledger_memory_service):
+        """(b) EXPLICIT CANCELLED GUARD: a cancelled fix task must never
+        silence the finding — it is re-asserted exactly as before."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.FIX_CITE])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1')
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(status='cancelled'),
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, f'a cancelled fix task must not suppress; got {result!r}'
+        assert result[0]['persisted_from_run'] == 'r1'
+        assert result[0]['last_seen_run_id'] == 'r2'
+
+    @pytest.mark.asyncio
+    async def test_miss_is_never_suppressed(self, ledger_memory_service):
+        """(c) MISS-only gate: suppression is a carried-forward-only behaviour,
+        so a first-cycle finding issues no lookup at all."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.FIX_CITE])
+        taskmaster = self._taskmaster()
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r1',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, f'a first-cycle finding must never be suppressed; got {result!r}'
+        assert 'persisted_from_run' not in result[0]
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lookup_exception_is_fail_open(self, ledger_memory_service):
+        """(d) FAIL-OPEN: a backend outage keeps the flag."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.FIX_CITE])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1')
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(side_effect=RuntimeError('backend down')),
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, f'a lookup failure must fail open; got {result!r}'
+        assert result[0]['persisted_from_run'] == 'r1'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'known_projects',
+        [{}, {'some_other_project': '/other'}],
+        ids=['no-routing', 'cited-project-unknown'],
+    )
+    async def test_unresolvable_project_is_fail_open(
+        self, ledger_memory_service, known_projects
+    ):
+        """(e) FAIL-OPEN on project resolution: an unresolvable cited project
+        issues no lookup and keeps the flag."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.FIX_CITE])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1')
+        taskmaster = self._taskmaster()
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=known_projects,
+        )
+
+        assert len(result) == 1, f'an unresolvable cited project must fail open; got {result!r}'
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_flag_without_cited_tasks_is_unchanged(self, ledger_memory_service):
+        """(f) REGRESSION: a flag with no cited_tasks is annotated exactly as
+        today, with no lookup."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag()
+        tid, ftype = self._signature(flag)
+        await _seed_marker(ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1')
+        taskmaster = self._taskmaster()
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, f'an uncited flag must be unaffected; got {result!r}'
+        assert result[0]['persisted_from_run'] == 'r1'
+        assert result[0]['last_seen_run_id'] == 'r2'
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_kwargs_omitted_degrades_to_todays_behaviour(self, ledger_memory_service):
+        """(g) REGRESSION: called WITHOUT the new kwargs — the shape every one
+        of the ~40 existing call sites uses — a live foreign citation changes
+        nothing."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.FIX_CITE])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1')
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+        )
+
+        assert len(result) == 1, (
+            f'omitting the new kwargs must degrade to today\'s behaviour; got {result!r}'
+        )
+        assert result[0]['persisted_from_run'] == 'r1'
+
+    @pytest.mark.asyncio
+    async def test_same_project_only_citations_are_not_suppressed(self, ledger_memory_service):
+        """(h) The self-suppression guard, end to end: a flag citing only its
+        own subject task issues no lookup and survives."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1')
+        taskmaster = self._taskmaster()
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, (
+            f'a flag citing only its own subject must never self-suppress; got {result!r}'
+        )
+        taskmaster.get_task.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # task-1656 step-3 — RED: dedup_flags write-guard integration tests
 # ---------------------------------------------------------------------------
 
