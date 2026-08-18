@@ -9,6 +9,7 @@ Step test-quarantine: RED — quarantine method absent.
 
 from __future__ import annotations
 
+import codecs
 import json
 import locale
 import logging
@@ -25,6 +26,7 @@ from orchestrator.lane_lifecycle import (
     AcquireRoute,
     IllegalLaneTransition,
     LaneLifecycle,
+    LaneRecord,
     LaneState,
 )
 
@@ -581,12 +583,33 @@ class TestDelegatesToSharedAtomicWriter:
     These pin that this site's semantics survived the move. Task 3387 fixed
     the encoding: this site's payload is JSON (RFC 8259 requires JSON on disk
     to be UTF-8), so the encoding is pinned utf-8 rather than following the
-    process's locale, regardless of the ambient ``LC_ALL``/``LANG``.
+    process's locale — regardless of the ambient ``LC_ALL``/``LANG`` AND of how
+    the platform happens to spell its UTF-8 alias.
+
+    Both pins below monkeypatch ``locale.getpreferredencoding``, and here that
+    patch is LOAD-BEARING rather than decorative: the pre-3387 body called
+    ``locale.getpreferredencoding(False)`` explicitly, at the Python level,
+    so the patch genuinely reaches it and both pins fail against that source on
+    EVERY host. (``session_registry``'s twin pin is deliberately NOT this
+    shape. Its unfixed body was a bare ``os.fdopen(fd, 'w')``, whose default
+    encoding comes from the C-level locale and is unreachable from Python — an
+    identical-looking monkeypatch there was measured INERT, which is exactly
+    how that half of task 3387 first shipped with a vacuous test. Do not
+    copy this shape over there, or that shape over here.)
     """
 
     def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):
         """One delegated call carrying mkdir=True, 0600, utf-8 encoding, no fsync."""
         import shared.safe_io as _safe_io
+
+        # Load-bearing (see class docstring): the unfixed body forwards THIS
+        # value as `encoding=`, so with it patched to 'ascii' the assertion
+        # below fails on every host. Without it the pin only discriminated by
+        # the accident of this host spelling its alias 'UTF-8' (uppercase) —
+        # on a host returning lowercase 'utf-8' it was silently vacuous.
+        monkeypatch.setattr(
+            locale, 'getpreferredencoding', lambda do_setlocale=True: 'ascii'
+        )
 
         calls = []
         monkeypatch.setattr(
@@ -604,26 +627,59 @@ class TestDelegatesToSharedAtomicWriter:
         assert kwargs.get('mkdir') is True, 'this site created its parent dir'
         assert kwargs.get('mode') == 0o600, 'mkstemp created 0600; must not widen'
         assert not kwargs.get('fsync'), 'this site never fsynced'
-        assert kwargs.get('encoding') == 'utf-8', (
-            'JSON payloads must be written utf-8 regardless of ambient locale (task 3387)'
+        # Normalised, not compared to the literal 'utf-8': this asserts the
+        # SEMANTIC contract (this names the utf-8 codec) rather than one
+        # spelling of it. The discriminating power comes from the locale patch
+        # above, deliberately, instead of from a string-case accident.
+        assert codecs.lookup(kwargs.get('encoding', 'ascii')).name == 'utf-8', (
+            f'JSON payloads must be written utf-8 regardless of ambient locale '
+            f'(task 3387); got encoding={kwargs.get("encoding")!r}'
         )
 
     def test_writes_non_ascii_json_as_utf8_regardless_of_locale(
         self, tmp_path, monkeypatch
     ):
         """End-to-end: non-ASCII JSON round-trips as utf-8 bytes on disk, even
-        under a non-UTF-8 ambient locale (task 3387 regression pin)."""
-        monkeypatch.setattr(locale, 'getpreferredencoding', lambda do_setlocale=True: 'ascii')
+        under a non-UTF-8 ambient locale (task 3387 regression pin).
+
+        WHY ``to_json`` IS PATCHED — the naive version of this test cannot
+        discriminate, and shipped that way once. ``LaneRecord.to_json`` is
+        ``json.dumps(..., indent=2)`` with the default ``ensure_ascii=True``,
+        so ``seeded_from_sha='café'`` is flattened to the pure-ASCII escape
+        ``"caf\\u00e9"`` BEFORE it ever reaches the encoder. Encoding an
+        all-ASCII payload as 'ascii' succeeds and is byte-identical to
+        encoding it as utf-8, so no assertion downstream could tell the two
+        apart. Dropping ``ensure_ascii`` here is what actually puts U+00E9 in
+        front of the encoder; the ``isascii`` guard below fails loudly if that
+        ever stops being true, rather than letting the pin go quietly vacuous
+        again.
+        """
+        monkeypatch.setattr(
+            locale, 'getpreferredencoding', lambda do_setlocale=True: 'ascii'
+        )
+        monkeypatch.setattr(
+            LaneRecord,
+            'to_json',
+            lambda self: json.dumps(self.to_dict(), indent=2, ensure_ascii=False),
+        )
 
         lifecycle = _lifecycle(tmp_path)
         record = lifecycle.transition(
             tmp_path / 'lane-1', LaneState.SEED, seeded_from_sha='café'
         )
 
-        raw = lifecycle._record_path('lane-1').read_bytes()
-        assert raw.decode('utf-8') == record.to_json(), (
-            'on-disk bytes must be valid utf-8 even when getpreferredencoding() lies'
+        expected = record.to_json()
+        assert not expected.isascii(), (
+            'this pin is vacuous unless a genuinely non-ASCII character reaches '
+            'the encoder — see the ensure_ascii note in the docstring'
         )
+
+        raw = lifecycle._record_path('lane-1').read_bytes()
+        assert raw == expected.encode('utf-8'), (
+            'on-disk bytes must be the utf-8 encoding of the record even when '
+            'getpreferredencoding() reports a non-UTF-8 codec'
+        )
+        assert 'café' in raw.decode('utf-8')
 
     def test_transition_creates_missing_state_dir_and_round_trips(self, tmp_path):
         """End-to-end: a first transition creates state_dir and the record reloads."""
