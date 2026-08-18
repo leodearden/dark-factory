@@ -50,6 +50,7 @@ from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_arti
 from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
+from fused_memory.mcp_tools.scheduler_state import effective_lock_depth
 from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_dependencies
@@ -2233,7 +2234,17 @@ class TaskCurator:
         project_root: str,
     ) -> tuple[list[_PoolEntry], dict[str, int]]:
         """Assemble the four-stream pool for the LLM prompt."""
-        lock_depth = self._config.curator.lock_depth
+        # Resolve lock_depth PER PROJECT, not from a single global scalar:
+        # fused-memory serves many projects and each orchestrator resolves its
+        # own depth (3..12 across the fleet). The scheduler snapshot already
+        # publishes the effective value, so we read it rather than
+        # reimplementing orchestrator.config's layering here. lock_depth is
+        # red-tier (changes only at orchestrator restart), so an hours-old
+        # snapshot still carries the correct depth. Absent/unreadable snapshot
+        # falls back COARSE (the config scalar) — see effective_lock_depth.
+        lock_depth = effective_lock_depth(
+            project_root, self._config.curator.lock_depth,
+        )
         pool: list[_PoolEntry] = []
         seen_ids: set[str] = set()
 

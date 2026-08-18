@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -22,6 +23,7 @@ from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import TaskmasterError, TaskNotFoundError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
+from fused_memory.mcp_tools.scheduler_state import effective_lock_depth
 from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.middleware.task_curator import (
     _CURATOR_PROMPT_HARNESS_VERSION,
@@ -6493,3 +6495,113 @@ class TestCuratorDeterministicRefusal:
 
         assert decision is not None and decision.action == "refuse"
         assert payload_hash not in curator._decision_cache
+
+
+class TestPerProjectLockDepth:
+    """lock_depth must be resolved PER PROJECT from the scheduler snapshot.
+
+    fused-memory is one server serving many projects whose orchestrators run
+    at different effective depths (3..12 across the fleet). A single global
+    scalar is wrong for nearly all of them, so the curator reads the depth the
+    orchestrator itself published in ``scheduler_state.json``.
+    """
+
+    @staticmethod
+    def _write_snapshot(root: Path, depth):
+        d = root / 'data' / 'orchestrator'
+        d.mkdir(parents=True, exist_ok=True)
+        body = {'parks': {}, 'current_holders': {}}
+        if depth is not None:
+            body['lock_depth'] = depth
+        (d / 'scheduler_state.json').write_text(json.dumps(body))
+
+    def test_snapshot_present_yields_that_depth(self, tmp_path):
+        self._write_snapshot(tmp_path, 12)
+        assert effective_lock_depth(str(tmp_path), 2) == 12
+
+    def test_missing_snapshot_falls_back_coarse(self, tmp_path):
+        # Freshly onboarded project: orchestrator has never run. Must NOT
+        # raise, must NOT invent a fleet-typical value like 4 — coarse is the
+        # fail-safe direction for a dedup tool.
+        assert effective_lock_depth(str(tmp_path / 'never-run'), 2) == 2
+
+    def test_snapshot_without_lock_depth_falls_back_coarse(self, tmp_path):
+        self._write_snapshot(tmp_path, None)
+        assert effective_lock_depth(str(tmp_path), 2) == 2
+
+    def test_unreadable_snapshot_falls_back_coarse(self, tmp_path):
+        d = tmp_path / 'data' / 'orchestrator'
+        d.mkdir(parents=True)
+        (d / 'scheduler_state.json').write_text('{not json')
+        assert effective_lock_depth(str(tmp_path), 2) == 2
+
+    @pytest.mark.parametrize('bad', [0, -1, True, '12', 4.0, None])
+    def test_unusable_depth_values_fall_back_coarse(self, tmp_path, bad):
+        # bool is an int subclass; True must never be read as depth 1.
+        self._write_snapshot(tmp_path, bad)
+        assert effective_lock_depth(str(tmp_path), 2) == 2
+
+    def test_two_project_roots_in_one_process_yield_two_depths(self, tmp_path):
+        """The multi-project property — a single-project test cannot show it.
+
+        This is the assertion that fails against the old global scalar.
+        """
+        shallow = tmp_path / 'shallow-project'
+        deep = tmp_path / 'deep-project'
+        self._write_snapshot(shallow, 4)
+        self._write_snapshot(deep, 12)
+
+        assert effective_lock_depth(str(shallow), 2) == 4
+        assert effective_lock_depth(str(deep), 2) == 12
+        # ...and interleaved, to rule out any cached/global first-wins value.
+        assert effective_lock_depth(str(shallow), 2) == 4
+
+    @pytest.mark.asyncio
+    async def test_module_keys_differ_per_project_in_assembled_pool(self, tmp_path):
+        """USER-OBSERVABLE SIGNAL: same candidate payload, two projects,
+        module-stream keys computed at each project's own depth."""
+        shallow = tmp_path / 'shallow-project'
+        deep = tmp_path / 'deep-project'
+        self._write_snapshot(shallow, 4)
+        self._write_snapshot(deep, 12)
+
+        files = ['a/b/c/d/e/f.py']
+
+        async def build(project_root: str):
+            config = _make_config()
+            taskmaster = AsyncMock()
+            taskmaster.get_task = AsyncMock(return_value=None)
+            taskmaster.get_tasks = AsyncMock(return_value={
+                'tasks': [{
+                    'id': '300',
+                    'title': 'Pending work in same file',
+                    'status': 'pending',
+                    'priority': 'medium',
+                    'files_to_modify': files,
+                }],
+            })
+            curator = TaskCurator(config=config, taskmaster=taskmaster)
+
+            async def fail_collection(*a, **k):
+                raise RuntimeError('no qdrant')
+
+            with patch.object(curator, '_ensure_collection', side_effect=fail_collection):
+                pool, _sizes = await curator._build_corpus(
+                    CandidateTask(title='New bug', files_to_modify=files),
+                    project_id='p', project_root=project_root,
+                )
+            return [e for e in pool if e.source == 'module']
+
+        shallow_entries = await build(str(shallow))
+        deep_entries = await build(str(deep))
+
+        assert shallow_entries and deep_entries, 'module stream should match in both'
+        shallow_keys = set(shallow_entries[0].module_keys)
+        deep_keys = set(deep_entries[0].module_keys)
+
+        assert shallow_keys == {'a/b/c/d'}
+        assert deep_keys == {'a/b/c/d/e/f.py'}
+        assert shallow_keys != deep_keys, (
+            'module keys must reflect each project\'s own depth; identical keys '
+            'mean a single global scalar is still in use'
+        )

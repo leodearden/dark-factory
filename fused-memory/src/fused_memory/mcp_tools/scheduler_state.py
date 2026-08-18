@@ -57,6 +57,49 @@ def read_scheduler_state(project_root: Path) -> dict:
     return _empty_skeleton()
 
 
+def effective_lock_depth(project_root, default):
+    """Return the scheduler's effective ``lock_depth`` for one project.
+
+    fused-memory is ONE server serving MANY projects, and each project's
+    orchestrator resolves its own ``lock_depth`` (measured 2026-08-07 across
+    the fleet: 3, 4, 4, 4, 4, 10, 12 — five distinct values). A single global
+    scalar in fused-memory's own config cannot match all of them, so callers
+    that need scheduler-consistent lock keys must resolve the depth per
+    project. This reads the value the orchestrator itself published, so there
+    is no second implementation of the orchestrator's config layering (package
+    ``defaults.yaml`` -> project yaml -> pydantic default) here — that layering
+    lives in ``orchestrator.config``, which fused-memory deliberately does not
+    import.
+
+    STALENESS IS A NON-ISSUE FOR THIS FIELD SPECIFICALLY. ``lock_depth`` is
+    red-tier (not in the orchestrator's ``RELOADABLE_FIELDS``), so it changes
+    only at orchestrator restart — unlike ``parks``/``current_holders`` in the
+    same snapshot, which are live state and genuinely stale between writes. A
+    snapshot hours old still carries the correct depth.
+
+    ``default`` is returned when the snapshot is absent (a freshly onboarded
+    project whose orchestrator has never run), unreadable, or carries no
+    usable ``lock_depth``. Callers should pass a COARSE default rather than a
+    guess at "the usual" fleet value: for a dedup tool the error costs are
+    asymmetric — a falsely-coarse key over-matches, costing one LLM look at an
+    irrelevant pool entry, while a falsely-fine key under-matches and costs a
+    DUPLICATE TASK, which is the failure the curator exists to prevent.
+    """
+    try:
+        state = read_scheduler_state(Path(project_root))
+    except Exception as exc:  # defensive: never let depth resolution raise
+        _log.warning(
+            'effective_lock_depth: %s — falling back to coarse default %s',
+            exc, default,
+        )
+        return default
+    depth = state.get('lock_depth')
+    # bool is an int subclass; reject it explicitly so True never means depth 1.
+    if isinstance(depth, int) and not isinstance(depth, bool) and depth > 0:
+        return depth
+    return default
+
+
 async def read_scheduler_events(
     project_root: Path,
     since: str | None,

@@ -1887,8 +1887,17 @@ class CuratorConfig(BaseModel):
     pool_dependency_cap: int = Field(default=3)
     pool_total_cap: int = Field(default=30)
 
-    # Lock-key depth must match the scheduler's lock_depth to make module-pool
-    # matching scheduler-consistent. Default 2 matches shared.locking defaults.
+    # COARSE FALLBACK ONLY — this is not the depth the curator normally uses.
+    # Module-pool keys must match the *scheduler's* lock_depth to be
+    # scheduler-consistent, and that depth is per-project (measured 2026-08-07
+    # across the fleet this one server serves: 3, 4, 4, 4, 4, 10, 12). The
+    # curator resolves it per call from <project_root>'s scheduler_state.json
+    # snapshot via ``effective_lock_depth``; this scalar is used only when no
+    # snapshot exists (a freshly onboarded project whose orchestrator has never
+    # run) or it is unreadable. Deliberately COARSE rather than a guess at the
+    # fleet's usual value: for a dedup tool a too-coarse key over-matches and
+    # costs one LLM look at an irrelevant pool entry, while a too-fine key
+    # under-matches and costs a DUPLICATE TASK.
     lock_depth: int = Field(default=2)
 
     # Idempotency cache: skip re-invoking the LLM for the same candidate payload
