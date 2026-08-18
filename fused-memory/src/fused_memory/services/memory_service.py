@@ -527,10 +527,16 @@ async def _apply_memory_metadata_validation(
     false rejections/week).  Validating the full effective dict on every
     patch would silently invalidate that measurement: legacy records are
     known fatal-invalid today (``scripts/sweep_toolcall_xml_leak.py``
-    enumerates unknown ``kind``, malformed ``supersedes``, non-bool
-    ``canonical``), so re-tagging exactly those records — including by the
-    repair sweeps that exist to fix them — would start failing the moment
-    the flip landed.  Costs one extra PURE synchronous
+    enumerates the classes — unknown ``kind``, malformed ``supersedes``,
+    non-bool ``canonical``), so re-tagging exactly those records would start
+    failing the moment the flip landed.  ``scripts/retro_stamp_topics.py``
+    is the in-repo bulk re-tagger that would hit it: it stamps ``topic``
+    onto legacy records through THIS path, one metadata-only patch each.
+    (That sweep is cited for the enumeration and for the re-tagging
+    exposure, NOT as a caller of this arm — it repairs by delete + re-add
+    through ``add_memory`` and pre-checks with ``validate_memory_metadata``
+    itself, so it never reaches ``update_memory``.)  Costs one extra PURE
+    synchronous
     ``validate_memory_metadata`` call on a shallow copy, and zero I/O; see
     the block comment at the subtraction for the two-halves forgiveness rule
     and its ordering constraints.
@@ -5104,10 +5110,10 @@ class MemoryService:
           relative to the record's pre-image are judged.  Amending a record
           never re-validates the record.  See ``baseline`` on the seam.
         * A CONTENT-ONLY amend does not run it at all.  Such a write leaves the
-          metadata byte-identical, so there is nothing it is responsible for;
-          validating anyway would make a legacy record's TEXT uncorrectable
-          under ``enforce`` — blocking the very repair sweeps
-          (``scripts/sweep_toolcall_xml_leak.py``) that exist to fix it.
+          metadata byte-identical, so there is nothing it is responsible for.
+          That reason stands unaided; the consequence of getting it wrong is
+          that a legacy record's TEXT would become uncorrectable under
+          ``enforce`` because of metadata the amend never touched.
 
         Returns the ``{'status': 'updated', 'store': 'mem0', 'id': memory_id,
         ...}`` envelope on success, or a structured ``{'error_type': ...}``
@@ -5217,13 +5223,17 @@ class MemoryService:
         # GATED ON A METADATA DELTA EXISTING. A content-only amend leaves the
         # record's metadata byte-identical, so this write is responsible for
         # none of it; validating it anyway would be corpus re-validation by
-        # another name. Under `enforce` that would make a legacy record's TEXT
-        # uncorrectable because of unrelated legacy metadata — blocking the
-        # very repair sweeps (sweep_toolcall_xml_leak.py) that exist to fix
-        # those records — and would quietly restate `enforce` from "rejects
-        # WRITES" to "re-validates the corpus", the model task 3626's flip
-        # measurement depends on. It also keeps the seam's cost off the one
-        # arm that already pays for a re-embed.
+        # another name. That first-principles reason is the whole
+        # justification and stands unaided — do not prop it up with a named
+        # repair sweep: no in-repo sweep drives this arm (grepped — the only
+        # callers of MemoryService.update_memory are the MCP tool and
+        # scripts/retro_stamp_topics.py, and the latter never amends
+        # content). The consequence of getting it wrong is nonetheless real:
+        # under `enforce` a legacy record's TEXT would become uncorrectable
+        # because of unrelated legacy metadata, and `enforce` would quietly
+        # restate from "rejects WRITES" to "re-validates the corpus", the
+        # model task 3626's flip measurement depends on. It also keeps the
+        # seam's cost off the one arm that already pays for a re-embed.
         if metadata_patch or metadata_delete_keys:
             await _apply_memory_metadata_validation(
                 new_custom,

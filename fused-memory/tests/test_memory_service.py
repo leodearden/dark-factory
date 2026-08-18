@@ -1719,12 +1719,14 @@ class TestUpdateMemoryContentArm:
         The pre-image staged here is the real hazard, not a contrived one:
         `eval_worktree_plan_tools_missing` is the snake_case topic the live
         `dark_factory` canonical record actually carried, and
-        `sweep_toolcall_xml_leak.py` enumerates legacy records that are
-        fatal-invalid today. Validating it here would make a legacy record's
-        TEXT uncorrectable under `enforce` — blocking the very repair sweeps
-        that exist to fix those records — and would quietly convert `enforce`
-        from "rejects WRITES" into "re-validates the corpus", the model task
-        3626's flip measurement (~20 → ~19 false rejections/week) rests on.
+        `sweep_toolcall_xml_leak.py` enumerates the classes of legacy record
+        that are fatal-invalid today. (Cited for that enumeration only — that
+        sweep repairs by delete + re-add through `add_memory` and never
+        reaches this arm.) Validating here would make a legacy record's TEXT
+        uncorrectable under `enforce` because of metadata the amend never
+        touched, and would quietly convert `enforce` from "rejects WRITES"
+        into "re-validates the corpus", the model task 3626's flip
+        measurement (~20 → ~19 false rejections/week) rests on.
         """
         service.config.memory_metadata.enforce = True
         service.mem0.get_point_by_id = AsyncMock(return_value={
@@ -11438,7 +11440,9 @@ class TestUpdateMemoryValidatesTheDeltaNotTheCorpus:
         """The load-bearing case: routine re-tagging of a legacy record.
 
         Without delta scoping this raises, and `enforce` becomes an outage
-        for exactly the records the repair sweeps exist to fix.
+        for exactly the records that most need re-tagging — including for
+        `retro_stamp_topics.py`, the in-repo bulk re-tagger that actually
+        drives this arm (one metadata-only patch per legacy record).
         """
         service.config.memory_metadata.enforce = True
         self._stage(service, _MM_LEGACY_INVALID_PRE_IMAGE)
