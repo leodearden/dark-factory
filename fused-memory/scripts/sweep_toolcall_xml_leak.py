@@ -97,11 +97,20 @@ shape check, so it costs nothing to run BEFORE the irreversible delete.
 The printed report ALWAYS survives, because for a ``content_lost_in_flight``
 record it is the only remaining copy of the original text. Each record is added
 to the report BEFORE any store mutation is attempted and its repair runs under
-its own ``try``, so one record's transport error is recorded as ``record_error``
-on that record (non-zero exit; whether its delete landed is unknown) and the
-sweep continues instead of unwinding. Should anything escape anyway, ``main``
-owns the progress container and prints the PARTIAL report -- same shape, plus
-``"aborted": true`` -- before exiting 2.
+its own ``try``, so one record's transport error is recorded on that record
+(non-zero exit) and the sweep continues instead of unwinding. Should anything
+escape anyway, ``main`` owns the progress container and prints the PARTIAL
+report -- same shape, plus ``"aborted": true`` -- before exiting 2.
+
+A failed repair is ADJUDICATED, not assumed unknown. A raised ``delete_memory``
+does not mean the delete failed: mem0 removes the Qdrant point BEFORE writing
+its SQLite history, so the measured 7d073281 failure raised with the content
+already gone. The sweep therefore performs the read-only id check the runbook
+used to hand to a human (:func:`probe_delete_landed`) and records the verdict
+as ``delete_landed`` on the record. A landed delete becomes
+``content_lost_in_flight`` like any other; ``record_error`` now means the
+delete demonstrably did NOT land, or the probe could not answer -- the residual
+genuine unknown, which is precisely the state a human has to adjudicate.
 
 Scope
 -----
@@ -876,6 +885,27 @@ async def _repair_record(
     Both flags force a non-zero exit (:func:`resolve_exit_code`) so a skipped
     record is never mistaken for a repaired one.
 
+    POST-DELETE ADJUDICATION. The delete runs under its own ``try``, because a
+    delete that RAISED has not necessarily failed: mem0 removes the Qdrant
+    point BEFORE writing its SQLite history, so the measured 7d073281 failure
+    raised with the content already gone (see :func:`probe_delete_landed`).
+    Every path therefore settles ``record['delete_landed']``:
+
+      * the delete RETURNED -- ``True``, no probe: a returned call is direct
+        evidence;
+      * the delete RAISED and the read-only probe finds the point ABSENT --
+        ``True``, and the record is routed to :func:`_report_content_lost`,
+        the same flag and the same loudness as any other landed-delete loss;
+      * the delete RAISED and the point SURVIVED (``False``) or the probe
+        could not answer (``None``) -- ``record_error``, which has always
+        meant "a human must go and check this id". The ORIGINAL delete error
+        stays in ``record['error']``; the probe's account lives beside it in
+        ``delete_landed_note`` and never displaces it.
+
+    ``delete_landed`` is EVIDENCE, not an outcome: it is deliberately not in
+    :data:`HUMAN_ADJUDICATION_FLAGS`, since every successful repair legitimately
+    carries ``delete_landed: True`` and adding it would fail every clean run.
+
     POSTCONDITION, after the re-add: :func:`readd_persisted` must vouch for the
     response. ``repaired=True`` is set ONLY then. A non-raising ``add_memory``
     that did not actually persist is treated IDENTICALLY to a throw -- same
@@ -929,11 +959,41 @@ async def _repair_record(
         )
         return
 
-    await memory_service.delete_memory(
-        memory_id=memory_id,
-        store='mem0',
-        project_id=args.project_id,
-    )
+    try:
+        await memory_service.delete_memory(
+            memory_id=memory_id,
+            store='mem0',
+            project_id=args.project_id,
+        )
+    except Exception as delete_exc:  # noqa: BLE001 - adjudicated, then reported
+        # A raised delete does NOT mean the point survived. mem0 removes the
+        # Qdrant point BEFORE writing its SQLite history, so the measured
+        # 7d073281 failure raised with the content already gone. Ask the store
+        # (read-only) instead of guessing from the exception.
+        landed, probe_note = await probe_delete_landed(
+            memory_service, args.project_id, memory_id
+        )
+        record['delete_landed'] = landed
+        record['delete_landed_note'] = probe_note
+        if landed is True:
+            _report_content_lost(record, memory_id, f'{delete_exc} -- {probe_note}')
+            return
+        # False (the point survived) or None (unanswerable). record_error has
+        # always meant "a human must go and check this id", which is the honest
+        # label for both. The ORIGINAL delete error is what a human needs, so
+        # the probe's note lives in its own field and never displaces it.
+        record[RECORD_ERROR] = True
+        record['error'] = str(delete_exc)
+        logger.exception(
+            'sweep_toolcall_xml_leak: delete FAILED for memory_id=%s (%s). %s',
+            memory_id, delete_exc, probe_note,
+        )
+        return
+    # A delete that RETURNED is direct evidence that it landed -- no probe
+    # needed. Recorded so run()'s catch-all can attribute anything escaping the
+    # post-delete window below (see run()'s docstring).
+    record['delete_landed'] = True
+
     try:
         response = await memory_service.add_memory(
             content=repaired,
