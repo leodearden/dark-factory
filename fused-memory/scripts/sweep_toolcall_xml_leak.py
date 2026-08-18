@@ -727,13 +727,23 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
       * Each record is appended to ``progress['records']`` BEFORE any mutation
         of the store is attempted, and its per-record body runs under its own
         ``try``. One record's transport error (a ``delete_memory`` timeout, a
-        Qdrant outage) is recorded on THAT record as ``record_error`` and the
-        sweep continues, instead of unwinding the whole run and taking every
-        earlier record's report entry -- including any already-lost original
-        text -- with it.
+        Qdrant outage) is recorded on THAT record and the sweep continues,
+        instead of unwinding the whole run and taking every earlier record's
+        report entry -- including any already-lost original text -- with it.
       * *progress* is caller-owned. Should anything escape anyway, the caller
         still holds every record accumulated so far and can print the partial
         report (see :func:`main`).
+
+    That per-record catch-all ATTRIBUTES rather than assumes. It reads the
+    ``delete_landed`` evidence :func:`_repair_record` has already settled: True
+    means the point is gone, so the escape is a ``content_lost_in_flight``
+    exactly like a raising or non-persisting re-add. That covers the one window
+    ``_repair_record`` cannot -- between ``add_memory`` returning and
+    :func:`readd_persisted` rendering its verdict -- since a response the sweep
+    could not even evaluate cannot be vouched for. False, None, or ABSENT (a
+    pre-flight failure, so no delete was ever attempted) stay ``record_error``.
+    Reading one field, rather than repeating the classification, is what keeps
+    the two sites from drifting apart.
     """
     progress = new_progress() if progress is None else progress
     records: list[dict] = progress['records']
@@ -841,8 +851,20 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
                     match.get('id'),
                 )
         except Exception as exc:  # noqa: BLE001 - one bad record must not void the run
-            record[RECORD_ERROR] = True
-            record['error'] = str(exc)
+            # ONE rule, consulted rather than re-derived: _repair_record has
+            # already settled whether this record's delete landed, so the
+            # catch-all reads that field instead of writing record_error
+            # unconditionally. True covers the window between add_memory
+            # RETURNING and readd_persisted's verdict -- an escape there leaves
+            # a landed delete with no vouched-for replacement, and a response
+            # the sweep could not even evaluate certainly cannot be vouched
+            # for. False/None/ABSENT (a pre-flight failure, so no delete was
+            # ever attempted) correctly stay record_error.
+            if record.get('delete_landed') is True:
+                _report_content_lost(record, match.get('id'), str(exc))
+            else:
+                record[RECORD_ERROR] = True
+                record['error'] = str(exc)
             logger.exception(
                 'sweep_toolcall_xml_leak: memory_id=%s failed mid-repair (%s). '
                 'Recorded on this record and the sweep continues -- aborting here '
