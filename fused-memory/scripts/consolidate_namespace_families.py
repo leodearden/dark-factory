@@ -661,8 +661,8 @@ async def scroll_collection_points(
             'its page budget (%d page(s) of %d) after %d point(s) -- the '
             'enumeration is INCOMPLETE, so this collection is reported '
             'UNRESOLVED and its source will not be deleted (see '
-            'merge_collection). Re-run with a higher --limit (page size) or '
-            'raise the page budget.',
+            'merge_collection). Re-run with a higher --max-pages (page '
+            'budget) or --limit (page size).',
             collection, max_pages, page_size, point_count,
         )
         return point_count, True
@@ -868,6 +868,7 @@ async def run(
     memory_service: Any,
     *,
     limit: int = 1000,
+    max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
 ) -> dict:
     """Enumerate/scroll/count every configured family, collection, junk key,
     and empty-collection candidate and, with ``args.apply``, perform the
@@ -962,7 +963,7 @@ async def run(
         # preflight is vectorless and holds no point list; merge_collection
         # below runs the sole with-vectors drain.
         point_count, capped = await scroll_collection_points(
-            memory_service.mem0, source, page_size=limit,
+            memory_service.mem0, source, page_size=limit, max_pages=max_pages,
         )
         canonical_user_id = canonical_user_id_for(target)
         item = {
@@ -980,7 +981,7 @@ async def run(
         if args.apply and not capped:
             summary = await merge_collection(
                 memory_service.mem0, qdrant_client, source, target, canonical_user_id,
-                page_size=limit,
+                page_size=limit, max_pages=max_pages,
             )
             item.update(summary)
             # A phase-2 drain that died mid-merge upserted only part of the
@@ -1068,12 +1069,12 @@ async def run(
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main() -> int:
-    """Parse CLI args, build a live MemoryService, and run the consolidation."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s %(name)s %(levelname)s %(message)s',
-    )
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser.
+
+    Extracted from ``main()`` so the flags are testable without running the
+    consolidation, mirroring ``census_memory_metadata.py::_build_parser``.
+    """
     parser = argparse.ArgumentParser(
         description=(
             'Consolidate cross-graph namespace families: merge sibling Graphiti '
@@ -1095,15 +1096,33 @@ def main() -> int:
              'reported UNRESOLVED. For the COLLECTION scroll it is the PAGE '
              'SIZE -- pages are followed to exhaustion, so a collection larger '
              'than this now migrates fully instead of being permanently '
-             f'UNRESOLVED; the page budget ({DEFAULT_SCROLL_MAX_PAGES} pages) '
-             'bounds the total. Increase if the dry-run report logs a '
-             'row-cap or page-budget WARNING; memory scales with this value.',
+             'UNRESOLVED; --max-pages bounds the total. It is also the merge '
+             'upsert CHUNK size, so peak memory scales with this value, not '
+             'with the collection. Increase if the dry-run report logs a '
+             'row-cap WARNING.',
+    )
+    parser.add_argument(
+        '--max-pages', dest='max_pages', type=int, default=DEFAULT_SCROLL_MAX_PAGES,
+        help='Per-collection PAGE BUDGET for the Qdrant scroll (default: '
+             f'{DEFAULT_SCROLL_MAX_PAGES}). Total points enumerated per '
+             'collection is bounded by --limit x --max-pages; exceeding it '
+             'reports that collection UNRESOLVED with its source undeleted. '
+             'Raise it when the report logs a page-budget WARNING.',
     )
     parser.add_argument(
         '--config', default=None,
         help='Path to a fused-memory config file (sets CONFIG_PATH before loading).',
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    """Parse CLI args, build a live MemoryService, and run the consolidation."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(name)s %(levelname)s %(message)s',
+    )
+    args = _build_parser().parse_args()
 
     if args.config:
         import os  # noqa: PLC0415
@@ -1117,7 +1136,7 @@ def main() -> int:
         memory = MemoryService(config)
         try:
             await memory.initialize()
-            return await run(args, memory, limit=args.limit)
+            return await run(args, memory, limit=args.limit, max_pages=args.max_pages)
         finally:
             if hasattr(memory, 'close'):
                 await memory.close()
