@@ -76,8 +76,15 @@ from fused_memory.services.memory_metadata_census import (
     file_unknown_key_storm_escalation,
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
+from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.referent_resolution import (
+    REFERENT_SOURCES,
+    ReferentResolution,
+    ReferentSet,
+    resolve_referents,
+)
 from fused_memory.utils.task_naming import canonicalize_task_node_name
-from fused_memory.utils.validation import require_full_uuid
+from fused_memory.utils.validation import _safe_repr, require_full_uuid
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -1081,6 +1088,182 @@ def _serialize_temporal(
     }
 
 
+def _encode_referents(resolution: ReferentResolution) -> dict[str, Any]:
+    """Encode a resolved referent set for the durable-queue payload.
+
+    THE WIRE CONTRACT (task 3670, PRD leaf epsilon).  One additional key,
+    ``'referents'``, on the EXISTING ``add_episode`` / ``add_memory_graphiti``
+    payloads::
+
+        {'source': <one of REFERENT_SOURCES>,
+         'refs': [{'kind': ..., 'project_id': ..., 'number': ...}, ...]}
+
+    Deliberately NO ``payload_version``, no unknown-operation guard and no
+    migration (PRD "Queue compatibility is free here").  An OLD consumer
+    draining a new row ignores exactly one unknown key; a NEW consumer draining
+    an old row finds the key absent and treats it as "no referents" — which is
+    today's behaviour exactly.  A new queue OPERATION would have needed all
+    three; one additional key on an existing payload needs none of them.
+
+    Nesting everything under a single key (rather than flat ``referent_source``
+    + ``referent_refs``) keeps the back-compat story to one presence test and
+    gives :func:`_decode_referents` exactly one thing to validate.
+
+    Emits PLAIN JSON SCALARS ONLY, never the frozen :class:`Referent` dataclass
+    itself: the queue persists payloads as JSON TEXT in SQLite, so a
+    non-serializable value here would surface only in production.
+
+    AMBIGUITY IS DELIBERATELY NOT THREADED — READ THIS BEFORE WRITING ZETA.
+    ``ReferentResolution.ambiguous`` (and ``.conflicts``) are dropped here; only
+    ``.source`` and ``.referents`` ride the wire.  That matters because gamma
+    excludes ambiguous referents from ``.referents`` on purpose ("recorded, not
+    guessed"), so a consumer that reads ONLY ``refs`` sees an ambiguous endpoint
+    as a plain non-member of the set — indistinguishable from a genuine
+    conflation.  Leaf zeta must therefore NOT treat "endpoint not in the decoded
+    set" as sufficient grounds for leaf eta to repoint the edge, or an ambiguous
+    reference gets destructively repaired instead of recorded and left alone
+    (PRD boundary-test table: "Ambiguous scan | ref routed to ``.ambiguous``;
+    treated as undeclared; recorded, not guessed").
+
+    Zeta re-derives it rather than reading it off the wire.  ``.ambiguous`` is
+    ``scan_content(content, group_id=group_id).ambiguous`` verbatim on EVERY
+    precedence path — a pure function of ``(content, group_id)``, independent of
+    ``declared``/``metadata`` (referent_resolution.py: "`.ambiguous` is the
+    scan's verbatim answer on every path").  ``_execute_graphiti_write`` holds
+    both ``payload['content']`` and ``payload['group_id']``, so zeta can recover
+    the producer's exact ambiguity set from data already on the payload.
+
+    That re-derivation is a SECOND SCAN SITE, which gamma's own comment flags as
+    the INV-5 lockstep duplication canonical_labels exists to prevent — so
+    carrying ``'ambiguous'`` as a third key is the better long-term shape and is
+    filed as follow-up work.  It is not done here because this leaf's frozen
+    contract is the two-key blob and widening it changes this function's return
+    arity and the wire shape every test in
+    tests/test_referent_queue_threading.py pins.  Extending it later is
+    additive and needs no migration, exactly as adding ``'referents'`` did.
+    """
+    return {
+        'source': resolution.source,
+        'refs': [
+            {'kind': r.kind, 'project_id': r.project_id, 'number': r.number}
+            for r in resolution.referents
+        ],
+    }
+
+
+def _decode_referents(payload: dict[str, Any]) -> tuple[ReferentSet, str]:
+    """Pop and decode the ``'referents'`` blob :func:`_encode_referents` wrote.
+
+    Returns ``(referents, source)``.  An ABSENT key decodes to ``((), 'none')``
+    — an old-format queue row executes byte-identically to today.
+
+    POPS the key, matching how ``_execute_graphiti_write`` already treats
+    ``temporal_context`` / ``unverified_claim`` / ``reference_time``.  Safe
+    because ``DurableWriteQueue._process_item`` hands the executor one
+    ``parsed_payload()`` and the registered callback a SECOND, FRESH one,
+    precisely so the executor can pop what the callbacks read back.
+
+    Each entry is rebuilt through the ``Referent(...)`` constructor rather than
+    kept as a bare dict, so the frozen type's kind-registry validation runs on
+    untrusted wire data too — which is also what makes an unregistered ``kind``
+    on the wire fall into the degradation path below instead of minting a bogus
+    referent.  That constructor validates ``kind`` ONLY, so ``number`` and
+    ``project_id`` are type-checked here before it runs; see the inline comment
+    in the decode loop for the three distinct ways an unchecked field escapes.
+
+    DEGRADATION IS ALL-OR-NOTHING.  Any unreadable element — a non-dict blob, a
+    ``source`` outside :data:`REFERENT_SOURCES`, a non-list ``refs``, or a
+    SINGLE malformed entry — degrades the WHOLE blob to ``((), 'none')``, never
+    a partial set.  A partial set is worse than no set for the consumer this
+    exists to serve: leaf zeta's set-membership check reads "endpoint not in
+    the referent set" as a conflation and leaf eta repairs it by repointing the
+    edge, so a referent silently dropped by a lenient decoder would manufacture
+    a false conflation and drive destructive edge surgery onto the wrong node.
+    Referents are therefore accumulated into a local list and only frozen into
+    a tuple on FULL success, so a partial set cannot escape by construction.
+
+    DEGRADES RATHER THAN RAISES, deliberately.  This runs inside the queue
+    executor: raising would route the item to ``_handle_failure`` and
+    eventually dead-letter it, LOSING the memory over a telemetry field.
+    Degrading is safe here only BECAUSE the anomaly lands in the 'none' bucket
+    that ``_execute_graphiti_write``'s counter makes loud — the INV-4 escape,
+    not a silent fallthrough.  The ABSENT key is the one case that does NOT
+    warn: it is the load-bearing back-compat path (every row written before
+    task 3670), not an anomaly, and warning on it would drown the log during a
+    drain of a pre-feature queue.  It is still COUNTED, in the same bucket.
+
+    Loud-and-degrade mirrors the invalid-``reference_time`` arm already in
+    ``_execute_graphiti_write``, so this file has one idiom, not two.
+    """
+    blob = payload.pop('referents', None)
+    if blob is None:
+        return (), 'none'
+
+    def _degrade(reason: str) -> tuple[ReferentSet, str]:
+        # _safe_repr, not a bare %r: the blob is arbitrary decoded JSON from a
+        # queue row and this warning fires on EVERY retry attempt of that item,
+        # so an oversized corrupt value would otherwise dump its full repr into
+        # the log repeatedly. Matches how the sibling module this codec is
+        # written against (utils/referent_resolution.py) renders every one of
+        # its untrusted-value rejection messages.
+        logger.warning(
+            "Unreadable 'referents' payload key (%s); treating the write as "
+            'having no referents. Blob: %s',
+            reason, _safe_repr(blob),
+        )
+        return (), 'none'
+
+    if not isinstance(blob, dict):
+        return _degrade(f'expected a dict, got {type(blob).__name__}')
+    source = blob.get('source')
+    if source not in REFERENT_SOURCES:
+        return _degrade(f'source {source!r} is not one of {list(REFERENT_SOURCES)}')
+    refs = blob.get('refs')
+    if not isinstance(refs, list):
+        return _degrade(f"'refs' must be a list, got {type(refs).__name__}")
+
+    decoded: list[Referent] = []
+    for entry in refs:
+        if not isinstance(entry, dict):
+            return _degrade(f'entry {_safe_repr(entry)} is not a dict')
+        # `Referent.__post_init__` validates `kind` against the kind registry
+        # but NOT `number`/`project_id` — those two fields accept any object at
+        # all, so the constructor alone does NOT harden this boundary. Each
+        # unchecked type is a distinct downstream failure:
+        #   - a non-str `number` (e.g. 3127) mints a Referent that compares
+        #     UNEQUAL to its string twin, so leaf zeta's set-membership check
+        #     would read a legitimate endpoint as a conflation and leaf eta
+        #     would repoint the edge destructively — the same false-conflation
+        #     failure the all-or-nothing rule above exists to prevent, arriving
+        #     through a mistyped field instead of a dropped one;
+        #   - a None `number`/`project_id` mints a referent whose `node_name`
+        #     is the literal string 'Task None';
+        #   - an UNHASHABLE `number` (a list) mints a Referent that raises
+        #     TypeError the moment a consumer puts it in a set — a raise inside
+        #     the queue executor, i.e. exactly the dead-letter-and-lose-the-
+        #     memory outcome degrade-rather-than-raise exists to prevent.
+        # `_encode_referents` only ever emits strings, so this is reachable
+        # today only from a corrupt or hand-edited SQLite row — but this
+        # function is the wire-hardening boundary, so it hardens the fields
+        # that matter rather than assuming its own encoder wrote the row.
+        number = entry.get('number')
+        project_id = entry.get('project_id', '')
+        if not isinstance(number, str) or not isinstance(project_id, str):
+            return _degrade(
+                f'entry {_safe_repr(entry)} has a non-string number/project_id'
+            )
+        try:
+            decoded.append(Referent(
+                kind=entry.get('kind', 'task'),
+                project_id=project_id,
+                number=number,
+            ))
+        except (KeyError, TypeError, ValueError) as e:
+            return _degrade(f'entry {_safe_repr(entry)} is not a valid Referent: {e}')
+
+    return tuple(decoded), source
+
+
 def _created_at_to_utc_iso(created_at: datetime | None) -> str | None:
     """Serialize an episode's created_at to canonical UTC ISO-8601, or None.
 
@@ -1415,6 +1598,26 @@ class MemoryService:
         # likely to be noticed any other way.
         self._mem0_update_storm_counters: dict[str, StormCounter] = {}
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
+        # INV-4 storm escape for the referent-set queue channel (task 3670, PRD
+        # leaf epsilon). `_decode_referents` degrades an unreadable or absent
+        # blob to ('none') rather than raising — losing the memory over a
+        # telemetry field would be worse — so that degradation MUST be counted
+        # rather than silently fallen through. Constructed UNCONDITIONALLY, for
+        # the same reason the two counters above are: an alarm that only exists
+        # when `_write_journal` is configured would vanish in exactly the
+        # degraded configuration where a referent-less write storm is least
+        # likely to be noticed any other way.
+        #
+        # Bucketed by ALL FOUR sources, not just 'none', because leaf iota needs
+        # a DENOMINATOR: "sustained 100% none" is a rate, and an absolute
+        # none-count alone cannot distinguish a broken producer from a quiet
+        # system. Keyed off gamma's exported REFERENT_SOURCES so the vocabulary
+        # lives at ONE site (that constant's stated purpose) and a fifth source
+        # cannot escape the counter.
+        #
+        # Bounded by that four-member closed vocabulary, so unlike the per-agent
+        # storm counters above it needs no pruning.
+        self._referent_source_counts: dict[str, int] = dict.fromkeys(REFERENT_SOURCES, 0)
         # Test seam for the injectable-clock convention: a 3600s window has to
         # be exercised by advancing a fake clock, not by sleeping.
         self._mem0_update_storm_time_provider: Callable[[], float] = time.time
@@ -2504,6 +2707,47 @@ class MemoryService:
         )
         return stats
 
+    def referent_source_counts(self) -> dict[str, int]:
+        """How many Graphiti write ATTEMPTS resolved to each referent source.
+
+        ATTEMPTS, not completed writes, and the distinction is load-bearing for
+        anyone building an alert on the rate.  The increment sits at the TOP of
+        ``_execute_graphiti_write``, which ``DurableWriteQueue._process_item``
+        re-invokes on every RETRY of an item with a freshly parsed payload — so
+        a retry storm on one group inflates whichever bucket that item lands in,
+        and an item that eventually dead-letters is still counted.  Retries are
+        in the numerator AND the denominator; the skew is roughly uniform across
+        buckets in the common case (a row's source does not change between its
+        own attempts), so a "sustained 100% none" reading survives it, but a
+        per-bucket ABSOLUTE count must not be read as a count of memories.
+
+        The increment deliberately stays at the top rather than moving after the
+        successful backend call: counting only successes would make the escape
+        go dark during a backend outage — exactly when a referent-less write
+        storm is least likely to be noticed any other way — and would decouple
+        it from the single decode the journal stamp also reads.
+
+        The INV-4 storm escape for the referent-set queue channel (task 3670,
+        PRD leaf epsilon), and the read side of ``_referent_source_counts``.
+
+        Emitted at the CONSUMER (``_execute_graphiti_write``), not at the three
+        producers, deliberately: the regression this exists to detect is "the
+        plumbing breaks, every row arrives referent-less, and the feature
+        no-ops in total silence", and that failure lives on the PRODUCER side —
+        a counter emitted there would go dark in exactly that scenario. Only
+        the consumer sees both new-format and old-format rows.
+
+        Buckets ALL FOUR sources rather than only 'none', because leaf iota
+        needs a denominator: "sustained 100% none" is a RATE, and an absolute
+        none-count alone cannot distinguish a broken producer from a quiet
+        system.
+
+        Returns a COPY, so a caller cannot mutate the escape hatch's own state.
+        Process-lifetime totals, never reset — a monotonic counter a reader
+        samples and differences, matching the uptime-baseline convention above.
+        """
+        return dict(self._referent_source_counts)
+
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
     ) -> Any:
@@ -2522,6 +2766,23 @@ class MemoryService:
         # the tag reaches the persisted episodic node (and, via
         # _dual_write_callback, every fact derived from it).
         unverified_claim = bool(payload.pop('unverified_claim', False))
+        # task 3670: the referent set resolved at the write boundary, popped on
+        # the same channel. An ABSENT key decodes to ((), 'none'), so a queue
+        # row written before this feature executes byte-identically to today.
+        #
+        # `referents` is the value leaf zeta will hand to
+        # `_verify_episode_referents(result, group_id=..., referents=referents)`
+        # INSIDE the identity-lock critical section below — deliberately inside,
+        # so no wrongly-attached state is ever externally visible between the
+        # write and its verification. Nothing else in this method changes, which
+        # is what keeps an old-format row byte-identical.
+        referents: ReferentSet
+        referents, referent_source = _decode_referents(payload)
+        # INV-4 escape: EVERY Graphiti write is bucketed, so the absent and
+        # degraded paths are counted rather than silently falling through. See
+        # `_referent_source_counts` in __init__ for why this is unconditional
+        # and why all four sources are bucketed. Leaf iota reads it.
+        self._referent_source_counts[referent_source] += 1
         reference_time_iso = payload.pop('reference_time', None)
         reference_time = None
         if reference_time_iso is not None:
@@ -2553,7 +2814,26 @@ class MemoryService:
                 causation_id=causation_id,
                 backend='graphiti',
                 operation='add_episode',
-                payload={'content': payload['content'][:200], 'group_id': payload.get('group_id')},
+                # referent_source/referent_count (task 3670) are the DURABLE
+                # half of the telemetry split, and come from the ONE decode
+                # above — never re-derived, so the durable channel and the
+                # in-process counter cannot disagree. The counter is the
+                # unconditional INV-4 escape (it exists even when
+                # `_write_journal` is None); this row is what gives leaf iota
+                # per-project, time-windowed data, through a journal row that
+                # already exists — no new schema, no new table, no new write.
+                # That resolves epsilon's half of PRD open question 2 (which
+                # suggested `write_ops.params`) without pre-empting iota's
+                # read-path choice.
+                #
+                # `len(referents)` is also what keeps the decoded set a live
+                # local rather than dead code until leaf zeta lands.
+                payload={
+                    'content': payload['content'][:200],
+                    'group_id': payload.get('group_id'),
+                    'referent_source': referent_source,
+                    'referent_count': len(referents),
+                },
                 coro=self.graphiti.add_episode(
                     name=payload.get('name', ''),
                     content=payload['content'],
@@ -2860,6 +3140,26 @@ class MemoryService:
 
         assert self.durable_queue is not None
 
+        # Resolve WHICH referents this episode is about (task 3670, PRD leaf
+        # epsilon) BEFORE the try below, for the same loud-over-silent reason
+        # add_memory's call sits outside its own try: gamma raises
+        # InputValidationError on a structural wiring bug, and that must not be
+        # absorbed by an enqueue-failure handler.
+        #
+        # metadata=None is not an oversight: add_episode deliberately never
+        # persists a metadata argument — the same fact that forced task 3142's
+        # `unverified_claim` onto this payload channel — so the bridge has
+        # nothing to read and the derived scan is the only live source here.
+        #
+        # declared=None: leaf delta owns the `entities` parameter; this is the
+        # seam it fills.
+        resolution = resolve_referents(
+            declared=None,
+            metadata=None,
+            content=content,
+            group_id=scope.graphiti_group_id,
+        )
+
         success = True
         error_msg = None
         try:
@@ -2883,6 +3183,7 @@ class MemoryService:
                     'temporal_context': temporal_context,
                     'unverified_claim': unverified_claim,
                     'reference_time': reference_time.isoformat() if reference_time is not None else None,
+                    'referents': _encode_referents(resolution),
                 },
                 callback_type='dual_write_episode',
             )
@@ -3009,6 +3310,32 @@ class MemoryService:
 
         # Graphiti: enqueue via durable queue (async, but durably persisted)
         if write_graphiti:
+            # Resolve WHICH referents this write is about (task 3670, PRD leaf
+            # epsilon), so leaf zeta can verify the resulting edges against it.
+            #
+            # Placement is load-bearing at BOTH ends:
+            #   INSIDE `if write_graphiti:` — a Mem0-only write never reaches
+            #   Graphiti, so it pays for no scan;
+            #   OUTSIDE the `try:` below, which degrades to `_graphiti_error`
+            #   and DROPS the Graphiti write. gamma raises InputValidationError
+            #   on structural inputs (a non-str content or group_id) precisely
+            #   so a wiring bug is loud; resolving inside that try would
+            #   convert that loud signal into a silently skipped Graphiti
+            #   write.
+            #
+            # `meta` is read AFTER _normalize_task_id_metadata has coerced
+            # task_id to a scalar str, which is the contract gamma's metadata
+            # bridge documents itself against.
+            #
+            # declared=None: leaf delta owns the `entities` parameter and its
+            # `_entities_gate`, and THIS CALL is the single seam it fills. No
+            # declared referents can exist until it lands.
+            resolution = resolve_referents(
+                declared=None,
+                metadata=meta,
+                content=content,
+                group_id=scope.graphiti_group_id,
+            )
             try:
                 assert self.durable_queue is not None
                 await self.durable_queue.enqueue(
@@ -3022,6 +3349,8 @@ class MemoryService:
                         'source_description': f'add_memory:{resolved_category.value}',
                         '_causation_id': causation_id,
                         '_write_op_id': write_op_id,
+                        # Popped and decoded by _execute_graphiti_write.
+                        'referents': _encode_referents(resolution),
                     },
                     callback_type='refresh_entity_summaries',
                 )
@@ -3507,8 +3836,43 @@ class MemoryService:
             content = mem.get('memory', '')
             if not content:
                 continue
+            if not isinstance(content, str):
+                # `resolve_referents` (task 3670) raises InputValidationError on
+                # a truthy non-str content, deliberately — but this call sits in
+                # a per-memory loop whose `enqueue_batch` only runs AFTER the
+                # loop completes, so letting it propagate would abort the WHOLE
+                # replay and enqueue nothing over ONE malformed Mem0 record.
+                # Skipping the record keeps the blast radius at one row, which
+                # is what it was before referents were threaded here. Loud
+                # rather than silent, unlike the empty-content skip above: an
+                # empty memory is ordinary, a non-str one is a Mem0 anomaly.
+                logger.warning(
+                    'Skipping replay of a Mem0 record whose memory is not a '
+                    'string (got %s): %s',
+                    type(content).__name__, _safe_repr(content),
+                )
+                continue
             meta = mem.get('metadata', {}) or {}
             category = meta.get('category', 'observations_and_summaries')
+            # The THIRD and last producer of add_memory_graphiti rows (task
+            # 3670, PRD leaf epsilon). Threaded even though the PRD named only
+            # the two primary write-boundary sites: replayed rows carry real
+            # prose whose referents the derived scanner can see, so leaving
+            # them on the absent path would stamp them 'none' and inflate leaf
+            # iota's undeclared bucket with writes that were plainly derivable
+            # — a false regression signal in the very counter this task exists
+            # to make trustworthy. They also produce real graph edges leaf zeta
+            # will want to verify.
+            #
+            # Unlike add_episode, this loop DOES hold a metadata dict (the Mem0
+            # record's own), so the bridge is live here. declared=None: leaf
+            # delta's seam, as at the other two producers.
+            #
+            # add_system_record is deliberately NOT threaded — it is Mem0-only
+            # and never routes to Graphiti.
+            resolution = resolve_referents(
+                declared=None, metadata=meta, content=content, group_id=target,
+            )
             batch.append({
                 'group_id': target,
                 'operation': 'add_memory_graphiti',
@@ -3518,6 +3882,7 @@ class MemoryService:
                     'source': 'text',
                     'group_id': target,
                     'source_description': f'replay_from_mem0:{category}',
+                    'referents': _encode_referents(resolution),
                 },
                 'callback_type': 'refresh_entity_summaries',
             })
