@@ -22,10 +22,11 @@ from shared.cli_invoke import (
     invoke_with_cap_retry,
     transcript_exists,
 )
+from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
 from shared.mcp_envelope import resolver_failed
 from shared.task_metadata import RoutingState
-from shared.transcript_archive import durable_archive_path
+from shared.transcript_archive import archive_task_transcripts, durable_archive_path
 
 from orchestrator import digest as digest_mod
 from orchestrator.agents.briefing import BriefingAssembler
@@ -3070,6 +3071,107 @@ class Harness:
         )
         return key
 
+    def _sweep_orphaned_transcripts(self, *, deadline_secs: float = 30.0) -> int:
+        """Archive transcripts left behind on surviving worktrees; return the count.
+
+        The boot-time half of INV-7.  ``archive_before_delete`` makes archival a
+        PRECONDITION of config-dir deletion everywhere the orchestrator itself
+        does the deleting, which closes every path this process walks — but a
+        SIGKILL walks none of them, and ``archive_before_delete`` also
+        deliberately HOLDS a ``.jsonl`` it could not make durable (having purged
+        the credential-bearing rest of the config dir around it).  Both leave
+        transcripts sitting in a worktree with no other owner.  This sweep is
+        that owner: the held/orphaned state is bounded by the NEXT PROCESS
+        START rather than being unbounded, which is what makes the hold safe to
+        take in the first place.
+
+        It COPIES (:func:`shared.transcript_archive.archive_task_transcripts`,
+        reused unchanged) and never deletes.  The worktrees it walks are the
+        ones crash recovery is about to adopt: moving a transcript out from
+        under a session that is about to ``--resume`` would make
+        ``transcript_exists`` false and degrade that resume to a
+        ``no_transcript`` fresh dispatch — the exact failure this task exists to
+        remove.  Deletion stays with the teardown sites, which know the session
+        is finished.
+
+        The archive key is the config-dir name with ``CONFIG_DIR_PREFIX``
+        stripped (``claude-config-3464-unblock`` -> ``3464-unblock``), DERIVED
+        from the shared constant rather than restating the string (INV-5), so a
+        transcript swept here and the same transcript archived later by
+        ``_cleanup_config_dir`` / ``cleanup_worktree`` land on one path and
+        collide idempotently instead of forking two archives of one session.
+
+        Best-effort: a per-entry failure is logged and skipped so one unreadable
+        worktree cannot abort the sweep — and, since this runs inside boot-time
+        recovery, cannot abort recovery either.  Bounded by
+        *deadline_secs*; a truncated pass logs a WARNING naming itself
+        INCOMPLETE with the examined/archived counts, mirroring
+        ``sweep_stale_pid_dirs`` — a bounded sweep that returns quietly reads to
+        an operator as "swept everything", and the transcripts it did not reach
+        would then be invisible until the next boot.
+        """
+        ta = self.config.transcript_archive
+        if not ta.enabled:
+            return 0                            # kill switch: archival, not teardown
+        worktree_base = self.git_ops.worktree_base
+        if not worktree_base.exists():
+            return 0
+        archive_root = Path(self.config.project_root) / ta.root
+
+        started = time.monotonic()
+        examined = 0
+        archived = 0
+        truncated = False
+        try:
+            entries = sorted(worktree_base.iterdir())
+        except OSError as e:
+            logger.warning(
+                'Transcript sweep: cannot list worktree_base %s (%s) — '
+                'skipping the orphaned-transcript sweep this boot',
+                worktree_base, e,
+            )
+            return 0
+
+        for entry in entries:
+            if (time.monotonic() - started) >= deadline_secs:
+                truncated = True
+                break
+            try:
+                if not entry.is_dir():
+                    continue
+                for cfg in sorted((entry / '.task').glob(f'{CONFIG_DIR_PREFIX}*')):
+                    if not cfg.is_dir():
+                        continue
+                    examined += 1
+                    task_id = cfg.name[len(CONFIG_DIR_PREFIX):]
+                    archived += archive_task_transcripts(
+                        cfg, task_id, None, archive_root=archive_root,
+                    )
+            except Exception as e:
+                # One bad entry must not cost its siblings their transcripts,
+                # nor abort the boot-time recovery pass that calls this.
+                logger.warning(
+                    'Transcript sweep: skipping worktree entry %s (%s)',
+                    entry, e,
+                )
+
+        if truncated:
+            logger.warning(
+                'Transcript sweep INCOMPLETE — hit the %.1fs deadline after '
+                'examining %d config dir(s) and archiving %d transcript(s); '
+                'the remaining surviving worktrees under %s were NOT swept '
+                'and their orphaned transcripts stay held until the next '
+                'process start',
+                deadline_secs, examined, archived, worktree_base,
+            )
+        elif archived:
+            logger.info(
+                'Transcript sweep: archived %d orphaned transcript(s) from '
+                '%d surviving config dir(s) to %s (sources left in place)',
+                archived, examined, archive_root,
+            )
+        return archived
+
     def _session_resume_eligible(
         self, session: dict, config_dir: str | None
     ) -> tuple[bool, str]:
@@ -3296,6 +3398,16 @@ class Harness:
             )
             self._file_pool_storage_absent_escalation()
             return
+
+        # Orphaned-transcript sweep (task 3619, INV-7): archive whatever the
+        # last process's SIGKILL — or a held, un-archivable transcript — left
+        # behind, BEFORE the loop below starts calling cleanup_worktree.  A
+        # worktree removed first has already taken its transcripts with it, so
+        # the ordering is the property, not an optimisation.  Sited AFTER the
+        # pool-storage guard on purpose: globbing an unmounted worktree_base
+        # finds nothing, and a "swept 0" tally would read as "no orphans"
+        # rather than "not mounted".
+        self._sweep_orphaned_transcripts()
 
         recovered = 0
         cleaned = 0
