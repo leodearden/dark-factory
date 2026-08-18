@@ -134,6 +134,39 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 
+# MODULE-LEVEL, not merely the two @pytest.mark.integration class decorators
+# below (which it deliberately duplicates rather than replaces).
+#
+# Both classes already carry the marker, so this changes NOTHING about which
+# items pytest selects — every test here was, and remains, deselected by
+# shared/pyproject.toml's addopts `-m 'not integration'`. What it changes is
+# whether the orchestrator can PROVE that statically.
+#
+# `orchestrator.pytest_markers.module_level_marker_names` returns a LOWER BOUND
+# on every collected item's markers, and to keep that bound sound it walks only
+# a module-level `pytestmark` binding — per-class and per-function
+# `@pytest.mark.X` decorators are deliberately NOT collected (parametrize,
+# `pytest.param(marks=...)`, imported test classes and
+# `pytest_collection_modifyitems` all let an unmarked, hence SELECTED, item live
+# in a file that "looks" fully marked). Without this binding the detector
+# under-fires on this file — the documented safe direction, but it has a cost
+# here.
+#
+# That cost is a FALSE RED, observed as esc-3830-4: a docs-only edit to this
+# file put it in the diff, `_derive_module_runs`' arm 4a could not prove the
+# deselection, so verify emitted the arm-4b FILE_SCOPED run
+# `pytest shared/tests/test_cli_invoke_integration.py`, which collected 5 items,
+# deselected all 5, and exited rc=5 — classified UNKNOWN_TEST_FAILURE and
+# blocking the task. With the binding, arm 4a fires and widens to shared's own
+# full suite instead (those 5 stay deselected there too, and the emitted reason
+# says so).
+#
+# KEEP THIS IN SYNC: if a test is ever added here that is NOT integration-only,
+# this binding must go, and the marker must move back onto the items that
+# genuinely carry it — a module-level marker that over-claims would make the
+# detector's lower bound unsound and silently skip real coverage.
+pytestmark = pytest.mark.integration
+
 # Discover available OAuth tokens from env (scan order B,C,D,E,F,G).
 _AVAILABLE_TOKENS: list[tuple[str, str]] = available_tokens(os.environ)
 
