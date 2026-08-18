@@ -769,6 +769,162 @@ class TestArchiveBeforeDeleteCrossDevice:
         assert warnings[0].path == str(src)
 
 
+class TestArchivalFailureHook:
+    """INV-4 substrate: ONE machine-readable seam onto the failure counter.
+
+    The α task left ``_ARCHIVAL_FAILURES`` deliberately owned-but-not-consumed.
+    A consumer needs to be TOLD, not to poll a module global, so this adds a
+    single notification seam beside the counter — one hook, fired by the one
+    ``_record_failure`` both producers already funnel through, rather than a
+    second counter or a per-producer callback that could drift out of step with
+    the first. The policy that consumes it (a rate threshold, an escalation)
+    lives in the orchestrator, where the live config is; this module is on the
+    PURE_STDLIB_LEAVES contract and stays a mechanism.
+    """
+
+    @staticmethod
+    def _teardown_hook():
+        transcript_archive_module.set_archival_failure_hook(None)
+
+    def test_the_hook_fires_once_per_failed_file_from_both_producers(
+        self, tmp_path
+    ):
+        """(a) One seam, both producers — no second notification path."""
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        seen: list[dict] = []
+
+        # Producer 1: the COPY path (archive_task_transcripts).
+        copy_dir = tmp_path / 'claude-config-copy'
+        bad_copy = _write(copy_dir / 'projects' / ENC / 'sess-copy.jsonl', b'{}\n')
+        blocker = root / task_id / ENC / 'sess-copy.jsonl'
+        blocker.mkdir(parents=True)
+        os.utime(blocker, (0, 0))
+
+        # Producer 2: the MOVE path (archive_before_delete).
+        move_dir = tmp_path / 'claude-config-move'
+        bad_move = _write(move_dir / 'projects' / ENC / 'sess-move.jsonl', b'{}\n')
+        blocker2 = root / task_id / ENC / 'sess-move.jsonl'
+        blocker2.mkdir(parents=True)
+        os.utime(blocker2, (0, 0))
+
+        transcript_archive_module._reset_archival_failures()
+        transcript_archive_module.set_archival_failure_hook(seen.append)
+        try:
+            archive_task_transcripts(copy_dir, task_id, None, archive_root=root)
+            archive_before_delete(move_dir, task_id, archive_root=root)
+        finally:
+            self._teardown_hook()
+
+        assert len(seen) == 2
+        assert [p['path'] for p in seen] == [str(bad_copy), str(bad_move)]
+        assert {p['task_id'] for p in seen} == {task_id}
+        assert {p['errno'] for p in seen} == {errno.EISDIR}
+        # The counter is unchanged in meaning: the hook is a notification, not
+        # a replacement for the substrate a digest consumer samples.
+        assert transcript_archive_module._archival_failures() == 2
+
+    def test_the_hook_can_be_uninstalled_and_does_not_leak_between_tests(
+        self, tmp_path
+    ):
+        """(b) None uninstalls, and _reset_archival_failures also clears it.
+
+        The reset accessor is what every test in this module already calls for
+        isolation; if it cleared the counter but left a previous test's hook
+        installed, one test's callback would be fed another's failures.
+        """
+        root = tmp_path / 'archive'
+        seen: list[dict] = []
+
+        def one_failure(config_dir_name):
+            config_dir = tmp_path / config_dir_name
+            src = _write(config_dir / 'projects' / ENC / 'sess.jsonl', b'{}\n')
+            blocker = root / '3619' / ENC / 'sess.jsonl'
+            if not blocker.exists():
+                blocker.mkdir(parents=True)
+                os.utime(blocker, (0, 0))
+            archive_task_transcripts(config_dir, '3619', None, archive_root=root)
+            return src
+
+        transcript_archive_module._reset_archival_failures()
+        transcript_archive_module.set_archival_failure_hook(seen.append)
+        try:
+            one_failure('cfg-a')
+            assert len(seen) == 1
+
+            transcript_archive_module.set_archival_failure_hook(None)
+            one_failure('cfg-b')
+            assert len(seen) == 1
+
+            transcript_archive_module.set_archival_failure_hook(seen.append)
+            transcript_archive_module._reset_archival_failures()
+            one_failure('cfg-c')
+            assert len(seen) == 1
+        finally:
+            self._teardown_hook()
+
+    def test_a_raising_hook_cannot_become_an_archival_outage(
+        self, tmp_path, caplog
+    ):
+        """(c) A broken consumer must not take archival down with it.
+
+        The hook is called from inside the failure path of a function whose
+        whole contract is totality — it runs in ``finally`` blocks and teardown
+        paths. Letting a consumer's exception escape would turn "the digest
+        consumer has a bug" into "teardown raises", which is a strictly worse
+        failure than the one being reported.
+        """
+        root = tmp_path / 'archive'
+        config_dir = tmp_path / 'claude-config-3619'
+        good = _write(config_dir / 'projects' / ENC / 'sess-good.jsonl', b'{"g":1}\n')
+        _write(config_dir / 'projects' / ENC / 'sess-bad.jsonl', b'{"b":1}\n')
+        blocker = root / '3619' / ENC / 'sess-bad.jsonl'
+        blocker.mkdir(parents=True)
+        os.utime(blocker, (0, 0))
+
+        def exploding_hook(_payload):
+            raise RuntimeError('consumer is broken')
+
+        transcript_archive_module._reset_archival_failures()
+        transcript_archive_module.set_archival_failure_hook(exploding_hook)
+        try:
+            with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+                count = archive_task_transcripts(
+                    config_dir, '3619', None, archive_root=root
+                )
+        finally:
+            self._teardown_hook()
+
+        # The surrounding archive still completed...
+        assert count == 1
+        assert (root / '3619' / ENC / 'sess-good.jsonl').read_bytes() == good.read_bytes()
+        # ...and still counted the ORIGINAL failure, which the hook must not
+        # be able to suppress by dying.
+        assert transcript_archive_module._archival_failures() == 1
+
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('consumer is broken' in m for m in messages)
+        assert any('sess-bad.jsonl' in m for m in messages)
+
+    def test_with_no_hook_installed_behaviour_is_unchanged(self, tmp_path, caplog):
+        """(d) The default path is byte-identical to before the seam existed."""
+        root = tmp_path / 'archive'
+        config_dir = tmp_path / 'claude-config-3619'
+        _write(config_dir / 'projects' / ENC / 'sess-bad.jsonl', b'{"b":1}\n')
+        blocker = root / '3619' / ENC / 'sess-bad.jsonl'
+        blocker.mkdir(parents=True)
+        os.utime(blocker, (0, 0))
+
+        transcript_archive_module._reset_archival_failures()
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            archive_task_transcripts(config_dir, '3619', None, archive_root=root)
+
+        assert transcript_archive_module._archival_failures() == 1
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].errno == errno.EISDIR
+
+
 class TestDurableArchivePathLookup:
     """B1/B2/B4 — the read side: locate one session's archived transcript.
 
