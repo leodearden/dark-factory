@@ -13,6 +13,12 @@ const { MemoryEvalsSection } = window.DF_MEMORY_EVALS;
 // defined in this file — index.html's load order (guarded by
 // test_index_html.py) is the real contract; this is the degradation path.
 const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No tasks' };
+// Unguarded, like DF_CHARTS / DF_SHELL / DF_RUNTIME_FMT above and NOT like the
+// DF_ORCH_FILTER line directly overhead — these two gate real rendering (the
+// stranded badge, every burndown band), so a fallback here would silently draw
+// a chart with no bands rather than fail. index.html's load order is the
+// enforced contract, pinned per-module by test_index_html.py: both scripts are
+// asserted served-200 and asserted to load before this file.
 const { strandBadgeState, agentCellState } = window.DF_TASK_STRAND_BADGE;
 const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
 const { useState: uS, useEffect: uE } = React;
