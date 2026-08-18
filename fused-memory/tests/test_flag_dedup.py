@@ -3815,6 +3815,256 @@ class TestDedupFlagsDedupedAgainstEnrichment:
 
 
 # ---------------------------------------------------------------------------
+# ---- task 4381 step-1 ----
+# RED: dedup_flags carries the flag's cited_tasks into the stage1_flag_marker
+# ledger payload (GAP 1 / esc-3841-1), sanitized so the payload json.dumps can
+# never fail on LLM-authored content.
+# ---------------------------------------------------------------------------
+
+
+class TestDedupFlagsCitedTasksPayload:
+    """dedup_flags threads the flag's ``cited_tasks`` into the persisted
+    ``stage1_flag_marker`` payload (task 4381 GAP 1).
+
+    Every assertion reads the PERSISTED payload rather than the in-memory
+    flag, because the gap this closes is exactly at that boundary: the
+    payload was a fixed 6-key literal that never consulted
+    ``flag['cited_tasks']``, so a carried-forward marker lost the
+    project-qualified anchor its cross-project fix task lives behind.
+
+    The persisted value is SANITIZED (the three canonical keys, scalar values
+    only) so the ``json.dumps`` inside dedup_flags' best-effort try/except
+    can never raise on LLM-authored content and silently stop persisting the
+    marker at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_payload_carries_cited_tasks_in_order(self, ledger_memory_service):
+        """(a) A flag citing two project-qualified tasks persists both, in the
+        order given, under payload['cited_tasks']."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        cited = [
+            {'project_id': 'know_live', 'task_id': '598', 'title': 'T1'},
+            {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'T2'},
+        ]
+        flag = {
+            'task_id': 598,
+            'flag_type': 'remediation_payload_live_workflow_signals_gap',
+            'cited_tasks': cited,
+        }
+        sig = compute_flag_signature(flag)
+        assert sig is not None
+        tid, ftype = sig
+
+        await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id='know_live',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        row = await _get_marker(ledger_memory_service.recon_ledger, 'know_live', tid, ftype)
+        assert row is not None, 'marker row must be persisted'
+        payload = json.loads(row.payload_json)
+        assert payload['cited_tasks'] == [
+            {'project_id': 'know_live', 'task_id': '598', 'title': 'T1'},
+            {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'T2'},
+        ], f'cited_tasks must round-trip in input order; got {payload.get("cited_tasks")!r}'
+
+    @pytest.mark.asyncio
+    async def test_no_cited_tasks_payload_shape_unchanged(self, ledger_memory_service):
+        """(b) REGRESSION: a flag with no cited_tasks key persists exactly the
+        six historical payload keys, and its returned annotations are
+        unchanged."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = {'task_id': 42, 'flag_type': 'missing_deliverable', 'description': 'x'}
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        row = await _get_marker(ledger_memory_service.recon_ledger, 'p', '42', 'missing_deliverable')
+        assert row is not None
+        payload = json.loads(row.payload_json)
+        assert set(payload) == {
+            'source', 'kind', 'task_id', 'flag_type', 'run_id', 'last_seen_run_id',
+        }, f'payload key set must be unchanged for a flag with no cited_tasks; got {sorted(payload)!r}'
+        assert 'cited_tasks' not in payload
+        assert len(result) == 1
+        assert result[0]['last_seen_run_id'] == 'r1'
+        assert 'persisted_from_run' not in result[0], (
+            f'a MISS must not annotate persisted_from_run; got {result[0]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_cited_tasks_omits_key(self, ledger_memory_service):
+        """(c) cited_tasks=[] persists no 'cited_tasks' key either — the key is
+        optional exactly like 'deduped_against'."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = {'task_id': 42, 'flag_type': 'missing_deliverable', 'cited_tasks': []}
+
+        await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        row = await _get_marker(ledger_memory_service.recon_ledger, 'p', '42', 'missing_deliverable')
+        assert row is not None
+        payload = json.loads(row.payload_json)
+        assert 'cited_tasks' not in payload, (
+            f'an empty cited_tasks must omit the key entirely; got {payload!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_sanitizer_drops_junk_entries_and_values(self, ledger_memory_service):
+        """(d) Non-dict entries, unknown keys, and non-scalar values are all
+        dropped before the payload is written."""
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': 42,
+            'flag_type': 'missing_deliverable',
+            'cited_tasks': [
+                'not-a-dict',
+                {'project_id': 'p', 'task_id': 1, 'title': 'ok', 'extra': 'dropped'},
+                {'project_id': 'p', 'task_id': 2, 'title': {'nested': 'dict'}},
+            ],
+        }
+        sig = compute_flag_signature(flag)
+        assert sig is not None
+        tid, ftype = sig
+
+        await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id='p',
+            run_id='r1',
+            flags=[flag],
+        )
+
+        row = await _get_marker(ledger_memory_service.recon_ledger, 'p', tid, ftype)
+        assert row is not None
+        payload = json.loads(row.payload_json)
+        assert payload['cited_tasks'] == [
+            {'project_id': 'p', 'task_id': 1, 'title': 'ok'},
+            {'project_id': 'p', 'task_id': 2},
+        ], f'sanitizer must drop non-dicts, unknown keys and non-scalar values; got {payload.get("cited_tasks")!r}'
+
+    @pytest.mark.asyncio
+    async def test_unserialisable_cited_value_still_persists_marker(
+        self, ledger_memory_service, caplog
+    ):
+        """(e) A cited_tasks value that is NOT JSON-serialisable still yields a
+        persisted marker row with a valid payload.
+
+        This pins that the enrichment can never turn the ledger write into the
+        best-effort WARNING path and silently stop persisting the marker —
+        which would be a regression on the module's core cross-cycle dedup
+        guarantee, not merely a lost annotation.
+        """
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import (
+            compute_flag_signature,
+            dedup_flags,
+        )
+
+        flag = {
+            'task_id': 42,
+            'flag_type': 'missing_deliverable',
+            'cited_tasks': [{'project_id': 'p', 'task_id': 1, 'title': object()}],
+        }
+        sig = compute_flag_signature(flag)
+        assert sig is not None
+        tid, ftype = sig
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'):
+            await dedup_flags(
+                memory_service=ledger_memory_service,
+                project_id='p',
+                run_id='r1',
+                flags=[flag],
+            )
+
+        row = await _get_marker(ledger_memory_service.recon_ledger, 'p', tid, ftype)
+        assert row is not None, (
+            'an unserialisable cited_tasks value must not suppress the marker write'
+        )
+        payload = json.loads(row.payload_json)
+        assert payload['cited_tasks'] == [{'project_id': 'p', 'task_id': 1}], (
+            f'the unserialisable value must be stripped by the sanitizer; got {payload.get("cited_tasks")!r}'
+        )
+        warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not any('recon_ledger read/write failed' in m for m in warnings), (
+            f'the ledger write must not fall into the best-effort WARNING path; got {warnings!r}'
+        )
+
+
+class TestSanitizeCitedTasks:
+    """Direct unit tests for the pure ``_sanitize_cited_tasks`` helper."""
+
+    def test_absent_key_returns_none(self):
+        from fused_memory.reconciliation.flag_dedup import _sanitize_cited_tasks
+
+        result = _sanitize_cited_tasks({'task_id': 1, 'flag_type': 'x'})
+        assert result is None, f'absent cited_tasks must yield None; got {result!r}'
+
+    def test_empty_list_returns_none(self):
+        from fused_memory.reconciliation.flag_dedup import _sanitize_cited_tasks
+
+        result = _sanitize_cited_tasks({'cited_tasks': []})
+        assert result is None, f'empty cited_tasks must yield None; got {result!r}'
+
+    @pytest.mark.parametrize(
+        'value',
+        ['not-a-list', 42, {'project_id': 'p'}, None, object()],
+        ids=['str', 'int', 'dict', 'none', 'object'],
+    )
+    def test_non_list_returns_none(self, value):
+        from fused_memory.reconciliation.flag_dedup import _sanitize_cited_tasks
+
+        result = _sanitize_cited_tasks({'cited_tasks': value})
+        assert result is None, f'a non-list cited_tasks must yield None; got {result!r}'
+
+    def test_all_junk_list_returns_none(self):
+        from fused_memory.reconciliation.flag_dedup import _sanitize_cited_tasks
+
+        result = _sanitize_cited_tasks(
+            {'cited_tasks': ['x', 7, None, ['nested'], {'unknown_key': 'v'}]}
+        )
+        assert result is None, f'an all-junk cited_tasks must yield None; got {result!r}'
+
+    def test_preserves_order_and_scalar_values(self):
+        from fused_memory.reconciliation.flag_dedup import _sanitize_cited_tasks
+
+        result = _sanitize_cited_tasks({
+            'cited_tasks': [
+                {'project_id': 'a', 'task_id': 1, 'title': 'first'},
+                {'project_id': 'b', 'task_id': '2', 'title': None},
+                {'project_id': 'c', 'task_id': 3.0, 'title': True},
+            ]
+        })
+        assert result == [
+            {'project_id': 'a', 'task_id': 1, 'title': 'first'},
+            {'project_id': 'b', 'task_id': '2', 'title': None},
+            {'project_id': 'c', 'task_id': 3.0, 'title': True},
+        ], f'scalar/None values must survive in input order; got {result!r}'
+
+
+# ---------------------------------------------------------------------------
 # task-1656 step-3 — RED: dedup_flags write-guard integration tests
 # ---------------------------------------------------------------------------
 
