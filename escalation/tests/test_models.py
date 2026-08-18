@@ -10,6 +10,7 @@ import pytest
 
 from escalation.models import (
     BORN_AT_L2_SEVERITIES,
+    Amendment,
     KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
     SEVERITY_RANK,
@@ -1257,6 +1258,86 @@ class TestFilingClaimantRunId:
         payload['not_a_real_field'] = 'boom'
         restored = Escalation.from_dict(payload)
         assert not hasattr(restored, 'not_a_real_field')
+
+
+class TestEscalationAmendments:
+    """`amendments` / `amendments_truncated` — the preserved-incoming-framing fields (task 3997).
+
+    `queue.add_members_to_l2` is the SOLE writer: when a fold carries framing
+    (root_cause / evidence / options / summary) that would otherwise be silently
+    discarded, it is APPENDED here instead.  Pinned by exactly the two properties
+    this repo already pins for train_state / members / granted_files: a verbatim
+    round-trip, and legacy JSON without the keys deserialising to the defaults so
+    no on-disk migration is required.
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        """An L2 carrying its own original framing, plus whatever kwargs override."""
+        return Escalation(
+            id='esc-task-1-0001',
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='task_failure',
+            summary='original one-line hypothesis',
+            detail='the ORIGINAL human-facing evidence',
+            root_cause='original root cause',
+            options=['A: rollback', 'B: fix forward'],
+            level=2,
+            **kwargs,
+        )
+
+    def test_amendments_field_roundtrips_and_defaults_empty(self):
+        """Amendments survive to_json/from_json verbatim; legacy JSON defaults to empty."""
+        # --- (a) ROUND-TRIP: the amendment dict and the counter survive verbatim.
+        amendment: Amendment = {
+            'timestamp': '2026-08-11T00:00:00+00:00',
+            'agent_role': 'escalation-watcher-auto',
+            'root_cause': 'rc',
+            'summary': 's',
+            'detail': 'incoming evidence',
+            'options': ['A: x'],
+        }
+        esc = self._seeded(amendments=[amendment], amendments_truncated=2)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.amendments == [amendment], (
+            f'amendment lost or mangled through to_json/from_json: {restored.amendments!r}'
+        )
+        assert restored.amendments_truncated == 2, (
+            f'truncation counter lost: {restored.amendments_truncated!r}'
+        )
+        # The record's OWN framing is a separate thing and is untouched by the
+        # amendment — that separation is the whole point of appending.
+        assert restored.root_cause == 'original root cause'
+        assert restored.detail == 'the ORIGINAL human-facing evidence'
+
+        # --- (b) ZERO MIGRATION: legacy on-disk JSON has neither key.
+        legacy = esc.to_dict()
+        del legacy['amendments']
+        del legacy['amendments_truncated']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.amendments == [], (
+            f'legacy record without the key must default to []: {from_legacy.amendments!r}'
+        )
+        assert from_legacy.amendments_truncated == 0, (
+            f'legacy record without the key must default to 0: '
+            f'{from_legacy.amendments_truncated!r}'
+        )
+
+        # --- (c) PER-INSTANCE default: field(default_factory=list), not a shared
+        # mutable default.  Without this, one L2's amendment would appear on every
+        # other default-constructed record in the process.
+        a = self._seeded()
+        b = self._seeded()
+        a.amendments.append(amendment)
+        assert b.amendments == [], (
+            'default amendments list is SHARED between instances — '
+            'a mutable default leaked one record\'s framing onto another'
+        )
 
 
 class TestTimestampIsStampedFromTheLiveClock:
