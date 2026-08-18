@@ -12472,40 +12472,41 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # propagation.
             ta = self.config.transcript_archive
             if ta.enabled and self._config_dir is not None and self._last_invoke_session_id:
-                # Offload to a worker thread: archive_task_transcripts does
-                # blocking filesystem work (glob + move each transcript). Task
-                # 3618 dropped the compression, so the per-file cost is now an
-                # O(1) same-filesystem rename rather than a CPU-bound
-                # stream-gzip; what remains is the glob and the syscalls.
+                # SYNCHRONOUS, and that is the fix. This was
+                # `await asyncio.to_thread(archive_task_transcripts, ...)`
+                # with an `except asyncio.CancelledError: raise` clause whose
+                # own comment conceded the gap: "the abandoned-in-flight tail
+                # is the explicit job of β/task 2729's idempotent teardown
+                # backstop". That backstop fires at worktree REMOVAL — but on
+                # the preserve-for-resume path the worktree is deliberately
+                # RETAINED, so nothing ever came back for the transcript. The
+                # await was therefore the one part of this finally a shutdown
+                # could skip, and the shutdown that skipped it is the same one
+                # that sets `session_preserved = True` and writes a resume
+                # sidecar naming that session. Removing the await removes the
+                # cancellation point; there is nothing left here to cancel.
                 #
-                # The to_thread is therefore no longer load-bearing for loop
-                # latency, and it is what CancelledError kills at SIGTERM —
-                # losing every in-flight transcript. Collapsing this to a
-                # synchronous, uncancellable call is leaf 2 of
-                # plans/transcript-preservation-seam-prd.md, which 3618 exists
-                # to unblock. Do not re-justify the offload on gzip grounds.
+                # Affordable, measured rather than assumed: over n=7788
+                # archived transcripts on this host, median 381 KB, p95 1.0 MB,
+                # max 2.06 MB. Task 3618 dropped the compression, so this is a
+                # plain copy — single-digit milliseconds, and cheaper than the
+                # transcript it currently loses.
+                #
+                # This site COPIES (archive_task_transcripts), where the
+                # teardown sites MOVE (archive_before_delete): the session may
+                # be resumed and must keep reading and appending to its own
+                # live transcript. Moving it here would turn every resume into
+                # a no_transcript fallback — the opposite of what this exists
+                # to enable.
                 try:
-                    await asyncio.to_thread(
-                        archive_task_transcripts,
+                    archive_task_transcripts(
                         self._config_dir.path,
                         self.task_id,
                         self._last_invoke_session_id,
                         archive_root=self.config.project_root / ta.root,
                     )
-                except asyncio.CancelledError:
-                    # Cancellation (loop teardown / hard-kill) surfaces here from
-                    # the await, NOT an archival error. Cooperative cancellation
-                    # must propagate, so we re-raise — meaning a KILLED
-                    # invocation's transcript is deliberately not archived by this
-                    # producer hook. That is an accepted, documented gap: shielding
-                    # the await to salvage it (asyncio.shield) risks a dangling
-                    # background task during loop close, and the abandoned-in-flight
-                    # tail is the explicit job of β/task 2729's idempotent
-                    # teardown backstop (agent-transcript-archival-prd §3), so it
-                    # is not lost overall.
-                    raise
                 except Exception:
-                    # Defense-in-depth for a finally that awaits cross-module work.
+                    # Defense-in-depth for a finally doing cross-module work.
                     # archive_task_transcripts is total by contract (per-file
                     # OSErrors are swallowed + counted), but its top-level glob /
                     # Path / archive_root construction is not individually guarded.
