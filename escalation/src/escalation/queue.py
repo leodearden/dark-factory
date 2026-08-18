@@ -85,42 +85,110 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
 # already bounded by the next self-archival — see _archive_resolved).
 _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
 
-# Hard cap on Escalation.amendments (see add_members_to_l2, the SOLE writer and
-# sole trimmer).  Worst case is repeated folds of one cluster inside a single AFK
-# window; ~20 entries of framing text is well inside the envelope, and amendments
-# are deliberately NOT in the server's compact projection, so they never inflate a
-# watcher's drain no matter how deep the list gets.  Past the cap the OLDEST are
-# shed — the ORIGINAL framing is never in this list at all (it lives permanently
-# in the record's own immutable root_cause/detail/options/summary), so the oldest
-# amendment is the least-informative entry and a rotation triaging NOW needs the
-# most recent framing.  Each drop increments the record's `amendments_truncated`,
-# so the loss is a durable structured fact rather than log-only.
+# Hard cap on the NUMBER of Escalation.amendments entries (see add_members_to_l2,
+# the SOLE writer and sole trimmer).  Worst case is repeated folds of one cluster
+# inside a single AFK window, and amendments are deliberately NOT in the server's
+# compact projection, so they never inflate a watcher's drain no matter how deep
+# the list gets.  Past the cap the OLDEST are shed — the ORIGINAL framing is never
+# in this list at all (it lives permanently in the record's own immutable
+# root_cause/detail/options/summary), so the oldest amendment is the
+# least-informative entry and a rotation triaging NOW needs the most recent
+# framing.  Each drop increments the record's `amendments_truncated`, so the loss
+# is a durable structured fact rather than log-only.
 # SIZED AGAINST THE POST-CANONICALISATION FOLD RATE (task 3998), which raises the
 # fold rate BY DESIGN — a cap tuned to today's rate would be immediately wrong.
 _MAX_AMENDMENTS = 20
+
+# Per-ENTRY character caps.  An entry count alone is NOT a size bound: each
+# entry's `detail` is the promote's unbounded free-text `evidence` argument —
+# the very field compact mode exists to keep off the wire — so a hot-folding L2
+# could stay "inside the cap" while growing by hundreds of KB, and EVERY reader
+# of a full record pays that (get_escalation, get_pending_escalations(compact=
+# False), every sweep's JSON parse).  These caps are what make the envelope
+# ARITHMETIC rather than assertion:
+#
+#   kept text per entry <= 2*300 (root_cause + summary) + 1200 (detail)
+#                          + 6*300 (options)                    = 3600 chars
+#   + at most 9 elision markers (~70 chars each) + role/timestamp  ~  800 chars
+#   whole list <= _MAX_AMENDMENTS * ~4.4 KB                      ~=   88 KB
+#
+# root_cause and summary are one-LINERS by contract (a dedup key and a one-line
+# hypothesis), and each option is an 'A: ...' style choice, so they share one
+# line-sized cap; `detail` gets the larger share because it is the only field
+# meant to carry prose.  Elision is per-field and marked in-band; the characters
+# dropped are counted on the record in `amendments_chars_elided`, exactly as
+# shed ENTRIES are counted in `amendments_truncated` — the loss is a durable
+# structured fact either way, never log-only.
+_MAX_AMENDMENT_LINE_CHARS = 300
+_MAX_AMENDMENT_DETAIL_CHARS = 1200
+_MAX_AMENDMENT_OPTIONS = 6
+
+
+def _elide(text: str, limit: int) -> tuple[str, int]:
+    """Return (*text* capped at *limit*, characters dropped).
+
+    The elision is MARKED IN-BAND and names both the count and the cap, so a
+    human reading a preserved framing can tell "this is all of it" from "this
+    is the head of it" without cross-referencing anything.  Silent truncation
+    of decision context would be the loud-over-silent norm inverted.
+    """
+    if len(text) <= limit:
+        return text, 0
+    dropped = len(text) - limit
+    return (
+        f'{text[:limit]}\n[... {dropped} char(s) elided at the '
+        f'{limit}-char amendment field cap ...]'
+    ), dropped
 
 
 def _build_amendment(
     *, root_cause: str, summary: str, evidence: str, options: list[str] | None,
     agent_role: str, timestamp: str,
-) -> Amendment:
-    """Build one :class:`~escalation.models.Amendment` from a fold's framing.
+) -> tuple[Amendment, int]:
+    """Build one :class:`~escalation.models.Amendment`, size-bounded.
 
     THE single site that maps the promote's ARGUMENT names onto the Amendment's
     KEY names — notably *evidence* onto ``detail``, the same field the create
     path writes that argument into.  It builds both the entry actually appended
     AND the projection of the record's OWN framing that repeat detection
     compares against (see :func:`_is_repeat_framing`), so those two can never
-    drift into comparing differently-shaped dicts.
+    drift into comparing differently-shaped dicts — and, because BOTH sides are
+    elided by this one function, repeat detection keeps working verbatim on
+    framing large enough to be elided.
+
+    Every free-text field is capped (see ``_MAX_AMENDMENT_LINE_CHARS`` /
+    ``_MAX_AMENDMENT_DETAIL_CHARS``) and the options LIST is capped in length
+    (``_MAX_AMENDMENT_OPTIONS``), which is what turns ``_MAX_AMENDMENTS`` from
+    an entry count into an actual size bound.  Options past the cap are shed
+    whole and their full length counts as elided, so the returned total covers
+    everything the entry did not keep.
+
+    Returns ``(amendment, chars_elided)``.
     """
-    return {
+    kept_root_cause, rc_lost = _elide(root_cause, _MAX_AMENDMENT_LINE_CHARS)
+    kept_summary, sm_lost = _elide(summary, _MAX_AMENDMENT_LINE_CHARS)
+    kept_detail, dt_lost = _elide(evidence, _MAX_AMENDMENT_DETAIL_CHARS)
+
+    incoming_options = list(options or [])
+    # Shed the TAIL of an over-long options list, the opposite of the entry-cap
+    # policy: options are ordered proposals ('A: ...', 'B: ...'), so the leading
+    # ones are the ones a reader is being asked to choose between.
+    opt_lost = sum(len(o) for o in incoming_options[_MAX_AMENDMENT_OPTIONS:])
+    kept_options: list[str] = []
+    for option in incoming_options[:_MAX_AMENDMENT_OPTIONS]:
+        kept, lost = _elide(option, _MAX_AMENDMENT_LINE_CHARS)
+        kept_options.append(kept)
+        opt_lost += lost
+
+    amendment: Amendment = {
         'timestamp': timestamp,
         'agent_role': agent_role,
-        'root_cause': root_cause,
-        'summary': summary,
-        'detail': evidence,
-        'options': list(options or []),
+        'root_cause': kept_root_cause,
+        'summary': kept_summary,
+        'detail': kept_detail,
+        'options': kept_options,
     }
+    return amendment, rc_lost + sm_lost + dt_lost + opt_lost
 
 
 def _framing_view(a: Amendment) -> tuple[str, str, str, list[str]]:
@@ -172,10 +240,16 @@ def _is_repeat_framing(esc: Escalation, candidate: Amendment) -> bool:
     reframing genuinely returns to a previous position and IS new relative to
     what the record currently says.
     """
-    baseline = esc.amendments[-1] if esc.amendments else _build_amendment(
-        root_cause=esc.root_cause, summary=esc.summary, evidence=esc.detail,
-        options=esc.options, agent_role='', timestamp='',
-    )
+    if esc.amendments:
+        baseline = esc.amendments[-1]
+    else:
+        # Built through the SAME function as the candidate, so the record's own
+        # framing is elided identically — a re-promote of framing long enough to
+        # be elided still compares equal instead of reading as new every time.
+        baseline, _ = _build_amendment(
+            root_cause=esc.root_cause, summary=esc.summary, evidence=esc.detail,
+            options=esc.options, agent_role='', timestamp='',
+        )
     return _framing_view(baseline) == _framing_view(candidate)
 
 
@@ -999,6 +1073,14 @@ class EscalationQueue:
         re-send the create's exact text, is a no-op too rather than a verbatim
         copy of the record's own fields.
 
+        **Each entry is size-bounded too.**  Every free-text field is elided to
+        its named per-field cap (``_MAX_AMENDMENT_LINE_CHARS`` /
+        ``_MAX_AMENDMENT_DETAIL_CHARS``) with an in-band marker, and the options
+        list is capped at ``_MAX_AMENDMENT_OPTIONS`` — without that, the entry
+        count alone would bound nothing, since *evidence* is unbounded free
+        text.  Characters dropped are added to ``amendments_chars_elided``,
+        the byte-side counterpart of ``amendments_truncated``.
+
         **The list is capped at** :data:`_MAX_AMENDMENTS`.  THIS METHOD is the
         trimmer, at write time, in the same critical section and the same single
         ``_rewrite`` as the append — so cap enforcement is atomic with it and no
@@ -1064,7 +1146,7 @@ class EscalationQueue:
             # write path, no new durability story.
             amendment_recorded = False
             if incoming_framing:
-                candidate = _build_amendment(
+                candidate, chars_elided = _build_amendment(
                     root_cause=root_cause, summary=summary, evidence=evidence,
                     options=options, agent_role=agent_role,
                     timestamp=datetime.now(UTC).isoformat(),
@@ -1076,6 +1158,20 @@ class EscalationQueue:
                 if not _is_repeat_framing(esc, candidate):
                     esc.amendments.append(candidate)
                     amendment_recorded = True
+                    # Count what the per-field caps dropped on the record, for
+                    # the same reason shed ENTRIES are counted below: a reader
+                    # must be able to tell a whole framing from the head of one
+                    # without scraping logs (INV-8).
+                    if chars_elided:
+                        esc.amendments_chars_elided += chars_elided
+                        logger.warning(
+                            'add_members_to_l2: %s elided %d char(s) of incoming '
+                            'framing at the per-field amendment caps (running '
+                            "total elided=%d); the record's own framing is "
+                            'unaffected',
+                            escalation_id, chars_elided,
+                            esc.amendments_chars_elided,
+                        )
                     # Enforce the cap in the SAME critical section, so the trim
                     # lands in the same single _rewrite as the append and there
                     # is no durable window in which an over-cap list exists.

@@ -17,7 +17,14 @@ import pytest
 
 from escalation.classify import effective_benign
 from escalation.models import Escalation
-from escalation.queue import _MAX_AMENDMENTS, EscalationQueue, iter_all_escalation_paths
+from escalation.queue import (
+    _MAX_AMENDMENT_DETAIL_CHARS,
+    _MAX_AMENDMENT_LINE_CHARS,
+    _MAX_AMENDMENT_OPTIONS,
+    _MAX_AMENDMENTS,
+    EscalationQueue,
+    iter_all_escalation_paths,
+)
 
 
 def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', level: int = 0) -> Escalation:
@@ -3039,6 +3046,140 @@ class TestAddMembersToL2:
             f'whitespace on the dedup key is not a reframing, got {result.amendments!r}'
         )
         assert result.updated_at is None
+
+    def test_amendment_fields_are_elided_to_their_named_caps(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Each entry is BYTE-bounded, marked, and the loss is counted.
+
+        The entry cap alone bounds nothing: an amendment's `detail` is the
+        promote's unbounded free-text `evidence` argument — the same field the
+        compact projection exists to keep off the wire — so a hot-folding L2
+        could sit "inside `_MAX_AMENDMENTS`" while growing by hundreds of KB,
+        and every reader of a FULL record pays that (`get_escalation`,
+        `get_pending_escalations(compact=False)`, every sweep's JSON parse).
+
+        Bounds are derived from the constants' NAMES, never their values.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        over = 50  # comfortably past every cap, whatever they are retuned to
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            result = queue.add_members_to_l2(
+                l2.id, [],
+                root_cause='R' * (_MAX_AMENDMENT_LINE_CHARS + over),
+                summary='S' * (_MAX_AMENDMENT_LINE_CHARS + over),
+                evidence='D' * (_MAX_AMENDMENT_DETAIL_CHARS + over),
+                options=(
+                    ['O' * (_MAX_AMENDMENT_LINE_CHARS + over)]
+                    * (_MAX_AMENDMENT_OPTIONS + 2)
+                ),
+                agent_role='escalation-watcher-auto',
+            )
+
+        assert result is not None
+        assert len(result.amendments) == 1
+        amendment = result.amendments[0]
+
+        # (a) the KEPT text of each field is capped — the marker is allowed to
+        # push the stored string past the cap, but the payload is not.
+        assert amendment['root_cause'].count('R') == _MAX_AMENDMENT_LINE_CHARS
+        assert amendment['summary'].count('S') == _MAX_AMENDMENT_LINE_CHARS
+        assert amendment['detail'].count('D') == _MAX_AMENDMENT_DETAIL_CHARS
+        # (b) the options LIST is capped in length, and each option in width.
+        assert len(amendment['options']) == _MAX_AMENDMENT_OPTIONS, (
+            f'the options list must be length-capped, got '
+            f'{len(amendment["options"])}'
+        )
+        assert all(
+            o.count('O') == _MAX_AMENDMENT_LINE_CHARS for o in amendment['options']
+        )
+        # (c) the elision is MARKED IN-BAND, so a reader can tell the head of a
+        # framing from the whole of one without cross-referencing anything.
+        assert amendment['detail'].endswith(' ...]'), (
+            f'elision must be marked in-band, got tail {amendment["detail"][-80:]!r}'
+        )
+        assert str(over) in amendment['detail'], (
+            f'the marker must name what it dropped: {amendment["detail"][-120:]!r}'
+        )
+        # (d) the loss is DURABLY COUNTED on the record (INV-8) — the byte-side
+        # counterpart of amendments_truncated.
+        shed_options = 2 * (_MAX_AMENDMENT_LINE_CHARS + over)
+        expected = over * (3 + _MAX_AMENDMENT_OPTIONS) + shed_options
+        assert result.amendments_chars_elided == expected, (
+            f'expected {expected} elided chars, got {result.amendments_chars_elided}'
+        )
+        assert self._on_disk(queue, l2.id).amendments_chars_elided == expected
+        assert any(
+            'elided' in r.getMessage() for r in caplog.records
+        ), 'elision must also be loud in the log'
+
+        # (e) elision does not defeat repeat detection: the SAME oversized
+        # framing re-submitted is still a no-op, because both sides are elided
+        # by the same builder.
+        bumped_at = result.updated_at
+        again = queue.add_members_to_l2(
+            l2.id, [],
+            root_cause='R' * (_MAX_AMENDMENT_LINE_CHARS + over),
+            summary='S' * (_MAX_AMENDMENT_LINE_CHARS + over),
+            evidence='D' * (_MAX_AMENDMENT_DETAIL_CHARS + over),
+            options=(
+                ['O' * (_MAX_AMENDMENT_LINE_CHARS + over)]
+                * (_MAX_AMENDMENT_OPTIONS + 2)
+            ),
+        )
+        assert again is not None
+        assert len(again.amendments) == 1, (
+            f'elided framing must still compare equal, got {again.amendments!r}'
+        )
+        assert again.updated_at == bumped_at
+
+    def test_amendment_list_size_envelope_is_bounded(self, tmp_path: Path):
+        """The whole list's SIZE — not just its length — is bounded by the caps.
+
+        The property the caps exist for, asserted end-to-end: feed folds far
+        larger than any cap, fill past `_MAX_AMENDMENTS`, and the stored framing
+        still fits an envelope computed FROM the constants.  Without per-field
+        elision this is ~5 MB of durable record.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        huge = 50_000
+
+        for i in range(_MAX_AMENDMENTS + 3):
+            queue.add_members_to_l2(
+                l2.id, [],
+                root_cause=f'{i}' + 'R' * huge,
+                summary=f'{i}' + 'S' * huge,
+                evidence=f'{i}' + 'D' * huge,
+                options=[f'{i}' + 'O' * huge] * 10,
+                agent_role='escalation-watcher-auto',
+            )
+
+        record = self._on_disk(queue, l2.id)
+        assert len(record.amendments) == _MAX_AMENDMENTS
+        stored = sum(
+            len(a['root_cause']) + len(a['summary']) + len(a['detail'])
+            + sum(len(o) for o in a['options'])
+            for a in record.amendments
+        )
+        # Per-entry payload, derived from the constants; the marker allowance
+        # covers the in-band elision notes (one per elided field).
+        marker_allowance = 120
+        fields_per_entry = 3 + _MAX_AMENDMENT_OPTIONS
+        envelope = _MAX_AMENDMENTS * (
+            2 * _MAX_AMENDMENT_LINE_CHARS
+            + _MAX_AMENDMENT_DETAIL_CHARS
+            + _MAX_AMENDMENT_OPTIONS * _MAX_AMENDMENT_LINE_CHARS
+            + fields_per_entry * marker_allowance
+        )
+        assert stored <= envelope, (
+            f'amendments must stay inside the {envelope}-char envelope the caps '
+            f'imply, got {stored}'
+        )
+        # And the byte loss is counted, not silent.
+        assert record.amendments_chars_elided > 0
 
     def test_amendment_list_is_capped_and_truncation_is_loud(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,

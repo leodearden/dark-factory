@@ -26,6 +26,13 @@ Incoming-framing amendments (default-empty; task 3997):
               count of oldest entries shed to the `queue._MAX_AMENDMENTS` cap;
               a durable structured fact so the loss is assertable from the
               record rather than only by log-scrape.
+  amendments_chars_elided:
+              the BYTE-side counterpart: count of characters dropped by the
+              per-field caps (`queue._MAX_AMENDMENT_LINE_CHARS` /
+              `_MAX_AMENDMENT_DETAIL_CHARS` / `_MAX_AMENDMENT_OPTIONS`).  An
+              entry count alone bounds nothing when one field is unbounded free
+              text, so the two counters together are what make the list's size
+              envelope assertable from the record.
   SOLE WRITER: `queue.add_members_to_l2`.
 
 Filing-identity field (default-None; task 3533):
@@ -130,6 +137,12 @@ class Amendment(TypedDict):
     `timestamp` is stamped by the queue at write time, never author-supplied —
     the write chokepoint owns its clock (mirroring `stamp_triage`/`triaged_at`),
     so a caller cannot backdate an amendment.
+
+    Every free-text field is stored ELIDED to the queue's per-field caps, with
+    an in-band marker naming what was dropped (`queue._build_amendment`), and
+    `options` is capped in length.  A field ending in that marker is the HEAD of
+    what was submitted, not all of it; the record-level `amendments_chars_elided`
+    holds the running character total.
 
     Shape mirrors the EvidenceEntry / TrainState TypedDicts.  TypedDict at
     runtime is a plain dict; existing from_dict / to_dict / asdict() paths are
@@ -329,6 +342,10 @@ class Escalation:
     # change (they are field-agnostic passthroughs or RMW-on-hydrated-record).
     amendments: list[Amendment] = field(default_factory=list)
     amendments_truncated: int = 0
+    # BYTE-side counterpart of amendments_truncated: characters dropped by the
+    # per-field caps that make the list's size (not merely its length) bounded.
+    # Same zero-migration story as the two fields above.
+    amendments_chars_elided: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
