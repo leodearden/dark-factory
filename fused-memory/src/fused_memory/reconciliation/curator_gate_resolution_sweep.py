@@ -39,6 +39,39 @@ Design decisions (captured in plan.json):
 - Best-effort throughout, in the fail-SAFE direction: an errored read is
   never treated as evidence of resolution (see
   ``sweep_resolved_curator_gates``).
+
+Evidence for the source-key format, and the zero-recall risk it carries
+(reviewer finding "correctness-risk", amendment pass):
+
+    The ``curator_gate_{task_id}`` spelling has NO producer in this repo.  The
+    writer is the reify MEMORY-curation session, and the only in-tree record of
+    what it stamps is ``fused-memory/tests/fixtures/README.md`` (~line 100:
+    "each canonical identified by ``metadata.source == 'curator_gate_NNNN'``"),
+    which describes that session labelling the canonical of an adjudicated
+    duplicate-memory cluster.  Two things therefore cannot be settled from
+    inside this repo, and both are handled rather than assumed away:
+
+    1. If the real writer's spelling — or its id BASIS (escalation id vs task
+       id) — differs, this sweep is permanently zero-recall and reports
+       ``scanned=N, flags_emitted=0``, byte-identical to a healthy cycle in
+       which no gate happened to be resolved.  That is the exact silent miss
+       the sweep exists to fix, so it is made VISIBLE two ways:
+       ``sweep_resolved_curator_gates`` logs a distinct warning whenever it
+       scanned gates and matched nothing without erroring, and the Stage-1 call
+       site surfaces ``curator_gate_resolution_errors`` alongside the scanned/
+       emitted counts, so "scanned > 0 and emitted == 0 and errors == 0" — the
+       zero-recall signature — is derivable straight from ``report.stats``.
+       To CONFIRM the format against live data, probe the reify corpus for the
+       two gates the task names:
+       ``count_memories_by_metadata(project_id='reify',
+       filters={'source': 'curator_gate_5561'})`` (and ``..._5563``); a
+       non-zero count is direct observation of the spelling.
+    2. The key may be stamped for gates whose memories were merely CURATED
+       rather than gates that were RULED ON.  The flag text therefore asserts
+       only what was OBSERVED — that N entries carrying the key exist — and
+       tells the reader to check the cited memories before acting (see
+       ``build_gate_resolution_flag``).  Stage 2 holds ``set_task_status``, so
+       an over-claiming description could get a still-open human gate closed.
 """
 
 from __future__ import annotations
@@ -159,7 +192,13 @@ def build_gate_resolution_flag(task_id, memories, *, task: dict | None = None) -
     - ``description`` names the exact ``metadata.source`` key that was matched
       and how many entries matched (plus the task title when *task* is given),
       so a Stage-2 reader can re-derive the evidence deterministically rather
-      than trusting the flag's assertion.
+      than trusting the flag's assertion.  It states only what was OBSERVED —
+      that N entries carrying the key exist — and NOT that the gate is
+      resolved: the entries are matched on the key alone and their content is
+      never read here, and the key's producer lives outside this repo (see the
+      module docstring).  Stage 2 holds ``set_task_status``, so an
+      over-claiming description could get a still-open human decision gate
+      closed on a curated-but-unruled cluster.
     - ``cited_memories`` carries one ``{'memory_id', 'store': 'mem0'}`` entry
       per input memory, in input order.  A memory dict with a missing or
       ``None`` ``'id'`` contributes NO entry rather than raising — a malformed
@@ -192,12 +231,16 @@ def build_gate_resolution_flag(task_id, memories, *, task: dict | None = None) -
     description = (
         f'Human-curator gate task {tid}'
         + (f' ("{title}")' if title else '')
-        + f' is still open, but the curator has already ruled on it: '
+        + ' is still open, and '
         f'{len(memories)} Mem0 entr{"y" if len(memories) == 1 else "ies"} '
-        f"carry metadata.source == '{source}' (deterministic Qdrant payload-filter "
-        'match, not semantic search). The task state does not reflect the '
-        'recorded resolution — read the cited memories for the ruling, then '
-        'close or update the gate task accordingly.'
+        f"stamped metadata.source == '{source}' exist"
+        f'{"s" if len(memories) == 1 else ""} '
+        '(deterministic Qdrant payload-filter match, not semantic search). '
+        'That source key is what the reify curator stamps when it records a '
+        'ruling on a gate, so this is EVIDENCE the gate may already be '
+        'resolved — not proof: the match is on the key alone, and the entry '
+        'content was not read here. Read the cited memories; if they record '
+        'a ruling on this gate, the task state does not reflect it.'
     )
 
     return {
@@ -208,9 +251,12 @@ def build_gate_resolution_flag(task_id, memories, *, task: dict | None = None) -
         'flag_type': GATE_RESOLUTION_FLAG_TYPE,
         'category': GATE_RESOLUTION_FLAG_CATEGORY,
         'suggested_action': (
-            f'Verify the ruling in the cited memories (metadata.source == '
-            f"'{source}'), then set task {tid} to its resolved status and record "
-            'the decision, so the gate stops appearing as an open human decision.'
+            f'Read the cited memories (metadata.source == \'{source}\') and check '
+            f'whether they record a ruling on gate {tid}. If they do, set the task '
+            'to its resolved status and record the decision, so the gate stops '
+            'appearing as an open human decision. If they only curate memories '
+            'about the gate without ruling on it, dismiss this flag — do NOT '
+            'close a human decision that has not been made.'
         ),
         'cited_memories': cited_memories,
     }
@@ -224,6 +270,7 @@ async def sweep_resolved_curator_gates(
     project_id: str,
     task_ids: list[str],
     *,
+    tasks_by_id: dict[str, dict] | None = None,
     log: logging.Logger = logger,
 ) -> dict:
     """Flag every open gate in *task_ids* that already has a curator ruling.
@@ -235,6 +282,13 @@ async def sweep_resolved_curator_gates(
     lost to top-N truncation.  On a positive count the matching memories are
     enumerated with ``get_memories_by_metadata`` (Qdrant's scroll API, same
     filter) purely to cite them, and one flag is built per resolved gate.
+
+    The scroll alone could answer both questions, so the count is NOT kept for
+    determinism (the scroll is equally deterministic) — it is kept solely to
+    avoid payload transfer on the common path.  Most open gates are unresolved,
+    and for those the count is a payload-free probe that returns 0 and moves no
+    memory bodies; only a gate that actually has evidence pays a second round
+    trip.
 
     The payload filter carries ONLY the ``source`` key.  Qdrant ANDs filter
     conditions, so adding a ``task_id`` condition would silently miss any
@@ -248,6 +302,11 @@ async def sweep_resolved_curator_gates(
         project_id: Project scope for both reads.
         task_ids: Str gate task ids (typically from
             ``extract_open_gate_task_ids``).
+        tasks_by_id: Optional ``{str(task_id): task_dict}`` map, used ONLY to
+            enrich an emitted flag's description with the gate's title.  A
+            missing id — or ``None`` — simply omits the title.  The map is
+            never consulted for selection, so a stale or partial map cannot
+            change which gates are swept or which are flagged.
         log: Logger to use (default: this module's logger).
 
     Returns:
@@ -322,7 +381,50 @@ async def sweep_resolved_curator_gates(
             stats['errors'] += 1
             continue
 
+        if not memories:
+            # Count/scroll divergence (TOCTOU).  The count said evidence exists
+            # but the scroll read none back — the curator entry was deleted or
+            # GC'd between the two reads, or the count was answered from a
+            # stale segment.  An empty list is NOT an exception, so without this
+            # guard it falls straight through and emits a flag reading "0 Mem0
+            # entries ... exist" with an EMPTY cited_memories: the same
+            # uncitable claim the fetch-failure branch above exists to prevent,
+            # handed to a stage that holds set_task_status.  A gate is only
+            # flagged once at least one citable memory was actually READ.
+            # Tallied as an error — an anomalous read, not a clean "no
+            # evidence" — and skipped; the next cycle re-checks.
+            log.warning(
+                'curator_gate_resolution_sweep: count/scroll divergence for '
+                'source=%s project_id=%s (count=%s, scroll returned 0 rows) — '
+                'not flagging; a gate needs at least one citable memory',
+                source, project_id, count,
+            )
+            stats['errors'] += 1
+            continue
+
         stats['resolved'] += 1
-        stats['flags'].append(build_gate_resolution_flag(task_id, memories))
+        stats['flags'].append(
+            build_gate_resolution_flag(
+                task_id, memories, task=(tasks_by_id or {}).get(str(task_id)),
+            ),
+        )
+
+    if stats['scanned'] and not stats['resolved'] and not stats['errors']:
+        # Zero-recall canary (reviewer finding "correctness-risk").  A clean
+        # sweep that matched nothing is indistinguishable, in the stats alone,
+        # from a sweep whose source-key spelling (or id basis) does not match
+        # what the curator actually writes — and that writer lives outside this
+        # repo (see the module docstring).  Log the exact key SHAPE that was
+        # probed so a format drift is greppable instead of silent; the Stage-1
+        # call site surfaces the same signature on report.stats as
+        # scanned > 0 / flags_emitted == 0 / errors == 0.
+        log.warning(
+            'curator_gate_resolution_sweep: scanned %d open gate(s) in '
+            'project_id=%s with no errors and matched no curator entries '
+            '(probed keys of the form %r) — expected when no gate is resolved, '
+            'but also the signature of a source-key format drift that would '
+            'make this sweep permanently zero-recall',
+            stats['scanned'], project_id, CURATOR_GATE_SOURCE_TEMPLATE,
+        )
 
     return stats

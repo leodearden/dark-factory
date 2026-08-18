@@ -4088,7 +4088,8 @@ class TestCuratorGateResolutionSweepWiring:
     """MemoryConsolidator.run() must sweep open curator gates and APPEND the
     resulting flags to report.items_flagged, surfacing
     report.stats['curator_gate_resolution_scanned'] /
-    ['curator_gate_resolution_flags_emitted'].
+    ['curator_gate_resolution_flags_emitted'] /
+    ['curator_gate_resolution_errors'].
 
     Unlike the other three Stage-1 sweeps (which sit below the filter chain and
     only return int stats), this one EMITS flags — so it must run ABOVE
@@ -4162,7 +4163,14 @@ class TestCuratorGateResolutionSweepWiring:
                 run_id='run-3084-step11a',
             )
 
-        sweep_mock.assert_awaited_once_with(stage.memory, 'test_project', ['5561'])
+        sweep_mock.assert_awaited_once_with(
+            stage.memory, 'test_project', ['5561'],
+            # Title-enrichment map (reviewer finding "dead-code", amendment
+            # pass): the selector returns bare ids, so without this the flag
+            # description can only name the gate by number.  Restricted to the
+            # swept ids — the non-gate 4242 must NOT appear.
+            tasks_by_id={'5561': _open_gate_task('5561')},
+        )
         flag_types = [f.get('flag_type') for f in report.items_flagged]
         assert 'task_completed_not_reflected' in flag_types, (
             'the sweep flag must be appended to report.items_flagged; got '
@@ -4177,6 +4185,11 @@ class TestCuratorGateResolutionSweepWiring:
         )
         assert report.stats.get('curator_gate_resolution_flags_emitted') == 1, (
             f'expected flags_emitted == 1; got stats={report.stats!r}'
+        )
+        assert report.stats.get('curator_gate_resolution_errors') == 0, (
+            "the sweep's error tally must reach report.stats, else a cycle in "
+            'which every gate failed its Qdrant read is indistinguishable from a '
+            f'clean cycle that found nothing; got stats={report.stats!r}'
         )
 
     @pytest.mark.asyncio
@@ -4270,6 +4283,121 @@ class TestCuratorGateResolutionSweepWiring:
             'task_completed_not_reflected',
         ], f'got {report.items_flagged!r}'
 
+    @pytest.mark.asyncio
+    async def test_sweep_errors_reach_report_stats(self):
+        """An all-gates-failed cycle must be distinguishable from a clean empty one.
+
+        Without the errors stat both read scanned=N, flags_emitted=0 — and
+        Stage 1's stats blob is fed verbatim into Stage 2's prompt by
+        _format_report, so the failure would exist only in the process log
+        (reviewer finding "observability", amendment pass).
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.filtered_task_tree = FilteredTaskTree(active_tasks=[
+            _open_gate_task('5561'), _open_gate_task('5563'),
+        ])
+        sweep_mock = AsyncMock(return_value={
+            'flags': [], 'scanned': 2, 'resolved': 0, 'errors': 2,
+        })
+
+        with (
+            patch.object(
+                BaseStage, 'run', new=AsyncMock(return_value=self._base_report()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=lambda **kw: kw['flags']),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.sweep_resolved_curator_gates',
+                new=sweep_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-3084-amend-errors',
+            )
+
+        assert report.stats.get('curator_gate_resolution_errors') == 2, (
+            f'the sweep error tally must be surfaced; got stats={report.stats!r}'
+        )
+        assert report.stats.get('curator_gate_resolution_scanned') == 2
+        assert report.stats.get('curator_gate_resolution_flags_emitted') == 0
+
+    @pytest.mark.asyncio
+    async def test_real_sweep_runs_against_memory_service_shaped_readers(self):
+        """End-to-end with the REAL sweep — only the MemoryService readers are mocked.
+
+        Every other test in this class patches sweep_resolved_curator_gates, so
+        the contract between ``self.memory`` (a real MemoryService in
+        production, whose readers are
+        count_memories_by_metadata(project_id, filters) /
+        get_memories_by_metadata(project_id, filters, limit=1000)) and the
+        sweep's keyword-only call shape would otherwise only be asserted
+        against a duck-typed mock in the sweep's own test file — a signature
+        drift on MemoryService would break production with both files green
+        (reviewer finding "test-coverage", amendment pass).
+        """
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.filtered_task_tree = FilteredTaskTree(active_tasks=[
+            _open_gate_task('5561', title='Gate: adopt the widget policy'),
+            {'id': '4242', 'status': 'pending', 'metadata': {'operational_mode': 'llm'}},
+        ])
+        stage.memory.count_memories_by_metadata = AsyncMock(
+            side_effect=lambda project_id, filters: (
+                2 if filters == {'source': 'curator_gate_5561'} else 0
+            ),
+        )
+        stage.memory.get_memories_by_metadata = AsyncMock(
+            side_effect=lambda project_id, filters: (
+                [{'id': 'mem-a'}, {'id': 'mem-b'}]
+                if filters == {'source': 'curator_gate_5561'} else []
+            ),
+        )
+
+        with (
+            patch.object(
+                BaseStage, 'run', new=AsyncMock(return_value=self._base_report()),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=lambda **kw: kw['flags']),
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-3084-amend-realsweep',
+            )
+
+        # The real sweep must reach the real reader signature, by keyword, with
+        # the ONLY-source payload filter — and must not probe the non-gate task.
+        stage.memory.count_memories_by_metadata.assert_awaited_once_with(
+            project_id='test_project', filters={'source': 'curator_gate_5561'},
+        )
+        gate_flags = [
+            f for f in report.items_flagged
+            if f.get('flag_type') == 'task_completed_not_reflected'
+        ]
+        assert len(gate_flags) == 1, (
+            f'the real sweep must produce exactly one flag; got {report.items_flagged!r}'
+        )
+        assert gate_flags[0]['task_id'] == '5561'
+        assert gate_flags[0]['cited_memories'] == [
+            {'memory_id': 'mem-a', 'store': 'mem0'},
+            {'memory_id': 'mem-b', 'store': 'mem0'},
+        ]
+        assert 'adopt the widget policy' in gate_flags[0]['description'], (
+            'the wired-through title map must reach the real flag; got '
+            f'{gate_flags[0]["description"]!r}'
+        )
+        assert report.stats.get('curator_gate_resolution_scanned') == 1
+        assert report.stats.get('curator_gate_resolution_flags_emitted') == 1
+        assert report.stats.get('curator_gate_resolution_errors') == 0
+
 
 # ---------------------------------------------------------------------------
 # task 3084 step-13 (RED) / step-14 (GREEN): curator-gate sweep wiring guards
@@ -4282,7 +4410,7 @@ class TestCuratorGateResolutionSweepGuards:
     (a) a sweep failure is swallowed (best-effort, mirroring the three existing
         sweep call sites) — run() still returns a StageReport and
         items_flagged is left untouched.
-    (b) both stat keys are present with value 0 on a REMEDIATION pass, proving
+    (b) all three stat keys are present with value 0 on a REMEDIATION pass, proving
         they are set ABOVE the early-return and never conditionally absent —
         the file's established convention (cf.
         stage1_completion_markers_self_deleted, stage1_cycle_summary_ledger_written),
@@ -4375,6 +4503,9 @@ class TestCuratorGateResolutionSweepGuards:
         assert report.stats.get('curator_gate_resolution_flags_emitted') == 0, (
             f'the flags_emitted stat must likewise be present at 0; got {report.stats!r}'
         )
+        assert report.stats.get('curator_gate_resolution_errors') == 0, (
+            f'the errors stat must likewise be present at 0; got {report.stats!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_remediation_pass_never_sweeps(self):
@@ -4406,5 +4537,8 @@ class TestCuratorGateResolutionSweepGuards:
             f'got stats={report.stats!r}'
         )
         assert report.stats.get('curator_gate_resolution_flags_emitted') == 0, (
+            f'got stats={report.stats!r}'
+        )
+        assert report.stats.get('curator_gate_resolution_errors') == 0, (
             f'got stats={report.stats!r}'
         )

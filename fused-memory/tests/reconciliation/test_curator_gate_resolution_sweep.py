@@ -48,8 +48,14 @@ class TestCuratorGateSource:
 
     Every Mem0 read this module performs filters on exactly this string, so a
     divergence here is silently a zero-recall sweep — the failure mode this
-    task exists to fix.  These tests pin the spelling, the int coercion, and
-    the template/helper identity (INV-5: one copy in the tree).
+    task exists to fix.  These tests pin the spelling and the int coercion.
+
+    They deliberately do NOT assert
+    ``CURATOR_GATE_SOURCE_TEMPLATE.format(...) == curator_gate_source(...)``:
+    the helper IS that format call, so the assertion is true by construction
+    and can never fail while the implementation stands (reviewer finding
+    "test-quality", amendment pass).  What is worth pinning is the literal
+    wire format itself, once on the template and once on the helper's output.
     """
 
     def test_str_task_id_yields_curator_gate_key(self):
@@ -69,12 +75,8 @@ class TestCuratorGateSource:
             'int and str spellings of the same task id must collapse to one key'
         )
 
-    def test_template_and_helper_are_one_definition(self):
-        """CURATOR_GATE_SOURCE_TEMPLATE.format(...) equals the helper's output (INV-5)."""
-        assert CURATOR_GATE_SOURCE_TEMPLATE.format(task_id='5561') == curator_gate_source('5561'), (
-            'the template and the helper must be one definition, not two copies '
-            'that can drift apart'
-        )
+    def test_template_pins_the_exported_wire_format(self):
+        """The exported template is the wire format other readers would format against."""
         assert CURATOR_GATE_SOURCE_TEMPLATE == 'curator_gate_{task_id}', (
             f'template spelling drifted; got {CURATOR_GATE_SOURCE_TEMPLATE!r}'
         )
@@ -227,15 +229,56 @@ class TestBuildGateResolutionFlag:
         assert flag['task_id'] == '5563' and isinstance(flag['task_id'], str)
 
     def test_description_names_the_source_key_and_hit_count(self):
-        """A Stage-2 reader can re-derive the evidence from the description alone."""
+        """A Stage-2 reader can re-derive the evidence from the description alone.
+
+        The count is asserted as the RENDERED PHRASE, not as a bare '2'
+        substring: any digit 2 anywhere in the string — a task id, some future
+        count — satisfies the bare form, so it would not catch a wrong count
+        being rendered (reviewer finding "test-quality", amendment pass).
+        """
         flag = build_gate_resolution_flag('5561', [{'id': 'a'}, {'id': 'b'}])
 
         assert curator_gate_source('5561') in flag['description'], (
             'the description must name the exact metadata.source key so the '
             f'evidence is re-derivable; got {flag["description"]!r}'
         )
-        assert '2' in flag['description'], (
+        assert '2 Mem0 entries' in flag['description'], (
             f'the description must name the hit count; got {flag["description"]!r}'
+        )
+
+    def test_description_uses_the_singular_form_for_one_hit(self):
+        """One matching entry renders '1 Mem0 entry', not '1 Mem0 entries'."""
+        flag = build_gate_resolution_flag('5561', [{'id': 'a'}])
+
+        assert '1 Mem0 entry' in flag['description'], (
+            f'expected the singular rendering; got {flag["description"]!r}'
+        )
+        assert 'entries' not in flag['description'], (
+            f'the plural form must not leak into a single-hit description; got '
+            f'{flag["description"]!r}'
+        )
+
+    def test_description_claims_only_what_was_observed(self):
+        """The text asserts the entries EXIST — never that the gate is resolved.
+
+        The key's producer lives outside this repo and may stamp it for merely
+        CURATED (not ruled-on) clusters, and Stage 2 holds set_task_status — so
+        an over-claiming description could get a still-open human decision gate
+        closed (reviewer finding "correctness-risk", amendment pass).
+        """
+        flag = build_gate_resolution_flag('5561', [{'id': 'a'}, {'id': 'b'}])
+
+        assert 'already ruled' not in flag['description'], (
+            'the description must not assert that the curator ruled — it can only '
+            f'report that entries carrying the key exist; got {flag["description"]!r}'
+        )
+        assert 'not proof' in flag['description'], (
+            'the description must mark itself as evidence rather than proof; got '
+            f'{flag["description"]!r}'
+        )
+        assert 'dismiss this flag' in flag['suggested_action'], (
+            'the suggested action must offer the dismiss branch for a curated-but-'
+            f'unruled cluster; got {flag["suggested_action"]!r}'
         )
 
     def test_description_names_the_task_title_when_task_given(self):
@@ -408,6 +451,52 @@ class TestSweepResolvedCuratorGates:
         assert {f['task_id'] for f in stats['flags']} == {'5561', '5563'}
 
     @pytest.mark.asyncio
+    async def test_tasks_by_id_puts_the_gate_title_in_the_emitted_flag(self):
+        """The optional map threads the gate's title into the emitted description.
+
+        Without it, build_gate_resolution_flag's title branch is unreachable in
+        production — extract_open_gate_task_ids returns bare ids (reviewer
+        finding "dead-code", amendment pass).
+        """
+        memory_service = _make_memory_service(
+            counts={'curator_gate_5561': 1},
+            memories={'curator_gate_5561': [{'id': 'mem-a'}]},
+        )
+
+        stats = await sweep_resolved_curator_gates(
+            memory_service, 'reify', ['5561'],
+            tasks_by_id={'5561': {'id': 5561, 'title': 'Gate: adopt the widget policy'}},
+        )
+
+        assert 'adopt the widget policy' in stats['flags'][0]['description'], (
+            'the mapped task title must reach the emitted flag; got '
+            f'{stats["flags"][0]["description"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_or_absent_tasks_by_id_entry_still_flags(self):
+        """A partial/None map only costs the title — it never changes what is flagged."""
+        memory_service = _make_memory_service(
+            counts={'curator_gate_5561': 1},
+            memories={'curator_gate_5561': [{'id': 'mem-a'}]},
+        )
+
+        partial = await sweep_resolved_curator_gates(
+            memory_service, 'reify', ['5561'], tasks_by_id={'9999': {'title': 'other'}},
+        )
+        none_map = await sweep_resolved_curator_gates(memory_service, 'reify', ['5561'])
+
+        for stats in (partial, none_map):
+            assert [f['task_id'] for f in stats['flags']] == ['5561'], (
+                'the enrichment map must never gate flag emission; got '
+                f'{stats["flags"]!r}'
+            )
+        assert 'other' not in partial['flags'][0]['description'], (
+            'a non-matching map entry must not leak into the description; got '
+            f'{partial["flags"][0]["description"]!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_empty_task_ids_short_circuits_with_no_backend_calls(self):
         """No gates -> zero stats, empty flag list, and not one backend round trip."""
         memory_service = _make_memory_service()
@@ -505,6 +594,49 @@ class TestSweepResolvedCuratorGatesFailSafe:
         )
 
     @pytest.mark.asyncio
+    async def test_count_scroll_divergence_emits_no_flag(self):
+        """count > 0 but the scroll returns [] must NOT become a citation-less flag.
+
+        The deletion/TOCTOU race (entry deleted or GC'd between the two reads, or
+        a count answered from a stale segment) is not an exception, so without an
+        explicit guard it falls through to a flag whose description reads "0 Mem0
+        entries ... exist" with an EMPTY cited_memories — the same uncitable
+        claim the fetch-failure branch exists to prevent, handed to a stage that
+        holds set_task_status (reviewer finding "robustness", amendment pass).
+        """
+        memory_service = _make_memory_service(
+            counts={'curator_gate_5561': 2, 'curator_gate_5563': 1},
+            memories={'curator_gate_5563': [{'id': 'mem-b'}]},
+        )
+
+        stats = await sweep_resolved_curator_gates(
+            memory_service, 'reify', ['5561', '5563'],
+        )
+
+        assert [f['task_id'] for f in stats['flags']] == ['5563'], (
+            'a gate is only flagged when at least one citable memory was actually '
+            f'read; got {stats["flags"]!r}'
+        )
+        assert stats['resolved'] == 1, (
+            f'a divergent read is never counted as resolved; got {stats!r}'
+        )
+        assert stats['errors'] == 1, (
+            'the divergence is an anomalous read, not a clean "no evidence" — it '
+            f'must be tallied so it is visible in report.stats; got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_divergence_never_emits_an_empty_citation_flag(self):
+        """The single-gate case: divergence yields no flag at all, not an empty one."""
+        memory_service = _make_memory_service(counts={'curator_gate_5561': 3})
+
+        stats = await sweep_resolved_curator_gates(memory_service, 'reify', ['5561'])
+
+        assert stats['flags'] == [], f'expected no flag whatsoever, got {stats["flags"]!r}'
+        assert stats['resolved'] == 0
+        assert stats['errors'] == 1
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('exc', [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
     async def test_cancellation_from_count_is_reraised(self, exc):
         """CancelledError/KeyboardInterrupt/SystemExit are never swallowed as best-effort."""
@@ -523,3 +655,76 @@ class TestSweepResolvedCuratorGatesFailSafe:
 
         with pytest.raises(exc):
             await sweep_resolved_curator_gates(memory_service, 'reify', ['5561'])
+
+
+class TestSweepZeroRecallCanary:
+    """A clean sweep that matched nothing must be greppable, not silent.
+
+    ``scanned=N, flags_emitted=0`` is byte-identical whether no gate happened to
+    be resolved or the ``curator_gate_{task_id}`` spelling does not match what
+    the curator actually writes (its producer lives outside this repo).  The
+    second case would make this sweep permanently zero-recall — exactly the
+    silent miss it was built to fix — so it is logged (reviewer finding
+    "correctness-risk", amendment pass).
+    """
+
+    @pytest.mark.asyncio
+    async def test_scanned_but_matched_nothing_logs_the_probed_key_shape(self):
+        """A clean, empty-handed sweep warns and names the key format it probed."""
+        memory_service = _make_memory_service(
+            counts={'curator_gate_5561': 0, 'curator_gate_5563': 0},
+        )
+        log = MagicMock()
+
+        stats = await sweep_resolved_curator_gates(
+            memory_service, 'reify', ['5561', '5563'], log=log,
+        )
+
+        assert stats == {'flags': [], 'scanned': 2, 'resolved': 0, 'errors': 0}
+        assert log.warning.call_count == 1, (
+            'a scanned-but-matched-nothing cycle must emit exactly one canary '
+            f'warning; got {log.warning.call_args_list!r}'
+        )
+        rendered = log.warning.call_args.args[0] % log.warning.call_args.args[1:]
+        assert CURATOR_GATE_SOURCE_TEMPLATE in rendered, (
+            'the canary must name the probed key shape so a format drift is '
+            f'greppable; got {rendered!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_canary_when_something_matched(self):
+        """A sweep that found evidence is not zero-recall — no canary."""
+        memory_service = _make_memory_service(
+            counts={'curator_gate_5561': 1},
+            memories={'curator_gate_5561': [{'id': 'mem-a'}]},
+        )
+        log = MagicMock()
+
+        await sweep_resolved_curator_gates(memory_service, 'reify', ['5561'], log=log)
+
+        log.warning.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_canary_when_the_sweep_errored(self):
+        """An errored sweep matched nothing for a KNOWN reason already logged."""
+        memory_service = _make_memory_service()
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=lambda project_id, filters: _raise(RuntimeError('qdrant down')),
+        )
+        log = MagicMock()
+
+        stats = await sweep_resolved_curator_gates(
+            memory_service, 'reify', ['5561'], log=log,
+        )
+
+        assert stats['errors'] == 1
+        log.warning.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_canary_when_there_were_no_gates_to_scan(self):
+        """Zero open gates is not evidence about the key format either way."""
+        log = MagicMock()
+
+        await sweep_resolved_curator_gates(_make_memory_service(), 'reify', [], log=log)
+
+        log.warning.assert_not_called()
