@@ -426,3 +426,128 @@ class TestCleanupConfigDirArchivesFirst:
             workflow._cleanup_config_dir()
 
         assert not config_dir_path.exists()
+
+
+@pytest.mark.asyncio
+class TestProducerHookIsUncancellable:
+    """Task 3619: the producer hook must survive the SIGTERM that triggers it.
+
+    ``_invoke``'s finally archived behind ``await asyncio.to_thread(...)``. The
+    cancellation that reaches this finally IS the shutdown — and it lands on
+    that await, so the archival is skipped and re-raised. The same shutdown
+    then sets ``session_preserved = True`` and writes a resume sidecar naming a
+    session whose transcript was never made durable. This site still COPIES
+    rather than moves: the session may be resumed and must keep reading its own
+    live transcript.
+    """
+
+    @staticmethod
+    def _writes_then(workflow, payload: bytes, then):
+        """Side effect that lays down a transcript, then does *then*()."""
+        def _side_effect(**kwargs):
+            assert workflow._config_dir is not None
+            sid = kwargs['session_id']
+            p = workflow._config_dir.path / 'projects' / ENC / f'{sid}.jsonl'
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(payload)
+            return then()
+        return _side_effect
+
+    async def test_a_cancelled_invocation_still_archives_its_transcript(
+        self, monkeypatch, git_repo, git_ops, task_assignment
+    ):
+        """The SIGTERM shape: cancellation propagates AND the archive exists.
+
+        MEASURED, so the next reader is not misled: this one passes against the
+        pre-fix ``await asyncio.to_thread(...)`` too. A ``CancelledError``
+        RAISED by the invoke (rather than delivered by ``task.cancel()``) does
+        not cancel the surrounding task, so the offloaded archival still gets
+        to complete. It is a re-verification of the propagate-and-archive pair,
+        not the RED. The RED for this step is the sibling below: only patching
+        ``asyncio.to_thread`` distinguishes "archival happened" from "archival
+        happened on a cancellable await".
+        """
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = _config(git_repo)
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        payload = b'{"transcript":"in flight at SIGTERM"}\n'
+
+        def _boom():
+            raise asyncio.CancelledError
+
+        with patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            side_effect=self._writes_then(workflow, payload, _boom),
+        ), pytest.raises(asyncio.CancelledError):
+            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+
+        sid = workflow._last_invoke_session_id
+        archived = (
+            git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
+            / task_assignment.task_id / ENC / f'{sid}.jsonl'
+        )
+        # Cancellation still propagates — teardown is cooperative. What changed
+        # is that it can no longer take the archival with it.
+        assert archived.read_bytes() == payload
+
+    async def test_archival_does_not_go_through_to_thread(
+        self, monkeypatch, git_repo, git_ops, task_assignment
+    ):
+        """Pin the SYNCHRONOUS call, not merely a passing end-to-end result.
+
+        Without this, someone could re-offload the hook to a worker thread and
+        every other test here would still pass — while quietly restoring the
+        cancellation point that loses the transcript. Making
+        ``asyncio.to_thread`` explode proves archival does not route through it.
+        """
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = _config(git_repo)
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        payload = b'{"transcript":"synchronous"}\n'
+
+        async def _explode(*_a, **_kw):
+            raise AssertionError('archival must not be offloaded to a thread')
+
+        with patch('orchestrator.workflow.asyncio.to_thread', _explode), patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            side_effect=self._writes_then(workflow, payload, lambda: AgentResult(
+                success=True, output='')),
+        ):
+            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+
+        sid = workflow._last_invoke_session_id
+        archived = (
+            git_repo / 'data' / 'orchestrator' / 'agent-transcripts'
+            / task_assignment.task_id / ENC / f'{sid}.jsonl'
+        )
+        assert archived.read_bytes() == payload
+
+    async def test_this_site_copies_so_a_resumed_session_keeps_reading(
+        self, monkeypatch, git_repo, git_ops, task_assignment
+    ):
+        """The producer COPIES; only the teardown sites move.
+
+        ``_invoke`` can return to a caller that resumes the very same session,
+        which reads and appends to its own live transcript. Moving it out from
+        under a live session would turn every resume into a no_transcript
+        fallback — the opposite of what this task exists to enable.
+        """
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = _config(git_repo)
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+        payload = b'{"transcript":"still live"}\n'
+
+        with patch(
+            'orchestrator.workflow.invoke_with_cap_retry',
+            new_callable=AsyncMock,
+            side_effect=self._writes_then(workflow, payload, lambda: AgentResult(
+                success=True, output='')),
+        ):
+            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+
+        assert workflow._config_dir is not None
+        sid = workflow._last_invoke_session_id
+        src = workflow._config_dir.path / 'projects' / ENC / f'{sid}.jsonl'
+        assert src.read_bytes() == payload
