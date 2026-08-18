@@ -461,3 +461,89 @@ class TestCascadeAntiDeadlockPreserved:
         assert outcome.status == 'done', f'expected a done outcome, got {outcome!r}'
 
         await _teardown_fill_drive(drive, task, worker)
+
+
+# ---------------------------------------------------------------------------
+# single-host coverage: the redispatch-drain shape under the surviving clause
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSingleHostRedispatchSourceDegeneracy:
+    """The surviving ``free_host_count() == 0`` clause stops the fill pass
+    after exactly one dispatch on a single host, whether that dispatch came
+    from ``_redispatch`` or ``_verifier_queue`` -- task 3276.
+
+    ``TestSingleHostSerialByteIdentical`` (test_merge_queue_concurrent_
+    verify.py) already pins this for a queue-sourced dispatch. Since this
+    task's whole premise is that redispatch-sourced and queue-sourced
+    dispatch had diverged, this closes the one shape that was otherwise
+    governed only by the surviving clause with no direct test: a
+    redispatch-sourced dispatch on a single host.
+    """
+
+    async def test_single_host_stops_after_one_redispatch_sourced_dispatch(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """One host, one item in ``_redispatch``, a second already queued in
+        ``_verifier_queue``: only the first is dispatched before the loop
+        commits to FINALIZE-HEAD.
+
+        No fake remote is injected, so the allocator's only slot is
+        'local'. Once item_a's dispatch takes it, free_host_count() == 0
+        makes the surviving guard clause fire immediately and
+        synchronously -- there is no await point between that decision and
+        ``_finalize_inflight``'s ``await entry.verify_task`` (item
+        acquisition, ``_note_transition`` and ``_inflight_append`` are all
+        synchronous), so by the time ``first_dispatched`` (set only after
+        item_a's lease is held -- see ``_fake_dispatch_item``) resumes this
+        test, the loop is already parked in FINALIZE-HEAD and item_b is
+        guaranteed untouched.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        allocator = HostAllocator([], quarantine=worker._runner_quarantine)
+        worker._host_allocator = allocator
+        assert allocator.free_host_count() == 1, 'precondition: one free (local) host'
+
+        drive = _drive_fill(worker, allocator)
+
+        item_a = _make_real_item(git_ops, config, 'rd-1host-a', 'aaa')
+        item_b = _make_real_item(git_ops, config, 'rd-1host-b', 'bbb')
+
+        worker._register_item(item_a, initial=ItemLifecycleState.REDISPATCH_PARKED)
+        worker._register_item(item_b, initial=ItemLifecycleState.AWAITING_VERIFY)
+
+        worker._redispatch.append(item_a)
+        await worker._verifier_queue.put(item_b)
+
+        task = asyncio.ensure_future(worker._verifier_loop())
+        worker._verifier_task = task
+
+        try:
+            await asyncio.wait_for(drive.first_dispatched.wait(), timeout=MERGE_RESULT_TIMEOUT)
+        except TimeoutError:
+            await _teardown_fill_drive(drive, task, worker)
+            pytest.fail(
+                'item_a (from _redispatch) was never dispatched within '
+                f'{MERGE_RESULT_TIMEOUT}s on a single-host allocator.'
+            )
+
+        assert drive.dispatched == [item_a], (
+            f'expected only item_a dispatched before FINALIZE-HEAD, got {drive.dispatched!r}'
+        )
+        assert allocator.free_host_count() == 0, (
+            'expected the sole host slot held; '
+            f'free_host_count() == {allocator.free_host_count()}'
+        )
+        assert not drive.second_dispatched.is_set(), (
+            'item_b must not be dispatched in the same fill pass on a single '
+            'host -- the surviving free_host_count() == 0 clause must stop '
+            'the fill pass after exactly one dispatch regardless of source'
+        )
+        assert worker._verifier_queue.qsize() == 1, (
+            'item_b must still be sitting untouched in _verifier_queue'
+        )
+
+        await _teardown_fill_drive(drive, task, worker)
