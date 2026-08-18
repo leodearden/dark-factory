@@ -4325,3 +4325,407 @@ class TestPinnedTaintSemanticsSurviveTheCapRetrySeam:
         assert result.outcome == 'done'
         assert result.metrics['cap_tainted'] is False
         assert result.metrics['invocation_error'] is None
+
+
+# ---------------------------------------------------------------------------
+# AMENDMENT PASS — reviewer follow-ups on eval-revival φ (task 3630)
+#
+# Four independent holes in the first cut of the gated seam: a gate that
+# CONSTRUCTS but resolves no accounts, a gate that is never torn down, spend
+# from an abandoned attempt vanishing, and the cap-RESUME branch (the common
+# shape of a real cap) going entirely unexercised.
+# ---------------------------------------------------------------------------
+
+def _zero_account_gate():
+    """A UsageGate that CONSTRUCTS successfully but resolves ZERO accounts.
+
+    Not a hypothetical: ``_init_accounts`` logs "No accounts configured and no
+    default credential found" and returns ``[]`` whenever ``usage_cap.enabled``
+    is on but no ``CLAUDE_OAUTH_*`` env is exported and no
+    ``~/.claude/.credentials.json`` exists — an ordinary CI/cron shell. The
+    constructor SUCCEEDS, so the enabled-guard and the try/except around
+    construction both pass it straight through.
+    """
+    from _orch_helpers import build_usage_gate
+
+    return build_usage_gate([], [])
+
+
+def _mid_run_cap_agent_result(*, cost_usd: float = 0.9, session_id: str = ''):
+    """A cap that landed MID-run, after the architect spent real money.
+
+    ``_cap_agent_result()`` is the OTHER cap shape — an instant, $0.00, zero-
+    turn refusal where the account was already capped when the attempt
+    started. This one is the shape that makes both remaining amendments
+    observable: real ``cost_usd`` to lose, and a real ``session_id`` to resume.
+    """
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=False,
+        output=_CAP_TEXT,
+        cost_usd=cost_usd,
+        duration_ms=180_000,
+        turns=14,
+        subtype='error',
+        api_error_status=429,
+        session_id=session_id,
+    )
+
+
+@pytest.mark.asyncio
+class TestArchitectEvalZeroAccountGate:
+    """An EMPTY account pool must degrade to ungated, not refuse every cell."""
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_the_premise_a_zero_account_gate_refuses_every_invocation(self):
+        """Pin WHY the degrade exists, so it cannot be deleted as dead code.
+
+        The failure is deferred, not absent: construction succeeds and the
+        first ``before_invoke`` raises. Routed through ``run_architect_eval``
+        that RuntimeError lands in the generic handler, is stamped
+        ``harness_error:`` → ``arch_unmeasurable`` → tainted → the cell is
+        EXCLUDED. Every architect cell in the campaign, for a reason having
+        nothing to do with the candidate — a strictly worse version of the
+        ~40% cell loss φ exists to fix, since pre-φ the same run worked ungated
+        on ambient credentials.
+        """
+        gate = _zero_account_gate()
+        assert gate.account_count == 0
+        with pytest.raises(RuntimeError, match='No OAuth accounts available'):
+            await gate.before_invoke()
+
+    async def test_zero_account_gate_degrades_to_the_ungated_path(self, caplog):
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        gate = _zero_account_gate()
+
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(), usage_gate=gate,
+        )
+
+        # Loud about it — an empty pool where the operator asked for one is a
+        # misconfiguration worth seeing in the campaign log.
+        assert 'ZERO accounts' in caplog.text
+        assert 'without failover' in caplog.text
+
+        # …and the cell is a NORMAL cell: one invoke, measured, judged,
+        # INCLUDED. An empty pool has nothing to fail over TO, so the ungated
+        # path forfeits nothing.
+        assert mocks['invoke'].await_count == 1
+        assert result.outcome == 'done'
+        assert result.metrics['cap_tainted'] is False
+        assert result.metrics['invocation_error'] is None
+        assert result.metrics['plan_quality'] == 0.77
+
+    async def test_the_empty_gate_is_never_dispatched_through(self):
+        """The degrade happens at BUILD time, not by catching the refusal.
+
+        Catching the RuntimeError at the call site would work too, but it would
+        pay a real ``invoke_slot`` acquisition per cell and leave the gate
+        installed for anything else that later reads it. The gate must simply
+        never become this cell's transport.
+        """
+        gate = _zero_account_gate()
+        gate.before_invoke = AsyncMock(side_effect=AssertionError('gate was used'))
+
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(), usage_gate=gate,
+        )
+        assert result.outcome == 'done'
+        gate.before_invoke.assert_not_awaited()
+
+    async def test_the_discarded_empty_gate_is_torn_down(self):
+        """…and it is not merely dropped on the floor.
+
+        Even with zero accounts the constructor allocates a FALLBACK probe
+        ``TaskConfigDir`` (the ``or TaskConfigDir(...)`` alias branch) and
+        installs a SIGHUP handler. Discarding without teardown would leak one
+        temp dir PER CELL for the whole campaign.
+        """
+        gate = _zero_account_gate()
+        gate.shutdown = AsyncMock()
+
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(), usage_gate=gate,
+        )
+        assert result.outcome == 'done'
+        gate.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+class TestArchitectEvalGateLifecycle:
+    """The gate is built PER CELL, so it must be torn down per cell.
+
+    ``cli.py`` loops ``run_architect_eval`` over every config, and a campaign
+    loops fixtures × trials, all in ONE process. A gate that is never shut down
+    leaves its account-resume probe loop firing real CLI probes for the rest of
+    the campaign, and every new gate steals the SIGHUP handler from
+    predecessors kept alive by exactly those background tasks.
+    """
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_gate_is_shut_down_when_the_cell_completes(self):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(), usage_gate=gate,
+        )
+
+        assert result.outcome == 'done'
+        gate.shutdown.assert_awaited_once()
+
+    async def test_gate_is_shut_down_even_when_the_cell_fails(self):
+        """Teardown lives in the ``finally``, so the failure paths get it too.
+
+        A campaign's LOSING cells are the ones most likely to have hit a cap —
+        i.e. exactly the ones holding a live probe loop. Leaking on the failure
+        path would leak precisely where it costs the most.
+        """
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan={},
+            usage_gate=gate,
+            invoke_side_effect=RuntimeError('architect exploded'),
+        )
+
+        assert result.outcome == 'blocked'
+        gate.shutdown.assert_awaited_once()
+
+    async def test_a_failing_shutdown_never_damages_the_cell(self, caplog):
+        """Teardown is best-effort: the cell is already scored by then."""
+        from shared.testing import make_gate_mock
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        gate = make_gate_mock()
+        gate.shutdown = AsyncMock(side_effect=RuntimeError('teardown boom'))
+
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(), usage_gate=gate,
+        )
+
+        assert result.outcome == 'done'
+        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['cap_tainted'] is False
+        assert 'shutdown failed' in caplog.text
+
+    async def test_no_gate_means_nothing_to_shut_down(self):
+        """The ungated path must not NameError or invent a teardown."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+        assert result.outcome == 'done'
+        assert mocks['gate'] is None
+
+
+@pytest.mark.asyncio
+class TestArchitectEvalSpendSurvivesFailover:
+    """Spend from an ABANDONED attempt must still be charged to the cell.
+
+    ``invoke_with_cap_retry`` returns only the LAST AgentResult and never
+    aggregates cost across attempts. Reading ``result.cost_usd`` therefore
+    drops everything the architect spent before a mid-run cap — and φ makes
+    that newly consequential, because the cell is now INCLUDED in the
+    aggregate. An under-reported cost biases the cost comparison in the same
+    direction, and for the same reason, that the quality comparison was biased:
+    the more cap-exposed candidate is the one that fails over more often.
+    """
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_spend_from_the_capped_attempt_is_not_dropped(self):
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            usage_gate=_two_account_gate(),
+            invoke_side_effect=[
+                _mid_run_cap_agent_result(cost_usd=0.9),
+                _healthy_agent_result(),
+            ],
+        )
+
+        assert mocks['invoke'].await_count == 2
+        # $0.90 burned before the cap + $1.23 on the account that finished.
+        # Reading only the last result would report $1.23 and silently make
+        # this candidate look 42% cheaper than it was.
+        assert result.metrics['cost_usd'] == pytest.approx(0.9 + 1.23)
+        # The judge's share is a SUBSET of that total, not an addend, and the
+        # stub verdict spends nothing.
+        assert result.metrics['judge_cost_usd'] == 0.0
+        assert result.metrics['cap_tainted'] is False
+
+    async def test_duration_stays_the_winning_attempt_not_the_sum(self):
+        """Cost accumulates; LATENCY deliberately does not.
+
+        Cap waits and abandoned attempts are INFRA time, not candidate
+        latency. Summing them would corrupt the per-candidate duration the
+        campaign compares — the same class of error, one column over.
+        """
+        result, _mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            usage_gate=_two_account_gate(),
+            invoke_side_effect=[
+                _mid_run_cap_agent_result(cost_usd=0.9),  # duration_ms=180_000
+                _healthy_agent_result(),                  # duration_ms=4_567
+            ],
+        )
+        assert result.metrics['workflow_duration_ms'] == 4567
+
+    async def test_single_attempt_spend_is_byte_identical_to_pre_amendment(self):
+        """One attempt ⇒ the accumulator equals the old direct read."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            usage_gate=_two_account_gate(),
+            arch_result=_healthy_agent_result(),
+        )
+        assert mocks['invoke'].await_count == 1
+        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+
+    async def test_spend_before_a_fully_capped_pool_is_still_reported(self):
+        """Even the give-up path reports what it burned.
+
+        The cap-exhaustion handler has no AgentResult to read — the exception
+        was raised AT the invoke — so pre-amendment the cell reported $0.00
+        however much money the architect had already spent. The accumulator
+        makes an EXCLUDED cell's spend honest too, which matters because
+        exclusions are still charged to the campaign's budget.
+        """
+        from orchestrator.evals import runner
+
+        with patch.object(runner, '_EVAL_CAP_WAIT_SANITY_SECS', 0.0):
+            result, _mocks = await _run_architect_eval_hermetic(
+                self._cfg(),
+                produced_plan={},
+                usage_gate=_one_account_gate(),
+                arch_result=_mid_run_cap_agent_result(cost_usd=0.9),
+            )
+
+        assert result.outcome == 'blocked'
+        assert result.metrics['cap_tainted'] is True
+        assert result.metrics['cost_usd'] == pytest.approx(0.9)
+
+
+@pytest.mark.asyncio
+class TestArchitectEvalCapResume:
+    """The cap-RESUME branch — the shape a real mid-run cap actually takes.
+
+    ``TestArchitectEvalCapFailover`` exercises the FRESH-retry branch, and only
+    because ``_cap_agent_result()`` happens to carry no ``session_id``. A cap
+    that lands after the architect has been working DOES carry one, and the
+    wrapper then resumes that session on the next account instead of restarting
+    it: ``resume_session_id`` is set and the prompt is replaced with
+    ``CAP_HIT_RESUME_PROMPT``.
+
+    That branch is where a mis-resume would be most damaging: an architect
+    resumed into an EMPTY session receives a two-line "continue" prompt with no
+    task context, produces nothing, and is scored as a genuine content 0.0 —
+    the φ bias re-created from the inside, with no marker to reveal it.
+
+    Why unchecked resume is nonetheless SOUND for this call site: the wrapper's
+    transcript-reachability veto only runs when a ``config_dir`` is supplied,
+    and the eval passes none. Claude CLI transcripts are local JSONL at
+    ``<config_dir>/projects/<cwd-slug>/<session_id>.jsonl`` (measured
+    2026-08-01, cli_invoke.py), and with ``config_dir=None`` every attempt
+    inherits the SAME ambient ``CLAUDE_CONFIG_DIR`` in the SAME process with
+    the SAME cwd (this cell's eval worktree) — so the transcript attempt 1
+    wrote is exactly where attempt 2's ``--resume`` looks. The veto has nothing
+    to add here; these tests pin the behaviour so a future change to either
+    half (threading a config_dir in, or moving the worktree between attempts)
+    fails loudly instead of silently degrading the measurement.
+    """
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_a_capped_session_is_resumed_on_the_next_account(self, caplog):
+        from shared.cli_invoke import CAP_HIT_RESUME_PROMPT
+
+        caplog.set_level(logging.WARNING, logger='shared.cli_invoke')
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            usage_gate=_two_account_gate(),
+            invoke_side_effect=[
+                _mid_run_cap_agent_result(session_id='sess-abc'),
+                _healthy_agent_result(),
+            ],
+        )
+
+        first, second = mocks['invoke'].call_args_list
+
+        # (a) Attempt 1 is a normal fresh dispatch carrying the real prompt.
+        assert first.kwargs['prompt'] == 'ARCH PROMPT'
+        assert first.kwargs.get('resume_session_id') is None
+
+        # (b) Attempt 2 RESUMES that session on the OTHER account, rather than
+        #     re-running the architect from scratch (which would double the
+        #     cell's cost and discard everything already reasoned).
+        assert second.kwargs['resume_session_id'] == 'sess-abc'
+        assert second.kwargs['prompt'] == CAP_HIT_RESUME_PROMPT
+        assert second.kwargs['oauth_token'] == 'tok-b'
+
+        # (c) The candidate SPEC is unchanged across the resume — the seam is
+        #     transport, never a re-specification of what is being measured.
+        assert second.kwargs['model'] == 'sonnet'
+        assert second.kwargs['backend'] == 'claude'
+        assert second.kwargs['effort'] == 'high'
+        assert second.kwargs['cwd'] == Path('/fake/wt')
+        assert second.kwargs['mcp_config'] is not None
+
+        # (d) It took the unchecked-resume branch, and says so in the log —
+        #     "unchecked" is the honest word, since with no config_dir the
+        #     wrapper never looked for the transcript.
+        assert 'transcript unchecked' in caplog.text
+
+        # (e) The cell lands as a normal MEASURED cell, with both attempts'
+        #     spend charged to it.
+        assert result.outcome == 'done'
+        assert result.metrics['cap_tainted'] is False
+        assert result.metrics['invocation_error'] is None
+        assert result.metrics['plan_quality'] == 0.77
+        assert result.metrics['cost_usd'] == pytest.approx(0.9 + 1.23)
+
+    async def test_a_sessionless_cap_still_retries_fresh_with_the_real_prompt(self):
+        """The contrast case, pinned side by side so the fork stays legible.
+
+        No ``session_id`` ⇒ nothing to resume ⇒ the wrapper restores the
+        original architect prompt. Reversing either half of this fork (fresh
+        where a session exists, or ``CAP_HIT_RESUME_PROMPT`` where none does)
+        silently changes WHAT the second attempt is asked to do.
+        """
+        _result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            usage_gate=_two_account_gate(),
+            invoke_side_effect=[_cap_agent_result(), _healthy_agent_result()],
+        )
+
+        _first, second = mocks['invoke'].call_args_list
+        assert second.kwargs.get('resume_session_id') is None
+        assert second.kwargs['prompt'] == 'ARCH PROMPT'

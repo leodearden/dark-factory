@@ -133,6 +133,21 @@ _WATCHDOG_WORKING_POLL_SECS = 60.0
 #                                         pool cycle, so a fixed count would
 #                                         give a BIGGER account pool LESS
 #                                         wall-clock patience.
+#
+# SCOPE OF EVERY BOUND IN THIS TABLE (task 3630 amendment, reviewer:
+# robustness).  cap_wait_sanity_secs is consulted at exactly one place —
+# _check_cap_wait — which runs in the cap-hit branch AFTER an invocation
+# returned and was classified as a cap.  It therefore bounds cap-RETRY
+# patience.  It does NOT bound the gate's own all-accounts-capped wait: the
+# next loop iteration re-enters usage_gate.invoke_slot -> before_invoke, which
+# ends in an unbounded `await self._open.wait()` (usage_gate.py) released only
+# by a real cap reset or a successful resume probe.  So a caller whose pool is
+# ALREADY frozen when it starts can still block for hours despite a 120 s or
+# 1800 s policy here.  Every caller in this table inherits that gap; none of
+# them currently compensates for it.  Closing it belongs HERE, inside the
+# wrapper, where a wait in before_invoke is definitionally a cap wait and can
+# be attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
+# pool from a slow agent and would misattribute the latter.
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
