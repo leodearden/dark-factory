@@ -31,9 +31,9 @@ from __future__ import annotations
 import pytest
 
 from orchestrator.agents.roles import (
+    _MEMORY_INSTRUCTIONS,
     METADATA_VOCABULARY_INSTRUCTIONS,
     ROLES,
-    _MEMORY_INSTRUCTIONS,
 )
 
 # The roles whose system_prompt splices the memory block, and therefore must

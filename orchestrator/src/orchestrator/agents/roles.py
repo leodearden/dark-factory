@@ -276,6 +276,56 @@ _PLAN_STATUS_TOOLS = [
     'mcp__plan-tools__mark_step_done',
 ]
 
+# The writer-facing metadata vocabulary spliced onto the tail of
+# _MEMORY_INSTRUCTIONS (task 3202, PRD docs/prds/memory-metadata-vocabulary.md
+# leaf iota).  Before it, the word `metadata` did not appear anywhere in the
+# memory block: every role told to write memories was told nothing about the
+# reserved keys the writer path actually validates.
+#
+# POINTER, NOT A SECOND COPY (INV-5).  The single normative home of the
+# vocabulary is `fused-memory/src/fused_memory/memory_metadata.py` (leaf beta,
+# task 3195) -- RESERVED_VOCABULARY_KEYS, KIND_REGISTRY, TOPIC_SLUG_RE,
+# EXPERIMENTAL_KEY_PREFIX.  The prose below summarises those for a writer; it
+# must never restate the registry's contents.  The drift pin that fails when
+# the two sides disagree lives in
+# `fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py` (that suite
+# has BOTH packages on its pythonpath, so the guard is a hard import there
+# rather than a silently-skipped no-op); the orchestrator-local
+# presence/brace/role-split anchor is `tests/test_roles_metadata_vocabulary.py`.
+#
+# SEQUENCING SEAM -- task 3131 (dep-gated behind 3169) inverts the
+# write-eagerness guidance in the PRECEDING block ("Write when you discover..."
+# / "Write immediately..."). The two edits are different sentences at the same
+# site and must NOT be merged: 3131 rewrites what comes before, 3202 only
+# appends this section at the end.  The seam is enforced structurally by
+# `_MEMORY_INSTRUCTIONS.endswith(METADATA_VOCABULARY_INSTRUCTIONS)`, which pins
+# no sentence 3131 owns.
+#
+# Plain text, NO literal `{`/`}` braces -- same reason as
+# MANDATED_STAGING_COMMAND and BACKGROUND_TASK_WARNING below: role prompts are
+# plain `+` concatenation precisely because they carry literal braces, and
+# staying brace-free keeps this section safe if a future splice site ever
+# interpolates it.
+METADATA_VOCABULARY_INSTRUCTIONS = """
+### Memory metadata vocabulary
+
+`add_memory` also takes an optional `metadata` dict. Five keys are RESERVED and
+validated on write:
+
+- `topic` — kebab-case slug naming the subject an entry is about; set it whenever other entries cover the same subject, so they group.
+- `canonical` — bool marking the one authoritative entry for a topic; requires `topic`, and at most one entry per project and topic may claim it.
+- `kind` — the record type, drawn from a closed registry; distinct from `source`, which records writer provenance rather than record type.
+- `parent_id` — full 36-character UUID of a live entry this one attaches to; triage attach outcomes only, kinds `amendment` and `sighting`.
+- `supersedes` — LIST of full 36-character UUIDs this entry replaces; never a bare string, even for a single UUID.
+
+Any other key still writes, but WARNS to a census line. If the annotation is
+deliberate, prefix it `x_` and it passes silently.
+
+The registry module `fused-memory/src/fused_memory/memory_metadata.py` is the
+single normative source for all of this; consult it rather than guessing.
+"""
+
+
 _MEMORY_INSTRUCTIONS = """
 ## Memory
 
@@ -308,7 +358,7 @@ Use when you need context not in your briefing:
 - Before making assumptions about conventions or patterns
 - When encountering unfamiliar code or entities
 - When you need context about prior decisions
-"""
+""" + METADATA_VOCABULARY_INSTRUCTIONS
 
 # The canonical staging command that every role's "## CRITICAL: Git Staging
 # Rules" section (implementer, debugger, merger, steward, simple_task) must
