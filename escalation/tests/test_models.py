@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
+
+import pytest
 
 from escalation.models import (
     BORN_AT_L2_SEVERITIES,
+    KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
+    SEVERITY_RANK,
     Escalation,
     EvidenceEntry,
     IndexHealthState,
     TrainState,
+    max_severity,
 )
 
 
@@ -1289,3 +1295,100 @@ class TestTimestampIsStampedFromTheLiveClock:
         assert datetime.fromisoformat(second.timestamp) >= datetime.fromisoformat(
             first.timestamp,
         ), 'Timestamps must be non-decreasing across constructions'
+
+
+class TestSeverityRank:
+    """`escalation.models` owns a COMPLETE, public severity ordering (task 3976).
+
+    The ordering `info < blocking < critical < urgent` is not invented here: it
+    mirrors the repo's only other canonical escalation-severity ranking,
+    `cockpit/src/cockpit/priority.py:257` `_ESCALATION_SEVERITIES` and its
+    `severity_weights` (`:98-115`, urgent 6.0 > critical 5.0 > blocking 2.5 >
+    info 0.25).  Keeping the two traceably one decision is the point — two
+    independent guesses would drift.
+
+    These tests exist because `queue._SEVERITY_RANK` was `{'info': 0,
+    'blocking': 1}`: `critical`/`urgent` both fell to the rank-0 unknown
+    fail-soft, making the fold ORDER-DEPENDENT for them.
+    """
+
+    def test_rank_is_total_over_known_severities(self):
+        """(a) SEVERITY_RANK covers exactly KNOWN_SEVERITIES — no gaps, no extras.
+
+        A severity added to the vocabulary without a rank must be a loud test
+        failure, not a silent rank-0 that reads as info-level.
+        """
+        assert set(SEVERITY_RANK) == set(KNOWN_SEVERITIES), (
+            f'SEVERITY_RANK keys {sorted(SEVERITY_RANK)} != '
+            f'KNOWN_SEVERITIES {sorted(KNOWN_SEVERITIES)}'
+        )
+
+    def test_ordering_is_info_blocking_critical_urgent(self):
+        """(b) Ranks ascend info < blocking < critical < urgent."""
+        assert (
+            SEVERITY_RANK['info']
+            < SEVERITY_RANK['blocking']
+            < SEVERITY_RANK['critical']
+            < SEVERITY_RANK['urgent']
+        ), f'Unexpected ordering: {SEVERITY_RANK}'
+
+    def test_born_at_l2_severities_all_outrank_blocking(self):
+        """(b) Every born-at-L2 severity outranks 'blocking'."""
+        for sev in BORN_AT_L2_SEVERITIES:
+            assert SEVERITY_RANK[sev] > SEVERITY_RANK['blocking'], (
+                f'{sev!r} (born-at-L2) must outrank blocking; got {SEVERITY_RANK}'
+            )
+
+    @pytest.mark.parametrize(
+        ('a', 'b', 'expected'),
+        [
+            ('info', 'blocking', 'blocking'),
+            ('info', 'critical', 'critical'),
+            ('info', 'urgent', 'urgent'),
+            ('blocking', 'critical', 'critical'),
+            ('blocking', 'urgent', 'urgent'),
+            ('critical', 'urgent', 'urgent'),
+        ],
+    )
+    def test_max_severity_returns_higher_urgency(self, a: str, b: str, expected: str):
+        """(c) max_severity returns the higher-urgency of the two."""
+        assert max_severity(a, b) == expected
+        assert max_severity(b, a) == expected
+
+    @pytest.mark.parametrize('a', sorted(KNOWN_SEVERITIES))
+    @pytest.mark.parametrize('b', sorted(KNOWN_SEVERITIES))
+    def test_max_severity_is_order_independent(self, a: str, b: str):
+        """(c) max_severity(x, y) == max_severity(y, x) over every known pair."""
+        assert max_severity(a, b) == max_severity(b, a), (
+            f'Order-dependent fold: max_severity({a!r}, {b!r}) != '
+            f'max_severity({b!r}, {a!r})'
+        )
+
+    def test_info_vs_critical_regression(self):
+        """(c) Explicit regression for the live bug in queue._SEVERITY_RANK.
+
+        `queue._max_severity('info', 'critical')` returned `'info'` — both
+        arguments fell to rank 0 and the `>=` tie-break handed the win to `a`.
+        """
+        assert max_severity('info', 'critical') == 'critical'
+        assert max_severity('critical', 'info') == 'critical'
+
+    def test_unknown_severity_fails_soft_to_rank_zero(self, caplog):
+        """(d) An unknown severity is treated as rank 0 and WARNs — never raises."""
+        with caplog.at_level(logging.WARNING, logger='escalation.models'):
+            result = max_severity('warn', 'blocking')
+
+        assert result == 'blocking'
+        warned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'warn' in r.getMessage()
+        ]
+        assert warned, (
+            'Expected a WARNING naming the unrecognised severity; '
+            f'got records: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_unknown_vs_unknown_is_deterministic(self):
+        """(e) Unknown-vs-unknown resolves on the first argument, not arbitrarily."""
+        assert max_severity('warn', 'wat') == 'warn'
+        assert max_severity('wat', 'warn') == 'wat'
