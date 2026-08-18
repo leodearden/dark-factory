@@ -5183,7 +5183,7 @@ def _names_the_utf8_codec(name: str) -> bool:
 
 
 def _utf8_child_env(**overrides: str) -> dict[str, str]:
-    """Scrubbed env for the ``_atomic_write_text`` encoding child processes.
+    """Scrubbed env for the ``_atomic_write_text`` encoding child process.
 
     Built from scratch rather than from ``os.environ`` so a developer's shell
     (``LANG``, ``PYTHONUTF8``, ``PYTHONWARNDEFAULTENCODING``, ...) cannot
@@ -5214,44 +5214,36 @@ def _utf8_child_env(**overrides: str) -> dict[str, str]:
     return env
 
 
-#: The non-ASCII JSON payload both child scripts below write.  It reaches each
+#: The non-ASCII JSON payload the child script below writes.  It reaches the
 #: child as a ``\\u00e9`` ESCAPE (via ``json.dumps``, whose output is a valid
 #: Python string literal for this content) so the generated script file is pure
-#: ASCII.  MEASURED and load-bearing: under ``LC_ALL=C`` a literal non-ASCII
-#: character cannot cross a process boundary in argv at all — ``python3 -c``
-#: with one dies decoding argv before Python starts.  Keeping the child source
-#: ASCII sidesteps that entire class of failure, so a RED here always means the
-#: contract broke rather than the harness misfiring.
+#: ASCII and the payload rides in the FILE rather than in argv.  Keep it that
+#: way if this pin is ever re-parameterised: MEASURED while building it, a
+#: literal non-ASCII character cannot cross a process boundary in argv under a
+#: C locale at all — ``python3 -c`` with one dies decoding argv before Python
+#: starts — so an ASCII-only child source keeps a RED here meaning "the
+#: contract broke" rather than "the harness misfired".
 _UTF8_PIN_PAYLOAD = '{"note": "café"}'
 
 _ENCODING_WARNING_CHILD = '''\
 """Write one record via session_registry with implicit encodings made fatal."""
 import pathlib
 import sys
-
-from orchestrator import session_registry as sr
-
-sr._atomic_write_text(pathlib.Path(sys.argv[1]), %(payload)s)
-'''
-
-_C_LOCALE_CHILD = '''\
-"""Write one record via session_registry under a genuinely non-UTF-8 locale."""
-import locale
-import pathlib
-import sys
-
-# Report the env BEFORE the write.  If the write raises, the parent still needs
-# this line to tell "the pin caught the bug" apart from "this host coerced the
-# C locale to UTF-8, so the run proved nothing".  Every print here stays
-# ASCII-only: under LC_ALL=C a non-ASCII print would itself raise and mask the
-# result the child exists to report.
-print('PREFERRED=' + locale.getpreferredencoding(False), flush=True)
+import warnings
 
 from orchestrator import session_registry as sr
 
 target = pathlib.Path(sys.argv[1])
-sr._atomic_write_text(target, %(payload)s)
-print('HEX=' + target.read_bytes().hex(), flush=True)
+
+# SCOPED to this one call, deliberately.  Promoting EncodingWarning for the
+# whole interpreter (``-W error::EncodingWarning``, which this child used to
+# rely on) makes ANY unrelated implicit-encoding text open anywhere on the
+# ``import orchestrator.session_registry`` path fail this test with a message
+# about task 3387 -- a false RED pointing at the wrong line.  The import is
+# therefore left outside the block; only the write under test is strict.
+with warnings.catch_warnings():
+    warnings.simplefilter('error', EncodingWarning)
+    sr._atomic_write_text(target, %(payload)s)
 '''
 
 
@@ -5325,12 +5317,24 @@ class TestAtomicWriteSemantics:
     # log and skip the file — i.e. silent data loss.  (NOT
     # ``shared.safe_io.load_json_or_warn``, which an earlier version of this
     # comment named: that helper never reads session, decision or lease
-    # records.)  Three pins, deliberately different in KIND, because no single
-    # one of them is trustworthy alone:
+    # records.)  Two pins, deliberately different in KIND, because neither is
+    # trustworthy alone:
     #
-    #   1. a boundary spy   — fast, deterministic, host-independent
-    #   2. an EncodingWarning child — the interpreter itself names the defect
-    #   3. a C-locale child — real bytes, on a real disk, under a real locale
+    #   1. a boundary spy   — fast, deterministic, host-independent; localises
+    #      the defect to the exact argument
+    #   2. an EncodingWarning child — the interpreter itself names the defect,
+    #      and byte-asserts the result, so the BYTES on disk are pinned too
+    #
+    # A third pin, a genuine ``LC_ALL=C`` child, was written, mutation-verified
+    # and then REMOVED as disproportionate: it pinned the same contract as 2
+    # while being the only one that can go vacuous (it self-skips whenever the
+    # host coerces the C locale to UTF-8), and it cost a second subprocess in
+    # an already subprocess-heavy suite.  Do not re-add it without a failure
+    # mode 1 and 2 provably cannot catch; if you do, all four of LC_ALL=C,
+    # LANG=C, PYTHONUTF8=0 and PYTHONCOERCECLOCALE=0 are REQUIRED (measured:
+    # bare LC_ALL=C LANG=C still reports 'utf-8' under PEP 540/538 coercion,
+    # so a version missing the last two is silently vacuous), plus a
+    # self-check that the child really landed in a non-UTF-8 env.
     #
     # WHAT THIS REPLACED, so it is not reintroduced: the first version of this
     # pin monkeypatched ``locale.getpreferredencoding`` and asserted the bytes
@@ -5349,13 +5353,11 @@ class TestAtomicWriteSemantics:
     #
     # MUTATION GATE.  Run with BOTH sites reverted at once — ``os.fdopen(fd,
     # 'w')`` here and ``encoding=locale.getpreferredencoding(False)`` in
-    # lane_lifecycle — all three pins below were observed FAILING, each in its
-    # own way, before the fix was accepted:
+    # lane_lifecycle — both pins below were observed FAILING, each in its own
+    # way, before the fix was accepted:
     #
     #   spy    -> AssertionError: no encoding= kwarg  (assert None is not None)
     #   strict -> child exit 1, EncodingWarning at this module's fdopen line
-    #   locale -> child exit 1, PREFERRED=ANSI_X3.4-1968, UnicodeEncodeError
-    #             on '\xe9'
     #
     # Re-run that gate before trusting any future edit to these three, in the
     # vocabulary this file already uses for its bare-shell rows below: a guard
@@ -5366,7 +5368,7 @@ class TestAtomicWriteSemantics:
     def test_passes_an_explicit_utf8_encoding_to_fdopen(self, tmp_path, monkeypatch):
         """Task 3387: the ``os.fdopen`` boundary is handed an explicit utf-8.
 
-        The cheapest of the three pins and the one that localises the defect:
+        The cheaper of the two pins and the one that localises the defect:
         it fails on EVERY host regardless of locale, because against the
         unfixed source no ``encoding`` kwarg is passed AT ALL — there is no
         spelling for it to accidentally agree with.
@@ -5414,18 +5416,30 @@ class TestAtomicWriteSemantics:
     def test_names_no_default_encoding_in_a_strict_child(self, tmp_path):
         """Task 3387: an interpreter told to reject implicit encodings runs clean.
 
-        The PRIMARY end-to-end pin.  ``PYTHONWARNDEFAULTENCODING=1`` plus
-        ``-W error::EncodingWarning`` promotes every implicit-locale-encoding
-        text open into a hard error naming the exact file and line.
+        The end-to-end pin.  ``PYTHONWARNDEFAULTENCODING=1`` makes every
+        implicit-locale-encoding text open emit an ``EncodingWarning`` naming
+        the exact file and line, and the child promotes that warning to an
+        error AROUND THE WRITE UNDER TEST ONLY.
+
+        The narrow scope is the point.  Promoting it for the whole interpreter
+        (``-W error::EncodingWarning``, the first shape of this pin) meant any
+        unrelated implicit-encoding open on the ``import
+        orchestrator.session_registry`` path would fail this test with a
+        message about task 3387 — a false RED aimed at the wrong line.  The
+        import now happens outside the strict block.
 
         Preferred over a locale-based pin because it cannot be quietly
         neutralised: it keys on the MISSING ``encoding=`` argument itself, so
         neither PEP 540/538 C-locale coercion nor a host's choice of UTF-8
-        alias can make it pass vacuously.
+        alias can make it pass vacuously.  The trailing byte assertion keeps
+        the on-disk BYTES pinned as well, which is the actual contract (RFC
+        8259) — that is why removing the retired C-locale child cost no
+        coverage.
 
-        MEASURED both ways.  Against the unfixed ``os.fdopen(fd, 'w')``: exit
-        1, ``EncodingWarning: 'encoding' argument not specified``, pointing at
-        session_registry's fdopen line.  Against the fix: exit 0, clean.
+        MEASURED both ways, with the filter scoped as it now is.  Against the
+        unfixed ``os.fdopen(fd, 'w')``: exit 1, ``EncodingWarning: 'encoding'
+        argument not specified``, pointing at session_registry's fdopen line.
+        Against the fix: exit 0, clean.
         """
         script = tmp_path / 'child_encoding_warning.py'
         script.write_text(
@@ -5435,7 +5449,7 @@ class TestAtomicWriteSemantics:
         target = tmp_path / 'record.json'
 
         result = subprocess.run(
-            [sys.executable, '-W', 'error::EncodingWarning', str(script), str(target)],
+            [sys.executable, str(script), str(target)],
             env=_utf8_child_env(PYTHONWARNDEFAULTENCODING='1'),
             # A neutral cwd, for the reasons ``_run_row`` documents at length:
             # the process's own cwd goes on sys.path, and the suite's cwd would
@@ -5450,85 +5464,6 @@ class TestAtomicWriteSemantics:
             'session_registry opened a text file without naming an encoding, so '
             'it writes JSON in whatever the ambient locale happens to be '
             f'(task 3387).\nstderr:\n{result.stderr}'
-        )
-        assert target.read_bytes() == _UTF8_PIN_PAYLOAD.encode('utf-8')
-
-    def test_writes_utf8_bytes_under_a_genuine_non_utf8_locale(self, tmp_path):
-        """Task 3387: real utf-8 bytes land on disk under a real C locale.
-
-        The only pin that proves the BYTES rather than the argument — and the
-        on-disk bytes are the actual contract, since it is
-        ``load_json_or_warn`` quarantining a mis-encoded record that loses the
-        data.
-
-        All four of ``LC_ALL``/``LANG``/``PYTHONUTF8``/``PYTHONCOERCECLOCALE``
-        are required, and NONE is boilerplate: MEASURED on this host, bare
-        ``LC_ALL=C LANG=C`` still yields ``getpreferredencoding(False) ==
-        'utf-8'``, because PEP 540/538 coerce the C locale to UTF-8.  A version
-        of this test missing the last two would be SILENTLY VACUOUS — exactly
-        the defect the surrounding comment describes.  (Task 3967 independently
-        recorded the same bare-``LC_ALL=C`` non-reproduction, so this is a
-        repeat trap in this codebase, not a one-off.)
-
-        Because that hazard is invisible from the outside, the child REPORTS
-        the encoding it actually got and this test skips LOUDLY if it is a
-        UTF-8 alias — the same "prove the row can discriminate before trusting
-        its green" discipline the bare-shell registry's ``probe`` field
-        enforces below.
-
-        MEASURED: with all four set the child reports ``ANSI_X3.4-1968``; the
-        unfixed source then dies with ``UnicodeEncodeError: 'ascii' codec can't
-        encode character '\\xe9'``, and the fix writes ``b'caf\\xc3\\xa9'``.
-        """
-        script = tmp_path / 'child_c_locale.py'
-        script.write_text(
-            _C_LOCALE_CHILD % {'payload': json.dumps(_UTF8_PIN_PAYLOAD)},
-            encoding='utf-8',
-        )
-        target = tmp_path / 'record.json'
-
-        result = subprocess.run(
-            [sys.executable, str(script), str(target)],
-            env=_utf8_child_env(
-                LC_ALL='C',
-                LANG='C',
-                PYTHONUTF8='0',
-                PYTHONCOERCECLOCALE='0',
-            ),
-            cwd=tmp_path,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-
-        preferred = next(
-            (
-                line.removeprefix('PREFERRED=')
-                for line in result.stdout.splitlines()
-                if line.startswith('PREFERRED=')
-            ),
-            None,
-        )
-        assert preferred is not None, (
-            'the child never reported its preferred encoding, so nothing below '
-            f'can be trusted.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}'
-        )
-        if _names_the_utf8_codec(preferred):
-            pytest.skip(
-                f'this interpreter reports {preferred!r} even under LC_ALL=C with '
-                'PYTHONUTF8=0/PYTHONCOERCECLOCALE=0, so it cannot tell a utf-8 '
-                'write from a locale-encoded one. Skipping LOUDLY rather than '
-                'passing vacuously; test_names_no_default_encoding_in_a_strict_'
-                'child pins the same contract locale-independently.'
-            )
-
-        assert result.returncode == 0, (
-            f'under a genuine {preferred} locale session_registry failed to write '
-            f'non-ASCII JSON (task 3387).\nstderr:\n{result.stderr}'
-        )
-        assert f'HEX={_UTF8_PIN_PAYLOAD.encode("utf-8").hex()}' in result.stdout, (
-            f'on-disk bytes are not the utf-8 encoding of the payload under a '
-            f'{preferred} locale.\nstdout:\n{result.stdout}'
         )
         assert target.read_bytes() == _UTF8_PIN_PAYLOAD.encode('utf-8')
 
