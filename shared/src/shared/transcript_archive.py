@@ -91,18 +91,32 @@ def _reset_archival_failures() -> None:
     _ARCHIVAL_FAILURES = 0
 
 
-def _record_failure(src: Path, task_id: str, exc: OSError) -> None:
+def _record_failure(
+    src: Path,
+    task_id: str,
+    exc: BaseException,
+    *,
+    detail: str = 'failed to archive',
+) -> None:
     """Count and loudly (but non-fatally) log a single per-file archive failure.
 
     Increments :data:`_ARCHIVAL_FAILURES` and emits one structured WARNING so a
     systemic breakage (e.g. disk full → every file fails) is visible as a
     climbing counter rather than failing silently (design-invariants
     INV-2/INV-4).
+
+    *detail* names WHAT failed. It exists so the one other loud failure this
+    module reports — a credential-isolation regression, where
+    :func:`_purge_config_dir` left ``.credentials.json`` behind — accrues to the
+    SAME counter and the same ``path``/``task_id``/``errno`` shape rather than
+    growing a second, separately-monitored signal. One counter, one greppable
+    shape, one thing a consumer has to watch.
     """
     global _ARCHIVAL_FAILURES
     _ARCHIVAL_FAILURES += 1
     logger.warning(
-        'transcript_archive: failed to archive %s: %s',
+        'transcript_archive: %s %s: %s',
+        detail,
         src,
         exc,
         extra={
@@ -209,11 +223,11 @@ class ArchiveBeforeDelete:
 
 
 def _move_to_archive(
-    src,
-    projects_root,
-    archive_root,
-    task_id,
-):
+    src: Path,
+    projects_root: Path,
+    archive_root: Path,
+    task_id: str,
+) -> bool:
     """MOVE a single transcript *src* to its mirror under *archive_root*.
 
     The sibling of :func:`_archive_one`, and deliberately the same destination
@@ -264,24 +278,116 @@ def _move_to_archive(
     return True
 
 
-def _purge_config_dir(config_dir, held, task_id):
-    """Remove *config_dir*, or as much of it as *held* permits.
+def _remove_member(entry: Path) -> None:
+    """Delete one config-dir member. Never raises, and never FOLLOWS a symlink.
+
+    The ``is_symlink()`` test comes first and is load-bearing. A symlink to a
+    directory answers ``is_dir()`` True, and the per-task config dir contains
+    exactly that shape — ``TaskConfigDir._setup_symlinks`` links
+    ``settings.json`` / ``settings.local.json`` into the operator's real
+    ``~/.claude``. Handing such an entry to :func:`shutil.rmtree` raises
+    (rmtree refuses a symlinked root), and any variant that resolved the link
+    first would delete the operator's real settings. Unlinking the LINK is the
+    only correct move, and testing for it first makes following one
+    structurally impossible rather than incidentally avoided.
+    """
+    try:
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(entry, ignore_errors=True)
+    except OSError as exc:  # pragma: no cover - the purge is itself best-effort
+        logger.warning(
+            'transcript_archive: failed to purge config-dir member %s: %s',
+            entry,
+            exc,
+            extra={'path': str(entry), 'errno': getattr(exc, 'errno', None)},
+        )
+
+
+def _warn_on_surviving_credential(config_dir: Path, task_id: str) -> None:
+    """Count + log a ``.credentials.json`` that outlived the purge.
+
+    The purge runs on best-effort primitives (``rmtree(ignore_errors=True)``,
+    a swallowing :func:`_remove_member`), so a credential CAN survive it — and
+    a surviving per-task OAuth credential is a strictly worse outcome than the
+    transcript loss this task set out to fix. It accrues to the existing
+    archival-failure counter, so the same consumer watching for a broken
+    archive root sees this too and there is no second signal to wire up.
+    """
+    creds = config_dir / '.credentials.json'
+    if creds.exists():
+        _record_failure(
+            creds,
+            task_id,
+            RuntimeError('config-dir purge left it in place'),
+            detail='CREDENTIAL ISOLATION REGRESSION — failed to purge',
+        )
+
+
+def _purge_config_dir(config_dir: Path, held: list[Path], task_id: str) -> bool:
+    """Remove *config_dir*, or everything in it except the *held* transcripts.
 
     Returns ``True`` when the whole directory is gone. Never raises.
+
+    With nothing held this is equivalent to the ``TaskConfigDir.cleanup()``
+    rmtree it replaces. With something held the purge is still UNCONDITIONAL
+    for every member that is neither a held transcript nor a directory on the
+    path to one — the per-task OAuth ``.credentials.json``, the ``~/.claude``
+    settings symlinks, ``sessions/``, ``telemetry/``, all of it.
+
+    That asymmetry is the D1/INV-7 decision, and it is deliberate. Refusing to
+    tear down at all until archival succeeds would convert a bounded transcript
+    loss into an unbounded credential exposure: a permanently-failing archive
+    root (full disk, wrong permissions, unmounted volume) would strand every
+    task's live OAuth credential on disk indefinitely, defeating the per-task
+    isolation the config dir exists to provide. So the hold is SCOPED to the
+    un-archivable ``.jsonl`` alone; it is OWNED by the next process start's
+    ``Harness._sweep_orphaned_transcripts``, which re-archives whatever is
+    still lying in a surviving worktree; and it is therefore BOUNDED by a
+    restart rather than open-ended in time.
     """
     if not held:
-        # Byte-equivalent to the TaskConfigDir.cleanup() this replaces.
         shutil.rmtree(config_dir, ignore_errors=True)
-        return True
+        # Read the outcome back rather than assuming it: rmtree was asked to
+        # ignore its errors, so "we called it" and "the directory is gone" are
+        # different claims and only the second licenses the True.
+        removed = not config_dir.exists()
+        _warn_on_surviving_credential(config_dir, task_id)
+        return removed
+
+    projects_root = config_dir / 'projects'
+    keep_files = set(held)
+    keep_dirs: set[Path] = {projects_root, config_dir}
+    for f in keep_files:
+        keep_dirs.update(f.parents)
+
+    # Everything outside projects/ goes, whatever happened to the transcripts.
+    for entry in config_dir.iterdir():
+        if entry != projects_root:
+            _remove_member(entry)
+
+    # Inside projects/, keep the held files and only the directories that lead
+    # to them. Deepest-first, so any directory reached here provably contains
+    # no keeper (a directory that did would be in keep_dirs) and no rmtree can
+    # take a held transcript down with it.
+    for entry in sorted(
+        projects_root.rglob('*'), key=lambda q: len(q.parts), reverse=True
+    ):
+        if entry in keep_files or entry in keep_dirs:
+            continue
+        _remove_member(entry)
+
+    _warn_on_surviving_credential(config_dir, task_id)
     return False
 
 
 def archive_before_delete(
-    config_dir,
-    task_id,
+    config_dir: Path,
+    task_id: str,
     *,
-    archive_root,
-):
+    archive_root: Path,
+) -> ArchiveBeforeDelete:
     """Make *config_dir*'s transcripts durable, THEN delete the directory.
 
     The fused replacement for "call :func:`archive_task_transcripts`, then
@@ -318,6 +424,15 @@ def archive_before_delete(
     per-file failure is counted through :func:`_record_failure` and the file is
     HELD: reported in the returned :class:`ArchiveBeforeDelete`, left on disk,
     never deleted.
+
+    A hold is deliberately NARROW and deliberately TEMPORARY. It covers the
+    un-archivable ``.jsonl`` alone — every other member of the config dir,
+    ``.credentials.json`` included, is purged unconditionally (see
+    :func:`_purge_config_dir` for why holding those instead would be the worse
+    bug). It is owned by the next process start's
+    ``Harness._sweep_orphaned_transcripts``, which re-archives whatever is
+    still lying in a surviving worktree, so the hold is bounded by a restart
+    rather than open-ended in time.
     """
     config_dir = Path(config_dir)
     archive_root = Path(archive_root)
