@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 from shared import transcript_archive as transcript_archive_module
-from shared.transcript_archive import archive_task_transcripts, durable_archive_path
+from shared.transcript_archive import (
+    archive_before_delete,
+    archive_task_transcripts,
+    durable_archive_path,
+)
 
 # A representative encoded-project directory name (Claude Code encodes the
 # absolute project path into this leaf; the exact encoding is irrelevant here).
@@ -299,6 +303,192 @@ class TestBestEffortLoud:
         assert dest.stat().st_mtime_ns == before_mtime_ns
         assert [p.name for p in root.rglob('*') if p.is_file()] == [dest.name]
         assert transcript_archive_module._archival_failures() == 1
+
+
+class TestArchiveBeforeDelete:
+    """Task 3619 leaf 2 — archival as a PRECONDITION of config-dir deletion.
+
+    :func:`archive_task_transcripts` COPIES and leaves the source alone; the
+    caller then deletes the config dir as a *separate, later* step. That gap is
+    the measured bug: every teardown site (``_cleanup_config_dir``,
+    ``_recycle_config_dir``, ``cleanup_worktree``) can lose the copy step —
+    to a SIGTERM cancellation landing on the archival ``await``, or to a code
+    path that simply never had one — and still run the ``rmtree``, destroying
+    the only copy of the transcript.
+
+    :func:`archive_before_delete` closes it by making the two ONE operation:
+    a transcript is moved out first, and only what is provably durable is
+    deleted. These tests pin the happy path (this class); the credential-purge
+    hard constraint and the EXDEV fallback are pinned separately below.
+    """
+
+    def test_moves_every_transcript_then_removes_the_whole_config_dir(self, tmp_path):
+        """(a)+(b)+(d): archive at the canonical path, sources gone, dir gone."""
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        sid = 'sess-move'
+
+        main_bytes = b'{"type":"main","line":1}\n{"type":"main","line":2}\n'
+        sub_bytes = b'{"type":"subagent","line":1}\n'
+
+        src_main = _write(config_dir / 'projects' / ENC / f'{sid}.jsonl', main_bytes)
+        src_sub = _write(
+            config_dir / 'projects' / ENC / sid / 'subagents' / 'agent-1.jsonl',
+            sub_bytes,
+        )
+
+        outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        # (a) Byte-identical at the SAME layout _archive_one writes, so the
+        # already-current skip is shared across all three producer sites.
+        main_dest = root / task_id / ENC / f'{sid}.jsonl'
+        sub_dest = root / task_id / ENC / sid / 'subagents' / 'agent-1.jsonl'
+        assert main_dest.read_bytes() == main_bytes
+        assert sub_dest.read_bytes() == sub_bytes
+
+        # (b) The sources are gone and the ENTIRE config dir is gone — parity
+        # with today's TaskConfigDir.cleanup() rmtree, which this replaces.
+        assert not src_main.exists()
+        assert not src_sub.exists()
+        assert not config_dir.exists()
+
+        # (d) Structured outcome: two moved, nothing skipped, nothing held.
+        assert outcome.archived == 2
+        assert outcome.already_current == 0
+        assert outcome.held == ()
+        assert outcome.config_dir_removed is True
+
+    def test_a_rename_preserves_the_source_mtime_so_the_next_call_skips(
+        self, tmp_path
+    ):
+        """The move must leave the archive stamped from the SOURCE, not `now`.
+
+        ``_archive_one``'s copy path needs an explicit ``os.utime`` mirror for
+        this; a rename preserves the inode, so it comes free. It is asserted
+        anyway because it is load-bearing in two directions: a ``now``-stamped
+        archive reads to ``gc_agent_transcripts`` as a reset retention age, and
+        it would defeat the already-current skip the sweeper and the producer
+        both depend on.
+        """
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        sid = 'sess-mtime'
+
+        src = _write(config_dir / 'projects' / ENC / f'{sid}.jsonl', b'{"l":1}\n')
+        os.utime(src, (1_600_000_000, 1_600_000_000))
+        src_mtime = src.stat().st_mtime
+
+        archive_before_delete(config_dir, task_id, archive_root=root)
+
+        dest = root / task_id / ENC / f'{sid}.jsonl'
+        assert int(dest.stat().st_mtime) == int(src_mtime)
+
+    def test_an_already_current_archive_is_corroborated_not_rewritten(self, tmp_path):
+        """(c): dest already current → source deleted, archive left untouched.
+
+        Corroborate-then-delete, not re-archive-then-delete. The producer hook
+        already archived this session on its way out (workflow.py's
+        ``_invoke`` finally), so by teardown the common case is that the
+        durable copy is ALREADY there. Rewriting it would be wasted I/O; more
+        importantly, proving the archive is current is exactly the precondition
+        that licenses the delete.
+        """
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        sid = 'sess-current'
+
+        src = _write(config_dir / 'projects' / ENC / f'{sid}.jsonl', b'{"src":1}\n')
+        # Pre-write the archive with a DISTINCTIVE payload and mirror the
+        # source mtime onto it, so the already-current predicate holds. A
+        # genuine skip leaves the marker intact; an unconditional re-archive
+        # replaces it with the source bytes.
+        marker = b'MARKER-already-current-not-rewritten'
+        dest = _write(root / task_id / ENC / f'{sid}.jsonl', marker)
+        st = src.stat()
+        os.utime(dest, (st.st_atime, st.st_mtime))
+
+        outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        assert dest.read_bytes() == marker
+        # ...yet the source is still deleted, and the dir still torn down.
+        assert not src.exists()
+        assert not config_dir.exists()
+        assert outcome.archived == 0
+        assert outcome.already_current == 1
+        assert outcome.held == ()
+        assert outcome.config_dir_removed is True
+
+    def test_a_mixed_dir_reports_both_moved_and_already_current(self, tmp_path):
+        """One transcript already archived, one not — both resolved, both gone."""
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        task_id = '3619'
+
+        stale = _write(config_dir / 'projects' / ENC / 'sess-new.jsonl', b'{"n":1}\n')
+        done = _write(config_dir / 'projects' / ENC / 'sess-old.jsonl', b'{"o":1}\n')
+        done_dest = _write(root / task_id / ENC / 'sess-old.jsonl', b'{"o":1}\n')
+        st = done.stat()
+        os.utime(done_dest, (st.st_atime, st.st_mtime))
+
+        outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        assert outcome.archived == 1
+        assert outcome.already_current == 1
+        assert outcome.held == ()
+        assert (root / task_id / ENC / 'sess-new.jsonl').read_bytes() == b'{"n":1}\n'
+        assert not stale.exists()
+        assert not config_dir.exists()
+
+    def test_a_missing_config_dir_is_an_idempotent_no_op(self, tmp_path):
+        """(e): never raises on an absent dir — teardown sites call it blind.
+
+        ``cleanup_worktree`` fires on lanes that never got a config dir, and
+        ``_cleanup_config_dir`` can run twice; both must be cheap no-ops rather
+        than a raise inside a teardown path.
+        """
+        root = tmp_path / 'archive'
+        outcome = archive_before_delete(
+            tmp_path / 'no-such-config-dir', '3619', archive_root=root
+        )
+        assert outcome.archived == 0
+        assert outcome.already_current == 0
+        assert outcome.held == ()
+        # Nothing to remove, so nothing was removed — and no archive tree was
+        # conjured for a task that has no transcripts.
+        assert outcome.config_dir_removed is False
+        assert not root.exists()
+
+    def test_a_config_dir_with_no_transcripts_is_still_torn_down(self, tmp_path):
+        """No ``projects/`` at all → nothing held, so the dir still goes."""
+        config_dir = tmp_path / 'claude-config-3619'
+        _write(config_dir / '.credentials.json', b'{"claudeAiOauth":{}}')
+
+        outcome = archive_before_delete(
+            config_dir, '3619', archive_root=tmp_path / 'archive'
+        )
+
+        assert outcome.archived == 0
+        assert outcome.held == ()
+        assert outcome.config_dir_removed is True
+        assert not config_dir.exists()
+
+    def test_running_it_twice_is_idempotent(self, tmp_path):
+        """A second call over the already-removed dir is a silent no-op."""
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        _write(config_dir / 'projects' / ENC / 'sess-twice.jsonl', b'{"t":1}\n')
+
+        first = archive_before_delete(config_dir, '3619', archive_root=root)
+        second = archive_before_delete(config_dir, '3619', archive_root=root)
+
+        assert first.archived == 1
+        assert second.archived == 0
+        assert second.already_current == 0
+        assert second.held == ()
+        assert (root / '3619' / ENC / 'sess-twice.jsonl').exists()
 
 
 class TestDurableArchivePathLookup:
