@@ -706,6 +706,13 @@ async def collect_tasks_with_counts(
     ``'unknown'`` sentinel.  Defaults to ``False`` so the scheduler-page path
     (``collect_active_tasks``) issues no extra MCP round-trip.
 
+    That call runs AFTER the per-project walk and is inside the same deadline:
+    it is both CHECKED (skipped outright once the budget is spent) and BOUNDED
+    (run under ``asyncio.wait_for`` on whatever remains).  Checked-but-unbounded
+    is not enough — a small positive remainder would still admit a call that
+    then took ``mcp_tool_call``'s own default — and "bounded as a whole" has to
+    mean the whole, or the claim is false for the last leg of the handler.
+
     *now* is resolved ONCE (via :func:`dashboard.data.utils.resolve_now`) at
     this aggregation boundary and threaded into every project's
     ``_shape_one_project`` call, so every returned row's ``started`` shares
@@ -804,9 +811,29 @@ async def collect_tasks_with_counts(
                 len(dep_ids), _TASKS_TOTAL_BUDGET,
             )
         elif dep_ids:
-            status_map = await fetch_external_statuses(
-                client, config, sorted(dep_ids),
-            )
+            # BOUNDED, not merely deadline-checked. The check above only
+            # decides whether to start; without this wait_for the call itself
+            # ran on mcp_tool_call's 10s-per-request default and — a cold
+            # session being three posts, per fan-out URL — could overrun the
+            # whole-handler budget by ~30s and blow past data.js's 30 000 ms
+            # fetch abort, throwing away the very partial payload the deadline
+            # exists to deliver. Same two-layer shape as the per-project loop.
+            try:
+                status_map = await asyncio.wait_for(
+                    fetch_external_statuses(client, config, sorted(dep_ids)),
+                    timeout=ext_remaining,
+                )
+            except TimeoutError:
+                # Every entry keeps its 'unknown' sentinel — identical to the
+                # skip branch above, and for the identical reason: a status
+                # that was never read has no honest value but 'unknown'.
+                logger.warning(
+                    'external dep statuses for %d id(s) exceeded the %.1fs '
+                    'remaining of the %.1fs Tasks budget — every external dep '
+                    "keeps its 'unknown' sentinel for this render",
+                    len(dep_ids), ext_remaining, _TASKS_TOTAL_BUDGET,
+                )
+                status_map = {}
             map_offline = bool(status_map.get('offline'))
             for row in all_active:
                 if 'completed' in row:

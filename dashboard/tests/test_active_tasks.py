@@ -2707,13 +2707,20 @@ class TestDepsOutsideTheTerminalWindow:
 _BUDGET_SLOW = 5.0
 
 
-def _register_shaper(monkeypatch, delays, *, offline=(), done_counts=None):
+def _register_shaper(monkeypatch, delays, *, offline=(), done_counts=None,
+                     external_deps=None):
     """Patch ``_shape_one_project`` with a per-project coroutine that sleeps.
 
     *delays* maps project label -> seconds to sleep before returning; a label
     absent from it returns immediately. Labels in *offline* return the offline
     marker triple ``([], True, 0)`` — a fetch that demonstrably FAILED, which
     must stay distinguishable from a project the budget never reached.
+
+    *external_deps* is an optional list of external dep ids stamped onto every
+    emitted row (in the ``_build_task_row`` shape, each on the ``'unknown'``
+    sentinel), so the batched ``fetch_external_statuses`` leg of the handler is
+    reachable from this harness — without it ``dep_ids`` is empty and that leg
+    short-circuits.
 
     Returns the list of labels ``_shape_one_project`` was actually INVOKED
     with, in order. That record is what makes "never got its turn" a checkable
@@ -2735,6 +2742,10 @@ def _register_shaper(monkeypatch, delays, *, offline=(), done_counts=None):
         if label in offline:
             return [], True, 0
         row = {'id': f'{label}/T-1', 'project': label, 'status': 'in-progress'}
+        if external_deps:
+            row['external_deps'] = [
+                {'id': dep, 'status': 'unknown'} for dep in external_deps
+            ]
         return [row], False, counts.get(label, 0)
 
     monkeypatch.setattr('dashboard.data.active_tasks._shape_one_project', _fake_shape)
@@ -2936,6 +2947,67 @@ class TestCollectTasksBudget:
             f'elapsed {elapsed:.3f}s exceeded the whole-handler budget of '
             f'{active_tasks_mod._TASKS_TOTAL_BUDGET}s'
         )
+
+    async def test_external_status_fetch_cannot_overrun_the_handler_budget(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(e2) the batched external-dep call is BOUNDED, not merely deadline-CHECKED.
+
+        It runs AFTER the per-project walk, guarded only by an
+        ``ext_remaining <= 0`` skip.  With a small POSITIVE remainder the call
+        still proceeded unbounded on ``mcp_tool_call``'s 10 s default — and a
+        cold MCP session performs three posts, per fan-out URL — so the handler
+        could exceed ``_TASKS_TOTAL_BUDGET`` by ~30 s and blow past ``data.js``'s
+        30 000 ms fetch abort.  That is precisely the "the degraded payload is
+        aborted before it can be rendered" failure ``test_tasks_budget.py``
+        exists to prevent and structurally cannot see: it checks constants, and
+        this leg simply did not honour them.
+
+        Expiry leaves every entry on its honest ``'unknown'`` sentinel — the
+        same treatment the ``ext_remaining <= 0`` skip and the per-project
+        ``TimeoutError`` branch already give.
+        """
+        import dashboard.data.active_tasks as active_tasks_mod
+
+        _register_shaper(
+            monkeypatch, {}, external_deps=['dark_factory:13', 'reify:8'],
+        )
+
+        async def _slow_ext(client, config, deps):
+            await asyncio.sleep(_BUDGET_SLOW)
+            return {'dark_factory:13': 'done'}
+
+        monkeypatch.setattr(
+            'dashboard.data.active_tasks.fetch_external_statuses', _slow_ext
+        )
+        # A positive remainder when the external leg is reached: the
+        # ext_remaining <= 0 skip must NOT be what saves us here, or the test
+        # would pass against the unbounded code.
+        self._tighten(monkeypatch, total=1.0, per_project=0.5)
+        config = _budget_config(tmp_path, ['alpha'])
+
+        started = time.monotonic()
+        active, offline, _counts, _degraded = await collect_tasks_with_counts(
+            client=dummy_client, config=config, resolve_external=True,
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < _BUDGET_SLOW / 2, (
+            f'elapsed {elapsed:.3f}s is not well under the {_BUDGET_SLOW}s '
+            'external-status sleep — the batched external-dep call is still '
+            'unbounded, so the handler budget does not bound the handler'
+        )
+        assert elapsed < active_tasks_mod._TASKS_TOTAL_BUDGET + 0.5, (
+            f'elapsed {elapsed:.3f}s exceeded the whole-handler budget of '
+            f'{active_tasks_mod._TASKS_TOTAL_BUDGET}s'
+        )
+        # Degrade honestly: no status was read, so none is fabricated, and the
+        # project is NOT declared offline (its rows loaded fine).
+        assert offline == []
+        assert active[0]['external_deps'] == [
+            {'id': 'dark_factory:13', 'status': 'unknown'},
+            {'id': 'reify:8', 'status': 'unknown'},
+        ]
 
     async def test_happy_path_is_unchanged_by_the_budget(
         self, monkeypatch, tmp_path, dummy_client
