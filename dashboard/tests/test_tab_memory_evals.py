@@ -18,7 +18,6 @@ import re
 
 import pytest
 from _dashboard_helpers import extract_function_body
-from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures
@@ -1622,7 +1621,6 @@ def test_parity_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None:
     )
 
     badge_body = extract_function_body(code, 'verdictBadge')
-    assert badge_body, 'could not extract the verdictBadge body.'
     labels = _return_label_exprs(badge_body)
     assert labels, 'verdictBadge returns no `label`.'
     for expr in labels:
@@ -1779,7 +1777,6 @@ def test_unknown_verdict_is_visibly_unrenderable(
     # distinction at once ("no verdict · unrecognised verdict" — absent in the
     # first clause, present-but-unreadable in the second).
     badge_body = extract_function_body(code, 'verdictBadge')
-    assert badge_body, 'could not extract the verdictBadge body.'
     assigned = re.findall(r"\bbase\s*=\s*'([^']*)'", badge_body)
     assert assigned, 'verdictBadge assigns no literal `base` label.'
     absent = assigned[0]  # the seed, in force until a verdict is recognised
@@ -1864,8 +1861,11 @@ def test_verdict_badges_driven_by_persisted_verdict(
         )
 
     # A null/absent verdict renders its own state, not a defaulted one.
-    badge_body = extract_function_body(fmt_code, 'verdictBadge')
-    assert badge_body, 'could not extract the verdictBadge body.'
+    # The call is kept for its EXISTENCE check alone — `extract_function_body`
+    # raises if `verdictBadge` is renamed or removed (task 3549), which is what
+    # the node tests named below depend on and what the discarded body used to
+    # be asserted truthy for.
+    extract_function_body(fmt_code, 'verdictBadge')
     # (i) THE PARITY SHORT-CIRCUIT — that no parity branch may discard the
     #     verdict-derived label — now lives in
     #     `test_parity_vocabulary_fully_covered`, asserted structurally over
@@ -2061,12 +2061,6 @@ def test_no_client_side_alarm_derivation(
     #     are not comparisons, and failing on them would push the next author
     #     to reword a correct comment rather than fix real code.
     badge_body = extract_function_body(code, 'verdictBadge')
-    assert badge_body, (
-        'could not extract the verdictBadge body from memory_evals_fmt.js. '
-        'This assertion is the anti-vacuity guard for everything below it: if '
-        'verdictBadge moves again, FOLLOW it here rather than deleting this '
-        'check, or the ordering-operator scan silently stops scanning anything.'
-    )
     assert 'parity' in badge_body, (
         'verdictBadge must read `parity` — the server-derived display state.'
     )
@@ -2254,7 +2248,6 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
     code = tab_memory_evals_jsx_code
 
     row_body = extract_function_body(code, 'MemoryEvalMetricRow')
-    assert row_body, 'could not extract the MemoryEvalMetricRow body.'
 
     # (a) something must MEASURE the series length. Nothing did.
     points_decl = re.search(
@@ -2575,7 +2568,6 @@ def test_limits_provenance_rendered(
     # falsy.  Pinning the operator-facing sentence would fail the suite on any
     # rewording while proving nothing extra about the branch.
     prov_body = extract_function_body(code, 'LimitsProvenance')
-    assert prov_body, 'could not extract the LimitsProvenance body.'
     # The local's NAME is derived from the `ev.limits` read rather than pinned,
     # so renaming `lim` is not a test failure; what must hold is that whatever
     # it is called gates the early return.
@@ -2663,7 +2655,6 @@ def test_limits_provenance_open_state_is_per_eval(
     code = tab_memory_evals_jsx_code
 
     prov_body = extract_function_body(code, 'LimitsProvenance')
-    assert prov_body, 'could not extract the LimitsProvenance body.'
 
     # (a) the `open=` attribute is a bare identifier, not a call.
     open_attr = re.search(r'<details\s[^>]*open=\{(\w+)\}', prov_body)
@@ -2927,7 +2918,6 @@ def test_tabs_jsx_memory_tab_renders_evals_section(
 
     # (c) rendered inside MemoryTab and nowhere else; NOT a DF_TABS entry.
     memory_tab_body = extract_function_body(body, 'MemoryTab')
-    assert memory_tab_body, 'could not extract the MemoryTab body.'
     assert '<MemoryEvalsSection' in memory_tab_body, (
         'MemoryTab must render <MemoryEvalsSection ... /> (PRD DD3: the eval '
         'view lives with the memory panels).'

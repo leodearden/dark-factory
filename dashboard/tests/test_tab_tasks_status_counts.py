@@ -30,7 +30,6 @@ import re
 
 import pytest
 from _dashboard_helpers import extract_function_body, strip_js_comments
-from starlette.testclient import TestClient
 
 
 @pytest.fixture(scope='module')

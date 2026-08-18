@@ -12,7 +12,6 @@ import re
 
 import pytest
 from _dashboard_helpers import extract_function_body
-from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures
@@ -473,10 +472,6 @@ def test_tab_escalations_task_sort_and_expand_collapse(tab_escalations_jsx_body:
     # Numeric-aware comparator uses Number() — scoped to the sortRows function body
     # so we don't get a false pass from Number() appearing in an unrelated context.
     sort_fn = extract_function_body(tab_escalations_jsx_body, 'sortRows')
-    assert sort_fn, (
-        'tab_escalations.jsx does not define a `function sortRows(` — '
-        'add a named sortRows function to sort escalation rows by numeric task_id.'
-    )
     assert 'Number(' in sort_fn, (
         "sortRows function does not use Number( for numeric task_id conversion — "
         'add `Number(a.task_id)` / `Number(b.task_id)` for numeric-aware sort.'
@@ -823,10 +818,6 @@ def test_tab_escalations_strip_mounted_and_wired(tab_escalations_jsx_body: str) 
     # (3) Scoped to the EscalationStatStrip body: reads the analytics payload,
     # renders StatTile.
     strip_fn = extract_function_body(body, 'EscalationStatStrip')
-    assert strip_fn, (
-        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body — '
-        'add the component definition.'
-    )
     assert 'ESCALATION_ANALYTICS' in strip_fn, (
         'EscalationStatStrip does not reference ESCALATION_ANALYTICS — it should read '
         'the analytics payload (e.g. `analytics || DF.ESCALATION_ANALYTICS`).'
@@ -838,9 +829,6 @@ def test_tab_escalations_strip_mounted_and_wired(tab_escalations_jsx_body: str) 
     # (4) Scoped to the EscalationsTab body: strip mounts before the level-filter
     # controls (top-of-tab placement).
     tab_fn = extract_function_body(body, 'EscalationsTab')
-    assert tab_fn, (
-        'tab_escalations.jsx does not define a `function EscalationsTab(` body.'
-    )
     strip_idx = tab_fn.find('<EscalationStatStrip')
     assert strip_idx != -1, (
         'EscalationsTab does not render <EscalationStatStrip — mount it as the first '
@@ -877,10 +865,6 @@ def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> No
     (e) at least four <C.StatTile tiles are rendered.
     """
     strip_fn = extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
-    assert strip_fn, (
-        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body — '
-        'add the component definition.'
-    )
 
     # (a) benign-rate substrate
     assert 'flow_daily' in strip_fn, (
@@ -954,11 +938,6 @@ def test_tab_escalations_strip_window_anchored_7d(tab_escalations_jsx_body: str)
 
     # (1) windowCutoffDate helper, generatedAt-anchored, no Date.now()
     cutoff_fn = extract_function_body(body, 'windowCutoffDate')
-    assert cutoff_fn, (
-        'tab_escalations.jsx does not define `function windowCutoffDate(` — add a '
-        'local generated_at-anchored cutoff helper (copy the pattern from '
-        'tab_escalation_analytics.jsx).'
-    )
     assert 'generatedAt' in cutoff_fn, (
         'windowCutoffDate does not reference `generatedAt` in its body — it must '
         'anchor the cutoff to the payload clock, not the browser clock.'
@@ -970,9 +949,6 @@ def test_tab_escalations_strip_window_anchored_7d(tab_escalations_jsx_body: str)
 
     # (2)/(3) EscalationStatStrip anchors to generated_at, never Date.now()
     strip_fn = extract_function_body(body, 'EscalationStatStrip')
-    assert strip_fn, (
-        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body.'
-    )
     assert 'generated_at' in strip_fn, (
         'EscalationStatStrip does not reference generated_at — anchor the window '
         'cutoff to analytics.generated_at.'
@@ -1014,9 +990,6 @@ def test_tab_escalations_strip_sparklines_and_churn_retained(tab_escalations_jsx
         presence — a stray spark= elsewhere wouldn't prove churn has one).
     """
     strip_fn = extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
-    assert strip_fn, (
-        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body.'
-    )
 
     # (1) at least three spark= props within <C.StatTile tiles
     spark_count = len(re.findall(r'<C\.StatTile[^>]*\bspark=', strip_fn))
@@ -1111,7 +1084,6 @@ def test_focus_handoff_retries_then_reports_a_miss(
     #     different thing — the frozen pre-fetch reference, which correctly
     #     must NOT appear in the deps.
     tab_body = extract_function_body(code, 'EscalationsTab')
-    assert tab_body, 'could not extract the EscalationsTab body.'
     esc_local = re.search(r'const\s+(\w+)\s*=\s*DF\.ESCALATIONS', tab_body)
     assert esc_local is not None, (
         'EscalationsTab must read `DF.ESCALATIONS` into a local.'
@@ -1205,7 +1177,6 @@ def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
     # (a) data.js records the marker inside applyKey — the one place that knows
     #     a real server value was applied.
     apply_body = extract_function_body(data_js_body, 'applyKey')
-    assert apply_body, 'could not extract data.js\'s applyKey body.'
     marker = re.search(r'([\w.$]+)\[\s*key\s*\]\s*=\s*true', apply_body)
     assert marker is not None, (
         'data.js\'s applyKey records no per-key first-success marker '
@@ -1237,7 +1208,6 @@ def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
 
     # (d) tab_escalations.jsx reads THAT marker, keyed on its own payload key.
     loaded_body = extract_function_body(code, 'escalationsLoaded')
-    assert loaded_body, 'could not extract the escalationsLoaded body.'
     assert leaf in loaded_body, (
         f'escalationsLoaded does not read data.js\'s `{leaf}` marker registry: '
         f'{loaded_body.strip()!r}'

@@ -14,9 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
 from _dashboard_helpers import extract_function_body
-from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Helper: extract a named seed block from window.DF_DATA (brace-aware).
@@ -556,10 +554,6 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
         'the component must be declared as a named function for the export to work.'
     )
     tab_body = extract_function_body(body, 'EscalationAnalyticsTab')
-    assert tab_body, (
-        'Could not locate the `function EscalationAnalyticsTab(` body in '
-        'tab_escalation_analytics.jsx.'
-    )
     # Additive export — must NOT clobber window.DF_TABS = {...} and must assign
     # EscalationAnalyticsTab. Requires the assignment's `=` (not just the
     # dotted path) so a prose mention in a comment cannot satisfy the check.
@@ -808,10 +802,6 @@ def test_tab_analytics_window_toggle_and_crosscutting(tab_analytics_jsx_body: st
 
     # (a) Window toggle, scoped to EscalationAnalyticsTab's own body.
     tab_body = extract_function_body(body, 'EscalationAnalyticsTab')
-    assert tab_body, (
-        'Could not locate the `function EscalationAnalyticsTab(` body in '
-        'tab_escalation_analytics.jsx.'
-    )
     assert re.search(
         r"usePersistedState\(\s*['\"]df\.escanalytics\.window['\"]\s*,\s*['\"]28d['\"]\s*\)",
         tab_body,
@@ -842,7 +832,6 @@ def test_tab_analytics_window_toggle_and_crosscutting(tab_analytics_jsx_body: st
         'add the helper that computes the window cutoff relative to generated_at.'
     )
     cutoff_body = extract_function_body(body, 'windowCutoffDate')
-    assert cutoff_body, 'Could not locate the windowCutoffDate( function body.'
     assert 'generatedAt' in cutoff_body, (
         'windowCutoffDate does not reference its generatedAt parameter — the window '
         'cutoff must be anchored to the payload clock, not the browser clock.'
@@ -902,7 +891,6 @@ def test_tab_analytics_origin_panel(tab_analytics_jsx_body: str) -> None:
         'add the Origin panel component.'
     )
     origin_body = extract_function_body(body, 'OriginPanel')
-    assert origin_body, 'Could not locate the OriginPanel( function body.'
 
     # (a) StackedAreaChart over daily_by_source, long tail folded into 'other'.
     assert 'daily_by_source' in origin_body, (
@@ -992,7 +980,6 @@ def test_tab_analytics_lifespan_panel(tab_analytics_jsx_body: str) -> None:
         'add the Lifespan panel component.'
     )
     lifespan_body = extract_function_body(body, 'LifespanPanel')
-    assert lifespan_body, 'Could not locate the LifespanPanel( function body.'
 
     # (a) StatTile percentiles keyed by level from percentiles_by_level.
     assert 'percentiles_by_level' in lifespan_body, (
@@ -1080,7 +1067,6 @@ def test_tab_analytics_workflow_panel(tab_analytics_jsx_body: str) -> None:
         'add the Workflow panel component.'
     )
     workflow_body = extract_function_body(body, 'WorkflowPanel')
-    assert workflow_body, 'Could not locate the WorkflowPanel( function body.'
 
     # (a) 100%-normalized StackedAreaChart of tier absorption from tier_weekly.
     assert 'tier_weekly' in workflow_body, (
@@ -1166,7 +1152,6 @@ def test_esc_per_done_chart_does_not_compact_its_series(tab_analytics_jsx_body: 
     rows themselves, not a filtered copy.
     """
     workflow_body = extract_function_body(tab_analytics_jsx_body, 'WorkflowPanel')
-    assert workflow_body, 'Could not locate the WorkflowPanel( function body.'
 
     filter_on_ratio = re.search(r'\.filter\([^)]*\bratio\b[^)]*\bnull\b', workflow_body)
     assert filter_on_ratio is None, (
@@ -1235,7 +1220,6 @@ def test_charts_jsx_padding_matches_analytics_marker_overlay(charts_jsx_body: st
     """
     for fn_name in ('LineChart', 'StackedAreaChart'):
         fn_body = extract_function_body(charts_jsx_body, fn_name)
-        assert fn_body, f'Could not locate the {fn_name}( function body in charts.jsx.'
         assert re.search(r'padL\s*=\s*38\b', fn_body), (
             f'charts.jsx {fn_name} no longer declares padL = 38 — '
             'tab_escalation_analytics.jsx hardcodes _CHART_PAD_L = 38 for its '

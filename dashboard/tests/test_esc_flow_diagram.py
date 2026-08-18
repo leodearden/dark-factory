@@ -37,7 +37,6 @@ import re
 
 import pytest
 from _dashboard_helpers import extract_function_body
-from starlette.testclient import TestClient
 
 
 @pytest.fixture(scope='module')
@@ -318,7 +317,6 @@ def test_workflow_panel_mounts_lifecycle_flow_diagram_in_slot(tab_analytics_jsx_
     """
     body = tab_analytics_jsx_body
     panel_body = extract_function_body(body, 'WorkflowPanel')
-    assert panel_body, 'Could not locate the WorkflowPanel( function body.'
 
     # (c) regression guard — δ's seam markers must survive this edit.
     assert 'esc-flow-slot' in panel_body, (

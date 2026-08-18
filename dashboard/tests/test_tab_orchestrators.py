@@ -10,7 +10,6 @@ import re
 
 import pytest
 from _dashboard_helpers import extract_function_body
-from starlette.testclient import TestClient
 
 
 @pytest.fixture(scope='module')

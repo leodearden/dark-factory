@@ -46,9 +46,7 @@ import re
 import shutil
 import subprocess
 
-import pytest
 from _dashboard_helpers import extract_function_body
-from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # The served-asset fixtures (`charts_jsx_body`, `tab_analytics_jsx_body`,
@@ -81,18 +79,14 @@ def _extract_signature(src: str, fn_name: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Extractors.  Each asserts LOUDLY when its regex misses — a silent '' would
-# make a rename turn this whole file into a permanent false GREEN.
+# make a rename turn this whole file into a permanent false GREEN.  That is
+# also why `_component_body` needs no guard of its own: `extract_function_body`
+# raises rather than returning '' (task 3549).
 # ---------------------------------------------------------------------------
 
 
 def _component_body(src: str, name: str) -> str:
-    body = extract_function_body(src, name)
-    assert body, (
-        f'could not slice the body of `function {name}(` out of the served '
-        'source — it was renamed, moved, or converted to an arrow/const '
-        'declaration. Every assertion keyed on this body would silently pass.'
-    )
-    return body
+    return extract_function_body(src, name)
 
 
 def _default_format_y(charts_jsx_body: str) -> str:
