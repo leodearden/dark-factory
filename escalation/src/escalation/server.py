@@ -1531,7 +1531,11 @@ def create_server(
         **Root-cause dedup**: if a pending L2 with the same *root_cause* already
         exists, this call UPDATES that existing L2 (appends new members) rather
         than filing a duplicate.  The response ``status`` distinguishes the two
-        outcomes: ``'created'`` for a new L2, ``'updated'`` for an append.
+        outcomes: ``'created'`` for a new L2, ``'updated'`` for an append.  An
+        append RAISES the existing L2's severity when the incoming members (or
+        an explicit *severity*) justify it, and never lowers it — an L2's
+        severity is monotonically non-decreasing after mint, so a record cannot
+        be quieted out from under a human already looking at it.
 
         **Members stay at L1**: the member L1 escalations are referenced but
         NOT promoted; they remain pending at L1 until the L2 is resolved.
@@ -1645,7 +1649,15 @@ def create_server(
         # Dedup check: look for an existing pending L2 with the same root_cause.
         existing_id = queue.find_pending_l2_by_root_cause(root_cause)
         if existing_id is not None:
-            updated = queue.add_members_to_l2(existing_id, list(dict.fromkeys(member_ids)))
+            # effective_severity is either the caller's explicit value or
+            # max(member severities) over the ids in THIS call — exactly the
+            # floor the incoming members justify.  Upward-only inside
+            # add_members_to_l2, so an append can never quiet an existing L2.
+            updated = queue.add_members_to_l2(
+                existing_id,
+                list(dict.fromkeys(member_ids)),
+                severity_floor=effective_severity,
+            )
             if updated is not None:
                 return {
                     'id': existing_id,
