@@ -3589,3 +3589,87 @@ class TestCoerceTierUnrecognizedValueDedup:
             f"dedupe memo grew to {len(_cfg._warned_priority_values)} "
             f"entries, exceeding cap {cap}"
         )
+
+
+class TestRecoveryEmissionConfig:
+    """The structured recovery-decision emission knobs (task 3535).
+
+    PRD ``plans/task-escalation-state-graph-prd.md`` D5.  The canonical WHY
+    for the mechanism lives in
+    ``orchestrator/src/orchestrator/recovery_emission.py`` (module docstring);
+    this class only pins the operator-facing surface.
+    """
+
+    def test_section_is_registered_on_orchestrator_config(self):
+        """OrchestratorConfig exposes recovery_emission with the shipped defaults.
+
+        Registration is load-bearing, not cosmetic: ``model_config`` sets
+        ``extra='ignore'``, so an UNREGISTERED yaml block is silently dropped
+        and the operator edits a stanza that does nothing.
+        """
+        from orchestrator.config import OrchestratorConfig
+
+        cfg = OrchestratorConfig()
+        assert hasattr(cfg, 'recovery_emission'), (
+            'recovery_emission must be a registered field, or its yaml block '
+            'is silently dropped by extra="ignore"'
+        )
+        # Ships ENABLED: emission is the whole deliverable of task 3535, and
+        # shipping it off would leave every strand unexplained.
+        assert cfg.recovery_emission.enabled is True
+        assert cfg.recovery_emission.veto_streak_threshold == 3
+        assert cfg.recovery_emission.veto_streak_min_span_secs == 1500.0
+        # The narrower kill switch for the only part that WRITES to the
+        # escalation queue — separate from `enabled` on purpose.
+        assert cfg.recovery_emission.streak_escalation_enabled is True
+
+    def test_veto_streak_threshold_must_be_at_least_one(self):
+        """threshold=0 would file an L1 on the very first observed veto."""
+        from orchestrator.config import RecoveryEmissionConfig
+
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(veto_streak_threshold=0)
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(veto_streak_threshold=-1)
+
+    def test_veto_streak_min_span_secs_must_not_be_negative(self):
+        """0 is legal (disables the time half); negative is nonsense."""
+        from orchestrator.config import RecoveryEmissionConfig
+
+        assert RecoveryEmissionConfig(veto_streak_min_span_secs=0).veto_streak_min_span_secs == 0.0
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(veto_streak_min_span_secs=-1)
+
+    def test_defaults_yaml_block_matches_the_field_defaults(self):
+        """The shipped stanza must not drift from the pydantic defaults.
+
+        YamlSettingsSource layers defaults.yaml UNDER the project YAML, so the
+        STANZA — not the ``Field(default=...)`` — is what actually applies.  A
+        drifted stanza would silently win.
+        """
+        defaults = _load_package_defaults()
+        assert 'recovery_emission' in defaults, (
+            'the shipped defaults.yaml must declare the recovery_emission: '
+            'block so the knobs are discoverable without reading pydantic source'
+        )
+        block = defaults['recovery_emission']
+        assert block['enabled'] is True
+        assert block['veto_streak_threshold'] == 3
+        assert block['veto_streak_min_span_secs'] == 1500.0
+        assert block['streak_escalation_enabled'] is True
+
+    def test_leaves_are_green_tier_hot_reloadable(self):
+        """Every leaf is in RELOADABLE_FIELDS (whole-submodel-group idiom).
+
+        An operator must be able to retune the threshold or silence a noisy
+        detector live — a detector you can only silence by restarting the
+        fleet is one that gets silenced by ignoring it instead.
+        """
+        from orchestrator.config import RecoveryEmissionConfig
+
+        for leaf in RecoveryEmissionConfig.model_fields:
+            assert f'recovery_emission.{leaf}' in RELOADABLE_FIELDS, (
+                f'recovery_emission.{leaf} must be green-tier hot-reloadable; '
+                'register the whole submodel via _submodel_leaf_paths so new '
+                'leaves are covered automatically'
+            )
