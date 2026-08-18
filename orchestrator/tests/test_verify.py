@@ -9861,7 +9861,14 @@ class TestFleetTypeCheckPinSurvivesTheRealFallbackPath:
             '3931) — it only does that for a zero-.py diff, so the FILE_SCOPED '
             'path this guard exists to cover was not exercised at all'
         )
-        return mc.type_check_command
+        type_cmd = mc.type_check_command
+        assert type_cmd is not None, (
+            '_build_fallback_config produced a ModuleConfig with no '
+            'type_check_command for the esc-3805-1 diff (task 3931) — the '
+            'type gate would dispatch nothing at all, so there is no '
+            'pyright invocation left for this guard to inspect'
+        )
+        return type_cmd
 
     def test_the_real_config_dispatches_a_version_pinned_pyright(self):
         cmd = self._fallback_type_command()
