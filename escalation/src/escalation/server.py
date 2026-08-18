@@ -374,17 +374,27 @@ CATEGORIES = [
     'stranded_merge_failed',
 ]
 
-# Fields returned by get_pending_escalations(compact=True) — the triage-relevant
-# subset a long-running L2 watcher needs to decide whether to pull a full record.
-# The heavy fields (detail, members, options, root_cause, train_state,
-# workflow_state, worktree, dedupe_*) are dropped to keep the watcher's context
-# small as the pending pile grows during an AFK window. The triage-ack fields
-# (triaged_at, triaged_by, triage_note, updated_at) are included so a compact
-# drain can decide stamp-then-skip without a per-record get_escalation round-trip.
+# OUTPUT keys of a compact row — the triage-relevant subset a long-running L2
+# watcher needs to decide whether to pull a full record.  NOTE these are output
+# keys, not model field names: ``member_ids`` is a PROJECTION of the model's
+# ``members`` list (renamed once, in _compact_escalation below), so this tuple is
+# no longer a pure key subset of Escalation.to_dict().
+# The heavy fields (detail, options, train_state, workflow_state, worktree,
+# dedupe_*) are still dropped to keep the watcher's context small as the pending
+# pile grows during an AFK window; `detail` in particular is the unbounded
+# free-text field that motivated compact mode.  ``root_cause`` (a one-line dedup
+# key) and ``member_ids`` (a short id list) are bounded by construction and are
+# what let a rotating watcher rebuild `already_promoted` from the drain ALONE,
+# with no session memory (task 3997, C1).  ``amendments`` is deliberately NOT
+# projected, so preserved incoming framing never inflates a drain.
+# The triage-ack fields (triaged_at, triaged_by, triage_note, updated_at) are
+# included so a compact drain can decide stamp-then-skip without a per-record
+# get_escalation round-trip.
 _COMPACT_ESCALATION_FIELDS = (
     'id', 'task_id', 'category', 'severity', 'level', 'status',
     'summary', 'suggested_action', 'timestamp',
     'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
+    'root_cause', 'member_ids',
 )
 
 # get_pending_escalations(compact=True) additionally keeps its computed
@@ -392,6 +402,32 @@ _COMPACT_ESCALATION_FIELDS = (
 # here would blank the whole PINNING surface.  Kept as a separate tuple so
 # get_task_escalations — which never computes the annotation — is untouched.
 _COMPACT_PENDING_FIELDS = (*_COMPACT_ESCALATION_FIELDS, 'pins_recovery')
+
+
+def _compact_escalation(d: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    """Project one Escalation.to_dict() into a compact row over *fields*.
+
+    THE single site that knows compact rows expose ``member_ids`` where the model
+    says ``members`` (task 3997).  Both compact apply sites route through here so
+    the rename exists exactly once; widening _COMPACT_ESCALATION_FIELDS is then
+    enough to change both tools' wire shape.
+
+    Keys absent from *d* are OMITTED rather than defaulted.  That is not
+    defensive tidiness: ``pins_recovery`` is deliberately absent when it cannot
+    be computed, and emitting a false ``[]`` there reads as "nothing pins this
+    task" — the exact collapse (esc-3163) the omission contract exists to
+    prevent.
+    """
+    row: dict[str, Any] = {}
+    for k in fields:
+        if k == 'member_ids':
+            # Projection, not a model field: renamed from `members`.  Copied so a
+            # caller mutating the row cannot reach back into the loaded record.
+            row[k] = list(d.get('members', []))
+        elif k in d:
+            row[k] = d[k]
+    return row
+
 
 # Task statuses from which a recovery/redispatch is still possible.  A record
 # on a task outside this set pins nothing: there is no recovery to block.
@@ -1344,10 +1380,12 @@ def create_server(
                 'unstamped records report UNKNOWN (key absent)', len(dicts),
             )
         if compact:
-            # `if k in d` because pins_recovery is deliberately absent when
-            # unknown — projecting it unconditionally would KeyError on
-            # exactly the degraded path the omission contract exists for.
-            return [{k: d[k] for k in _COMPACT_PENDING_FIELDS if k in d} for d in dicts]
+            # _compact_escalation OMITS absent keys because pins_recovery is
+            # deliberately absent when unknown — projecting it unconditionally
+            # would KeyError on exactly the degraded path the omission contract
+            # exists for.  The same helper also owns the members -> member_ids
+            # rename, so both compact tools share one projection (task 3997).
+            return [_compact_escalation(d, _COMPACT_PENDING_FIELDS) for d in dicts]
         return dicts
 
     @mcp.tool()
@@ -1410,7 +1448,7 @@ def create_server(
         )
         if compact:
             return [
-                {k: d[k] for k in _COMPACT_ESCALATION_FIELDS}
+                _compact_escalation(d, _COMPACT_ESCALATION_FIELDS)
                 for d in (e.to_dict() for e in escalations)
             ]
         return [e.to_dict() for e in escalations]

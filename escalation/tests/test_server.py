@@ -338,14 +338,15 @@ class TestGetPendingLevelFilter:
 class TestGetPendingCompact:
     """get_pending_escalations(compact=True) returns only the triage-relevant fields."""
 
-    _COMPACT_KEYS = {
-        'id', 'task_id', 'category', 'severity', 'level', 'status',
-        'summary', 'suggested_action', 'timestamp',
-        'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
-    }
-    # Heavy fields that compact mode must omit.
+    # DERIVED from the constant, never re-transcribed: a hand-copied literal here
+    # encodes the constant's VALUE instead of its NAME and silently drifts every
+    # time the projection is widened (it did — task 3997).
+    _COMPACT_KEYS = set(_COMPACT_ESCALATION_FIELDS)
+    # Heavy fields that compact mode must omit.  `members` stays here even though
+    # `member_ids` is now projected: the raw model key must never appear in a
+    # compact row, only its renamed projection.
     _HEAVY_KEYS = {
-        'detail', 'members', 'options', 'root_cause', 'train_state',
+        'detail', 'members', 'options', 'train_state',
         'workflow_state', 'worktree', 'dedupe_children', 'dedupe_fingerprint',
         'resolution',
     }
