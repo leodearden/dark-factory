@@ -2866,6 +2866,18 @@ class TestClose:
         mock_buffer.close.assert_called_once()
 
 
+# The logger MemoryService.close() reports sub-close failures on. Single-sourced
+# so the caplog LEVEL scope (`at_level(logger=...)`) and the record FILTER below
+# can never drift apart: caplog's handler sits on the ROOT logger, so `at_level`
+# scopes only the level, not the capture. ERROR records emitted by unrelated
+# loggers still land in caplog.records — notably asyncio's "Task exception was
+# never retrieved", logged when the GC finalises a task leaked by an earlier test
+# (e.g. an unclosed httpx.AsyncClient whose event loop is already closed). That
+# arrives at a nondeterministic point in the session, so a count taken over every
+# logger is a latent flake rather than a real assertion about close().
+_CLOSE_LOGGER = 'fused_memory.services.memory_service'
+
+
 class TestCloseLogsExceptions:
     """Tests that MemoryService.close() logs exceptions via logger.exception
     and continues closing remaining resources (failure isolation)."""
@@ -2919,7 +2931,7 @@ class TestCloseLogsExceptions:
         # Make ONLY the failing resource raise
         resources[failing_resource].close.side_effect = RuntimeError('boom')
 
-        with caplog.at_level(logging.ERROR, logger='fused_memory.services.memory_service'):
+        with caplog.at_level(logging.ERROR, logger=_CLOSE_LOGGER):
             # Must NOT raise
             await service.close()
 
@@ -2927,8 +2939,12 @@ class TestCloseLogsExceptions:
         for _name, resource in resources.items():
             resource.close.assert_awaited_once()
 
-        # Exactly one ERROR record
-        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        # Exactly one ERROR record *from close()* — see _CLOSE_LOGGER on why the
+        # filter must scope by logger name and not by level alone.
+        error_records = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR and r.name == _CLOSE_LOGGER
+        ]
         assert len(error_records) == 1, (
             f'Expected 1 ERROR record, got {len(error_records)}: '
             f'{[r.message for r in error_records]}'
@@ -2954,7 +2970,7 @@ class TestCloseLogsExceptions:
         resources['_event_buffer'].close.side_effect = TimeoutError('buffer-fail')
         resources['planned_episode_registry'].close.side_effect = RuntimeError('registry-fail')
 
-        with caplog.at_level(logging.ERROR, logger='fused_memory.services.memory_service'):
+        with caplog.at_level(logging.ERROR, logger=_CLOSE_LOGGER):
             # Must NOT raise even when every resource fails
             await service.close()
 
@@ -2962,8 +2978,12 @@ class TestCloseLogsExceptions:
         for _name, resource in resources.items():
             resource.close.assert_awaited_once()
 
-        # Exactly six ERROR records
-        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        # Exactly six ERROR records *from close()* — see _CLOSE_LOGGER on why the
+        # filter must scope by logger name and not by level alone.
+        error_records = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR and r.name == _CLOSE_LOGGER
+        ]
         assert len(error_records) == 6, (
             f'Expected 6 ERROR records, got {len(error_records)}'
         )
