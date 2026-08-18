@@ -20,12 +20,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import FakeMemoryLookup, build_journal_with_closed_run
+from mcp.server.fastmcp.exceptions import ToolError
 
 from fused_memory.models.reconciliation import StageReport
 from fused_memory.server.recon_report import (
     ReconReportState,
     create_recon_report_server,
-    get_recon_report_tool_signatures,
 )
 
 CALLER_RUN = 'caller-1'
@@ -290,7 +290,7 @@ class TestStateRepairMemoryCitation:
 
 
 class TestRepairToolViaFastMCP:
-    """The MCP surface: registration, signature, end-to-end call, docs."""
+    """The MCP surface: registration, boundary validation, end-to-end call, docs."""
 
     @pytest.mark.asyncio
     async def test_tool_is_registered(self):
@@ -298,22 +298,79 @@ class TestRepairToolViaFastMCP:
         names = {tool.name for tool in await mcp.list_tools()}
         assert 'repair_memory_citation' in names
 
-    def test_signature_shape(self):
-        sig = get_recon_report_tool_signatures()['repair_memory_citation']
-        assert list(sig.parameters) == [
-            'run_id',
-            'target_run_id',
-            'finding_id',
-            'memory_id',
-            'store',
-            'replacement_memory_id',
-        ]
-        assert sig.parameters['replacement_memory_id'].default is None
-        # Mirrors cite_memory's declared shape so a bad store is rejected at the
-        # schema boundary too, not only by the unsupported_store gate.
-        # recon_report.py carries `from __future__ import annotations`, so the
-        # signature holds the SOURCE TEXT of the annotation, not the object.
-        assert sig.parameters['store'].annotation == "Literal['graphiti', 'mem0']"
+    @pytest.mark.asyncio
+    async def test_bad_store_rejected_at_the_schema_boundary(self, tmp_path):
+        """An out-of-enum ``store`` never reaches the helper's own gate.
+
+        Asserted BEHAVIOURALLY — by calling the tool — rather than by comparing
+        the annotation's source text. Under ``from __future__ import
+        annotations`` that text is just a string, so a comparison would fail on
+        a cosmetic requote and still pass if boundary validation were dropped
+        entirely; this fails only if the validation actually stops happening.
+        ``memory.calls`` is the second half: rejection at the schema boundary
+        means no backend read is attempted at all, which is what distinguishes
+        it from the helper's own ``unsupported_store`` refusal further in.
+        """
+        journal = await _seeded_journal(tmp_path)
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+            mcp = create_recon_report_server(state)
+
+            with pytest.raises(ToolError) as excinfo:
+                await mcp._tool_manager.call_tool(
+                    'repair_memory_citation',
+                    {
+                        'run_id': CALLER_RUN,
+                        'target_run_id': TARGET_RUN,
+                        'finding_id': 'f-1',
+                        'memory_id': DANGLING,
+                        'store': 'postgres',
+                        'replacement_memory_id': SUCCESSOR,
+                    },
+                )
+
+            assert 'store' in str(excinfo.value)
+            assert memory.calls == []
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_replacement_memory_id_is_optional_over_the_wire(self, tmp_path):
+        """Omitting ``replacement_memory_id`` DROPS the dangling citation.
+
+        The behavioural form of the "defaults to None" contract: a caller that
+        simply leaves the argument out must get a drop-only repair, not a
+        missing-argument rejection.
+        """
+        journal = await _seeded_journal(tmp_path)
+        try:
+            memory = FakeMemoryLookup({DANGLING: None})
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+            mcp = create_recon_report_server(state)
+
+            result = await mcp._tool_manager.call_tool(
+                'repair_memory_citation',
+                {
+                    'run_id': CALLER_RUN,
+                    'target_run_id': TARGET_RUN,
+                    'finding_id': 'f-1',
+                    'memory_id': DANGLING,
+                    'store': 'mem0',
+                },
+            )
+
+            assert result['status'] == 'repaired'
+            assert result['replacement_memory_id'] is None
+            assert result['cited_memories'] == []
+        finally:
+            await journal.close()
 
     @pytest.mark.asyncio
     async def test_end_to_end_tool_call(self, tmp_path):
