@@ -2430,6 +2430,52 @@ def _cited_task_corroborated(cited: dict[str, Any], get_task_result: object) -> 
     return normalized_cited == normalized_result
 
 
+def _cited_fix_task_live(cited: dict[str, Any], get_task_result: object) -> bool:
+    """True iff *cited* names a FILED, non-cancelled task confirmed by *get_task_result*.
+
+    Layers the ruled status policy on top of :func:`_cited_task_corroborated`,
+    giving three guarantees:
+
+    1. **Presence + title corroboration** is inherited wholesale from
+       :func:`_cited_task_corroborated`.  This matters more here than in the
+       phantom guard: a ``cited_tasks`` entry is not always the product of
+       ``recon_report.cite_task`` (which validates existence at cite time) —
+       the structured-output JSON-fallback citation path bypasses that check
+       entirely — so a hallucinated or stale entry must never be able to
+       suppress a real recurring complaint on a bare id match.
+    2. **The status policy is "filed and not cancelled"** (Leo's ruling,
+       2026-08-17, task 4381 / esc-3841-1).  Any status other than
+       ``'cancelled'`` counts, INCLUDING ``pending`` and ``blocked``: the
+       complaint these findings raise is literally "no fix task has been
+       filed", which a filed-but-unstarted task already answers.  A
+       ``cancelled`` task must NOT count — treating it as satisfying the
+       complaint would silence the finding permanently, with no event left
+       to ever revive it.
+    3. **An absent or non-``str`` status is INCONCLUSIVE** and returns False,
+       matching this module's suppress-only-on-positive-confirmation posture
+       (:func:`confirm_task_present` / :func:`confirm_task_absent`).  In
+       practice ``sqlite_task_backend._row_to_task`` always emits ``status``,
+       so this costs nothing against a healthy backend and fails safe against
+       an unhealthy one.
+
+    Args:
+        cited: One ``cited_tasks`` entry ``{'project_id', 'task_id', 'title'}``.
+        get_task_result: The raw (or normalised-exception) value returned by
+            ``taskmaster.get_task()`` for *cited*.
+
+    Returns:
+        True only when the record is positively present, its title matches the
+        citation, and its status is a non-cancelled string.
+
+    Pure, sync, no I/O.
+    """
+    if not _cited_task_corroborated(cited, get_task_result):
+        return False
+    # _cited_task_corroborated already proved get_task_result is a dict.
+    status = get_task_result.get('status')  # type: ignore[union-attr]
+    return isinstance(status, str) and status != 'cancelled'
+
+
 # --------------------------------------------------------------------------- #
 # Phantom task-creation guard (task-2525)
 # --------------------------------------------------------------------------- #
