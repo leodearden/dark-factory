@@ -547,7 +547,10 @@ class TestMaterializeBGroupedArm:
             assert kind in KIND_REGISTRY
 
     def test_parent_ids_are_canonical_dashed_uuids(self):
-        """β's `_is_full_uuid` rule: 36 chars, dashed, and its own str() round-trip.
+        """The `parent_id` shape rule: 36 chars, dashed, own str() round-trip.
+
+        The rule is `fused_memory.utils.validation.is_full_uuid`, enforced by
+        β's `validate_memory_metadata`.
 
         A short hex id or a bare hex32 would trip `invalid_parent_id_shape`,
         so the arm cannot mint ids casually.

@@ -540,7 +540,9 @@ DISTRACTOR_ROLE = 'distractor'
 #: report diff stops being signal.  The namespace is a fixed literal — a
 #: value derived at runtime would reintroduce exactly the nondeterminism
 #: this avoids.  It also keeps the ids canonical 36-char dashed UUIDs, which
-#: is what β's ``parent_id`` shape rule (``_is_full_uuid``) requires.
+#: is what the ``parent_id`` shape rule
+#: (``fused_memory.utils.validation.is_full_uuid``, enforced by β's
+#: ``validate_memory_metadata``) requires.
 _E2_ID_NAMESPACE = uuid.UUID('6f2b7c14-9a3d-4e58-8b71-2c5d0a4f9e63')
 
 
