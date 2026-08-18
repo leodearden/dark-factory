@@ -3673,14 +3673,24 @@ class TestConflictingTaskStatusFraming:
         after. It moves these two detectors off the module's
         fail-open-on-under-firing default toward over-firing.
 
-        The blast radius is bounded by construction: a hit only soft-blocks a
-        recon-stage write in server/tools.py with a rephrase hint
-        (conflicting_task_status_framing_write_blocked) — no exception, no
-        write, no data corruption. Suppressing it instead would require
-        nearest-ref proximity binding, a redesign of the association algorithm
-        and a far larger risk to the two edge-invalidation consumers of
-        TASK_REF_RE. Following the module's house idiom, the trade-off is pinned
-        by a test so it stays visible rather than being discovered later.
+        What bounds the blast radius is the CONSUMER SET of the private
+        _CLAUSE_SPLIT_RE, not any property of these detectors. It holds while
+        the consumers are exactly find_conflicting_task_status_ids
+        (conflicting_task_status_framing_write_blocked) and
+        find_present_tense_completion_claim_task_ids
+        (premature_completion_claim_write_blocked) — both early-return
+        SOFT-BLOCK gates in server/tools.py, where a hit costs a
+        rephrase-and-retry: no exception, no write, no data corruption. The
+        claim is contingent, and it was already falsified once: the task 3403
+        review found services/completion_claim_gate.py importing the same
+        constant while durably tagging episodes and filing operator
+        escalations. That consumer now keeps its own _CLAUSE_BOUNDARY_RE.
+
+        Suppressing the over-fire here instead would require nearest-ref
+        proximity binding, a redesign of the association algorithm and a far
+        larger risk to the two edge-invalidation consumers of TASK_REF_RE.
+        Following the module's house idiom, the trade-off is pinned by a test
+        so it stays visible rather than being discovered later.
         """
         from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
 

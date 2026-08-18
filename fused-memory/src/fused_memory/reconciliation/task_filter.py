@@ -339,10 +339,30 @@ NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
 #         ids tags ALL of them) fires more often — one sentence coordinating two
 #         tasks with different statuses now tags both. This moves these two
 #         detectors off the module's fail-open-on-under-firing default toward
-#         over-firing. Bounded by construction: a hit only soft-blocks a
-#         recon-stage write with a rephrase hint, never corrupts data. Pinned by
+#         over-firing. Pinned by
 #         TestConflictingTaskStatusFraming.test_widened_clause_tags_both_coordinated_ids
 #         so the trade-off stays visible.
+#
+#         What bounds that over-fire is the CONSUMER SET, not any property of
+#         the detectors — this constant is module-private BY CONTRACT, and the
+#         bound holds only while its consumers are exactly:
+#           - find_conflicting_task_status_ids       -> server/tools.py,
+#             conflicting_task_status_framing_write_blocked
+#           - find_present_tense_completion_claim_task_ids -> server/tools.py,
+#             premature_completion_claim_write_blocked
+#         Both are early-return SOFT-BLOCK write gates: a hit costs the author
+#         a rephrase-and-retry. No exception, no write, no data corruption.
+#
+#         That claim is VOID the moment a consumer on a destructive or
+#         corpus-tagging path imports this. It already happened once: the
+#         task 3403 review found services/completion_claim_gate.py importing
+#         this constant while tagging episodes durably and filing operator
+#         escalations, which made the shipped bounded-blast-radius claim false.
+#         It now keeps its own copy of the ORIGINAL alphabet — see
+#         completion_claim_gate._CLAUSE_BOUNDARY_RE and the divergence comment
+#         above it — as the worked example of a consumer that had to diverge.
+#         A new importer must first show its fail-safe direction matches, or
+#         diverge the same way.
 #   (ii)  'e.g.' / 'i.e.' still split at their SECOND dot (the right-side-only
 #         rule). Harmless — that is a genuine phrase boundary, not a break
 #         between a ref and its status.
