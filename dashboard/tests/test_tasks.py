@@ -397,14 +397,25 @@ class TestFetchTasksCache:
         assert result_b[0]['title'] == 'Task B'
 
     async def test_fetch_tasks_offline_not_cached(
-        self, dummy_client, dummy_config
+        self, monkeypatch, dummy_client, dummy_config
     ):
-        """Offline markers ({offline: True}) are never pinned in the cache.
+        """Offline markers ({offline: True}) are never pinned in the POSITIVE cache.
 
         First call: ConnectError → offline dict returned.
         Second call: mock recovers → MCP call issued (call_count == 2); list returned.
+
+        Task 3857 note: an offline marker is now held briefly in the SEPARATE
+        negative cache (``_FETCH_TASKS_NEGATIVE_TTL_SECONDS``, ~5 s) so a
+        broken root stops being re-walked on every 3 s poll. That window is
+        collapsed to zero here so this test keeps asserting what it always
+        asserted — a failure never pins itself for the 20 s POSITIVE TTL, and
+        recovery is observed as soon as an attempt is allowed to run. The
+        negative window itself is covered by ``TestFetchTasksNegativeCache``.
         """
+        import dashboard.data.tasks as tasks_mod
         from dashboard.data.tasks import fetch_tasks
+
+        monkeypatch.setattr(tasks_mod, '_FETCH_TASKS_NEGATIVE_TTL_SECONDS', 0.0)
 
         task_c_raw = {
             'id': '3', 'title': 'Task C', 'status': 'pending',
@@ -428,6 +439,9 @@ class TestFetchTasksCache:
         assert isinstance(success_result, list)
         assert len(success_result) == 1
         assert success_result[0]['title'] == 'Task C'
+        # The marker never entered the positive cache — the recovered list did.
+        key = tasks_mod._fetch_tasks_cache_key('/proj/C', None, None, 0)
+        assert tasks_mod._fetch_tasks_cache.get_fresh(key) == success_result
 
     async def test_fetch_tasks_returned_list_is_a_copy(
         self, dummy_client, dummy_config

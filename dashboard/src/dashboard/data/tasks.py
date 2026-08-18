@@ -97,10 +97,35 @@ _fetch_tasks_cache: TTLCache[list[dict] | dict] = TTLCache(
     ttl_seconds=lambda: _FETCH_TASKS_TTL_SECONDS
 )
 
+# Negative (offline-marker) cache.  ``cache_ok`` on the positive cache stores
+# successes ONLY, which made failure the expensive path: a healthy root rides
+# the 20 s TTL while a broken one re-walks its whole tree on every UI poll.
+#
+# 5.0 s is picked against the two real clocks either side of it:
+#   * SHORTER than _FETCH_TASKS_TTL_SECONDS (20 s), so an outage is re-probed
+#     several times per positive-cache window and recovery is noticed quickly;
+#   * LONGER than data.js's POLL_INTERVAL_MS (3 s), so a broken root costs at
+#     most one tree-walk attempt per two polls instead of one per poll.
+#
+# A SECOND TTLCache instance rather than a change to TTLCache itself: the
+# class carries exactly one TTL per instance and sits on eight other call
+# sites, so parameterising it would be the larger and less obviously correct
+# change.  No mcp_fanout change is required.
+#
+# No cross-invalidation hook is needed.  While a negative entry is fresh no
+# attempt runs for that key, so no success can occur inside the window to
+# contradict it; and both caches share :func:`_fetch_tasks_cache_key`, so a
+# recovered root simply repopulates the positive cache on its next attempt.
+_FETCH_TASKS_NEGATIVE_TTL_SECONDS = 5.0
+_fetch_tasks_negative_cache: TTLCache[dict] = TTLCache(
+    ttl_seconds=lambda: _FETCH_TASKS_NEGATIVE_TTL_SECONDS
+)
+
 
 def _fetch_tasks_cache_clear() -> None:
-    """Clear the fetch_tasks TTL cache (test/admin hook)."""
+    """Clear BOTH fetch_tasks TTL caches, positive and negative (test/admin hook)."""
     _fetch_tasks_cache.clear()
+    _fetch_tasks_negative_cache.clear()
 
 
 def _fetch_tasks_cache_key(
@@ -278,6 +303,15 @@ async def fetch_tasks(
     a fresh attempt is made.  This delays outage detection by up to ~20 s —
     intentional for a monitoring view (stale data preferable to a blank tab).
 
+    **Negative caching:** once that entry does expire and the attempt fails,
+    the resulting offline marker is held for
+    ``_FETCH_TASKS_NEGATIVE_TTL_SECONDS`` (~5 s) under the SAME key, so a
+    broken root stops being the expensive path.  The marker is still returned
+    to every caller in the window — the retry is suppressed, the degradation
+    signal is not — and the negative entry is per (project_root, narrowing),
+    so one failing read never blinds a healthy sibling root or a differently
+    narrowed read of the same root.
+
     **Data consistency:** ``fetch_statuses`` is uncached and returns live data;
     callers that combine a cached task tree (this function) with a live status
     map (``fetch_statuses``) in the same render may observe transiently
@@ -361,12 +395,30 @@ async def fetch_tasks(
             offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
         )
 
+    key = _fetch_tasks_cache_key(project_root_str, statuses, page_size, offset)
+
+    # A fresh negative entry short-circuits the attempt.  The marker is still
+    # RETURNED, so degradation stays exactly as visible to the caller as it was
+    # before — only the retry is suppressed.
+    suppressed = _fetch_tasks_negative_cache.get_fresh(key)
+    if suppressed is not None:
+        return suppressed
+
     result = await _fetch_tasks_cache.get_or_refresh(
-        _fetch_tasks_cache_key(project_root_str, statuses, page_size, offset),
-        _refresh,
-        cache_ok=lambda v: isinstance(v, list),
+        key, _refresh, cache_ok=lambda v: isinstance(v, list),
     )
-    return list(result) if isinstance(result, list) else result
+    if not isinstance(result, list):
+        # Record the offline marker.  ``get_or_refresh`` is the store path
+        # because ``TTLCache`` exposes no bare setter and this needs no
+        # ``mcp_fanout`` change; the default always-true ``cache_ok`` keeps it,
+        # and its per-key lock makes a concurrent second failure reuse the
+        # first marker rather than race it.
+        async def _mark() -> dict:
+            return result
+
+        await _fetch_tasks_negative_cache.get_or_refresh(key, _mark)
+        return result
+    return list(result)
 
 
 async def fetch_external_statuses(
