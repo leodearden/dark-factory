@@ -1031,7 +1031,7 @@ class Mem0Backend:
                 )
             offset = next_offset
 
-    async def scroll_all_by_metadata(
+    def scroll_all_by_metadata(
         self,
         scope: Scope,
         filters: dict[str, Any],
@@ -1077,8 +1077,18 @@ class Mem0Backend:
             *with_vectors*) — identical in shape to
             :meth:`scroll_by_metadata`'s list elements.
 
+        Argument validation is EAGER: the ``ValueError`` (and any error from
+        resolving the collection or building the payload filter) raises when
+        this method is CALLED, matching the coroutine sibling
+        :meth:`scroll_by_metadata`, so a caller that builds the stream and
+        then conditionally never iterates it still gets the error. Only the
+        paging is deferred — this is a plain ``def`` returning
+        :meth:`_scroll_all_records`, because an ``async def`` containing
+        ``yield`` would be an async-generator function whose body, guard
+        included, does not run until the first ``__anext__``.
+
         Raises:
-            ValueError: If *filters* is empty.
+            ValueError: If *filters* is empty — at CALL time.
             ScrollPageBudgetExhausted: If the enumeration is truncated by the
                 page budget.
             TimeoutError: If a single page exceeds the read timeout —
@@ -1091,6 +1101,30 @@ class Mem0Backend:
             )
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         scroll_filter = self._build_payload_filter(filters)
+        return self._scroll_all_records(
+            collection_name,
+            scroll_filter,
+            page_size=page_size,
+            max_pages=max_pages,
+            with_vectors=with_vectors,
+        )
+
+    async def _scroll_all_records(
+        self,
+        collection_name: str,
+        scroll_filter: Any,
+        *,
+        page_size: int,
+        max_pages: int,
+        with_vectors: bool,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Lazy paging half of :meth:`scroll_all_by_metadata`.
+
+        Assumes PRE-VALIDATED arguments — the public method is the sole entry
+        point and owns the empty-filters guard, the collection resolution and
+        the payload-filter build. See it for the streaming, budget and
+        timeout contracts.
+        """
         async for point in self.scroll_collection_pages(
             collection_name,
             scroll_filter=scroll_filter,
