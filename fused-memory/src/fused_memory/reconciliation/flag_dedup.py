@@ -14,11 +14,19 @@ reaped each cycle by ``ReconLedgerStore.gc()``.
 mirror is unaffected and still writes on every suppression upsert; either
 way, Mem0 is never searched by this module.
 
-Note: this module does not suppress persistent flags before Stage 2 sees
-them at the LLM level; suppression logic also lives in Stage 2's prompt
-instructions, which direct the LLM to soft-handle annotated flags.  This
-module enforces the suppression contract in code (see "Suppression"
-below), making it authoritative over the prompt directive.
+Note: suppression logic also lives in Stage 2's prompt instructions, which
+direct the LLM to soft-handle annotated flags.  This module enforces the
+suppression contract in code (see "Suppression" below), making it
+authoritative over the prompt directive WHERE IT REACHES — and it reaches
+exactly ONE of Stage 2's two flag channels.  On the STRUCTURED-REPORT
+channel (``report.items_flagged``) a dropped flag never reaches Stage 2 at
+all, which since task 4381 includes a carried-forward flag whose
+``cited_tasks`` resolve to a live foreign fix task.  On the independent
+Mem0 channel (``task_knowledge_sync._query_stage2_flags`` re-queries
+``metadata.flag_for_stage2``) no code filter here can reach the flag, so
+the prompt directive is the only lever — which is why the Stage 2 prompt
+carries the matching "Persistent Flags" instruction and must be kept in
+agreement with this module rather than allowed to go stale.
 
 Ledger-backed marker UPSERT (task 2227)
 ----------------------------------------

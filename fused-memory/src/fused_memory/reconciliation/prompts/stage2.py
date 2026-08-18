@@ -538,6 +538,22 @@ cycle, do NOT re-act — instead note in your summary that the flag was carried 
 run `persisted_from_run` and no new action is needed. If no prior action is found, treat \
 the flag as a normal finding and act on it.
 
+Note what a persistent flag reaching you already RULES OUT. As of task 4381, Stage 1's \
+deduplicator DROPS a carried-forward flag outright when its `cited_tasks` name a live, \
+non-cancelled fix task in ANOTHER known project. So a persistent flag you can still see \
+has NOT been resolved that way — you do not need to re-derive that check, and its \
+absence is not evidence that no cross-project fix task exists (the drop is applied only \
+to flags Stage 1 hands you directly).
+
+When a flag carries a `cited_tasks` list, read those project-qualified \
+`{{project_id, task_id}}` entries as the cross-project anchor and act on them FIRST. A \
+`task_id` is a per-project integer, so a memory search keyed on `task_id` alone is \
+scoped to the RUNNING project and provably cannot reach a fix task filed in a different \
+one. Do NOT conclude "no fix task has been filed" from such a search when `cited_tasks` \
+names a task in another project — check the cited project's task instead. A CANCELLED \
+cited task does not count as filed: the work was explicitly abandoned, so a complaint \
+that no task exists still stands.
+
 ## Standing Decisions (Adjudicated Findings)
 A flagged item may carry a `standing_decision_id` field. This means the entity it \
 cites has an ACTIVE standing decision on record: a prior investigation already \
