@@ -907,6 +907,25 @@ _ALLOWED_RENAMERS = {
         'BEFORE the replace, and atomic_write_text exposes no pre-replace seam '
         'for that — a now-stamped archive reads to gc_agent_transcripts as a '
         'reset retention age.',
+    ('shared/src/shared/transcript_archive.py', '_move_to_archive'):
+        'MOVES an existing transcript rather than writing new text — the '
+        'sibling of _archive_one above, and the same category as escalation '
+        'sweep._atomic_move / queue._archive_resolved. atomic_write_text does '
+        'not merely fit badly here, it has nothing to be handed: there is no '
+        'content string, only an inode to relink. The os.rename IS the '
+        'operation, not a rename-into-place finishing a write, so the '
+        'structural detector that flags it is reading the shape correctly and '
+        'the shape is correct. Added by task 3619, which made archival a '
+        'precondition of config-dir deletion and needed the O(1) metadata move '
+        'to keep that affordable inside a synchronous teardown. Two properties '
+        'the copy path has to work for and this one gets from the rename '
+        'itself: atomicity within a filesystem (no staging sibling, so a '
+        'truncated transcript cannot appear at the canonical path) and mtime '
+        'preservation via the surviving inode (a now-stamped archive would '
+        'reset gc_agent_transcripts retention age and defeat the '
+        'already-current skip). The EXDEV branch delegates to _archive_one '
+        'when the rename is physically impossible, so the cross-device case '
+        'is handled by the entry above rather than by a second writer here.',
     ('orchestrator/src/orchestrator/mcp/plan_tools.py', '_atomic_write_plan'):
         'Cannot delegate without losing three semantics atomic_write_text does '
         'not offer. (1) SYMLINK RESOLUTION: it writes to os.path.realpath(path) '

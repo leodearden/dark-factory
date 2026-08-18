@@ -1294,6 +1294,122 @@ decompressed and decoded every one of them with zero failures.
 
 ---
 
+## 14. Transcript preservation & the archival guard
+
+Agent transcripts are the only durable record of what an agent actually did,
+and the substrate `--resume` reads. Task 3619 (leaf 2 of
+`plans/transcript-preservation-seam-prd.md` §8) changed *when* they are made
+durable. This is the operator-facing surface of that change.
+
+### Archival is a precondition of deletion, not a step before it
+
+Every path that deletes a per-task config dir now goes through
+`shared.transcript_archive.archive_before_delete`, which archives first and
+deletes only what it has made durable. The three sites are
+`TaskWorkflow._cleanup_config_dir`, `_recycle_config_dir`, and the
+`GitOps.cleanup_worktree` backstop.
+
+The call is **synchronous** on purpose. It used to be
+`await asyncio.to_thread(...)`, which meant a SIGTERM arriving mid-teardown
+cancelled the archive and destroyed the transcript anyway — the failure this
+task exists to remove. There is nothing left to cancel: same-filesystem
+archival is an `os.rename` (O(1) metadata), and the cross-device fallback is a
+copy of a file whose median size is 381 KB.
+
+**Consequence for you:** you can no longer lose a transcript by restarting the
+orchestrator at the wrong moment. A transcript is either archived or still on
+disk.
+
+### A failed archive holds the transcript — and only the transcript
+
+When a transcript cannot be made durable (disk full, permissions, read-only
+remount), `archive_before_delete` **holds** that `.jsonl` in place rather than
+deleting it. Everything else in the config dir is deleted **unconditionally**:
+`.credentials.json`, the `~/.claude` settings symlinks (unlinked, never
+followed), `sessions/`, `telemetry/`, and every other non-transcript member.
+
+That scoping is the point. A permanently-failing archive must never convert
+into an unbounded hold on a credential-bearing directory. If the purge itself
+somehow leaves `.credentials.json` behind, that is reported loudly through the
+same archival-failure counter — it is not allowed to be silent.
+
+At the `cleanup_worktree` backstop a held transcript is destroyed moments
+later by `git worktree remove --force`. That is deliberate: the guard's
+promise is that *it* never deletes an un-archived transcript, and blocking
+worktree removal would trade a bounded, counted, escalated transcript loss for
+an unbounded hold on a worktree and its lane slot.
+
+### The boot-time sweeper covers the SIGKILL tail
+
+Nothing above runs when the process is SIGKILLed.
+`Harness._sweep_orphaned_transcripts` runs at startup, inside crash recovery
+(after the pool-storage guard, before any worktree is cleaned up), and
+archives whatever transcripts survive in
+`<worktree>/.task/claude-config-*/`. It also drains the held
+backlog from the previous point — which is what bounds a hold to "until the
+next process start".
+
+It **only ever copies**. The worktrees it walks are the ones recovery is about
+to adopt; moving a transcript out from under a session that is about to
+`--resume` would degrade that resume to a fresh dispatch. Deletion stays with
+the teardown sites, which know the session is finished.
+
+The sweep is deadline-bounded (30s). A truncated pass logs a WARNING naming
+itself `INCOMPLETE` with the examined/archived counts — if you see it, the
+untouched worktrees are simply swept at the next start.
+
+### The archival-storm L1
+
+One failed archive is routine and only increments a counter. A **burst** files
+one L1, deduped so a runaway files once, not hundreds of times:
+
+| | |
+|---|---|
+| Sentinel / role | `__transcript_archival_storm__` / `orchestrator-transcript-archival-storm` |
+| Severity | `blocking`, `category=infra_issue`, level 1 |
+| Knobs | `transcript_archive.storm_threshold` (default 5), `transcript_archive.storm_window_secs` (default 600.0) |
+| Tier | **Green** — both hot-reload via `reload_config`, and are read live on every failure (no restart needed) |
+
+The escalation names the archive root, the failing paths, and the errnos
+symbolically (`ENOSPC(28)`, `EACCES(13)`, …) — that distinction *is* the next
+action. Check, in order: free space and inode headroom on the archive root;
+that the path exists and is writable by this process (a read-only remount
+looks exactly like a permissions failure); and that the archive root is on the
+expected device. Held transcripts are retried automatically by the next
+start's sweeper, so a fixed root self-heals on restart with no manual copy.
+
+### Verifying the fix on your own host
+
+The claim is scoped to the **post-fix cohort** — sessions preserved by a
+restart that ran this code. Archive coverage of sessions preserved by a
+SIGTERM restart should read 100%, against the 12.5% (2 of 16) measured
+2026-08-04 before the guard existed. The historical cohort is not
+retroactively recoverable, so do not expect an all-time number to move.
+
+After a graceful restart with sessions in flight, from `project_root`:
+
+```bash
+for sc in .worktrees/*/.task/agent_session.json; do
+  [ -e "$sc" ] || continue
+  sid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("session_id",""))' "$sc")
+  [ -n "$sid" ] || continue
+  if compgen -G "data/orchestrator/agent-transcripts/*/*/$sid.jsonl" >/dev/null; then
+    echo "OK   $sid"
+  else
+    echo "MISS $sid  ($sc)"
+  fi
+done
+```
+
+Every preserved session should print `OK`. A `MISS` means that session will
+fall back to a fresh dispatch on re-dispatch — check the orchestrator log for
+`transcript_archive:` WARNINGs and for an open archival-storm L1.
+
+Note this task makes the archive *exist*; whether a given session actually
+resumes from it is task 3578's separate eligibility guard.
+
+---
+
 ## See also
 
 - [README.md](README.md) — what Dark Factory is, quick start
