@@ -17,7 +17,7 @@ import pytest
 
 from escalation.classify import effective_benign
 from escalation.models import Escalation
-from escalation.queue import EscalationQueue, iter_all_escalation_paths
+from escalation.queue import _MAX_AMENDMENTS, EscalationQueue, iter_all_escalation_paths
 
 
 def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', level: int = 0) -> Escalation:
@@ -2897,6 +2897,78 @@ class TestAddMembersToL2:
             f'A framing-free call must record no amendment, got {result.amendments!r}'
         )
         assert self._on_disk(queue, l2.id).amendments == []
+
+    def test_amendment_list_is_capped_and_truncation_is_loud(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """Amendment growth is bounded, sheds the OLDEST, and counts what it shed.
+
+        INV-7: the cap has a NAME (`_MAX_AMENDMENTS`), a direction (drop oldest)
+        and an owner (this method, at write time).  The loop bound is derived
+        FROM the constant, never hardcoded — a literal here would encode the
+        constant's VALUE instead of its NAME and go stale the moment it is
+        retuned (sibling task 3998 raises the fold rate by design).
+
+        Shedding the OLDEST is safe precisely because the ORIGINAL framing is
+        never in this list at all: it lives permanently in the record's own
+        immutable root_cause/detail/options/summary, so the oldest amendment is
+        the least-informative entry and a rotation triaging NOW needs the most
+        recent framing.
+        """
+        overflow = 3
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            for i in range(_MAX_AMENDMENTS + overflow):
+                result = queue.add_members_to_l2(
+                    l2.id, [],
+                    root_cause=f'root cause pass {i}',
+                    evidence=f'evidence pass {i}',
+                    agent_role='escalation-watcher-auto',
+                )
+
+        assert result is not None
+        # (a) growth is BOUNDED.
+        assert len(result.amendments) == _MAX_AMENDMENTS, (
+            f'Expected the list capped at {_MAX_AMENDMENTS}, '
+            f'got {len(result.amendments)}'
+        )
+        # (b) the RETAINED entries are the most RECENT ones — identified by
+        # index-derived content, not by position alone.
+        retained = {a['root_cause'] for a in result.amendments}
+        assert retained == {
+            f'root cause pass {i}'
+            for i in range(overflow, _MAX_AMENDMENTS + overflow)
+        }, f'Expected the newest {_MAX_AMENDMENTS} passes to survive, got {sorted(retained)}'
+        assert result.amendments[-1]['detail'] == (
+            f'evidence pass {_MAX_AMENDMENTS + overflow - 1}'
+        ), 'the most recent framing must be the LAST entry'
+        # (c) the loss is DURABLY COUNTED on the record — assertable without
+        # scraping logs (INV-8).
+        assert result.amendments_truncated == overflow, (
+            f'Expected {overflow} shed entries counted, got {result.amendments_truncated}'
+        )
+
+        # (d) and it is LOUD.
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'escalation.queue'
+        ]
+        assert warning_records, (
+            f"Expected a WARNING at logger 'escalation.queue'; got records: {caplog.records}"
+        )
+        assert any(l2.id in r.getMessage() for r in warning_records), (
+            f'Expected a truncation WARNING naming {l2.id}; '
+            f'got {[r.getMessage() for r in warning_records]}'
+        )
+
+        # The cap is enforced on DISK too, not just on the returned object —
+        # the trim rides the same single _rewrite as the append.
+        reloaded = self._on_disk(queue, l2.id)
+        assert len(reloaded.amendments) == _MAX_AMENDMENTS
+        assert reloaded.amendments_truncated == overflow
+        assert {a['root_cause'] for a in reloaded.amendments} == retained
 
 
 class TestStampTriage:
