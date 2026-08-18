@@ -24,6 +24,7 @@ from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.models import Escalation
 from escalation.queue import _MAX_AMENDMENTS, EscalationQueue
 from escalation.server import (
+    _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
     _AMENDMENT_TRUNCATION_STORM_THRESHOLD,
     _AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS,
     _COMPACT_ESCALATION_FIELDS,
@@ -3032,6 +3033,26 @@ class TestAmendmentTruncationStorm:
         )
         assert str(_AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS) in blob, (
             f'the window must be named so the rate is legible: {blob!r}'
+        )
+        # The condition is SYSTEM-scoped — cap sizing, or root-cause matching
+        # over-folding — and a burst routinely spans several L2s across several
+        # tasks.  Filing it against whichever promote crossed the threshold
+        # would put an unrelated infra record on that task's
+        # get_task_escalations, and (because the helper calls _submit_or_dedupe
+        # directly, bypassing the terminal-task chokepoint) could land it
+        # PENDING on an already-terminal task.  Same synthetic-anchor discipline
+        # as markup_tripwire._ANCHOR_TASK_ID.
+        assert storm.task_id == _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID, (
+            f'a system-scoped report must file under the synthetic anchor, not '
+            f'the triggering promote\'s task: {storm.task_id!r}'
+        )
+        assert storm.task_id != _L2_DEFAULTS['task_id']
+        on_triggering_task = {
+            e.id for e in queue.get_by_task(_L2_DEFAULTS['task_id'], status='pending')
+        }
+        assert storm.id not in on_triggering_task, (
+            f'the storm report must not surface on the triggering task: '
+            f'{sorted(on_triggering_task)}'
         )
         known |= new_ids
 

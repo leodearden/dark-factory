@@ -448,6 +448,21 @@ def _compact_escalation(d: dict[str, Any], fields: tuple[str, ...]) -> dict[str,
 _AMENDMENT_TRUNCATION_STORM_THRESHOLD = 3
 _AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS = 3600.0  # 1 h
 
+# A stable SYNTHETIC anchor (not a real task id), mirroring
+# ``markup_tripwire._ANCHOR_TASK_ID`` and its siblings.  The condition this
+# report describes — cap sizing, or root-cause matching over-folding unrelated
+# clusters — is SYSTEM-scoped, and a burst routinely spans several L2s across
+# several tasks, so filing it against whichever promote happened to cross the
+# threshold would be arbitrary attribution with two real costs:
+# ``get_task_escalations(that_task)`` would surface an infra record unrelated to
+# the task, and because this helper calls ``_submit_or_dedupe`` directly (it is
+# sync, and must never fail the promote) it bypasses the terminal-task
+# chokepoint, so the report could land PENDING on an already-terminal task.
+# The affected L2 ids stay named in the summary and detail, which is where the
+# attribution belongs.  The ids also form one greppable
+# ``esc-l2-amendment-truncation-N`` series.
+_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID = 'l2-amendment-truncation'
+
 
 # Task statuses from which a recovery/redispatch is still possible.  A record
 # on a task outside this set pins nothing: there is no recovery to block.
@@ -697,7 +712,7 @@ def create_server(
     # counter in this closure is what preserves that property.
     _amendment_truncation_storm = StormCounter()
 
-    def _report_amendment_truncation_storm(l2_id: str, task_id: str) -> None:
+    def _report_amendment_truncation_storm(l2_id: str) -> None:
         """File ONE info escalation when amendment truncation BURSTS.
 
         ``queue.add_members_to_l2`` already counts every dropped amendment on
@@ -718,6 +733,11 @@ def create_server(
         ``emit_residual_candidate_key_escalation``: nothing raised in here may
         fail the promote that triggered it.  A dropped report costs a
         notification; a raised one would cost the fold.
+
+        Filed under ``_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID``, following the same
+        analogues, because the condition is system-scoped rather than a property
+        of whichever task's promote crossed the threshold.  The affected L2 ids
+        are named in the summary and detail instead.
         """
         try:
             storm = _amendment_truncation_storm.record(
@@ -734,8 +754,10 @@ def create_server(
                 return
             labels = ', '.join(storm['labels']) or l2_id
             _submit_or_dedupe(Escalation(
-                id=queue.make_id(task_id),
-                task_id=task_id,
+                # Filed under the synthetic anchor, NOT the triggering promote's
+                # task_id — see _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID.
+                id=queue.make_id(_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID),
+                task_id=_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
                 agent_role='escalation-server',
                 # A report about lost framing is a notification, not a page:
                 # 'info' keeps it off the born-at-L2 human-direct route.
@@ -1936,7 +1958,7 @@ def create_server(
                 # _report_amendment_truncation_storm never raises, so a failed
                 # report can never fail this fold.
                 if outcome['dropped']:
-                    _report_amendment_truncation_storm(existing_id, task_id)
+                    _report_amendment_truncation_storm(existing_id)
                 return {
                     'id': existing_id,
                     'status': 'updated',
