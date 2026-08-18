@@ -89,7 +89,18 @@ def build_bwrap_command(
     <data_dir>/recon-config/, outside every bind above, so every recon
     stage was told where to write its transcript and then denied the write.
     Note this branch drops a writable_extra that is not an existing dir
-    (see below), so a mistimed grant is silently vacuous here too.
+    (see below), so a mistimed grant is vacuous here too — logged, not
+    silent, and landlock_exec._add_path now prints the same signal for its
+    --writable list, so the two backends degrade equally loudly.
+
+    ALSO NOTE `--tmpfs /tmp` below: unlike the Landlock branch, which grants
+    the HOST /tmp blanket, this branch replaces /tmp with a fresh empty
+    tmpfs before binding anything. A CLAUDE_CONFIG_DIR under host /tmp is
+    therefore NOT reachable here just by living there — its pre-spawn
+    .credentials.json is invisible and its session JSONL lands in a tmpfs
+    the parent can never read. It must be named in writable_extras, which
+    is bound over the tmpfs. sandbox_guard._writable_roots excludes /tmp
+    from its containment roots for exactly this reason.
     """
     cmd = [
         'bwrap',

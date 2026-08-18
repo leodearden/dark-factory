@@ -392,6 +392,20 @@ producing a transcript-less stage. The stale claim in `landlock_exec.py`
 (~:20-23) is corrected in the same change, along with its twin in
 `sandbox.py`'s bwrap docstring.
 
+The containment roots are `<cwd>/.task` **plus each existing extra** — and
+pointedly **not** `/tmp` (amendment, 2026-08-18). Landlock grants the host
+`/tmp` blanket but `build_bwrap_command` mounts `--tmpfs /tmp` before its
+binds, so "under `/tmp`" denotes two different things per backend: a config
+dir there that is not *also* an explicit extra would lose its pre-spawn
+`.credentials.json` and write its session JSONL into a tmpfs the parent can
+never read — the 2026-07-18 defect reproduced while the check said PASS.
+Symmetrically, the "does this root exist?" filter applies to the **extras
+only**: both backends `makedirs` `<cwd>/.task` before granting it, so
+filtering it out would fail closed on a fresh cwd and — since
+`run_stage_via_cli` treats that as fatal — error every stage. That matters
+directly to open question 5, whose considered alternative is relocating the
+config dir under `<cwd>/.task/`.
+
 Credential isolation is **enforced by the ruleset**, not merely preserved
 by naming: it is the per-run grant plus the containment assertion that
 keep it, and the earlier framing — "nothing new is shared across runs —
@@ -557,9 +571,9 @@ does not exist today (corrected under η's Amendment finding 1).
   plus an empty-by-default config list, and the mismatch between the two
   was discovered by failure three weeks late; the containment assertion
   at `resolve_recon_sandbox_wrap` converts it to an enforced check) and
-  INV-4 `storm-escape-required` (the None-transcript degrade and the
-  cap-retry force-fresh both absorbed the same `PermissionError` with no
-  counter on either path; `note_unreadable_transcript` is the escape).
+  INV-4 `storm-escape-required` (the None-transcript degrade absorbed the
+  `PermissionError` with no rate, no bound and no signal;
+  `note_unreadable_transcript` is the escape — see the scope note below).
   Correcting the `landlock_exec.py` comment does **not** satisfy INV-1 —
   a corrected comment is still a prose contract, and the whole failure
   is that a comment cannot notice when it stops being true.
@@ -597,6 +611,31 @@ does not exist today (corrected under η's Amendment finding 1).
   >   indistinguishable from silence. That is exactly the fail-soft
   >   INV-4 exists to forbid, and it is what turned a one-line config
   >   defect into a three-week subsystem outage.
+  >
+  >   **SCOPE of the escape as built (amendment, 2026-08-18).**
+  >   `note_unreadable_transcript` is wired into the **watchdog poll
+  >   sites only** (`shared/src/shared/cli_invoke.py`, both
+  >   `count_transcript_turns() is None` branches). The **cap-retry
+  >   force-fresh** — the other consumer of the same unreadable
+  >   transcript — is deliberately NOT routed through it: that branch
+  >   already emits its own WARNING at the point of decision (*"capped
+  >   session … has no transcript under … — retrying FRESH"*), naming
+  >   the session it is about to drop. It is a one-shot decision rather
+  >   than a poll loop, so it has no streak to latch and needs no
+  >   escape; INV-4's checkable question is answered there by that
+  >   existing WARNING. Read the claim above as covering the watchdog
+  >   path — the one that was genuinely counterless AND silent.
+  >
+  >   The escape's gate is **wall-clock, not a poll count**: it fires at
+  >   the caller's `startup_grace_secs`, the budget already defined as
+  >   "how long before we may conclude something is wrong", and latches
+  >   once per crossing in the caller. A poll-count threshold was
+  >   rejected on amendment review: it denotes two unrelated durations
+  >   in the watchdog's two regimes (5 s vs 60 s per poll) and, in the
+  >   startup regime, would fire ~15 s after spawn — inside the MCP-init
+  >   window a healthy recon stage routinely spends before its first
+  >   record lands, i.e. it would emit the WARNING once on *every*
+  >   healthy invocation, which is how a warning gets tuned out.
 - θ: INV-2 (structured per-event evidence, observation separated from
   hypothesis — required by the polarity dispute it settles).
 - No leaf introduces an unbounded hold, a new prose contract, a

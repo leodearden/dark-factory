@@ -30,13 +30,11 @@ from shared.cli_invoke import (
     build_failure_message,
     classify_agent_failure,
     count_transcript_turns,
-    get_unreadable_transcript_escapes,
     invoke_claude_agent,
     invoke_with_cap_retry,
     is_timed_out_with_progress,
     is_zero_output_timeout,
     read_transcript_records,
-    reset_unreadable_transcript_escapes,
 )
 from shared.invocation_outcome import classify_invocation
 from shared.testing import make_gate_mock
@@ -4585,24 +4583,34 @@ class TestBackendForwarding:
 
 # ── INV-4: the unreadable-transcript storm escape, wiring half (task 4003) ────
 
+_ESCAPE_NEEDLE = 'Transcript UNREADABLE'
+
+
+def _escape_records(caplog):
+    """The storm-escape WARNINGs emitted during a driven watchdog run.
+
+    The WARNING is the product here: `note_unreadable_transcript` deliberately
+    keeps no process-wide counter (nothing in production read one), so the log
+    record IS the observable and the assertion is made on it directly.
+    """
+    return [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and _ESCAPE_NEEDLE in r.getMessage()
+    ]
+
 
 @pytest.mark.asyncio
 class TestUnreadableTranscriptEscapeWiring:
-    """The watchdog loop must COUNT its consecutive unreadable-transcript polls.
+    """The watchdog loop must surface an unreadable transcript, once, past grace.
 
     The unit half (test_transcript_unreadable_escape.py) pins the helper. This
-    pins that the loop actually calls it, with a CONSECUTIVE streak, and only
-    for roles configured to have a transcript.
+    pins that the loop actually calls it, gated on the SAME wall-clock grace the
+    startup kill uses, latched to one record per crossing, and only for roles
+    configured to have a transcript.
 
     The escape must not change any kill decision — "NEVER kill on None" stays
     exactly as it is. It only makes the degrade observable.
     """
-
-    @pytest.fixture(autouse=True)
-    def _reset_counter(self):
-        reset_unreadable_transcript_escapes()
-        yield
-        reset_unreadable_transcript_escapes()
 
     @staticmethod
     def _proc(run_secs: float = 0.25):
@@ -4629,7 +4637,17 @@ class TestUnreadableTranscriptEscapeWiring:
         proc.pid = 4003
         return proc
 
-    async def _drive(self, tmp_path, *, turns_side_effect, config_dir, session_id):
+    async def _drive(
+        self,
+        tmp_path,
+        *,
+        turns_side_effect,
+        config_dir,
+        session_id,
+        startup_grace_secs=0.0,
+        working_idle_secs=None,
+        absolute_cap_secs=None,
+    ):
         """Run the watchdog loop at millisecond cadence with a patched transcript read."""
         proc = self._proc()
 
@@ -4639,6 +4657,7 @@ class TestUnreadableTranscriptEscapeWiring:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.005),
+            patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.005),
             patch('shared.cli_invoke._WATCHDOG_MIN_POLL_SECS', 0.001),
             patch(
                 'shared.cli_invoke.count_transcript_turns',
@@ -4653,7 +4672,9 @@ class TestUnreadableTranscriptEscapeWiring:
                 timeout_seconds=30.0,
                 session_id=session_id,
                 config_dir=config_dir,
-                startup_grace_secs=30.0,
+                startup_grace_secs=startup_grace_secs,
+                working_idle_secs=working_idle_secs,
+                absolute_cap_secs=absolute_cap_secs,
             )
 
         # The process exited normally — no kill decision was taken, which is the
@@ -4661,69 +4682,112 @@ class TestUnreadableTranscriptEscapeWiring:
         assert result.timed_out is False, 'the escape must not change the kill decision'
         return mock_turns
 
-    async def test_streak_escape_fires_when_transcript_never_readable(self, tmp_path):
-        """A transcript that is never readable fires the escape exactly once.
+    async def test_escape_fires_once_when_transcript_never_readable(self, tmp_path, caplog):
+        """A transcript still unreadable past grace fires the escape exactly once.
 
         This is the test that would have fired on 2026-07-18. Every poll of every
-        recon stage read None for three weeks and nothing counted it.
+        recon stage read None for three weeks and nothing said so.
+
+        ONCE, not once per poll: a wedged invocation polls its transcript for the
+        whole of a long run, and one WARNING per poll would bury the very signal
+        this exists to raise. The caller owns that latch.
         """
-        mock_turns = await self._drive(
-            tmp_path,
-            turns_side_effect=lambda *a, **k: None,
-            config_dir=tmp_path / 'cfg',
-            session_id='sid',
-        )
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: None,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=0.0,
+            )
 
         assert mock_turns.call_count >= 3, (
-            f'harness must produce enough polls to cross the threshold; '
+            f'harness must produce several polls for "once" to mean anything; '
             f'got {mock_turns.call_count}'
         )
-        assert get_unreadable_transcript_escapes() == 1, (
-            f'an always-unreadable transcript must fire exactly one escape; '
-            f'got {get_unreadable_transcript_escapes()} over '
-            f'{mock_turns.call_count} polls'
+        records = _escape_records(caplog)
+        assert len(records) == 1, (
+            f'an always-unreadable transcript must fire exactly one escape over '
+            f'{mock_turns.call_count} polls; got {[r.getMessage() for r in records]}'
         )
 
-    async def test_no_escape_when_transcript_readable(self, tmp_path):
-        """A readable transcript never fires the escape."""
-        await self._drive(
-            tmp_path,
-            turns_side_effect=lambda *a, **k: 1,
-            config_dir=tmp_path / 'cfg',
-            session_id='sid',
-        )
+    async def test_no_escape_inside_grace(self, tmp_path, caplog):
+        """An unreadable transcript INSIDE the grace window is silent.
 
-        assert get_unreadable_transcript_escapes() == 0, (
-            f'a readable transcript must not fire; got {get_unreadable_transcript_escapes()}'
-        )
-
-    async def test_streak_resets_on_a_readable_read(self, tmp_path):
-        """The streak is CONSECUTIVE, not cumulative.
-
-        Alternates None/0 rather than None/1: a 0 keeps ``seen_turn`` False, so
-        the loop keeps reading every poll. (A 1 would latch ``seen_turn`` and
-        short-circuit all further reads, making the alternation untestable after
-        two polls.) Over dozens of polls a cumulative counter would cross the
-        threshold many times over; a consecutive one never crosses at all.
+        The gate is wall-clock, and this is the regime it exists to protect: the
+        session JSONL does not exist until the CLI writes its first record, and a
+        recon stage spawns with fused-memory + escalation MCP servers to
+        initialise first. A poll-count gate of 3 would fire ~15s after spawn and
+        so emit this WARNING once on every healthy invocation.
         """
-        alternating = itertools.cycle([None, 0])
-        mock_turns = await self._drive(
-            tmp_path,
-            turns_side_effect=lambda *a, **k: next(alternating),
-            config_dir=tmp_path / 'cfg',
-            session_id='sid',
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: None,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                # The driven run lasts ~0.25s; nothing may fire inside 30s.
+                startup_grace_secs=30.0,
+            )
+
+        assert mock_turns.call_count >= 3, (
+            f'harness must actually poll for this to mean anything; '
+            f'got {mock_turns.call_count}'
         )
+        records = _escape_records(caplog)
+        assert not records, (
+            f'no escape may fire inside grace over {mock_turns.call_count} polls; '
+            f'got {[r.getMessage() for r in records]}'
+        )
+
+    async def test_no_escape_when_transcript_readable(self, tmp_path, caplog):
+        """A readable transcript never fires the escape, even with grace at zero."""
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: 1,
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=0.0,
+            )
+
+        records = _escape_records(caplog)
+        assert not records, (
+            f'a readable transcript must not fire; got {[r.getMessage() for r in records]}'
+        )
+
+    async def test_latch_clears_on_a_readable_read(self, tmp_path, caplog):
+        """A relapse after a readable read is a NEW crossing and fires again.
+
+        Alternates None/1 with the progress extension engaged, so ``seen_turn``
+        latches on the first readable poll and the loop keeps reading every poll
+        via the extension branch (without the extension it would short-circuit
+        all further reads and the alternation would be untestable). The idle and
+        absolute bounds are far beyond the ~0.25s run, so no kill is in play.
+        """
+        alternating = itertools.cycle([None, 1])
+        with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+            mock_turns = await self._drive(
+                tmp_path,
+                turns_side_effect=lambda *a, **k: next(alternating),
+                config_dir=tmp_path / 'cfg',
+                session_id='sid',
+                startup_grace_secs=0.0,
+                working_idle_secs=30.0,
+                absolute_cap_secs=30.0,
+            )
 
         assert mock_turns.call_count >= 6, (
             f'need several alternations for this to mean anything; '
             f'got {mock_turns.call_count} polls'
         )
-        assert get_unreadable_transcript_escapes() == 0, (
-            f'an alternating streak never reaches the threshold; got '
-            f'{get_unreadable_transcript_escapes()} over {mock_turns.call_count} polls'
+        records = _escape_records(caplog)
+        assert len(records) >= 2, (
+            f'each relapse after a readable read is a new crossing; got '
+            f'{[r.getMessage() for r in records]} over {mock_turns.call_count} polls'
         )
 
-    async def test_no_escape_without_config_dir_or_session_id(self, tmp_path):
+    async def test_no_escape_without_config_dir_or_session_id(self, tmp_path, caplog):
         """A role with no transcript configured is out of scope and never fires.
 
         The watchdog never reads a transcript for such a role, so its Nones mean
@@ -4735,19 +4799,22 @@ class TestUnreadableTranscriptEscapeWiring:
             (tmp_path / 'cfg', None),
             (None, None),
         ):
-            reset_unreadable_transcript_escapes()
-            mock_turns = await self._drive(
-                tmp_path,
-                turns_side_effect=lambda *a, **k: None,
-                config_dir=config_dir,
-                session_id=session_id,
-            )
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+                mock_turns = await self._drive(
+                    tmp_path,
+                    turns_side_effect=lambda *a, **k: None,
+                    config_dir=config_dir,
+                    session_id=session_id,
+                    startup_grace_secs=0.0,
+                )
 
             assert mock_turns.call_count == 0, (
                 f'no transcript read is expected for config_dir={config_dir!r} '
                 f'session_id={session_id!r}; got {mock_turns.call_count} calls'
             )
-            assert get_unreadable_transcript_escapes() == 0, (
+            records = _escape_records(caplog)
+            assert not records, (
                 f'must not fire for config_dir={config_dir!r} session_id={session_id!r}; '
-                f'got {get_unreadable_transcript_escapes()}'
+                f'got {[r.getMessage() for r in records]}'
             )

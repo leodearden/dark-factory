@@ -94,7 +94,6 @@ class TestModuleLevelAll:
             'count_transcript_turns',
             'detect_ended_awaiting_background',
             'ended_awaiting_background_for_session',
-            'get_unreadable_transcript_escapes',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
             'is_cli_invocation_rejected',
@@ -104,7 +103,6 @@ class TestModuleLevelAll:
             'note_unreadable_transcript',
             'read_transcript_records',
             'require_non_blank_prompt',
-            'reset_unreadable_transcript_escapes',
             'transcript_exists',
         }
 

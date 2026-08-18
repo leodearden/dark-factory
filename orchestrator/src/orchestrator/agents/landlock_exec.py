@@ -39,9 +39,13 @@ That check exists because the obligation was silently unmet once: from
 2026-07-18 (task 2744) to 2026-08-11 (task 4003), recon's config dir lived under
 ``<data_dir>/recon-config/`` — outside every writable path above — so every
 reconciliation stage was told where to write its transcript and then denied the
-write. Zero transcripts, for three weeks, with no error. ``_add_path`` returns
-SILENTLY for a path that does not exist, so a wrong or missing grant produces no
-signal at this layer at all; the caller must verify.
+write. Zero transcripts, for three weeks, with no error. ``_add_path`` still
+SKIPS a path that does not exist — it has no fd to open — but it no longer does
+so silently for a ``--writable`` grant: it prints to stderr, matching what
+``build_bwrap_command`` already logs, so the same missing grant degrades equally
+loudly whichever backend the host kernel selects. A grant that is present but
+WRONG still produces no signal here, so the caller must verify (as
+``sandbox_guard`` does).
 """
 
 from __future__ import annotations
@@ -123,8 +127,39 @@ def _die(label: str) -> None:
     sys.exit(2)
 
 
-def _add_path(libc, ruleset_fd: int, path: str, allowed: int) -> None:
+def _add_path(
+    libc,
+    ruleset_fd: int,
+    path: str,
+    allowed: int,
+    *,
+    warn_if_missing: bool = False,
+) -> None:
+    """Add a path-beneath rule, skipping a path that is not an existing dir.
+
+    The skip is unavoidable — ``landlock_add_rule`` needs an O_PATH fd, so there
+    is nothing to open for a path that does not exist — but it must not be
+    SILENT for a caller-supplied grant. ``build_bwrap_command`` logs a WARNING
+    naming the dropped extra (sandbox.py); this backend said nothing at all, so
+    the same missing grant (e.g. ``~/.claude/fleet`` on first run, computed by
+    ``write_set.compute_write_set`` but never created) degraded loudly under one
+    backend and invisibly under the other. Whichever backend wins resolution is
+    an accident of the host kernel; the operator signal must not be.
+
+    ``warn_if_missing`` is opt-in so the built-in grants (``/``, ``/dev``,
+    ``/tmp``) stay quiet: they are unconditional, always present, and a warning
+    for them would be noise. Callers pass it for the ``--writable`` list, whose
+    members come from outside this module.
+    """
     if not os.path.isdir(path):
+        if warn_if_missing:
+            print(
+                f'landlock_exec: --writable {path} is not an existing directory '
+                f'— NOT granting it. Whatever needed to write there will be '
+                f'denied by the kernel. (A grant issued before the directory is '
+                f'created is vacuous; create it first, then wrap.)',
+                file=sys.stderr,
+            )
         return
     fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
     try:
@@ -200,9 +235,11 @@ def main(argv: list[str] | None = None) -> int:
     # /tmp only — avoid /var/tmp so worktrees placed there stay restricted.
     _add_path(libc, ruleset_fd, '/tmp', fs_writable_all)
 
-    # Per-invocation writable paths (locked modules, .task, extras)
+    # Per-invocation writable paths (locked modules, .task, extras).
+    # warn_if_missing=True: these come from the caller, so a missing one is a
+    # lost grant the caller needs to hear about — see `_add_path`.
     for path in ns.writable:
-        _add_path(libc, ruleset_fd, path, fs_writable_all)
+        _add_path(libc, ruleset_fd, path, fs_writable_all, warn_if_missing=True)
 
     if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
         _die('prctl(NO_NEW_PRIVS)')

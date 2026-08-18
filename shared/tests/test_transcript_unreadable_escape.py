@@ -1,21 +1,30 @@
 """The None-transcript storm escape — INV-4 ``storm-escape-required`` (task 4003).
 
 ``count_transcript_turns`` returns None when the transcript cannot be read, and
-both consumers absorb that None by design: the liveness watchdog refuses to kill
-on it ("NEVER kill on None — conservative degrade") and the cap-retry veto
-force-freshes instead of resuming.  Both fail-softs were COUNTERLESS.
+the liveness watchdog absorbs that None by design: it refuses to kill on it
+("NEVER kill on None — conservative degrade"). That fail-soft was SILENT.
 
-That is how a real defect ran silently for three weeks.  From 2026-07-18 (task
-2744) to 2026-08-11 (task 4003) every reconciliation stage had its
-``CLAUDE_CONFIG_DIR`` outside the sandbox writable set, so no transcript was
-ever written; every read returned None; the watchdog went inert and every
-cap-retry force-freshed.  Nothing logged, nothing counted, nothing escalated.
+That is how a real defect ran for three weeks. From 2026-07-18 (task 2744) to
+2026-08-11 (task 4003) every reconciliation stage had its ``CLAUDE_CONFIG_DIR``
+outside the sandbox writable set, so no transcript was ever written; every read
+returned None; the watchdog went inert. Nothing logged, nothing escalated.
 
-``note_unreadable_transcript`` is the escape: a counted, once-per-crossing
-WARNING for an invocation that was configured WITH both ``config_dir`` and
-``session_id`` — i.e. a role that is SUPPOSED to have a transcript.  It counts
-rather than kills, deliberately: the conservative degrade stays, it just stops
-being silent.
+``note_unreadable_transcript`` is the escape: an actionable WARNING for an
+invocation that was configured WITH both ``config_dir`` and ``session_id`` —
+i.e. a role that is SUPPOSED to have a transcript. It logs rather than kills,
+deliberately: the conservative degrade stays, it just stops being silent.
+
+SCOPE. This covers the WATCHDOG path. The cap-retry force-fresh is the other
+consumer of the same unreadable transcript, and it is NOT routed through here:
+it already emits its own WARNING at the point of decision ("capped session ...
+has no transcript under ... — retrying FRESH"). It is a one-shot decision
+rather than a poll loop, so it has no streak to latch and needs no escape.
+
+The gate is WALL-CLOCK, not a poll count: it fires at the caller's
+``startup_grace_secs``, the budget already defined as "how long before we may
+conclude something is wrong". A poll count would mean two different durations in
+the watchdog's two regimes, and ~15s in the startup regime — inside the MCP-init
+window a healthy stage routinely spends before its first record lands.
 """
 
 from __future__ import annotations
@@ -24,142 +33,103 @@ import logging
 
 import pytest
 
-from shared.cli_invoke import (
-    _WATCHDOG_UNREADABLE_STREAK_THRESHOLD,
-    get_unreadable_transcript_escapes,
-    note_unreadable_transcript,
-    reset_unreadable_transcript_escapes,
-)
+from shared.cli_invoke import note_unreadable_transcript
 
-_THRESHOLD = _WATCHDOG_UNREADABLE_STREAK_THRESHOLD
+_GRACE = 120.0
 
 
-@pytest.fixture(autouse=True)
-def _reset_counter():
-    """The counter is process-wide, so every test must start from a known zero."""
-    reset_unreadable_transcript_escapes()
-    yield
-    reset_unreadable_transcript_escapes()
-
-
-def _note(streak: int, *, session_id: str = 'sid') -> bool:
+def _note(elapsed, *, grace = _GRACE, session_id = 'sid'):
     return note_unreadable_transcript(
-        streak,
+        elapsed,
+        grace_secs=grace,
         config_dir='/tmp/cfg-x',
         session_id=session_id,
         label='Reconciliation stage (test)',
     )
 
 
-def test_below_threshold_is_silent(caplog):
-    """Streaks below the threshold neither fire nor log.
+def test_inside_grace_is_silent(caplog):
+    """An unreadable transcript inside the grace window neither fires nor logs.
 
-    A transcript that is briefly unreadable is normal — the file does not exist
-    until the CLI's first write. Firing on streak 1 would make this a log storm
-    on every healthy invocation, which is how a warning gets tuned out.
+    A transcript that does not exist yet is NORMAL: the file appears only on the
+    CLI's first write, and a recon stage spawns with fused-memory + escalation
+    MCP servers to initialise first. Firing during that window would emit the
+    WARNING once on every healthy invocation, which is how a warning gets tuned
+    out — the precise failure mode this escape exists to avoid.
     """
     with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
-        for streak in range(1, _THRESHOLD):
-            assert _note(streak) is False, (
-                f'streak {streak} < threshold {_THRESHOLD} must not fire'
+        for elapsed in (0.0, 1.0, _GRACE / 2, _GRACE - 0.001):
+            assert _note(elapsed) is False, (
+                f'elapsed {elapsed} < grace {_GRACE} must not fire'
             )
 
-    assert get_unreadable_transcript_escapes() == 0, (
-        f'counter must stay 0 below threshold; got {get_unreadable_transcript_escapes()}'
-    )
     assert not caplog.records, (
-        f'no WARNING may be emitted below threshold; got {[r.message for r in caplog.records]}'
+        f'no WARNING may be emitted inside grace; got {[r.message for r in caplog.records]}'
     )
 
 
-def test_crossing_threshold_fires_once(caplog):
-    """Crossing the threshold fires exactly one actionable WARNING."""
+def test_at_grace_fires_one_actionable_warning(caplog):
+    """Reaching the grace bound fires exactly one actionable WARNING.
+
+    The bound is inclusive: it is the same instant at which the watchdog would
+    have killed on an explicit 0-turn read, so an unreadable transcript there is
+    a defect rather than patience.
+    """
     with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
         fired = note_unreadable_transcript(
-            _THRESHOLD,
+            _GRACE,
+            grace_secs=_GRACE,
             config_dir='/tmp/cfg-x',
             session_id='sid-abc',
             label='Reconciliation stage (test)',
         )
 
-    assert fired is True, f'streak == threshold ({_THRESHOLD}) must fire'
-    assert get_unreadable_transcript_escapes() == 1, (
-        f'counter must be 1 after one crossing; got {get_unreadable_transcript_escapes()}'
-    )
+    assert fired is True, f'elapsed == grace ({_GRACE}) must fire'
 
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1, (
-        f'exactly one WARNING per crossing; got {[r.message for r in warnings]}'
+        f'exactly one WARNING per call past the bound; got {[r.message for r in warnings]}'
     )
     msg = warnings[0].getMessage()
     # The escape must be actionable without a code read: which config dir,
-    # which session, which invocation.
-    for needle in ('/tmp/cfg-x', 'sid-abc', 'Reconciliation stage (test)'):
+    # which session, which invocation, and how long it has been wrong.
+    for needle in ('/tmp/cfg-x', 'sid-abc', 'Reconciliation stage (test)', '120.0'):
         assert needle in msg, f'WARNING must name {needle!r}; got {msg!r}'
 
 
-def test_above_threshold_does_not_re_fire(caplog):
-    """One fire per CROSSING, not per poll — this is what keeps it out of storm class.
+def test_past_grace_fires_because_the_latch_is_the_callers(caplog):
+    """The helper is STATELESS — every call past the bound fires.
 
-    A wedged invocation polls its transcript for the whole of a long run. Firing
-    on every poll above the threshold would emit hundreds of identical records
-    and bury the signal; that is the failure mode this helper exists to avoid,
-    so re-firing would be self-defeating.
+    This is a contract, not an oversight: the once-per-crossing latch lives in
+    the caller (``_run_subprocess``'s ``unreadable_escape_fired``) so that two
+    concurrent invocations in one process cannot silence each other, which a
+    module-global latch would allow. The wiring half
+    (``test_cli_invoke.py::TestUnreadableTranscriptEscapeWiring``) pins that the
+    real caller does latch, so a wedged run emits ONE record and not hundreds.
     """
-    assert _note(_THRESHOLD) is True
-    assert get_unreadable_transcript_escapes() == 1
-
-    # Drop the record from the crossing above: caplog accumulates for the whole
-    # test, and this block asserts that NO FURTHER record is emitted.
-    caplog.clear()
-
     with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
-        for streak in range(_THRESHOLD + 1, _THRESHOLD + 6):
-            assert _note(streak) is False, (
-                f'streak {streak} > threshold must not re-fire'
-            )
+        for elapsed in (_GRACE, _GRACE + 1.0, _GRACE * 10):
+            assert _note(elapsed) is True, f'elapsed {elapsed} >= grace must fire'
 
-    assert get_unreadable_transcript_escapes() == 1, (
-        f'counter must stay at 1 above threshold; got {get_unreadable_transcript_escapes()}'
-    )
-    assert not caplog.records, (
-        f'no further WARNING above threshold; got {[r.message for r in caplog.records]}'
-    )
-
-    # A streak that resets to 0 and climbs again IS a new crossing, and fires.
-    assert _note(0) is False, 'a reset streak must not fire'
-    assert _note(_THRESHOLD) is True, 'a second crossing must fire again'
-    assert get_unreadable_transcript_escapes() == 2, (
-        f'a second crossing must count; got {get_unreadable_transcript_escapes()}'
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 3, (
+        f'the helper itself does not latch — every call past the bound logs; '
+        f'got {[r.message for r in warnings]}'
     )
 
 
-def test_counter_is_process_wide_and_resettable():
-    """The counter aggregates across invocations and resets cleanly for tests."""
-    assert _note(_THRESHOLD, session_id='sid-1') is True
-    assert _note(_THRESHOLD, session_id='sid-2') is True
-    assert get_unreadable_transcript_escapes() == 2, (
-        f'two crossings on distinct sessions must accumulate; '
-        f'got {get_unreadable_transcript_escapes()}'
-    )
+@pytest.mark.parametrize('grace', [0.0, 5.0, 600.0])
+def test_bound_is_the_callers_grace_not_a_constant_of_its_own(grace, caplog):
+    """The escape has no threshold of its own — it tracks whatever grace it is given.
 
-    reset_unreadable_transcript_escapes()
-    assert get_unreadable_transcript_escapes() == 0, (
-        f'reset must return the counter to 0; got {get_unreadable_transcript_escapes()}'
-    )
-
-
-def test_threshold_constant_is_small_and_positive():
-    """The threshold must be a small positive int — a guard against a silent retune.
-
-    A future edit setting this to 0 (fires on every healthy poll) or to something
-    huge (never fires within a real invocation's lifetime) would restore the
-    silence this task removed, in one line and without touching a test.
+    A per-role ``startup_grace_secs`` is the whole point: a role with a long
+    grace is one we are willing to wait longer for, and the escape must inherit
+    that patience rather than second-guess it from a poll count that means a
+    different duration in each watchdog regime.
     """
-    assert isinstance(_WATCHDOG_UNREADABLE_STREAK_THRESHOLD, int), (
-        f'threshold must be an int; got {type(_WATCHDOG_UNREADABLE_STREAK_THRESHOLD)}'
-    )
-    assert 1 <= _WATCHDOG_UNREADABLE_STREAK_THRESHOLD <= 10, (
-        f'threshold must be in [1, 10] to fire within a real invocation without '
-        f'storming; got {_WATCHDOG_UNREADABLE_STREAK_THRESHOLD}'
-    )
+    with caplog.at_level(logging.WARNING, logger='shared.cli_invoke'):
+        just_under = _note(max(grace - 0.001, 0.0) if grace else -1.0, grace=grace)
+        at_bound = _note(grace, grace=grace)
+
+    assert just_under is False, f'below grace={grace} must not fire'
+    assert at_bound is True, f'at grace={grace} must fire'

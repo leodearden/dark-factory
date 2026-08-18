@@ -68,11 +68,13 @@ _WATCHDOG_MIN_POLL_SECS = 0.01
 # Still floored by _WATCHDOG_MIN_POLL_SECS and clamped by time-to-idle-kill /
 # time-to-absolute-cap so a kill boundary is never overshot by a full poll.
 _WATCHDOG_WORKING_POLL_SECS = 60.0
-# Consecutive unreadable-transcript polls before the storm escape fires (task 4003).
-# Small enough to fire well inside a real invocation, large enough that the
-# ordinary startup window — where the transcript legitimately does not exist yet
-# because the CLI has not written its first record — never trips it.
-_WATCHDOG_UNREADABLE_STREAK_THRESHOLD = 3
+# The unreadable-transcript storm escape (task 4003) has no constant of its own:
+# it fires on wall-clock, at the caller's `startup_grace_secs`, which is already
+# defined as "how long before we may conclude something is wrong".  A poll-count
+# threshold would mean two unrelated durations in the two regimes above (5s vs
+# 60s per poll) and, in the startup regime, would fire ~15s after spawn — inside
+# the MCP-init window a healthy stage routinely spends before the CLI writes its
+# first record.  See `note_unreadable_transcript`.
 # Per-caller cap-wait policy (post-1365 audit, task 1401)
 # ─────────────────────────────────────────────────────────────────────────────
 # _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
@@ -190,7 +192,6 @@ __all__ = [
     'count_transcript_turns',
     'detect_ended_awaiting_background',
     'ended_awaiting_background_for_session',
-    'get_unreadable_transcript_escapes',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
     'is_cli_invocation_rejected',
@@ -200,7 +201,6 @@ __all__ = [
     'note_unreadable_transcript',
     'read_transcript_records',
     'require_non_blank_prompt',
-    'reset_unreadable_transcript_escapes',
     'transcript_exists',
 ]
 
@@ -472,33 +472,17 @@ def count_transcript_turns(
     return sum(1 for r in records if r.get('type') == 'assistant')
 
 
-# Process-wide count of storm escapes fired (task 4003).  A plain module global
-# with an explicit `global` statement is sufficient — the watchdog runs on the
-# event loop thread, so there is no cross-thread race to lock against.
-_unreadable_transcript_escapes = 0
-
-
-def get_unreadable_transcript_escapes() -> int:
-    """Number of unreadable-transcript storm escapes fired in this process."""
-    return _unreadable_transcript_escapes
-
-
-def reset_unreadable_transcript_escapes() -> None:
-    """Reset the escape counter (test isolation)."""
-    global _unreadable_transcript_escapes
-    _unreadable_transcript_escapes = 0
-
-
 def note_unreadable_transcript(
-    streak: int,
+    elapsed_secs: float,
     *,
+    grace_secs: float,
     config_dir: object,
     session_id: str,
     label: str,
 ) -> bool:
     """Escape hatch for the silent ``count_transcript_turns() is None`` degrade.
 
-    THIS COUNTS; IT DOES NOT KILL.  The conservative degrade it observes is
+    THIS LOGS; IT DOES NOT KILL.  The conservative degrade it observes is
     correct and stays exactly as it is — the watchdog must never kill on an
     unreadable transcript, because "unreadable" is indistinguishable from
     "not written yet".  What was wrong was that it ran *silently*.
@@ -508,14 +492,33 @@ def note_unreadable_transcript(
     stage had its ``CLAUDE_CONFIG_DIR`` outside the sandbox writable set, so the
     CLI could never write a transcript; every poll read None; the liveness
     watchdog degraded to inert and every cap-retry force-freshed instead of
-    resuming.  Two independent fail-softs absorbed the same PermissionError and
-    neither incremented anything, so there was no signal to notice.
+    resuming, and neither fail-soft said anything the operator could see.
 
-    Fires EXACTLY ONCE per crossing (``streak == threshold``), never on every
-    poll above it — a wedged invocation polls its transcript for the whole of a
-    long run, and one WARNING per poll would bury the very signal this exists to
-    raise.  A readable transcript resets the caller's streak, so a later relapse
-    is a new crossing and fires again.
+    SCOPE — this covers the WATCHDOG path only.  The cap-retry force-fresh is
+    the OTHER consumer of the same unreadable transcript, but it is not routed
+    through here: it already emits its own WARNING at the point of decision
+    ("capped session ... has no transcript under ... — retrying FRESH"), which
+    names the session it is about to drop.  It is a one-shot decision, not a
+    poll loop, so it has no streak to latch and needs no escape; do not read
+    this helper as covering it.
+
+    WALL-CLOCK, NOT POLL COUNT.  The bound is ``grace_secs`` — the caller's
+    existing "how long before we may conclude something is wrong" budget — and
+    NOT a number of polls.  A poll count means two unrelated durations in the
+    watchdog's two regimes (``_WATCHDOG_POLL_SECS`` = 5 s vs
+    ``_WATCHDOG_WORKING_POLL_SECS`` = 60 s), and in the startup regime three
+    polls is ~15 s after spawn, which a healthy recon stage routinely spends on
+    MCP server init before the CLI lays down its first record.  That would fire
+    the WARNING once on every healthy invocation — exactly the "tuned out"
+    failure mode this exists to avoid.
+
+    STATELESS BY DESIGN — the caller owns the once-per-crossing latch.  Every
+    call at or past the bound fires, so a caller that invokes this on every poll
+    of a long wedged run WILL storm; ``_run_subprocess`` latches a local
+    ``unreadable_escape_fired`` and clears it on any readable read, so a later
+    relapse is a new crossing and fires again.  The latch is deliberately not a
+    module global: a global would make concurrent invocations in one process
+    silence each other.
 
     Scope: only invocations configured with BOTH ``config_dir`` and
     ``session_id`` reach here, i.e. roles that are SUPPOSED to have a
@@ -523,27 +526,27 @@ def note_unreadable_transcript(
     mean nothing.  (Both call sites are already inside branches requiring them,
     so no additional guard is needed here.)
 
-    Deliberately a counter plus a log rather than an escalation call: ``shared``
-    sits at the bottom of the dependency stack and must not take an import edge
-    on the escalation client.
+    Deliberately a log rather than an escalation call: ``shared`` sits at the
+    bottom of the dependency stack and must not take an import edge on the
+    escalation client.
 
     Args:
-        streak: Number of CONSECUTIVE unreadable polls, including this one.
+        elapsed_secs: Seconds since the watchdog started for this invocation.
+        grace_secs: The bound past which an unreadable transcript is a defect
+            rather than patience (``_run_subprocess`` passes its
+            ``startup_grace_secs``).
         config_dir: The ``CLAUDE_CONFIG_DIR`` the transcript was expected under.
         session_id: The session whose transcript could not be read.
         label: The invocation label (which agent/model), for the log line.
 
     Returns:
-        True if this call fired the escape, False otherwise.
+        True if this call fired the escape, False if it is still inside grace.
     """
-    global _unreadable_transcript_escapes
-
-    if streak != _WATCHDOG_UNREADABLE_STREAK_THRESHOLD:
+    if elapsed_secs < grace_secs:
         return False
 
-    _unreadable_transcript_escapes += 1
     logger.warning(
-        'Transcript UNREADABLE for %d consecutive watchdog polls — '
+        'Transcript UNREADABLE %.1fs after spawn (grace=%.1fs) — '
         'label=%s session_id=%s config_dir=%s. This invocation was configured '
         'with both config_dir and session_id, so it is SUPPOSED to have a '
         'transcript; an unreadable one means the transcript is not being '
@@ -555,7 +558,8 @@ def note_unreadable_transcript(
         '2026-07-18 -> 2026-08-11, where the per-run CLAUDE_CONFIG_DIR sat '
         'outside the sandbox writable set (task 4003). Check that config_dir '
         'is inside the sandbox writable set and that the path exists.',
-        streak,
+        elapsed_secs,
+        grace_secs,
         label,
         session_id,
         config_dir,
@@ -2882,12 +2886,15 @@ async def _run_subprocess(
             # updated together whenever a later poll observes MORE turns.
             last_progress_turns: int | None = None
             last_progress_monotonic: float | None = None
-            # CONSECUTIVE unreadable-transcript polls (task 4003).  Reset by any
-            # successful read, so a transcript that is briefly unreadable — the
-            # normal startup window, before the CLI writes its first record —
-            # never accumulates toward the escape.  Only a transcript that is
-            # never readable does.
-            unreadable_streak = 0
+            # Once-per-crossing latch for the unreadable-transcript storm escape
+            # (task 4003).  `note_unreadable_transcript` is stateless and fires on
+            # EVERY call past the grace bound, so the latch is what keeps a wedged
+            # invocation — which polls its transcript for the whole of a long run —
+            # to a single WARNING.  Cleared by any successful read, so a transcript
+            # that goes unreadable again later is a new crossing and fires again.
+            # Local, not a module global: two concurrent invocations in one process
+            # must not silence each other.
+            unreadable_escape_fired = False
 
             comm_task = asyncio.ensure_future(proc.communicate(input=stdin_data))
 
@@ -2977,15 +2984,16 @@ async def _run_subprocess(
                 if not seen_turn and config_dir and session_id:
                     n = count_transcript_turns(config_dir, session_id)
                     if n is None:
-                        unreadable_streak += 1
-                        note_unreadable_transcript(
-                            unreadable_streak,
-                            config_dir=config_dir,
-                            session_id=session_id,
-                            label=model,
-                        )
+                        if not unreadable_escape_fired:
+                            unreadable_escape_fired = note_unreadable_transcript(
+                                time.monotonic() - watchdog_start,
+                                grace_secs=startup_grace_secs,
+                                config_dir=config_dir,
+                                session_id=session_id,
+                                label=model,
+                            )
                     else:
-                        unreadable_streak = 0
+                        unreadable_escape_fired = False
                         live_turns = n
                         if n >= 1:
                             seen_turn = True
@@ -2994,15 +3002,16 @@ async def _run_subprocess(
                 elif extension_engaged and config_dir and session_id:
                     n = count_transcript_turns(config_dir, session_id)
                     if n is None:
-                        unreadable_streak += 1
-                        note_unreadable_transcript(
-                            unreadable_streak,
-                            config_dir=config_dir,
-                            session_id=session_id,
-                            label=model,
-                        )
+                        if not unreadable_escape_fired:
+                            unreadable_escape_fired = note_unreadable_transcript(
+                                time.monotonic() - watchdog_start,
+                                grace_secs=startup_grace_secs,
+                                config_dir=config_dir,
+                                session_id=session_id,
+                                label=model,
+                            )
                     else:
-                        unreadable_streak = 0
+                        unreadable_escape_fired = False
                         if last_progress_turns is None or n > last_progress_turns:
                             last_progress_turns = n
                             last_progress_monotonic = time.monotonic()
@@ -3016,10 +3025,12 @@ async def _run_subprocess(
 
                 # Startup-regime kill: explicit 0-turn read AND grace expired.
                 # NEVER kill on None (unreadable transcript) — conservative degrade.
-                # That degrade is now COUNTED (note_unreadable_transcript, above):
-                # a role configured WITH config_dir and session_id is supposed to
-                # HAVE a transcript, so one that is never readable is a defect,
-                # not patience.  The comment alone was not enough — it was correct
+                # That degrade is now LOGGED (note_unreadable_transcript, above)
+                # once the SAME startup_grace_secs bound this kill uses has
+                # passed: a role configured WITH config_dir and session_id is
+                # supposed to HAVE a transcript, so one still unreadable at the
+                # point we would have killed on an explicit 0 is a defect, not
+                # patience.  The comment alone was not enough — it was correct
                 # and present the whole time recon's per-run CLAUDE_CONFIG_DIR sat
                 # outside the sandbox writable set (2026-07-18 -> 2026-08-11, task
                 # 4003), during which this branch degraded to inert on every poll
