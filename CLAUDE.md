@@ -142,6 +142,7 @@ correct, and knowing which you are in is the whole point of asking.
 - **Decisions made** — immediately, don't wait until session end
 - **Conventions discovered** — coding patterns, naming rules, project norms
 - **Session end** — reflect and write observations, summaries of what was accomplished
+- **Tagging a write** — `add_memory` takes an optional `metadata` dict with five reserved keys: `topic`, `canonical`, `kind`, `parent_id`, `supersedes`. Any other key warns to a census line unless you prefix it `x_`. `fused-memory/src/fused_memory/memory_metadata.py` is the single normative source for their shapes and rules (contract: `docs/prds/memory-metadata-vocabulary.md` V1) — read it there rather than from a summary.
 - **Before writing a gotcha-class `procedural_knowledge` entry** — `search()` first for existing coverage; if a near-duplicate already exists, consolidate into/update it instead of writing a new one. (`fused-memory/scripts/audit_duplicate_memories.py` is the automated backstop sweep for whatever slips through.) `add_memory` now ENFORCES this at write time: a `procedural_knowledge` write matching an existing entry at high similarity is soft-blocked; override with `metadata={'allow_near_duplicate': True}` only for genuinely distinct content.
 
 ### Write operations

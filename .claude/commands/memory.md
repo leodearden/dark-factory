@@ -81,6 +81,25 @@ add_memory(
 )
 ```
 
+### Metadata vocabulary
+
+`add_memory` also takes an optional `metadata` dict. Five keys are reserved and
+validated on write:
+
+- `topic` — kebab-case slug naming the subject; groups every entry about it
+- `canonical` — the one authoritative entry for a topic (requires `topic`)
+- `kind` — record type, from a closed registry; not `source`, which is writer provenance
+- `parent_id` — UUID of a live entry this one attaches to
+- `supersedes` — list of UUIDs this entry replaces
+
+Any other key still writes but warns to a census line; prefix a deliberate
+annotation `x_` and it passes silently.
+
+The exact shapes, validation rules and the kind registry itself live in
+`fused-memory/src/fused_memory/memory_metadata.py` — the single normative
+source. Consult it rather than this summary; the contract is
+`docs/prds/memory-metadata-vocabulary.md` (V1).
+
 ### `add_episode` — for raw content needing extraction (5-15 LLM calls)
 
 Use sparingly. Appropriate when you have a block of unstructured content (conversation transcript, meeting notes, design discussion) that contains multiple facts the system should extract.
