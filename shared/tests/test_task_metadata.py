@@ -2226,6 +2226,75 @@ class TestParseMetadataFailurePolicy:
             f'in the census; got warnings: {warnings}'
         )
 
+    def test_execution_class_metadata_key_is_blessed(self):
+        """The recon-stage execution-class discriminator must not census-warn (task 3780).
+
+        `execution_class` is MACHINE-read by live guards at the fused-memory
+        submit boundary and carries real dispatch consequences — most sharply
+        `fused_memory.middleware.operational_routing_guard`, which coerces an
+        `operational`/`decision` record to `task_kind='deterministic'` +
+        `always_escalates`. That is exactly the profile
+        docs/task-authoring.md §8 "Promoting a convention" prescribes blessing
+        for: a load-bearing, stable, machine-written convention with live code
+        readers. The point-in-time census behind the ruling is transcribed
+        ONCE, beside the frozenset entry in shared/src/shared/task_metadata.py,
+        and deliberately not restated here — a measurement kept in three
+        places ages into two stale copies.
+
+        Blessed rather than promoted to a typed field, which is the non-obvious
+        half: the note on `operational_mode` in shared/src/shared/task_metadata.py
+        already records that `execution_class` is "validated only by a
+        fused-memory guard conditional on recon-stage caller identity — logic a
+        pydantic field validator cannot express", and contrasts `operational_mode`
+        as the caller-INDEPENDENT rule a plain typed `Literal` can carry.
+
+        RED until 'execution_class' is added to _BLESSED_METADATA_KEYS.
+        """
+        # (a) The census leg — the only leg RED at base.
+        _, warnings = parse_metadata({'execution_class': 'code_tdd'}, direction='read')
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'execution_class'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for execution_class; got: {offending}'
+        )
+
+        # (b) An allowlist entry, NOT a typed Literal — a difference that is
+        # load-bearing rather than stylistic. Tasks 3623 and 3624 (both `done`,
+        # both carrying `done_provenance`) really do carry the
+        # out-of-vocabulary value 'implementation', outside
+        # recon_self_model.EXECUTION_CLASSES ('code_tdd', 'operational',
+        # 'decision'). Under direction='write', enforce=True the parser RAISES
+        # on malformed input, so a future well-meaning promotion to a typed
+        # Literal would block EVERY metadata write to those two tasks — and
+        # they are unrepairable until task 3777 lifts the presence-only
+        # write-authority floor on done_provenance. Accepting the value here is
+        # not laxity: value validation for recon-stage callers correctly lives
+        # in fused_memory.middleware.execution_class_guard.execution_class_error
+        # at the submit boundary, which can see the caller identity the rule is
+        # conditional on.
+        model, write_warnings = parse_metadata(
+            {'execution_class': 'implementation'}, direction='write', enforce=True
+        )
+        invalid_field_warnings = [w for w in write_warnings if w.code == 'invalid_field']
+        assert invalid_field_warnings == [], (
+            'execution_class must not be value-validated by the parser (tasks '
+            f'3623/3624 carry \'implementation\'); got: {invalid_field_warnings}'
+        )
+
+        # (c) Round-trip preservation (I1): re-emitted verbatim, and living in
+        # model_extra — i.e. still an extra='allow' key, not a typed field.
+        assert model.model_dump()['execution_class'] == 'implementation'
+        assert (model.model_extra or {}).get('execution_class') == 'implementation', (
+            'execution_class must stay an extra=\'allow\' key, not become a typed field'
+        )
+
+        # (d) No-noise: an absent execution_class contributes no key to the
+        # dump. This is the documented rationale for Tier-A being an allowlist
+        # rather than a wall of typed Optional fields (docs/task-authoring.md §8).
+        empty_model, _ = parse_metadata({}, direction='read')
+        assert 'execution_class' not in empty_model.model_dump()
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)
