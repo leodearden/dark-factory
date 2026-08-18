@@ -395,6 +395,7 @@ _RECON_REPORT_PLACEHOLDERS = {
 # deregistered upstream) cannot break rendering either.
 _GUIDANCE_TOOL_ORDER = (
     'add_finding',
+    'delete_finding',
     'cite_entity',
     'cite_edge',
     'cite_task',
@@ -404,6 +405,21 @@ _GUIDANCE_TOOL_ORDER = (
     'inc_stat',
     'complete',
 )
+
+# The citation tools share ONE lead-in sentence introducing them as a list.
+# It is emitted immediately before whichever of them renders FIRST (rather
+# than being welded onto add_finding's paragraph, where it used to live), so
+# inserting delete_finding between filing and citing does not strand a
+# colon-terminated 'Then attach typed citations:' in front of unrelated prose
+# — and so the lead-in disappears entirely if no citation tool is present.
+_GUIDANCE_CITATION_GROUP = (
+    'cite_entity',
+    'cite_edge',
+    'cite_task',
+    'cite_memory',
+    'cite_run',
+)
+_GUIDANCE_CITATIONS_LEAD_IN = 'Then attach typed citations:\n'
 
 # set_stat and inc_stat share ONE sentence because they are ALTERNATIVES ("use
 # X or Y"), not successive steps like the rest of the narrative. They render as
@@ -433,8 +449,19 @@ _GUIDANCE_PREAMBLE = (
 # every stage prompt at once; delete it and a stage silently loses the rule.
 _GUIDANCE_TOOL_PROSE: dict[str, str] = {
     'add_finding': (
-        'For each finding, call `{call}` and capture the `finding_id` from the response.'
-        ' Then attach typed citations:\n'
+        'For each finding, call `{call}` and capture the `finding_id` from the'
+        ' response. '
+    ),
+    'delete_finding': (
+        'To retract a finding you filed in error, call `{call}` — IRREVERSIBLE, and'
+        ' scoped by run_id + finding_id. It is rejected once that finding\'s OWNING'
+        ' stage entry has been completed, so retraction is for in-progress stages'
+        ' only: because every stage calls `complete` as its terminal action, that'
+        ' guard means you are retracting a finding your own still-running stage'
+        ' filed, not overriding a verdict a finished stage already closed.'
+        ' Structured errors: run_id_unknown / finding_unknown /'
+        ' report_already_completed. Retract and re-file rather than filing a'
+        ' correction alongside a finding you know to be wrong.\n'
     ),
     'cite_entity': (
         '- `{call}` — pass the ENTITY NAME (not a UUID); the server resolves the UUID'
@@ -539,6 +566,7 @@ def _render_recon_report_tool_guidance(
         return f'mcp__recon-report__{tool_name}({", ".join(parts)})'
 
     stats_present = [tool for tool in _GUIDANCE_STATS_GROUP if tool in signatures]
+    citations_lead_in_pending = _GUIDANCE_CITATIONS_LEAD_IN
     sections = [_GUIDANCE_PREAMBLE]
     for tool in _GUIDANCE_TOOL_ORDER:
         if tool not in signatures:
@@ -546,6 +574,9 @@ def _render_recon_report_tool_guidance(
             # than raising, so a tool removed upstream degrades to a missing
             # paragraph instead of a bare KeyError for every prompt consumer.
             continue
+        if tool in _GUIDANCE_CITATION_GROUP and citations_lead_in_pending:
+            sections.append(citations_lead_in_pending)
+            citations_lead_in_pending = ''
         if tool in _GUIDANCE_STATS_GROUP:
             if tool != stats_present[0]:
                 continue  # already covered by the shared stats sentence below
@@ -594,15 +625,34 @@ def render_recon_report_tool_guidance() -> str:
     catches this and falls back to the frozen fallback rather than letting
     it become an ImportError for every consumer of this package.
     """
-    from fused_memory.server.recon_report import get_recon_report_tool_signatures
+    from fused_memory.server.recon_report import (
+        HARNESS_CALLED_REPORT_TOOLS,
+        STAGE_GATED_REPORT_TOOLS,
+        get_recon_report_tool_signatures,
+    )
 
     signatures = get_recon_report_tool_signatures()
+    # WHICH tools an agent is told about is decided by the classification that
+    # lives next to the @mcp.tool() registrations, not here and not by the
+    # renderer: every registered tool is shared-guidance unless it is
+    # harness-called (start_report — the harness opens the report before the
+    # stage begins) or stage-gated (denied in some stages via
+    # DISALLOW_RECON_REPORT_LEDGER_WRITES). Filtering HERE rather than inside
+    # _render_recon_report_tool_guidance() is what lets that renderer stay a
+    # pure 'render everything I was handed' function shared with the frozen
+    # fallback, so the two paths cannot drift in wording.
+    #
+    # This block is interpolated into ALL THREE stage prompts, so a stage-gated
+    # tool named here would tell Stage 1 and Stage 3 about an action they
+    # cannot take: --disallowed-tools OMITS a denied tool rather than rejecting
+    # the call, so the agent would see an advertised tool simply not exist.
     specs = {
         tool: tuple(
             (name, param.default is inspect.Parameter.empty)
             for name, param in sig.parameters.items()
         )
         for tool, sig in signatures.items()
+        if tool not in HARNESS_CALLED_REPORT_TOOLS and tool not in STAGE_GATED_REPORT_TOOLS
     }
     return _render_recon_report_tool_guidance(specs)
 
@@ -633,6 +683,7 @@ _FROZEN_RECON_REPORT_SIGNATURE_SPECS: dict[str, tuple[tuple[str, bool], ...]] = 
         ('task_id', False),
         ('flag_type', False),
     ),
+    'delete_finding': (('run_id', True), ('finding_id', True)),
     'cite_entity': (('run_id', True), ('finding_id', True), ('name', True)),
     'cite_edge': (('run_id', True), ('finding_id', True), ('edge_uuid', True)),
     'cite_task': (
