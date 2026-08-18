@@ -596,6 +596,17 @@ class TestDelegatesToSharedAtomicWriter:
     identical-looking monkeypatch there was measured INERT, which is exactly
     how that half of task 3387 first shipped with a vacuous test. Do not
     copy this shape over there, or that shape over here.)
+
+    MUTATION GATE. With the fix reverted at BOTH sites, both pins here were
+    observed FAILING before the fix was accepted:
+    ``test_delegates_with_preserved_semantics`` with ``assert 'ascii' ==
+    'utf-8'`` after normalisation, and
+    ``test_writes_non_ascii_json_as_utf8_regardless_of_locale`` with
+    ``UnicodeEncodeError: 'ascii' codec can't encode character '\\xe9'``
+    raised inside ``safe_io.atomic_write_text``. Re-run that gate before
+    trusting any future edit to either: BOTH of these passed against the
+    unfixed source once already, so green here is not by itself evidence.
+    A pin not observed failing is not a pin.
     """
 
     def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):

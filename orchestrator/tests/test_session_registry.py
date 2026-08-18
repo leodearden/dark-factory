@@ -5290,6 +5290,22 @@ class TestAtomicWriteSemantics:
     # defaults to.  (``lane_lifecycle``'s twin pin is NOT this shape — that
     # site calls ``locale.getpreferredencoding(False)`` explicitly at the
     # Python level, so a monkeypatch does reach it and no child is warranted.)
+    #
+    # MUTATION GATE.  Run with BOTH sites reverted at once — ``os.fdopen(fd,
+    # 'w')`` here and ``encoding=locale.getpreferredencoding(False)`` in
+    # lane_lifecycle — all three pins below were observed FAILING, each in its
+    # own way, before the fix was accepted:
+    #
+    #   spy    -> AssertionError: no encoding= kwarg  (assert None is not None)
+    #   strict -> child exit 1, EncodingWarning at this module's fdopen line
+    #   locale -> child exit 1, PREFERRED=ANSI_X3.4-1968, UnicodeEncodeError
+    #             on '\xe9'
+    #
+    # Re-run that gate before trusting any future edit to these three, in the
+    # vocabulary this file already uses for its bare-shell rows below: a guard
+    # must be observed FAILING rather than merely observed green.  A pin not
+    # observed failing is not a pin — which is how the version these replaced
+    # shipped green and pinned nothing.
 
     def test_passes_an_explicit_utf8_encoding_to_fdopen(self, tmp_path, monkeypatch):
         """Task 3387: the ``os.fdopen`` boundary is handed an explicit utf-8.
