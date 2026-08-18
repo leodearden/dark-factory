@@ -11454,6 +11454,84 @@ class TestUpdateMemoryValidatesTheDeltaNotTheCorpus:
         assert 'canonical_without_topic' in {v.code for v in excinfo.value.violations}
         service.mem0.delete_payload.assert_not_called()
 
+    @staticmethod
+    def _stage_with_parent(service, pre_image, lookups):
+        """Route the record's own id to *pre_image*; every other id is DEAD.
+
+        The §5(c) existence check and leaf δ's parent lookup share ONE
+        backend primitive (`get_memory_by_id` → `mem0.get_point_by_id`), so a
+        flat `AsyncMock(return_value=None)` would fail the existence check and
+        never reach the seam. *lookups* records the ids in order, which is how
+        these cases assert the round-trip COUNT and not merely the verdict.
+        """
+        async def _routed(point_id, scope, *args, **kwargs):
+            lookups.append(point_id)
+            return dict(pre_image) if point_id == 'point-1' else None
+
+        service.mem0.get_point_by_id = _routed
+
+    @pytest.mark.asyncio
+    async def test_a_dead_pre_existing_parent_is_not_this_writes_problem(
+        self, service, caplog
+    ):
+        """Liveness is delta-scoped too — at its own gate, not by subtraction.
+
+        The `(key, code)` subtraction cannot reach this rule: its baseline set
+        comes from the PURE `validate_memory_metadata`, which structurally
+        cannot emit `dead_parent_id` / `parent_id_liveness_unavailable`, so
+        both codes would survive EVERY patch of a record carrying a
+        `parent_id` — including one that never mentions it. That would make a
+        record whose parent was since deleted permanently un-patchable under
+        `enforce` (and census a line per patch under the shipped warn mode):
+        corpus re-validation, the exact failure this class exists to prevent,
+        reintroduced through the one rule the subtraction is blind to.
+        """
+        service.config.memory_metadata.enforce = True
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        lookups: list[str] = []
+        self._stage_with_parent(
+            service, {**DEFAULT_POINT_PAYLOAD, 'parent_id': _MM_UUID}, lookups,
+        )
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'x_note': 'hi'},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        assert _mm_census_codes(caplog) == []
+        # Exactly ONE read — the existence check. The parent was never probed,
+        # which is also ε's contracted zero-extra-round-trips property holding
+        # for a patch that asserts no parent.
+        assert lookups == [self._POINT]
+
+    @pytest.mark.asyncio
+    async def test_a_parent_id_this_write_asserts_still_fails_closed(self, service):
+        """Delta scoping is not a liveness exemption.
+
+        The other side of the same line: a write that ASSERTS a parent — a new
+        one, or a different one — is answerable for it, pays the round-trip
+        and still fails closed under `enforce`. INV-3 read literally.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        other_parent = '9c5b94b1-35ad-49bb-b118-8e8fc24abf80'
+        lookups: list[str] = []
+        self._stage_with_parent(
+            service, {**DEFAULT_POINT_PAYLOAD, 'parent_id': _MM_UUID}, lookups,
+        )
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'parent_id': other_parent},
+            )
+
+        assert 'dead_parent_id' in {v.code for v in excinfo.value.violations}
+        assert lookups == [self._POINT, other_parent]
+        service.mem0.set_payload.assert_not_called()
+
 
 class TestCanonicalUniquenessAtSeam:
     """<=1 canonical memory per (project, topic) — the live INV-3 re-check.

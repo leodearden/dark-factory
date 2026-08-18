@@ -502,11 +502,22 @@ async def _apply_memory_metadata_validation(
     ``baseline`` and every obligation above applies to the whole dict,
     bit-identically to before this parameter existed.  ``update_memory``
     AMENDS one, and passes the record's pre-image custom subset.  When it is
-    supplied, obligations 3, 4 and 5 are reduced to what this write actually
+    supplied, obligations 2 through 5 are reduced to what this write actually
     CHANGED — a violation the record already carried (on a key this write
-    left alone) is neither re-censused nor re-rejected, and the uniqueness
-    probe fires only for a ``canonical``/``topic`` claim the record does not
-    already hold.
+    left alone) is neither re-censused nor re-rejected, the ``parent_id``
+    liveness probe fires only for a parent this write ASSERTS, and the
+    uniqueness probe fires only for a ``canonical``/``topic`` claim the
+    record does not already hold.
+
+    That reduction has THREE implementation sites, not one, because the
+    rules reach live state differently.  Obligations 3 and 4 are reduced by
+    the ``(key, code)`` subtraction below; obligation 5 by
+    :func:`_check_canonical_uniqueness`'s guard 3; obligation 2 by its own
+    claim-is-NEW gate on the liveness block, because the subtraction
+    structurally cannot see liveness codes (the pure validator cannot
+    produce them) and would let both survive every patch.  A fourth rule
+    that reads live state needs its own gate too — the subtraction will not
+    cover it.
 
     That reduction is not a leniency knob; it is what keeps ``enforce``
     meaning "reject WRITES" instead of quietly becoming "re-validate the
@@ -536,10 +547,13 @@ async def _apply_memory_metadata_validation(
     :func:`~fused_memory.memory_metadata.parent_liveness_violation`, so the
     rule still has exactly one normative home.
 
-    The lookup fires only when ``parent_id`` is PRESENT *and* already
-    shape-valid: the common write path (no ``parent_id`` at all — leaf α
-    measured zero live records carrying one) pays no round-trip, and an id
-    no store could resolve is never spent on.  Liveness ADDS a violation
+    The lookup fires only when ``parent_id`` is PRESENT, already
+    shape-valid, *and* (task 3523, when a ``baseline`` is supplied) actually
+    ASSERTED by this write: the common write path (no ``parent_id`` at all —
+    leaf α measured zero live records carrying one) pays no round-trip, an
+    id no store could resolve is never spent on, and a patch that leaves an
+    existing ``parent_id`` untouched is answerable for neither the lookup
+    nor its verdict.  Liveness ADDS a violation
     rather than opening a second rejection path: because
     ``parent_liveness_violation`` is ``fatal=True``, warn mode censuses and
     proceeds while ``enforce`` rejects, both through the same arms below.
@@ -591,7 +605,31 @@ async def _apply_memory_metadata_validation(
     # `validate_memory_metadata` emits `invalid_parent_id_shape` under the
     # same key, so any parent_id-keyed violation means the id is malformed
     # and no store could resolve it in that spelling.
-    if 'parent_id' in meta and not any(v.key == 'parent_id' for v in violations):
+    #
+    # ALSO gated on the parent_id claim being NEW (task 3523), mirroring
+    # `_check_canonical_uniqueness`'s guard 3 in shape and for the same
+    # reason. Liveness is the ONE rule the (key, code) subtraction below
+    # structurally cannot delta-scope: the baseline set is built by the PURE
+    # `validate_memory_metadata`, which cannot produce `dead_parent_id` or
+    # `parent_id_liveness_unavailable`, so those codes would survive the
+    # subtraction on EVERY patch — including one that never mentions
+    # parent_id. A record whose parent was later deleted would then become
+    # permanently un-patchable under `enforce` (and census a `dead_parent_id`
+    # line per patch under the shipped warn mode), which is exactly the
+    # "`enforce` re-validates the corpus" failure the delta rule exists to
+    # prevent. So the scoping happens HERE, at the source, instead.
+    #
+    # Fail-CLOSED is preserved for every write that ASSERTS a parent: a new
+    # or CHANGED parent_id still pays the round-trip and still rejects under
+    # `enforce`. Only an untouched pre-existing one is forgiven — the same
+    # value-unchanged half the shape rules use below. Compared raw rather
+    # than against the normalized copy because `validate_memory_metadata`'s
+    # only in-place mutation is `supersedes`; `parent_id` is never rewritten.
+    if (
+        'parent_id' in meta
+        and (baseline is None or baseline.get('parent_id') != meta['parent_id'])
+        and not any(v.key == 'parent_id' for v in violations)
+    ):
         try:
             parent = await parent_lookup(project_id, meta['parent_id'])
         except Exception as exc:
@@ -636,9 +674,16 @@ async def _apply_memory_metadata_validation(
     # `parent_id` carrying no shape violation, so subtracting first would let
     # a pre-existing `invalid_parent_id_shape` spend a lookup on an id no
     # store could resolve and then census `dead_parent_id` for it — blaming
-    # the wrong rule, which leaf δ explicitly forbids.  Liveness codes are
-    # never in the baseline set anyway: `validate_memory_metadata` is pure
-    # and structurally cannot produce them.
+    # the wrong rule, which leaf δ explicitly forbids.
+    #
+    # THIS SUBTRACTION DOES NOT DELTA-SCOPE LIVENESS, and cannot: `already`
+    # comes from the PURE `validate_memory_metadata`, which structurally
+    # cannot emit `dead_parent_id` / `parent_id_liveness_unavailable`, so
+    # `(v.key, v.code) not in already` is unconditionally True for both and
+    # they would survive every patch. Liveness is delta-scoped at its SOURCE
+    # instead — see the claim-is-NEW gate on the block above. Do not "unify"
+    # the two by deleting that gate and relying on this list comprehension:
+    # it would silently reinstate corpus re-validation for exactly one rule.
     #
     # Forgiven only when BOTH halves hold: the baseline already carried this
     # (key, code) AND the write left that key's value alone.  (key, code)
