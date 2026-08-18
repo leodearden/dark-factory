@@ -140,21 +140,54 @@ def _filter_grouped_children(entry: dict, target: str) -> int:
     unclassifiable. Returns the number of nested entries dropped; the caller
     folds that into its own ``dropped`` total.
 
-    Only the child LISTS are rewritten. ``amendment_count`` / ``sighting_count``
-    and every other ``grouped`` key are left exactly as the server sent them.
+    SURGICAL. Only the child LISTS are rewritten, and only when something was
+    actually dropped. ``amendment_count`` / ``sighting_count`` are NEVER
+    recomputed: they are the EXACT values ``_read_grouped_document``
+    (``fused_memory/server/grouped_read.py``:292-327) got from
+    ``count_memories_by_metadata``, deliberately independent of what the
+    bounded digest list happens to contain — the block already reports a
+    short list via ``truncated`` rather than by shrinking the count. A
+    briefing that "fixed" the apparent inconsistency between a shortened list
+    and its count would be fabricating a number the store never returned.
+    ``truncated``, ``children_unavailable`` and every other ``grouped`` key
+    are likewise left exactly as the server sent them.
+
+    FAILS OPEN, like the rest of this module: a ``grouped`` value or a child
+    collection of an unexpected TYPE is left untouched (and logged at WARNING,
+    since a shape surprise means the safeguard did not run on that entry)
+    rather than raising, and a nested entry that is not a dict is KEPT — the
+    same treatment the top-level loop gives a stray non-dict result.
     """
     grouped = entry.get('grouped')
-    if not grouped:
+    if grouped is None:
+        # The overwhelmingly common shape: a canonical with no child records
+        # gets no grouped block at all.
+        return 0
+    if not isinstance(grouped, dict):
+        logger.warning(
+            f'filter_foreign_project_results: entry {entry.get("id")!r} has a '
+            f"'grouped' value of type {type(grouped).__name__}, not a dict; "
+            'nested children left unfiltered'
+        )
         return 0
     dropped = 0
     for key in GROUPED_CHILD_KEYS:
         children = grouped.get(key)
-        if not children:
+        if children is None:
+            continue
+        if not isinstance(children, list):
+            logger.warning(
+                f'filter_foreign_project_results: entry {entry.get("id")!r} has '
+                f'grouped[{key!r}] of type {type(children).__name__}, not a list; '
+                'left unfiltered'
+            )
             continue
         kept = []
         for child in children:
-            match = _result_project(child)
-            if match is not None:
+            # A non-dict nested entry is unclassifiable, not foreign — kept,
+            # exactly as an untagged child is. (``_result_project`` already
+            # tolerates a non-dict ``metadata`` on a well-formed one.)
+            if isinstance(child, dict) and (match := _result_project(child)) is not None:
                 tag_key, tag = match
                 if _canonical_project(tag) != target:
                     dropped += 1

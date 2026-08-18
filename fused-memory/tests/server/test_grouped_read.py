@@ -1879,7 +1879,7 @@ class TestPinnedChildCarriesOriginProjectTag:
         entry = pinned[_SIGHT_1]
         assert entry.get('metadata') == {'src_project': 'reify'}, (
             'A pinned body is agent-visible content, so it must carry the origin '
-            'tag a cross-project filter needs to classify it — got {!r}'.format(entry)
+            f'tag a cross-project filter needs to classify it — got {entry!r}'
         )
         # ...and the pre-existing pinned-entry fields are unchanged.
         assert entry['id'] == _SIGHT_1
