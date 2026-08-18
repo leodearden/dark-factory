@@ -91,7 +91,10 @@ def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body) == {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
+    assert set(body) == {
+        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+        'TASKS_DEGRADED_PROJECTS', 'DONE_COUNTS',
+    }
     assert 'FILE_LOCKS' not in body
     assert isinstance(body['ACTIVE_TASKS'], list)
     assert body['TASKS_OFFLINE'] is False
@@ -160,7 +163,10 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
     ]
 
     # (c) top-level key set unchanged
-    assert set(body) == {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
+    assert set(body) == {
+        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+        'TASKS_DEGRADED_PROJECTS', 'DONE_COUNTS',
+    }
 
 
 def test_tasks_endpoint_passes_max_cancelled_per_project(client):
@@ -171,7 +177,8 @@ def test_tasks_endpoint_passes_max_cancelled_per_project(client):
     (b) existing kwargs still present: max_done_per_project == _MAX_DONE_PER_PROJECT,
         resolve_external == True
     (c) top-level payload key-set remains exactly
-        {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
+        {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+         'TASKS_DEGRADED_PROJECTS', 'DONE_COUNTS'}
         (no new key added for cancelled)
 
     RED today: app.py does not yet pass max_cancelled_per_project.
@@ -203,7 +210,133 @@ def test_tasks_endpoint_passes_max_cancelled_per_project(client):
     )
 
     # (c) payload key-set unchanged
-    assert set(body) == {'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'}
+    assert set(body) == {
+        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+        'TASKS_DEGRADED_PROJECTS', 'DONE_COUNTS',
+    }
+
+
+# ---------------------------------------------------------------------------
+# /api/v2/dashboard/tasks — honest offline signal (task 3857 steps 15/16)
+# ---------------------------------------------------------------------------
+
+
+def _fake_roots(n):
+    """N distinct project roots, for patching ``app._all_project_roots``.
+
+    The route-level ``client`` fixture runs against a single isolated temp
+    root, so "k of N failed with k < N" is not expressible against the real
+    config at all. Patching the root enumerator is the seam ``api_tasks``
+    itself uses to learn N, so a test that patches it is asserting on the same
+    fact the handler reads — not on a parallel fixture that could drift.
+    """
+    from pathlib import Path
+
+    return [Path(f'/proj/p{i}') for i in range(n)]
+
+
+def _tasks_body(client, *, offline_projects, degraded_projects=(), total_roots):
+    """GET /api/v2/dashboard/tasks with a canned collector result and N roots."""
+    collector = AsyncMock(
+        return_value=([], list(offline_projects), {}, list(degraded_projects))
+    )
+    with patch('dashboard.app.collect_tasks_with_counts', new=collector), patch(
+        'dashboard.app._all_project_roots', new=lambda config: _fake_roots(total_roots)
+    ):
+        resp = client.get('/api/v2/dashboard/tasks')
+    assert resp.status_code == 200
+    return resp.json()
+
+
+def test_tasks_partial_outage_does_not_set_the_global_offline_flag(client):
+    """One failing root out of nine must not claim a total outage.
+
+    THE headline defect: ``TASKS_OFFLINE`` is ``bool(offline_projects)``, so a
+    single unreachable root raises a global "fused-memory offline — task data
+    unavailable" banner directly above eight other projects' rows, which are
+    on the wire and fine. The per-project list already carries the honest
+    fact; the boolean's job is the DIFFERENT fact of a total outage.
+    """
+    body = _tasks_body(client, offline_projects=['p3'], total_roots=9)
+
+    assert body['TASKS_OFFLINE'] is False, (
+        '1 of 9 roots failing is not a fused-memory outage — the other 8 '
+        "projects' rows are in this very payload"
+    )
+    assert body['TASKS_OFFLINE_PROJECTS'] == ['p3']
+
+
+def test_tasks_all_roots_offline_sets_the_global_flag(client):
+    """Every configured root failing IS the outage signal.
+
+    One fused-memory URL serves every root, so all-roots-failed is the
+    observable proxy for "every configured fused-memory URL is unreachable" —
+    the state the global banner's copy actually describes.
+    """
+    body = _tasks_body(
+        client, offline_projects=['p0', 'p1', 'p2'], total_roots=3,
+    )
+
+    assert body['TASKS_OFFLINE'] is True
+    assert body['TASKS_OFFLINE_PROJECTS'] == ['p0', 'p1', 'p2']
+
+
+def test_tasks_no_offline_roots_leaves_the_global_flag_false(client):
+    body = _tasks_body(client, offline_projects=[], total_roots=4)
+
+    assert body['TASKS_OFFLINE'] is False
+    assert body['TASKS_OFFLINE_PROJECTS'] == []
+    assert body['TASKS_DEGRADED_PROJECTS'] == []
+
+
+def test_tasks_degraded_projects_surface_without_claiming_offline(client):
+    """Budget expiry is its own fact on the wire, and never an outage claim.
+
+    A project the handler ran out of budget for was never proven unreachable —
+    its state is UNKNOWN. Folding it into ``TASKS_OFFLINE`` (or into
+    ``TASKS_OFFLINE_PROJECTS``) would report a healthy fused-memory as down.
+    """
+    body = _tasks_body(
+        client,
+        offline_projects=[],
+        degraded_projects=['p2', 'p3'],
+        total_roots=4,
+    )
+
+    assert body['TASKS_DEGRADED_PROJECTS'] == ['p2', 'p3']
+    assert body['TASKS_OFFLINE'] is False, (
+        'a budget expiry is not a demonstrated outage'
+    )
+    assert body['TASKS_OFFLINE_PROJECTS'] == []
+
+
+def test_tasks_all_roots_degraded_is_still_not_an_outage(client):
+    """Even ALL roots degrading is not an outage — nothing was proven down.
+
+    Guards the fix against over-correcting into "any total failure sets the
+    flag": the global banner's copy says fused-memory is unreachable, a claim
+    a timeout does not license.
+    """
+    body = _tasks_body(
+        client,
+        offline_projects=[],
+        degraded_projects=['p0', 'p1'],
+        total_roots=2,
+    )
+
+    assert body['TASKS_OFFLINE'] is False
+    assert body['TASKS_DEGRADED_PROJECTS'] == ['p0', 'p1']
+
+
+def test_tasks_payload_keeps_file_locks_out_and_adds_only_the_degraded_key(client):
+    """The payload gains exactly one key, and FILE_LOCKS stays gone."""
+    body = _tasks_body(client, offline_projects=[], total_roots=1)
+
+    assert set(body) == {
+        'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+        'TASKS_DEGRADED_PROJECTS', 'DONE_COUNTS',
+    }
+    assert 'FILE_LOCKS' not in body
 
 
 def test_memory_returns_memory_status(client):
