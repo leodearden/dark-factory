@@ -541,6 +541,12 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
     stop.  ``digest`` keeps its own meaning (the bounded pointer every listed
     amendment carries); ``content`` is added ALONGSIDE it.
 
+    A pinned entry also carries the child's ORIGIN-PROJECT TAGS (see
+    :func:`_origin_tags`) alongside ``kind``, because a pinned body is
+    agent-visible content — the orchestrator briefing renders it verbatim into
+    a dispatched agent's prompt — and a cross-project filter can only classify
+    it if the tag rides along with the body.
+
     Mutates only *block* — a dict this call's :func:`build_grouped_document`
     just built, never a shared or cached structure.
     """
@@ -551,6 +557,11 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
     body = getattr(hit, 'content', '') or ''
     for digest in block.get('amendments') or []:
         if digest.get('id') == child_id:
+            # No origin-tag re-stamp here, deliberately: this entry came from
+            # :func:`_digest_entry`, which already tagged it from the RAW Qdrant
+            # payload — a superset of the normalised ``hit.metadata`` read below
+            # — so re-stamping could only introduce a disagreement between two
+            # reads of the same record.  The asymmetry is intent, not oversight.
             digest['matched'] = True
             # Unconditional, not "only when the digest was cut": the invariant
             # a consumer can rely on is "a matched entry carries the body the
@@ -562,15 +573,17 @@ def _pin_matched_child(block: dict[str, Any], hit: Any) -> None:
     if any(entry.get('id') == child_id for entry in pinned):
         return
     meta = getattr(hit, 'metadata', None) or {}
-    pinned.append(
-        {
-            'id': child_id,
-            'content': body,
-            'created_at': getattr(hit, 'created_at', None),
-            'kind': meta.get('kind'),
-            'matched': True,
-        }
-    )
+    entry: dict[str, Any] = {
+        'id': child_id,
+        'content': body,
+        'created_at': getattr(hit, 'created_at', None),
+        'kind': meta.get('kind'),
+        'matched': True,
+    }
+    # Omitted (never ``{}``) when untagged — see :func:`_origin_tags`.
+    if tags := _origin_tags(meta):
+        entry['metadata'] = tags
+    pinned.append(entry)
 
 
 def _represented_ids(parent_block: Mapping[str, Any] | None) -> set[str]:
