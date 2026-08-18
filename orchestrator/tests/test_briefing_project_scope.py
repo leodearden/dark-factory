@@ -752,3 +752,152 @@ class TestGroupedChildrenAreFiltered:
         assert dropped == 1
         assert 'FOREIGN AMENDMENT BODY' not in text
         assert json.loads(text)['results'][0]['grouped']['amendments'] == []
+
+
+class TestGroupedDescentIsSurgicalAndFailsOpen:
+    """The descent rewrites the child LISTS and nothing else, and never raises.
+
+    Surgical: the server's ``grouped`` block carries EXACT counts from
+    ``count_memories_by_metadata``; a briefing that recomputed them after a
+    drop would be fabricating a number the store never returned, which is a
+    worse lie than a visibly-short list.
+
+    Fails open: mirroring the malformed-payload arms of
+    ``filter_foreign_project_results``, a shape surprise must never blank the
+    ``# Context`` block — a silent capability loss across every prompt builder
+    is the worse failure direction than one unfiltered entry.
+    """
+
+    def test_the_server_counts_are_never_rewritten(self):
+        """(a) A shortened list keeps the count API's EXACT value."""
+        payload = json.dumps({'results': [_grouped_parent()]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        grouped = json.loads(text)['results'][0]['grouped']
+        assert dropped == 2
+        assert len(grouped['amendments']) == 2, 'PRECONDITION: the list really did shrink'
+        assert grouped['amendment_count'] == 3, (
+            'amendment_count is the count API\'s exact value; recomputing it here '
+            f'would fabricate a number the store never returned, got {grouped!r}'
+        )
+        assert grouped['sighting_count'] == 1, (
+            f'sighting_count must survive a matched_children drop verbatim, got {grouped!r}'
+        )
+
+    def test_sibling_grouped_keys_survive_verbatim(self):
+        """(b) Only the child lists are touched."""
+        block = _grouped_block()
+        block['truncated'] = True
+        block['children_unavailable'] = True
+        block['error_type'] = 'TimeoutError'
+        payload = json.dumps({'results': [_grouped_parent(grouped=block)]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        grouped = json.loads(text)['results'][0]['grouped']
+        assert dropped == 2
+        assert grouped['truncated'] is True
+        assert grouped['children_unavailable'] is True
+        assert grouped['error_type'] == 'TimeoutError'
+
+    def test_the_parents_own_fields_are_untouched(self):
+        """(c) The descent edits the subtree, never the entry that carries it."""
+        payload = json.dumps({'results': [_grouped_parent()]})
+
+        text, _ = filter_foreign_project_results(payload, 'dark_factory')
+
+        parent = json.loads(text)['results'][0]
+        assert parent['id'] == 'p1'
+        assert parent['content'] == 'Native canonical.'
+        assert parent['metadata'] == {'project_id': 'dark_factory'}
+        assert parent['relevance_score'] == 0.9
+
+    def test_an_entry_with_no_grouped_key_is_a_no_op(self):
+        """(d) Today's overwhelmingly common shape: zero child records in the corpus.
+
+        ``build_grouped_document`` returns None on a zero-child canonical, so
+        ``group_search_results`` sets no ``grouped`` key at all.
+        """
+        payload = json.dumps({
+            'results': [_result('n1', 'Native fact.', metadata={'project_id': 'dark_factory'})],
+        })
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert dropped == 0
+        assert 'Native fact.' in text
+
+    def test_a_non_dict_grouped_value_fails_open(self):
+        """(e)"""
+        entry = _result('p1', 'Native canonical.', metadata={'project_id': 'dark_factory'})
+        entry['grouped'] = 'not a dict at all'
+        payload = json.dumps({'results': [entry]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert dropped == 0, f'A shape surprise must not be counted as a drop, got {dropped}'
+        assert [r['id'] for r in json.loads(text)['results']] == ['p1'], (
+            f'The entry must SURVIVE a malformed grouped block, got {text!r}'
+        )
+
+    def test_a_non_list_child_collection_fails_open(self):
+        """(f)"""
+        entry = _result('p1', 'Native canonical.', metadata={'project_id': 'dark_factory'})
+        entry['grouped'] = {'amendments': 'not a list', 'amendment_count': 1}
+        payload = json.dumps({'results': [entry]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert dropped == 0
+        assert json.loads(text)['results'][0]['grouped']['amendments'] == 'not a list', (
+            'A child collection of the wrong type is left EXACTLY as received — '
+            'never coerced, never emptied'
+        )
+
+    def test_a_non_dict_nested_entry_is_kept_not_dropped(self):
+        """(g) Same treatment the top-level loop gives a stray non-dict entry."""
+        entry = _result('p1', 'Native canonical.', metadata={'project_id': 'dark_factory'})
+        entry['grouped'] = {
+            'amendments': [
+                None,
+                'a bare string',
+                {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'kind': 'amendment',
+                 'metadata': {'src_project': 'reify'}},
+                {'id': 'a2', 'digest': 'NATIVE AMENDMENT BODY', 'kind': 'amendment'},
+            ],
+            'amendment_count': 4,
+        }
+        payload = json.dumps({'results': [entry]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert dropped == 1, (
+            f'Only the classifiably-foreign child may be dropped, got {dropped}'
+        )
+        amendments = json.loads(text)['results'][0]['grouped']['amendments']
+        assert amendments[:2] == [None, 'a bare string'], (
+            f'An unclassifiable nested entry is KEPT, not dropped, got {amendments!r}'
+        )
+        assert 'FOREIGN AMENDMENT BODY' not in text
+        assert 'NATIVE AMENDMENT BODY' in text
+
+    def test_a_non_dict_nested_metadata_is_kept(self):
+        """(h) ``_result_project`` already returns None for that — pinned end to end."""
+        entry = _result('p1', 'Native canonical.', metadata={'project_id': 'dark_factory'})
+        entry['grouped'] = {
+            'amendments': [
+                {'id': 'a1', 'digest': 'ODDLY SHAPED BODY', 'kind': 'amendment',
+                 'metadata': 'not a dict'},
+            ],
+            'amendment_count': 1,
+        }
+        payload = json.dumps({'results': [entry]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert dropped == 0
+        assert 'ODDLY SHAPED BODY' in text, (
+            'A nested entry whose metadata is unreadable is untagged, and '
+            f'untagged means KEPT, got {text!r}'
+        )
