@@ -2359,3 +2359,155 @@ class TestShapeOneProjectNarrowing:
             for r in caplog.records
         ), 'the degraded count must be logged, not silent'
 
+
+# ---------------------------------------------------------------------------
+# TestDepsOutsideTheTerminalWindow — dependency chips must not silently vanish
+# (task 3857 step-9)
+# ---------------------------------------------------------------------------
+
+
+class TestDepsOutsideTheTerminalWindow:
+    """A bounded terminal fetch must not silently delete dependency chips.
+
+    ``_resolve_deps`` used to read a ``by_id`` built over the WHOLE tree, so
+    every dep id resolved.  After the terminal window bounds what is fetched,
+    a done dependency outside the window is no longer in ``by_id`` — and the
+    ``continue`` would drop a chip that renders today.  The compact status map
+    is the bounded source that keeps the load-bearing half of the chip (the
+    ``done`` flag) honest.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch):
+        import dashboard.data.tasks as tasks_mod
+        tasks_mod._fetch_tasks_cache_clear()
+        _register_runtime(monkeypatch, {})
+        yield
+        tasks_mod._fetch_tasks_cache_clear()
+
+    @staticmethod
+    def _config(tmp_path):
+        root = tmp_path / 'proj'
+        root.mkdir(parents=True, exist_ok=True)
+        return DashboardConfig(project_root=root)
+
+    async def _shape(self, monkeypatch, tmp_path, dummy_client, *, window=2):
+        """One active task depending on ids inside, outside and beyond the tree."""
+        import dashboard.data.active_tasks as at_mod
+        from dashboard.data.active_tasks import _shape_one_project
+
+        monkeypatch.setattr(at_mod, '_TERMINAL_FETCH_WINDOW', window)
+
+        rows = [
+            _raw_row(1, 'in-progress', title='the active one'),
+            _raw_row(5, 'pending', title='an active dep'),
+            # Low-id done dep: present in the status map, pushed OUT of the
+            # high-id terminal window by the ids below.
+            _raw_row(10, 'done', title='long-parked dep'),
+            _raw_row(90, 'done', title='recent dep'),
+            _raw_row(91, 'done', title='recenter dep'),
+        ]
+        rows[0]['dependencies'] = ['5', '10', '90', '999']
+        status_map = {int(r['id']): r['status'] for r in rows}
+        mcp, _calls = _canned_mcp(rows, status_map)
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
+
+        config = self._config(tmp_path)
+        active, _offline, _done = await _shape_one_project(
+            dummy_client, config, config.project_root,
+            max_done_per_project=50, max_cancelled_per_project=50,
+        )
+        row = next(r for r in active if r.get('status') == 'in-progress')
+        return {int(d['id'].rsplit('T-', 1)[-1]): d for d in row['deps']}
+
+    async def test_done_dep_outside_the_window_is_still_emitted(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(a) An honest partial entry beats a dropped chip."""
+        deps = await self._shape(monkeypatch, tmp_path, dummy_client)
+
+        assert 10 in deps, (
+            'a done dependency outside the terminal window must still render a '
+            f'chip — got only {sorted(deps)}'
+        )
+        assert deps[10]['done'] is True, 'the done flag comes from the status map'
+        assert deps[10]['title'] == '', (
+            'the title is unresolvable without an extra whole-tree read, so it '
+            'degrades to the empty string the shape already allows'
+        )
+
+    async def test_dep_present_in_the_window_keeps_its_real_title(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(b) No regression for deps whose full row was actually fetched."""
+        deps = await self._shape(monkeypatch, tmp_path, dummy_client)
+
+        assert deps[90]['title'] == 'recent dep'
+        assert deps[90]['done'] is True
+
+    async def test_dep_absent_from_rows_and_map_is_still_dropped(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(c) The id does not exist — fabricating a chip is worse than omitting it."""
+        deps = await self._shape(monkeypatch, tmp_path, dummy_client)
+
+        assert 999 not in deps, (
+            'an id absent from both the rows and the status map must be dropped'
+        )
+
+    async def test_active_dep_resolves_with_done_false(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(d) A non-done dep is emitted with done False, however it resolved."""
+        deps = await self._shape(monkeypatch, tmp_path, dummy_client)
+
+        assert deps[5]['done'] is False
+        assert deps[5]['title'] == 'an active dep'
+
+    async def test_active_dep_outside_the_rows_yields_done_false(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(d) The status-map fallback must not assume 'not fetched' means done."""
+        import dashboard.data.active_tasks as at_mod
+        from dashboard.data.active_tasks import _shape_one_project
+
+        monkeypatch.setattr(at_mod, '_TERMINAL_FETCH_WINDOW', 1)
+        rows = [
+            _raw_row(1, 'in-progress', title='the active one'),
+            _raw_row(7, 'blocked', title='a blocked dep'),
+            _raw_row(80, 'done'),
+            _raw_row(81, 'done'),
+        ]
+        rows[0]['dependencies'] = ['7', '80']
+        status_map = {int(r['id']): r['status'] for r in rows}
+
+        async def _mcp(client, url, tool, args, **_kw):
+            if tool == 'get_statuses':
+                return {'statuses': {str(k): v for k, v in status_map.items()}}
+            statuses = args.get('statuses')
+            # Deliberately omit the blocked row from the ACTIVE rows so its
+            # only source is the compact map.
+            selected = [
+                r for r in rows
+                if (statuses is None or r.get('status') in statuses)
+                and r['id'] != '7'
+            ]
+            selected.sort(key=lambda r: int(r['id']))
+            page_size = args.get('page_size')
+            if page_size is not None:
+                start = args.get('offset', 0)
+                selected = selected[start:start + page_size]
+            return {'tasks': selected}
+
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _mcp)
+
+        config = self._config(tmp_path)
+        active, _offline, _done = await _shape_one_project(
+            dummy_client, config, config.project_root,
+            max_done_per_project=50, max_cancelled_per_project=50,
+        )
+        row = next(r for r in active if r.get('status') == 'in-progress')
+        deps = {int(d['id'].rsplit('T-', 1)[-1]): d for d in row['deps']}
+
+        assert deps[7]['done'] is False, 'a blocked dep must never render as done'
+        assert deps[7]['title'] == ''
