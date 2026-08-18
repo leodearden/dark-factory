@@ -69,8 +69,8 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
     return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
 
 
-def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str:
-    """Return max(member severities) for a promoted L2; 'blocking' if none resolve.
+def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | None:
+    """Return max(member severities) for a promoted L2, or None if none is usable.
 
     This is what an OMITTED ``promote_to_l2(severity=...)`` argument resolves
     to (task 3976).  The old literal ``'blocking'`` default inflated every
@@ -84,45 +84,73 @@ def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str:
     back to the archive), and repeated lookups of a genuinely nonexistent id
     are negative-cached rather than re-scanning the archive each time.
 
-    **Fail-safe direction is UP, loudly.**  Member ids are opaque strings that
-    this tool never existence-checks, so when NOTHING resolves we return
-    ``'blocking'`` — today's behaviour, unchanged — and WARN naming the ids,
-    rather than rejecting the promotion (which would silently drop a promotion
-    the caller believed it had made) or quieting it to ``'info'``.  This
-    matches ``escalation.pins`` link 2: an unknown severity fails safe to
-    pinning, never to conversion.
+    **The fold ranges over ``KNOWN_SEVERITIES`` ONLY.**  A member is USABLE
+    only if it resolves AND its ``severity`` is in the vocabulary.  Nothing
+    validates a record's severity on write — ``Escalation`` is a plain
+    dataclass and ``queue.submit``/``_rewrite`` are field-agnostic
+    passthroughs — so a legacy, corrupt, or externally-written member can carry
+    an out-of-vocabulary string (``''``, ``'warn'``).  ``max_severity`` ranks
+    an unknown at 0, but its ``>=`` tie-break would let that string WIN over a
+    genuine ``'info'`` sibling and be minted onto the L2 verbatim, reported
+    back through the response ``severity`` key and missed by cockpit's
+    ``severity_weights``.  Treating it as unusable keeps the tool's promise
+    that a filed severity is always one of ``KNOWN_SEVERITIES``.
 
-    A PARTIALLY resolvable set derives from the resolvable subset only —
-    discarding a known-info member because a sibling id was unreadable would
-    reintroduce the very inflation this exists to remove.  The fold is
-    therefore seeded from the first RESOLVED member rather than from
-    ``'info'``: an empty-ish seed would be indistinguishable from a real info
-    member, and the explicit nothing-resolved branch is what carries the
-    fail-safe.
+    **Returning None means "the members say nothing".**  The two call paths
+    need different fail-safes, so this function reports the fact rather than
+    picking one:
+
+    - CREATE must choose a severity, so it fails safe UP to ``'blocking'`` —
+      today's behaviour, unchanged.  Rejecting the promotion instead would
+      silently drop a promotion the caller believed it had made, and quieting
+      it to ``'info'`` would fail in the dangerous direction.  This matches
+      ``escalation.pins`` link 2: an unknown severity fails safe to pinning,
+      never to conversion.
+    - UPDATE must NOT: the existing L2 already carries a severity derived from
+      real members, so an underivable set has nothing to contribute.  Failing
+      up there would inflate a correctly-inherited ``info`` L2 to ``blocking``
+      (and bump ``updated_at``, re-triggering the watcher's re-assess) merely
+      because an id was typo'd or momentarily unreadable.
+
+    Either way the unusable ids are named at WARNING — loud, never silent.
+
+    A PARTIALLY usable set derives from the usable subset only — discarding a
+    known-info member because a sibling id was unreadable would reintroduce
+    the very inflation this exists to remove.  The fold is therefore seeded
+    from the first USABLE member rather than from ``'info'``: an empty-ish
+    seed would be indistinguishable from a real info member, and the explicit
+    nothing-usable branch is what carries the fail-safe.
     """
     resolved: list[str] = []
-    unresolved: list[str] = []
+    unusable: list[str] = []
     for mid in member_ids:
         member = queue.get(mid)
         if member is None:
-            unresolved.append(mid)
+            unusable.append(mid)
+        elif member.severity not in KNOWN_SEVERITIES:
+            logger.warning(
+                'promote_to_l2: member escalation %s carries out-of-vocabulary '
+                'severity %r (expected one of %s); excluding it from the derived '
+                'L2 severity rather than propagating it.',
+                mid, member.severity, sorted(KNOWN_SEVERITIES),
+            )
+            unusable.append(mid)
         else:
             resolved.append(member.severity)
 
     if not resolved:
         logger.warning(
-            'promote_to_l2: no member escalation resolved for %s — cannot derive '
-            "severity from members; failing safe UP to 'blocking'. "
-            'Unresolved ids: %s',
-            member_ids, ', '.join(unresolved) or '(none)',
+            'promote_to_l2: no member escalation yielded a usable severity for %s '
+            '— cannot derive an L2 severity from members. Unusable ids: %s',
+            member_ids, ', '.join(unusable) or '(none)',
         )
-        return 'blocking'
+        return None
 
-    if unresolved:
+    if unusable:
         logger.warning(
-            'promote_to_l2: %d of %d member escalation(s) did not resolve; '
-            'deriving severity from the resolvable subset only. Unresolved ids: %s',
-            len(unresolved), len(member_ids), ', '.join(unresolved),
+            'promote_to_l2: %d of %d member escalation(s) yielded no usable '
+            'severity; deriving from the usable subset only. Unusable ids: %s',
+            len(unusable), len(member_ids), ', '.join(unusable),
         )
 
     derived = resolved[0]
@@ -1592,13 +1620,37 @@ def create_server(
             monotonic floor and will not accept a demotion — see
             **Root-cause dedup**.)
 
-            When NO member id resolves, the derivation fails safe UP to
-            ``'blocking'`` and logs a WARNING naming the unresolved ids; a
-            partially resolvable set derives from the resolvable subset.
+            The derivation ranges over ``models.KNOWN_SEVERITIES`` ONLY: a
+            member that does not resolve, or that resolves carrying an
+            out-of-vocabulary severity (nothing validates a record's severity
+            on write), contributes nothing and is named at WARNING.  A
+            partially usable set derives from the usable subset, so the filed
+            severity is always a member of the vocabulary.
+
+            When NO member yields a usable severity the two paths fail safe in
+            DIFFERENT directions.  CREATE must pick something, so it fails safe
+            UP to ``'blocking'``.  UPDATE deliberately does not: the existing
+            L2 already carries a severity derived from real members, so it is
+            left untouched (no floor, no ``updated_at`` bump) rather than being
+            inflated on nothing more than a typo'd or momentarily unreadable
+            member id.
 
             An explicit value must be one of ``models.KNOWN_SEVERITIES``;
             unknown values return ``{'error': ...}`` (mirrors
             ``escalate_blocker`` validation) and mint nothing.
+
+            **An inherited ``'info'`` L2 is deliberately NON_PINNING.**  Before
+            task 3976 no producer could mint an L2 below ``'blocking'``, so
+            every L2 classified ``QUEUE_HANDOFF`` in ``escalation.pins``.  Link
+            1 there short-circuits on ``severity == 'info'`` BEFORE the
+            ``level != 0`` link — "an info record never pins, at any level" —
+            so an inherited-info L2 no longer vetoes its subject task's
+            ``done`` flip.  That is the INTENDED semantics and was considered
+            here, not an oversight: the members it clusters were themselves
+            non-pinning, and a record that does not merit a human's attention
+            must not hold a task open waiting for one.  An L2 that genuinely
+            should pin is one whose members are genuinely non-info, or one the
+            caller filed with an explicit upward *severity*.
 
         Response shapes
         ---------------
@@ -1648,21 +1700,44 @@ def create_server(
         # nothing and must never be reachable past the derive branch.  Derived
         # from the RAW member_ids: the fold is order-independent by
         # construction, and deduplicating the id list is a storage concern.
-        effective_severity = (
-            severity if severity is not None else _derive_l2_severity(queue, member_ids)
+        #
+        # `derived is None` means the members said nothing usable (no id
+        # resolved, or every resolved member carried an out-of-vocabulary
+        # severity).  The two paths below fail safe in DIFFERENT directions,
+        # which is why the helper reports the fact instead of picking one.
+        derived = (
+            None if severity is not None else _derive_l2_severity(queue, member_ids)
         )
+
+        # CREATE must land on some severity, so an underivable set fails safe
+        # UP to 'blocking' — unchanged from before task 3976.
+        effective_severity = (
+            severity
+            if severity is not None
+            else (derived if derived is not None else 'blocking')
+        )
+
+        # UPDATE must NOT fail up: the existing L2 already carries a severity
+        # derived from its real members, so an underivable set has nothing to
+        # contribute and leaves the record (and its updated_at) alone.  Failing
+        # up here would re-inflate a correctly-inherited info L2 to blocking on
+        # nothing more than a typo'd or momentarily unreadable member id —
+        # exactly the inflation this task removes.
+        severity_floor = severity if severity is not None else derived
 
         # Dedup check: look for an existing pending L2 with the same root_cause.
         existing_id = queue.find_pending_l2_by_root_cause(root_cause)
         if existing_id is not None:
-            # effective_severity is either the caller's explicit value or
-            # max(member severities) over the ids in THIS call — exactly the
-            # floor the incoming members justify.  Upward-only inside
-            # add_members_to_l2, so an append can never quiet an existing L2.
+            # severity_floor is the caller's explicit value, or max(member
+            # severities) over the ids in THIS call — exactly the floor the
+            # incoming members justify — or None when they justify none, in
+            # which case add_members_to_l2 leaves the severity untouched.
+            # Upward-only inside add_members_to_l2, so an append can never
+            # quiet an existing L2.
             updated = queue.add_members_to_l2(
                 existing_id,
                 list(dict.fromkeys(member_ids)),
-                severity_floor=effective_severity,
+                severity_floor=severity_floor,
             )
             if updated is not None:
                 return {
