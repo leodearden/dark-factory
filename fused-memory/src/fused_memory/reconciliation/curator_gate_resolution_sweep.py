@@ -40,38 +40,45 @@ Design decisions (captured in plan.json):
   never treated as evidence of resolution (see
   ``sweep_resolved_curator_gates``).
 
-Evidence for the source-key format, and the zero-recall risk it carries
+Evidence for the source-key format, and what a hit does and does not prove
 (reviewer finding "correctness-risk", amendment pass):
 
-    The ``curator_gate_{task_id}`` spelling has NO producer in this repo.  The
-    writer is the reify MEMORY-curation session, and the only in-tree record of
-    what it stamps is ``fused-memory/tests/fixtures/README.md`` (~line 100:
-    "each canonical identified by ``metadata.source == 'curator_gate_NNNN'``"),
-    which describes that session labelling the canonical of an adjudicated
-    duplicate-memory cluster.  Two things therefore cannot be settled from
-    inside this repo, and both are handled rather than assumed away:
+    The ``curator_gate_{task_id}`` spelling has NO producer in this repo — the
+    writer is the reify MEMORY-curation session — so it was probed against the
+    live reify corpus rather than assumed.  OBSERVED 2026-08-18:
 
-    1. If the real writer's spelling — or its id BASIS (escalation id vs task
-       id) — differs, this sweep is permanently zero-recall and reports
-       ``scanned=N, flags_emitted=0``, byte-identical to a healthy cycle in
-       which no gate happened to be resolved.  That is the exact silent miss
-       the sweep exists to fix, so it is made VISIBLE two ways:
-       ``sweep_resolved_curator_gates`` logs a distinct warning whenever it
-       scanned gates and matched nothing without erroring, and the Stage-1 call
-       site surfaces ``curator_gate_resolution_errors`` alongside the scanned/
-       emitted counts, so "scanned > 0 and emitted == 0 and errors == 0" — the
-       zero-recall signature — is derivable straight from ``report.stats``.
-       To CONFIRM the format against live data, probe the reify corpus for the
-       two gates the task names:
-       ``count_memories_by_metadata(project_id='reify',
-       filters={'source': 'curator_gate_5561'})`` (and ``..._5563``); a
-       non-zero count is direct observation of the spelling.
-    2. The key may be stamped for gates whose memories were merely CURATED
-       rather than gates that were RULED ON.  The flag text therefore asserts
-       only what was OBSERVED — that N entries carrying the key exist — and
-       tells the reader to check the cited memories before acting (see
-       ``build_gate_resolution_flag``).  Stage 2 holds ``set_task_status``, so
-       an over-claiming description could get a still-open human gate closed.
+        count_memories_by_metadata('reify', {'source': 'curator_gate_5561'}) -> 1
+        count_memories_by_metadata('reify', {'source': 'curator_gate_5563'}) -> 1
+
+    the two gates run ec45eed0 missed.  Re-run those two calls to re-verify the
+    format at any time.  That settles the SPELLING and the ID BASIS: the key
+    carries the bare numeric gate id — no ``esc-`` prefix, no ``-1`` suffix —
+    so this sweep is not zero-recall against that corpus.
+
+    It also settles the SEMANTICS, in the direction the reviewer suspected.
+    Scrolling the 5563 hit returns memory ``e0a41fcd-0745-426b-bf71-45466e6d34e0``
+    (created 2026-07-27, ``agent_id='curator-milestone-gate-2026-07-27'``) whose
+    metadata is ``kind='procedural_consolidation'``, ``canonical=True``,
+    ``supersedes=[9 ids]`` and whose text opens "... CANONICAL (consolidates 9
+    entries ...) under curator gate esc-5563-1".  That is a CURATED CANONICAL
+    produced while working the gate — NOT a written ruling on the gate task.
+    So a positive hit is evidence the curator PROCESSED the gate, not proof it
+    RULED on it, and the flag must not claim otherwise: Stage 2 holds
+    ``set_task_status``, and an over-claiming description could get a still-open
+    human decision gate closed on a merely-curated cluster.  This is why
+    ``build_gate_resolution_flag``'s description reports only what was observed
+    (N entries carrying the key exist), marks itself "not proof", and offers a
+    dismiss branch in ``suggested_action``.
+
+    The zero-recall exposure remains real for any OTHER corpus, or if the
+    writer's convention later drifts, because ``scanned=N, flags_emitted=0`` is
+    byte-identical to a healthy cycle in which no gate happened to be resolved.
+    It is made visible two ways: ``sweep_resolved_curator_gates`` logs a
+    distinct warning whenever it scanned gates and matched nothing without
+    erroring, and the Stage-1 call site surfaces
+    ``curator_gate_resolution_errors`` alongside the scanned/emitted counts, so
+    "scanned > 0 and emitted == 0 and errors == 0" — the zero-recall signature
+    — is derivable straight from ``report.stats``.
 """
 
 from __future__ import annotations
