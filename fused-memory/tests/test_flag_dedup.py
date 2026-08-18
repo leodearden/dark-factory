@@ -4465,6 +4465,177 @@ class TestSanitizeCitedTasks:
 
 
 # ---------------------------------------------------------------------------
+# ---- task 4381 step-16 (review fix) ----
+# RED: the PERSISTENCE projection that BOUNDS the cross-cycle anchor.
+#
+# step-19 feeds the union back into the ledger payload every cycle, which makes
+# the persisted list a feedback loop: whatever is written is read back and
+# re-merged next cycle. _union_cited_tasks deliberately appends an
+# identity-less entry WITHOUT collapsing it against `seen`, so such entries
+# would accumulate +1 per cycle forever (simulated: 2,3,4,5,6,7 over six
+# cycles). _persistable_cited_tasks is the projection applied ONLY to the
+# persisted value: identity-bearing entries only, hard-capped.
+# ---------------------------------------------------------------------------
+
+
+class TestPersistableCitedTasks:
+    """Direct unit tests for the pure ``_persistable_cited_tasks`` helper and
+    its ``_MAX_PERSISTED_CITED_TASKS`` ceiling (task 4381 review fix).
+
+    RED until step-17 adds both symbols.
+    """
+
+    def test_identity_bearing_entries_survive_identity_less_are_dropped(self):
+        """(a) IDENTITY FILTER: only entries carrying BOTH project_id and
+        task_id are persistable — those are the only ones that de-duplicate on
+        the next cycle's union, and the only ones the resolver can look up."""
+        from fused_memory.reconciliation.flag_dedup import _persistable_cited_tasks
+
+        result = _persistable_cited_tasks([
+            {'title': 'x'},
+            {'project_id': 'p', 'task_id': '1', 'title': 'keep me'},
+            {'project_id': 'p'},
+            {'task_id': '2'},
+            {'project_id': 'q', 'task_id': 3},
+        ])
+        assert result == [
+            {'project_id': 'p', 'task_id': '1', 'title': 'keep me'},
+            {'project_id': 'q', 'task_id': 3},
+        ], f'only identity-bearing entries survive, in input order; got {result!r}'
+
+    @pytest.mark.parametrize(
+        'entry',
+        [
+            {'project_id': None, 'task_id': '1'},
+            {'project_id': 'p', 'task_id': None},
+            {'project_id': None, 'task_id': None},
+        ],
+        ids=['null-project', 'null-task', 'both-null'],
+    )
+    def test_explicit_none_identity_counts_as_absent(self, entry):
+        """(b) An explicit ``None`` value for either identity key is exactly as
+        un-deduplicable as an absent key — dropped."""
+        from fused_memory.reconciliation.flag_dedup import _persistable_cited_tasks
+
+        result = _persistable_cited_tasks([entry])
+        assert result is None, (
+            f'an explicit None identity must be dropped like an absent key; got {result!r}'
+        )
+
+    def test_falsy_but_present_identity_values_are_kept(self):
+        """(c) task_id=0 and project_id='' are FALSY but PRESENT — a
+        truthiness check would silently discard a legitimate zero id. Pins an
+        ``is None`` check."""
+        from fused_memory.reconciliation.flag_dedup import _persistable_cited_tasks
+
+        result = _persistable_cited_tasks([
+            {'project_id': 'p', 'task_id': 0, 'title': 'zero id'},
+            {'project_id': '', 'task_id': '7', 'title': 'empty project'},
+        ])
+        assert result == [
+            {'project_id': 'p', 'task_id': 0, 'title': 'zero id'},
+            {'project_id': '', 'task_id': '7', 'title': 'empty project'},
+        ], f'falsy-but-present identity scalars must survive; got {result!r}'
+
+    def test_caps_at_max_keeping_the_first_entries(self):
+        """(d) CAP: the ceiling truncates to the FIRST N — ``_union_cited_tasks``
+        sorts the current cycle's citations first, so the freshest anchor is the
+        one retained."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _MAX_PERSISTED_CITED_TASKS,
+            _persistable_cited_tasks,
+        )
+
+        entries = [
+            {'project_id': 'p', 'task_id': str(i)}
+            for i in range(_MAX_PERSISTED_CITED_TASKS + 5)
+        ]
+        result = _persistable_cited_tasks(entries)
+        assert result is not None
+        assert len(result) == _MAX_PERSISTED_CITED_TASKS, (
+            f'the persisted anchor must be capped at {_MAX_PERSISTED_CITED_TASKS}; '
+            f'got {len(result)}'
+        )
+        assert result == entries[:_MAX_PERSISTED_CITED_TASKS], (
+            f'truncation must keep the FIRST (freshest) entries in order; got {result!r}'
+        )
+
+    @pytest.mark.parametrize(
+        'value',
+        [[], None, 'not-a-list', 42, {'project_id': 'p', 'task_id': '1'}],
+        ids=['empty-list', 'none', 'str', 'int', 'dict'],
+    )
+    def test_nothing_to_persist_returns_none(self, value):
+        """(e) None (never ``[]``) so the caller's ``if persistable:`` gate omits
+        the payload key exactly as the ``deduped_against`` idiom does."""
+        from fused_memory.reconciliation.flag_dedup import _persistable_cited_tasks
+
+        result = _persistable_cited_tasks(value)
+        assert result is None, f'nothing to persist must yield None; got {result!r}'
+
+    def test_all_identity_less_returns_none(self):
+        """(e, mirror) A list that survives sanitization but carries no
+        identity at all yields None, not an empty list."""
+        from fused_memory.reconciliation.flag_dedup import _persistable_cited_tasks
+
+        result = _persistable_cited_tasks([{'title': 'a'}, {'title': 'b'}, 'junk'])
+        assert result is None, (
+            f'an all-identity-less list must yield None, not []; got {result!r}'
+        )
+
+    def test_returns_a_new_list_and_does_not_mutate_input(self):
+        """(f) The projection is pure — the in-memory resolution list handed to
+        the resolver must be untouched by what gets persisted."""
+        import copy
+
+        from fused_memory.reconciliation.flag_dedup import _persistable_cited_tasks
+
+        entries = [
+            {'title': 'identity-less'},
+            {'project_id': 'p', 'task_id': '1'},
+        ]
+        snapshot = copy.deepcopy(entries)
+        result = _persistable_cited_tasks(entries)
+        assert entries == snapshot, (
+            f'the input list must not be mutated; got {entries!r}'
+        )
+        assert result is not entries, (
+            'the projection must return a NEW list, not the caller\'s'
+        )
+
+    def test_max_persisted_cited_tasks_is_a_sane_ceiling(self):
+        """(g) SANITY FLOOR: realistic cited_tasks lists are 1-5 entries, so the
+        cap must never bite in normal operation — it exists only to bound the
+        cross-cycle feedback loop."""
+        from fused_memory.reconciliation.flag_dedup import _MAX_PERSISTED_CITED_TASKS
+
+        assert isinstance(_MAX_PERSISTED_CITED_TASKS, int), (
+            f'the cap must be an int; got {_MAX_PERSISTED_CITED_TASKS!r}'
+        )
+        assert not isinstance(_MAX_PERSISTED_CITED_TASKS, bool), (
+            f'the cap must be an int, not a bool; got {_MAX_PERSISTED_CITED_TASKS!r}'
+        )
+        assert _MAX_PERSISTED_CITED_TASKS >= 8, (
+            'the cap must sit well above realistic 1-5 entry citation lists; '
+            f'got {_MAX_PERSISTED_CITED_TASKS!r}'
+        )
+
+    def test_union_still_keeps_identity_less_entries_in_memory(self):
+        """The projection is PERSISTENCE-ONLY: ``_union_cited_tasks`` keeps
+        identity-less entries in the in-memory resolution list it returns, and
+        this step must not change that (they cost nothing — the resolver skips
+        them — and narrowing the union would be an unrelated behaviour change).
+        """
+        from fused_memory.reconciliation.flag_dedup import _union_cited_tasks
+
+        result = _union_cited_tasks([{'title': 'identity-less'}, {'project_id': 'p', 'task_id': '1'}], None)
+        assert result == [
+            {'title': 'identity-less'},
+            {'project_id': 'p', 'task_id': '1'},
+        ], f'_union_cited_tasks must still pass identity-less entries through; got {result!r}'
+
+
+# ---------------------------------------------------------------------------
 # ---- task 4381 step-7 ----
 # RED: dedup_flags' HIT-path cross-project fix-task suppression gate.
 # ---------------------------------------------------------------------------
