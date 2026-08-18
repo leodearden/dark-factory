@@ -6636,7 +6636,9 @@ class TestPerProjectLockDepth:
         assert effective_lock_depth(str(tmp_path), 2) == 12
 
         assert effective_lock_depth('', 2) == 2
-        # None today reaches the fallback only incidentally, via the broad
-        # ``except`` (logging a NoneType/__fspath__ warning) rather than by a
-        # deliberate guard. Pin it so it stays a decision.
+        # ``None`` used to reach the fallback only incidentally, via the broad
+        # ``except`` (logging a NoneType/__fspath__ warning); the falsy guard
+        # now handles it deliberately, and the signature admits ``str | Path |
+        # None`` so that is a typed contract rather than an accident. Pin it so
+        # it stays a decision.
         assert effective_lock_depth(None, 2) == 2
