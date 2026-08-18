@@ -2765,6 +2765,139 @@ class TestAddMembersToL2:
             f'Expected 3 unique members (esc-l1-0, esc-l1-1, esc-l1-2), got {result.members}'
         )
 
+    # -- C2: incoming framing is PRESERVED, not discarded (task 3997) --------
+
+    def _framed_l2(self, queue: EscalationQueue) -> Escalation:
+        """A pending L2 carrying its OWN original framing, so it is assertable."""
+        esc = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='ORIGINAL one-line hypothesis',
+            detail='ORIGINAL evidence text',
+            root_cause='Bad merge strategy',
+            options=['A: fix', 'B: rollback'],
+            level=2,
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        return esc
+
+    def _on_disk(self, queue: EscalationQueue, esc_id: str) -> Escalation:
+        return Escalation.from_json((queue.queue_dir / f'{esc_id}.json').read_text())
+
+    def test_add_members_preserves_incoming_framing(self, tmp_path: Path):
+        """A fold's incoming framing is APPENDED to `amendments`, never discarded.
+
+        C2.  Repeated promotes of the same cluster used to drop every incoming
+        root_cause/evidence/options/summary on the floor (measured: 336,875
+        characters lost).  They are now preserved alongside — never instead of —
+        the record's own original framing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        original_ts = l2.timestamp
+
+        result = queue.add_members_to_l2(
+            l2.id, ['esc-l1-1'],
+            root_cause='canonical root cause v2',
+            evidence='NEW evidence text authored by this promote',
+            options=['C: third way'],
+            summary='new one-line hypothesis',
+            agent_role='escalation-watcher-auto',
+        )
+
+        assert result is not None
+        # (a) the incoming framing landed, verbatim.
+        assert len(result.amendments) == 1, (
+            f'Expected exactly one amendment, got {result.amendments!r}'
+        )
+        amendment = result.amendments[0]
+        assert amendment['root_cause'] == 'canonical root cause v2'
+        assert amendment['summary'] == 'new one-line hypothesis'
+        assert amendment['options'] == ['C: third way']
+        assert amendment['detail'] == 'NEW evidence text authored by this promote', (
+            "the incoming `evidence` argument is stored under `detail` — the same "
+            f'field the create path writes it to; got {amendment!r}'
+        )
+        assert amendment['agent_role'] == 'escalation-watcher-auto'
+
+        # (b) the queue stamped the clock itself — a real, parseable ISO instant.
+        from datetime import datetime
+        assert amendment['timestamp'], f'amendment carries no timestamp: {amendment!r}'
+        datetime.fromisoformat(amendment['timestamp'])
+
+        # (c) APPEND, NOT OVERWRITE: the record's own framing is immutable.
+        assert result.root_cause == 'Bad merge strategy'
+        assert result.detail == 'ORIGINAL evidence text'
+        assert result.options == ['A: fix', 'B: rollback']
+        assert result.summary == 'ORIGINAL one-line hypothesis'
+        assert result.timestamp == original_ts
+
+        # (d) DURABILITY: it is on disk, not just on the returned object.
+        reloaded = self._on_disk(queue, l2.id)
+        assert reloaded.amendments == result.amendments, (
+            f'amendment did not survive to disk: {reloaded.amendments!r}'
+        )
+        assert reloaded.root_cause == 'Bad merge strategy'
+
+    def test_add_members_records_amendment_with_no_new_members(self, tmp_path: Path):
+        """A framing-only fold (ZERO new members) still preserves the framing.
+
+        This is the repeated-promote-of-the-same-cluster case where the measured
+        336,875 characters were lost: `if not new_member_ids and severity_floor
+        is None: return esc` treated it as a no-op and discarded the framing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        assert l2.updated_at is None
+
+        result = queue.add_members_to_l2(
+            l2.id, [],
+            root_cause='same cluster, third pass',
+            evidence='third-pass evidence',
+            summary='third-pass hypothesis',
+            agent_role='escalation-watcher-auto',
+        )
+
+        assert result is not None
+        assert len(result.amendments) == 1, (
+            f'A framing-only fold must NOT be treated as a no-op: {result.amendments!r}'
+        )
+        assert result.amendments[0]['detail'] == 'third-pass evidence'
+        # New framing IS a substantive content change: it is exactly the
+        # re-assess trigger the watcher's stamp-then-skip protocol keys off
+        # (updated_at > triaged_at), so it must bump rather than sit silent.
+        assert result.updated_at is not None, (
+            'A framing-only fold must stamp updated_at — otherwise a record that '
+            'silently gained new framing is skipped forever'
+        )
+        assert result.members == ['esc-l1-0'], (
+            f'members must be untouched by a framing-only fold, got {result.members}'
+        )
+        assert self._on_disk(queue, l2.id).amendments == result.amendments
+
+    def test_add_members_without_framing_records_no_amendment(self, tmp_path: Path):
+        """The existing two-positional-arg call form appends nothing (back-compat).
+
+        No framing means no amendment: a bare member append must not manufacture
+        an empty row that burns cap budget and reads as a reframing that never
+        happened.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-1'])
+
+        assert result is not None
+        assert result.members == ['esc-l1-0', 'esc-l1-1']
+        assert result.amendments == [], (
+            f'A framing-free call must record no amendment, got {result.amendments!r}'
+        )
+        assert self._on_disk(queue, l2.id).amendments == []
+
 
 class TestStampTriage:
     """EscalationQueue.stamp_triage() stamps a triage-ack annotation on a pending record.
