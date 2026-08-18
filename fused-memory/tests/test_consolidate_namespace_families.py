@@ -74,6 +74,7 @@ def _make_backend_pager(
     pages: list[list] | None = None,
     *,
     raise_budget_after: int | None = None,
+    raise_exc: BaseException | None = None,
     calls: list | None = None,
 ) -> MagicMock:
     """Mem0Backend stand-in whose scroll_collection_pages is an async generator.
@@ -83,13 +84,25 @@ def _make_backend_pager(
     it drives ``backend.scroll_collection_pages`` and the pages are its
     business.  *pages* is a list of point-lists purely so a test can prove
     points from page 2+ still arrive; *raise_budget_after* makes the
-    generator raise ``ScrollPageBudgetExhausted`` mid-stream after that many
-    points, modelling a collection larger than the page budget.
+    generator raise mid-stream after that many points, modelling a collection
+    larger than the page budget.
+
+    *raise_exc* substitutes an ARBITRARY exception for the default
+    ``ScrollPageBudgetExhausted`` at that same position -- the backend
+    propagates a ``TimeoutError`` from its per-page ``asyncio.wait_for`` and
+    any transport error, so the drain has to survive more than a budget cap.
 
     *calls* collects ``(collection, kwargs)`` per scroll.
     """
     call_log = calls if calls is not None else []
     page_list = pages if pages is not None else []
+
+    def _boom(collection):
+        if raise_exc is not None:
+            return raise_exc
+        return _mod.ScrollPageBudgetExhausted(
+            f'collection={collection!r} exhausted its page budget',
+        )
 
     async def _scroll_collection_pages(collection, **kwargs):
         call_log.append((collection, dict(kwargs)))
@@ -97,15 +110,11 @@ def _make_backend_pager(
         for page in page_list:
             for point in page:
                 if raise_budget_after is not None and emitted >= raise_budget_after:
-                    raise _mod.ScrollPageBudgetExhausted(
-                        f'collection={collection!r} exhausted its page budget',
-                    )
+                    raise _boom(collection)
                 yield point
                 emitted += 1
         if raise_budget_after is not None and emitted >= raise_budget_after:
-            raise _mod.ScrollPageBudgetExhausted(
-                f'collection={collection!r} exhausted its page budget',
-            )
+            raise _boom(collection)
 
     backend = MagicMock()
     backend.scroll_collection_pages = _scroll_collection_pages
@@ -1299,6 +1308,86 @@ class TestScrollCollectionPoints:
         )
 
     @pytest.mark.asyncio
+    async def test_a_timeout_mid_drain_is_caught_and_reported_as_capped(self, caplog):
+        """A TimeoutError must be caught too, not just a budget cap.
+
+        The backend deliberately PROPAGATES the TimeoutError from its
+        per-page ``asyncio.wait_for``, so a slow Qdrant aborts this drain.
+        The docstring's stated rationale -- a raising sub-operation must not
+        abort the whole consolidation run, because earlier keys/sections of
+        the same --apply pass may already hold committed mutations -- applies
+        to ANY drain failure, not only the one subclass named in the except.
+        This is the file's established idiom: delete_empty_collection catches
+        bare Exception, logs a WARNING, and returns UNRESOLVED.
+        """
+        backend = _make_backend_pager(
+            [[_make_point('p1'), _make_point('p2')], [_make_point('p3')]],
+            raise_budget_after=2,
+            raise_exc=TimeoutError('too slow'),
+        )
+
+        with caplog.at_level('WARNING'):
+            point_count, capped = await _mod.scroll_collection_points(
+                backend, 'reify_reify', page_size=2,
+            )
+
+        assert capped is True, 'a failed enumeration is incomplete, i.e. capped'
+        assert point_count == 2, 'the count reached before the drain died'
+        messages = [rec.message for rec in caplog.records]
+        assert any('reify_reify' in m for m in messages), (
+            f'the WARNING must name the collection; got {messages}'
+        )
+        assert any('too slow' in m for m in messages), (
+            f'the WARNING must name the exception; got {messages}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_transport_error_mid_drain_is_caught_and_reported_as_capped(self, caplog):
+        """Same for a generic transport-shaped failure -- the guard is not
+        special-cased to TimeoutError either."""
+        backend = _make_backend_pager(
+            [[_make_point('p1')], [_make_point('p2')]],
+            raise_budget_after=1,
+            raise_exc=RuntimeError('connection reset'),
+        )
+
+        with caplog.at_level('WARNING'):
+            point_count, capped = await _mod.scroll_collection_points(
+                backend, 'fused_dark-factory', page_size=1,
+            )
+
+        assert (point_count, capped) == (1, True)
+        assert any('connection reset' in rec.message for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_budget_exhaustion_keeps_its_own_remediation_message(self, caplog):
+        """The two failures must not share one message.
+
+        Telling an operator to raise the page budget after a network timeout
+        is WRONG advice -- it sends them to re-run a bigger scroll against a
+        transport that is failing. Only the budget branch carries the
+        --max-pages/--limit remediation.
+        """
+        budget_backend = _make_backend_pager([[_make_point('p1')]], raise_budget_after=1)
+        with caplog.at_level('WARNING'):
+            await _mod.scroll_collection_points(budget_backend, 'reify_reify')
+        budget_msgs = ' '.join(rec.message for rec in caplog.records)
+        assert '--max-pages' in budget_msgs and '--limit' in budget_msgs
+
+        caplog.clear()
+        timeout_backend = _make_backend_pager(
+            [[_make_point('p1')]], raise_budget_after=1, raise_exc=TimeoutError('too slow'),
+        )
+        with caplog.at_level('WARNING'):
+            await _mod.scroll_collection_points(timeout_backend, 'reify_reify')
+        generic_msgs = ' '.join(rec.message for rec in caplog.records)
+        assert generic_msgs, 'the generic failure must still warn'
+        assert '--max-pages' not in generic_msgs, (
+            'raise-the-budget is wrong advice after a transport failure; got '
+            f'{generic_msgs!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_no_warning_on_a_clean_drain(self):
         """A fully-drained scroll is not a cap and must not warn."""
         import logging as _logging
@@ -1522,6 +1611,47 @@ class TestMergeCollection:
         assert any('reify_reify' in rec.message for rec in caplog.records), (
             'no-silent-caps: the WARNING must name the collection; got '
             f'{[r.message for r in caplog.records]}'
+        )
+
+
+    @pytest.mark.asyncio
+    async def test_a_transport_error_mid_drain_also_withholds_the_delete(self, caplog):
+        """A NON-budget failure after some chunks landed must never authorise
+        deleting the source.
+
+        A TimeoutError from the backend's per-page asyncio.wait_for, or any
+        transport error, leaves the enumeration exactly as incomplete as a
+        budget cap does -- the un-drained remainder is still only in the
+        source. Mirrors delete_empty_collection's except-Exception -> WARNING
+        -> UNRESOLVED idiom rather than propagating and aborting a pass whose
+        earlier sections may already hold committed mutations.
+        """
+        pages = [
+            [_make_point('p1'), _make_point('p2')],
+            [_make_point('p3'), _make_point('p4')],
+        ]
+        backend = _make_backend_pager(
+            pages, raise_budget_after=3, raise_exc=TimeoutError('too slow'),
+        )
+        client = _make_qdrant_mock()
+
+        with caplog.at_level('WARNING'):
+            result = await _mod.merge_collection(
+                backend, client, 'reify_reify', 'fused_reify', 'reify', page_size=2,
+            )
+
+        client.delete_collection.assert_not_called()
+        assert result['source_deleted'] is False
+        assert result['enumeration_incomplete'] is True
+        landed = sum(len(c.kwargs['points']) for c in client.upsert.call_args_list)
+        assert result['points_upserted'] == landed
+        messages = [rec.message for rec in caplog.records]
+        assert any('reify_reify' in m for m in messages), messages
+        assert any('too slow' in m for m in messages), (
+            f'the WARNING must name the exception; got {messages}'
+        )
+        assert not any('--max-pages' in m for m in messages), (
+            'raise-the-budget is wrong advice after a transport failure'
         )
 
 
