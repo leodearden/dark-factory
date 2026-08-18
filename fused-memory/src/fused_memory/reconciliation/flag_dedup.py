@@ -93,6 +93,21 @@ by family within the same call, so one call cannot mint its own
 multi-row companion sprawl either.  See ``filter_suppressed`` and
 ``write_suppression_record`` for full semantics.
 
+``dedup_flags`` has a SECOND way to drop a flag (task 4381 / esc-3841-1):
+the cross-project fix-task gate.  When the optional ``taskmaster`` /
+``known_projects`` kwargs are supplied and a flag's ledger lookup was a HIT,
+its ``cited_tasks`` are resolved via
+``_resolve_live_cross_project_fix_task``; a live, non-cancelled task in a
+DIFFERENT known project drops the flag rather than re-asserting it.  The
+gate is HIT-only (a first-cycle finding is never suppressed),
+foreign-project-only, and fail-open in every direction — omitting either
+kwarg restores the pre-4381 behaviour exactly.  Note this gate reaches only
+the Stage 1 STRUCTURED-REPORT channel (``report.items_flagged``); Stage 2
+independently re-surfaces flags from Mem0 via
+``task_knowledge_sync._query_stage2_flags``, where no code filter here can
+reach them — which is why the Stage 2 prompt carries the matching
+instruction (see the note at the top of this docstring).
+
 Completion-marker same-cycle self-delete (task-2312)
 -----------------------------------------------------
 Some Stage 1 findings represent ONE-TIME completed/bookkeeping work (e.g.
@@ -718,6 +733,9 @@ async def dedup_flags(
     project_id: str,
     run_id: str,
     flags: list[dict[str, Any]],
+    *,
+    taskmaster: Any = None,
+    known_projects: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Annotate Stage 1 flagged items against prior ``stage1_flag_marker`` ledger rows.
 
@@ -790,6 +808,40 @@ async def dedup_flags(
     shape carries.  The value is sanitized precisely so the ``json.dumps``
     inside the best-effort try/except below can never fail on LLM-authored
     content and silently skip the marker write.
+
+    Cross-project fix-task suppression (task 4381 / esc-3841-1): this is the
+    SECOND way ``dedup_flags`` can drop a flag, alongside ``filter_suppressed``
+    above.  When the OPTIONAL keyword-only *taskmaster* and *known_projects*
+    are both supplied and the ledger read was a HIT (``persisted_from_run`` is
+    set), the flag's ``cited_tasks`` are passed to
+    :func:`_resolve_live_cross_project_fix_task`; if one of them names a live,
+    non-cancelled task in ANOTHER known project, the flag is dropped instead of
+    re-asserted.  Properties, each load-bearing:
+
+    * **HIT-only.** A first-cycle finding is never suppressed — the point is to
+      stop re-asserting a complaint that has already been converted into
+      tracked work, not to pre-empt the first report of it.
+    * **Foreign-project-only.** See
+      :func:`_resolve_live_cross_project_fix_task` — a finding's own subject
+      task is routinely its own first citation.
+    * **Fail-open in every direction.** Omitting either kwarg degrades to the
+      pre-4381 behaviour exactly, which is why every existing positional call
+      site is unaffected.
+    * **The upsert still runs first.** Suppression happens AFTER the ledger
+      write, so a suppressed-but-still-recurring signature keeps its row,
+      refreshes its 14-day TTL, and re-persists ``cited_tasks``.  Skipping the
+      write would let the marker age out and lose the recurrence history the
+      cancelled-fix-task path depends on.
+
+    Args:
+        memory_service: Service exposing ``recon_ledger`` (may be absent/None).
+        project_id: The project this reconciliation run belongs to.
+        run_id: The current run's id.
+        flags: Stage 1 ``items_flagged``.
+        taskmaster: Optional object with an async ``get_task(task_id,
+            project_root)``, enabling the cross-project suppression gate.
+        known_projects: Optional ``project_id -> project_root`` map, enabling
+            the same gate.  Both must be truthy for it to run at all.
 
     Returns the (possibly annotated) flag list.
     """
@@ -984,6 +1036,26 @@ async def dedup_flags(
         if persisted_from_run is not None:
             flag['persisted_from_run'] = persisted_from_run
         flag['last_seen_run_id'] = run_id
+
+        # --- Cross-project fix-task suppression gate (task 4381) ---
+        # Deliberately placed AFTER the upsert above: a suppressed-but-still-
+        # recurring signature must keep its row, refresh its 14-day TTL and
+        # re-persist its cited_tasks, so the marker never ages out and loses
+        # the recurrence history the cancelled-fix-task path depends on.
+        # HIT-only: persisted_from_run is not None means this signature was
+        # carried forward from a prior cycle. A first-cycle finding is never
+        # suppressed.
+        if persisted_from_run is not None and taskmaster and known_projects:
+            fix_cite = await _resolve_live_cross_project_fix_task(
+                taskmaster, known_projects, project_id, flag.get('cited_tasks')
+            )
+            if fix_cite is not None:
+                logger.info(
+                    'reconciliation.stage1_flag_cross_project_fix_task_suppressed '
+                    'task_id=%s flag_type=%s fix_project_id=%s fix_task_id=%s',
+                    tid, ftype, fix_cite.get('project_id'), fix_cite.get('task_id'),
+                )
+                continue
 
         result.append(flag)
     return result
