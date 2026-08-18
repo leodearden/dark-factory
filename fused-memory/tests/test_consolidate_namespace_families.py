@@ -1130,7 +1130,12 @@ class TestMergeGraphFamily:
 
 class TestScrollCollectionPoints:
     """async scroll_collection_points(backend, collection, *, page_size, max_pages)
-    -> (points, capped).
+    -> (point_count, capped).
+
+    This is the read-only PREFLIGHT: it establishes ``point_count`` for the
+    report and ``capped`` for run()'s ``if args.apply and not capped`` guard,
+    and it holds NO point list -- peak memory is O(1) regardless of
+    collection size.  merge_collection performs the sole with-vectors drain.
 
     Task 3225: this used to issue exactly ONE scroll and discard
     ``next_offset``, so a collection larger than --limit was permanently
@@ -1138,28 +1143,36 @@ class TestScrollCollectionPoints:
     ``Mem0Backend.scroll_collection_pages``, which pages properly -- a real
     bug fix, not a refactor.
 
-    ``capped`` can no longer be inferred from ``len(points)`` (a fully-drained
+    ``capped`` can no longer be inferred from the count (a fully-drained
     multi-page scroll returns any count), so it is RETURNED explicitly.
     """
 
     @pytest.mark.asyncio
-    async def test_returns_every_point_across_multiple_pages(self):
-        """THE bug fix: page 2+ arrives instead of being silently dropped."""
+    async def test_counts_every_point_across_multiple_pages(self):
+        """THE 3225 bug fix, preserved: page 2+ is still counted instead of
+        being silently dropped."""
         p1, p2, p3 = _make_point('p1'), _make_point('p2'), _make_point('p3')
         backend = _make_backend_pager([[p1, p2], [p3]])
 
-        points, capped = await _mod.scroll_collection_points(
+        point_count, capped = await _mod.scroll_collection_points(
             backend, 'reify_reify', page_size=2,
         )
 
-        assert points == [p1, p2, p3], 'a 2-page stream must yield all 3 points'
+        assert point_count == 3, 'a 2-page stream must count all 3 points'
         assert capped is False
 
     @pytest.mark.asyncio
-    async def test_requests_vectors_and_forwards_the_page_budget(self):
-        """with_vectors=True is essential -- omitting it drops embeddings from
-        the returned points, which would silently destroy them once re-upserted
-        into the target collection (see merge_collection)."""
+    async def test_does_not_request_vectors(self):
+        """POLARITY FLIP: the preflight must NOT fetch embeddings.
+
+        with_vectors=True used to be essential here because the returned
+        points were handed straight to merge_collection to upsert, and
+        omitting the vectors would have silently destroyed them.  Nothing
+        downstream reads the preflight's points any more -- merge_collection
+        drives its own with-vectors drain -- so fetching embeddings here
+        would cost multi-GB of transfer and resident memory to produce a
+        number that a counter already gives.
+        """
         calls: list = []
         backend = _make_backend_pager([[_make_point('p1')]], calls=calls)
 
@@ -1168,7 +1181,9 @@ class TestScrollCollectionPoints:
         )
 
         _collection, kwargs = calls[0]
-        assert kwargs['with_vectors'] is True
+        assert kwargs['with_vectors'] is False, (
+            'the preflight counts; it does not carry payloads anywhere'
+        )
         assert kwargs['page_size'] == 500
         assert kwargs['max_pages'] == 7
 
@@ -1186,26 +1201,48 @@ class TestScrollCollectionPoints:
         assert calls[0][0] == 'fused_dark-factory'
 
     @pytest.mark.asyncio
+    async def test_counts_without_accumulating_points(self):
+        """The preflight returns a COUNT, not a list.
+
+        The return type is the contract: an int cannot hold the points, so a
+        1000-page collection costs the same resident memory as a 1-page one.
+        Asserted through the public return value alone -- the function's
+        internals are deliberately not introspected.
+        """
+        pages = [[_make_point(f'p{i}') for i in range(50)] for _ in range(4)]
+        backend = _make_backend_pager(pages)
+
+        point_count, capped = await _mod.scroll_collection_points(
+            backend, 'reify_reify', page_size=50,
+        )
+
+        assert point_count == 200
+        assert isinstance(point_count, int) and not isinstance(point_count, bool)
+        assert capped is False
+
+    @pytest.mark.asyncio
     async def test_budget_exhaustion_is_caught_and_reported_as_capped(self, caplog):
         """A ScrollPageBudgetExhausted must NOT propagate out of this call.
 
         run_consolidation states that a raising sub-operation must never abort
         the whole run: earlier keys/sections of the same --apply pass may
         already hold committed mutations.  Budget exhaustion is instead mapped
-        onto the EXISTING capped contract -- points collected so far, capped
+        onto the EXISTING capped contract -- the count reached so far, capped
         True -- which the caller turns into UNRESOLVED (no upsert, no source
         delete, non-zero exit).
         """
-        p1, p2 = _make_point('p1'), _make_point('p2')
-        backend = _make_backend_pager([[p1, p2], [_make_point('p3')]], raise_budget_after=2)
+        backend = _make_backend_pager(
+            [[_make_point('p1'), _make_point('p2')], [_make_point('p3')]],
+            raise_budget_after=2,
+        )
 
         with caplog.at_level('WARNING'):
-            points, capped = await _mod.scroll_collection_points(
+            point_count, capped = await _mod.scroll_collection_points(
                 backend, 'reify_reify', page_size=2, max_pages=1,
             )
 
         assert capped is True
-        assert points == [p1, p2], 'the points collected before the budget ran out'
+        assert point_count == 2, 'the count reached before the budget ran out'
         assert any('reify_reify' in rec.message for rec in caplog.records), (
             'no-silent-caps: the WARNING must name the collection; got '
             f'{[r.message for r in caplog.records]}'
@@ -1222,12 +1259,12 @@ class TestScrollCollectionPoints:
         handler.emit = records.append  # type: ignore[method-assign]
         _mod.logger.addHandler(handler)
         try:
-            points, capped = await _mod.scroll_collection_points(backend, 'reify_reify')
+            point_count, capped = await _mod.scroll_collection_points(backend, 'reify_reify')
         finally:
             _mod.logger.removeHandler(handler)
 
         assert capped is False
-        assert len(points) == 1
+        assert point_count == 1
         assert [r for r in records if r.levelno >= _logging.WARNING] == []
 
 
