@@ -4248,6 +4248,28 @@ def create_mcp_server(
         in both lists, and `metadata_mode='replace'` without a non-empty
         `metadata_patch` (an empty replace would delete every custom key).
 
+        A well-formed argument set can still be turned away, by a SECOND and
+        later rejection class (task 3523): `metadata_patch` is validated
+        against the Mem0 metadata vocabulary at the service seam — the same
+        one `add_memory` and `add_system_record` go through — so an
+        off-vocabulary `topic` spelling, or a second `canonical` for a topic
+        already taken, is refused there rather than written. The checks above
+        are decided BEFORE dispatch; this one after, and only for a metadata
+        arm (a content-only amend is exempt, and an existing violation the
+        patch does not touch is not re-judged).
+
+        Both surface the way every other failure of this tool does — as an
+        `{'error', 'error_type'}` envelope, never as a `status='updated'`
+        success — because `@mcp_tool_errors()` converts the service seam's
+        `MemoryMetadataValidationError` / `CanonicalUniquenessViolation` for
+        us. It wraps `add_memory` and `add_system_record` identically, so a
+        seam rejection reads the same on every write path. `error_type` names
+        the exact class and is the whole of that distinction at this layer: a
+        caller cannot `except` an envelope, so collapsing either into a shared
+        'ValidationError' would erase a difference PRD V1 requires — malformed
+        metadata is fixable by reshaping the patch, a canonical collision is
+        not, and its message names the incumbent record to go look at.
+
         Args:
             memory_id: The memory ID (from search results)
             store: Must be "mem0"

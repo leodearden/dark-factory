@@ -31,20 +31,34 @@ rather than merely asserted.
 
 Why this script enforces ε's rules itself
 -----------------------------------------
-Measured, not assumed: ``MemoryService.update_memory`` never calls
-``_apply_memory_metadata_validation`` — that seam runs only from
-``add_memory`` and ``add_system_record``.  So a metadata-only patch reaches
-Qdrant with **no** slug-shape check and **no** canonical-uniqueness probe.
+NOT because the seam is unreachable — that was true when this script was
+written and is no longer.  Task 3523 wired
+``_apply_memory_metadata_validation`` into ``MemoryService.update_memory``,
+so a metadata-only patch from here now DOES traverse the slug-shape check
+and the canonical-uniqueness probe.  The original claim ("update_memory
+never calls it; that seam runs only from ``add_memory`` and
+``add_system_record``") is retired, not merely softened.
 
-θ is the one caller stamping ``canonical: true`` at scale, and it is exactly
-the corpus ε's ``memory_metadata.enforce`` flag cannot yet be flipped
-against.  Leaning on a seam this script does not traverse would let it write
-a second canonical for a topic, or a non-conforming slug, with equal
-silence — re-creating the defect ε shipped warn-mode to avoid.  So the two
-probes are re-expressed here against the injected service.  That is a
-deliberate, narrow INV-5 exception: the alternative — routing θ through
-``add_memory`` — would re-embed the content and change point ids, breaking
-the whole in-place-update contract this script depends on
+The INV-5 exception survives on the reason that still holds: **posture**.
+Under the shipped ``memory_metadata.enforce = false`` the seam warn-fails
+OPEN — it censuses a violation and lets the write through, and on a probe
+error it proceeds rather than refusing.  θ is the one caller stamping
+``canonical: true`` at scale, unattended, against exactly the corpus that
+flag cannot yet be flipped against.  A bulk canonical writer that proceeds
+on an unverified uniqueness probe would write the second canonical ε exists
+to prevent, and would do it silently.  So the two probes are re-expressed
+here and FAIL CLOSED (see :func:`stamp_one`), which is a posture the seam
+deliberately does not adopt for interactive writes.
+
+Read the two as layered, not redundant: the seam is the floor every write
+path now shares; this is the stricter local ceiling for an unattended one.
+Once ``enforce`` flips (task 3626), the difference narrows to probe-error
+handling alone — at which point retiring this duplication becomes a
+reviewable question rather than the silent regression it would be today.
+
+The alternative to duplicating — routing θ through ``add_memory`` — remains
+unavailable for an unrelated reason: it would re-embed the content and mint
+new point ids, breaking the in-place-update contract this script depends on
 (``plans/mem0-in-place-update-decision.md`` §3).
 
 The *rules themselves* are still single-homed.  The slug shape and its cap
@@ -1010,9 +1024,13 @@ def merge_plans(*plan_lists: list[ClusterPlan]) -> tuple[list[StampTarget], list
       make the corpus depend on which planner ran first, invisibly.
 
     The result upholds ε's <=1-canonical-per-``(project_id, topic)`` rule
-    BEFORE any write — necessary because ``update_memory`` never reaches the
-    service-side uniqueness probe, so a violating plan would reach Qdrant
-    unchallenged.
+    BEFORE any write.  The service-side probe (which ``update_memory`` does
+    reach as of task 3523) cannot substitute for this one: it adjudicates a
+    single write against live state, one record at a time, so it would let
+    the FIRST member of a within-plan duplicate pair through and only refuse
+    the second — leaving the corpus dependent on iteration order and the
+    report unable to say the plan was self-contradictory.  Catching it here
+    rejects the pair as a pair, before either is written.
 
     Output is sorted by ``(project_id, topic, memory_id)`` so two dry-runs of
     an unchanged corpus produce byte-comparable reports.
@@ -1145,9 +1163,11 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
        ``canonical`` — one ``count_memories_by_metadata`` and, only on a
        non-zero count, one bounded ``get_memories_by_metadata(limit=1)`` to
        name the incumbent.  The same two-probe shape as
-       ``services.memory_service._check_canonical_uniqueness``, re-expressed
-       here for the measured reason that ``update_memory`` never reaches
-       that seam (see the module docstring's INV-5 note).
+       ``services.memory_service._check_canonical_uniqueness``, which the
+       write in step 4 now also traverses (task 3523).  Kept because the
+       seam warn-fails OPEN under the shipped ``enforce = false`` while this
+       one fails CLOSED — see the module docstring's INV-5 note, and the
+       FAIL CLOSED paragraph below for why that is the right posture here.
     4. **write**, metadata-only and merge-mode.
 
     FAIL CLOSED on a probe error, inverting the service seam's warn-mode

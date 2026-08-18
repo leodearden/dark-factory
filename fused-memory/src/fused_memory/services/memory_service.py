@@ -460,18 +460,27 @@ async def _apply_memory_metadata_validation(
     parent_lookup: Callable[[str, str], Awaitable[dict | None]],
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
+    baseline: dict | None = None,
 ) -> None:
     """Validate the Mem0 metadata vocabulary at the write boundary, in place.
 
     Task 3195 (leaf β of ``docs/prds/memory-metadata-vocabulary.md``).  The
     third of this module's shared in-place metadata helpers, alongside
     :func:`_normalize_task_id_metadata` and
-    :func:`_apply_cycle_summary_metadata_tagging`, and shared by
-    ``add_memory`` and ``add_system_record`` for the same reason the
-    task-2222 amendment made the cycle-summary tagging shared: PRD D8/§2 pin
-    enforcement at the SERVICE seam precisely because ``add_system_record``
-    is a second write path that a tools-layer validator would leak past.
-    Two call sites with drifting behaviour would reopen that hole.
+    :func:`_apply_cycle_summary_metadata_tagging`, and shared by ALL THREE
+    Mem0 write paths — ``add_memory``, ``add_system_record`` and (task 3523)
+    ``update_memory`` — for the same reason the task-2222 amendment made the
+    cycle-summary tagging shared: PRD D8/§2 pin enforcement at the SERVICE
+    seam precisely because ``add_system_record`` is a second write path that
+    a tools-layer validator would leak past.  Call sites with drifting
+    behaviour would reopen that hole.
+
+    ``update_memory`` is the third such path and reproduced exactly that
+    leak until task 3523: a patch could set any ``topic`` spelling or a
+    second ``canonical`` for a taken topic without ever reaching this
+    function.  D8/§2 enumerated only the two add paths, and that silence
+    read as coverage.  If a FOURTH write path appears, it belongs here too —
+    the enumeration above is the checkable list.
 
     Discharges five obligations:
 
@@ -488,6 +497,50 @@ async def _apply_memory_metadata_validation(
        above: malformed metadata is refused on shape before any live-state
        probe is spent on it.
 
+    ``baseline`` — JUDGE THE DELTA, NEVER THE CORPUS (task 3523).  The two
+    add paths CREATE a record, so there is no pre-image: they pass no
+    ``baseline`` and every obligation above applies to the whole dict,
+    bit-identically to before this parameter existed.  ``update_memory``
+    AMENDS one, and passes the record's pre-image custom subset.  When it is
+    supplied, obligations 2 through 5 are reduced to what this write actually
+    CHANGED — a violation the record already carried (on a key this write
+    left alone) is neither re-censused nor re-rejected, the ``parent_id``
+    liveness probe fires only for a parent this write ASSERTS, and the
+    uniqueness probe fires only for a ``canonical``/``topic`` claim the
+    record does not already hold.
+
+    That reduction has THREE implementation sites, not one, because the
+    rules reach live state differently.  Obligations 3 and 4 are reduced by
+    the ``(key, code)`` subtraction below; obligation 5 by
+    :func:`_check_canonical_uniqueness`'s guard 3; obligation 2 by its own
+    claim-is-NEW gate on the liveness block, because the subtraction
+    structurally cannot see liveness codes (the pure validator cannot
+    produce them) and would let both survive every patch.  A fourth rule
+    that reads live state needs its own gate too — the subtraction will not
+    cover it.
+
+    That reduction is not a leniency knob; it is what keeps ``enforce``
+    meaning "reject WRITES" instead of quietly becoming "re-validate the
+    corpus".  Both PRD §9 leaf ε's 2026-08-04 amendment and
+    :func:`_check_canonical_uniqueness` state that model in prose, and task
+    3626's decision to flip ``enforce`` on is measured against it (~20 → ~19
+    false rejections/week).  Validating the full effective dict on every
+    patch would silently invalidate that measurement: legacy records are
+    known fatal-invalid today (``scripts/sweep_toolcall_xml_leak.py``
+    enumerates the classes — unknown ``kind``, malformed ``supersedes``,
+    non-bool ``canonical``), so re-tagging exactly those records would start
+    failing the moment the flip landed.  ``scripts/retro_stamp_topics.py``
+    is the in-repo bulk re-tagger that would hit it: it stamps ``topic``
+    onto legacy records through THIS path, one metadata-only patch each.
+    (That sweep is cited for the enumeration and for the re-tagging
+    exposure, NOT as a caller of this arm — it repairs by delete + re-add
+    through ``add_memory`` and pre-checks with ``validate_memory_metadata``
+    itself, so it never reaches ``update_memory``.)  Costs one extra PURE
+    synchronous
+    ``validate_memory_metadata`` call on a shallow copy, and zero I/O; see
+    the block comment at the subtraction for the two-halves forgiveness rule
+    and its ordering constraints.
+
     LIVENESS IS HERE, NOT IN THE REGISTRY, on purpose.  Leaf β made
     ``validate_memory_metadata`` a pure synchronous function taking only a
     dict, so it structurally *cannot* perform a store lookup — a boundary
@@ -500,10 +553,13 @@ async def _apply_memory_metadata_validation(
     :func:`~fused_memory.memory_metadata.parent_liveness_violation`, so the
     rule still has exactly one normative home.
 
-    The lookup fires only when ``parent_id`` is PRESENT *and* already
-    shape-valid: the common write path (no ``parent_id`` at all — leaf α
-    measured zero live records carrying one) pays no round-trip, and an id
-    no store could resolve is never spent on.  Liveness ADDS a violation
+    The lookup fires only when ``parent_id`` is PRESENT, already
+    shape-valid, *and* (task 3523, when a ``baseline`` is supplied) actually
+    ASSERTED by this write: the common write path (no ``parent_id`` at all —
+    leaf α measured zero live records carrying one) pays no round-trip, an
+    id no store could resolve is never spent on, and a patch that leaves an
+    existing ``parent_id`` untouched is answerable for neither the lookup
+    nor its verdict.  Liveness ADDS a violation
     rather than opening a second rejection path: because
     ``parent_liveness_violation`` is ``fatal=True``, warn mode censuses and
     proceeds while ``enforce`` rejects, both through the same arms below.
@@ -555,7 +611,31 @@ async def _apply_memory_metadata_validation(
     # `validate_memory_metadata` emits `invalid_parent_id_shape` under the
     # same key, so any parent_id-keyed violation means the id is malformed
     # and no store could resolve it in that spelling.
-    if 'parent_id' in meta and not any(v.key == 'parent_id' for v in violations):
+    #
+    # ALSO gated on the parent_id claim being NEW (task 3523), mirroring
+    # `_check_canonical_uniqueness`'s guard 3 in shape and for the same
+    # reason. Liveness is the ONE rule the (key, code) subtraction below
+    # structurally cannot delta-scope: the baseline set is built by the PURE
+    # `validate_memory_metadata`, which cannot produce `dead_parent_id` or
+    # `parent_id_liveness_unavailable`, so those codes would survive the
+    # subtraction on EVERY patch — including one that never mentions
+    # parent_id. A record whose parent was later deleted would then become
+    # permanently un-patchable under `enforce` (and census a `dead_parent_id`
+    # line per patch under the shipped warn mode), which is exactly the
+    # "`enforce` re-validates the corpus" failure the delta rule exists to
+    # prevent. So the scoping happens HERE, at the source, instead.
+    #
+    # Fail-CLOSED is preserved for every write that ASSERTS a parent: a new
+    # or CHANGED parent_id still pays the round-trip and still rejects under
+    # `enforce`. Only an untouched pre-existing one is forgiven — the same
+    # value-unchanged half the shape rules use below. Compared raw rather
+    # than against the normalized copy because `validate_memory_metadata`'s
+    # only in-place mutation is `supersedes`; `parent_id` is never rewritten.
+    if (
+        'parent_id' in meta
+        and (baseline is None or baseline.get('parent_id') != meta['parent_id'])
+        and not any(v.key == 'parent_id' for v in violations)
+    ):
         try:
             parent = await parent_lookup(project_id, meta['parent_id'])
         except Exception as exc:
@@ -580,6 +660,64 @@ async def _apply_memory_metadata_validation(
             violations.append(
                 parent_liveness_violation(meta['parent_id'], code=liveness_code)
             )
+
+    # DELTA SCOPING (task 3523) — judge what this write CHANGED, never the
+    # record at rest.  Supplied only by `update_memory`, which is amending an
+    # existing record; the two add paths create one and so have no pre-image,
+    # pass no baseline, and are bit-identical to before.
+    #
+    # Reducing the set here, ONCE, is what makes the rule uniform: all three
+    # arms below — census, storm detector, enforce-reject — then operate on
+    # NEW violations only.  Re-censusing a pre-existing violation on every
+    # patch would inflate the census stream the task-3626 flip is measured
+    # from and trip false unknown-key storms off a long tail that was already
+    # counted; re-rejecting one would quietly restate `enforce` from "rejects
+    # WRITES" to "re-validates the corpus", which is the model both
+    # `_check_canonical_uniqueness`'s docstring and PRD §9 leaf ε's
+    # 2026-08-04 amendment state and measure against.
+    #
+    # AFTER the liveness block on purpose: that block gates its round-trip on
+    # `parent_id` carrying no shape violation, so subtracting first would let
+    # a pre-existing `invalid_parent_id_shape` spend a lookup on an id no
+    # store could resolve and then census `dead_parent_id` for it — blaming
+    # the wrong rule, which leaf δ explicitly forbids.
+    #
+    # THIS SUBTRACTION DOES NOT DELTA-SCOPE LIVENESS, and cannot: `already`
+    # comes from the PURE `validate_memory_metadata`, which structurally
+    # cannot emit `dead_parent_id` / `parent_id_liveness_unavailable`, so
+    # `(v.key, v.code) not in already` is unconditionally True for both and
+    # they would survive every patch. Liveness is delta-scoped at its SOURCE
+    # instead — see the claim-is-NEW gate on the block above. Do not "unify"
+    # the two by deleting that gate and relying on this list comprehension:
+    # it would silently reinstate corpus re-validation for exactly one rule.
+    #
+    # Forgiven only when BOTH halves hold: the baseline already carried this
+    # (key, code) AND the write left that key's value alone.  (key, code)
+    # alone is not enough — swapping one bad slug for a DIFFERENT bad slug
+    # repeats the pair while being entirely this write's doing, and would
+    # earn a free pass.  "Judge what the write CHANGED" is about the KEY's
+    # value, not about which rule happens to fire.
+    #
+    # Compared against the NORMALIZED baseline copy, not the raw pre-image:
+    # `validate_memory_metadata` mutates in place, so a record whose stored
+    # `supersedes` is a legacy scalar would otherwise read as "changed" on
+    # every patch that never mentioned it.
+    #
+    # One extra PURE synchronous call on a shallow COPY, and zero I/O.
+    if baseline is not None:
+        _unset = object()
+        before = dict(baseline)
+        already = {
+            (v.key, v.code)
+            for v in validate_memory_metadata(
+                before, enforce_kind_registry=config.enforce_kind_registry
+            )
+        }
+        violations = [
+            v for v in violations
+            if (v.key, v.code) not in already
+            or meta.get(v.key, _unset) != before.get(v.key, _unset)
+        ]
 
     # NOTE: this is `if violations:`, not an early `return` — the canonical
     # uniqueness re-check below must still run for metadata that is
@@ -619,6 +757,7 @@ async def _apply_memory_metadata_validation(
         config=config,
         count_canonical=count_canonical,
         find_canonical=find_canonical,
+        baseline=baseline,
     )
 
 
@@ -637,6 +776,7 @@ async def _check_canonical_uniqueness(
     config: MemoryMetadataConfig,
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
+    baseline: dict | None = None,
 ) -> None:
     """Enforce <=1 canonical memory per ``(project, topic)`` (PRD V1, INV-3).
 
@@ -707,9 +847,30 @@ async def _check_canonical_uniqueness(
        was already reported by the pure validator, and we must never build
        a query on a malformed key (``count_by_metadata`` also rejects an
        empty filter).
-    3. count == 0 → return.  The happy path pays exactly one exact Qdrant
+    3. *baseline* supplied and the effective ``(canonical, topic)`` claim
+       EQUALS the baseline's → return (task 3523).  This write asserts no
+       claim the record does not already hold, so there is nothing new to
+       check, and ε's contracted zero-extra-round-trips property must hold
+       for a no-op too.  Only ``update_memory`` supplies a baseline; the two
+       add paths pass none, keep this guard inert, and so keep today's exact
+       guard order and round-trip count.
+
+       THIS IS WHAT MAKES SELF-INCUMBENCY STRUCTURALLY IMPOSSIBLE — do not
+       "fix" it later by adding an ``exclude_id``.  The probe now runs only
+       when the record is ACQUIRING a claim, and a record that does not yet
+       hold the claim in the store cannot appear in the store-side count.
+       An ``exclude_id`` would instead cost an extra round-trip on every
+       canonical patch, need ``limit=2`` to filter self out of the scroll,
+       add a parameter to both injected collaborators, and risk
+       over-excluding a genuine duplicate — while STILL needing this guard
+       to avoid probing on a no-op.
+
+       Compared as a PAIR, not on ``canonical`` alone: a canonical record
+       re-homed from topic T to topic U changes no ``canonical`` value but
+       is acquiring a claim at U, where it genuinely is not the incumbent.
+    4. count == 0 → return.  The happy path pays exactly one exact Qdrant
        count and never scrolls.
-    4. otherwise resolve the incumbent's id and reject.
+    5. otherwise resolve the incumbent's id and reject.
 
     WHY COUNT THEN SCROLL: V1 contract-fixes ``count_memories_by_metadata``
     as the INV-3 mechanism, but also requires the error to name the existing
@@ -745,6 +906,17 @@ async def _check_canonical_uniqueness(
       who were never told the rule: ``_MEMORY_INSTRUCTIONS`` still carries
       no slug guidance.  THE REAL PRECONDITION is leaf ι (task 3202).
 
+    STILL TRUE AFTER TASK 3523, and deliberately so.  Wiring this seam into
+    ``update_memory`` added a third write path, but its enforcement is
+    DELTA-scoped: a patch is judged only on the violations and claims it
+    introduces, so amending a record never re-validates what that record
+    already carried.  Had it been full-dict instead, every patch of a legacy
+    record would have become a rejection under ``enforce`` and the ~19/week
+    figure above — the number 3626 flips against — would have silently
+    stopped describing the system.  Guard 3 is the uniqueness half of that
+    rule; see :func:`_apply_memory_metadata_validation`'s ``baseline`` for
+    the shape half.
+
     Task 3626 is the gate that re-measures and decides the flip; it carries
     the full model and the re-measurement recipes.  Do not flip from this
     docstring alone.
@@ -763,6 +935,14 @@ async def _check_canonical_uniqueness(
 
     topic = meta.get('topic')
     if not isinstance(topic, str) or not is_valid_topic_slug(topic):
+        return
+
+    # Guard 3 (task 3523) — no NEW claim, no probe.  See the numbered list in
+    # the docstring: this is what makes the record's own presence in the
+    # store irrelevant, so no `exclude_id` is needed anywhere below.
+    if baseline is not None and (
+        (baseline.get('canonical'), baseline.get('topic')) == (True, topic)
+    ):
         return
 
     filters = {'topic': topic, 'canonical': True}
@@ -4915,10 +5095,41 @@ class MemoryService:
         fails those loud before dispatching here — mirroring how ``update_edge``
         splits its boundary checks from its write path.
 
+        METADATA VOCABULARY is the exception, and belongs HERE (task 3523).  A
+        patch runs :func:`_apply_memory_metadata_validation` at this seam, the
+        same one ``add_memory`` and ``add_system_record`` use, for the reason
+        PRD D8 pins enforcement at the service layer: a tools-layer validator
+        leaks past every additional write path, and this was the third one.
+        Placed after the §5(c) existence check and before every journaled
+        backend call, so a rejection cannot leave a journal row, a partial
+        write, or a pending mem0 intent behind.
+
+        Two properties of that check are deliberate and easy to "simplify" away:
+
+        * It is DELTA-scoped — only violations and ``canonical`` claims NEW
+          relative to the record's pre-image are judged.  Amending a record
+          never re-validates the record.  See ``baseline`` on the seam.
+        * A CONTENT-ONLY amend does not run it at all.  Such a write leaves the
+          metadata byte-identical, so there is nothing it is responsible for.
+          That reason stands unaided; the consequence of getting it wrong is
+          that a legacy record's TEXT would become uncorrectable under
+          ``enforce`` because of metadata the amend never touched.
+
         Returns the ``{'status': 'updated', 'store': 'mem0', 'id': memory_id,
         ...}`` envelope on success, or a structured ``{'error_type': ...}``
         rejection. The id is echoed so a caller can assert identity stability
         straight from the response instead of re-fetching.
+
+        A vocabulary rejection is the one outcome that does NOT use that
+        envelope: :class:`MemoryMetadataValidationError` and
+        :class:`CanonicalUniquenessViolation` PROPAGATE from here, exactly as
+        they do from ``add_memory``.  PRD V1 keeps the two deliberately
+        distinguishable at an ``except`` (neither subclasses the other), and
+        flattening them into ``error_type`` strings at this layer would discard
+        their structured fields — the incumbent id a caller needs in order to
+        act.  The MCP tool above converts every exception to an
+        ``{'error', 'error_type'}`` envelope via ``@mcp_tool_errors()``, and
+        does so identically for all three write paths.
 
         *emit_event* forces a ``memory_updated`` event on a metadata-only route,
         which is otherwise silent (a patch leaves the record saying the same
@@ -4980,10 +5191,12 @@ class MemoryService:
         # metadata-only path — a caller must get the same resulting metadata
         # whether or not it also amended the content.
         #
-        # The set_payload / delete_payload fast paths deliberately do NOT read
-        # it: they hand the raw patch / key list to Qdrant and let it apply
-        # merge and delete SERVER-side, which is the entire reason those routes
-        # can skip a read-modify-write. So the INV-5 single-home claim is
+        # The set_payload / delete_payload fast paths read it for VALUES only
+        # (task 3523 — so the seam's `supersedes` scalar→list normalization is
+        # not lost on this route), never for merge / delete SEMANTICS: they
+        # still name only the patch keys / key list and let Qdrant apply the
+        # merge and the delete SERVER-side, which is the entire reason those
+        # routes can skip a read-modify-write. So the INV-5 single-home claim is
         # narrower than "every arm calls _apply_metadata_delta": merge and
         # delete semantics have two implementations that have to agree — this
         # one and Qdrant's primitives. ``TestMetadataFastPathEquivalence`` pins
@@ -4995,6 +5208,47 @@ class MemoryService:
             metadata_delete_keys=metadata_delete_keys,
             metadata_mode=metadata_mode,
         )
+
+        # Mem0 metadata vocabulary validation on the THIRD write path (task
+        # 3523). PRD D8/§2 pin enforcement at this seam precisely because a
+        # second write path leaks past a tools-layer validator; update_memory
+        # is a third one and reproduced exactly that leak.
+        #
+        # Placement mirrors add_memory's (see the note at its call site):
+        # AFTER the §5(c) read leg's existence check and the delta, so the
+        # EFFECTIVE post-patch custom subset is what gets judged; BEFORE
+        # `scope` and every _journaled_backend_call below, so a rejection can
+        # never leave a journal row or a half-applied patch behind.
+        #
+        # GATED ON A METADATA DELTA EXISTING. A content-only amend leaves the
+        # record's metadata byte-identical, so this write is responsible for
+        # none of it; validating it anyway would be corpus re-validation by
+        # another name. That first-principles reason is the whole
+        # justification and stands unaided — do not prop it up with a named
+        # repair sweep: no in-repo sweep drives this arm (grepped — the only
+        # callers of MemoryService.update_memory are the MCP tool and
+        # scripts/retro_stamp_topics.py, and the latter never amends
+        # content). The consequence of getting it wrong is nonetheless real:
+        # under `enforce` a legacy record's TEXT would become uncorrectable
+        # because of unrelated legacy metadata, and `enforce` would quietly
+        # restate from "rejects WRITES" to "re-validates the corpus", the
+        # model task 3626's flip measurement depends on. It also keeps the
+        # seam's cost off the one arm that already pays for a re-embed.
+        if metadata_patch or metadata_delete_keys:
+            await _apply_memory_metadata_validation(
+                new_custom,
+                project_id=project_id,
+                agent_id=agent_id,
+                config=self.config.memory_metadata,
+                storm_detector=self._metadata_storm_detector,
+                project_root=self._memory_metadata_project_root(),
+                parent_lookup=self.get_memory_by_id,
+                count_canonical=self.count_memories_by_metadata,
+                find_canonical=self.get_memories_by_metadata,
+                # The record's PRE-IMAGE, free from the §5(c) read leg above.
+                # Only violations NEW relative to it are this write's problem.
+                baseline=existing_custom,
+            )
 
         scope = Scope(project_id=project_id)
 
@@ -5075,8 +5329,48 @@ class MemoryService:
             elif metadata_patch:
                 # Qdrant merges server-side, so unlisted pre-existing keys
                 # survive without this layer reconstructing the whole payload.
+                #
+                # The VALIDATED values for the patch keys, not the raw patch
+                # (task 3523): the vocabulary seam normalizes in place —
+                # `supersedes` scalar→list, PRD D2 — and writing the raw patch
+                # here would persist the legacy scalar on this route while the
+                # overwrite and content arms persisted a list. Restricted to
+                # the patch keys, so the fast path keeps its whole point:
+                # Qdrant still merges server-side and no pre-image key the
+                # caller did not name is rewritten.
+                #
+                # UNFILTERED on purpose, and LOUD if that ever stops holding.
+                # This branch is reached only for `metadata_mode == 'merge'`
+                # with no delete keys, so `_apply_metadata_delta`'s
+                # `new_custom.update(metadata_patch)` puts every patch key in
+                # and the seam only ever ASSIGNS (`meta['supersedes'] =
+                # members`), never pops — so `missing` is unreachable today.
+                # Were a future normalizer to drop a key, an `if k in
+                # new_custom` filter would silently skip it here while
+                # set_payload merged server-side and LEFT THE OLD VALUE in
+                # Qdrant, whereas the overwrite and content arms would drop
+                # it: the three-route split this whole change closed,
+                # reopened silently. Raising costs the write and names the
+                # divergence, which is the house's loud-over-silent norm; it
+                # happens before the coroutine is built, so no journal row
+                # and no un-awaited coroutine are left behind.
+                missing = [k for k in metadata_patch if k not in new_custom]
+                if missing:
+                    raise RuntimeError(
+                        'update_memory: the metadata vocabulary seam removed '
+                        f'patch key(s) {missing!r} from the effective metadata; '
+                        'the set_payload fast path cannot express a key REMOVAL '
+                        '(Qdrant merges server-side), so this write would leave '
+                        'the stale value in place while the overwrite and '
+                        'content arms would drop it. Route key-removing '
+                        'normalization through the overwrite arm instead.'
+                    )
                 operation = 'update_memory_set_payload'
-                coro = self.mem0.set_payload(memory_id, dict(metadata_patch), scope)
+                coro = self.mem0.set_payload(
+                    memory_id,
+                    {k: new_custom[k] for k in metadata_patch},
+                    scope,
+                )
             else:
                 operation = 'update_memory_delete_payload'
                 coro = self.mem0.delete_payload(

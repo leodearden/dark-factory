@@ -1704,6 +1704,51 @@ class TestUpdateMemoryContentArm:
         assert event.payload['memory_id'] == 'point-1'
         assert event.payload['store'] == 'mem0'
 
+    @pytest.mark.asyncio
+    async def test_content_only_amend_does_not_revalidate_existing_metadata(
+        self, service, caplog
+    ):
+        """A content amend must never be judged on metadata it did not touch.
+
+        Task 3523. The vocabulary seam now runs on the update path, and the
+        line between "judging this write" and "re-validating the corpus" is
+        the whole reason the seam is delta-scoped. A content amend leaves the
+        record's metadata BYTE-IDENTICAL, so this write is responsible for
+        none of it.
+
+        The pre-image staged here is the real hazard, not a contrived one:
+        `eval_worktree_plan_tools_missing` is the snake_case topic the live
+        `dark_factory` canonical record actually carried, and
+        `sweep_toolcall_xml_leak.py` enumerates the classes of legacy record
+        that are fatal-invalid today. (Cited for that enumeration only — that
+        sweep repairs by delete + re-add through `add_memory` and never
+        reaches this arm.) Validating here would make a legacy record's TEXT
+        uncorrectable under `enforce` because of metadata the amend never
+        touched, and would quietly convert `enforce` from "rejects WRITES"
+        into "re-validates the corpus", the model task 3626's flip
+        measurement (~20 → ~19 false rejections/week) rests on.
+        """
+        service.config.memory_metadata.enforce = True
+        service.mem0.get_point_by_id = AsyncMock(return_value={
+            **DEFAULT_POINT_PAYLOAD,
+            'topic': 'eval_worktree_plan_tools_missing',
+        })
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+
+        result = await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='fix typo',
+        )
+
+        assert result['status'] == 'updated'
+        assert result['content_amended'] is True
+        assert result['metadata_patched'] is False
+        service.mem0.update.assert_awaited_once()
+        # Not merely "did not raise": a censused violation would still be a
+        # re-validation of the corpus, inflating the very census stream the
+        # flip decision is measured from.
+        assert _mm_census_codes(caplog) == []
+
 
 class TestUpdateMemoryMetadataArm:
     """§5(b)'s routing decision table — which primitive each argument shape maps to.
@@ -1908,6 +1953,117 @@ class TestUpdateMemoryMetadataArm:
         )
 
         buffer.push.assert_awaited_once()
+
+
+class TestFastPathPersistsSeamNormalizedValues:
+    """The set_payload fast path must write the VALIDATED value, not the raw patch.
+
+    Task 3523. The vocabulary seam's only in-place mutation is ``supersedes``
+    scalar→list (PRD D2), and it lands in ``new_custom`` — which the
+    ``overwrite_payload`` and content arms persist but the ``set_payload``
+    fast path historically did not, handing Qdrant ``dict(metadata_patch)``
+    raw. Left alone, wiring the seam in would persist a list on two routes
+    and the raw scalar on a third: a NEW split in exactly the semantics
+    ``TestMetadataFastPathEquivalence`` (below) exists to keep from drifting.
+    """
+
+    _SUPERSEDED = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
+
+    @pytest.mark.asyncio
+    async def test_scalar_supersedes_is_persisted_normalized(self, service):
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'supersedes': self._SUPERSEDED},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        payload = service.mem0.set_payload.await_args.args[1]
+        assert payload['supersedes'] == [self._SUPERSEDED], (
+            'the fast path must persist what the seam normalized, or the '
+            'legacy scalar shape survives on this route alone'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_overwrite_arm_persists_the_identical_value(self, service):
+        """The agreement this is really about — one shape, three routes."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'supersedes': self._SUPERSEDED},
+            metadata_mode='replace',
+        )
+
+        service.mem0.overwrite_payload.assert_awaited_once()
+        payload = service.mem0.overwrite_payload.await_args.args[1]
+        assert payload['supersedes'] == [self._SUPERSEDED]
+
+    @pytest.mark.asyncio
+    async def test_the_fast_path_still_writes_only_the_patch_keys(self, service):
+        """Reading the delta for VALUES must not turn this into a rebuild.
+
+        Qdrant merges server-side; that is the whole reason this route can
+        skip a read-modify-write. A payload that also carried the pre-image's
+        `kind` / `src_project` / `category` would be reconstructing the
+        record — costing nothing visible in a mock, but silently re-writing
+        keys the caller never named and clobbering any concurrent edit to
+        them.
+        """
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        payload = service.mem0.set_payload.await_args.args[1]
+        assert payload == {'topic': 'cgl-eta'}
+
+    @pytest.mark.asyncio
+    async def test_the_content_arm_persists_the_identical_value(self, service):
+        """The THIRD route, and the one with the widest blast radius.
+
+        A combined content+metadata call forwards the whole `new_custom` to
+        `mem0.update`, whose backend rebuilds the point payload from scratch.
+        Pinning only the two metadata-only routes would leave the agreement
+        two-thirds established while reading as complete.
+        """
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text',
+            metadata_patch={'supersedes': self._SUPERSEDED},
+        )
+
+        service.mem0.update.assert_awaited_once()
+        metadata = service.mem0.update.await_args.kwargs['metadata']
+        assert metadata['supersedes'] == [self._SUPERSEDED]
+
+    @pytest.mark.asyncio
+    async def test_a_patch_key_the_seam_removes_fails_loudly(
+        self, service, monkeypatch
+    ):
+        """Unreachable today, and it must stay unreachable LOUDLY.
+
+        The seam only ever assigns, never pops, so every patch key survives
+        into `new_custom`. Were a future normalizer to drop one, filtering it
+        out here would silently succeed while `set_payload` merged
+        server-side and LEFT THE STALE VALUE in Qdrant — whereas the
+        overwrite and content arms would drop it. That is the three-route
+        split this change closed, reopened without a single failing test.
+        """
+        from fused_memory.services import memory_service as ms
+
+        real = ms.validate_memory_metadata
+
+        def _dropping(meta, **kwargs):
+            meta.pop('x_dropped', None)
+            return real(meta, **kwargs)
+
+        monkeypatch.setattr(ms, 'validate_memory_metadata', _dropping)
+
+        with pytest.raises(RuntimeError, match='x_dropped'):
+            await service.update_memory(
+                memory_id='point-1', project_id='test',
+                metadata_patch={'x_dropped': 'gone'},
+            )
+
+        service.mem0.set_payload.assert_not_called()
 
 
 class TestMetadataFastPathEquivalence:
@@ -10794,12 +10950,43 @@ def _mm_configure_project_root(svc, root):
     return str(root)
 
 
+#: The pre-image staged for the ``update_memory`` arm of :func:`_mm_write`.
+#:
+#: mem0-OWNED keys only (``MEM0_MANAGED_METADATA_KEYS``), so the record's
+#: CUSTOM subset — the half ``split_managed_metadata`` hands to the seam — is
+#: vocabulary-EMPTY.  That emptiness is load-bearing, not incidental: the
+#: update seam judges a patch against the record's pre-image (task 3523), so
+#: an empty pre-image makes the baseline subtraction a NO-OP and every shared
+#: case below asserts exactly what it asserts on the two add paths.  Staging a
+#: pre-image that carried violations would silently mask half of them and the
+#: suite would still look green.
+_MM_UPDATE_PRE_IMAGE = {
+    'data': 'original content',
+    'hash': 'abc123hash',
+    'created_at': '2026-01-01T00:00:00+00:00',
+    'updated_at': '2026-01-02T00:00:00+00:00',
+    'user_id': 'darkfactory',
+}
+
+_MM_UPDATE_POINT_ID = 'mm-point-1'
+
+
 async def _mm_write(svc, entry_point, *, metadata, category='observations_and_summaries',
                     project_id='dark_factory', agent_id='claude-task-3195'):
-    """Drive one write through either seam.
+    """Drive one write through any of the three seams.
 
     D8/§2 pin enforcement at the SERVICE seam precisely so
     ``add_system_record`` cannot bypass it, so every case runs against both.
+    Task 3523 adds ``update_memory`` — the THIRD write path — for the same
+    reason: an entry point the shared cases do not reach is an entry point
+    that can drift away from the seam without failing anything.
+
+    ``category`` rides in the PATCH on the update arm.  The two add paths
+    stamp ``meta['category'] = resolved_category.value`` themselves because
+    they are creating the record; an update has no category to resolve (the
+    record already carries one), so the harness supplies it explicitly rather
+    than leaving the shared "caller keys survive alongside category"
+    assertion to pass vacuously on two seams and fail on the third.
     """
     if entry_point == 'add_memory':
         return await svc.add_memory(
@@ -10810,6 +10997,34 @@ async def _mm_write(svc, entry_point, *, metadata, category='observations_and_su
             metadata=metadata,
             causation_id='c1',
         )
+    if entry_point == 'update_memory':
+        # The §5(c) existence check and leaf δ's parent-liveness lookup share
+        # ONE backend primitive on this path — both run through
+        # ``get_memory_by_id`` → ``mem0.get_point_by_id``. Route the record's
+        # OWN id to the staged pre-image and delegate every OTHER id (i.e. the
+        # parent) to whatever the case staged, then restore. Without the split
+        # a case staging ``return_value=None`` would fail the existence check
+        # and never reach the seam at all, one staging a ``TimeoutError`` would
+        # die in the read leg, and every ``get_point_by_id.assert_awaited_once``
+        # would be counting the existence check rather than the parent lookup.
+        staged = svc.mem0.get_point_by_id
+
+        async def _routed(point_id, scope, *args, **kwargs):
+            if point_id == _MM_UPDATE_POINT_ID:
+                return dict(_MM_UPDATE_PRE_IMAGE)
+            return await staged(point_id, scope, *args, **kwargs)
+
+        svc.mem0.get_point_by_id = _routed
+        try:
+            return await svc.update_memory(
+                memory_id=_MM_UPDATE_POINT_ID,
+                project_id=project_id,
+                agent_id=agent_id,
+                metadata_patch={'category': category, **metadata},
+                causation_id='c1',
+            )
+        finally:
+            svc.mem0.get_point_by_id = staged
     svc.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
     return await svc.add_system_record(
         content='some content',
@@ -10822,12 +11037,26 @@ async def _mm_write(svc, entry_point, *, metadata, category='observations_and_su
 
 
 def _mm_backend_mock(svc, entry_point):
-    return svc.mem0.add if entry_point == 'add_memory' else svc.mem0.add_system_record
+    """The backend write primitive this entry point must reach — or not.
+
+    ``update_memory``'s metadata-only route with a patch and no delete keys
+    lands on ``set_payload`` (the Qdrant server-side-merge fast path), which
+    is what ``_mm_write`` above drives.
+    """
+    return {
+        'add_memory': svc.mem0.add,
+        'update_memory': svc.mem0.set_payload,
+        'add_system_record': svc.mem0.add_system_record,
+    }[entry_point]
 
 
 def _mm_backend_meta(svc, entry_point):
     """The metadata dict the backend actually received."""
-    return _mm_backend_mock(svc, entry_point).call_args.kwargs['metadata']
+    call = _mm_backend_mock(svc, entry_point).call_args
+    if entry_point == 'update_memory':
+        # set_payload(memory_id, payload, scope) — positional, no metadata=.
+        return call.args[1]
+    return call.kwargs['metadata']
 
 
 def _mm_census_codes(caplog):
@@ -10842,7 +11071,17 @@ def _mm_census_codes(caplog):
     return codes
 
 
-_MM_ENTRY_POINTS = ['add_memory', 'add_system_record']
+_MM_ENTRY_POINTS = ['add_memory', 'add_system_record', 'update_memory']
+
+#: The two CREATE paths only.  Used by the single case whose subject is the
+#: ordering of the add path's server-side tagging helpers
+#: (``_apply_cycle_summary_metadata_tagging``), which an in-place amendment
+#: deliberately does not run: those stamps were applied when the record was
+#: created, and re-deriving `recon_pool`/`run_id` on every patch would rewrite
+#: provenance the patch never mentioned.  Scoped explicitly rather than by
+#: shrinking ``_MM_ENTRY_POINTS``, so the default for a new shared case stays
+#: "runs against all three".
+_MM_ADD_ENTRY_POINTS = ['add_memory', 'add_system_record']
 
 
 class TestMemoryMetadataValidationAtSeam:
@@ -11002,7 +11241,7 @@ class TestMemoryMetadataValidationAtSeam:
         assert _mm_census_codes(caplog) == []
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    @pytest.mark.parametrize('entry_point', _MM_ADD_ENTRY_POINTS)
     async def test_validation_runs_after_the_existing_tagging_helpers(
         self, service, entry_point, caplog
     ):
@@ -11153,6 +11392,231 @@ class TestMemoryMetadataValidationAtSeam:
         service.config.memory_metadata.enforce = True
         with pytest.raises(MemoryMetadataValidationError):
             await _mm_write(service, 'add_memory', metadata={'topic': 'bad_slug'})
+
+
+#: A pre-image that is FATAL-invalid under the vocabulary as it sits.
+#:
+#: `eval_worktree_plan_tools_missing` is not invented — it is the snake_case
+#: topic the live `dark_factory` canonical record carried, and
+#: `sweep_toolcall_xml_leak.py` enumerates the classes of legacy record that
+#: are fatal-invalid today (unknown `kind`, malformed `supersedes`, non-bool
+#: `canonical`). Records like this exist; the update seam has to be able to
+#: re-tag them.
+_MM_LEGACY_INVALID_PRE_IMAGE = {
+    **DEFAULT_POINT_PAYLOAD,
+    'topic': 'eval_worktree_plan_tools_missing',
+}
+
+
+class TestUpdateMemoryValidatesTheDeltaNotTheCorpus:
+    """A patch is judged on what it CHANGES, never on the record at rest.
+
+    Task 3523. Wiring the seam into `update_memory` without this rule would
+    make `enforce` start re-validating records at rest on every patch —
+    silently contradicting a model the codebase both states in prose and
+    MEASURES against. `_check_canonical_uniqueness`'s docstring and PRD §9
+    leaf ε's 2026-08-04 amendment both say "`enforce` rejects WRITES and
+    never re-validates the corpus", and quantify the flip's blast radius
+    (~20 → ~19 false rejections/week) on exactly that basis; task 3626's
+    flip decision rests on that number.
+
+    The three cases below draw the line from both sides, which is the point:
+    a pre-existing violation the patch did not cause is not this write's
+    problem, but a violation the patch DOES cause is — including one that
+    emerges from the combination and appears in neither the pre-image nor the
+    patch keys alone.
+    """
+
+    _POINT = 'point-1'
+
+    @staticmethod
+    def _stage(service, payload):
+        service.mem0.get_point_by_id = AsyncMock(return_value=dict(payload))
+
+    @pytest.mark.asyncio
+    async def test_patching_an_unrelated_key_is_not_judged_on_the_pre_image(
+        self, service, caplog
+    ):
+        """The load-bearing case: routine re-tagging of a legacy record.
+
+        Without delta scoping this raises, and `enforce` becomes an outage
+        for exactly the records that most need re-tagging — including for
+        `retro_stamp_topics.py`, the in-repo bulk re-tagger that actually
+        drives this arm (one metadata-only patch per legacy record).
+        """
+        service.config.memory_metadata.enforce = True
+        self._stage(service, _MM_LEGACY_INVALID_PRE_IMAGE)
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'x_note': 'hi'},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        # Empty, not merely "no invalid_topic_slug": re-censusing a
+        # pre-existing violation on every patch would inflate the census
+        # stream the flip is measured from, and would trip false unknown-key
+        # storms on a record whose long-tail keys were already counted once.
+        assert _mm_census_codes(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_a_violation_the_patch_itself_introduces_is_rejected(self, service):
+        """The other side of the line — delta scoping is not a blanket pass."""
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, _MM_LEGACY_INVALID_PRE_IMAGE)
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'topic': 'Not A Slug'},
+            )
+
+        assert 'invalid_topic_slug' in {v.code for v in excinfo.value.violations}
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_violation_that_emerges_from_the_combination_is_rejected(
+        self, service
+    ):
+        """NEW is judged on the effective post-image, not on the patch keys.
+
+        Neither half shows this violation alone: the pre-image is clean
+        (`canonical` with a valid `topic`) and the delta names only `topic`.
+        `canonical_without_topic` exists only in the record the write would
+        leave behind — so a rule that diffed the PATCH against the vocabulary
+        instead of the post-image against the pre-image would admit it.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {
+            **DEFAULT_POINT_PAYLOAD, 'topic': 'a-good-slug', 'canonical': True,
+        })
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_delete_keys=['topic'],
+            )
+
+        assert 'canonical_without_topic' in {v.code for v in excinfo.value.violations}
+        service.mem0.delete_payload.assert_not_called()
+
+    @staticmethod
+    def _stage_with_parent(service, pre_image, lookups):
+        """Route the record's own id to *pre_image*; every other id is DEAD.
+
+        The §5(c) existence check and leaf δ's parent lookup share ONE
+        backend primitive (`get_memory_by_id` → `mem0.get_point_by_id`), so a
+        flat `AsyncMock(return_value=None)` would fail the existence check and
+        never reach the seam. *lookups* records the ids in order, which is how
+        these cases assert the round-trip COUNT and not merely the verdict.
+        """
+        async def _routed(point_id, scope, *args, **kwargs):
+            lookups.append(point_id)
+            return dict(pre_image) if point_id == 'point-1' else None
+
+        service.mem0.get_point_by_id = _routed
+
+    @pytest.mark.asyncio
+    async def test_a_dead_pre_existing_parent_is_not_this_writes_problem(
+        self, service, caplog
+    ):
+        """Liveness is delta-scoped too — at its own gate, not by subtraction.
+
+        The `(key, code)` subtraction cannot reach this rule: its baseline set
+        comes from the PURE `validate_memory_metadata`, which structurally
+        cannot emit `dead_parent_id` / `parent_id_liveness_unavailable`, so
+        both codes would survive EVERY patch of a record carrying a
+        `parent_id` — including one that never mentions it. That would make a
+        record whose parent was since deleted permanently un-patchable under
+        `enforce` (and census a line per patch under the shipped warn mode):
+        corpus re-validation, the exact failure this class exists to prevent,
+        reintroduced through the one rule the subtraction is blind to.
+        """
+        service.config.memory_metadata.enforce = True
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        lookups: list[str] = []
+        self._stage_with_parent(
+            service, {**DEFAULT_POINT_PAYLOAD, 'parent_id': _MM_UUID}, lookups,
+        )
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'x_note': 'hi'},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        assert _mm_census_codes(caplog) == []
+        # Exactly ONE read — the existence check. The parent was never probed,
+        # which is also ε's contracted zero-extra-round-trips property holding
+        # for a patch that asserts no parent.
+        assert lookups == [self._POINT]
+
+    @pytest.mark.asyncio
+    async def test_a_parent_id_this_write_asserts_still_fails_closed(self, service):
+        """Delta scoping is not a liveness exemption.
+
+        The other side of the same line: a write that ASSERTS a parent — a new
+        one, or a different one — is answerable for it, pays the round-trip
+        and still fails closed under `enforce`. INV-3 read literally.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        other_parent = '9c5b94b1-35ad-49bb-b118-8e8fc24abf80'
+        lookups: list[str] = []
+        self._stage_with_parent(
+            service, {**DEFAULT_POINT_PAYLOAD, 'parent_id': _MM_UUID}, lookups,
+        )
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'parent_id': other_parent},
+            )
+
+        assert 'dead_parent_id' in {v.code for v in excinfo.value.violations}
+        assert lookups == [self._POINT, other_parent]
+        service.mem0.set_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_combined_content_and_patch_rejection_writes_nothing(
+        self, service
+    ):
+        """The widest-blast-radius arm, pinned for rejection ORDERING.
+
+        Every other case here drives a metadata-only route, so their
+        `mem0.update.assert_not_called()` passes vacuously — no content was
+        ever supplied. This one supplies it: the content arm rebuilds the
+        point payload from scratch, so a rejection that landed AFTER the
+        write is the one that could leave a record carrying new text with
+        stale metadata. The seam sits before `scope` and every journaled
+        backend call precisely so that cannot happen.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, _MM_LEGACY_INVALID_PRE_IMAGE)
+        journal = _mm_install_journal(service)
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                content='new text',
+                metadata_patch={'topic': 'Not A Slug'},
+            )
+
+        assert 'invalid_topic_slug' in {v.code for v in excinfo.value.violations}
+        service.mem0.update.assert_not_called()
+        journal.log_mem0_intent.assert_not_called()
+        journal.log_write_op.assert_not_called()
 
 
 class TestCanonicalUniquenessAtSeam:
@@ -11533,6 +11997,133 @@ class TestCanonicalUniquenessAtSeam:
                 metadata={'topic': self._TOPIC, 'canonical': True},
                 category='decisions_and_rationale',
             )
+
+
+class TestCanonicalClaimChangeOnTheUpdatePath:
+    """The probe fires only on a NEW claim — so a record is never its OWN incumbent.
+
+    Task 3523. Wiring leaf ε's uniqueness re-check into `update_memory` raises
+    a question the add paths never face: the record being patched may ALREADY
+    hold the claim, and it is in the store, so a naive probe counts it and
+    rejects the record against itself.
+
+    Gating on the claim CHANGING dissolves that structurally rather than
+    patching around it. A probe is issued only when the write is ACQUIRING a
+    `(canonical, topic)` claim the record does not already hold — and a record
+    that does not yet hold the claim in the store cannot appear in the
+    store-side count. So no `exclude_id` is needed, and none should be added:
+    it would cost an extra round-trip on every canonical patch, need
+    `limit=2` to filter self out of the scroll, and risk over-excluding a real
+    duplicate.
+
+    It also preserves ε's contracted "ordinary writes issue ZERO extra
+    round-trips": re-asserting a claim the record already holds is a no-op,
+    and no-ops must not pay for I/O.
+    """
+
+    _TOPIC = 'some-topic'
+    _INCUMBENT = 'incumbent-uuid-1'
+    _POINT = 'point-1'
+
+    @staticmethod
+    def _stage(service, custom):
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value={**DEFAULT_POINT_PAYLOAD, **custom}
+        )
+
+    @staticmethod
+    def _assert_no_probe(service):
+        """Neither half of the two-round-trip probe may have been spent."""
+        service.mem0.count_by_metadata.assert_not_called()
+        service.mem0.scroll_by_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reasserting_a_held_claim_issues_no_probe(self, service):
+        """THE self-incumbency case, stated as the no-op it is.
+
+        A foreign incumbent is staged, so a probe that ran WOULD find one —
+        without that staging this would pass for the wrong reason.
+        """
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': True})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'canonical': True},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        self._assert_no_probe(service)
+
+    @pytest.mark.asyncio
+    async def test_patching_an_unrelated_key_on_a_canonical_record_issues_no_probe(
+        self, service
+    ):
+        """ε's zero-extra-round-trips property, on the update path.
+
+        Every patch to an already-canonical record would otherwise pay a
+        Qdrant count it can only ever answer with "yes, itself".
+        """
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': True})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'x_note': 'hi'},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        self._assert_no_probe(service)
+
+    @pytest.mark.asyncio
+    async def test_acquiring_the_claim_does_probe_and_names_the_incumbent(
+        self, service
+    ):
+        """POSITIVE CONTROL — without it the two `assert_not_called`s above
+        cannot distinguish "correctly gated" from "the check is dead on this
+        path".
+
+        The pre-image carries the topic but NOT `canonical`, so this write is
+        genuinely acquiring a claim it does not hold.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'canonical': True},
+            )
+
+        assert excinfo.value.incumbent_id == self._INCUMBENT
+        service.mem0.set_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_moving_the_claim_probes_the_new_topic(self, service):
+        """A claim that MOVES is acquired at the destination.
+
+        Asserted on the filters, not merely on "a probe happened": a gate
+        that compared only `canonical` would see no change here and skip the
+        check entirely, letting a canonical record be re-homed onto a topic
+        that already has one.
+        """
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': True})
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'topic': 'other-topic'},
+        )
+
+        service.mem0.count_by_metadata.assert_awaited_once()
+        call = service.mem0.count_by_metadata.await_args
+        filters = call.kwargs.get('filters', call.args[1] if len(call.args) > 1 else None)
+        assert filters == {'topic': 'other-topic', 'canonical': True}
 
 
 class TestParentIdLivenessAtSeam:
