@@ -1705,3 +1705,138 @@ class TestPointIdParentIsVerified:
             'A canonical has no parent pointer to verify, so the point-id surface '
             f'must issue no extra read, got {service.get_memory_by_id.await_args_list!r}'
         )
+
+
+class TestDigestCarriesOriginProjectTag:
+    """task 4008: an amendment digest carries its child's ORIGIN-project tag.
+
+    A nested digest is agent-visible content: ``group_search_results`` hangs it
+    inside a KEPT parent entry at ``entry['grouped']['amendments']``, and the
+    orchestrator briefing renders that sub-object verbatim into a dispatched
+    agent's ``# Context`` block.  The briefing's cross-project safeguard
+    (``orchestrator/src/orchestrator/agents/briefing.py``:
+    ``filter_foreign_project_results``) reads a project tag off each entry's
+    ``metadata`` — so a digest that carries no ``metadata`` at all cannot be
+    classified, and the deliberate keep-untagged policy keeps every one of
+    them.  Emitting the tag here is what gives that safeguard a key to read.
+
+    The leak shape this addresses is the task-2273 CGL-eta rehome: a record
+    PHYSICALLY IN this project's collection whose ``src_project`` names a
+    different origin project.  A child living in another project's collection
+    cannot appear at all — ``_read_grouped_document`` scopes every child read
+    by ``project_id``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_foreign_tagged_child_digest_carries_its_origin_tag(self):
+        service = _stub_service([
+            _child(
+                _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a rehomed correction',
+                '2026-08-01T00:00:00+00:00', src_project='reify',
+            ),
+        ])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        entry = block['amendments'][0]
+        assert entry.get('metadata') == {'src_project': 'reify'}, (
+            'A digest built from a child carrying src_project must carry that '
+            'origin tag, or the briefing filter has no key to read on it — '
+            f'got {entry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_native_tagged_child_digest_carries_its_tag_too(self):
+        """The native case is tagged POSITIVELY, not left to keep-untagged."""
+        service = _stub_service([
+            _child(
+                _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a local correction',
+                '2026-08-01T00:00:00+00:00', project_id=_PROJECT_ID,
+            ),
+        ])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        entry = block['amendments'][0]
+        assert entry.get('metadata') == {'project_id': 'dark_factory'}, (
+            'A natively-tagged child must be classifiable as NATIVE rather than '
+            f'falling through to the keep-untagged default, got {entry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_untagged_child_digest_emits_no_metadata_key_at_all(self):
+        """Omit-when-absent, as ``contested`` and ``truncated`` already do.
+
+        The overwhelmingly common corpus carries no origin tag, and an empty
+        ``metadata: {}`` on every digest would be pure wire cost for a key
+        that says nothing.
+        """
+        service = _stub_service([
+            _child(
+                _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'an untagged correction',
+                '2026-08-01T00:00:00+00:00',
+            ),
+        ])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        entry = block['amendments'][0]
+        assert 'metadata' not in entry, (
+            'An untagged child must emit NO metadata key — never an empty dict '
+            f'— per the module\'s omit-when-absent convention, got {entry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_projection_is_narrow_and_never_leaks_managed_keys(self):
+        """Only origin-tag keys ride along — not the body, not mem0's own keys.
+
+        No member of ``MEM0_MANAGED_METADATA_KEYS`` may appear in the emitted
+        projection: mem0's ``user_id`` scoping key in particular must never be
+        readable as an origin-project tag, or a native record could be
+        false-positive dropped by a filter that mistook it for one.
+        """
+        service = _stub_service([
+            _child(
+                _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a noisy rehomed correction',
+                '2026-08-01T00:00:00+00:00',
+                src_project='reify', hash='abc', user_id='dark_factory',
+            ),
+        ])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        emitted = block['amendments'][0].get('metadata')
+        assert emitted == {'src_project': 'reify'}, (
+            f'The projection must carry ONLY origin-project tags, got {emitted!r}'
+        )
+        for noise in ('data', 'hash', 'user_id', 'kind', 'parent_id'):
+            assert noise not in emitted, (
+                f'{noise!r} must not ride along in the origin-tag projection — '
+                f'got {emitted!r}'
+            )
+        assert not (MEM0_MANAGED_METADATA_KEYS & set(emitted)), (
+            "No mem0-managed key may be emitted as an origin tag (mem0's own "
+            f'user_id scoping key most of all), got {emitted!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_pre_existing_digest_fields_are_untouched(self):
+        service = _stub_service([
+            _child(
+                _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a rehomed correction',
+                '2026-08-01T00:00:00+00:00', src_project='reify',
+            ),
+        ])
+
+        block = await build_grouped_document(service, _PROJECT_ID, _CANONICAL_ID)
+
+        assert block is not None
+        entry = block['amendments'][0]
+        assert entry['id'] == _AMEND_1
+        assert entry['digest'] == 'a rehomed correction'
+        assert entry['created_at'] == '2026-08-01T00:00:00+00:00'
+        assert entry['kind'] == AMENDMENT_KIND
