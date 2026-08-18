@@ -13,6 +13,8 @@ const { MemoryEvalsSection } = window.DF_MEMORY_EVALS;
 // defined in this file — index.html's load order (guarded by
 // test_index_html.py) is the real contract; this is the degradation path.
 const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No tasks' };
+const { strandBadgeState, agentCellState } = window.DF_TASK_STRAND_BADGE;
+const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
 const { useState: uS, useEffect: uE } = React;
 
 // shared open-state helper for furl/unfurl, persisted to localStorage by key
@@ -297,8 +299,8 @@ function OrchTab({ projectFilter, search }) {
                                 verdict (task 3543) rides alongside it, gated on its own
                                 server-computed field — never on the agent value. */}
                             <td className="mono" style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {t.agent || '—'}
-                              {t.stranded && <span className="badge bad" style={{ marginLeft: 4 }} title="stranded: in-progress with no live claimant / stale heartbeat">stranded</span>}
+                              {agentCellState(t, { placeholder: '—' }).text}
+                              {(() => { const sb = strandBadgeState(t, { marginLeft: 4 }); return sb && <span className={sb.cls} style={{ marginLeft: sb.marginLeft }} title={sb.title}>{sb.label}</span>; })()}
                             </td>
                             <td className="num">{rtCell(t.loops)}</td>
                             <td className="num">{rtCell(t.attempts)}</td>
@@ -1203,15 +1205,16 @@ function BurnTab({ projectFilter, displayWindow }) {
   // restarts and the cap also varies between projects, so it is TIME-VARYING
   // across the window regardless: re-deriving one cap here from the rendered
   // series would forgive a real past breach after a raise and invent one after a
-  // cut. This renders the verdict and nothing else.
+  // cut. This renders the verdict and nothing else — parityBannerState in
+  // burndown_bands.js decides WHETHER it draws (null on a false or absent
+  // alarm) and what it says; this closure is only the markup.
   const parityBanner = (block, projects) => {
-    if (!block || !block.parity_alarm) return null;
-    const n = block.parity_breach_count ?? 0;
-    const who = projects && projects.length ? ` · ${projects.join(', ')}` : '';
+    const st = parityBannerState(block, projects);
+    if (!st) return null;
     return (
       <div className="badge bad" style={{ padding: '6px 12px', fontSize: 11 }}>
-        ⚠ Over concurrency cap · peaked at {block.parity_peak} in flight, cap {block.parity_cap}
-        {` · ${n} snapshot${n !== 1 ? 's' : ''} over${who}`}
+        ⚠ Over concurrency cap · peaked at {st.peak} in flight, cap {st.cap}
+        {st.text}
       </div>
     );
   };
@@ -1276,22 +1279,18 @@ function BurnTab({ projectFilter, displayWindow }) {
             <span className="meta">aggregate · all projects</span>
           </div>
           <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {b.parity_alarm && parityBanner(b, b.parity_projects)}
+            {parityBanner(b, b.parity_projects)}
             <div style={{ display: 'flex', gap: 16, fontSize: 11 }}>
-              {[['done',CP.ok],['live',CP.accent],['stranded',CP.stranded],['blocked',CP.bad],['pending',CP.warn]].map(([l,c]) => (
+              {burndownLegend(CP).map(({ label: l, color: c }) => (
                 <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
               ))}
             </div>
             {/* in_progress is banded as live + stranded, never alongside them:
                 stacking the whole beside its parts would draw a total no
-                census ever produced. The server guarantees they sum. */}
-            <SA labels={b.labels} stacks={[
-              { key: 'done',                 color: CP.ok,       values: b.done },
-              { key: 'in_progress_live',     color: CP.accent,   values: b.in_progress_live },
-              { key: 'in_progress_stranded', color: CP.stranded, values: b.in_progress_stranded },
-              { key: 'blocked',              color: CP.bad,      values: b.blocked },
-              { key: 'pending',              color: CP.warn,     values: b.pending },
-            ]} height={300} formatX={window.DF_SHELL.fmtDateTime} />
+                census ever produced. The server guarantees they sum. The rule
+                is enforced (and tested) in burndown_bands.js — burndownStacks
+                below never emits an undivided in_progress band. */}
+            <SA labels={b.labels} stacks={burndownStacks(b, CP)} height={300} formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
       )}
@@ -1351,22 +1350,16 @@ function BurnTab({ projectFilter, displayWindow }) {
                     <span className="title">Status mix · 30d</span>
                   </div>
                   <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                    {pb.parity_alarm && parityBanner(pb, null)}
+                    {parityBanner(pb, null)}
                     <div style={{ display: 'flex', gap: 16, fontSize: 11 }}>
-                      {[['done',CP.ok],['live',CP.accent],['stranded',CP.stranded],['blocked',CP.bad],['pending',CP.warn]].map(([l,c]) => (
+                      {burndownLegend(CP).map(({ label: l, color: c }) => (
                         <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
                       ))}
                     </div>
                     {/* Bands must be indexed by THIS project's own snapshot row: b.labels is
                         the sorted union across all projects (redux_api.py shape_burndown), so
                         pairing it with pb.* both overruns and index-shifts them. */}
-                    <SA labels={pb.labels} stacks={[
-                      { key: 'done',                 color: CP.ok,       values: pb.done },
-                      { key: 'in_progress_live',     color: CP.accent,   values: pb.in_progress_live },
-                      { key: 'in_progress_stranded', color: CP.stranded, values: pb.in_progress_stranded },
-                      { key: 'blocked',              color: CP.bad,      values: pb.blocked },
-                      { key: 'pending',              color: CP.warn,     values: pb.pending },
-                    ]} height={220} formatX={window.DF_SHELL.fmtDateTime} />
+                    <SA labels={pb.labels} stacks={burndownStacks(pb, CP)} height={220} formatX={window.DF_SHELL.fmtDateTime} />
                   </div>
                 </div>
 
