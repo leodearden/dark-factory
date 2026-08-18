@@ -2048,7 +2048,10 @@ def _canned_mcp(rows, status_map):
     calls: list[dict] = []
 
     async def _mcp(client, url, tool, args, **_kw):
-        calls.append({'tool': tool, 'args': dict(args)})
+        # ``kwargs`` is recorded too so the per-request budget (``timeout=``,
+        # which rides as a keyword and never inside ``args``) is assertable at
+        # the wire — see test_every_per_project_call_carries_the_per_request_budget.
+        calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(_kw)})
         if tool == 'get_statuses':
             return {'statuses': {str(k): v for k, v in status_map.items()}}
         if tool == 'get_tasks':
@@ -2138,6 +2141,55 @@ class TestShapeOneProjectNarrowing:
             )
         assert {r['title'] for r in active} == {'task 1', 'task 2'}
         assert done_count == 50
+
+    async def test_every_per_project_call_carries_the_per_request_budget(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """The budget ROSTER must describe the shipped calls, not merely count them.
+
+        ``test_tasks_budget.py`` machine-checks
+        ``DEFAULT_PER_CALL_TIMEOUT * len(_PER_PROJECT_MCP_CALLS) <=
+        _TASKS_PER_PROJECT_BUDGET``.  That arithmetic is only a true statement
+        ABOUT THIS SYSTEM if every enumerated call actually threads the term.
+        ``fetch_statuses`` shipped without it, so one of the three ran on
+        ``mcp_tool_call``'s 10 s default and could alone overrun the 7 s
+        per-project budget the roster claims to bound — a constants-only test
+        cannot see that, which is why this one asserts at the WIRE.
+
+        Driving the full three-call path (caps > 0) also means adding a fourth
+        per-project call without the keyword fails here, rather than silently
+        widening the budget.
+        """
+        import dashboard.data.tasks as tasks_mod
+        from dashboard.data.active_tasks import (
+            _PER_PROJECT_MCP_CALLS,
+            _shape_one_project,
+        )
+
+        rows = [_raw_row(1, 'in-progress')]
+        rows += [_raw_row(i, 'done') for i in range(10, 20)]
+        status_map = {int(r['id']): r['status'] for r in rows}
+        mcp, calls = _canned_mcp(rows, status_map)
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
+
+        config = self._one_project_config(tmp_path)
+        await _shape_one_project(
+            dummy_client, config, config.project_root,
+            max_done_per_project=50, max_cancelled_per_project=50,
+        )
+
+        assert len(calls) == len(_PER_PROJECT_MCP_CALLS), (
+            f'the roster enumerates {len(_PER_PROJECT_MCP_CALLS)} per-project '
+            f'calls {_PER_PROJECT_MCP_CALLS} but {len(calls)} were issued: '
+            f'{[c["tool"] for c in calls]}'
+        )
+        for call in calls:
+            assert call['kwargs'].get('timeout') == tasks_mod.DEFAULT_PER_CALL_TIMEOUT, (
+                f"{call['tool']} was issued without the per-request budget "
+                f"(timeout={call['kwargs'].get('timeout')!r}) — it falls back to "
+                "mcp_tool_call's 10s default, so the per-project budget "
+                'arithmetic in test_tasks_budget.py does not describe it'
+            )
 
     async def test_tasks_tab_path_issues_a_bounded_terminal_window(
         self, monkeypatch, tmp_path, dummy_client

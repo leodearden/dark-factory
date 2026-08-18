@@ -461,6 +461,8 @@ async def fetch_statuses(
     client: httpx.AsyncClient,
     config: DashboardConfig,
     project_root: str | bytes | os.PathLike[str],
+    *,
+    timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> Mapping[Any, Any]:
     """Fetch a compact ``{int(id): status}`` map for *project_root* via MCP.
 
@@ -476,12 +478,24 @@ async def fetch_statuses(
     this note lives on ``collect_done_counts``; keep the two in step.)
 
     Returns ``{'offline': True, 'error': str}`` if every server fails.
+
+    **Per-request budget.** *timeout* is threaded into
+    :func:`dashboard.data.memory.mcp_tool_call` exactly as ``fetch_tasks``
+    threads its own, and shares ``fetch_tasks``'s default so the two agree by
+    construction.  This is not decoration: ``get_statuses`` is one of the
+    three calls enumerated in ``active_tasks._PER_PROJECT_MCP_CALLS``, whose
+    budget invariant (``DEFAULT_PER_CALL_TIMEOUT * 3 <=
+    _TASKS_PER_PROJECT_BUDGET``) is only a true statement about the shipped
+    system if every enumerated call actually carries the term.  Left on
+    ``mcp_tool_call``'s 10 s default, this one call could alone exceed the
+    per-project budget the arithmetic claims to bound.
     """
     project_root_str = str(project_root)
 
     async def _call(url: str) -> dict[int, str]:
         result = await mcp_tool_call(
             client, url, 'get_statuses', {'project_root': project_root_str},
+            timeout=timeout,
         )
         if 'error' in result and 'statuses' not in result:
             raise ValueError(str(result.get('error')))
