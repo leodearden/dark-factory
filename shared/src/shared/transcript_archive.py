@@ -54,6 +54,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -189,6 +190,170 @@ def _archive_one(
         _discard_staging(staging)
         raise
     return True
+
+
+@dataclass(frozen=True)
+class ArchiveBeforeDelete:
+    """Structured outcome of one :func:`archive_before_delete` call.
+
+    *held* names the transcripts that could NOT be made durable and were
+    therefore deliberately left on disk. It is the caller's only handle on a
+    partial teardown: an empty ``held`` means every transcript is durable and
+    the config dir is gone, which is the whole point of the operation.
+    """
+
+    archived: int = 0
+    already_current: int = 0
+    held: tuple[Path, ...] = ()
+    config_dir_removed: bool = False
+
+
+def _move_to_archive(
+    src,
+    projects_root,
+    archive_root,
+    task_id,
+):
+    """MOVE a single transcript *src* to its mirror under *archive_root*.
+
+    The sibling of :func:`_archive_one`, and deliberately the same destination
+    layout (``<archive_root>/<task_id>/<relpath-under-projects>``) so the
+    already-current skip is shared by the copier and the mover — all three
+    producer sites converge on one archive, not two.
+
+    Returns ``True`` when the file was newly moved into the archive, ``False``
+    when the archive was ALREADY current and the source was merely dropped.
+    Either way the source is gone on return; an OSError means it is NOT.
+
+    Why a rename rather than :func:`_archive_one`'s staged copy:
+
+    * **No staging sibling is needed.** ``os.rename`` is itself atomic within
+      one filesystem, so a truncated transcript can never appear at the
+      canonical archive path — the failure mode the staged copy exists to
+      prevent is structurally impossible here.
+    * **The mtime mirror is free.** A rename preserves the inode, so the
+      source's mtime lands on the archive without ``os.utime``. That matters
+      twice over: a ``now``-stamped archive would read to
+      ``gc_agent_transcripts`` as a reset retention age, and it would defeat
+      the already-current skip above.
+    * **It is O(1) metadata, not O(size) I/O** — which is what makes doing it
+      synchronously, inside a teardown path, cheap enough to be
+      unconditional.
+
+    The rename fast path requires source and destination on ONE filesystem.
+    Re-measured on this host 2026-08-18: ``<project_root>/.worktrees`` (where
+    the per-task config dir lives) and ``<project_root>/data/orchestrator``
+    (where the archive root lives) report the SAME ``st_dev``, so the fast
+    path is the live route here. That is a property of the deployment, not a
+    guarantee, and a Linux ``st_dev`` is an ephemeral mount handle rather than
+    a stable id, so the cross-device case is handled rather than assumed (see
+    the EXDEV branch).
+    """
+    rel = src.relative_to(projects_root)
+    dest = archive_root / task_id / rel.parent / rel.name
+    st = src.stat()
+    # Idempotency, shared verbatim with _archive_one: int-truncate to dodge FS
+    # mtime-granularity mismatch. The archive is already current, so the
+    # precondition for deleting the source is already satisfied — corroborate,
+    # then delete, rather than re-archive then delete.
+    if dest.exists() and int(dest.stat().st_mtime) == int(st.st_mtime):
+        src.unlink()
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.rename(src, dest)
+    return True
+
+
+def _purge_config_dir(config_dir, held, task_id):
+    """Remove *config_dir*, or as much of it as *held* permits.
+
+    Returns ``True`` when the whole directory is gone. Never raises.
+    """
+    if not held:
+        # Byte-equivalent to the TaskConfigDir.cleanup() this replaces.
+        shutil.rmtree(config_dir, ignore_errors=True)
+        return True
+    return False
+
+
+def archive_before_delete(
+    config_dir,
+    task_id,
+    *,
+    archive_root,
+):
+    """Make *config_dir*'s transcripts durable, THEN delete the directory.
+
+    The fused replacement for "call :func:`archive_task_transcripts`, then
+    call ``TaskConfigDir.cleanup()``" at every teardown site (task 3619, leaf 2
+    of plans/transcript-preservation-seam-prd.md). Those were two steps with a
+    gap between them, and the gap is where transcripts were measurably lost:
+    the archival step is skippable (a cancellation landing on its ``await``, a
+    teardown path that never had one) while the ``rmtree`` is not, so the copy
+    could be dropped and the original destroyed anyway. Here deletion is not a
+    step AFTER archival, it is a step archival LICENSES: a transcript is
+    unlinked only once its durable copy provably exists.
+
+    Every ``projects/**/*.jsonl`` is moved to
+    ``<archive_root>/<task_id>/<relpath-under-projects>`` — the same layout
+    :func:`_archive_one` writes and :func:`durable_archive_path` reads, so
+    producer, mover and reader cannot drift (INV-5). Nothing outside
+    ``projects/`` is ever read, so the per-task OAuth ``.credentials.json`` at
+    the config-dir root is structurally unreachable, exactly as in
+    :func:`archive_task_transcripts`.
+
+    **Synchronous, and that is the fix, not an oversight.** The caller must
+    NOT wrap this in ``asyncio.to_thread`` or otherwise make it awaitable. An
+    ``await`` is a cancellation point, and the SIGTERM that triggers teardown
+    is precisely what delivers the cancellation — the archival step would be
+    the one part of teardown that a shutdown can skip. A rename is O(1)
+    metadata; even the EXDEV copy fallback is a single-digit-millisecond
+    operation on the measured corpus (n=7788 archived transcripts: median
+    381 KB, p95 1.0 MB, max 2.06 MB), i.e. cheaper than the transcript it
+    would otherwise lose.
+
+    **Total by contract** — never raises, mirroring
+    :func:`archive_task_transcripts`, because callers invoke it from teardown
+    paths and ``finally`` blocks that may already be unwinding an exception. A
+    per-file failure is counted through :func:`_record_failure` and the file is
+    HELD: reported in the returned :class:`ArchiveBeforeDelete`, left on disk,
+    never deleted.
+    """
+    config_dir = Path(config_dir)
+    archive_root = Path(archive_root)
+    projects_root = config_dir / 'projects'
+
+    if not config_dir.exists():
+        # Teardown sites call this blind (a lane that never got a config dir,
+        # a second cleanup pass). A cheap no-op, not a raise — and note no
+        # archive tree is conjured for a task that has no transcripts.
+        return ArchiveBeforeDelete()
+
+    archived = 0
+    already_current = 0
+    held: list[Path] = []
+    # sorted() so the WARNING stream and the reported `held` order are
+    # reproducible across runs rather than filesystem-order-dependent.
+    for src in sorted(projects_root.glob('**/*.jsonl')):
+        try:
+            if _move_to_archive(src, projects_root, archive_root, task_id):
+                archived += 1
+            else:
+                already_current += 1
+        except OSError as exc:
+            # Counted + logged loudly, and the source is HELD. Deleting an
+            # un-archived transcript is the one thing this function exists to
+            # prevent, so a failure costs us the directory, never the data.
+            _record_failure(src, task_id, exc)
+            held.append(src)
+
+    removed = _purge_config_dir(config_dir, held, task_id)
+    return ArchiveBeforeDelete(
+        archived=archived,
+        already_current=already_current,
+        held=tuple(held),
+        config_dir_removed=removed,
+    )
 
 
 def archive_task_transcripts(
