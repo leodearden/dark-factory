@@ -312,7 +312,7 @@ METADATA_VOCABULARY_INSTRUCTIONS = """
 `add_memory` also takes an optional `metadata` dict. Five keys are RESERVED and
 validated on write:
 
-- `topic` — kebab-case slug naming the subject an entry is about; set it whenever other entries cover the same subject, so they group.
+- `topic` — kebab-case slug naming the subject an entry is about, 100 characters at most: `memory-write-path` is a valid slug, `Memory Write Path` is not; set it whenever other entries cover the same subject, so they group.
 - `canonical` — bool marking the one authoritative entry for a topic; requires `topic`, and at most one entry per project and topic may claim it.
 - `kind` — the record type, drawn from a closed registry; distinct from `source`, which records writer provenance rather than record type.
 - `parent_id` — full 36-character UUID of a live entry this one attaches to; triage attach outcomes only, kinds `amendment` and `sighting`.
