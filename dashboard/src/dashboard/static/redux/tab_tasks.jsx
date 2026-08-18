@@ -8,6 +8,7 @@ const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focus
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
 const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
+const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
 
 // Dot colour per activity pip. activityPips is pure and owns ORDER and
 // zero-suppression; colour is the caller's concern. Each reuses the hue
@@ -664,11 +665,29 @@ function TasksTab({ projectFilter, search }) {
     projectFilter.length === 0 || projectFilter.includes(p.id)
   );
 
-  // Surface a single-line banner when fused-memory is unreachable for any
-  // discovered project — without it the Tasks tab renders an empty grid that
-  // looks indistinguishable from "no active work".
-  const tasksOffline = !!DF_T.TASKS_OFFLINE;
-  const offlineProjects = DF_T.TASKS_OFFLINE_PROJECTS || [];
+  // Surface a banner when task data is missing or incomplete — without it the
+  // Tasks tab renders an empty grid that looks indistinguishable from "no
+  // active work". That rationale still motivates the total-outage case, and it
+  // is exactly why the partial and degraded cases exist too: after the
+  // whole-handler budget expires, a silently-missing project would otherwise
+  // read as a project with nothing to do.
+  //
+  // The three-way distinction itself is decided SERVER-SIDE (app.api_tasks)
+  // and turned into copy by tasks_offline_banner.js. Nothing here re-derives
+  // it: a `k of N` judgement made in the JSX would drift from the one the
+  // handler made. TASKS_PROJECT_COUNT is not on the wire, so the notice's
+  // denominator is the project list this tab already renders against.
+  const bannerNotices = tasksBannerNotices({
+    offline: !!DF_T.TASKS_OFFLINE,
+    offlineProjects: DF_T.TASKS_OFFLINE_PROJECTS || [],
+    degradedProjects: DF_T.TASKS_DEGRADED_PROJECTS || [],
+    totalProjects: (DF_T.PROJECTS || []).length,
+  });
+  const bannerTestIds = {
+    global: 'tasks-offline-banner',
+    partial: 'tasks-partial-banner',
+    degraded: 'tasks-degraded-banner',
+  };
 
   function statusMatches(s) {
     if (filters.active    && (s === 'in-progress' || s === 'blocked' || s === 'merge-deferred')) return true;
@@ -690,8 +709,9 @@ function TasksTab({ projectFilter, search }) {
 
   return (
     <div className="grid cols-12" style={{ gap: 16 }}>
-      {tasksOffline && (
-        <div className="col-span-12" data-testid="tasks-offline-banner"
+      {bannerNotices.map(notice => (
+        <div key={notice.kind} className="col-span-12"
+             data-testid={bannerTestIds[notice.kind]}
              style={{
                padding: '8px 12px',
                border: '1px solid var(--line)',
@@ -701,10 +721,9 @@ function TasksTab({ projectFilter, search }) {
                fontFamily: 'var(--mono)',
                fontSize: 11,
              }}>
-          fused-memory offline — task data unavailable
-          {offlineProjects.length > 0 && ` (${offlineProjects.join(', ')})`}
+          {notice.text}
         </div>
-      )}
+      ))}
       {/* Filter bar */}
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <span className="lbl" style={{ color: 'var(--fg-3)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>show</span>

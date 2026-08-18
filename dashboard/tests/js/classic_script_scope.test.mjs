@@ -65,6 +65,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'esc_flow_layout.js': 'DF_ESC_FLOW_LAYOUT',
   'spark_path.js': 'DF_SPARK_PATH',
   'memory_evals_fmt.js': 'DF_MEMORY_EVALS_FMT',
+  'tasks_offline_banner.js': 'DF_TASKS_OFFLINE_BANNER',
 };
 
 function readIndexHtml() {

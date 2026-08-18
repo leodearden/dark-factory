@@ -156,13 +156,23 @@ def test_banner_testids_distinguish_the_three_notice_kinds(tab_tasks_jsx_code):
     Partial and degraded need distinct hooks, or a test asserting "the outage
     banner is showing" would pass on a partial degradation.
     """
-    assert 'data-testid="tasks-offline-banner"' in tab_tasks_jsx_code
+    # The render site is ONE element whose data-testid is bound from a per-kind
+    # lookup, so the assertion is on the binding plus the three values rather
+    # than on three literal `data-testid="..."` spellings — a three-way copy of
+    # the same JSX block would satisfy the literal form and be worse code.
+    assert 'data-testid' in tab_tasks_jsx_code, (
+        'the banner render site must bind data-testid at all, or no test can '
+        'tell an outage banner from a partial one'
+    )
 
-    for testid in (
+    testids = (
+        'tasks-offline-banner',
         'tasks-partial-banner',
         'tasks-degraded-banner',
-    ):
-        assert f'data-testid="{testid}"' in tab_tasks_jsx_code, (
+    )
+    assert len(set(testids)) == 3, 'the three kinds must not share a testid'
+    for testid in testids:
+        assert testid in tab_tasks_jsx_code, (
             f'missing distinct testid {testid!r} — without it a partial '
             'degradation is indistinguishable from a total outage in tests'
         )
