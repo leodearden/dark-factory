@@ -105,7 +105,6 @@ test('several of many offline -> the count reflects the real k of N', () => {
     totalProjects: 7,
   });
 
-  assert.equal(kinds(notices), kinds(notices)); // shape sanity
   assert.equal(notices.length, 1);
   assert.equal(notices[0].kind, 'partial');
   assert.ok(
