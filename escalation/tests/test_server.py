@@ -2566,7 +2566,7 @@ class TestPromoteToL2SeverityInResponse:
         assert result['severity'] == 'info', (
             f'Response must report the inherited severity, got: {result}'
         )
-        assert result['severity'] == queue.get(result['id']).severity
+        assert result['severity'] == queue.get(result['id']).severity  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
     async def test_create_response_reports_an_explicit_severity(
@@ -2587,7 +2587,7 @@ class TestPromoteToL2SeverityInResponse:
         )
 
         assert result['severity'] == 'critical', f'Got: {result}'
-        assert result['severity'] == queue.get(result['id']).severity
+        assert result['severity'] == queue.get(result['id']).severity  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
     async def test_create_response_reports_the_fail_safe_severity(
@@ -2602,7 +2602,7 @@ class TestPromoteToL2SeverityInResponse:
         )
 
         assert result['severity'] == 'blocking', f'Got: {result}'
-        assert result['severity'] == queue.get(result['id']).severity
+        assert result['severity'] == queue.get(result['id']).severity  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
     async def test_update_response_reports_the_post_floor_severity(
@@ -2627,7 +2627,7 @@ class TestPromoteToL2SeverityInResponse:
         assert second['severity'] == 'blocking', (
             f'Response must report the post-floor severity, got: {second}'
         )
-        assert second['severity'] == queue.get(second['id']).severity
+        assert second['severity'] == queue.get(second['id']).severity  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
     async def test_existing_response_keys_are_unchanged_on_both_paths(
@@ -2696,7 +2696,7 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         first = await _promote_to_l2(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
         )
-        assert queue.get(first['id']).severity == 'info'
+        assert queue.get(first['id']).severity == 'info'  # type: ignore[union-attr]
 
         self._seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
         second = await _promote_to_l2(
@@ -2721,7 +2721,7 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         first = await _promote_to_l2(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
         )
-        assert queue.get(first['id']).severity == 'blocking'
+        assert queue.get(first['id']).severity == 'blocking'  # type: ignore[union-attr]
 
         self._seed_l1(queue, 'esc-l1-info', 'task-2', 'info')
         second = await _promote_to_l2(
@@ -2752,7 +2752,7 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         first = await _promote_to_l2(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
         )
-        assert queue.get(first['id']).severity == 'info'
+        assert queue.get(first['id']).severity == 'info'  # type: ignore[union-attr]
 
         # Explicit UP on an append: honoured.
         self._seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
@@ -2761,7 +2761,7 @@ class TestPromoteToL2SeverityFloorOnUpdate:
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-b'], 'severity': 'critical'},
         )
         assert raised['status'] == 'updated'
-        assert queue.get(first['id']).severity == 'critical', (
+        assert queue.get(first['id']).severity == 'critical', (  # type: ignore[union-attr]
             'An explicit upward override on an append must be honoured'
         )
 

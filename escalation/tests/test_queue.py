@@ -4519,8 +4519,10 @@ class TestAddMembersToL2SeverityFloor:
             critical_l2.id, ['esc-new'], severity_floor='blocking',
         )
 
-        assert raised is not None and raised.severity == 'critical'
-        assert held is not None and held.severity == 'critical', (
+        assert raised is not None
+        assert raised.severity == 'critical'
+        assert held is not None
+        assert held.severity == 'critical', (
             f'blocking must not outrank critical; got {held.severity!r}'
         )
 

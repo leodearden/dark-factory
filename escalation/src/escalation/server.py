@@ -1604,11 +1604,17 @@ def create_server(
         ---------------
         Create (new L2)::
 
-            {'id': <new_id>, 'status': 'created', 'members': [<member_ids>]}
+            {'id': <new_id>, 'status': 'created', 'members': [<member_ids>],
+             'severity': <severity_filed>}
 
         Update (existing pending L2 with same root_cause)::
 
-            {'id': <existing_id>, 'status': 'updated', 'members': [<all_members>]}
+            {'id': <existing_id>, 'status': 'updated', 'members': [<all_members>],
+             'severity': <severity_after_floor>}
+
+        ``severity`` reports what was ACTUALLY filed, which for a caller that
+        omitted the argument is how the inherited value becomes visible — and
+        on the update path is the post-floor value, not the argument.
 
         Error::
 
@@ -1663,6 +1669,9 @@ def create_server(
                     'id': existing_id,
                     'status': 'updated',
                     'members': updated.members,
+                    # Read off the returned Escalation, so this is the
+                    # POST-floor value rather than the argument.
+                    'severity': updated.severity,
                 }
             # Race: the pending L2 was resolved/archived between find and update.
             # Fall through to the create path so the caller gets a valid result
@@ -1690,7 +1699,12 @@ def create_server(
             options=list(options),
         )
         queue.submit(esc)
-        return {'id': esc.id, 'status': 'created', 'members': esc.members}
+        return {
+            'id': esc.id,
+            'status': 'created',
+            'members': esc.members,
+            'severity': esc.severity,
+        }
 
     # --- Merge queue tools ---
 
