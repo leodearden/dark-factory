@@ -270,6 +270,16 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
         "resolves to False if task_id is None or category starts with "
         "'cross_project', else True; an explicit True/False from the caller "
         'is always honored. '
+        "# prefix match, not an allowlist: a NEW 'cross_project'-prefixed "
+        'category that is genuinely actionable must still pass '
+        'actionable=True explicitly, or it silently resolves to False. '
+        '# task-1654 ripple: an actionable=False finding can vanish from '
+        'flagged_items when ALL of its citations trace to same-run '
+        'Stage-1 (memory_consolidator) findings (never when the finding '
+        'itself is Stage 1, and never with zero typed citations or any '
+        'uncovered citation) — pass actionable=True explicitly only in '
+        "that shape (see ReconReportState.add_finding's docstring for "
+        'the full rationale). '
         '# dedup key: cited_tasks is the authoritative dedup key, not this '
         'task_id param — a None / single / comma-joined / foreign top-level '
         'task_id is normalized to the cited-task set (see cite_task below '
