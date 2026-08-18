@@ -130,6 +130,52 @@ def _register_runtime(monkeypatch, mapping: dict[str, list[TaskRuntimeEntry]]) -
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_task_runtime', _fake_fetch_task_runtime)
 
 
+def _register_fetch_tasks(monkeypatch, fetch) -> None:
+    """Register a full-tree *fetch* as BOTH narrowed ``fetch_tasks`` and ``fetch_statuses``.
+
+    ``_shape_one_project`` no longer issues one unnarrowed fetch (task 3857).
+    It asks for active rows and, separately, a bounded window of terminal
+    rows, and it reads its ``done_count`` from the compact ``fetch_statuses``
+    map.  A fake that ignored ``statuses`` would hand the whole tree to BOTH
+    ``fetch_tasks`` calls and duplicate every row; one that left
+    ``fetch_statuses`` unpatched would reach for the network.
+
+    So the wrapper emulates exactly what the substrate does — a ``statuses``
+    row filter, then a ``page_size``/``offset`` slice over an ASCENDING-id
+    list — and derives the compact map from the same canned tree.  Tests here
+    are about SHAPING; the wire contract itself is asserted against a canned
+    ``mcp_tool_call`` in ``TestShapeOneProjectNarrowing``.
+
+    *fetch* keeps its original ``(client, config, project_root)`` signature and
+    may still return an offline marker dict, which is propagated unchanged.
+    """
+
+    async def _narrowed(
+        client, config, project_root, *,
+        statuses=None, page_size=None, offset=0, timeout=None,
+    ):
+        rows = await fetch(client, config, project_root)
+        if not isinstance(rows, list):
+            return rows
+        if statuses is not None:
+            rows = [r for r in rows if r.get('status') in statuses]
+        rows = sorted(rows, key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
+        if page_size is not None:
+            rows = rows[offset:offset + page_size]
+        return rows
+
+    async def _statuses(client, config, project_root):
+        rows = await fetch(client, config, project_root)
+        if not isinstance(rows, list):
+            return {'offline': True, 'error': 'task fetch offline'}
+        return {
+            r['id']: r.get('status') for r in rows if isinstance(r.get('id'), int)
+        }
+
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _narrowed)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _statuses)
+
+
 @pytest.fixture()
 def two_project_config(tmp_path, monkeypatch):
     """Two-project layout with shaped task lists registered against fetch_tasks."""
@@ -160,7 +206,7 @@ def two_project_config(tmp_path, monkeypatch):
     async def _fake_fetch_tasks(client, config, project_root):
         return list(by_root.get(project_root.resolve(), []))
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     _register_runtime(monkeypatch, {
         'dark-factory': [
             # 1/3 reviews passed -> attempts == 3 (total review count, not pass count)
@@ -227,7 +273,7 @@ async def test_collect_active_tasks_started_uses_provided_now(tmp_path, monkeypa
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     _register_runtime(monkeypatch, {'fixedclock': [_runtime_entry(1, started=created_at)]})
     cfg = DashboardConfig(project_root=root)
 
@@ -264,7 +310,7 @@ async def test_collect_tasks_with_counts_started_uses_provided_now_across_projec
     async def _fake_fetch_tasks(client, config, project_root):
         return list(by_root.get(project_root.resolve(), []))
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     _register_runtime(monkeypatch, {
         'df': [_runtime_entry(1, started=df_created)],
         'reify': [_runtime_entry(2, started=reify_created)],
@@ -287,7 +333,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
     async def _fake_fetch_tasks(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     # Project is online (a snapshot is registered for its label) but the
     # snapshot carries no entry for task 1 — the honest-zero case, distinct
     # from an offline project (see the runtime-offline tests below).
@@ -315,7 +361,7 @@ async def test_collect_active_tasks_surfaces_offline_projects(tmp_path, monkeypa
     async def _fake_fetch_tasks(client, config, project_root):
         return {'offline': True, 'error': 'connection refused'}
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     cfg = DashboardConfig(project_root=root)
     active, offline_projects = await collect_active_tasks(client=dummy_client, config=cfg)
     assert active == []
@@ -344,7 +390,7 @@ async def test_collect_active_tasks_runtime_join_populates_lane_phase_lane_state
     async def _fake_fetch_tasks(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     _register_runtime(monkeypatch, {
         'warmlane': [_runtime_entry(
             42, loops=3, attempts=1, started=entry_started,
@@ -384,7 +430,7 @@ async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
     async def _offline_fetch_task_runtime(client, escalation_urls):
         return {'downlane': TaskRuntimeSnapshot(offline=True)}
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_task_runtime', _offline_fetch_task_runtime)
     cfg = DashboardConfig(project_root=root)
 
@@ -412,7 +458,7 @@ async def test_collect_active_tasks_no_escalation_url_treated_as_offline(
     async def _fake_fetch_tasks(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     _register_runtime(monkeypatch, {})  # no label registered for 'nourl' at all
     cfg = DashboardConfig(project_root=root)
 
@@ -439,7 +485,7 @@ async def test_collect_active_tasks_runtime_per_task_read_failure_stays_online(
     async def _fake_fetch_tasks(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     _register_runtime(monkeypatch, {
         'flaky': [_runtime_entry(
             9, loops=None, attempts=None, started=None, phase=None,
@@ -496,7 +542,7 @@ async def test_collect_active_tasks_includes_merge_deferred_and_train_field(
     async def _fake_fetch_tasks(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
     cfg = DashboardConfig(project_root=root)
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
 
@@ -559,7 +605,7 @@ async def test_collect_active_tasks_bounded_done_appends_done_rows(tmp_path, mon
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
@@ -592,7 +638,7 @@ async def test_collect_active_tasks_bounded_done_completed_field(tmp_path, monke
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
@@ -625,7 +671,7 @@ async def test_collect_active_tasks_active_rows_unchanged_no_completed_key(tmp_p
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
@@ -658,7 +704,7 @@ async def test_collect_active_tasks_default_excludes_done_rows(tmp_path, monkeyp
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
@@ -691,7 +737,7 @@ async def test_collect_active_tasks_done_ordering_tie_broken_by_id(tmp_path, mon
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
@@ -988,7 +1034,7 @@ async def test_collect_active_tasks_includes_external_deps_with_unknown_sentinel
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
@@ -1017,7 +1063,7 @@ async def test_collect_active_tasks_external_deps_empty_when_absent(
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
@@ -1060,7 +1106,7 @@ async def test_collect_tasks_with_counts_resolve_external_overwrites_status(
         # Returns only 'dark_factory:13'; 'reify:8' is absent (simulates partial map).
         return {'dark_factory:13': 'done'}
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    _register_fetch_tasks(monkeypatch, _fake_fetch)
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _fake_ext_statuses)
 
     cfg = DashboardConfig(project_root=root)
@@ -1100,7 +1146,7 @@ async def test_collect_tasks_with_counts_resolve_external_false_skips_mcp(
     async def _must_not_be_called(*args, **kwargs):
         raise AssertionError('fetch_external_statuses must NOT be called when resolve_external=False')
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    _register_fetch_tasks(monkeypatch, _fake_fetch)
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _must_not_be_called)
 
     cfg = DashboardConfig(project_root=root)
@@ -1143,7 +1189,7 @@ async def test_collect_tasks_with_counts_resolve_external_single_batched_call(
         calls.append(sorted(deps))
         return {}
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    _register_fetch_tasks(monkeypatch, _fake_fetch)
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _record_call)
 
     cfg = DashboardConfig(project_root=root)
@@ -1174,7 +1220,7 @@ async def test_collect_tasks_with_counts_resolve_external_skips_call_when_no_dep
     async def _must_not_be_called(*args, **kwargs):
         raise AssertionError('fetch_external_statuses must NOT be called when union is empty')
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    _register_fetch_tasks(monkeypatch, _fake_fetch)
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _must_not_be_called)
 
     cfg = DashboardConfig(project_root=root)
@@ -1236,7 +1282,7 @@ async def test_collect_tasks_with_counts_resolve_external_skips_done_rows(
         calls.append(sorted(deps))
         return {'proj:10': 'done'}
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    _register_fetch_tasks(monkeypatch, _fake_fetch)
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _record_call)
 
     cfg = DashboardConfig(project_root=root)
@@ -1296,7 +1342,7 @@ async def test_collect_active_tasks_bounded_cancelled_appends_rows(
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
@@ -1345,7 +1391,7 @@ async def test_collect_active_tasks_default_excludes_cancelled(
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
@@ -1379,7 +1425,7 @@ async def test_collect_active_tasks_cancelled_ordering_tie_broken_by_id(
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
@@ -1433,7 +1479,7 @@ async def test_collect_active_tasks_both_done_and_cancelled_buckets_independent(
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     from dashboard.config import DashboardConfig
     cfg = DashboardConfig(project_root=root)
 
@@ -1518,7 +1564,7 @@ async def test_collect_active_tasks_includes_deferred_via_active_path(
     async def _fake_fetch(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    _register_fetch_tasks(monkeypatch, _fake_fetch)
     cfg = DashboardConfig(project_root=root)
 
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
@@ -1582,7 +1628,7 @@ async def test_collect_tasks_with_counts_resolve_external_offline_marker(
     async def _offline_ext_statuses(client, config, deps):
         return {'offline': True, 'error': 'down'}
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch)
+    _register_fetch_tasks(monkeypatch, _fake_fetch)
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _offline_ext_statuses)
 
     cfg = DashboardConfig(project_root=root)
@@ -1644,7 +1690,7 @@ async def test_collect_active_tasks_live_prd_member_beyond_cap_is_exempted(
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
@@ -1701,7 +1747,7 @@ async def test_collect_active_tasks_live_prd_member_beyond_cap_exempted_for_othe
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
@@ -1742,7 +1788,7 @@ async def test_collect_active_tasks_fully_done_prd_not_exempted(
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
@@ -1785,7 +1831,7 @@ async def test_collect_active_tasks_live_prd_member_within_cap_no_duplicate(
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
@@ -1827,7 +1873,7 @@ async def test_collect_active_tasks_live_prd_cancelled_member_beyond_cap_is_exem
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
@@ -1873,7 +1919,7 @@ async def test_collect_active_tasks_no_provenance_terminal_row_stays_capped(
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg,
@@ -1919,7 +1965,7 @@ async def test_collect_active_tasks_live_prd_exemption_warns_when_unusually_larg
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
     with caplog.at_level('WARNING', logger='dashboard.data.active_tasks'):
@@ -1958,7 +2004,7 @@ async def test_collect_active_tasks_live_prd_exemption_no_warning_under_threshol
     async def _fake(client, config, project_root):
         return list(shaped)
 
-    monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake)
+    _register_fetch_tasks(monkeypatch, _fake)
     cfg = DashboardConfig(project_root=root)
 
     with caplog.at_level('WARNING', logger='dashboard.data.active_tasks'):
@@ -2173,7 +2219,7 @@ class TestShapeOneProjectNarrowing:
         )
 
         emitted = sorted(
-            int(r['id'].rsplit(':', 1)[-1])
+            int(r['id'].rsplit('T-', 1)[-1])
             for r in active if r.get('status') == 'done'
         )
         assert emitted == [107, 108, 109], (

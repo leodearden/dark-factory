@@ -69,10 +69,24 @@ from dashboard.data.utils import resolve_now
 logger = logging.getLogger(__name__)
 
 _ACTIVE_STATUSES = {'in-progress', 'blocked', 'pending', 'merge-deferred', 'deferred'}
+# The two terminal buckets the Tasks tab renders. Sent as the ``statuses``
+# filter for the bounded terminal window, so this set is what crosses the wire
+# — keep it in step with the (status, cap) pairs iterated below.
+_TERMINAL_STATUSES = {'done', 'cancelled'}
 
 # Maximum done / cancelled tasks to include per project when the caller opts in
 # via ``max_done_per_project`` / ``max_cancelled_per_project``.
 # Kept at module level so app.py can import them.
+# Upper bound on how many terminal (done + cancelled) rows are pulled per
+# project per render — 8x the 50-row _MAX_DONE_PER_PROJECT render cap below.
+#
+# This is the ceiling: without it the Tasks tab pulled every done row in the
+# tree (~4000 rows / ~40 MB on dark-factory) to render at most 50 of them.
+# 8x rather than 1x because the window is selected by DESCENDING TASK ID
+# while the render cap selects by ``updated_at`` — see _shape_one_project's
+# docstring for why those differ and when the gap can bite.
+_TERMINAL_FETCH_WINDOW = 400
+
 _MAX_DONE_PER_PROJECT = 50
 _MAX_CANCELLED_PER_PROJECT = 50
 
@@ -323,10 +337,53 @@ async def _shape_one_project(
     caller surfaces that in the API payload so the React Tasks tab can
     show an offline banner.
 
-    *done_count* is the total number of ``'done'`` tasks in the fetched
-    list, **before** the *max_done_per_project* cap is applied.  Callers
-    that need the authoritative count for display should use this value
-    rather than counting the (capped) emitted rows.
+    *done_count* is the project's total number of ``'done'`` tasks, **before**
+    the *max_done_per_project* cap is applied.  It comes from the compact
+    ``fetch_statuses`` map (``{id: status}``), NOT from the fetched rows —
+    the rows are now a bounded window, so counting them would undercount any
+    project with more terminal tasks than the window holds.
+
+    **Three bounded calls, not one unbounded one.**  This function used to
+    issue a single unnarrowed ``fetch_tasks`` and derive active rows, terminal
+    buckets and *done_count* from that one full tree; on dark-factory that
+    meant transferring ~4000 done rows (~40 MB) per render to show at most 50
+    of them.  It now issues:
+
+    1. ``fetch_tasks(statuses=sorted(_ACTIVE_STATUSES))`` — active rows,
+       filtered server-side in SQL;
+    2. ``fetch_statuses(...)`` — the compact map, ~95% smaller, supplying both
+       *done_count* and the terminal population that positions (3).  Issued
+       concurrently with (1);
+    3. ``fetch_tasks(statuses=sorted(_TERMINAL_STATUSES), page_size=..., offset=...)``
+       — a bounded window of terminal rows, issued ONLY when a terminal cap is
+       actually requested.  ``collect_active_tasks``'s scheduler path passes
+       both caps as 0 and therefore transfers no terminal row at all.
+
+    The only component that still grows with the tree is the ~15 B/task status
+    map, not the ~10 KB/task rows.
+
+    **Two disclosed display-semantics changes**, both caused by what
+    ``get_tasks`` does and does not offer:
+
+    * The terminal window is selected by DESCENDING TASK ID.  That is the only
+      ordering available — ``SqliteTaskBackend._get_tasks_internal`` is
+      ``ORDER BY id`` and ``page_size``/``offset`` slice that ascending list,
+      and there is no ``ORDER BY updated_at``.  Rows inside the window are
+      still sorted by ``updated_at`` descending for display, so the common
+      case is unchanged (tasks are filed and completed in roughly id order).
+      The divergent case is real: a long-parked low-id task completing late
+      can fall outside the window.  ``_TERMINAL_FETCH_WINDOW`` is therefore 8x
+      the render cap, and truncation logs a WARNING rather than capping
+      silently.
+    * The live-PRD terminal-member exemption below now covers only members
+      INSIDE the window, for the same reason.
+
+    Benign race: *n_terminal* comes from a separate ``get_statuses`` read, so a
+    task completing between the two calls can shift the window by a row.
+
+    If the compact map read fails while the active fetch succeeded, the project
+    is NOT declared offline — *done_count* degrades to a count over the fetched
+    rows and a WARNING is logged.  Only an offline ACTIVE fetch means offline.
 
     When *max_done_per_project* > 0, the most-recent N done tasks
     (sorted by ``updated_at`` descending, then ``id`` descending) are
@@ -349,16 +406,71 @@ async def _shape_one_project(
     # Resolve the reference instant ONCE per build pass — never per row — so
     # every row's ``started`` and ``stranded`` verdict share one instant.
     effective_now = resolve_now(now)
-    fetched = await fetch_tasks(client, config, project_root)
+
+    # (1) active rows, SQL-filtered server-side, and (2) the compact
+    # {id: status} map — concurrently, since neither depends on the other.
+    fetched, status_map = await asyncio.gather(
+        fetch_tasks(client, config, project_root, statuses=sorted(_ACTIVE_STATUSES)),
+        fetch_statuses(client, config, project_root),
+    )
     if isinstance(fetched, dict) and fetched.get('offline'):
         return [], True, 0
-    tasks = fetched if isinstance(fetched, list) else []
-    if not tasks:
-        return [], False, 0
+    tasks = list(fetched) if isinstance(fetched, list) else []
 
-    # Count ALL done tasks before any cap — this is the authoritative figure
-    # for the DONE_COUNTS payload key.
-    done_count = sum(1 for t in tasks if t.get('status') == 'done')
+    # The compact map is the authoritative source of done_count (a count, not
+    # rows) and of the terminal population that positions the window below.
+    map_offline = not isinstance(status_map, dict) or bool(status_map.get('offline'))
+    status_map = (
+        {} if map_offline
+        else {k: v for k, v in status_map.items() if isinstance(k, int)}
+    )
+
+    wants_terminal = max_done_per_project > 0 or max_cancelled_per_project > 0
+    if wants_terminal:
+        n_terminal = sum(1 for s in status_map.values() if s in _TERMINAL_STATUSES)
+        window = _TERMINAL_FETCH_WINDOW
+        if n_terminal > window:
+            logger.warning(
+                'project %s: %d terminal (done+cancelled) tasks exceed the '
+                '%d-row fetch window — only the %d highest-id terminal rows '
+                'are fetched, so a low-id task completed long after it was '
+                'filed can be missing from the Tasks tab',
+                project, n_terminal, window, window,
+            )
+        # page_size/offset slice a list ordered by ASCENDING id, so reaching
+        # the high-id end requires a computed offset rather than a LIMIT.
+        terminal = await fetch_tasks(
+            client, config, project_root,
+            statuses=sorted(_TERMINAL_STATUSES),
+            page_size=window,
+            offset=max(0, n_terminal - window),
+        )
+        if isinstance(terminal, list):
+            tasks.extend(terminal)
+        else:
+            logger.warning(
+                'project %s: terminal-window fetch failed (%s) — done and '
+                'cancelled rows are omitted from this render',
+                project, terminal.get('error') if isinstance(terminal, dict) else terminal,
+            )
+
+    if map_offline:
+        # Degrade honestly rather than declaring an otherwise-healthy project
+        # offline: the active fetch succeeded, so its rows are still good; only
+        # the count loses its authoritative source and falls back to counting
+        # whatever rows this render happened to pull.
+        done_count = sum(1 for t in tasks if t.get('status') == 'done')
+        logger.warning(
+            'project %s: compact status map unavailable — done_count degraded '
+            'to a count over the %d fetched rows (%d), which undercounts when '
+            'the terminal window truncates',
+            project, len(tasks), done_count,
+        )
+    else:
+        done_count = sum(1 for s in status_map.values() if s == 'done')
+
+    if not tasks:
+        return [], False, done_count
 
     is_runtime_offline = runtime is None or runtime.offline
     runtime_index: dict[int, TaskRuntimeEntry] = (
