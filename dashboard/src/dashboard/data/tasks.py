@@ -112,10 +112,20 @@ _fetch_tasks_cache: TTLCache[list[dict] | dict] = TTLCache(
 # sites, so parameterising it would be the larger and less obviously correct
 # change.  No mcp_fanout change is required.
 #
-# No cross-invalidation hook is needed.  While a negative entry is fresh no
-# attempt runs for that key, so no success can occur inside the window to
-# contradict it; and both caches share :func:`_fetch_tasks_cache_key`, so a
-# recovered root simply repopulates the positive cache on its next attempt.
+# The two caches CAN both hold a fresh entry for one key, so the read order
+# between them is load-bearing.  The negative lookup sits outside the positive
+# cache's per-key lock, and ``TTLCache`` documents that a ``cache_ok``-rejected
+# value stores nothing and lets "the next lock-queued waiter run its own
+# refresh in turn" — so with two concurrent callers for the same key (the
+# routine case: app._load_task_cards, data.orchestrator, data.merge_queue and
+# data.burndown all fetch the same unnarrowed key on the same poll) waiter A's
+# failure can write a 5 s marker while waiter B's success writes a 20 s
+# positive entry.  ``fetch_tasks`` therefore prefers a fresh POSITIVE entry
+# over a fresh marker: a demonstrated success outranks a retry-suppression
+# hint, and serving the marker there would put a false offline banner over
+# rows that had already loaded.  Both caches share
+# :func:`_fetch_tasks_cache_key`, so a recovered root also repopulates the
+# positive cache on its next attempt.
 _FETCH_TASKS_NEGATIVE_TTL_SECONDS = 5.0
 _fetch_tasks_negative_cache: TTLCache[dict] = TTLCache(
     ttl_seconds=lambda: _FETCH_TASKS_NEGATIVE_TTL_SECONDS
@@ -310,7 +320,9 @@ async def fetch_tasks(
     to every caller in the window — the retry is suppressed, the degradation
     signal is not — and the negative entry is per (project_root, narrowing),
     so one failing read never blinds a healthy sibling root or a differently
-    narrowed read of the same root.
+    narrowed read of the same root.  A fresh POSITIVE entry outranks the
+    marker, so a success that raced a failure is served rather than shadowed;
+    the marker still suppresses the retry either way.
 
     **Data consistency:** ``fetch_statuses`` is uncached and returns live data;
     callers that combine a cached task tree (this function) with a live status
@@ -400,8 +412,18 @@ async def fetch_tasks(
     # A fresh negative entry short-circuits the attempt.  The marker is still
     # RETURNED, so degradation stays exactly as visible to the caller as it was
     # before — only the retry is suppressed.
+    #
+    # UNLESS a fresh positive entry also exists (see the negative-cache note
+    # above: a concurrent failure+success pair leaves both fresh).  Then fall
+    # through and serve the data: the marker exists to suppress a RETRY, not to
+    # withhold a result already in hand, and reporting a root offline while
+    # holding fresh rows for it is the false-banner failure this whole seam is
+    # meant to avoid.  Falling through costs no MCP call — ``get_or_refresh``
+    # returns the same fresh entry this check just saw.  If it expires in the
+    # gap the worst case is one extra attempt, which is strictly better than a
+    # wrong answer.
     suppressed = _fetch_tasks_negative_cache.get_fresh(key)
-    if suppressed is not None:
+    if suppressed is not None and _fetch_tasks_cache.get_fresh(key) is None:
         return suppressed
 
     result = await _fetch_tasks_cache.get_or_refresh(

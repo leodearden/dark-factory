@@ -1136,6 +1136,78 @@ class TestFetchTasksNegativeCache:
             'a successful fetch must never be stored as a negative entry'
         )
 
+    async def test_a_concurrent_success_is_never_shadowed_by_the_marker(
+        self, dummy_client, dummy_config
+    ):
+        """(f) A fresh SUCCESS must win over a fresh offline marker.
+
+        The negative lookup sits before, and outside of, the positive cache's
+        per-key lock, so the two can both be fresh at once.  ``TTLCache``
+        documents that a ``cache_ok``-rejected value stores nothing and "the
+        next lock-queued waiter runs its own refresh in turn", which is exactly
+        the interleaving driven here: two concurrent callers for one key (the
+        routine case — ``app._load_task_cards``, ``data.orchestrator``,
+        ``data.merge_queue`` and ``data.burndown`` all fetch the same
+        unnarrowed key on the same poll), waiter A fails and writes a 5 s
+        marker, waiter B then succeeds and writes a 20 s positive entry.
+
+        Every caller for the next ~5 s then got the offline marker while valid
+        fresh data sat in the positive cache — a false offline banner.  The
+        module comment asserted this could not happen ("no success can occur
+        inside the window to contradict it"), which held only single-threaded.
+
+        Note what is NOT asserted: retry suppression is unchanged.  The third
+        call below must issue no new MCP attempt — it is served from the
+        positive cache, so the marker still costs the broken root nothing.
+        """
+        import asyncio
+
+        import dashboard.data.tasks as tasks_mod
+        from dashboard.data.tasks import fetch_tasks
+
+        attempts = 0
+
+        async def _fail_then_succeed(client, url, tool, args, **_kw):
+            nonlocal attempts
+            attempts += 1
+            mine = attempts
+            await asyncio.sleep(0)  # yield, so both callers are in flight
+            if mine == 1:
+                raise httpx.ConnectError('refused')
+            return _CANNED_GET_TASKS_RESULT
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=_fail_then_succeed):
+            first, second = await asyncio.gather(
+                fetch_tasks(dummy_client, dummy_config, '/proj/NEG7'),
+                fetch_tasks(dummy_client, dummy_config, '/proj/NEG7'),
+            )
+            attempts_after_race = attempts
+            third = await fetch_tasks(dummy_client, dummy_config, '/proj/NEG7')
+
+        key = tasks_mod._fetch_tasks_cache_key('/proj/NEG7', None, None, 0)
+        # Precondition: the race really did leave BOTH entries fresh. Without
+        # this the test could pass for the wrong reason (e.g. no marker stored).
+        assert tasks_mod._fetch_tasks_negative_cache.get_fresh(key) is not None, (
+            'this test is only meaningful if the failure did store a marker'
+        )
+        assert tasks_mod._fetch_tasks_cache.get_fresh(key) is not None, (
+            'this test is only meaningful if the success did store a positive entry'
+        )
+        assert {isinstance(first, list), isinstance(second, list)} == {True, False}, (
+            'the interleaving under test is one failure and one success, got '
+            f'{type(first).__name__} and {type(second).__name__}'
+        )
+        assert isinstance(third, list), (
+            'a caller after the race got the offline marker while fresh, valid '
+            'data sat in the positive cache — a false offline banner over rows '
+            f'that had already loaded: {third}'
+        )
+        assert attempts == attempts_after_race, (
+            'the post-race call must be served from the positive cache, not '
+            'become a fresh attempt — retry suppression is not the thing being '
+            'relaxed here'
+        )
+
     async def test_offline_marker_still_never_lands_in_the_positive_cache(
         self, dummy_client, dummy_config
     ):
