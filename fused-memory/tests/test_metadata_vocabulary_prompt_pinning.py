@@ -12,7 +12,7 @@ every memory-writing agent role.  Adding a key to ``RESERVED_VOCABULARY_KEYS``
 without documenting it, documenting a key that is not reserved, or renaming
 either side, all fail here.
 
-ARM 2 (appended by a later step) — the reconciliation stage prompts, whose
+ARM 2 — the reconciliation stage prompts, whose
 ``'kind': '<literal>'`` filter examples must name kinds that are in
 ``KIND_REGISTRY``.
 
@@ -32,6 +32,7 @@ the very second copy INV-5 forbids.
 
 from __future__ import annotations
 
+import inspect
 import re
 
 import pytest
@@ -39,10 +40,19 @@ from orchestrator.agents.roles import METADATA_VOCABULARY_INSTRUCTIONS
 
 from fused_memory.memory_metadata import (
     EXPERIMENTAL_KEY_PREFIX,
+    KIND_REGISTRY,
     RESERVED_VOCABULARY_KEYS,
     TOPIC_SLUG_MAX_LEN,
     is_valid_topic_slug,
 )
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage2 import (
+    STAGE2_SYSTEM_PROMPT,
+    build_stage2_system_prompt,
+)
+from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+from fused_memory.reconciliation.recon_pool_map import CYCLE_SUMMARY_KIND
+from fused_memory.reconciliation.recon_self_model import render_cycle_summary_section
 
 # The documented-key bullet shape the writer instructions use:
 #     - `topic` — kebab-case slug naming ...
@@ -143,3 +153,94 @@ class TestPinFiresOnDrift:
                 METADATA_VOCABULARY_INSTRUCTIONS,
                 set(RESERVED_VOCABULARY_KEYS) - {'supersedes'},
             )
+
+
+# --------------------------------------------------------------------------
+# ARM 2 — recon prompt-embedded `'kind'` filter examples <-> KIND_REGISTRY
+# --------------------------------------------------------------------------
+
+# The shape a metadata filter example takes in RENDERED prompt text. The stage
+# prompts are f-strings that write `{{ }}` for a literal brace, so by the time
+# the constant exists the text carries single braces and ordinary dict syntax.
+_KIND_LITERAL_RE = re.compile(r"'kind':\s*'([^']+)'")
+
+# The prompt surfaces that show an agent a `'kind'` filter. Built at import
+# time, exactly as the stage prompts themselves are assembled.
+_PROMPT_SOURCES = {
+    'STAGE1_SYSTEM_PROMPT': STAGE1_SYSTEM_PROMPT,
+    'STAGE2_SYSTEM_PROMPT': STAGE2_SYSTEM_PROMPT,
+    "build_stage2_system_prompt('dark_factory')": build_stage2_system_prompt('dark_factory'),
+    'STAGE3_SYSTEM_PROMPT': STAGE3_SYSTEM_PROMPT,
+    'render_cycle_summary_section()': render_cycle_summary_section(),
+}
+
+# DELIBERATE NON-ASSERTION — do not "complete" this file by adding
+# `set(recon_self_model.MARKER_KINDS) <= KIND_REGISTRY`. MARKER_KINDS contains
+# `stage2_persistence_marker`, which is absent from KIND_REGISTRY and CORRECTLY
+# so: `_STAGE2_PERSISTENCE_MARKER_SOURCE` (stages/task_knowledge_sync.py) shows
+# it is a `metadata.source` value and a SQLite ledger `record_kind` — the
+# WRITER-PROVENANCE axis the PRD's V1 explicitly separates from `metadata.kind`.
+# That subset relation is a false premise; asserting it would fail on correct
+# code and pressure a future reader into polluting the kind registry with a
+# provenance token.
+
+
+def _kind_literals(text: str) -> set[str]:
+    """Extract the `'kind': '<value>'` literals a prompt shows to an agent."""
+    return set(_KIND_LITERAL_RE.findall(text))
+
+
+def _pin_kinds(text: str, registry: frozenset[str] | set[str]) -> set[str]:
+    """Assert every kind literal in `text` is in `registry`.
+
+    Same factoring rationale as `_pin_keys`: the drift demonstration below runs
+    this exact checker against a doctored registry.
+    """
+    literals = _kind_literals(text)
+    assert literals, 'no kind literal extracted — the regex stopped matching, so this guard is a no-op'
+    outside = literals - set(registry)
+    assert not outside, (
+        f'prompt names kind literals that are not in the registry: {sorted(outside)}'
+    )
+    return literals
+
+
+class TestReconPromptKindLiteralsPinned:
+    """Every `'kind'` filter example a recon prompt shows is a REGISTERED kind."""
+
+    @pytest.mark.parametrize('source_name', sorted(_PROMPT_SOURCES))
+    def test_kind_literals_extracted_and_include_cycle_summary(self, source_name: str) -> None:
+        """Non-emptiness is the load-bearing half: an extractor that silently
+        stops matching would turn the registry check below into a no-op."""
+        literals = _kind_literals(_PROMPT_SOURCES[source_name])
+        assert literals
+        assert CYCLE_SUMMARY_KIND in literals
+
+    @pytest.mark.parametrize('source_name', sorted(_PROMPT_SOURCES))
+    def test_every_kind_literal_is_registered(self, source_name: str) -> None:
+        assert _pin_kinds(_PROMPT_SOURCES[source_name], KIND_REGISTRY)
+
+    def test_cycle_summary_constant_is_registered(self) -> None:
+        """The constant<->registry edge itself: the shared kind constant the
+        writers use must be a member of the closed registry."""
+        assert CYCLE_SUMMARY_KIND in KIND_REGISTRY
+
+
+class TestCycleSummarySectionRendersFromTheConstant:
+    """INV-5 for the rendered section: one normative copy of the literal."""
+
+    def test_render_uses_the_shared_constant(self) -> None:
+        """`render_cycle_summary_section` must interpolate CYCLE_SUMMARY_KIND
+        rather than re-type `cycle_summary`, so a rename in recon_pool_map
+        reaches the prompt instead of silently stranding it."""
+        assert 'CYCLE_SUMMARY_KIND' in inspect.getsource(render_cycle_summary_section)
+
+
+class TestKindPinFiresOnDrift:
+    """DRIFT DEMONSTRATION — a `cycle_summary` rename in the registry provably
+    strands every recon filter example, loudly."""
+
+    @pytest.mark.parametrize('source_name', sorted(_PROMPT_SOURCES))
+    def test_renamed_kind_fails_the_pin(self, source_name: str) -> None:
+        with pytest.raises(AssertionError):
+            _pin_kinds(_PROMPT_SOURCES[source_name], KIND_REGISTRY - {CYCLE_SUMMARY_KIND})
