@@ -638,13 +638,23 @@ async def scroll_collection_points(
         preflight could not fully enumerate, so an UNRESOLVED item still
         means nothing was written.
 
-    A ``ScrollPageBudgetExhausted`` is CAUGHT, never propagated: a raising
-    sub-operation must not abort the whole consolidation run, because
-    earlier keys/sections of the same ``--apply`` pass may already hold
-    committed mutations (the same rationale the sibling ``count_graph_nodes``
-    guard states). Exhaustion maps onto the existing capped contract instead
-    -- item UNRESOLVED, no upsert, no source delete, non-zero exit -- so the
-    externally visible behaviour on a too-large collection is unchanged.
+    ANY drain failure is CAUGHT, never propagated: budget exhaustion, a
+    ``TimeoutError`` from ``scroll_collection_pages``'s per-page
+    ``asyncio.wait_for``, or a transport error. A raising sub-operation must
+    not abort the whole consolidation run, because earlier keys/sections of
+    the same ``--apply`` pass may already hold committed mutations -- the
+    same except-``Exception`` -> WARNING -> 'UNRESOLVED' idiom the sibling
+    ``delete_empty_collection`` uses. Every failure maps onto the existing
+    capped contract -- item UNRESOLVED, no upsert, no source delete, non-zero
+    exit -- so the externally visible behaviour on a too-large collection is
+    unchanged.
+
+    The backend deliberately PROPAGATES these (``mem0_client`` documents the
+    ``wait_for`` timeout as propagated); swallowing them is THIS SCRIPT's
+    run-level policy, not a weakening of the backend contract. The two
+    branches log DISTINCT warnings: only budget exhaustion carries the
+    raise-the-budget remediation, because that advice is wrong after a
+    transport failure.
     """
     point_count = 0
     try:
@@ -664,6 +674,18 @@ async def scroll_collection_points(
             'merge_collection). Re-run with a higher --max-pages (page '
             'budget) or --limit (page size).',
             collection, max_pages, page_size, point_count,
+        )
+        return point_count, True
+    except Exception as e:
+        # Deliberately NO raise-the-budget advice here: this is not a cap,
+        # and sending an operator to re-run a bigger scroll against a
+        # transport that is failing is wrong advice.
+        logger.warning(
+            "consolidate_namespace_families: scroll of collection '%s' FAILED "
+            'after %d point(s): %s -- the enumeration is INCOMPLETE, so this '
+            'collection is reported UNRESOLVED and its source will not be '
+            'deleted.',
+            collection, point_count, e, exc_info=True,
         )
         return point_count, True
     return point_count, False
@@ -713,11 +735,14 @@ async def merge_collection(
         ACTUALLY reached *target*, not what was enumerated -- a chunk still
         buffered when the drain died was never sent and is not counted.
 
-    A ``ScrollPageBudgetExhausted`` is CAUGHT, never propagated, for the
-    same reason ``scroll_collection_points`` catches it: a raising
-    sub-operation must not abort the whole consolidation run, because
-    earlier keys/sections of the same ``--apply`` pass may already hold
-    committed mutations.
+    ANY drain failure is CAUGHT, never propagated, for the same reason
+    ``scroll_collection_points`` catches its own: budget exhaustion, a
+    ``TimeoutError`` from ``scroll_collection_pages``'s per-page
+    ``asyncio.wait_for``, or a transport error -- a raising sub-operation
+    must not abort the whole consolidation run, because earlier
+    keys/sections of the same ``--apply`` pass may already hold committed
+    mutations (the ``delete_empty_collection`` idiom). Both branches withhold
+    the source delete; only the budget branch advises raising the budget.
     """
     from qdrant_client.http import models as qmodels  # noqa: PLC0415
 
@@ -761,6 +786,22 @@ async def merge_collection(
             'and idempotent: re-run with a higher --max-pages (page budget) '
             'or --limit (page size) to complete it.',
             source, max_pages, page_size, points_upserted, target,
+        )
+        return {
+            'points_upserted': points_upserted,
+            'source_deleted': False,
+            'enumeration_incomplete': True,
+        }
+    except Exception as e:
+        # Same withheld delete, no raise-the-budget advice -- see the sibling
+        # branch in scroll_collection_points.
+        logger.warning(
+            "consolidate_namespace_families: the merge drain of collection "
+            "'%s' FAILED after %d point(s) were upserted into %r: %s -- the "
+            'migration is INCOMPLETE, so this collection is reported '
+            'UNRESOLVED and its source is NOT deleted. The points already '
+            'upserted are id-keyed and idempotent, so a re-run completes it.',
+            source, points_upserted, target, e, exc_info=True,
         )
         return {
             'points_upserted': points_upserted,
