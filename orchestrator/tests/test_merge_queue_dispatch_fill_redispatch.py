@@ -1,40 +1,23 @@
 """DISPATCH-FILL redispatch-drain tests for task 3276.
 
-The DISPATCH-FILL loop's early-stop guard (``_verifier_loop``,
-``orchestrator/src/orchestrator/merge_queue.py``) tests whether
-``self._redispatch`` has just drained::
+Pins two invariants of the DISPATCH-FILL loop's early-stop guard
+(``_verifier_loop``, ``orchestrator/src/orchestrator/merge_queue.py``):
 
-    if allocator.free_host_count() == 0 or (
-        not is_from_verifier_queue and not self._redispatch
-    ):
-        fill_done = True
-        break
+* A redispatch-sourced dispatch that drains ``self._redispatch`` must not
+  end the fill pass while ``self._verifier_queue`` still holds a ready
+  item and a host slot is free -- whether that item was already queued
+  before the dispatch, or arrives a moment after.
+* Once ``self._redispatch`` and ``self._verifier_queue`` are genuinely
+  both empty, the loop must still fall through to FINALIZE-HEAD rather
+  than hang -- the anti-deadlock property a since-deleted redispatch-
+  specific special case used to provide is now structural, coming from
+  the fill loop's other fall-through paths.
 
-but the hazard the guard's own comment names is an EMPTY
-``self._verifier_queue`` (blocking on ``_verifier_queue.get()`` would
-deadlock after a cascade). Those are different conditions: when a
-redispatch-sourced item is dispatched and ``_redispatch`` happens to drain
-on that exact dispatch, the fill pass ends even though ``_verifier_queue``
-still holds a ready item and a host slot is free. The loop then falls
-through to FINALIZE-HEAD and blocks on the head's verify -- during which NO
-further dispatch of any kind can happen, even though a free host sits idle
-with ready work waiting in the queue.
-
-Step map:
-  step-1 RED  -- primary repro: a second, already-merged, ready item sitting
-                 in ``_verifier_queue`` is never dispatched to the free
-                 second host in the same fill pass as a redispatch-sourced
-                 dispatch that drains ``_redispatch``.
-  step-2 impl -- GREEN: re-predicate the guard on the verifier queue actually
-                 being empty (rather than ``_redispatch`` being empty).
-  step-3 RED  -- (a) the late-arrival shape the re-predicated guard still
-                 forfeits (an item arriving a moment after the guard runs);
-                 (b) the anti-deadlock invariant the original guard's comment
-                 claimed to provide, pinned so step-4's deletion cannot
-                 silently reintroduce the hang.
-  step-4 impl -- GREEN: delete the second clause outright; the anti-deadlock
-                 property is provided structurally by the fill loop's other
-                 fall-through paths (see merge_queue.py's updated comment).
+See merge_queue.py's comment on the guard (immediately above
+``allocator = self._ensure_host_allocator(...)`` in the DISPATCH-FILL
+tail) for the current predicate and the traced fall-through argument for
+why the anti-deadlock property holds without a redispatch-specific
+special case.
 """
 
 from __future__ import annotations
@@ -236,12 +219,13 @@ def _make_real_item(
 
 @pytest.mark.asyncio
 class TestRedispatchDrainDoesNotEndFillPass:
-    """DISPATCH-FILL's early-stop guard checks ``_redispatch`` draining
-    instead of ``_verifier_queue`` draining -- task 3276.
+    """A redispatch-sourced dispatch that drains ``self._redispatch`` must
+    not end the DISPATCH-FILL pass while ``self._verifier_queue`` still
+    holds a ready item and a host slot is free -- task 3276.
 
-    RED until step-2 GREEN re-predicates the guard (a partial fix -- see
-    step-3's tests for what step-2 alone still forfeits) and step-4 GREEN
-    deletes the clause outright (the complete fix).
+    Two shapes are pinned: the item already queued before the guard
+    evaluates (below), and the item arriving a moment after (see
+    ``test_late_arrival_dispatched_to_free_host_while_head_verify_runs``).
     """
 
     async def test_second_host_dispatched_from_verifier_queue_in_same_fill_pass(
@@ -253,13 +237,12 @@ class TestRedispatchDrainDoesNotEndFillPass:
         end the fill pass while ``_verifier_queue`` still holds a ready item
         and a host slot is free.
 
-        RED: only item_a (from ``_redispatch``) is dispatched; the guard's
-        ``not is_from_verifier_queue and not self._redispatch`` clause ends
-        the fill pass right after, so item_b sits untouched in
-        ``_verifier_queue`` while the laptop host slot sits idle -- the loop
-        blocks in FINALIZE-HEAD awaiting item_a's gated verify instead.
-        GREEN: item_b is dispatched to the free second host in the SAME fill
-        pass, immediately after item_a -- both leases held simultaneously.
+        item_b is dispatched to the free second host in the SAME fill pass,
+        immediately after item_a -- both leases held simultaneously. A
+        regression here means the fill pass ends as soon as ``_redispatch``
+        drains, leaving item_b stranded in ``_verifier_queue`` and the
+        laptop host slot idle while the loop blocks in FINALIZE-HEAD
+        awaiting item_a's verify instead.
         """
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         allocator = _inject_two_host_allocator(worker, _make_fake_remote('laptop'))
@@ -293,14 +276,12 @@ class TestRedispatchDrainDoesNotEndFillPass:
             pytest.fail(
                 'item_b (in _verifier_queue) was never dispatched within '
                 f'{MERGE_RESULT_TIMEOUT}s of item_a (from _redispatch) being '
-                "dispatched. RED: the DISPATCH-FILL guard's "
-                '`not is_from_verifier_queue and not self._redispatch` clause '
-                'ends the fill pass as soon as _redispatch drains, even '
-                'though _verifier_queue still holds item_b and a host slot '
-                'is free -- the loop falls through to FINALIZE-HEAD and '
-                "blocks on item_a's gated verify instead. GREEN (step-2/"
-                'step-4): the guard is re-predicated/deleted so item_b is '
-                'dispatched to the free second host in the same fill pass.'
+                'dispatched. This means the DISPATCH-FILL guard is ending '
+                'the fill pass as soon as _redispatch drains, even though '
+                '_verifier_queue still holds item_b and a host slot is '
+                "free -- the loop falls through to FINALIZE-HEAD and blocks "
+                "on item_a's gated verify instead of dispatching item_b to "
+                'the free second host in the same fill pass.'
             )
 
         assert drive.dispatched == [item_a, item_b], (
@@ -329,20 +310,15 @@ class TestRedispatchDrainDoesNotEndFillPass:
         yet queued when the loop starts, and only arrives after item_a has
         already been dispatched and the guard has already run.
 
-        RED against the step-2 re-predicated guard: ``self._verifier_queue.empty()``
-        is genuinely True at the instant the guard evaluates (item_b has not
-        arrived yet), so the fill pass still ends there and the loop blocks
-        in FINALIZE-HEAD awaiting item_a's gated verify -- item_b is never
-        picked up even though it arrives moments later with a host still
-        free. Fails identically against the ORIGINAL (pre-step-2) predicate
-        too: this is the test proving re-predication is strictly weaker than
-        deleting the clause (step-4).
-
-        GREEN only after step-4: with the clause deleted, dispatching item_a
-        falls through to the QueueEmpty multi-host fill-ahead race
-        (``asyncio.wait`` over the persistent getter + running verify
-        tasks), which picks up item_b the moment it is put() and dispatches
-        it to the free second host.
+        Dispatching item_a falls through to the QueueEmpty multi-host
+        fill-ahead race (``asyncio.wait`` over the persistent getter +
+        running verify tasks), which picks up item_b the moment it is
+        put() and dispatches it to the free second host. A guard that
+        merely re-checks ``self._verifier_queue.empty()`` at decision time
+        is NOT sufficient to pass this test: that snapshot is empty at the
+        instant the guard evaluates (item_b has not arrived yet), so a
+        snapshot-based guard would still end the fill pass there instead of
+        letting the fall-through paths keep filling.
         """
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         allocator = _inject_two_host_allocator(worker, _make_fake_remote('laptop'))
@@ -380,18 +356,15 @@ class TestRedispatchDrainDoesNotEndFillPass:
                 'item_b was never dispatched within '
                 f'{MERGE_RESULT_TIMEOUT}s of arriving in _verifier_queue '
                 "while item_a's verify was still running and a host was "
-                'free. RED (against the step-2 re-predicated guard): '
-                '_verifier_queue.empty() is True at the instant the guard '
-                'evaluates (item_b has not arrived yet), so the fill pass '
-                'ends there and the loop blocks in FINALIZE-HEAD awaiting '
-                "item_a's gated verify -- item_b arriving moments later "
-                'changes nothing because the loop already committed to '
-                'FINALIZE-HEAD. This proves re-predicating the guard '
-                '(step-2) is strictly weaker than deleting it (step-4): a '
-                'narrower empty-queue snapshot still forfeits real, '
-                'imminent work. GREEN only after step-4 deletes the clause '
-                'so a free host always falls through to the QueueEmpty '
-                'fill-ahead race instead of a special-cased early exit.'
+                'free. This means the DISPATCH-FILL guard is stopping the '
+                'fill pass on an empty-queue snapshot taken before item_b '
+                'arrived, so the loop commits to FINALIZE-HEAD and blocks '
+                "on item_a's gated verify -- item_b arriving moments later "
+                'changes nothing. A guard that merely re-checks '
+                '_verifier_queue.empty() at decision time forfeits this '
+                'real, imminent work; a free host must keep falling '
+                'through to the QueueEmpty fill-ahead race instead of a '
+                'special-cased early exit.'
             )
 
         assert drive.dispatched == [item_a, item_b], (
@@ -415,13 +388,13 @@ class TestCascadeAntiDeadlockPreserved:
     """Fences the anti-deadlock property the original DISPATCH-FILL guard's
     comment claimed to provide -- task 3276.
 
-    NOT a RED/GREEN pair: this test is GREEN before step-2, GREEN after
-    step-2, and must STAY green after step-4 deletes the guard's second
-    clause entirely. Its job is to prove the deletion does not silently
+    Not a regression pin on a specific fix, but a permanent invariant
+    fence: this test must stay green regardless of how the DISPATCH-FILL
+    guard is implemented, proving that emptying ``_redispatch`` does not
     reintroduce the "blocking on _verifier_queue.get() ... would deadlock
-    when the queue is empty after a cascade" hazard the original comment
-    named -- see step-4's rewritten comment on merge_queue.py for the traced
-    fall-through argument this test backs up empirically.
+    when the queue is empty after a cascade" hazard the original guard's
+    comment named -- see merge_queue.py's comment on the guard for the
+    traced fall-through argument this test backs up empirically.
     """
 
     async def test_empty_queue_after_redispatch_drain_still_finalizes_head(
