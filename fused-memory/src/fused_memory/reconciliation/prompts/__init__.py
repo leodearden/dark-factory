@@ -353,7 +353,26 @@ _STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
 # Call shapes below are GENERATED from live FastMCP tool signatures (task-2559
 # root-cause fix for run_id-omission drift that survived two reviewer rounds) —
 # see render_recon_report_tool_guidance() — rather than hand-transcribed, so a
-# rendered example can never silently omit a required kwarg again.
+# rendered example can never silently omit a required KWARG again.
+#
+# Which TOOLS get a call shape at all is derived too (task 3878): the renderer
+# iterates the keys of the signature mapping it is handed, so it can no longer
+# silently omit a whole tool the way its predecessor — nine hard-coded
+# render_call('...') invocations that ignored the mapping's other keys — did.
+# The mapping is the live tool set MINUS two classes, and that three-way
+# classification lives next to the @mcp.tool() registrations in
+# server/recon_report.py, not here:
+#   HARNESS_CALLED_REPORT_TOOLS — start_report; the harness opens the report
+#     before the stage begins, so an example would invite a redundant call.
+#     Its PROSE mention below is what tells the agent not to call it.
+#   STAGE_GATED_REPORT_TOOLS  — denied in some stages via
+#     DISALLOW_RECON_REPORT_LEDGER_WRITES (cli_stage_runner.py). This block is
+#     interpolated into ALL THREE stage prompts, and --disallowed-tools OMITS a
+#     denied tool rather than rejecting the call, so naming one here would tell
+#     a stage about an action it cannot take.
+#   everything else — shared guidance, rendered here for every stage.
+# Registering a new tool means classifying it into exactly one of the three;
+# tests/test_recon_report_guidance_drift.py fails loudly until you do.
 _RECON_REPORT_PLACEHOLDERS = {
     'run_id': '<from Reconciliation Context>',
     'finding_id': '<finding_id from add_finding response>',
@@ -538,8 +557,14 @@ def _render_recon_report_tool_guidance(
     renders bare, mirroring common CLI usage-string conventions
     (``cmd required [optional]``).
 
-    start_report is harness-called (agents never call it themselves) and is
-    intentionally excluded from generation — its mention below stays prose.
+    This function excludes NOTHING. start_report is absent from the rendered
+    call shapes because the CALLER does not hand it over (it is listed in
+    ``HARNESS_CALLED_REPORT_TOOLS``); the exclusion is data applied by
+    :func:`render_recon_report_tool_guidance`, not a property of this
+    function, which renders whatever mapping it is given. The start_report
+    PROSE mention in :data:`_GUIDANCE_PREAMBLE` is unconditional and
+    deliberately not derived from *signatures* — it is the sentence that tells
+    the agent the harness already called it.
 
     PRESENCE is derived, PLACEMENT is curated (task 3878). Every key of
     *signatures* is rendered: :data:`_GUIDANCE_TOOL_ORDER` +
@@ -617,8 +642,15 @@ def render_recon_report_tool_guidance() -> str:
     renders bare, mirroring common CLI usage-string conventions
     (``cmd required [optional]``).
 
-    start_report is harness-called (agents never call it themselves) and is
-    intentionally excluded from generation — its mention below stays prose.
+    Filters the live tool set down to the SHARED-GUIDANCE tools before
+    rendering: harness-called tools (start_report) and stage-gated tools
+    (denied in some stages via DISALLOW_RECON_REPORT_LEDGER_WRITES) are
+    dropped, per the classification constants that live next to the
+    ``@mcp.tool()`` registrations in ``server/recon_report.py``. That filtering
+    is this function's job precisely so that
+    :func:`_render_recon_report_tool_guidance` can stay a pure "render every
+    key I was handed" function shared with the frozen fallback. start_report
+    still gets a prose mention in the rendered text — just no call shape.
 
     Raises whatever :func:`get_recon_report_tool_signatures` raises (e.g. if
     FastMCP's internals have changed shape) — :func:`get_recon_report_tool_guidance`
@@ -666,12 +698,19 @@ def render_recon_report_tool_guidance() -> str:
 # the live guidance uses, so its WORDING cannot drift from the generated
 # guidance -- there is only one prose template and one renderer. The one
 # remaining hand-maintained surface is the snapshot's parameter data (names,
-# order, required-ness): a tool signature change needs that dict updated, and
+# order, required-ness) and its tool-set COVERAGE: this dict must hold exactly
+# the shared-guidance tools, so a newly registered agent-callable tool needs a
+# key here as well as a classification in server/recon_report.py.
 # tests/test_recon_report_guidance_drift.py::TestFallbackIsDerivedFromTheSameRenderer
-# fails loudly until it is. Every call shape below still carries run_id (true
-# by construction: run_id is required in the snapshot for all 9 tools), so
-# even a stale snapshot cannot regress the original run_id-omission bug
-# task-2559 fixed.
+# fails loudly until it is, comparing this dict against the DERIVED
+# shared-guidance set rather than against a second hand-maintained list.
+# Every call shape below still carries run_id (true by construction: run_id is
+# required in the snapshot for all 10 tools), so even a stale snapshot cannot
+# regress the original run_id-omission bug task-2559 fixed.
+#
+# Key ORDER here mirrors _GUIDANCE_TOOL_ORDER purely so this dict reads in the
+# same sequence as the text it renders; the renderer keys off the curated order
+# tuple, not off this insertion order.
 _FROZEN_RECON_REPORT_SIGNATURE_SPECS: dict[str, tuple[tuple[str, bool], ...]] = {
     'add_finding': (
         ('run_id', True),
@@ -711,11 +750,16 @@ def _frozen_recon_report_tool_guidance() -> str:
 
     Deliberately NOT rendered at module-import time (reviewer robustness
     finding). :data:`_FROZEN_RECON_REPORT_SIGNATURE_SPECS` is hand-maintained,
-    and ``render_call`` (inside :func:`_render_recon_report_tool_guidance`)
-    looks up each of the 9 agent-called tool names in it directly — a future
-    edit that drops, renames, or typos one of those keys raises a bare
-    ``KeyError``. Computing this eagerly at import time turned that into an
-    ImportError for every consumer of the ``prompts`` package, including
+    and rendering it can still fail or silently degrade. A dropped, renamed or
+    typo'd key no longer raises ``KeyError`` — since task 3878 the renderer
+    iterates the mapping it is handed and SKIPS a curated name that is absent —
+    but the failure modes that remain are real: a typo'd key renders as an
+    uncurated "Also registered on this server" bullet instead of its annotated
+    paragraph, a dropped key loses that tool's guidance (and its behavioural
+    rules) entirely, and a malformed VALUE — anything that is not an iterable of
+    ``(name, required)`` pairs — still raises from ``render_call``. Computing
+    this eagerly at import time turned any such raise into an ImportError for
+    every consumer of the ``prompts`` package, including
     sibling submodules such as ``prompts.judge`` that never touch
     recon-report guidance at all — exactly the blast radius
     :func:`get_recon_report_tool_guidance`'s try/except exists to contain.

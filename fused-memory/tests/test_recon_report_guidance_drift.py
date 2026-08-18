@@ -40,8 +40,42 @@ run_id is required in the snapshot for every tool) — it is retained as a
 cheap belt-and-braces guard on the original task-2559 bug, not as the
 mechanism that now prevents drift; do not mistake it for one.
 
-start_report is harness-called (agents never call it themselves) and is
-intentionally excluded — see reconciliation/prompts/__init__.py.
+Task 3878 widened the guard from "does each LISTED tool carry run_id" to
+"does every REGISTERED tool reach the agent at all", after finding two tools
+that had drifted past the old check: delete_finding (callable in every stage,
+in no rendered guidance) and write_entity_standing_decision (registered, in no
+server-level listing). Four things changed here:
+
+- There is NO hand-maintained tool-name list left in this module.
+  _SHARED_GUIDANCE_REPORT_TOOLS is DERIVED at import from the live tool set
+  minus HARNESS_CALLED_REPORT_TOOLS and STAGE_GATED_REPORT_TOOLS, which live
+  next to the @mcp.tool() registrations. The list this replaced was stale, and
+  it lived in a test file the tool author never opens — the drift itself.
+- That three-way classification (shared-guidance / harness-called /
+  stage-gated) is pinned to the REAL enforcement surface: it is cross-checked
+  against DISALLOW_RECON_REPORT_LEDGER_WRITES in cli_stage_runner.py, so it
+  cannot become a second hand-maintained list that drifts from the actual gate.
+- Coverage is asserted on BOTH surfaces a tool can reach an agent through:
+  RECON_REPORT_INSTRUCTIONS (the stage-agnostic server-level listing, for ALL
+  registered tools) and the rendered guidance block (for shared-guidance tools).
+  The RECON_REPORT_INSTRUCTIONS half is FULLY independent of the renderer —
+  those instructions are hand-written prose that is never generated.
+- TestRendererCoversEverySignatureItIsGiven is the assertion that escapes the
+  tautology described above: it injects a SYNTHETIC tool the renderer has never
+  heard of straight into _render_recon_report_tool_guidance()'s only argument,
+  proving "never silently omit a tool I was handed" from a signature source the
+  renderer cannot have hard-coded. The derived-coverage tests re-read the same
+  live signatures the renderer generates from, so they catch a filtering,
+  lookup or placement bug but not a signature-source bug.
+
+start_report gets a PROSE mention in the guidance but no call shape, and the
+stage-gated tools get neither. That is not a property of the renderer, which
+renders every key it is handed: render_recon_report_tool_guidance() filters the
+live tool set before calling it — see reconciliation/prompts/__init__.py. Both
+omissions are asserted positively here (TestNonSharedToolsAreNotAdvertisedToEveryStage),
+because --disallowed-tools OMITS a denied tool rather than rejecting the call,
+so advertising one to a stage that cannot call it produces silence, not a
+refusal the agent could act on.
 """
 from __future__ import annotations
 
@@ -457,8 +491,14 @@ class TestReconReportRunIdGuardOverAssembledPrompts:
     recon_self_model.MCP_CALL_SIGNATURES — verified never rendered into any
     stage prompt, and task 2231's (W5-ξ) domain — cannot be matched here.
 
-    start_report is harness-called (agents never call it themselves) and is
-    intentionally excluded, as in TestReconReportGuidanceDrift.
+    Scans the SHARED-GUIDANCE tools (_SHARED_GUIDANCE_REPORT_TOOLS, derived
+    above): start_report is harness-called and the stage-gated tools are denied
+    in some stages, so neither should appear as a call example in an assembled
+    prompt at all — that is asserted separately, and positively, by
+    TestNonSharedToolsAreNotAdvertisedToEveryStage. This scan's premise (every
+    shared-guidance tool is run-scoped, so "no run_id" really is a bug rather
+    than a tool that simply has no run_id) is pinned by
+    TestSharedGuidanceToolsAreAllRendered.test_shared_guidance_tool_takes_run_id_first.
     """
 
     @pytest.mark.parametrize(
