@@ -205,7 +205,7 @@ count as successful edge updates. This prevents silent write failures from infla
 `edges_updated` stat and triggering false-positive judge passes.
 
 ## Verifying add_finding responses
-A `mcp__fused-memory__add_finding` (recon_report) call is a successful new filing ONLY \
+A `mcp__recon-report__add_finding` (recon_report) call is a successful new filing ONLY \
 when its response contains a `finding_id` key. You MUST capture that `finding_id` \
 **verbatim** from the actual tool response, and you may cite or echo it ONLY when you \
 hold a genuine successful `add_finding` response from this turn. **Never** state that a \
