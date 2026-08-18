@@ -400,14 +400,49 @@ def _segment(cmd: str, keyword: str) -> str:
     return matching[0]
 
 
+def _anchor_split(cmd: str, keyword: str) -> tuple[list[str], list[str]]:
+    """*keyword*'s segment of *cmd*, split at the checker anchor into (pre, post).
+
+    The ANCHOR is the last whitespace-separated token of *keyword* (see the
+    ``_RUFF``/``_PYRIGHT`` comment above) and belongs to neither half. Sole
+    implementation of the anchor location and the anchor-presence assertion, so
+    every caller that cares about position shares one notion of where the
+    wrapper stops and the checker starts.
+    """
+    anchor = keyword.split()[-1]
+    tokens = shlex.split(_segment(cmd, keyword))
+    assert anchor in tokens, (
+        f'no `{anchor}` token in the `{keyword}` segment of {cmd!r}, so the '
+        "checker's own arguments cannot be located"
+    )
+    at = tokens.index(anchor)
+    return tokens[:at], tokens[at + 1:]
+
+
+def _pre_anchor_tokens(cmd: str, keyword: str) -> list[str]:
+    """The WRAPPER's tokens in *cmd* — everything before the checker anchor.
+
+    The mirror of ``_post_anchor_tokens``, for the assertions that are about
+    how the checker is RESOLVED rather than what it checks: in
+    ``uv run --project shared pyright scripts/`` these four tokens are uv's, and
+    they decide which member environment supplies the ``pyright`` binary.
+
+    Shares ``_anchor_split`` with its mirror deliberately. A hand-rolled
+    ``tokens.index(_PYRIGHT)`` at the call site is a third copy of the same
+    logic — the drift this file already paid for once (task 4358:
+    ``_narrowing_flag_args`` had missed the slice ``_targets`` always had) — and
+    it raises a bare ``ValueError`` instead of the diagnostic above when the
+    anchor is absent.
+    """
+    return _anchor_split(cmd, keyword)[0]
+
+
 def _post_anchor_tokens(cmd: str, keyword: str) -> list[str]:
     """*keyword*'s OWN arguments in *cmd* — the tokens after the checker anchor.
 
-    The ANCHOR is the last whitespace-separated token of *keyword* (see the
-    ``_RUFF``/``_PYRIGHT`` comment above). Everything before it belongs to the
-    WRAPPER, not the checker: in ``uv run --project shared pyright scripts/``
-    the pre-anchor tokens are uv's, and reading them as the checker's is a
-    category error.
+    Everything before the anchor belongs to the WRAPPER, not the checker: in
+    ``uv run --project shared pyright scripts/`` the pre-anchor tokens are uv's,
+    and reading them as the checker's is a category error.
 
     Both callers need exactly this slice, for the same reason from opposite
     directions — ``_targets`` must not count uv's positional ``shared`` as a
@@ -416,13 +451,7 @@ def _post_anchor_tokens(cmd: str, keyword: str) -> list[str]:
     what keeps the two from drifting apart again (task 4358: ``_targets`` had
     the slice from the start, ``_narrowing_flag_args`` never got it).
     """
-    anchor = keyword.split()[-1]
-    tokens = shlex.split(_segment(cmd, keyword))
-    assert anchor in tokens, (
-        f'no `{anchor}` token in the `{keyword}` segment of {cmd!r}, so the '
-        "checker's own arguments cannot be located"
-    )
-    return tokens[tokens.index(anchor) + 1:]
+    return _anchor_split(cmd, keyword)[1]
 
 
 def _targets(cmd: str, keyword: str) -> list[str]:
@@ -454,6 +483,34 @@ def _narrowing_flag_args(cmd: str, keyword: str) -> list[str]:
     """
     prefixes = _NARROWING_FLAGS[keyword]
     return [t for t in _post_anchor_tokens(cmd, keyword) if t.startswith(prefixes)]
+
+
+def _uv_project_member(cmd: str, keyword: str) -> str | None:
+    """The member named by uv's PRE-anchor ``--project`` in *keyword*'s segment.
+
+    Both spellings, matching ``_narrowing_flag_args``' documented both-spellings
+    behaviour: ``--project shared`` and ``--project=shared`` are the same uv
+    invocation, and a reader that recognises only one of them rejects a correct
+    command with a message claiming it selects no environment at all.
+
+    ``None`` means NO USABLE PRE-ANCHOR SELECTOR, which covers three cases the
+    caller reports identically because uv fails them identically:
+
+      * no ``--project`` before the anchor at all;
+      * a POST-anchor ``--project``, which is pyright's CONFIG-FILE redirect and
+        a different flag entirely (see ``_NARROWING_FLAGS``) — that one is
+        ``_narrowing_flag_args``' business, not this helper's;
+      * a dangling ``--project`` with the anchor as its next token, e.g.
+        ``uv run --project pyright scripts/``, where uv would consume
+        ``pyright`` as the project name and never invoke the checker.
+    """
+    pre = _pre_anchor_tokens(cmd, keyword)
+    for i, token in enumerate(pre):
+        if token == '--project':
+            return pre[i + 1] if i + 1 < len(pre) else None
+        if token.startswith('--project='):
+            return token.split('=', 1)[1]
+    return None
 
 
 # Thin ruff-spelling wrappers, kept so test_scripts_diff_is_lint_gated below is
@@ -604,6 +661,71 @@ def test_narrowing_flag_detection_is_scoped_to_the_checkers_own_arguments() -> N
         "the repo's actual scripts/ lint_command carries no exclude flag, and "
         "uv's pre-anchor --project must not be mistaken for one here either"
     )
+
+
+def test_uv_project_member_reads_both_spellings_and_only_pre_anchor() -> None:
+    """``_uv_project_member`` must accept ``--project=X`` as well as ``--project X``.
+
+    Task 4358 amendment. ``uv run --project=shared pyright scripts/`` is an
+    exactly equivalent uv invocation to the space-separated spelling, so a
+    reader that recognises only one of them fails a command that does precisely
+    what the contract asks — a FALSE POSITIVE whose message would accuse the
+    author of not selecting an environment. The sibling helper
+    ``_narrowing_flag_args`` already prefix-matches for this same reason ("Both
+    spellings are caught: ``--exclude foo`` and ``--exclude=foo``"); this pins
+    that ``test_type_gates_resolve_pyright_without_npx`` follows the convention
+    its own file established rather than re-deriving a stricter one.
+
+    Cases (c)-(e) carry the POSITION half, which is the same homograph
+    ``test_narrowing_flag_detection_is_scoped_to_the_checkers_own_arguments``
+    guards from the other side: this helper must see ONLY uv's pre-anchor
+    environment selector, ``_narrowing_flag_args`` ONLY pyright's post-anchor
+    config redirect. Case (e) is the mixed command that carries both at once —
+    neither helper alone can judge it, and each must read exactly its own half.
+    """
+    # (a) The spelling the repo actually declares.
+    assert _uv_project_member('uv run --project shared pyright scripts/', _PYRIGHT) == 'shared'
+
+    # (b) The equals spelling. RED before this amendment: the caller scanned for
+    # an exact `--project` token, so this equivalent command was reported as
+    # carrying no environment selector at all.
+    assert _uv_project_member('uv run --project=shared pyright scripts/', _PYRIGHT) == 'shared', (
+        '`--project=shared` selects the same environment as `--project shared`; '
+        'reading only the space-separated spelling turns an equivalent, correct '
+        'command into a false red'
+    )
+
+    # (c) No selector at all is None, not a crash — the caller turns that into
+    # its own diagnostic rather than an IndexError.
+    assert _uv_project_member('uv run pyright scripts/', _PYRIGHT) is None
+
+    # (d) A POST-anchor --project is pyright's config-file redirect, NOT a uv
+    # environment selector, so this helper must not report one. The command is
+    # caught instead by _narrowing_flag_args.
+    redirect = 'uv run pyright --project /tmp/lax.json scripts/'
+    assert _uv_project_member(redirect, _PYRIGHT) is None, (
+        "pyright's own post-anchor --project names a CONFIG FILE, not a uv "
+        'workspace member; reporting it as the environment selector would then '
+        'check `/tmp/lax.json` for membership in [tool.uv.workspace].members '
+        'and fail with a message about the wrong flag entirely'
+    )
+    assert _narrowing_flag_args(redirect, _PYRIGHT) == ['--project']
+
+    # (e) BOTH at once, each read by exactly one helper. This is the command
+    # that passes every assertion of test_type_gates_resolve_pyright_without_npx
+    # except the post-anchor-redirect one, which is why that assertion has to be
+    # a real check rather than a restatement of the pre-anchor one.
+    mixed = 'uv run --project=shared pyright --project /tmp/lax.json scripts/'
+    assert _uv_project_member(mixed, _PYRIGHT) == 'shared'
+    assert _narrowing_flag_args(mixed, _PYRIGHT) == ['--project']
+
+    # (f) The pre/post split itself, shared with _post_anchor_tokens.
+    assert _pre_anchor_tokens('uv run --project shared pyright scripts/', _PYRIGHT) == [
+        'uv',
+        'run',
+        '--project',
+        'shared',
+    ]
 
 
 def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
