@@ -3555,45 +3555,68 @@ class ReconciliationHarness:
         raises propagates to the caller's swallow, so a ledger fault means no
         degraded row rather than a possible clobber.
 
+        The read runs INSIDE the ``asyncio.shield`` below, never ahead of it:
+        ``asyncio.shield`` only protects work once its coroutine exists as its
+        own Task, so an unshielded read ahead of the shield would raise
+        ``CancelledError`` on exactly the already-being-cancelled path the
+        shield exists for — landing no row at all, silently, since the
+        caller swallows ``BaseException``. The shield therefore covers the
+        read and the write as one uninterruptible unit; a caller passing
+        *skip_if_row_exists=False* still performs no read at all, shielded or
+        not.
+
         Finally, when the run already carries an ``_error`` record, the arm
         stamps its outcome there as a breadcrumb rather than adding a new
         top-level ``stage_reports`` key — the same place operators already look
         for a failed cycle's diagnosis.
         """
-        # The read-back is skipped when no ledger is wired: there is then no row
-        # to clobber (and the upsert itself is a no-op). Both callers that pass
+        # ledger may be None (no ReconLedgerStore wired): there is then no row
+        # to clobber, and the upsert itself is a no-op. Both callers that pass
         # skip_if_row_exists already gate on the ledger being present, so this
         # is a type-narrowing belt-and-braces, not a live path.
         ledger = getattr(self.memory, 'recon_ledger', None)
-        if skip_if_row_exists and ledger is not None:
-            existing = await ledger.get_by_identity(
-                project_id,
-                'cycle_summary',
-                task_id='',
-                flag_type=stage_id.value,
-                run_id=run_id,
-            )
-            if existing is not None:
-                logger.info(
-                    f'reconciliation.{stage_prefix}_cycle_summary_backstop_row_present',
-                    extra={'run_id': run_id, 'project_id': project_id},
-                )
-                return
 
-        degraded_report = StageReport(
-            stage=stage_id,
-            # Whole-cycle anchor, not the stage's real start (see docstring).
-            started_at=cycle_start_time,
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={f'{stage_prefix}_cycle_summary_degraded_backstop': True},
-            # Zeroed means "unrecoverable", NOT "no work happened" (see docstring).
-            llm_calls=0,
-            tokens_used=0,
-        )
-        # Shielded against a second cancellation arriving mid-write; the write
-        # keeps running to completion in its own Task.
-        ledger_written = await asyncio.shield(writer(degraded_report))
+        async def _read_then_write() -> tuple[bool, bool | None]:
+            """Returns ``(skipped, ledger_written)``. Run as ONE shielded unit
+            (see the call site below) so a second cancellation arriving while
+            the clobber-guard read is in flight cannot separate the read from
+            the write it gates — see the skip_if_row_exists docstring
+            paragraph above.
+            """
+            if skip_if_row_exists and ledger is not None:
+                existing = await ledger.get_by_identity(
+                    project_id,
+                    'cycle_summary',
+                    task_id='',
+                    flag_type=stage_id.value,
+                    run_id=run_id,
+                )
+                if existing is not None:
+                    return True, None
+
+            degraded_report = StageReport(
+                stage=stage_id,
+                # Whole-cycle anchor, not the stage's real start (see docstring).
+                started_at=cycle_start_time,
+                completed_at=datetime.now(UTC),
+                items_flagged=[],
+                stats={f'{stage_prefix}_cycle_summary_degraded_backstop': True},
+                # Zeroed means "unrecoverable", NOT "no work happened" (see docstring).
+                llm_calls=0,
+                tokens_used=0,
+            )
+            return False, await writer(degraded_report)
+
+        # Shielded against a second cancellation arriving mid-read or
+        # mid-write; the read-then-write keeps running to completion in its
+        # own Task even if this method's own task is cancelled again.
+        skipped, ledger_written = await asyncio.shield(_read_then_write())
+        if skipped:
+            logger.info(
+                f'reconciliation.{stage_prefix}_cycle_summary_backstop_row_present',
+                extra={'run_id': run_id, 'project_id': project_id},
+            )
+            return
         logger.warning(
             f'reconciliation.{stage_prefix}_cycle_summary_backstop_fired',
             extra={
