@@ -206,3 +206,40 @@ def test_banner_testids_distinguish_the_three_notice_kinds(tab_tasks_jsx_code):
             f'missing distinct testid {testid!r} — without it a partial '
             'degradation is indistinguishable from a total outage in tests'
         )
+
+
+def test_dep_chips_do_not_render_a_dangling_separator(tab_tasks_jsx_code):
+    """(g) a titleless dependency chip must render as the id ALONE.
+
+    Sibling contract to the banner above, and here for the same reason: both
+    are "the Tasks tab must not render a string that misinforms", and this is
+    the repo's tab_tasks.jsx render-contract module.
+
+    ``_resolve_deps``' status-map fallback emits ``'title': ''`` for any
+    dependency outside the fetched rows.  Since task 3857 bounded the terminal
+    fetch to ``_TERMINAL_FETCH_WINDOW`` rows, that is the COMMON case on a
+    large tree, not a rare one: on dark-factory (~4000 terminal tasks against a
+    400-row window) most of an active task's done dependencies fall below the
+    window.  Rendering ``{taskId(d.id)} · {d.title}`` unconditionally therefore
+    degrades those chips en masse to ``3502 · `` — a dangling separator that
+    reads as a truncated or corrupted title rather than an absent one.
+
+    The titleless chip is still the right trade (before the fallback existed
+    the chip VANISHED, which is worse), so the fix is in the render: emit the
+    separator only when there is something to separate.
+    """
+    # Asserted on the guarded spelling rather than by banning ' · ' outright:
+    # the tab renders that separator legitimately elsewhere (the detail
+    # subtitle, the train badge, external-dep chips whose status is never
+    # empty), so a blanket ban would fail for unrelated reasons.
+    dep_renders = re.findall(r'\{[^{}]*\.title \? [^}]*\}', tab_tasks_jsx_code)
+    assert dep_renders, (
+        'no title-guarded chip render found — the dependency chips still emit '
+        "'{taskId(d.id)} · {d.title}' unconditionally, so every chip whose "
+        'title fell outside the fetched window renders a dangling separator'
+    )
+
+    assert '} · {d.title}' not in tab_tasks_jsx_code, (
+        'a chip still concatenates the separator with d.title unconditionally; '
+        'an empty title then renders as "3502 · " with nothing after it'
+    )

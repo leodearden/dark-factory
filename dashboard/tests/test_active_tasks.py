@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -2708,13 +2709,18 @@ _BUDGET_SLOW = 5.0
 
 
 def _register_shaper(monkeypatch, delays, *, offline=(), done_counts=None,
-                     external_deps=None):
+                     external_deps=None, raises=None):
     """Patch ``_shape_one_project`` with a per-project coroutine that sleeps.
 
     *delays* maps project label -> seconds to sleep before returning; a label
     absent from it returns immediately. Labels in *offline* return the offline
     marker triple ``([], True, 0)`` — a fetch that demonstrably FAILED, which
     must stay distinguishable from a project the budget never reached.
+
+    *raises* maps project label -> an exception INSTANCE to raise instead of
+    returning. Models the unexpected-failure path (a shape bug, a decode
+    error, an ``httpx`` transport error escaping the fan-out) as distinct from
+    both the timeout and the offline marker.
 
     *external_deps* is an optional list of external dep ids stamped onto every
     emitted row (in the ``_build_task_row`` shape, each on the ``'unknown'``
@@ -2728,6 +2734,7 @@ def _register_shaper(monkeypatch, delays, *, offline=(), done_counts=None,
     """
     invoked: list[str] = []
     counts = done_counts or {}
+    explode = raises or {}
 
     async def _fake_shape(
         client, config, project_root, *,
@@ -2739,6 +2746,8 @@ def _register_shaper(monkeypatch, delays, *, offline=(), done_counts=None,
         delay = delays.get(label, 0.0)
         if delay:
             await asyncio.sleep(delay)
+        if label in explode:
+            raise explode[label]
         if label in offline:
             return [], True, 0
         row = {'id': f'{label}/T-1', 'project': label, 'status': 'in-progress'}
@@ -2919,6 +2928,83 @@ class TestCollectTasksBudget:
         # An offline project already had no count; a degraded one must not
         # acquire a fabricated one either.
         assert counts == {'alpha': 4}
+
+    async def test_one_projects_unexpected_error_cannot_blank_the_whole_tab(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(e) an UNEXPECTED exception from one root must not 500 the handler.
+
+        The per-project ``try`` caught ``TimeoutError`` only, so any other
+        exception escaping ``_shape_one_project`` — a decode error, a shape
+        bug, an ``httpx`` transport error not converted to an offline marker by
+        the fan-out — propagated out of the whole aggregation and 500'd
+        ``/api/v2/dashboard/tasks``, discarding every HEALTHY project's rows
+        that had already been collected.
+
+        That is the same "one bad root blanks the whole tab" failure the
+        ``TASKS_OFFLINE`` fix exists to close, relocated from the banner to the
+        handler.  The fan-out normally converts failures into offline markers,
+        so this is defense-in-depth rather than a demonstrated crash — which is
+        exactly why it needs a test: nothing else exercises the path.
+
+        The failing root is marked OFFLINE, not degraded: the read demonstrably
+        failed, which is what *offline* means.  *degraded* is reserved for
+        "the budget never let us find out".
+        """
+        invoked = _register_shaper(
+            monkeypatch,
+            {},
+            done_counts={'alpha': 4, 'gamma': 7},
+            raises={'beta': ValueError('malformed get_tasks payload')},
+        )
+        config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
+
+        active, offline, counts, degraded = await collect_tasks_with_counts(
+            client=dummy_client, config=config,
+        )
+
+        # The walk CONTINUED past the exploding root rather than unwinding.
+        assert invoked == ['alpha', 'beta', 'gamma'], (
+            f'invoked {invoked} — gamma never got its turn, so the exception '
+            'aborted the aggregation instead of being contained to beta'
+        )
+        assert offline == ['beta']
+        assert degraded == [], 'the budget did not expire — nothing is UNKNOWN'
+        # Every healthy project still renders, and beta contributes no
+        # fabricated count.
+        assert {row['project'] for row in active} == {'alpha', 'gamma'}
+        assert counts == {'alpha': 4, 'gamma': 7}
+
+    async def test_unexpected_error_is_logged_at_warning_with_the_project(
+        self, monkeypatch, tmp_path, dummy_client, caplog
+    ):
+        """(f) ...and the swallowed exception must not be silent.
+
+        Containing the failure is only half the fix: an exception absorbed into
+        an offline marker with no log is a bug that renders as a routine
+        outage forever.  The record must name the project and carry the
+        traceback, so the next reader can tell "fused-memory is down" from
+        "our shaping code raised".
+        """
+        _register_shaper(
+            monkeypatch, {}, raises={'beta': ValueError('malformed get_tasks payload')},
+        )
+        config = _budget_config(tmp_path, ['alpha', 'beta'])
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.active_tasks'):
+            await collect_tasks_with_counts(client=dummy_client, config=config)
+
+        records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'beta' in r.getMessage()
+        ]
+        assert records, (
+            'an unexpected per-project exception was swallowed with no WARNING'
+        )
+        assert any(r.exc_info for r in records), (
+            'the WARNING carries no traceback — the exception type and origin '
+            'are exactly what distinguishes this from a routine outage'
+        )
 
     async def test_total_wall_time_is_bounded_by_the_handler_budget(
         self, monkeypatch, tmp_path, dummy_client

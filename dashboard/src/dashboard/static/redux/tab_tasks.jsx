@@ -555,14 +555,14 @@ function TaskDetail({ task, allTasks }) {
       {deps.length === 0
         ? <span className="chip-empty">no upstream dependencies</span>
         : <div className="chips multiline">{deps.map(d =>
-            <span key={d.id} className={`chip ${d.done ? 'dep-done' : 'dep-pending'}`} title={d.title}>{window.DF_SHELL.taskId(d.id)} · {d.title}</span>)}
+            <span key={d.id} className={`chip ${d.done ? 'dep-done' : 'dep-pending'}`} title={d.title}>{window.DF_SHELL.taskId(d.id)}{d.title ? ` · ${d.title}` : ''}</span>)}
           </div>}
 
       <div className="section-lbl">Blocks ({dependents.length})</div>
       {dependents.length === 0
         ? <span className="chip-empty">nothing depends on this</span>
         : <div className="chips multiline">{dependents.map(d =>
-            <span key={d.id} className="chip" title={d.title}>{window.DF_SHELL.taskId(d.id)} · {d.title}</span>)}
+            <span key={d.id} className="chip" title={d.title}>{window.DF_SHELL.taskId(d.id)}{d.title ? ` · ${d.title}` : ''}</span>)}
           </div>}
 
       {(() => {

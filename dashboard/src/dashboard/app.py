@@ -853,8 +853,16 @@ async def api_tasks(request: Request) -> JSONResponse:
     """
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    # Single-pass: fetch_tasks once per project, derive both active rows and
-    # done counts from the same snapshot — no second fetch_statuses round-trip.
+    # Bounded fan-out, two-to-three MCP calls per project: one `statuses`-
+    # narrowed active fetch and one compact get_statuses map (concurrent),
+    # plus a page_size/offset window over terminal rows only when a terminal
+    # cap is actually requested. See _shape_one_project's docstring for why
+    # each call is needed and what the window's disclosed narrowing costs.
+    #
+    # This comment used to read "single-pass: fetch_tasks once per project ...
+    # no second fetch_statuses round-trip". That described the unnarrowed
+    # whole-tree fetch this handler was changed to stop issuing, and
+    # fetch_statuses is now exactly the second round-trip it denied.
     active, offline_projects, done_counts, degraded_projects = await collect_tasks_with_counts(
         http_client, config,
         max_done_per_project=_MAX_DONE_PER_PROJECT,

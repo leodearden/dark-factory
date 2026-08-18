@@ -158,8 +158,13 @@ _TASKS_TOTAL_BUDGET = 20.0
 # Left as a disclosed narrowing rather than silently widened here: raising the
 # window to restore it trades directly against the payload budget this task
 # exists to bound, and that trade is a product decision about the PRD contract
-# rather than a defect in this module. Tracked as follow-up (see the task-3857
-# review notes) — do not "fix" it by quietly bumping the window.
+# rather than a defect in this module. Tracked as TASK 4416, which weighs the
+# three candidate resolutions (amend the PRD contract / raise the window /
+# fetch live-PRD members explicitly) — a task id, not "the review notes", so a
+# future reader can actually check whether it was revisited. Do not "fix" it
+# here by quietly bumping the window: the point of 4416 is that the contract
+# in plans/dashboard-taskgraph-legibility-prd.md and this code must agree
+# either way.
 _LIVE_PRD_EXEMPTION_WARN_THRESHOLD = 200
 
 
@@ -384,7 +389,15 @@ def _resolve_deps(
 
     1. a full row in *by_id* — real title, real status;
     2. otherwise, an id present in *status_map* — an honest PARTIAL entry:
-       the ``done`` flag is authoritative, the title degrades to ``''``;
+       the ``done`` flag is authoritative, the title degrades to ``''``.
+       BRANCH (2) IS THE COMMON CASE ON A LARGE TREE, not a rare fallback: it
+       fires for every dependency below the terminal window's high-id end, so
+       on a project with far more terminal tasks than ``_TERMINAL_FETCH_WINDOW``
+       (dark-factory: ~4000 against 400) MOST of an active task's done
+       dependencies resolve titleless.  ``tab_tasks.jsx`` therefore renders the
+       id ALONE for these — the `` · `` separator is emitted only when a title
+       exists, or the chips would read as ``3502 ·`` with nothing after it;
+
     3. otherwise dropped, unchanged.  The id exists nowhere the dashboard can
        see, and fabricating a chip for it would be worse than omitting it.
 
@@ -458,6 +471,20 @@ async def _shape_one_project(
 
     The only component that still grows with the tree is the ~15 B/task status
     map, not the ~10 KB/task rows.
+
+    **Scope of that win — read this before quoting the numbers.**  Every claim
+    above is about THIS function and the ``/api/v2/dashboard/tasks`` payload it
+    shapes.  It is NOT a claim about the process's total MCP traffic per poll.
+    Four other callers still issue an UNNARROWED ``fetch_tasks`` on the same
+    poll cycle — ``app._load_task_cards``, ``data/orchestrator.py``,
+    ``data/merge_queue.py`` and ``data/burndown.py`` — and since the
+    ``fetch_tasks`` cache key now includes the narrowing args, the Tasks tab no
+    longer shares their cached full tree.  Net per poll the process therefore
+    still transfers the whole tree once for those callers AND additionally
+    issues this function's narrowed calls.  What this change delivers is that
+    the TASKS TAB no longer pulls the full tree and no longer grows with the
+    terminal tree; removing the remaining whole-tree transfer means narrowing
+    those four callers too, which is separate work and is not done here.
 
     **Two disclosed display-semantics changes**, both caused by what
     ``get_tasks`` does and does not offer:
@@ -797,6 +824,34 @@ async def collect_tasks_with_counts(
                 'budget (%.1fs remained) — its rows and done count are '
                 'UNKNOWN for this render (not zero, and not offline)',
                 label, _TASKS_PER_PROJECT_BUDGET, _TASKS_TOTAL_BUDGET, remaining,
+            )
+            continue
+        except Exception:
+            # DEFENSE IN DEPTH, and deliberately broad. The fan-out normally
+            # converts a failed read into the offline marker, so nothing here
+            # is a demonstrated crash — but without this clause ANY unexpected
+            # exception (a decode error, a shaping bug, an httpx transport
+            # error that escaped the fan-out) unwinds the whole loop and 500s
+            # the handler, throwing away every healthy project already
+            # collected. That is the same "one bad root blanks the whole tab"
+            # failure TASKS_OFFLINE exists to close, relocated from the banner
+            # to the handler, and one root must not be able to cause it.
+            #
+            # OFFLINE, not degraded: the read demonstrably FAILED, which is
+            # what offline means. degraded is reserved for "the budget never
+            # let us find out" — the distinction the two branches above draw,
+            # and merging them here would undo it.
+            #
+            # exc_info is load-bearing: an exception absorbed into a routine
+            # offline marker with no traceback is a bug that renders as an
+            # outage forever. The log is what separates "fused-memory is down"
+            # from "our own shaping code raised".
+            offline_projects.append(label)
+            logger.warning(
+                'project %s: unexpected error while shaping its rows — the '
+                'project is marked offline for this render so the remaining '
+                'roots still render; this is a BUG, not an outage',
+                label, exc_info=True,
             )
             continue
         if offline:
