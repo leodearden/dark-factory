@@ -10,10 +10,10 @@ import pytest
 
 from escalation.models import (
     BORN_AT_L2_SEVERITIES,
-    Amendment,
     KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
     SEVERITY_RANK,
+    Amendment,
     Escalation,
     EvidenceEntry,
     IndexHealthState,
