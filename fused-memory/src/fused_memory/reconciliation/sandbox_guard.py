@@ -91,30 +91,51 @@ class RemediationSandboxUnavailable(RuntimeError):
 
 
 def _writable_roots(cwd: Path, writable_extras: list[str] | None) -> list[str]:
-    """Roots BOTH backends make writable: ``/tmp``, ``<cwd>/.task``, each extra.
+    """Roots BOTH backends make writable: ``<cwd>/.task`` plus each existing extra.
 
     Computed backend-agnostically on purpose — the containment invariant must
-    hold whether Landlock or bwrap wins resolution, and both grant exactly these
-    (``build_landlock_command`` at landlock.py:69-108, ``build_bwrap_command``
-    at sandbox.py:56-101).
+    hold whether Landlock or bwrap wins resolution, so only roots BOTH grant,
+    with the SAME meaning, may appear here (``build_landlock_command`` at
+    landlock.py:69-108, ``build_bwrap_command`` at sandbox.py:56-101).
 
-    Two details keep the check honest:
+    ``/tmp`` is deliberately NOT one of them, even though ``landlock_exec``
+    grants it blanket. ``build_bwrap_command`` mounts ``--tmpfs /tmp`` before its
+    binds, so under bwrap the sandbox's ``/tmp`` is a fresh EMPTY tmpfs and not
+    the host's: a config dir under host ``/tmp`` that is not ALSO named in
+    ``writable_extras`` would be invisible inside the sandbox (the pre-spawn
+    ``.credentials.json`` gone) and its session JSONL would land in a tmpfs the
+    parent can never read — ``count_transcript_turns`` None forever, i.e. the
+    exact 2026-07-18 defect PASSING the check that exists to catch it. Counting
+    ``/tmp`` would make this function backend-DEPENDENT while claiming not to be.
+    The explicit extras grant is honoured identically by both backends (bwrap
+    binds it over the tmpfs, Landlock adds the path rule), so requiring it costs
+    the caller nothing — ``run_stage_via_cli`` already passes it — and keeps this
+    docstring's claim true.
+
+    Two details keep the rest honest:
 
     - ``os.path.realpath`` on every root. Landlock resolves its rules by O_PATH
-      fd — i.e. by real path — so a symlinked ``/tmp`` or a symlinked data dir
+      fd — i.e. by real path — so a symlinked config dir or a symlinked data dir
       must not produce a false PASS or a false FAIL here.
-    - Roots that do not exist as directories are DROPPED. ``landlock_exec._add_path``
-      returns silently for a non-existent path, adding no rule and raising
-      nothing, so a grant naming a missing dir is vacuous. Counting it would let
-      the check pass while the write still failed at runtime — precisely the
-      silent-degrade class this module is meant to end.
+    - The existence filter applies to the EXTRAS ONLY. ``landlock_exec._add_path``
+      returns silently for a non-existent path and ``build_bwrap_command`` warns
+      and skips, so an extra naming a missing dir is a vacuous grant and must not
+      satisfy containment. ``<cwd>/.task`` is the opposite case: both backends
+      ``os.makedirs(..., exist_ok=True)`` it immediately before granting it
+      (landlock.py:96-97, sandbox.py:110-112), so it is granted whether or not it
+      exists yet. Filtering it out on a fresh cwd would fail-CLOSED a config dir
+      whose write would in fact succeed — and since ``run_stage_via_cli`` treats
+      that as fatal, every reconciliation stage would return an error. That is a
+      live foot-gun: relocating the recon config dir under ``<cwd>/.task/`` is the
+      alternative the PRD's open question 5 explicitly considers.
     """
-    roots = [
-        os.path.realpath('/tmp'),
-        os.path.realpath(os.path.join(str(Path(cwd).resolve()), '.task')),
+    roots = [os.path.realpath(os.path.join(str(Path(cwd).resolve()), '.task'))]
+    roots += [
+        os.path.realpath(extra)
+        for extra in (writable_extras or [])
+        if os.path.isdir(extra)
     ]
-    roots += [os.path.realpath(extra) for extra in (writable_extras or [])]
-    return [root for root in roots if os.path.isdir(root)]
+    return roots
 
 
 def _assert_config_dir_writable(
@@ -126,6 +147,11 @@ def _assert_config_dir_writable(
 
     Containment is prefix-WITH-SEPARATOR, never a bare ``str.startswith`` on the
     root: ``/tmp-evil`` is not inside ``/tmp``.
+
+    A config dir under ``/tmp`` is NOT contained by virtue of living there — see
+    ``_writable_roots`` for why the blanket ``/tmp`` grant is backend-specific
+    and therefore not a root. It must be named in ``writable_extras`` like any
+    other, which ``run_stage_via_cli`` already does.
     """
     raw = str(config_dir)
     resolved = os.path.realpath(raw)
@@ -145,7 +171,7 @@ def _assert_config_dir_writable(
         f'write its session transcript there and then denied the write by the '
         f'kernel — silently (this is the 2026-07-18 -> 2026-08-11 recon defect, '
         f'task 4003). Writable roots resolved for this invocation: '
-        f'{roots or "(none — no writable root exists on disk)"}. '
+        f'{roots}. '
         f'The per-run config dir is normally granted automatically by '
         f'cli_stage_runner.run_stage_via_cli; if you are seeing this, that '
         f'computed grant was lost. Note that a path listed in '
@@ -205,8 +231,10 @@ def resolve_recon_sandbox_wrap(
             when ``config_dir`` is outside the writable set.
     """
     # The containment check runs ONCE, before the backend branch, because the
-    # invariant is backend-independent: Landlock and bwrap grant the same roots
-    # (/tmp, <cwd>/.task, extras). Checking here rather than inside each branch
+    # invariant is backend-independent BY CONSTRUCTION: `_writable_roots` counts
+    # only roots Landlock and bwrap grant with the SAME meaning (<cwd>/.task and
+    # each existing extra — notably NOT /tmp, which bwrap replaces with a fresh
+    # tmpfs; see `_writable_roots`). Checking here rather than inside each branch
     # means a future third backend cannot be added without inheriting it.
     if config_dir is not None:
         _assert_config_dir_writable(config_dir, cwd, writable_extras)

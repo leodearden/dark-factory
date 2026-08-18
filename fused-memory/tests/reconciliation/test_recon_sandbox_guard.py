@@ -325,10 +325,13 @@ class TestConfigDirContainment:
     drops the computed grant, ``resolve_recon_sandbox_wrap`` refuses to launch
     instead of silently producing a transcript-less stage.
 
-    Containment is asserted against the roots BOTH backends grant (``/tmp``,
-    ``<cwd>/.task``, and each extra — verified at landlock.py:69-108 and
-    sandbox.py:56-101), so the invariant does not depend on which backend wins
-    resolution.
+    Containment is asserted against the roots BOTH backends grant WITH THE SAME
+    MEANING (``<cwd>/.task`` and each existing extra — verified at
+    landlock.py:69-108 and sandbox.py:56-101), so the invariant does not depend
+    on which backend wins resolution. ``/tmp`` is pointedly absent from that
+    list: ``landlock_exec`` grants the host ``/tmp`` blanket, but
+    ``build_bwrap_command`` mounts a fresh ``--tmpfs`` over it, so "under /tmp"
+    means two different things per backend and cannot be a root.
     """
 
     def test_config_dir_outside_writable_set_fails_closed(self, tmp_path: Path) -> None:
@@ -336,8 +339,8 @@ class TestConfigDirContainment:
 
         This is the regression that would have caught the 2026-07-18 breakage on
         day one: `<data_dir>/recon-config/claude-config-<run_id>` is neither
-        `/tmp` nor `<cwd>/.task` nor an extra, so the grant was absent and the
-        CLI's transcript writes were denied — silently.
+        `<cwd>/.task` nor an extra, so the grant was absent and the CLI's
+        transcript writes were denied — silently.
         """
         orphan = Path('/var/tmp/recon-config/claude-config-x')
         with patch(
@@ -385,10 +388,9 @@ class TestConfigDirContainment:
         """`<cwd>/.task/...` is accepted with no extras — both backends grant `.task`.
 
         The `_writable_roots` assertion is what makes this leaf mean something:
-        pytest's ``tmp_path`` lives under ``/tmp``, which is blanket-writable, so
-        acceptance alone would be satisfied by the ``/tmp`` root no matter what
-        the ``.task`` logic did. Asserting the `.task` root is present AND
-        contains the config dir pins the grant this leaf is named for.
+        acceptance alone would not distinguish "the `.task` root matched" from
+        "some other root did". Asserting the `.task` root is present AND contains
+        the config dir pins the grant this leaf is named for.
         """
         cfg = tmp_path / '.task' / 'claude-config-x'
         cfg.mkdir(parents=True)
@@ -412,20 +414,85 @@ class TestConfigDirContainment:
             f'{cfg} must be inside the .task root {task_root}'
         )
 
-    def test_config_dir_under_tmp_is_accepted(self) -> None:
-        """A /tmp config dir is accepted with no extras — /tmp is blanket-writable."""
+    def test_config_dir_under_tmp_requires_an_explicit_extra(self) -> None:
+        """A /tmp config dir is NOT contained by virtue of living under /tmp.
+
+        ``landlock_exec`` grants the host ``/tmp`` blanket, but
+        ``build_bwrap_command`` mounts ``--tmpfs /tmp`` BEFORE its binds: under
+        bwrap the sandbox's ``/tmp`` is a fresh EMPTY tmpfs. A config dir there
+        that is not also bound via ``writable_extras`` therefore loses its
+        pre-spawn ``.credentials.json`` and writes its session JSONL into a tmpfs
+        the parent can never read — ``count_transcript_turns`` None forever, the
+        2026-07-18 defect reproduced exactly, while the check that exists to
+        catch it says PASS. Accepting a bare ``/tmp`` config dir would bake that
+        false pass in as a pinned expectation.
+
+        The extras grant is what both backends honour identically (bwrap binds it
+        over the tmpfs), so the same dir named as an extra IS accepted — which is
+        what ``run_stage_via_cli`` always does.
+        """
         cfg = Path(tempfile.mkdtemp(prefix='recon-cfg-', dir='/tmp'))
         try:
             with patch(
                 'orchestrator.agents.landlock.is_landlock_available',
                 return_value=True,
             ):
+                with pytest.raises(RemediationSandboxUnavailable):  # type: ignore[possibly-unbound]
+                    resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                        cfg, [], config_dir=cfg,
+                    )
+
                 wrap = resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
-                    cfg, [], config_dir=cfg,
+                    cfg, [str(cfg)], config_dir=cfg,
                 )
+
             assert callable(wrap), f'Expected a callable; got {wrap!r}'
+            wrapped = wrap(['claude', '--print'])
+            writable_vals = [
+                wrapped[i + 1] for i, tok in enumerate(wrapped) if tok == '--writable'
+            ]
+            assert str(cfg) in writable_vals, (
+                f'The config dir must be granted via extras, not via a /tmp '
+                f'blanket; got {writable_vals!r}'
+            )
         finally:
             shutil.rmtree(cfg, ignore_errors=True)
+
+    def test_task_root_counts_even_when_it_does_not_exist_yet(self, tmp_path: Path) -> None:
+        """`<cwd>/.task` is a root whether or not it exists — the backends create it.
+
+        The existence filter is correct for EXTRAS (``landlock_exec._add_path``
+        silently skips a missing path; ``build_bwrap_command`` warns and skips)
+        but wrong for ``.task``: both backends ``os.makedirs(..., exist_ok=True)``
+        it immediately before granting it, so a not-yet-created ``.task`` is not a
+        vacuous grant. Filtering it out would fail-CLOSED on a fresh cwd — and
+        because ``run_stage_via_cli`` treats ``RemediationSandboxUnavailable`` as
+        fatal, EVERY reconciliation stage would return an error StageResult.
+        Relocating the recon config dir under ``<cwd>/.task/`` is the alternative
+        the PRD's open question 5 names, so this is a live foot-gun, not a
+        hypothetical.
+        """
+        fresh_cwd = tmp_path / 'never-initialised'
+        fresh_cwd.mkdir()
+        cfg = fresh_cwd / '.task' / 'claude-config-x'
+        assert not cfg.parent.exists(), 'precondition: .task must not exist yet'
+
+        task_root = os.path.realpath(str(cfg.parent))
+        roots = _writable_roots(fresh_cwd, [])  # type: ignore[possibly-unbound]
+        assert task_root in roots, (
+            f'`<cwd>/.task` must be a writable root even before it is created; '
+            f'got {roots!r}'
+        )
+
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ):
+            wrap = resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                fresh_cwd, [], config_dir=cfg,
+            )
+
+        assert callable(wrap), f'Expected a callable; got {wrap!r}'
 
     def test_config_dir_none_skips_check(self, tmp_path: Path) -> None:
         """config_dir=None returns a wrap and never raises (back-compat).
@@ -452,9 +519,9 @@ class TestConfigDirContainment:
         runtime, reproducing the exact silent-degrade class this check exists to
         end.
         """
-        # NOT under tmp_path: pytest's tmp_path is itself under /tmp, which both
-        # backends grant blanket, so a ghost root there would be rescued by the
-        # /tmp rule and this leaf would silently prove nothing. Nothing is ever
+        # NOT under tmp_path: a ghost root there would sit under the `.task` root
+        # only if it were spelled `<cwd>/.task/...`, but keeping it wholly outside
+        # every root makes the leaf independent of that detail. Nothing is ever
         # created here, so no /var/tmp write permission is required.
         ghost_root = Path(f'/var/tmp/df-4003-never-created-{uuid.uuid4().hex}')
         cfg = ghost_root / 'claude-config-x'

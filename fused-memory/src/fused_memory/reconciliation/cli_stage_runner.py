@@ -487,6 +487,27 @@ async def run_stage_via_cli(
         writable_extras = list(config.sandbox_recon_writable_extras)
         if config_dir is not None:
             writable_extras.append(str(config_dir.path))
+        else:
+            # The ONE configuration that bypasses the containment guard, so it
+            # must not be silent. With no config_dir there is nothing to grant
+            # and nothing to verify, and the CLI falls back to the process
+            # default ~/.claude — which NEITHER backend makes writable. That is
+            # the identical silent-transcript-loss shape this grant exists to
+            # end, merely arrived at from the other direction. Unreachable in
+            # production today (BaseStage.run always mints a TaskConfigDir), but
+            # nothing in this runner enforces that and the module's docstrings
+            # now advertise the invariant as machine-checked — so say so rather
+            # than let a future caller rediscover it by three weeks of silence.
+            logger.warning(
+                'Reconciliation sandboxing is ON but this stage was given no '
+                'config_dir: the CLI will fall back to the process-default '
+                '~/.claude, which is NOT in the sandbox writable set, so it can '
+                'write no session transcript (count_transcript_turns -> None, '
+                'liveness watchdog inert, every cap-retry force-freshes). The '
+                'containment check is skipped for this invocation because there '
+                'is no path to check. Pass a TaskConfigDir (BaseStage.run does) '
+                'or set reconciliation.sandbox_recon_agents=false.',
+            )
         try:
             sandbox_wrap = resolve_recon_sandbox_wrap(
                 effective_cwd,

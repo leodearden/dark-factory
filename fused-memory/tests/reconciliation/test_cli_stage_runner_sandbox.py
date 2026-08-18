@@ -16,6 +16,7 @@ Verifies:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -338,4 +339,93 @@ async def test_operator_writable_extras_are_preserved(tmp_path):
     assert str(mine.path) in writables, (
         f'The per-run config dir must still be granted alongside operator extras; '
         f'got {writables!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_sandbox_on_without_config_dir_warns(tmp_path, caplog):
+    """Confinement ON with no config_dir is the one path that skips the guard — say so.
+
+    With ``config_dir=None`` there is nothing to grant and nothing to verify, so
+    the containment check is skipped and the CLI falls back to the process
+    default ``~/.claude`` — which NEITHER backend makes writable. That is the
+    same silent-transcript-loss shape task 4003 exists to end, reached from the
+    other direction, and it must not be the one configuration that stays quiet
+    while the module's docstrings advertise the invariant as machine-checked.
+
+    Unreachable in production today (``BaseStage.run`` always mints a
+    ``TaskConfigDir``), but nothing in the runner enforces that.
+    """
+    mock_invoke = AsyncMock(return_value=_make_agent_result())
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.reconciliation.cli_stage_runner',
+    ), patch(
+        'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry',
+        mock_invoke,
+    ), patch(
+        'fused_memory.reconciliation.cli_stage_runner.resolve_recon_sandbox_wrap',
+        return_value=lambda cmd: cmd,
+    ) as mock_resolve:
+        await run_stage_via_cli(
+            system_prompt='sys',
+            payload='pay',
+            disallowed_tools=[],
+            config=_make_config(sandbox_recon_agents=True),
+            mcp_config=_make_mcp_config(),
+            cwd=tmp_path,
+            config_dir=None,
+        )
+
+    # The guard IS bypassed — that is the fact the warning exists to surface.
+    assert mock_resolve.call_args.kwargs.get('config_dir') is None, (
+        f'precondition: the guard is handed no config dir; '
+        f'got {mock_resolve.call_args.kwargs!r}'
+    )
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'config_dir' in r.getMessage()
+    ]
+    assert len(warnings) == 1, (
+        f'exactly one warning must name the bypass; got {[r.getMessage() for r in caplog.records]}'
+    )
+    msg = warnings[0].getMessage()
+    for needle in ('~/.claude', 'sandbox_recon_agents'):
+        assert needle in msg, f'warning must name {needle!r}; got {msg!r}'
+
+
+@pytest.mark.asyncio
+async def test_sandbox_on_with_config_dir_does_not_warn(tmp_path, caplog):
+    """The healthy path stays quiet — the bypass warning must not fire on every stage."""
+    base = recon_config_base_dir(tmp_path)
+    mine = TaskConfigDir(task_id='run-quiet', base_dir=base)
+    mock_invoke = AsyncMock(return_value=_make_agent_result())
+
+    with caplog.at_level(
+        logging.WARNING, logger='fused_memory.reconciliation.cli_stage_runner',
+    ), patch(
+        'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry',
+        mock_invoke,
+    ), patch(
+        'fused_memory.reconciliation.cli_stage_runner.resolve_recon_sandbox_wrap',
+        return_value=lambda cmd: cmd,
+    ):
+        await run_stage_via_cli(
+            system_prompt='sys',
+            payload='pay',
+            disallowed_tools=[],
+            config=_make_config(sandbox_recon_agents=True),
+            mcp_config=_make_mcp_config(),
+            cwd=tmp_path,
+            config_dir=mine,
+        )
+
+    bypass_warnings = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and 'config_dir' in r.getMessage()
+    ]
+    assert not bypass_warnings, (
+        f'a stage WITH a config dir must not warn; got '
+        f'{[r.getMessage() for r in bypass_warnings]}'
     )
