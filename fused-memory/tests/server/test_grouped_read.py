@@ -1840,3 +1840,103 @@ class TestDigestCarriesOriginProjectTag:
         assert entry['digest'] == 'a rehomed correction'
         assert entry['created_at'] == '2026-08-01T00:00:00+00:00'
         assert entry['kind'] == AMENDMENT_KIND
+
+
+class TestPinnedChildCarriesOriginProjectTag:
+    """task 4008: a PINNED matched child carries its origin-project tag too.
+
+    ``matched_children`` is where a swallowed child's FULL body lands — the
+    highest-value leak shape, since the briefing renders that body verbatim
+    into a dispatched agent's ``# Context`` block, attached to a canonical
+    that may itself be correctly tagged native.  Both branches of
+    :func:`_pin_matched_child` are covered: the ``pinned.append`` branch (a
+    matched sighting, or an amendment beyond the digest cap) and the in-place
+    digest-marking branch (the common in-cap amendment).
+    """
+
+    @staticmethod
+    def _canonical_hit(score: float = 0.9) -> MemoryResult:
+        return _result(_CANONICAL_ID, 'the canonical claim', score, metadata={'kind': 'canonical'})
+
+    @pytest.mark.asyncio
+    async def test_pinned_sighting_carries_its_origin_tag(self):
+        """(a) The append branch: a sighting is structurally unlistable as a digest."""
+        service = _stub_service([
+            _child(_AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a routine addendum', '2026-08-01T00:00:00+00:00'),
+            _child(_SIGHT_1, _CANONICAL_ID, SIGHTING_KIND, 'a rehomed sighting', '2026-08-02T00:00:00+00:00'),
+        ])
+        hits = [
+            self._canonical_hit(),
+            _child_result(_SIGHT_1, 0.8, kind=SIGHTING_KIND, src_project='reify'),
+        ]
+
+        block = (await group_search_results(service, _PROJECT_ID, hits))[0]['grouped']
+
+        pinned = {e['id']: e for e in block.get('matched_children', [])}
+        assert _SIGHT_1 in pinned, (
+            f'PRECONDITION: the matched sighting must be pinned, got {block!r}'
+        )
+        entry = pinned[_SIGHT_1]
+        assert entry.get('metadata') == {'src_project': 'reify'}, (
+            'A pinned body is agent-visible content, so it must carry the origin '
+            'tag a cross-project filter needs to classify it — got {!r}'.format(entry)
+        )
+        # ...and the pre-existing pinned-entry fields are unchanged.
+        assert entry['id'] == _SIGHT_1
+        assert entry['content'] == 'a correction'
+        assert entry['created_at'] is None
+        assert entry['kind'] == SIGHTING_KIND
+        assert entry['matched'] is True
+
+    @pytest.mark.asyncio
+    async def test_in_place_marking_does_not_clobber_the_digests_origin_tag(self):
+        """(b) The in-place branch: a full foreign body lands on a marked digest.
+
+        Regression guard, not new behaviour — ``_digest_entry`` already tagged
+        this entry from the raw Qdrant payload.  Marking it ``matched`` and
+        attaching the FULL body must not drop that tag, or the leakiest shape
+        of all (a complete foreign body hanging off a native canonical) would
+        go back to being unclassifiable.
+        """
+        service = _stub_service([
+            _child(
+                _AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a rehomed correction',
+                '2026-08-01T00:00:00+00:00', src_project='reify',
+            ),
+            _child(_AMEND_2, _CANONICAL_ID, AMENDMENT_KIND, 'a local correction', '2026-08-02T00:00:00+00:00'),
+        ])
+        hits = [self._canonical_hit(), _child_result(_AMEND_1, 0.8, src_project='reify')]
+
+        block = (await group_search_results(service, _PROJECT_ID, hits))[0]['grouped']
+
+        by_id = {d['id']: d for d in block['amendments']}
+        assert 'matched_children' not in block, (
+            f'PRECONDITION: an in-cap amendment is marked in place, got {block!r}'
+        )
+        entry = by_id[_AMEND_1]
+        assert entry['matched'] is True
+        assert entry['content'] == 'a correction', (
+            f'PRECONDITION: the marked digest gains the FULL body, got {entry!r}'
+        )
+        assert entry.get('metadata') == {'src_project': 'reify'}, (
+            'In-place marking must not clobber the origin tag _digest_entry set '
+            f'— got {entry!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_untagged_pinned_child_emits_no_metadata_key(self):
+        """(c) Omit-when-absent holds on the pinned path too."""
+        service = _stub_service([
+            _child(_AMEND_1, _CANONICAL_ID, AMENDMENT_KIND, 'a routine addendum', '2026-08-01T00:00:00+00:00'),
+            _child(_SIGHT_1, _CANONICAL_ID, SIGHTING_KIND, 'an untagged sighting', '2026-08-02T00:00:00+00:00'),
+        ])
+        hits = [self._canonical_hit(), _child_result(_SIGHT_1, 0.8, kind=SIGHTING_KIND)]
+
+        block = (await group_search_results(service, _PROJECT_ID, hits))[0]['grouped']
+
+        pinned = {e['id']: e for e in block.get('matched_children', [])}
+        assert _SIGHT_1 in pinned, f'PRECONDITION: the sighting must be pinned, got {block!r}'
+        assert 'metadata' not in pinned[_SIGHT_1], (
+            'An untagged pinned child must emit NO metadata key — never an empty '
+            f'dict, got {pinned[_SIGHT_1]!r}'
+        )
