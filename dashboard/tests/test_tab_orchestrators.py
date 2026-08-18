@@ -9,44 +9,19 @@ from __future__ import annotations
 import re
 
 import pytest
+from _dashboard_helpers import extract_function_body
 from starlette.testclient import TestClient
 
 
 @pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
+def orch_tab_body(tabs_jsx_body):
+    """OrchTab's brace-delimited body, signature excluded.
 
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def tabs_jsx_body(_client):
-    return _client.get('/static/redux/tabs.jsx').text
-
-
-def _extract_function_body(source: str, func_name: str) -> str:
-    """Extract the source text of a top-level ``function <func_name>(`` up to
-    (but not including) the next top-level ``function`` declaration, or to
-    end-of-file if it's the last one.
-
-    Used to scope structural assertions to a single tab's render function so
-    an assertion can't be accidentally satisfied by an unrelated tab (e.g.
+    Scoped away from the other tab-render functions in the same file so an
+    assertion here cannot be accidentally satisfied by an unrelated tab (e.g.
     ReconTab's "Recent runs" table also has a "Status" column header).
     """
-    start_match = re.search(rf'^function {re.escape(func_name)}\(', source, re.MULTILINE)
-    assert start_match is not None, f'function {func_name}( not found in tabs.jsx'
-    start = start_match.start()
-    next_match = re.search(r'^function \w+\(', source[start + 1 :], re.MULTILINE)
-    end = start + 1 + next_match.start() if next_match else len(source)
-    return source[start:end]
-
-
-@pytest.fixture(scope='module')
-def orch_tab_body(tabs_jsx_body):
-    """The OrchTab function's own source text, scoped away from the other
-    tab-render functions in the same file (see _extract_function_body)."""
-    return _extract_function_body(tabs_jsx_body, 'OrchTab')
+    return extract_function_body(tabs_jsx_body, 'OrchTab')
 
 
 class TestOrchTabCurrentFocusRemoved:
