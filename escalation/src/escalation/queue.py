@@ -20,12 +20,12 @@ from shared.timestamps import parse_timestamp_or_warn
 from escalation import archive
 from escalation.classify import default_resolution_class_for_resolver
 
-# max_severity is aliased to the historical private name ``_max_severity``: the
-# severity ordering now lives in models.py beside the KNOWN_SEVERITIES vocabulary
-# it must stay total over (task 3976), where server.py can share it without a
-# private cross-module import.  The alias keeps this module's call sites unchanged.
-from escalation.models import RESOLUTION_CLASSES, Escalation
-from escalation.models import max_severity as _max_severity
+# max_severity lives in models.py beside the KNOWN_SEVERITIES vocabulary it must
+# stay total over (task 3976), so server.py can share it without reaching for a
+# module-private symbol.  Imported under its real, public name: it is a shared
+# cross-module helper, and spelling it `_max_severity` here would signal the
+# opposite at every use site.
+from escalation.models import RESOLUTION_CLASSES, Escalation, max_severity
 
 logger = logging.getLogger(__name__)
 
@@ -875,7 +875,7 @@ class EscalationQueue:
         New ids are appended in the order they first appear in *new_member_ids*.
 
         ``members`` is modified, and — when *severity_floor* is given —
-        ``severity`` is additionally promoted UPWARD via ``_max_severity``.
+        ``severity`` is additionally promoted UPWARD via ``max_severity``.
         The invariant is that **an L2's severity is monotonically
         non-decreasing after mint**: the floor can raise the record but never
         lower it, so it can only ever add human attention, never suppress it.
@@ -917,12 +917,12 @@ class EscalationQueue:
             existing = set(esc.members)
             appended = [m for m in dict.fromkeys(new_member_ids) if m not in existing]
 
-            # Upward-only: _max_severity can only return the higher-ranked of
+            # Upward-only: max_severity can only return the higher-ranked of
             # the two, so a floor at or below the current severity is inert by
             # construction.  An unrecognised floor falls to rank 0 there (with
             # a WARNING) and likewise leaves the record alone.
             new_severity = (
-                _max_severity(esc.severity, severity_floor)
+                max_severity(esc.severity, severity_floor)
                 if severity_floor is not None
                 else esc.severity
             )
@@ -1028,7 +1028,7 @@ class EscalationQueue:
         - ``parent.dedupe_children`` gains *child_id* (appended).
         - ``parent.dedupe_count`` is incremented by 1.
         - ``parent.severity`` is promoted via
-          ``_max_severity(parent.severity, child_severity)``; never demoted.
+          ``max_severity(parent.severity, child_severity)``; never demoted.
         - The updated parent is written back to disk via ``_rewrite()``.  Only
           this final file-replace step is atomic (``tempfile.mkstemp`` +
           ``os.rename``); the preceding in-memory mutations are not.
@@ -1062,7 +1062,7 @@ class EscalationQueue:
                 return None
             parent.dedupe_children.append(child_id)
             parent.dedupe_count += 1
-            parent.severity = _max_severity(parent.severity, child_severity)
+            parent.severity = max_severity(parent.severity, child_severity)
             self._rewrite(parent_id, parent)
         logger.info(
             f'Dedupe: folded {child_id} into parent {parent_id} '
