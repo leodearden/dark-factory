@@ -430,6 +430,81 @@ def readd_persisted(response: Any) -> tuple[bool, str]:
     return True, ''
 
 
+async def probe_delete_landed(
+    memory_service: Any, project_id: str, memory_id: Any
+) -> tuple[bool | None, str]:
+    """Did the delete of *memory_id* actually land? Answered by READING the store.
+
+    Returns ``(True|False|None, note)``:
+
+      * ``True``  -- the point is GONE, so the delete landed;
+      * ``False`` -- the point SURVIVED, so it did not;
+      * ``None``  -- the probe could not answer. Genuinely unknown.
+
+    READ-ONLY. It delegates to ``MemoryService.get_memory_by_id``, a raw Qdrant
+    point read, and mutates nothing -- which matters because it runs at the
+    worst possible moment, immediately after a delete has already raised.
+
+    WHY THIS EXISTS -- the measured 7d073281 incident
+    (``docs/toolcall-xml-leak-sweep-2026-08-05/investigation.md`` §4). The
+    traceback landed INSIDE ``delete_memory``
+    (``_journaled_backend_call`` -> ``sqlite3.OperationalError`` on mem0's
+    SQLite history write), and mem0 removes the Qdrant point BEFORE that
+    history write. A read-only check measured the point ABSENT afterwards and
+    the collection down from 21,089 to 21,088: the delete HAD landed and the
+    content was gone -- the substance of ``content_lost_in_flight`` -- while
+    the report said ``record_error``/UNKNOWN. The runbook already prescribes
+    this exact remedy to a HUMAN ("the id check in that cell is not optional --
+    it is what established the delete had landed, and it must be a read-only
+    lookup"); this automates the step the operator was told to perform.
+
+    It MEASURES rather than infers. Sniffing the exception for
+    ``sqlite3.OperationalError`` / "readonly database" would encode mem0's
+    internal delete-then-write-history ORDERING as a string match in a repair
+    script, and would mis-attribute silently the day mem0 reorders those two
+    halves or another transport raises the same class.
+
+    ``get_memory_by_id`` is the right primitive precisely because its ``None``
+    means a GENUINE not-found and never a swallowed timeout -- it PROPAGATES a
+    read timeout rather than collapsing it into ``None`` -- so "absent" and
+    "could not tell" stay distinguishable, which is what makes a three-valued
+    verdict possible at all.
+
+    The three-valued return is deliberate: collapsing an unanswerable probe
+    into either verdict re-creates the very defect this fixes, pointing the
+    other way. Claiming a landed delete on no evidence sends an operator to
+    hand-restore a record that is still live (producing a duplicate); claiming
+    it did not land hides a real loss. ``record_error`` has always meant "a
+    human must go and check this id", which is the honest label for an unknown.
+
+    It swallows its OWN exceptions and never raises. An escaping probe would
+    replace the caller's ORIGINAL delete error with its own, destroying the one
+    fact a human most needs.
+    """
+    getter = getattr(memory_service, 'get_memory_by_id', None)
+    if getter is None:
+        return None, (
+            'delete-landed probe UNAVAILABLE: this memory service exposes no '
+            'get_memory_by_id, so whether the point survived could not be read'
+        )
+    try:
+        found = await getter(project_id=project_id, memory_id=memory_id)
+    except Exception as exc:  # noqa: BLE001 - the probe must never mask the delete error
+        return None, (
+            f'delete-landed probe FAILED ({type(exc).__name__}: {exc}); whether the '
+            'point survived is unknown. The original delete error is preserved.'
+        )
+    if found is None:
+        return True, (
+            'delete-landed probe: read-only get_memory_by_id reports the point ABSENT, '
+            'so the delete landed and the stored copy is gone'
+        )
+    return False, (
+        'delete-landed probe: read-only get_memory_by_id reports the point still '
+        'PRESENT, so the delete did not land and nothing was destroyed'
+    )
+
+
 def routes_to_mem0(payload: dict) -> tuple[bool, str]:
     """Return (True, '') only when this payload's category writes to mem0.
 
