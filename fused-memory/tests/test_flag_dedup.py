@@ -3445,6 +3445,269 @@ class TestCitedFixTaskLive:
 
 
 # ---------------------------------------------------------------------------
+# ---- task 4381 step-5 ----
+# RED: _resolve_live_cross_project_fix_task — the FOREIGN-ONLY cross-project
+# resolver behind dedup_flags' HIT-path suppression gate.
+# ---------------------------------------------------------------------------
+
+
+class TestResolveLiveCrossProjectFixTask:
+    """Tests for ``_resolve_live_cross_project_fix_task(taskmaster,
+    known_projects, project_id, cited_tasks) -> dict | None``.
+
+    Returns the corroborating ``cited_tasks`` entry (so the caller can log
+    which task drove the drop) or ``None``.
+
+    The FOREIGN-ONLY gate is the single most important behaviour here: a
+    finding's own SUBJECT task is routinely its own first citation (the live
+    repro flag e3527208 cites know_live:598 — itself — alongside the real
+    fix tasks dark_factory:3833/3839), so consulting same-project citations
+    would make every such flag self-suppress on the very next cycle.
+
+    RED until step-6 adds the symbol to flag_dedup.py.
+    """
+
+    FOREIGN = {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix'}
+    SAME = {'project_id': 'know_live', 'task_id': '598', 'title': 'Subject'}
+    KNOWN = {'dark_factory': '/df', 'know_live': '/kl'}
+
+    @pytest.mark.asyncio
+    async def test_returns_foreign_entry_and_skips_same_project_lookup(self):
+        """(a) The foreign citation resolves; the SAME-PROJECT one issues no
+        lookup at all."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _resolve_live_cross_project_fix_task,
+        )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': 3839, 'title': 'Fix', 'status': 'pending'}
+        )
+
+        result = await _resolve_live_cross_project_fix_task(
+            taskmaster, self.KNOWN, 'know_live', [self.SAME, self.FOREIGN]
+        )
+
+        assert result == self.FOREIGN, (
+            f'must return the corroborating foreign cited entry; got {result!r}'
+        )
+        taskmaster.get_task.assert_called_once_with('3839', '/df')
+
+    @pytest.mark.asyncio
+    async def test_same_project_only_citations_issue_no_lookup(self):
+        """(b) The self-suppression guard: only same-project citations ->
+        None, with no lookup issued."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _resolve_live_cross_project_fix_task,
+        )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': 598, 'title': 'Subject', 'status': 'pending'}
+        )
+
+        result = await _resolve_live_cross_project_fix_task(
+            taskmaster, self.KNOWN, 'know_live', [self.SAME]
+        )
+
+        assert result is None, (
+            f'a same-project citation must never self-suppress; got {result!r}'
+        )
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_foreign_task_does_not_resolve(self):
+        """(c) A cancelled fix task is not live."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _resolve_live_cross_project_fix_task,
+        )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': 3839, 'title': 'Fix', 'status': 'cancelled'}
+        )
+
+        result = await _resolve_live_cross_project_fix_task(
+            taskmaster, self.KNOWN, 'know_live', [self.FOREIGN]
+        )
+
+        assert result is None, f'a cancelled fix task must not resolve; got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_is_fail_open(self):
+        """(d) A backend outage returns None and never escapes."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _resolve_live_cross_project_fix_task,
+        )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=RuntimeError('backend down'))
+
+        result = await _resolve_live_cross_project_fix_task(
+            taskmaster, self.KNOWN, 'know_live', [self.FOREIGN]
+        )
+
+        assert result is None, f'a lookup exception must fail open; got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_task_not_found_error_is_fail_open(self):
+        """(e) A definitive not-found also returns None."""
+        from fused_memory.backends.task_backend_errors import TaskNotFoundError
+        from fused_memory.reconciliation.flag_dedup import (
+            _resolve_live_cross_project_fix_task,
+        )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=TaskNotFoundError('3839'))
+
+        result = await _resolve_live_cross_project_fix_task(
+            taskmaster, self.KNOWN, 'know_live', [self.FOREIGN]
+        )
+
+        assert result is None, f'a not-found lookup must not resolve; got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_project_issues_no_lookup(self):
+        """(f) A cited project_id absent from known_projects is skipped."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _resolve_live_cross_project_fix_task,
+        )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': 3839, 'title': 'Fix', 'status': 'pending'}
+        )
+
+        result = await _resolve_live_cross_project_fix_task(
+            taskmaster, {'know_live': '/kl'}, 'know_live', [self.FOREIGN]
+        )
+
+        assert result is None, (
+            f'an unresolvable cited project must not resolve; got {result!r}'
+        )
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_taskmaster_returns_none(self):
+        """(g) taskmaster=None degrades to None."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _resolve_live_cross_project_fix_task,
+        )
+
+        result = await _resolve_live_cross_project_fix_task(
+            None, self.KNOWN, 'know_live', [self.FOREIGN]
+        )
+
+        assert result is None, f'a falsy taskmaster must degrade to None; got {result!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('known_projects', [{}, None], ids=['empty', 'none'])
+    async def test_no_known_projects_returns_none(self, known_projects):
+        """(g) known_projects={} / None degrades to None with no lookup."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _resolve_live_cross_project_fix_task,
+        )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': 3839, 'title': 'Fix', 'status': 'pending'}
+        )
+
+        result = await _resolve_live_cross_project_fix_task(
+            taskmaster, known_projects, 'know_live', [self.FOREIGN]
+        )
+
+        assert result is None, (
+            f'absent cross-project routing must degrade to None; got {result!r}'
+        )
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'cited_tasks',
+        [[], None, 'not-a-list', {'project_id': 'dark_factory'}, 42],
+        ids=['empty', 'none', 'str', 'dict', 'int'],
+    )
+    async def test_malformed_cited_tasks_returns_none(self, cited_tasks):
+        """(h) An empty / absent / non-list cited_tasks issues no lookup."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _resolve_live_cross_project_fix_task,
+        )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': 3839, 'title': 'Fix', 'status': 'pending'}
+        )
+
+        result = await _resolve_live_cross_project_fix_task(
+            taskmaster, self.KNOWN, 'know_live', cited_tasks
+        )
+
+        assert result is None, f'a malformed cited_tasks must yield None; got {result!r}'
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_entries_missing_identity_fields_are_skipped(self):
+        """(i) Non-dict entries and entries missing project_id/task_id are
+        skipped, and a well-formed sibling still resolves."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _resolve_live_cross_project_fix_task,
+        )
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': 3839, 'title': 'Fix', 'status': 'pending'}
+        )
+
+        result = await _resolve_live_cross_project_fix_task(
+            taskmaster,
+            self.KNOWN,
+            'know_live',
+            [
+                'not-a-dict',
+                {'task_id': '3839', 'title': 'Fix'},  # no project_id
+                {'project_id': 'dark_factory', 'title': 'Fix'},  # no task_id
+                self.FOREIGN,
+            ],
+        )
+
+        assert result == self.FOREIGN, (
+            f'malformed entries must be skipped, not abort the resolve; got {result!r}'
+        )
+        taskmaster.get_task.assert_called_once_with('3839', '/df')
+
+    @pytest.mark.asyncio
+    async def test_second_foreign_citation_resolves_when_first_is_cancelled(self):
+        """(j) ANY live foreign fix task suffices, and both lookups are issued
+        in ONE gather."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _resolve_live_cross_project_fix_task,
+        )
+
+        cancelled = {'project_id': 'dark_factory', 'task_id': '3833', 'title': 'Old fix'}
+
+        async def _get_task(task_id, project_root):
+            if str(task_id) == '3833':
+                return {'id': 3833, 'title': 'Old fix', 'status': 'cancelled'}
+            return {'id': 3839, 'title': 'Fix', 'status': 'pending'}
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=_get_task)
+
+        result = await _resolve_live_cross_project_fix_task(
+            taskmaster, self.KNOWN, 'know_live', [cancelled, self.FOREIGN]
+        )
+
+        assert result == self.FOREIGN, (
+            f'the second, live foreign citation must resolve; got {result!r}'
+        )
+        assert taskmaster.get_task.call_count == 2, (
+            f'both foreign citations must be looked up in one gather; got '
+            f'{taskmaster.get_task.call_count}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task-1654 step-1 — RED: compute_content_fingerprint_signature tests
 # ---------------------------------------------------------------------------
 
