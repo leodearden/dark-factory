@@ -310,10 +310,21 @@ class LaneLifecycle:
         than silently upgraded (that consolidation explicitly forbade changing
         per-site encoding). Task 3387 fixed the resulting latent bug: this
         payload is JSON (``record.to_json()``), and RFC 8259 requires JSON on
-        disk to be UTF-8 — a non-UTF-8 locale wrote JSON that
-        ``shared.safe_io.load_json_or_warn`` would later quarantine as
-        corrupt. ``encoding`` is now pinned ``'utf-8'`` regardless of the
-        ambient locale.
+        disk to be UTF-8 — under a non-UTF-8 locale this wrote bytes that THIS
+        CLASS'S OWN READER then rejects. Name it precisely, so the next
+        investigator does not go looking in the wrong module:
+        ``_read_or_raise`` raises ``CorruptLaneRecord`` (the decode error is a
+        ``UnicodeDecodeError``, a ``ValueError`` subclass, so it lands in that
+        method's ``except`` clause), which ``read()`` logs and maps to
+        ``None``, so ``all_records()`` then silently omits the lane. (An
+        earlier version of this paragraph cited
+        ``shared.safe_io.load_json_or_warn``; that helper never reads lane
+        records — its callers are ``b3_gate``, ``chronic_flake``,
+        ``landed_outbox`` and ``merge_queue_store``.)
+
+        ``encoding`` is now pinned ``'utf-8'`` at both halves of the
+        round-trip — here on write, and on ``_read_or_raise``'s ``read_text``
+        — regardless of the ambient locale.
 
         Tracked as ticket ``tkt_0RRXRPD1EW9KP7JE2RDB0YXFWX``. That is a TICKET
         id, not a task id — the curator resolves tickets to tasks

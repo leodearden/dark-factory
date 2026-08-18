@@ -5268,9 +5268,13 @@ class TestAtomicWriteSemantics:
 
     # -- task 3387: the payload is JSON, and RFC 8259 requires JSON on disk to
     # be UTF-8.  Under a non-UTF-8 locale the old bare ``os.fdopen(fd, 'w')``
-    # wrote JSON that ``shared.safe_io.load_json_or_warn`` would later
-    # quarantine as corrupt — silent data loss.  Three pins, deliberately
-    # different in KIND, because no single one of them is trustworthy alone:
+    # wrote bytes that this module's OWN readers then reject — ``read_record``
+    # raises ``CorruptSessionRecord``, ``list_decisions``/``reap_stale_leases``
+    # log and skip the file — i.e. silent data loss.  (NOT
+    # ``shared.safe_io.load_json_or_warn``, which an earlier version of this
+    # comment named: that helper never reads session, decision or lease
+    # records.)  Three pins, deliberately different in KIND, because no single
+    # one of them is trustworthy alone:
     #
     #   1. a boundary spy   — fast, deterministic, host-independent
     #   2. an EncodingWarning child — the interpreter itself names the defect

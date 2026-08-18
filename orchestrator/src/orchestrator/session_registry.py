@@ -627,15 +627,27 @@ def _atomic_write_text(path: Path, text: str) -> None:
     is strictly better than a module that cannot be imported by its own
     documented entrypoint.
 
-    ``os.fdopen(fd, 'w')`` with no explicit encoding defaults to
-    ``locale.getpreferredencoding(False)``, which is locale-dependent. Task
-    3387 fixed the resulting latent bug: the payload is always JSON
-    (``record.to_json()``), and RFC 8259 requires JSON on disk to be UTF-8 —
-    a non-UTF-8 locale wrote JSON that ``shared.safe_io.load_json_or_warn``
-    would later quarantine as corrupt. The encoding is now pinned
-    ``'utf-8'`` explicitly, regardless of the ambient locale. This needs no
-    import (unlike ``locale.getpreferredencoding``) and so does not violate
-    this module's stdlib-only, no-extra-import constraint above.
+    ``os.fdopen(fd, 'w')`` with no explicit encoding defaults to the ambient
+    locale's encoding, which is host-dependent. Task 3387 fixed the resulting
+    latent bug: the payload is always JSON (``record.to_json()``), and RFC 8259
+    requires JSON on disk to be UTF-8 — under a non-UTF-8 locale this wrote
+    bytes that THIS MODULE'S OWN READERS then reject. Name them precisely, so
+    the next investigator does not go looking in the wrong module:
+    ``read_record`` raises ``CorruptSessionRecord`` (the decode error is a
+    ``UnicodeDecodeError``, a ``ValueError`` subclass, so it lands in that
+    function's ``except`` clause), ``list_decisions`` and ``reap_stale_leases``
+    log and SKIP the file, and ``_mutate_decision`` returns ``None``. (An
+    earlier version of this paragraph cited
+    ``shared.safe_io.load_json_or_warn``. That helper never reads session,
+    decision or lease records — its callers are ``b3_gate``, ``chronic_flake``,
+    ``landed_outbox`` and ``merge_queue_store``.)
+
+    The encoding is now pinned ``'utf-8'`` explicitly at both halves of the
+    round-trip — here on write, and on every ``read_text()`` in this module —
+    so neither half follows the ambient locale. The literal is preferred over
+    ``locale.getpreferredencoding(False)`` because it is locale-INDEPENDENT,
+    which is the entire point; ``locale`` is stdlib and importing it would not
+    have violated this module's stdlib-only constraint above.
 
     Error policy stays with the callers: write_record lets a failure propagate
     (its sole caller, the CLI main(), provides the outer fail-soft boundary);
