@@ -621,3 +621,134 @@ class TestScopedSearch:
         assert 'Foreign fact.' in text
         assert 'Own fact.' in text
         assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def _grouped_parent(id_: str = 'p1', *, grouped: dict | None = None) -> dict:
+    """A NATIVE canonical hit carrying a ``grouped`` block, as the server nests it.
+
+    Mirrors what ``fused_memory.server.grouped_read.group_search_results``
+    emits: the block is hung on a KEPT parent entry at ``entry['grouped']``
+    (grouped_read.py:716-718), with bounded amendment digests under
+    ``amendments`` and full swallowed bodies under ``matched_children``.
+    """
+    entry = _result('x', 'placeholder', metadata=None, source_store='mem0')
+    entry['id'] = id_
+    entry['content'] = 'Native canonical.'
+    entry['metadata'] = {'project_id': 'dark_factory'}
+    entry['grouped'] = _grouped_block() if grouped is None else grouped
+    return entry
+
+
+def _grouped_block() -> dict:
+    return {
+        'amendments': [
+            {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'created_at': None,
+             'kind': 'amendment', 'metadata': {'src_project': 'reify'}},
+            {'id': 'a2', 'digest': 'NATIVE AMENDMENT BODY', 'created_at': None,
+             'kind': 'amendment', 'metadata': {'project_id': 'dark_factory'}},
+            {'id': 'a3', 'digest': 'UNTAGGED AMENDMENT BODY', 'created_at': None,
+             'kind': 'amendment'},
+        ],
+        'matched_children': [
+            {'id': 's1', 'content': 'FOREIGN SIGHTING BODY', 'created_at': None,
+             'kind': 'sighting', 'matched': True, 'metadata': {'src_project': 'reify'}},
+        ],
+        'amendment_count': 3,
+        'sighting_count': 1,
+    }
+
+
+class TestGroupedChildrenAreFiltered:
+    """task 4008: a foreign child nested under a NATIVE canonical must not survive.
+
+    ``group_search_results`` nests child data inside a KEPT parent entry, and
+    ``_get_memory_context`` appends the filtered JSON verbatim into the
+    ``# Context`` block — so a ``grouped`` sub-object renders as raw JSON in a
+    dispatched agent's prompt, foreign digest text and foreign pinned bodies
+    included.  Reading only the TOP-LEVEL tag lets every one of them through.
+
+    SCOPE: ``src_project`` is the task-2273 CGL-eta rehome shape (see
+    :data:`FOREIGN_PROJECT_TAG_KEYS`) — a record physically in dark_factory's
+    collection naming a different ORIGIN project.  That is the ONLY reachable
+    leak shape here, because ``_read_grouped_document``
+    (``fused_memory/server/grouped_read.py``:275-305) already scopes every
+    child read by ``project_id``, so a child from a foreign COLLECTION cannot
+    appear in a block at all.
+    """
+
+    def test_foreign_nested_children_are_dropped_from_a_kept_parent(self):
+        payload = json.dumps({'results': [_grouped_parent()]})
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        # (a) THE SUBSTANTIVE PIN: neither foreign body reaches the prompt.
+        assert 'FOREIGN AMENDMENT BODY' not in text, (
+            'A foreign-tagged amendment digest nested under a native canonical '
+            f'must not survive into the # Context block, got {text!r}'
+        )
+        assert 'FOREIGN SIGHTING BODY' not in text, (
+            'A foreign-tagged pinned body — the FULL text, not a digest — must '
+            f'not survive into the # Context block, got {text!r}'
+        )
+        # (b) The correctly-tagged parent is NOT collateral damage.
+        assert [r['id'] for r in json.loads(text)['results']] == ['p1']
+        # (c) A native child survives.
+        assert 'NATIVE AMENDMENT BODY' in text
+        # (d) Nested entries inherit the top-level KEEP-UNTAGGED policy.
+        assert 'UNTAGGED AMENDMENT BODY' in text, (
+            'An untagged nested child must be KEPT, exactly as an untagged '
+            f'top-level result is — not held to a stricter policy, got {text!r}'
+        )
+        # (e) Exactly the foreign children are gone.
+        grouped = json.loads(text)['results'][0]['grouped']
+        assert [c['id'] for c in grouped['amendments']] == ['a2', 'a3']
+        assert grouped['matched_children'] == []
+        # (f) Nested drops are COUNTED, so they reach foreign_dropped/drop_note.
+        assert dropped == 2, (
+            'Nested drops must be counted into the SAME return counter that '
+            f'feeds the drop note, so a blocked leak is reported, got {dropped}'
+        )
+
+    def test_a_nested_only_drop_defeats_the_no_op_fast_path(self):
+        """Every top-level entry is native or untagged; only a CHILD is foreign.
+
+        Pins that the ``dropped == 0`` fast path (which returns ``payload_text``
+        byte-for-byte unchanged) cannot swallow a nested-only drop.
+        """
+        payload = json.dumps({
+            'results': [
+                _result('u1', 'Untagged graphiti fact.'),
+                _grouped_parent(),
+            ],
+        })
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert dropped == 2
+        assert 'FOREIGN AMENDMENT BODY' not in text
+        assert 'FOREIGN SIGHTING BODY' not in text
+        assert text != payload, (
+            'The payload must be genuinely re-serialised when only a nested '
+            'entry was dropped — returning the unfiltered text would discard '
+            'the drop entirely'
+        )
+        assert [r['id'] for r in json.loads(text)['results']] == ['u1', 'p1']
+
+    def test_a_single_nested_drop_is_reported_and_re_serialised(self):
+        """The minimal nested-only case: exactly ONE foreign child, nothing else."""
+        payload = json.dumps({
+            'results': [_grouped_parent(grouped={
+                'amendments': [
+                    {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'created_at': None,
+                     'kind': 'amendment', 'metadata': {'src_project': 'reify'}},
+                ],
+                'amendment_count': 1,
+                'sighting_count': 0,
+            })],
+        })
+
+        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert dropped == 1
+        assert 'FOREIGN AMENDMENT BODY' not in text
+        assert json.loads(text)['results'][0]['grouped']['amendments'] == []
