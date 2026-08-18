@@ -8346,3 +8346,379 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             f'Surviving flags must preserve original relative order; got {result!r}'
         )
 
+
+
+# ---------------------------------------------------------------------------
+# ---- task 4381 step-13 ----
+# RED: filter_already_tracked_systemic_patterns must span ALL known_projects
+# and stop being done-only (Leo's 2026-08-17 ruling, esc-3841-1).
+# ---------------------------------------------------------------------------
+
+
+class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
+    """Tests for filter_already_tracked_systemic_patterns(taskmaster,
+    known_projects, flags) -> list[dict] (task 4381, GAP 2).
+
+    Two behavioural changes land together here:
+
+    1. **Cross-project.** The second parameter becomes the harness'
+       ``known_projects`` map (matching filter_false_phantom_task_creation_flags'
+       shape) instead of a single resolved ``dark_factory_root``, and the
+       filter fans one ``get_tasks`` out per known project.  ALL projects are
+       queried (unlike dedup_flags' foreign-only rule) because this filter
+       matches on TEXT coverage, where a same-project match is genuine
+       evidence -- the original 1938/2412 incident was entirely
+       intra-dark_factory.
+    2. **Not done-only.** ``statuses=['done']`` is superseded by
+       ``_NON_CANCELLED_TASK_STATUSES``: under the ruling a FILED-but-not-yet-
+       landed task (pending/blocked/...) now DOES suppress, because the
+       finding's own complaint is that no task was filed.  A cancelled task
+       must still never suppress, or the complaint is silenced forever.
+
+    RED until step-14 rewrites the filter and migrates every call site.
+    """
+
+    def _make_never_tracked_flag(self) -> dict:
+        return {
+            'task_id': None,
+            'category': 'systemic_pattern',
+            'flag_type': 'systemic_pattern',
+            'description': (
+                'This systemic pattern was never converted to a tracked task: diff '
+                'the project_status_correction cache against live get_statuses every '
+                'cycle to catch drift.'
+            ),
+            'suggested_action': (
+                'File a task to diff the cache against live status each cycle.'
+            ),
+        }
+
+    def _make_covering_task(self, task_id: str = '3839', status: str = 'pending') -> dict:
+        """A task whose title+description covers the never-tracked finding's terms."""
+        return {
+            'id': task_id,
+            'status': status,
+            'title': (
+                'Diff project_status_correction cache against live get_statuses '
+                'every cycle'
+            ),
+            'description': (
+                'Implemented a periodic diff of the cached project_status_correction '
+                'value against a live get_statuses call each cycle to catch drift and '
+                'correct stale cache entries before they propagate.'
+            ),
+        }
+
+    # ---- (a) status policy -------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_requests_all_non_cancelled_statuses(self):
+        """(a) The done-only pin is gone: every call requests _NON_CANCELLED_TASK_STATUSES."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _NON_CANCELLED_TASK_STATUSES,
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
+
+        calls = taskmaster.get_tasks.call_args_list
+        assert calls, 'get_tasks must be called for a registered project'
+        for call in calls:
+            statuses = call.kwargs.get('statuses')
+            assert statuses == _NON_CANCELLED_TASK_STATUSES, (
+                'get_tasks must request _NON_CANCELLED_TASK_STATUSES (the done-only '
+                f'pin is superseded by task 4381); got {statuses!r}'
+            )
+            assert 'cancelled' not in statuses, (
+                'A cancelled task must never be able to suppress a finding '
+                f'permanently; got statuses={statuses!r}'
+            )
+            assert 'pending' in statuses, (
+                'A pending fix task now counts as filed (Leo 2026-08-17 ruling); '
+                f'got statuses={statuses!r}'
+            )
+            assert 'blocked' in statuses, (
+                'A blocked fix task now counts as filed (Leo 2026-08-17 ruling); '
+                f'got statuses={statuses!r}'
+            )
+
+    # ---- (b) pending task suppresses --------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_pending_task_in_dark_factory_drops_the_flag(self):
+        """(b) The ruled widening: a PENDING covering task now DROPS the finding.
+
+        dark_factory 3833/3839 were blocked/pending, which is exactly why the
+        observed flag survived the done-only filter.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [self._make_covering_task(task_id='3839', status='pending')],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
+
+        assert result == [], (
+            'A PENDING covering task must DROP the never-tracked finding under the '
+            f'"filed and not cancelled" policy; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_blocked_task_in_dark_factory_drops_the_flag(self):
+        """(b') A BLOCKED covering task drops the finding too."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [self._make_covering_task(task_id='3833', status='blocked')],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
+
+        assert result == [], (
+            'A BLOCKED covering task must DROP the never-tracked finding; '
+            f'got {result!r}'
+        )
+
+    # ---- (c) foreign-project coverage --------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_covering_task_only_in_foreign_project_drops_the_flag(self):
+        """(c) The dark_factory pin is gone: a covering task in know_live also drops."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+
+        def _by_root(root, **kwargs):
+            if root == '/kl':
+                return {'tasks': [self._make_covering_task(task_id='598')]}
+            return {'tasks': []}
+
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(side_effect=_by_root)
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df', 'know_live': '/kl'}, [flag],
+        )
+
+        assert result == [], (
+            'A covering task living ONLY in a foreign known project must DROP the '
+            f'finding (the dark_factory pin is gone); got {result!r}'
+        )
+
+    # ---- (d) belt-and-braces cancelled skip --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_cancelled_task_returned_by_backend_does_not_drop_the_flag(self):
+        """(d) A backend that ignores the statuses kwarg still cannot suppress.
+
+        Asserted directly rather than left implied by the kwarg: a cancelled
+        task must never silence the complaint, so the filter skips it
+        client-side too.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={
+            'tasks': [self._make_covering_task(task_id='3839', status='cancelled')],
+        })
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df'}, [flag],
+        )
+
+        assert result == [flag], (
+            'A CANCELLED covering task must NOT drop the finding even when the '
+            'backend ignores the statuses kwarg (client-side skip); '
+            f'got {result!r}'
+        )
+
+    # ---- (e) fan-out -------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_fans_out_one_get_tasks_per_known_project(self):
+        """(e) One get_tasks per known project, one call each."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df', 'know_live': '/kl'}, [flag],
+        )
+
+        assert taskmaster.get_tasks.call_count == 2, (
+            'One get_tasks per known project is expected; got '
+            f'{taskmaster.get_tasks.call_count}'
+        )
+        roots = {call.args[0] for call in taskmaster.get_tasks.call_args_list}
+        assert roots == {'/df', '/kl'}, (
+            f'Both project roots must be queried (order-independent); got {roots!r}'
+        )
+
+    # ---- (f) per-project fail-open ----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_one_project_erroring_does_not_blind_the_others(self):
+        """(f) A raising project is logged and skipped; the healthy one still drops."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+
+        def _by_root(root, **kwargs):
+            if root == '/kl':
+                raise RuntimeError('know_live backend down')
+            return {'tasks': [self._make_covering_task()]}
+
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(side_effect=_by_root)
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df', 'know_live': '/kl'}, [flag],
+        )
+
+        assert result == [], (
+            'One erroring project must not blind the filter to the healthy '
+            f"project's covering task; got {result!r}"
+        )
+
+    # ---- (g) all projects fail --------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_all_projects_erroring_keeps_all_flags(self):
+        """(g) EVERY project erroring → KEEP-all (today's single-project contract)."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(side_effect=RuntimeError('backend down'))
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, {'dark_factory': '/df', 'know_live': '/kl'}, [flag],
+        )
+
+        assert result == [flag], (
+            'When EVERY known project errors the filter must fail-open to KEEP-all '
+            f'(preserving the documented single-project contract); got {result!r}'
+        )
+
+    # ---- (h) degradation ---------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_empty_known_projects_keeps_all_flags_and_get_tasks_not_called(self):
+        """(h) known_projects={} → no-op KEEP-all, no I/O."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster, known_projects={}, flags=[flag],
+        )
+
+        assert result == [flag], (
+            f'An empty known_projects must degrade to a no-op KEEP-all; got {result!r}'
+        )
+        taskmaster.get_tasks.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_none_known_projects_keeps_all_flags_and_get_tasks_not_called(self):
+        """(h) known_projects=None → no-op KEEP-all, no I/O."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        result = await filter_already_tracked_systemic_patterns(taskmaster, None, [flag])
+
+        assert result == [flag], (
+            f'A None known_projects must degrade to a no-op KEEP-all; got {result!r}'
+        )
+        taskmaster.get_tasks.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_none_taskmaster_keeps_all_flags(self):
+        """(h) taskmaster=None → no-op KEEP-all."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = self._make_never_tracked_flag()
+
+        result = await filter_already_tracked_systemic_patterns(
+            None, {'dark_factory': '/df'}, [flag],
+        )
+
+        assert result == [flag], (
+            f'A None taskmaster must degrade to a no-op KEEP-all; got {result!r}'
+        )
+
+    # ---- (i) scope guard preserved ----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_zero_candidates_issues_no_get_tasks_for_any_project_count(self):
+        """(i) The zero-candidate scope guard stays AHEAD of all I/O.
+
+        Bounds the added cost of fanning across N projects with 8 statuses:
+        with no systemic_pattern 'never tracked' candidate present, the filter
+        issues no taskmaster I/O at all.
+        """
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        benign = {
+            'task_id': '100',
+            'category': 'stale_metadata',
+            'flag_type': 'stale_metadata',
+            'description': 'Task 100 has no deliverable.',
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+
+        result = await filter_already_tracked_systemic_patterns(
+            taskmaster,
+            {'dark_factory': '/df', 'know_live': '/kl', 'other': '/ot'},
+            [benign],
+        )
+
+        assert result == [benign], (
+            f'A non-candidate flag must pass through unchanged; got {result!r}'
+        )
+        taskmaster.get_tasks.assert_not_called()
