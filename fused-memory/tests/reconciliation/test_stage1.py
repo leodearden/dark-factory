@@ -3220,6 +3220,98 @@ class TestAlreadyTrackedSystemicPatternWiring:
         )
 
 
+# ---------------------------------------------------------------------------
+# ---- task 4381 step-11 ----
+# RED: MemoryConsolidator must feed dedup_flags the cross-project map.
+# ---------------------------------------------------------------------------
+
+
+class TestDedupFlagsCrossProjectWiring:
+    """MemoryConsolidator.run() must hand dedup_flags the cross-project map
+    (task 4381), so its HIT-path fix-task suppression gate can run at all.
+
+    Without ``taskmaster=`` AND ``known_projects=``, dedup_flags degrades to
+    its pre-4381 behaviour by design — a silent no-op that no other assertion
+    in the suite would catch.
+
+    RED until step-12 wires both kwargs through.
+    """
+
+    def _make_flag(self) -> dict:
+        return {
+            'task_id': '598',
+            'flag_type': 'remediation_payload_live_workflow_signals_gap',
+            'description': 'the remediation payload omits live workflow signals',
+            'cited_tasks': [{'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix'}],
+        }
+
+    async def _run_with_dedup_mock(self, stage, flags, dedup_mock):
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=list(flags),
+            stats={},
+        )
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-4381-step11',
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_passes_taskmaster_and_known_projects_to_dedup_flags(self):
+        """run() forwards self.taskmaster and self.known_projects."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.known_projects = {'dark_factory': '/df'}
+        assert stage.taskmaster is not None  # AsyncMock() from _make_consolidator
+        stage.taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+        dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
+
+        await self._run_with_dedup_mock(stage, [self._make_flag()], dedup_mock)
+
+        assert dedup_mock.await_count >= 1, 'dedup_flags must be called'
+        kwargs = dedup_mock.await_args.kwargs
+        assert kwargs.get('taskmaster') is stage.taskmaster, (
+            'run() must pass taskmaster= to dedup_flags or the cross-project '
+            f'suppression gate can never run; got kwargs={sorted(kwargs)!r}'
+        )
+        assert kwargs.get('known_projects') == {'dark_factory': '/df'}, (
+            'run() must pass known_projects= to dedup_flags; got '
+            f'known_projects={kwargs.get("known_projects")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_empty_known_projects_still_completes(self):
+        """Degradation guard: a stage with the default known_projects={} still
+        completes and keeps the flag, so the wiring cannot regress into a hard
+        dependency on cross-project routing."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.known_projects = {}
+        assert stage.taskmaster is not None
+        stage.taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
+        flag = self._make_flag()
+        dedup_mock = AsyncMock(side_effect=lambda **kw: kw['flags'])
+
+        report = await self._run_with_dedup_mock(stage, [flag], dedup_mock)
+
+        assert flag in report.items_flagged, (
+            f'the flag must survive without cross-project routing; got {report.items_flagged!r}'
+        )
+        assert dedup_mock.await_args.kwargs.get('known_projects') == {}, (
+            'the empty map must still be forwarded verbatim; got '
+            f'{dedup_mock.await_args.kwargs.get("known_projects")!r}'
+        )
+
+
 class TestMemoryConsolidatorCitationVerificationWiring:
     """MemoryConsolidator.run() must re-verify each flagged finding's cited
     Mem0 memories (verify_cited_memories) AFTER super().run() and BEFORE the
