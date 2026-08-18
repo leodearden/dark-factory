@@ -602,7 +602,30 @@ abandoned work is recorded as a successful run."""
 # tool called before `ToolSearch` loaded its schema -- which needs the
 # OPPOSITE fix (consult the schema, don't re-emit blindly).  This constant
 # points at that discrimination rather than repeating it; do not delete
-# either bullet as redundant with the other.
+# either bullet as redundant with the other.  Do NOT trim that mention down
+# to a generic "consult the schema" on the theory that a dispatched role
+# cannot reach `ToolSearch` -- it can, regardless of whether `ToolSearch`
+# appears in that role's `allowed_tools`; see the TOOL AVAILABILITY comment
+# above WAIT_PATTERN_GUIDANCE (roles.py:401-413), which verified this from
+# inside a live dispatched session and explicitly forbids the same trim
+# there for the same mistaken reason.
+#
+# JUDGE IS DELIBERATELY INCLUDED, not merely uncovered by an exclusion rule.
+# Task 3607 excluded judge (and reviewer_comprehensive) from
+# BACKGROUND_WAIT_GUIDANCE partly on a cost framing -- neither holds
+# unqualified `Bash`, so "the whole block would be dead weight in every one
+# of their sessions" (test_roles_wait_pattern.py's `_BACKGROUND_CAPABLE_ROLES`
+# comment).  JUDGE runs after EVERY implementer iteration, making it the
+# highest per-invocation multiplier of the eight roles this constant is
+# spliced into, and unlike the wait block, JUDGE genuinely can hit this
+# rejection: it holds `Read` and runs on a tight 30-turn budget, so a
+# rejected paginated `Read` it cannot diagnose costs it a turn with no other
+# way to recover.  The token cost this adds to JUDGE's prompt is real and is
+# accepted for JUDGE specifically -- it is not waved through by reusing the
+# wait block's Bash-capability line, which would have excluded it.  The only
+# exclusion in THIS constant's splice set (`_UNPINNED_PROMPT_ROLES` in
+# test_roles_tool_call_rejection.py) rests on the artifact-pinning mechanism;
+# there is no separate, non-arbitrary cost line to draw beside it.
 #
 # HARD CONSTRAINT -- do NOT add an `mcp__<family>__<name>` example to this
 # constant.  test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names
