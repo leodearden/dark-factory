@@ -293,10 +293,21 @@ async def fetch_tasks(
     callers.  Offline/error markers are never cached so a transient failure
     does not pin empty results for the TTL window.
 
-    The key space stays bounded — a small fixed set of narrowings times a
-    small set of roots — which preserves ``TTLCache``'s documented "bounded
-    key space is a caller assumption" contract: it never evicts individual
-    entries, so a high-cardinality key would leak locks and entries forever.
+    The key space is NOT a small fixed set, and this docstring previously
+    claimed it was.  ``active_tasks``' terminal-window call passes
+    ``offset=max(0, n_terminal - window)``, computed from a live task count
+    that grows every time a task completes, so a fresh key is minted on every
+    completion (``...|p=400|o=3601``, then ``o=3602``, ...).  Each retired key
+    held a 400-row list — rows carrying description/details/metadata — plus an
+    ``asyncio.Lock``, forever (task 3857 review).
+
+    Quantizing the offset does NOT fix this and was rejected: ``n_terminal``
+    grows monotonically, so quantized offsets do too — that slows the leak by
+    the quantum, it does not bound it.  ``TTLCache`` now evicts entries past
+    a multiple of the TTL (see :meth:`TTLCache._evict_expired`), which bounds
+    the resident set to "keys requested within the eviction horizon" no matter
+    how many distinct keys are ever used.  That is the real invariant, it lives
+    where the store lives, and it holds for every ``TTLCache`` caller.
 
     **Copy isolation (list-level only):** returns a shallow ``list()`` copy on
     every call, so list-level mutations (``result.clear()``, ``result.append()``)

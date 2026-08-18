@@ -753,3 +753,121 @@ class TestTTLCacheCacheOk:
         await cache.get_or_refresh('k', refresh, cache_ok=lambda v: isinstance(v, list))
 
         assert calls == 2, 'cache_ok=False must prevent storing, forcing a re-run'
+
+
+class TestTTLCacheEvictsExpiredKeys:
+    """A high-cardinality key space must not grow the store without bound.
+
+    Regression for the task-3857 review finding. ``fetch_tasks``' cache key
+    includes the paging ``offset``, and ``active_tasks``' terminal-window
+    caller computes it from a live task count that grows on every completion.
+    Because ``TTLCache`` evicted nothing, each retired offset permanently
+    retained a shaped-task list (rows carrying description/details/metadata)
+    plus an ``asyncio.Lock``.
+    """
+
+    @pytest.mark.parametrize('n_keys', [50, 200, 800])
+    async def test_store_size_is_independent_of_how_many_keys_are_minted(
+        self, monkeypatch, n_keys
+    ):
+        """Resident size is set by the eviction horizon, NOT by cardinality.
+
+        This is the assertion that actually discriminates a bounded store from
+        a leaking one: sweeping 50, 200 and 800 one-shot keys must all settle
+        at the SAME small resident size. A leak would grow with *n_keys*, and
+        a quantize-the-offset fix (rejected during this review) would still
+        grow with it — just more slowly.
+
+        Eviction is LAZY — it runs on a cold miss, not on a background timer —
+        so the newest few entries always post-date the last sweep. The bound
+        is therefore a small constant, not zero.
+        """
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        cache: TTLCache[list] = TTLCache(ttl_seconds=lambda: 20.0)
+
+        clock = {'t': 0.0}
+        monkeypatch.setattr(fanout_mod.time, 'monotonic', lambda: clock['t'])
+
+        # Each iteration mints a NEW key and never revisits it — exactly the
+        # shape of an offset that advances with every completed task.
+        for i in range(n_keys):
+            await cache.get_or_refresh(f'root|s=done|p=400|o={i}', _four_hundred_rows)
+            clock['t'] += 30.0  # > TTL, so the previous key is retired
+
+        # horizon 80s / 30s per key => at most ceil(80/30) + 1 == 4 entries can
+        # post-date the last sweep. Pinned as an absolute constant so the test
+        # fails if the store ever starts tracking n_keys.
+        assert len(cache._store) <= 4, (
+            f'{n_keys} distinct one-shot keys must not accumulate store slots; '
+            f'got {len(cache._store)} — the store is tracking cardinality'
+        )
+        assert len(cache._locks) <= 4, (
+            f'retired keys must not retain locks forever; got {len(cache._locks)}'
+        )
+        # No survivor may be arbitrarily old: everything still resident was
+        # either swept-and-kept or stored after the last sweep.
+        oldest = min(stamp for stamp, _ in cache._store.values())
+        assert clock['t'] - oldest <= 20.0 * TTLCache._EVICTION_TTL_MULTIPLE + 30.0, (
+            'a resident entry is older than one horizon plus one sweep interval'
+        )
+
+    async def test_eviction_never_drops_a_still_servable_entry(self, monkeypatch):
+        """Entries inside the TTL survive a sweep — eviction is memory-only."""
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        cache: TTLCache[list] = TTLCache(ttl_seconds=lambda: 20.0)
+        clock = {'t': 0.0}
+        monkeypatch.setattr(fanout_mod.time, 'monotonic', lambda: clock['t'])
+
+        await cache.get_or_refresh('keep-me', _four_hundred_rows)
+        clock['t'] += 1.0
+        # A cold miss on another key triggers the sweep.
+        await cache.get_or_refresh('other', _four_hundred_rows)
+
+        assert cache.get_fresh('keep-me') is not None, (
+            'a sweep must not evict an entry still inside its TTL'
+        )
+
+    async def test_sweep_does_not_disturb_an_in_flight_single_flight(self, monkeypatch):
+        """A lock held by an in-flight refresh survives a concurrent sweep."""
+        import asyncio
+
+        import dashboard.data.mcp_fanout as fanout_mod
+
+        cache: TTLCache[list] = TTLCache(ttl_seconds=lambda: 20.0)
+        clock = {'t': 0.0}
+        monkeypatch.setattr(fanout_mod.time, 'monotonic', lambda: clock['t'])
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = {'n': 0}
+
+        async def _slow() -> list:
+            calls['n'] += 1
+            started.set()
+            await release.wait()
+            return [{'id': 1}]
+
+        # Park a refresh for 'slow' holding its lock...
+        task_a = asyncio.create_task(cache.get_or_refresh('slow', _slow))
+        await started.wait()
+        # ...then queue a second waiter on the SAME key, and age the clock so a
+        # sweep on an unrelated cold miss would consider stale keys evictable.
+        task_b = asyncio.create_task(cache.get_or_refresh('slow', _slow))
+        await asyncio.sleep(0)
+        clock['t'] += 1000.0
+        await cache.get_or_refresh('unrelated', _four_hundred_rows)
+
+        release.set()
+        await task_a
+        await task_b
+        assert calls['n'] == 1, (
+            'the sweep must not break single-flight: the queued waiter should '
+            f'have reused the in-flight result, but refresh ran {calls["n"]} times'
+        )
+
+
+async def _four_hundred_rows() -> list:
+    """Stand-in for a terminal-window page: 400 rows carrying heavy fields."""
+    return [{'id': i, 'description': 'x' * 64} for i in range(400)]
