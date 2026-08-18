@@ -419,6 +419,105 @@ class TestGetPendingCompact:
         assert all(r['level'] == 2 for r in result)
         assert all(set(r.keys()) == self._COMPACT_KEYS for r in result)
 
+    # -- C1: root_cause + member_ids survive the projection (task 3997) ------
+
+    @pytest.mark.asyncio
+    async def test_compact_projection_carries_root_cause(self, tmp_path: Path):
+        """compact rows carry ``root_cause`` and ``member_ids`` (task 3997, C1).
+
+        A rotating L2 watcher must be able to answer "is this cluster already
+        promoted?" from the DRAIN ALONE — that needs the L2's ``root_cause``
+        (the dedup key ``find_pending_l2_by_root_cause`` matches on) and its
+        member ids, both of which compact mode used to drop.  ``detail`` stays
+        dropped: it is the unbounded free-text field the compact projection
+        exists to keep out of a long-running watcher's context.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_heavy(queue, 'task-A', level=2)
+
+        result = await _get_pending(server, level=2, compact=True)
+
+        assert len(result) == 1, f'Expected 1 result, got {len(result)}: {result}'
+        row = result[0]
+        assert row['root_cause'] == 'shared root cause hypothesis', (
+            f'root_cause missing or wrong in compact row: {row}'
+        )
+        # THE load-bearing assertion.  `member_ids` is NOT a key of to_dict()
+        # (the model field is `members`), so under the `if k in d` guard that
+        # pins_recovery's absent-means-UNKNOWN contract requires, a naive
+        # tuple-widening SILENTLY DROPS it.  This assertion is what makes that
+        # silent failure loud.
+        assert row['member_ids'] == ['esc-1-1', 'esc-1-2'], (
+            f'member_ids missing or wrong in compact row: {row}'
+        )
+        assert 'detail' not in row, (
+            f'the 4000-char free-text field must stay dropped: {sorted(row)}'
+        )
+        assert 'members' not in row, (
+            f'the contract key is member_ids; the raw model key stays dropped: {sorted(row)}'
+        )
+
+        # C1's sufficiency claim (boundary B2): a rotation with ZERO session
+        # memory rebuilds `already_promoted` from the returned rows alone.
+        second = Escalation(
+            id=queue.make_id('task-B'),
+            task_id='task-B',
+            agent_role='implementer',
+            severity='blocking',
+            category='design_concern',
+            summary='second cluster',
+            detail='y' * 4000,
+            suggested_action='manual_intervention',
+            level=2,
+            members=['esc-2-1'],
+            root_cause='a different root cause hypothesis',
+        )
+        queue.submit(second)
+
+        rows = await _get_pending(server, level=2, compact=True)
+
+        assert len(rows) == 2, f'Expected both L2 rows, got {rows}'
+        already_promoted = (
+            {r['root_cause'] for r in rows}
+            | {m for r in rows for m in r['member_ids']}
+        )
+        assert already_promoted == {
+            'shared root cause hypothesis',
+            'a different root cause hypothesis',
+            'esc-1-1',
+            'esc-1-2',
+            'esc-2-1',
+        }, f'drain-alone rebuild of already_promoted is incomplete: {already_promoted}'
+
+    @pytest.mark.asyncio
+    async def test_task_escalations_compact_carries_root_cause(self, tmp_path: Path):
+        """The OTHER apply site projects the same widened set (task 3997, C1).
+
+        The two compact apply sites fail in OPPOSITE ways under a naive
+        tuple-widening: the guarded ``get_pending_escalations`` projection
+        silently drops ``member_ids``, while this UNGUARDED
+        ``get_task_escalations`` one raises KeyError.  Both need a pin.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_heavy(queue, 'task-A', level=2)
+
+        result = await _get_task_escalations(server, task_id='task-A', compact=True)
+
+        assert len(result) == 1, f'Expected 1 result, got {result}'
+        row = result[0]
+        assert row['root_cause'] == 'shared root cause hypothesis', (
+            f'root_cause missing or wrong in compact row: {row}'
+        )
+        assert row['member_ids'] == ['esc-1-1', 'esc-1-2'], (
+            f'member_ids missing or wrong in compact row: {row}'
+        )
+        assert set(row.keys()) == set(_COMPACT_ESCALATION_FIELDS), (
+            f'compact row keys {sorted(row.keys())} != '
+            f'{sorted(_COMPACT_ESCALATION_FIELDS)}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestGetTaskEscalations: archive-inclusive task-scoped lookup (task 3023)
