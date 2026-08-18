@@ -25,7 +25,7 @@ from escalation.classify import default_resolution_class_for_resolver
 # module-private symbol.  Imported under its real, public name: it is a shared
 # cross-module helper, and spelling it `_max_severity` here would signal the
 # opposite at every use site.
-from escalation.models import RESOLUTION_CLASSES, Escalation, max_severity
+from escalation.models import RESOLUTION_CLASSES, Amendment, Escalation, max_severity
 
 logger = logging.getLogger(__name__)
 
@@ -853,6 +853,8 @@ class EscalationQueue:
     def add_members_to_l2(
         self, escalation_id: str, new_member_ids: list[str],
         *, severity_floor: str | None = None,
+        root_cause: str = '', evidence: str = '', options: list[str] | None = None,
+        summary: str = '', agent_role: str = '',
     ) -> Escalation | None:
         """Append *new_member_ids* to a pending L2 escalation's ``members`` list.
 
@@ -880,16 +882,30 @@ class EscalationQueue:
         non-decreasing after mint**: the floor can raise the record but never
         lower it, so it can only ever add human attention, never suppress it.
         Omitting *severity_floor* leaves ``severity`` untouched (task 3976).
-        ``root_cause``, ``options``, ``summary``, ``detail``, and ``timestamp``
-        are preserved so the human-facing decision context remains the L2's
-        original framing across repeated auto-watcher triage passes.
+        **Incoming framing is PRESERVED, not discarded (task 3997).**  The
+        record's own ``root_cause``, ``options``, ``summary``, ``detail`` and
+        ``timestamp`` are still never OVERWRITTEN — the human-facing decision
+        context stays the L2's original framing across repeated auto-watcher
+        triage passes.  But the framing a fold carries IN is no longer dropped
+        on the floor either (measured: 336,875 characters lost): when any of
+        *root_cause* / *evidence* / *options* / *summary* is non-empty, one
+        :class:`~escalation.models.Amendment` is APPENDED to ``esc.amendments``
+        recording it, alongside *agent_role* and a ``timestamp`` this method
+        stamps itself (the write chokepoint owns its clock, mirroring
+        ``stamp_triage``/``triaged_at``, so a caller cannot backdate one).
+        The incoming *evidence* is stored under the amendment's ``detail`` key —
+        the same field the create path writes that argument into.  Passing no
+        framing appends no amendment, so every existing two-positional-arg
+        caller is byte-unchanged.
 
         A severity promotion is a real content change, so it bumps
         ``updated_at`` even when no new member id was appended — the watcher's
         stamp-then-skip protocol keys off ``updated_at > triaged_at``, and a
         record that silently got more severe would otherwise be skipped
-        forever.  A floor at or below the current severity with no new members
-        remains a true no-op and does NOT bump.
+        forever.  A recorded amendment bumps it for the identical reason: new
+        framing IS the re-assess trigger.  A floor at or below the current
+        severity, with no new members and no framing, remains a true no-op and
+        does NOT bump.
 
         Both the member append and the severity bump happen inside the same
         ``escalation_id_lock`` and land in a single ``_rewrite``, so they are
@@ -911,7 +927,8 @@ class EscalationQueue:
                 logger.warning(f'Failed to parse L2 escalation {escalation_id}: {e}')
                 return None
 
-            if not new_member_ids and severity_floor is None:
+            incoming_framing = bool(root_cause or evidence or options or summary)
+            if not new_member_ids and severity_floor is None and not incoming_framing:
                 return esc  # no-op
 
             existing = set(esc.members)
@@ -928,20 +945,37 @@ class EscalationQueue:
             )
             severity_changed = new_severity != esc.severity
 
-            if appended or severity_changed:
+            # Preserve the incoming framing rather than discarding it.  Built
+            # inside the SAME escalation_id_lock critical section as the member
+            # append, so it lands in the same single _rewrite below — no second
+            # write path, no new durability story.
+            amendment_recorded = False
+            if incoming_framing:
+                amendment: Amendment = {
+                    'timestamp': datetime.now(UTC).isoformat(),
+                    'agent_role': agent_role,
+                    'root_cause': root_cause,
+                    'summary': summary,
+                    'detail': evidence,
+                    'options': list(options or []),
+                }
+                esc.amendments.append(amendment)
+                amendment_recorded = True
+
+            if appended or severity_changed or amendment_recorded:
                 esc.members.extend(appended)
                 esc.severity = new_severity
-                # Bump the "changed since triaged" signal — a member append or a
-                # severity promotion is exactly the re-assess trigger the
-                # watcher's stamp-then-skip protocol keys off
-                # (updated_at > triaged_at).
+                # Bump the "changed since triaged" signal — a member append, a
+                # severity promotion or a new framing amendment is exactly the
+                # re-assess trigger the watcher's stamp-then-skip protocol keys
+                # off (updated_at > triaged_at).
                 esc.updated_at = datetime.now(UTC).isoformat()
                 self._rewrite(escalation_id, esc)
                 logger.info(
                     'add_members_to_l2: added %d new member(s) to %s '
-                    '(total=%d, severity=%s%s)',
+                    '(total=%d, severity=%s%s, amendments=%d)',
                     len(appended), escalation_id, len(esc.members), esc.severity,
-                    ' [promoted]' if severity_changed else '',
+                    ' [promoted]' if severity_changed else '', len(esc.amendments),
                 )
             return esc
 
