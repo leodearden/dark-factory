@@ -493,6 +493,17 @@ kind, so a future fifth structural path is covered by construction.
 # (task 4340).  Recorded so the next person does not have to redo it, and
 # stated as claims with reasons so it can be FALSIFIED rather than trusted.
 #
+# THIS BLOCK IS THE ONE PLACE the measured figures, the open residual, and the
+# ticket cross-references are written down.  Everything else that used to
+# restate them — the two shim docstrings, _paged_ro_query's residual
+# paragraph, the pagination test module's docstring, and the task-4340
+# amendment in reconciliation/stale_status_snapshot_edge_sweep.py — now points
+# HERE, so a re-measurement is a one-block edit.  Keep it that way.  Moving
+# the block out of source entirely, into a reference doc, is tracked as ticket
+# tkt_0RSKFG5RX196H9CJ0RXGJCZF4F; the counts below are date-stamped precisely
+# because they rot (Entity nodes on dark_factory read 16038, then 16083, then
+# 16262 over roughly 24 hours of task 4340).
+#
 # Measured live against localhost:6379, RESULTSET_SIZE=10000:
 #
 #     graph          Entity nodes   valid-edge rows   an unpaginated read saw
