@@ -18,6 +18,26 @@ from _fm_helpers import extract_cypher, extract_params
 
 _LOGGER_NAME = 'fused_memory.backends.graphiti_client'
 
+
+def page_cypher(ro_query_mock) -> str:
+    """Return the SKIP/LIMIT page query from a paginated read's recorded calls.
+
+    get_all_valid_edges is paginated (task 4340), so it issues a single-row
+    ``count(*)`` census probe followed by N page queries. ``call_args`` is only
+    the LAST call, which makes it the wrong thing to assert the read's shape
+    against; find the page query explicitly instead.
+    """
+    pages = [
+        extract_cypher(c)
+        for c in ro_query_mock.call_args_list
+        if 'SKIP' in extract_cypher(c)
+    ]
+    assert pages, (
+        'no SKIP/LIMIT page query was issued — the read is not paginated: '
+        f'{[extract_cypher(c) for c in ro_query_mock.call_args_list]}'
+    )
+    return pages[0]
+
 # ---------------------------------------------------------------------------
 # step-1: GraphitiBackend.get_valid_edges_for_node
 # ---------------------------------------------------------------------------
@@ -102,7 +122,10 @@ class TestGetValidEdgesForNodeUuidDedup:
         backend._driver._get_graph = MagicMock(return_value=graph)
         with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
             await backend.get_valid_edges_for_node('u', group_id='test')
-        assert caplog.records == []
+        # Scoped to the dedup diagnostic this test is actually about. A bare
+        # `caplog.records == []` also doubled as an accidental "this module
+        # never logs anything" pin, which is not what it was written to test.
+        assert not [r for r in caplog.records if 'e1' in r.getMessage()]
 
 
 # ---------------------------------------------------------------------------
@@ -120,11 +143,14 @@ class TestGetAllValidEdgesUuidDedup:
         graph = make_graph_mock(ro_rows=[])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        cypher = extract_cypher(graph.ro_query.call_args)
+        cypher = page_cypher(graph.ro_query)
         assert 'WITH DISTINCT' not in cypher
         assert 'RELATES_TO' in cypher
         assert 'invalid_at IS NULL' in cypher
-        graph.ro_query.assert_awaited_once()
+        # The read is paginated (task 4340): one census probe plus N pages, so
+        # "exactly one query" is no longer the shape. The load-bearing half of
+        # that original assertion — this stays on the read-only path — is kept.
+        assert graph.ro_query.await_count >= 1
         graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -188,4 +214,9 @@ class TestGetAllValidEdgesUuidDedup:
         backend._driver._get_graph = MagicMock(return_value=graph)
         with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
             await backend.get_all_valid_edges(group_id='test')
-        assert caplog.records == []
+        # Scoped to the dedup diagnostic this test is actually about — see the
+        # get_valid_edges_for_node twin above.
+        assert not [
+            r for r in caplog.records
+            if 'e1' in r.getMessage() or "('A', 'e1')" in r.getMessage()
+        ]
