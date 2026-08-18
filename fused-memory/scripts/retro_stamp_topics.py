@@ -71,7 +71,7 @@ D2 says the scalar->list fold "rides θ's sweep where it touches entries
 anyway".  That is a convenience, not a mandate to manufacture a validation
 failure: two of the six live canonical records carry ``supersedes`` as an
 English *sentence*, and blindly wrapping it would produce a one-member list
-that fails ``_is_full_uuid``.  So the fold is applied only when the scalar
+that fails ``is_full_uuid``.  So the fold is applied only when the scalar
 parses as a full UUID; prose is left byte-identical and reported.
 
 Usage
@@ -96,8 +96,9 @@ import types
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fused_memory.memory_metadata import _is_full_uuid, normalize_supersedes
+from fused_memory.memory_metadata import normalize_supersedes
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
+from fused_memory.utils.validation import is_full_uuid
 
 __all__ = [
     'CALIBRATION_FIXTURE_PATH',
@@ -127,6 +128,7 @@ __all__ = [
     'compute_patch',
     'derive_topic_slug',
     'filter_plans_to_projects',
+    'is_full_uuid',
     'is_valid_topic_slug',
     'load_calibration_rows',
     'load_topic_registry',
@@ -364,13 +366,14 @@ def compute_patch(
     # would still be a resolvable id afterwards. `normalize_supersedes`
     # faithfully wraps any scalar — including the English sentences two live
     # canonical records carry — so folding unconditionally would write a
-    # one-member list that fails `_is_full_uuid`, converting a merely-legacy
+    # one-member list that fails `is_full_uuid`, converting a merely-legacy
     # shape into an outright validation failure. Both helpers are imported
-    # rather than re-expressed (INV-5).
+    # rather than re-expressed (INV-5) — the fold from `memory_metadata`, the
+    # UUID predicate from `fused_memory.utils.validation`.
     if 'supersedes' in existing_metadata:
         raw = existing_metadata['supersedes']
         members = normalize_supersedes(raw)
-        if not all(_is_full_uuid(m) for m in members):
+        if not all(is_full_uuid(m) for m in members):
             dispositions.append('supersedes_not_normalizable')
         elif isinstance(raw, list):
             # Already the target shape — no write, so run two stays empty.
@@ -446,7 +449,7 @@ def _harvest_member_ids(
 
     Every value is shaped by :func:`normalize_supersedes` (which tolerates
     both the scalar and list spellings without coercing members) and then
-    filtered by ``_is_full_uuid``.  A value that survives neither is appended
+    filtered by ``is_full_uuid``.  A value that survives neither is appended
     to *skips* rather than dropped: a member the sweep could not resolve is a
     fact about the cluster, and a report that omitted it would claim a clean
     pass over membership it never actually determined.
@@ -459,7 +462,7 @@ def _harvest_member_ids(
         if key not in metadata:
             continue
         for member in normalize_supersedes(metadata[key]):
-            if not _is_full_uuid(member):
+            if not is_full_uuid(member):
                 skips.append({
                     'reason': 'member_not_a_uuid',
                     'memory_id': memory_id,
@@ -637,11 +640,11 @@ def plan_calibration_clusters(
             if label not in (_CANONICAL_LABEL, _MEMBER_LABEL):
                 continue
             memory_id = row.get('memory_id')
-            # The isinstance arm is redundant at runtime (`_is_full_uuid`
+            # The isinstance arm is redundant at runtime (`is_full_uuid`
             # rejects a non-str) but not to a reader or a type checker: the
             # row came off a JSONL fixture, so `memory_id` is genuinely
             # `Any | None` here and the narrowing has to be visible.
-            if not isinstance(memory_id, str) or not _is_full_uuid(memory_id):
+            if not isinstance(memory_id, str) or not is_full_uuid(memory_id):
                 skips.append({
                     'reason': 'member_not_a_uuid',
                     'cluster_id': cluster_id,
