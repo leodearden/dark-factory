@@ -667,15 +667,24 @@ async def scroll_collection_points(
 
 
 async def merge_collection(
+    backend: Any,
     qdrant_client: Any,
     source: str,
     target: str,
     canonical_user_id: str,
-    points: list,
     *,
-    capped: bool,
+    page_size: int = 1000,
+    max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
 ) -> dict:
-    """Upsert *points* (payload user_id rewritten to canonical) into *target*.
+    """STREAM *source* into *target*, rewriting each payload's user_id.
+
+    This is the pass's SOLE with-vectors drain, and it upserts in CHUNKS of
+    at most *page_size* points: it never holds more than one chunk resident
+    and never issues a request larger than one chunk. Draining the whole
+    collection first (with vectors) and issuing a single upsert made both
+    peak memory and the request size scale with the collection -- up to
+    *page_size* x *max_pages* points carrying embeddings -- on exactly the
+    multi-page collections task 3225 first made reachable.
 
     Preserves each point's original id and vector -- only the payload's
     user_id is rewritten. Qdrant upsert is id-keyed: this ASSUMES every
@@ -685,31 +694,83 @@ async def merge_collection(
     existence check is performed -- COLLECTION_MERGES entries must only ever
     pair collections whose point ids cannot collide.
 
-    The *source* collection is deleted ONLY when *capped* is False (the
-    scroll that produced *points* was NOT capped, i.e. fully drained): a
-    capped scroll means the enumeration may be incomplete, so deleting
-    source would risk losing un-migrated data -- the caller marks that case
-    UNRESOLVED instead.
+    The *source* collection is deleted ONLY after this function's own drain
+    reaches exhaustion. A drain that dies mid-stream leaves the target
+    holding an idempotent, id-keyed PARTIAL copy while the source stays
+    fully intact: a re-run with a larger budget completes the migration,
+    harmlessly re-upserting the points that already landed. No data is lost,
+    only duplicated work. Deleting the source there would destroy the
+    un-migrated remainder, so the delete is withheld and
+    ``enumeration_incomplete`` is returned True for the caller to fold into
+    an UNRESOLVED disposition.
+
+    Returns:
+        ``{'points_upserted': n, 'source_deleted': bool,
+        'enumeration_incomplete': bool}``. ``points_upserted`` tallies what
+        ACTUALLY reached *target*, not what was enumerated -- a chunk still
+        buffered when the drain died was never sent and is not counted.
+
+    A ``ScrollPageBudgetExhausted`` is CAUGHT, never propagated, for the
+    same reason ``scroll_collection_points`` catches it: a raising
+    sub-operation must not abort the whole consolidation run, because
+    earlier keys/sections of the same ``--apply`` pass may already hold
+    committed mutations.
     """
     from qdrant_client.http import models as qmodels  # noqa: PLC0415
 
-    upsert_points = [
-        qmodels.PointStruct(
-            id=point.id,
-            vector=point.vector,
-            payload=rewrite_point_payload_user_id(dict(point.payload or {}), canonical_user_id),
+    points_upserted = 0
+    chunk: list = []
+
+    async def _flush() -> None:
+        nonlocal points_upserted
+        if not chunk:
+            return
+        await qdrant_client.upsert(collection_name=target, points=list(chunk))
+        points_upserted += len(chunk)
+        chunk.clear()
+
+    try:
+        async for point in backend.scroll_collection_pages(
+            source,
+            page_size=page_size,
+            max_pages=max_pages,
+            with_vectors=True,
+        ):
+            chunk.append(
+                qmodels.PointStruct(
+                    id=point.id,
+                    vector=point.vector,
+                    payload=rewrite_point_payload_user_id(
+                        dict(point.payload or {}), canonical_user_id,
+                    ),
+                ),
+            )
+            if len(chunk) >= page_size:
+                await _flush()
+        await _flush()
+    except ScrollPageBudgetExhausted:
+        logger.warning(
+            "consolidate_namespace_families: the merge drain of collection "
+            "'%s' exhausted its page budget (%d page(s) of %d) after "
+            '%d point(s) were upserted into %r -- the migration is '
+            'INCOMPLETE, so this collection is reported UNRESOLVED and its '
+            'source is NOT deleted. The points already upserted are id-keyed '
+            'and idempotent: re-run with a higher --max-pages (page budget) '
+            'or --limit (page size) to complete it.',
+            source, max_pages, page_size, points_upserted, target,
         )
-        for point in points
-    ]
-    if upsert_points:
-        await qdrant_client.upsert(collection_name=target, points=upsert_points)
+        return {
+            'points_upserted': points_upserted,
+            'source_deleted': False,
+            'enumeration_incomplete': True,
+        }
 
-    source_deleted = False
-    if not capped:
-        await qdrant_client.delete_collection(source)
-        source_deleted = True
-
-    return {'points_upserted': len(upsert_points), 'source_deleted': source_deleted}
+    await qdrant_client.delete_collection(source)
+    return {
+        'points_upserted': points_upserted,
+        'source_deleted': True,
+        'enumeration_incomplete': False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -912,11 +973,19 @@ async def run(
         # was written, matching the "reported UNRESOLVED rather than acted
         # on" contract (module docstring).
         if args.apply and not capped:
-            item.update(
-                await merge_collection(
-                    qdrant_client, source, target, canonical_user_id, points, capped=capped,
-                ),
+            summary = await merge_collection(
+                memory_service.mem0, qdrant_client, source, target, canonical_user_id,
+                page_size=limit,
             )
+            item.update(summary)
+            # A phase-2 drain that died mid-merge upserted only part of the
+            # source and withheld the delete, so the item is NOT a clean
+            # MERGE -- fold it into UNRESOLVED exactly like the graph-family
+            # post-merge downgrade above, so has_unresolved picks it up and
+            # the run exits non-zero rather than reporting a partial
+            # migration as done.
+            if summary['enumeration_incomplete']:
+                item['disposition'] = 'UNRESOLVED'
         collection_items.append(item)
 
     # --- 3. Guarded junk-key deletion (JUNK_KEYS + emptied siblings) --------
