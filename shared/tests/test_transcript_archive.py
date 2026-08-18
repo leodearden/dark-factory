@@ -649,6 +649,126 @@ class TestArchiveBeforeDeleteHoldsOnlyTheTranscript:
         assert (config_dir / 'projects').is_dir()
 
 
+class TestArchiveBeforeDeleteCrossDevice:
+    """PRD §9 Q4: the rename fast path is a deployment property, not a promise.
+
+    ``os.rename`` only works within one filesystem. On this host the config dir
+    (under ``<project_root>/.worktrees``) and the archive root (under
+    ``<project_root>/data/orchestrator``) are measurably on the SAME device, so
+    the fast path is the live route and ``EXDEV`` is unreachable here. But a
+    Linux ``st_dev`` is an ephemeral mount handle, not a stable identifier, and
+    an operator is free to mount either path elsewhere — so the cross-device
+    case is HANDLED rather than assumed. These tests are the only thing that
+    keeps that branch honest, since production never exercises it.
+
+    Deliberately no assertion on any device-id LITERAL: the invariant is that
+    the two paths agree with EACH OTHER, and a recorded number would go stale
+    across the next remount and make a healthy host look broken.
+    """
+
+    @staticmethod
+    def _rename_is_cross_device(monkeypatch):
+        monkeypatch.setattr(
+            transcript_archive_module.os,
+            'rename',
+            lambda *a, **kw: (_ for _ in ()).throw(
+                OSError(errno.EXDEV, 'Invalid cross-device link')
+            ),
+        )
+
+    def test_exdev_falls_back_to_copy_then_unlinks_the_source(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        sid = 'sess-xdev'
+
+        payload = b'{"line":1}\n{"line":2}\n'
+        src = _write(config_dir / 'projects' / ENC / f'{sid}.jsonl', payload)
+        os.utime(src, (1_600_000_000, 1_600_000_000))
+        src_mtime = src.stat().st_mtime
+
+        self._rename_is_cross_device(monkeypatch)
+        transcript_archive_module._reset_archival_failures()
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        dest = root / task_id / ENC / f'{sid}.jsonl'
+        # (a) The transcript is durable, with the SOURCE mtime mirrored onto
+        # it. The copy path needs an explicit os.utime for that where the
+        # rename got it free — and without it the already-current skip would
+        # never fire, so every later pass would re-archive forever and
+        # gc_agent_transcripts would read a permanently reset retention age.
+        assert dest.read_bytes() == payload
+        assert int(dest.stat().st_mtime) == int(src_mtime)
+
+        # (b) A cross-device host still gets deletion-AFTER-archival, not an
+        # unbounded hold: the whole point is that the copy licenses the delete.
+        assert not src.exists()
+
+        # (c) Nothing held, dir gone — outwardly indistinguishable from the
+        # rename path, which is what makes the fallback a real fallback.
+        assert outcome.archived == 1
+        assert outcome.held == ()
+        assert outcome.config_dir_removed is True
+        assert not config_dir.exists()
+
+        # (d) EXDEV is a handled ROUTE, not a failure. A counter that climbed
+        # here would page an operator on every archive on a two-mount host.
+        assert transcript_archive_module._archival_failures() == 0
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+        # (e) No staging debris left in the archive tree.
+        assert [p.name for p in root.rglob('*') if p.is_file()] == [dest.name]
+        assert not any(
+            p.name.endswith('.archive-tmp') for p in root.rglob('*')
+        )
+
+    def test_exdev_then_a_failing_copy_holds_the_transcript(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Both routes fail → hold, count once, publish nothing partial."""
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        sid = 'sess-xdev-dead'
+
+        src = _write(
+            config_dir / 'projects' / ENC / f'{sid}.jsonl',
+            b'{"line":1}\n{"line":2}\n{"line":3}\n',
+        )
+        self._rename_is_cross_device(monkeypatch)
+        # The realistic shape: bytes land, THEN the write fails. A mock that
+        # raised before writing anything would pass against an in-place copy
+        # too and prove nothing about where the partial bytes went.
+        TestBestEffortLoud._copyfile_dies_part_way(monkeypatch, b'{"line":1}\n{"li')
+
+        transcript_archive_module._reset_archival_failures()
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        assert outcome.archived == 0
+        assert outcome.held == (src,)
+        assert outcome.config_dir_removed is False
+        assert src.read_bytes() == b'{"line":1}\n{"line":2}\n{"line":3}\n'
+
+        # Nothing partial published at the canonical path, and no staging
+        # debris — the fallback inherits _archive_one's staged-write property.
+        dest = root / task_id / ENC / f'{sid}.jsonl'
+        assert not dest.exists()
+        assert [p for p in root.rglob('*') if p.is_file()] == []
+
+        # Counted ONCE: the EXDEV retry must not double-count one file.
+        assert transcript_archive_module._archival_failures() == 1
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].errno == errno.ENOSPC
+        assert warnings[0].path == str(src)
+
+
 class TestDurableArchivePathLookup:
     """B1/B2/B4 — the read side: locate one session's archived transcript.
 
