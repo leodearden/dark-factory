@@ -659,6 +659,42 @@ async def _census_count(graph, cypher: str, params: dict | None = None) -> int |
         return None
 
 
+_SKIP_PLACEHOLDER = '{skip}'
+_LIMIT_PLACEHOLDER = '{limit}'
+
+
+def _render_page_bounds(page_template: str, *, skip: int, limit: int) -> str:
+    """Substitute the two SKIP/LIMIT placeholders, leaving every other brace alone.
+
+    Deliberately NOT ``str.format``.  Cypher map patterns carry literal braces
+    — ``MATCH (n:Entity {name: $name})``, a shape several other queries in this
+    file already use — and ``str.format`` raises ``KeyError``/``ValueError`` on
+    one of those BEFORE any query is issued, from a traceback that points at a
+    formatting call rather than at the offending template.  Since more reads
+    are meant to be routed through this primitive, that trap would be one map
+    literal away for the next author, and it would need a brace-doubling
+    convention nobody has to remember here.  Two literal replacements have no
+    such failure mode.
+
+    Both placeholders are REQUIRED.  A template missing ``{skip}`` would
+    re-fetch the same offset every iteration until ``max_pages``, then report
+    a page-cap shortfall — a real authoring bug wearing the costume of a
+    server truncation.  Raising is how it stays legible.
+
+    Bounds are coerced to ``int`` before substitution, so nothing but a
+    validated integer this module computed can reach the Cypher text.
+    """
+    for placeholder in (_SKIP_PLACEHOLDER, _LIMIT_PLACEHOLDER):
+        if placeholder not in page_template:
+            raise ValueError(
+                f'page_template is missing the {placeholder} placeholder, so '
+                f'its pages could never advance: {page_template!r}'
+            )
+    return page_template.replace(_SKIP_PLACEHOLDER, str(int(skip))).replace(
+        _LIMIT_PLACEHOLDER, str(int(limit))
+    )
+
+
 async def _paged_ro_query(
     graph,
     page_template: str,
@@ -682,11 +718,14 @@ async def _paged_ro_query(
     page 1 never returned (silently dropped, permanently) or re-return rows it
     did (harmlessly deduped, which is what makes the drop so easy to miss).
 
-    SKIP/LIMIT bounds are formatted as validated ints rather than bound as
+    SKIP/LIMIT bounds are substituted as validated ints rather than bound as
     ``$`` parameters: parameterised SKIP/LIMIT is not portable across Cypher
     implementations, and these are integers this module computes, never caller
-    data, so there is no injection surface.  They are coerced to int before
-    formatting so a non-int can never reach the template.
+    data, so there is no injection surface.  Substitution goes through
+    ``_render_page_bounds``, which replaces the two placeholders LITERALLY
+    rather than running ``str.format`` over the whole template — so a template
+    containing a Cypher map pattern (``{name: $name}``) is safe, and no
+    brace-doubling convention has to be remembered.  See that helper.
 
     The read fails CLOSED on four independent paths, each logging a WARNING
     that names the numbers as structured facts rather than prose:
@@ -746,7 +785,9 @@ async def _paged_ro_query(
 
     Args:
         graph: FalkorDB graph handle exposing ``async ro_query(cypher, params)``.
-        page_template: Page query with ``{skip}``/``{limit}`` placeholders.
+        page_template: Page query with ``{skip}``/``{limit}`` placeholders,
+            both required. Other braces are left untouched (see
+            ``_render_page_bounds``); no escaping is needed.
         census_cypher: Single-row ``count(*)`` over the identical MATCH/WHERE.
         params: Optional bound parameters, passed to every query.
         page_size: Rows per page. Must stay strictly below ``resultset_size``.
@@ -806,7 +847,7 @@ async def _paged_ro_query(
     skip = 0
     paged_to_the_end = False
     for _ in range(max_pages):
-        page_cypher = page_template.format(skip=int(skip), limit=int(page_size))
+        page_cypher = _render_page_bounds(page_template, skip=skip, limit=page_size)
         result = await graph.ro_query(page_cypher, params)
         page = list(getattr(result, 'result_set', None) or [])
         rows.extend(page)
@@ -858,6 +899,64 @@ async def _paged_ro_query(
         reason=reason,
         incomplete_kind=kind,
     )
+
+
+def _apply_incompleteness_policy(
+    paged: PagedRead,
+    *,
+    method: str,
+    group_id: str,
+    returned_count: int,
+    noun: str,
+    consequence: str,
+) -> None:
+    """Apply the SPLIT incompleteness policy to a shim's PagedRead.
+
+    ONE implementation, shared by every back-compat shim over
+    ``_paged_ro_query``, because the policy is a single decision and not a
+    per-method opinion: copies drift, and the drift would be silent in exactly
+    the direction that matters — a shim that forgot to raise returns a
+    fabricated empty and the write-back path blanks summaries with it.  It is
+    also the single seam the follow-up ticket
+    (tkt_0RSJP8CH1M9GAAJTABV8FZB4AH, wire the completeness signal through to
+    consumers) has to move when the policy migrates to the consumer.
+
+      STRUCTURAL (``INCOMPLETE_STRUCTURAL_KINDS``) -> raise
+      ``IncompleteEnumerationError``.  Deterministic, non-transient, and
+      unreachable at the shipped defaults, so a raise here cannot flap.
+
+      EMPIRICAL (census unavailable, or a short read) -> WARN naming the
+      numbers and return what was fetched.  Transient-capable on a graph
+      under continuous write; raising would take the live rebuild down for
+      something that self-heals next cycle.
+
+    Args:
+        paged: The PagedRead the enumeration returned.
+        method: Shim name, for the message an operator reads.
+        group_id: Graph the read targeted.
+        returned_count: Size of the collection the shim would return.
+        noun: What ``returned_count`` counts, e.g. ``'entities'``/``'nodes'``.
+        consequence: Method-specific clause naming what must NOT be done with
+            a structurally incomplete result, appended to the raise message.
+
+    Raises:
+        IncompleteEnumerationError: ``paged`` is structurally incomplete.
+    """
+    if paged.incomplete_kind in INCOMPLETE_STRUCTURAL_KINDS:
+        raise IncompleteEnumerationError(
+            f'{method}(group_id={group_id!r}): the enumeration was '
+            f'structurally incomplete '
+            f'(incomplete_kind={paged.incomplete_kind!r}), so the '
+            f'{returned_count} {noun} it would have returned are not an '
+            f'answer and {consequence}. {paged.reason}'
+        )
+    if not paged.complete:
+        logger.warning(
+            '%s(group_id=%r): enumeration INCOMPLETE — returning %d rows as '
+            '%d %s, but %s. rows_seen=%s expected_rows=%s',
+            method, group_id, paged.rows_seen, returned_count, noun,
+            paged.reason, paged.rows_seen, paged.expected_rows,
+        )
 
 
 def _as_sortable_utc(created_at: datetime | None) -> datetime:
@@ -2182,22 +2281,14 @@ class GraphitiBackend:
             Halving buys margin, not correctness.
         """
         grouped, paged = await self.enumerate_all_valid_edges(group_id=group_id)
-        if paged.incomplete_kind in INCOMPLETE_STRUCTURAL_KINDS:
-            raise IncompleteEnumerationError(
-                f'get_all_valid_edges(group_id={group_id!r}): the enumeration '
-                f'was structurally incomplete '
-                f'(incomplete_kind={paged.incomplete_kind!r}), so the '
-                f'{len(grouped)} entities it would have returned are not an '
-                f'answer and must not be written back. {paged.reason}'
-            )
-        if not paged.complete:
-            logger.warning(
-                'get_all_valid_edges(group_id=%r): enumeration INCOMPLETE — '
-                'returning %d rows grouped into %d entities, but %s. '
-                'rows_seen=%s expected_rows=%s',
-                group_id, paged.rows_seen, len(grouped), paged.reason,
-                paged.rows_seen, paged.expected_rows,
-            )
+        _apply_incompleteness_policy(
+            paged,
+            method='get_all_valid_edges',
+            group_id=group_id,
+            returned_count=len(grouped),
+            noun='entities',
+            consequence='must not be written back',
+        )
         return grouped
 
     @_canonicalize_group_args
@@ -3456,10 +3547,16 @@ class GraphitiBackend:
             page_size: Rows per page. Must stay strictly below the server's
                 result-set cap — see _paged_ro_query.
 
+        Rows are deduplicated on ``n.uuid`` across ALL pages — see the loop
+        body for why paging makes that necessary where a single query never
+        did.
+
         Returns:
             (nodes, paged) where *nodes* is the same list list_entity_nodes
             returns and *paged* is the PagedRead carrying
-            ``complete``/``rows_seen``/``expected_rows``/``reason``.
+            ``complete``/``rows_seen``/``expected_rows``/``reason``.  Note that
+            ``paged.rows_seen`` counts ROWS FETCHED, so it can exceed
+            ``len(nodes)`` when a boundary row was re-emitted.
         """
         graph = self._graph_for(group_id)
         paged = await _paged_ro_query(
@@ -3468,14 +3565,38 @@ class GraphitiBackend:
             _ENTITY_NODES_CENSUS,
             page_size=page_size,
         )
-        nodes = [
-            {
-                'uuid': row[0],
+        # Dedup on n.uuid, built ONCE across every page — mirroring the
+        # (n.uuid, e.uuid) map in enumerate_all_valid_edges, and necessary for
+        # the same reason: this is a hazard PAGING INTRODUCED, not one it
+        # inherited.  Each page is a separate query against a graph under
+        # concurrent write, so an Entity inserted with a uuid sorting BEFORE
+        # the current offset shifts every later row up by one and the next
+        # page's SKIP re-returns the previous page's last row.  A single
+        # unpaginated query could never return a uuid twice, so every consumer
+        # is entitled to assume it cannot happen — and the ones downstream do:
+        # detect_stale_with_edges reports one stale entry per element and uses
+        # len(entities) as its total_count denominator, and
+        # rebuild_entity_summaries would schedule two concurrent writers for
+        # the repeated node.
+        seen: set[str] = set()
+        nodes: list[dict] = []
+        for row in paged.rows:
+            uuid = row[0]
+            if uuid in seen:
+                logger.debug(
+                    'enumerate_entity_nodes: node uuid %r seen on more than '
+                    'one page — most likely a row re-emitted across a '
+                    'SKIP/LIMIT boundary by a concurrent insert; keeping '
+                    'first-seen row',
+                    uuid,
+                )
+                continue
+            seen.add(uuid)
+            nodes.append({
+                'uuid': uuid,
                 'name': row[1] or '',
                 'summary': row[2] or '',
-            }
-            for row in paged.rows
-        ]
+            })
         return nodes, paged
 
     @_canonicalize_group_args
@@ -3524,22 +3645,14 @@ class GraphitiBackend:
                 structurally incomplete.
         """
         nodes, paged = await self.enumerate_entity_nodes(group_id=group_id)
-        if paged.incomplete_kind in INCOMPLETE_STRUCTURAL_KINDS:
-            raise IncompleteEnumerationError(
-                f'list_entity_nodes(group_id={group_id!r}): the enumeration '
-                f'was structurally incomplete '
-                f'(incomplete_kind={paged.incomplete_kind!r}), so the '
-                f'{len(nodes)} nodes it would have returned are not an answer '
-                f'and must not drive a staleness verdict or a summary '
-                f'rewrite. {paged.reason}'
-            )
-        if not paged.complete:
-            logger.warning(
-                'list_entity_nodes(group_id=%r): enumeration INCOMPLETE — '
-                'returning %d nodes, but %s. rows_seen=%s expected_rows=%s',
-                group_id, len(nodes), paged.reason,
-                paged.rows_seen, paged.expected_rows,
-            )
+        _apply_incompleteness_policy(
+            paged,
+            method='list_entity_nodes',
+            group_id=group_id,
+            returned_count=len(nodes),
+            noun='nodes',
+            consequence='must not drive a staleness verdict or a summary rewrite',
+        )
         return nodes
 
     @_canonicalize_group_args

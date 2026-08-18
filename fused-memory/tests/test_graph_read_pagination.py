@@ -248,6 +248,64 @@ class TestPagedRoQueryHappyPath:
         assert paged.rows[-1] == graph.corpus[-1]
 
 
+class TestPageBoundSubstitution:
+    """``_render_page_bounds``: the two placeholders, and nothing else.
+
+    Cypher map patterns carry literal braces — ``MATCH (n:Entity {name:
+    $name})``, a shape several other queries in graphiti_client.py already use
+    — so a ``str.format``-based substitution would raise before any query was
+    issued, from a traceback pointing at the formatter rather than at the
+    template. More reads are meant to be routed through this primitive, which
+    puts the next author one map literal away from that.
+    """
+
+    def test_literal_cypher_braces_survive_substitution(self):
+        from fused_memory.backends.graphiti_client import _render_page_bounds
+
+        template = (
+            'MATCH (n:Entity {name: $name}) RETURN n.uuid '
+            'ORDER BY n.uuid SKIP {skip} LIMIT {limit}'
+        )
+        rendered = _render_page_bounds(template, skip=5000, limit=5000)
+        assert rendered.endswith('SKIP 5000 LIMIT 5000')
+        assert '{name: $name}' in rendered   # untouched, not escaped away
+
+    @pytest.mark.asyncio
+    async def test_a_template_with_a_map_pattern_pages_normally(self):
+        """End to end: the brace-carrying template really does enumerate."""
+        from fused_memory.backends.graphiti_client import _paged_ro_query
+
+        template = (
+            'MATCH (n:Entity {group: $group})-[e:RELATES_TO]-() '
+            'RETURN n.uuid, e.uuid, e.fact, e.name '
+            'ORDER BY e.uuid, n.uuid SKIP {skip} LIMIT {limit}'
+        )
+        graph = FakeCappedGraph(make_edge_corpus(100), resultset_cap=None)
+        paged = await _paged_ro_query(
+            graph, template, _CENSUS_CYPHER, params={'group': 'g'}, page_size=40
+        )
+        assert paged.complete is True
+        assert paged.rows_seen == 100
+
+    @pytest.mark.parametrize('missing', ['{skip}', '{limit}'])
+    def test_a_missing_placeholder_is_an_authoring_error(self, missing):
+        """Not silently tolerated: without ``{skip}`` the pages never advance.
+
+        The same offset would be re-fetched until ``max_pages``, then reported
+        as a page-cap shortfall — an authoring bug wearing the costume of a
+        server truncation, which is the one diagnosis this module exists to
+        make trustworthy.
+        """
+        from fused_memory.backends.graphiti_client import _render_page_bounds
+
+        template = (
+            'MATCH (n:Entity) RETURN n.uuid ORDER BY n.uuid '
+            'SKIP {skip} LIMIT {limit}'
+        ).replace(missing, '0')
+        with pytest.raises(ValueError, match=re.escape(missing)):
+            _render_page_bounds(template, skip=0, limit=10)
+
+
 # ---------------------------------------------------------------------------
 # step-3: the four independent fail-closed completeness paths
 # ---------------------------------------------------------------------------
@@ -982,6 +1040,56 @@ class TestListEntityNodesPagination:
         nodes = await backend.list_entity_nodes(group_id='test')
         assert nodes == [{'uuid': 'u1', 'name': '', 'summary': ''}]
 
+    @pytest.mark.asyncio
+    async def test_dedup_spans_pages(self, mock_config, make_backend):
+        """A uuid re-emitted across a page boundary collapses to ONE node.
+
+        The node-path analogue of test_dedup_map_spans_pages, and a failure
+        mode PAGING INTRODUCED rather than one it inherited: a single
+        unpaginated query can never return the same n.uuid twice, so every
+        consumer downstream is entitled to assume it cannot happen. Under
+        SKIP/LIMIT paging over a graph being written to, an Entity inserted
+        with a uuid sorting before the current offset shifts every later row
+        up by one and the next page's SKIP re-returns the previous page's last
+        row — modelled here directly as a repeated row.
+        """
+        backend = make_backend(mock_config)
+        corpus = [
+            ['u1', 'n1', 's1'],
+            ['u2', 'n2', 's2'],
+            ['u1', 'n1', 's1'],   # page 2 — the boundary row, re-emitted
+            ['u3', 'n3', 's3'],
+        ]
+        _wire(backend, FakeCappedGraph(corpus, resultset_cap=None))
+        nodes, paged = await backend.enumerate_entity_nodes(
+            group_id='test', page_size=2
+        )
+        assert paged.rows_seen == 4          # every row really was fetched...
+        assert [n['uuid'] for n in nodes] == ['u1', 'u2', 'u3']   # ...and deduped
+        assert paged.complete is True
+
+    @pytest.mark.asyncio
+    async def test_repeated_boundary_row_does_not_inflate_the_stale_denominator(
+        self, mock_config, make_backend
+    ):
+        """The CONSEQUENCE of the dedup above, pinned where it actually bites.
+
+        detect_stale_with_edges reports one entry per element of the node list
+        and uses ``len(entities)`` as its ``total_count`` denominator, so a
+        duplicated uuid would both double-report the entity and inflate the
+        denominator the pagination fix exists to make trustworthy.
+        """
+        backend = make_backend(mock_config)
+        node_rows = [
+            ['u1', 'n1', 'summary-1'],
+            ['u2', 'n2', 'summary-2'],
+            ['u1', 'n1', 'summary-1'],   # the re-emitted boundary row
+        ]
+        _wire(backend, FakeCappedGraph(node_rows, resultset_cap=None))
+        nodes = await backend.list_entity_nodes(group_id='test')
+        assert len(nodes) == 2
+        assert len({n['uuid'] for n in nodes}) == 2
+
 
 class TestListEntityNodesEmittedCypher:
     """The node page query keeps its shape and gains a total order."""
@@ -1100,7 +1208,22 @@ class TestIncompleteEnumerationErrorType:
         from fused_memory.backends.graphiti_client import IncompleteEnumerationError
 
         assert issubclass(IncompleteEnumerationError, Exception)
-        assert not issubclass(BaseException, IncompleteEnumerationError)
+        # Behavioural, not structural: `except Exception` is literally the
+        # clause both sweeps are written with, so exercise THAT rather than
+        # re-asserting the subclass relation a second way. (The obvious
+        # `assert not issubclass(BaseException, IncompleteEnumerationError)`
+        # is a TAUTOLOGY — BaseException is not a subclass of any
+        # user-defined exception, so it holds for every possible definition
+        # of the class and can never fail.)
+        caught = False
+        try:
+            raise IncompleteEnumerationError('structurally incomplete')
+        except Exception:  # noqa: BLE001 - the sweeps' actual handler shape
+            caught = True
+        assert caught, (
+            'a bare `except Exception:` must catch it — that is the clause '
+            'both reconciliation sweeps use'
+        )
 
 
 class TestShimsRaiseOnStructuralIncompleteness:
