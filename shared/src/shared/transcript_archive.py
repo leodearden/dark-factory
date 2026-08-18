@@ -55,8 +55,10 @@ import errno
 import logging
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,19 @@ _ARCHIVAL_FAILURES: int = 0
 # transcript lookalike, and the next archival of the same session rewrites it.
 _STAGING_SUFFIX = '.archive-tmp'
 
+# The single notification seam onto the counter above. _record_failure is the
+# one funnel BOTH producers (archive_task_transcripts' copy, and
+# archive_before_delete's move) already pass through, so hanging one hook there
+# reaches every archival failure with no second counter and no per-producer
+# callback that could drift out of step with the first.
+#
+# It stays a bare mechanism deliberately. The POLICY that consumes it — a rate
+# threshold, a window, an escalation — needs the live orchestrator config to
+# honour a hot reload, and this module is on the PURE_STDLIB_LEAVES contract
+# (shared/tests/test_pure_stdlib_leaves.py), so the policy lives in the
+# consumer (Harness) and only the notification lives here.
+_ON_ARCHIVAL_FAILURE: Callable[[dict[str, Any]], None] | None = None
+
 
 def _archival_failures() -> int:
     """Return the current module-level archival failure count (test aid)."""
@@ -87,9 +102,41 @@ def _archival_failures() -> int:
 
 
 def _reset_archival_failures() -> None:
-    """Reset the module-level archival failure count (test isolation)."""
-    global _ARCHIVAL_FAILURES
+    """Reset the module-level archival failure count (test isolation).
+
+    Clears the installed failure hook too. Both are process-global state that a
+    test can leave behind, and this is the one call every test in the suite
+    already makes for isolation — resetting only half of it would let one
+    test's callback be fed another test's failures.
+    """
+    global _ARCHIVAL_FAILURES, _ON_ARCHIVAL_FAILURE
     _ARCHIVAL_FAILURES = 0
+    _ON_ARCHIVAL_FAILURE = None
+
+
+def set_archival_failure_hook(
+    hook: Callable[[dict[str, Any]], None] | None,
+) -> None:
+    """Install (or with ``None``, remove) the archival-failure notification.
+
+    *hook* is invoked once per failed file with the same structured payload the
+    WARNING carries — ``{'task_id': ..., 'path': ..., 'errno': ...}`` — so a
+    consumer sees exactly what an operator greps for, and the log line and the
+    machine-readable signal cannot disagree.
+
+    This is the seam the α task described as owned-but-not-yet-consumed:
+    ``_ARCHIVAL_FAILURES`` is substrate a consumer must poll, which is no use
+    to something that needs to react to a BURST. The consumer arrives in
+    ``Harness``, which applies a live-configured rate threshold and files one
+    deduped escalation per window.
+
+    Contract: a hook that raises is swallowed and logged, never propagated —
+    see :func:`_record_failure`. One hook at a time, last install wins; the
+    seam has exactly one consumer by design, and a list would invite the
+    fan-out this module has no reason to own.
+    """
+    global _ON_ARCHIVAL_FAILURE
+    _ON_ARCHIVAL_FAILURE = hook
 
 
 def _record_failure(
@@ -115,17 +162,36 @@ def _record_failure(
     """
     global _ARCHIVAL_FAILURES
     _ARCHIVAL_FAILURES += 1
+    payload = {
+        'path': str(src),
+        'task_id': task_id,
+        'errno': getattr(exc, 'errno', None),
+    }
     logger.warning(
         'transcript_archive: %s %s: %s',
         detail,
         src,
         exc,
-        extra={
-            'path': str(src),
-            'task_id': task_id,
-            'errno': getattr(exc, 'errno', None),
-        },
+        extra=payload,
     )
+    if _ON_ARCHIVAL_FAILURE is None:
+        return
+    try:
+        _ON_ARCHIVAL_FAILURE(payload)
+    except Exception as hook_exc:
+        # A broken consumer must not become an archival outage. _record_failure
+        # runs inside a function whose contract is totality — called from
+        # ``finally`` blocks and teardown paths that may already be unwinding —
+        # so letting the hook's exception escape would turn "the consumer has a
+        # bug" into "teardown raises", strictly worse than the failure being
+        # reported. Loud, not silent: its own WARNING, and the original failure
+        # is already counted above where the hook cannot suppress it.
+        logger.warning(
+            'transcript_archive: archival-failure hook raised for %s: %s',
+            src,
+            hook_exc,
+            extra=payload,
+        )
 
 
 def _discard_staging(staging: Path) -> None:
