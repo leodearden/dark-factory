@@ -2503,6 +2503,22 @@ class TestStage2CycleSummaryHarnessBackstop:
         assert isinstance(err, dict)
         assert err['stage2_cycle_summary_backstop_written'] is True
 
+    @staticmethod
+    def _assert_authoritative_row_intact(record) -> dict:
+        """Shared survival assertions for 'the degraded arm must never
+        clobber an existing authoritative row' — reused by the plain
+        never-clobbers test below and by the second-cancellation skip test
+        further down, which must exercise the identical criteria."""
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        assert payload['llm_calls'] == 9 and payload['tokens_used'] == 900, (
+            'the degraded arm must never overwrite an authoritative row with zeros'
+        )
+        assert 'stage2_cycle_summary_degraded_backstop' not in payload['stats'], (
+            'the pre-existing honest row must survive unstamped'
+        )
+        return payload
+
     @pytest.mark.asyncio
     async def test_degraded_arm_never_clobbers_an_existing_authoritative_row(
         self, journal, event_buffer, mock_memory_service, ledger_store
@@ -2541,14 +2557,7 @@ class TestStage2CycleSummaryHarnessBackstop:
             'test-project', 'cycle_summary',
             flag_type='task_knowledge_sync', run_id=run.id,
         )
-        assert record is not None
-        payload = json.loads(record.payload_json)
-        assert payload['llm_calls'] == 9 and payload['tokens_used'] == 900, (
-            'the degraded arm must never overwrite an authoritative row with zeros'
-        )
-        assert 'stage2_cycle_summary_degraded_backstop' not in payload['stats'], (
-            'the pre-existing honest row must survive unstamped'
-        )
+        self._assert_authoritative_row_intact(record)
         assert run.stage_reports.get('_error') is None
 
     # -- ordering: the clobber-guard read must not outrun the shield --------
@@ -2559,6 +2568,67 @@ class TestStage2CycleSummaryHarnessBackstop:
     # read is in flight raises CancelledError before the write coroutine is
     # ever created — so no degraded row lands at all, silently, because the
     # caller swallows BaseException.
+
+    @staticmethod
+    async def _poll_until(predicate, *, attempts=200, interval=0.01):
+        """Poll an async zero-arg *predicate* (bounded: up to `attempts`
+        tries, `interval` seconds apart — a 2s ceiling at the defaults)
+        instead of a fixed sleep. The common case resolves as soon as the
+        awaited signal is observed, and a loaded CI box gets real headroom
+        instead of a fixed sleep timing out and misreporting itself as the
+        very ordering regression these tests exist to catch. Returns the
+        last predicate result (truthy on success, falsy if every attempt
+        was exhausted)."""
+        result = await predicate()
+        for _ in range(attempts):
+            if result:
+                return result
+            await asyncio.sleep(interval)
+            result = await predicate()
+        return result
+
+    @staticmethod
+    async def _drive_degraded_arm_cancelling_first_identity_read(
+        harness, run, run_id, project_id, anchor, ledger_store,
+    ) -> bool:
+        """Run the degraded arm inside asyncio.create_task with
+        ledger_store.get_by_identity patched so its FIRST call cancels the
+        driving task and yields once before delegating to the real
+        implementation — simulating a SECOND cancellation arriving while
+        the clobber-guard identity read is in flight (mirrors the
+        outer_task_ref / self-cancelling-mock rig in
+        test_cancellation_cleanup_shielded_from_second_cancel below).
+        Restores get_by_identity before returning.
+
+        Returns `injection_fired`: True iff the first-call injection
+        actually ran. Callers MUST assert this — otherwise no cancellation
+        was ever delivered and the rest of the test silently exercises a
+        healthy task rather than the ordering invariant it exists to
+        cover.
+        """
+        outer_task_ref: list = [None]
+        original_get_by_identity = ledger_store.get_by_identity
+        first_call = [True]
+
+        async def self_cancelling_get_by_identity(*args, **kwargs):
+            if first_call[0]:
+                first_call[0] = False
+                outer_task_ref[0].cancel()
+                await asyncio.sleep(0)
+            return await original_get_by_identity(*args, **kwargs)
+
+        ledger_store.get_by_identity = self_cancelling_get_by_identity
+
+        outer_task = asyncio.create_task(
+            harness._ensure_stage2_cycle_summary(run, run_id, project_id, anchor)
+        )
+        outer_task_ref[0] = outer_task
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await outer_task
+
+        ledger_store.get_by_identity = original_get_by_identity
+        return not first_call[0]
 
     @pytest.mark.asyncio
     async def test_degraded_arm_lands_its_row_despite_a_second_cancellation_during_the_identity_read(
@@ -2576,35 +2646,22 @@ class TestStage2CycleSummaryHarnessBackstop:
         run = self._run_with_stage2_entry({'items_flagged': []})
         anchor = datetime.now(UTC)
 
-        outer_task_ref: list = [None]
-        original_get_by_identity = ledger_store.get_by_identity
-        first_call = [True]
-
-        async def self_cancelling_get_by_identity(*args, **kwargs):
-            if first_call[0]:
-                first_call[0] = False
-                outer_task_ref[0].cancel()
-                await asyncio.sleep(0)
-            return await original_get_by_identity(*args, **kwargs)
-
-        ledger_store.get_by_identity = self_cancelling_get_by_identity
-
-        outer_task = asyncio.create_task(
-            harness._ensure_stage2_cycle_summary(run, run.id, 'test-project', anchor)
+        injection_fired = await self._drive_degraded_arm_cancelling_first_identity_read(
+            harness, run, run.id, 'test-project', anchor, ledger_store,
         )
-        outer_task_ref[0] = outer_task
+        assert injection_fired, (
+            'the clobber-guard read never ran — this test no longer '
+            'exercises the cancellation ordering'
+        )
 
-        with contextlib.suppress(asyncio.CancelledError):
-            await outer_task
+        async def _read_degraded_row():
+            return await ledger_store.get_by_identity(
+                'test-project', 'cycle_summary',
+                flag_type='task_knowledge_sync', run_id=run.id,
+            )
 
         # Give any shield-wrapped inner Task time to complete the write.
-        await asyncio.sleep(0.1)
-        ledger_store.get_by_identity = original_get_by_identity
-
-        record = await ledger_store.get_by_identity(
-            'test-project', 'cycle_summary',
-            flag_type='task_knowledge_sync', run_id=run.id,
-        )
+        record = await self._poll_until(_read_degraded_row)
         assert record is not None, (
             'the clobber-guard identity read must not run ahead of the '
             'shield — the shield exists precisely to guarantee this row '
@@ -2647,49 +2704,35 @@ class TestStage2CycleSummaryHarnessBackstop:
         )
         assert written is True
 
-        outer_task_ref: list = [None]
-        original_get_by_identity = ledger_store.get_by_identity
-        first_call = [True]
-
-        async def self_cancelling_get_by_identity(*args, **kwargs):
-            if first_call[0]:
-                first_call[0] = False
-                outer_task_ref[0].cancel()
-                await asyncio.sleep(0)
-            return await original_get_by_identity(*args, **kwargs)
-
-        ledger_store.get_by_identity = self_cancelling_get_by_identity
-
         with patch(
             'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
             AsyncMock(return_value=True),
         ) as mock_write:
-            outer_task = asyncio.create_task(
-                harness._ensure_stage2_cycle_summary(run, run.id, 'test-project', anchor)
+            injection_fired = await self._drive_degraded_arm_cancelling_first_identity_read(
+                harness, run, run.id, 'test-project', anchor, ledger_store,
             )
-            outer_task_ref[0] = outer_task
 
-            with contextlib.suppress(asyncio.CancelledError):
-                await outer_task
+            async def _write_invoked():
+                return mock_write.await_count > 0
 
-            # Give any shield-wrapped inner Task time to complete.
-            await asyncio.sleep(0.1)
+            # Give any shield-wrapped inner Task time to complete. Unlike
+            # the sibling test above, the passing case never satisfies this
+            # predicate — polling still buys an early exit if a regression
+            # makes the closure call the writer, so that surfaces fast
+            # instead of relying solely on the row-content check below.
+            await self._poll_until(_write_invoked, attempts=20, interval=0.01)
 
-        ledger_store.get_by_identity = original_get_by_identity
+        assert injection_fired, (
+            'the clobber-guard read never ran — this test no longer '
+            'exercises the cancellation ordering'
+        )
         mock_write.assert_not_awaited()
 
         record = await ledger_store.get_by_identity(
             'test-project', 'cycle_summary',
             flag_type='task_knowledge_sync', run_id=run.id,
         )
-        assert record is not None
-        payload = json.loads(record.payload_json)
-        assert payload['llm_calls'] == 9 and payload['tokens_used'] == 900, (
-            'the degraded arm must never overwrite an authoritative row with zeros'
-        )
-        assert 'stage2_cycle_summary_degraded_backstop' not in payload['stats'], (
-            'the pre-existing honest row must survive unstamped'
-        )
+        self._assert_authoritative_row_intact(record)
 
 
 class TestStage2CycleSummaryRemediationBackstop:
