@@ -30,9 +30,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import dashboard.data.active_tasks as active_tasks
-import dashboard.data.tasks as tasks
-
+from dashboard.data import active_tasks, tasks
 
 # The tightest real caller of /api/v2/dashboard/tasks is the dashboard's own
 # poll loop, whose fetch wrapper aborts at DEFAULT_TIMEOUT_MS. Parsed out of

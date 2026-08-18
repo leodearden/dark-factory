@@ -91,6 +91,55 @@ _TERMINAL_FETCH_WINDOW = 400
 _MAX_DONE_PER_PROJECT = 50
 _MAX_CANCELLED_PER_PROJECT = 50
 
+# --- Budget constants -------------------------------------------------------
+#
+# Written in the ``app._HEALTHZ_TOTAL_BUDGET`` / ``app._DB_PROBE_TIMEOUT``
+# idiom: a per-unit budget, a whole-handler budget, and an introspectable
+# roster of the units, so ``tests/test_tasks_budget.py`` can machine-check
+# that the parts fit the whole instead of a human re-deriving the arithmetic
+# every time one of them moves.
+
+# The MCP calls ``_shape_one_project`` issues for ONE project root. A named
+# tuple rather than a literal ``3`` deliberately: the invariant then tracks
+# reality, so adding a fourth per-project call without raising the budget
+# fails the structural test rather than silently overrunning in production.
+_PER_PROJECT_MCP_CALLS: tuple[str, ...] = (
+    'get_tasks[active]',
+    'get_statuses',
+    'get_tasks[terminal]',
+)
+
+# Whole-operation bound for ONE project root, enforced by ``asyncio.wait_for``
+# in ``collect_tasks_with_counts``.
+#
+# ``tasks.DEFAULT_PER_CALL_TIMEOUT`` (2.0) * 3 calls = 6.0 <= 7.0, leaving
+# 1.0 s of slack so this deadline is a real backstop for non-MCP overhead
+# (JSON decode, row shaping, event-loop scheduling) rather than coinciding
+# exactly with the sum of its parts — the same reasoning as healthz's
+# ``_DB_PROBE_TIMEOUT * 3 = 2.7 <= _HEALTHZ_TOTAL_BUDGET = 3.0``.
+#
+# What that sum does and does NOT claim: it bounds the sum of the
+# PER-HTTP-REQUEST budgets. It does NOT bound a cold MCP session, which
+# performs three posts (initialize, notifications/initialized, tools/call) and
+# so can reach ``3 * DEFAULT_PER_CALL_TIMEOUT`` for a SINGLE tool call. That
+# residual is exactly what this ``wait_for`` layer exists to cap: the two
+# layers are complementary, not redundant (the same two-layer note
+# ``dashboard/src/dashboard/data/task_runtime.py``'s module docstring carries).
+_TASKS_PER_PROJECT_BUDGET = 7.0
+
+# Whole-handler deadline for the entire multi-project aggregation.
+#
+# Strictly below ``data.js``'s 30 000 ms fetch abort with 10 s of headroom for
+# HTTP and JSON serialisation, so the PARTIAL payload the deadline produces is
+# actually deliverable to the browser that asked for it. It replaces a
+# structural worst case of roughly ``roots * 3 posts * 10 s`` with no cap at
+# all.
+#
+# Raising any one of these three constants requires re-checking the others —
+# they are mutually constrained, and ``test_tasks_budget.py`` enforces that.
+# None of them may be raised toward ``memory.mcp_tool_call``'s 10 s default.
+_TASKS_TOTAL_BUDGET = 20.0
+
 # Defensive-visibility threshold: the live-PRD terminal-member exemption (see
 # _shape_one_project) never drops rows — "all live members" is the contract,
 # not "up to N" — but a PRD with an unusually large number of live done/
