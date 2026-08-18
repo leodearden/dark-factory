@@ -15,70 +15,31 @@
 // what it actually owns. Renamed in the task-4361 amendment pass; the browser
 // global moved with it, DF_TASK_STRAND_BADGE -> DF_TASK_ROW_CELLS.
 //
-// This is a plain-JS module: no JSX, no Babel. It is loaded two ways:
-//   - In the browser, via a classic `<script src="/static/redux/task_row_cells.js">`
-//     tag (like task_status_counts.js), which assigns `window.DF_TASK_ROW_CELLS`.
-//   - In node (no package.json in this repo, so this file resolves as
-//     CommonJS), via `require`/`import` for the `node --test` suite under
-//     dashboard/tests/js/.
+// Dual-loaded: a browser classic `<script>` assigns `window.DF_TASK_ROW_CELLS`,
+// node resolves the same file as CommonJS for `dashboard/tests/js/`. index.html
+// loads it before the Babel JSX tags, so the global exists before tab_tasks.jsx
+// and tabs.jsx run their top-level destructures of it.
 //
-// Both export paths are guarded so this file has no effect outside the
-// environment it's actually running in.
+// ── THE SHARED SUBSTRATE DECISION IS NOT RESTATED HERE ────────────────────
+// Why these helpers exist at all, why a DOM harness was considered and
+// REJECTED, why re-hardening the deleted greps is out of scope, and why no
+// module here reads a browser global: written out ONCE, in pins_recovery.js's
+// header (the block marked CANONICAL). Read it there before re-litigating any
+// of it. It is deliberately not copied into this file — three hand-copies of
+// one rationale drift, which is the hazard these modules exist to remove, and
+// which STRAND_TITLE below was extracted to fix in miniature.
 //
-// index.html loads this file (classic script, before the Babel JSX tags) so
-// `window.DF_TASK_ROW_CELLS` is defined before tab_tasks.jsx and tabs.jsx
-// execute their top-level destructures of it.
+// ── WHY THIS MODULE EXISTS (the stranded-badge specifics) ─────────────────
+// The block that covered THIS surface, test_tab_tasks_stranded_badge.py (187
+// lines), carried the shared defect plus one of its own: NEGATED regexes, which
+// passed vacuously when the feature was absent altogether. Delete the badge and
+// the assertions asking that it not be rendered wrongly all went green.
 //
-// ── WHY THIS MODULE EXISTS ────────────────────────────────────────────────
-// Commit 039e55c7ef deleted four JSX source-text meta-test blocks (task 3543)
-// because they asserted regexes and substrings over raw .jsx source fetched
-// over HTTP rather than over behaviour, and could not discriminate. The
-// decisive demonstration is on the sibling pins_recovery surface: a
-// whole-file substring grep is satisfied by a MENTION, so the explanatory
-// COMMENT at tab_escalation_analytics.jsx:414-419 alone satisfied
-// `'pins_recovery' in body` even with the render arm at :420-428 deleted. The
-// test could not fail for the one reason it existed. The stranded-badge file
-// (test_tab_tasks_stranded_badge.py, 187 lines) had the same defect plus
-// negated regexes that passed vacuously when the feature was absent
-// altogether.
-//
-// Deleting them was correct and left a real hole. This module closes the part
-// of it that can be closed: the render DECISION now lives in a pure function
-// with genuine behavioural coverage
-// (dashboard/tests/js/task_row_cells.test.mjs), so deleting a decision arm
-// fails a test instead of nothing.
-//
-// ── WHY NOT A DOM HARNESS (considered and rejected) ───────────────────────
-// jsdom or a headless browser would cover the JSX seam this extraction leaves
-// open, and was the first thing considered. It does not fit this repo:
-// there is no package.json, lockfile or tracked node_modules anywhere in git;
-// React 18.3.1 and @babel/standalone 7.29.0 are unpkg CDN tags with SRI
-// hashes, transpiled in-browser with no build step. The ABSENCE of a
-// package.json is load-bearing — it is exactly what makes these
-// static/redux/*.js files resolve as CommonJS for the existing node --test
-// suite, so adding one to host jsdom would break that resolution model. The
-// gate is `cd dashboard && uv run pytest tests/`, so a DOM harness would need
-// an install at gate time or a skip-when-deps-missing guard — and a test that
-// silently skips is the same "passes but does not discriminate" hole this
-// module exists to close, merely relocated. The settled precedent for this
-// trade is commit bea3edc34f, "GREEN — extract lockChipState helper, rewire
-// chips, drop meta-test" (scheduler_utils.jsx + test_lock_chip_state.py).
-//
-// ── WHAT IS OUT OF SCOPE ──────────────────────────────────────────────────
-// Re-hardening the deleted tests with tightened regexes or comment-stripped
-// source fixtures is explicitly out of scope, by the reviewer guidance that
-// motivated 039e55c7ef: hardening the greps deepens the same hole rather than
-// closing it. The residual gap — deleting the thin surviving JSX call site
-// still fails no test, because nothing in this repo renders JSX — is measured
-// rather than assumed (see the mutation-verification step of task 4361) and
-// is filed as a browser-harness follow-up. Do not "restore" the greps.
-//
-// Nothing here reads `window` or `document`: the shared-classic-script-scope
-// suite loads this file into a bare `vm.createContext({window:{}})`, and a
-// module that reached for browser globals would behave differently under test
-// than in the browser. For the same reason these functions return plain
-// render DESCRIPTORS rather than React elements — a module calling a global
-// `React` would violate that suite by construction.
+// That is now the other way round. The render DECISION lives in the pure
+// function below with behavioural coverage in
+// dashboard/tests/js/task_row_cells.test.mjs, so deleting a decision arm — or
+// keying the badge off `agent` instead of `stranded` — fails a named test
+// instead of nothing.
 
 // ── The one true strand tooltip ──
 // Exported once because all three render sites (tab_tasks.jsx renderNode,

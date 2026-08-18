@@ -6,21 +6,25 @@
 //   2. the "pinning" StatTile fed by the open-items reduction, in
 //      tab_escalations.jsx (pinningSummary).
 //
-// This is a plain-JS module: no JSX, no Babel. It is loaded two ways:
-//   - In the browser, via a classic `<script src="/static/redux/pins_recovery.js">`
-//     tag (like task_status_counts.js), which assigns `window.DF_PINS_RECOVERY`.
-//   - In node (no package.json in this repo, so this file resolves as
-//     CommonJS), via `require`/`import` for the `node --test` suite under
-//     dashboard/tests/js/.
+// Dual-loaded: a browser classic `<script>` assigns `window.DF_PINS_RECOVERY`,
+// node resolves the same file as CommonJS for `dashboard/tests/js/`. index.html
+// loads it before the Babel JSX tags, so the global exists before
+// tab_escalations.jsx and tab_escalation_analytics.jsx run their top-level
+// destructures of it.
 //
-// Both export paths are guarded so this file has no effect outside the
-// environment it's actually running in.
+// ═══════════════════════════════════════════════════════════════════════════
+// THE SHARED SUBSTRATE DECISION FOR ALL THREE task-4361 HELPERS — CANONICAL.
+// task_row_cells.js and burndown_bands.js point HERE rather than restating it.
 //
-// index.html loads this file (classic script, before the Babel JSX tags) so
-// `window.DF_PINS_RECOVERY` is defined before tab_escalations.jsx and
-// tab_escalation_analytics.jsx execute their top-level destructures of it.
+// It lived in all three headers verbatim at first. Three hand-copies of one
+// rationale is precisely the drift hazard these modules were created to remove
+// — STRAND_TITLE was extracted for exactly that reason — so a correction would
+// have landed in one file and silently diverged from the other two. This
+// surface is the anchor because it is the demonstration the whole argument
+// turns on; the other two headers cite it anyway.
+// ═══════════════════════════════════════════════════════════════════════════
 //
-// ── WHY THIS MODULE EXISTS ────────────────────────────────────────────────
+// ── (1) WHY THESE MODULES EXIST ───────────────────────────────────────────
 // Commit 039e55c7ef deleted four JSX source-text meta-test blocks (task 3543)
 // because they asserted regexes and substrings over raw .jsx source fetched
 // over HTTP rather than over behaviour, and could not discriminate. THIS
@@ -30,15 +34,16 @@
 // `'pins_recovery' in body` — the assertion passed with the render arm at
 // :420-428 deleted. It could not fail for the one reason it existed. The
 // tab_escalations.jsx block had the same defect: `label="pinning"` was
-// satisfied by the raw body with the tile removed.
+// satisfied by the raw body with the tile removed. (Each sibling header names
+// the block that covered ITS surface and how that one failed.)
 //
-// Deleting them was correct and left a real hole. This module closes the part
-// of it that can be closed: both decisions now live in pure functions with
-// genuine behavioural coverage (dashboard/tests/js/pins_recovery.test.mjs), so
-// deleting the pins_recovery arm — or adding a negated one — fails a test
-// instead of nothing.
+// Deleting them was correct and left a real hole. These modules close the part
+// of it that can be closed: the render DECISIONS now live in pure functions
+// with genuine behavioural coverage under dashboard/tests/js/, so deleting a
+// decision arm — or adding one nobody asked for — fails a test instead of
+// nothing.
 //
-// ── WHY NOT A DOM HARNESS (considered and rejected) ───────────────────────
+// ── (2) WHY NOT A DOM HARNESS (considered and rejected) ───────────────────
 // jsdom or a headless browser would cover the JSX seam this extraction leaves
 // open, and was the first thing considered. It does not fit this repo: there
 // is no package.json, lockfile or tracked node_modules anywhere in git; React
@@ -49,12 +54,12 @@
 // host jsdom would break that resolution model. The gate is
 // `cd dashboard && uv run pytest tests/`, so a DOM harness would need an
 // install at gate time or a skip-when-deps-missing guard — and a test that
-// silently skips is the same "passes but does not discriminate" hole this
-// module exists to close, merely relocated. The settled precedent for this
+// silently skips is the same "passes but does not discriminate" hole these
+// modules exist to close, merely relocated. The settled precedent for this
 // trade is commit bea3edc34f, "GREEN — extract lockChipState helper, rewire
 // chips, drop meta-test" (scheduler_utils.jsx + test_lock_chip_state.py).
 //
-// ── WHAT IS OUT OF SCOPE ──────────────────────────────────────────────────
+// ── (3) WHAT IS OUT OF SCOPE ──────────────────────────────────────────────
 // Re-hardening the deleted tests with tightened regexes or comment-stripped
 // source fixtures is explicitly out of scope, by the reviewer guidance that
 // motivated 039e55c7ef: hardening the greps deepens the same hole rather than
@@ -63,11 +68,25 @@
 // rather than assumed (see the mutation-verification step of task 4361) and
 // is filed as a browser-harness follow-up. Do not "restore" the greps.
 //
-// Nothing here reads `window` or `document`: the shared-classic-script-scope
-// suite loads this file into a bare `vm.createContext({window:{}})`, and a
-// module that reached for browser globals would behave differently under test
-// than in the browser. For the same reason these functions return plain
-// render DESCRIPTORS rather than React elements.
+// ── (4) NO BROWSER GLOBALS, IN ANY OF THE THREE ───────────────────────────
+// Nothing in these modules reads `window` or `document`: the
+// shared-classic-script-scope suite loads each file into a bare
+// `vm.createContext({window:{}})`, and a module that reached for browser
+// globals would behave differently under test than in the browser. For the
+// same reason they return plain render DESCRIPTORS rather than React elements
+// — a module calling a global `React` would violate that suite by
+// construction. Anything a decision needs from another module is INJECTED as a
+// parameter (the prd_grouping.js:18-21 convention).
+//
+// ── (5) DUAL LOAD, AND THE `API` NAMING RULE ──────────────────────────────
+// Each module ends with a module-unique `<NAME>_API` const — never a bare
+// `API`, which classic_script_scope.test.mjs probes for at runtime because all
+// classic scripts share one browser scope — assigned to `module.exports` and
+// `window.DF_*` behind `typeof` guards, so the file has no effect outside the
+// environment it is actually running in. Node's cjs-module-lexer cannot see
+// exports assigned from a variable, which is why every sibling test suite
+// default-imports and destructures instead of using named imports.
+// ═══════════════════════ end of the shared block ══════════════════════════
 //
 // ── THE THREE-STATE CONTRACT THAT GOVERNS BOTH FUNCTIONS ──────────────────
 // The backend emits THREE distinguishable states, and both surfaces below

@@ -3,74 +3,38 @@
 // the legend that explains them, and whether the concurrency-parity banner
 // draws at all (tabs.jsx BurnTab, aggregate and per-project views alike).
 //
-// This is a plain-JS module: no JSX, no Babel. It is loaded two ways:
-//   - In the browser, via a classic `<script src="/static/redux/burndown_bands.js">`
-//     tag (like task_status_counts.js), which assigns `window.DF_BURNDOWN_BANDS`.
-//   - In node (no package.json in this repo, so this file resolves as
-//     CommonJS), via `require`/`import` for the `node --test` suite under
-//     dashboard/tests/js/.
+// Dual-loaded: a browser classic `<script>` assigns `window.DF_BURNDOWN_BANDS`,
+// node resolves the same file as CommonJS for `dashboard/tests/js/`. index.html
+// loads it before the Babel JSX tags, so the global exists before tabs.jsx runs
+// its top-level destructure of it.
 //
-// Both export paths are guarded so this file has no effect outside the
-// environment it's actually running in.
+// ── THE SHARED SUBSTRATE DECISION IS NOT RESTATED HERE ────────────────────
+// Why these helpers exist at all, why a DOM harness was considered and
+// REJECTED, why re-hardening the deleted greps is out of scope, and why no
+// module here reads a browser global: written out ONCE, in pins_recovery.js's
+// header (the block marked CANONICAL). Read it there before re-litigating any
+// of it. It is deliberately not copied into this file — three hand-copies of
+// one rationale drift, which is the hazard these modules exist to remove.
 //
-// index.html loads this file (classic script, before the Babel JSX tags) so
-// `window.DF_BURNDOWN_BANDS` is defined before tabs.jsx executes its top-level
-// destructure of it.
+// ── WHY THIS MODULE EXISTS (the burndown specifics) ───────────────────────
+// The block that covered THIS surface, test_tab_burndown.py:133-270, carried
+// the shared defect in its own dialect: it pinned JSX object-literal SPELLING
+// and captured a colour identifier as source text, so it tracked how the bands
+// were WRITTEN rather than what they DREW. Renaming a local would have failed
+// it; merging the two in-progress bands would not have.
 //
-// ── WHY THIS MODULE EXISTS ────────────────────────────────────────────────
-// Commit 039e55c7ef deleted four JSX source-text meta-test blocks (task 3543)
-// because they asserted regexes and substrings over raw .jsx source fetched
-// over HTTP rather than over behaviour, and could not discriminate. The
-// decisive demonstration is on the sibling pins_recovery surface: a
-// whole-file substring grep is satisfied by a MENTION, so the explanatory
-// COMMENT at tab_escalation_analytics.jsx:414-419 alone satisfied
-// `'pins_recovery' in body` even with the render arm at :420-428 deleted —
-// the test could not fail for the one reason it existed. The burndown block
-// (test_tab_burndown.py:133-270) had the same defect in its own dialect: it
-// pinned JSX object-literal SPELLING and captured a colour identifier as
-// source text, so it tracked how the bands were written rather than what they
-// drew.
+// That is now the other way round. The band, legend and banner decisions live
+// in the pure functions below with behavioural coverage in
+// dashboard/tests/js/burndown_bands.test.mjs, so merging the two in-progress
+// bands, colliding their colours, or drawing the parity banner on a false
+// alarm each fails a named test instead of nothing.
 //
-// Deleting them was correct and left a real hole. This module closes the part
-// of it that can be closed: the band/legend/banner decisions now live in pure
-// functions with genuine behavioural coverage
-// (dashboard/tests/js/burndown_bands.test.mjs), so merging the two
-// in-progress bands, or colliding their colours, fails a test instead of
-// nothing.
-//
-// ── WHY NOT A DOM HARNESS (considered and rejected) ───────────────────────
-// jsdom or a headless browser would cover the JSX seam this extraction leaves
-// open, and was the first thing considered. It does not fit this repo: there
-// is no package.json, lockfile or tracked node_modules anywhere in git; React
-// 18.3.1 and @babel/standalone 7.29.0 are unpkg CDN tags with SRI hashes,
-// transpiled in-browser with no build step. The ABSENCE of a package.json is
-// load-bearing — it is exactly what makes these static/redux/*.js files
-// resolve as CommonJS for the existing node --test suite, so adding one to
-// host jsdom would break that resolution model. The gate is
-// `cd dashboard && uv run pytest tests/`, so a DOM harness would need an
-// install at gate time or a skip-when-deps-missing guard — and a test that
-// silently skips is the same "passes but does not discriminate" hole this
-// module exists to close, merely relocated. The settled precedent for this
-// trade is commit bea3edc34f, "GREEN — extract lockChipState helper, rewire
-// chips, drop meta-test" (scheduler_utils.jsx + test_lock_chip_state.py).
-//
-// ── WHAT IS OUT OF SCOPE ──────────────────────────────────────────────────
-// Re-hardening the deleted tests with tightened regexes or comment-stripped
-// source fixtures is explicitly out of scope, by the reviewer guidance that
-// motivated 039e55c7ef: hardening the greps deepens the same hole rather than
-// closing it. The residual gap — deleting the thin surviving JSX call site
-// still fails no test, because nothing in this repo renders JSX — is measured
-// rather than assumed (see the mutation-verification step of task 4361) and
-// is filed as a browser-harness follow-up. Do not "restore" the greps.
-//
-// Nothing here reads `window` or `document`: the shared-classic-script-scope
-// suite loads this file into a bare `vm.createContext({window:{}})`, and a
-// module that reached for browser globals would behave differently under test
-// than in the browser. THE COLOUR PALETTE IS THEREFORE INJECTED as a
-// parameter, never read off a global `CP` or `window.DF_CHARTS` — the same
-// convention prd_grouping.js:18-21 uses for computeTiers. That also keeps the
-// palette owned by exactly one file (charts.jsx) instead of being duplicated
-// into this one.
+// ── THE PALETTE IS INJECTED ───────────────────────────────────────────────
+// Per (4) of the canonical block: the colours arrive as a PARAMETER, never off
+// a global `CP` or `window.DF_CHARTS`, the same way prd_grouping.js takes
+// computeTiers. That is what lets the tests assert against a sentinel palette,
+// and it keeps the real palette owned by exactly one file (charts.jsx) instead
+// of duplicated into this one.
 
 // ── The five stacked bands of the status-mix chart ──
 // Takes a burndown block (the aggregate `b` or a project's `pb`) and the
