@@ -1547,6 +1547,68 @@ class TestCliExitCodes:
         assert await _mod._run(_args(tmp_path)) != 0
 
 
+class TestCensusScanIncompleteIsTheBackendException:
+    """CensusScanIncomplete must BE the backend's exception, not merely
+    resemble it.
+
+    _run's ``except CensusScanIncomplete`` has to name exactly what
+    ``backend.scroll_all_by_metadata`` raises. The name is an ALIAS of
+    ``ScrollPageBudgetExhausted`` -- but every existing test that exercises
+    the handler raises ``_mod.CensusScanIncomplete`` itself, so the identity
+    is satisfied tautologically: re-declaring it as
+    ``class CensusScanIncomplete(RuntimeError)`` would keep all of them green
+    while the real exception escaped as an uncaught traceback instead of a
+    clean exit 1. These two guards are what close that gap. Both PASS against
+    today's correct code; their value is regression pressure.
+    """
+
+    def test_is_the_backend_exception_itself_not_a_lookalike(self):
+        """The one-line identity the handler depends on.
+
+        A subclass would not catch its parent; a sibling re-declaration would
+        not catch it either. Only identity works.
+        """
+        from fused_memory.backends.mem0_client import ScrollPageBudgetExhausted
+
+        assert _mod.CensusScanIncomplete is ScrollPageBudgetExhausted
+
+    @pytest.mark.asyncio
+    async def test_the_real_backend_exception_exits_nonzero_through_census_project(
+        self, tmp_path, monkeypatch,
+    ):
+        """End-to-end: the REAL backend exception, raised from a real scroll,
+        travelling through the REAL census_project into _run's handler.
+
+        Deliberately imports ScrollPageBudgetExhausted from the backend
+        rather than referencing _mod.CensusScanIncomplete -- naming the alias
+        here would rebuild the same tautology this class exists to break.
+        census_project is NOT stubbed, so the exception crosses the same code
+        path it crosses in production.
+        """
+        from fused_memory.backends.mem0_client import ScrollPageBudgetExhausted
+
+        async def _scroll_all_by_metadata(scope, filters, **kwargs):
+            raise ScrollPageBudgetExhausted('page budget exhausted')
+            yield  # pragma: no cover - makes this an async generator
+
+        backend = AsyncMock()
+        backend.config = MagicMock()
+        backend.config.mem0.collection_prefix = 'fused'
+        backend.count_by_metadata = AsyncMock(return_value=1)
+        backend.count = AsyncMock(return_value=1)
+        backend.scroll_all_by_metadata = _scroll_all_by_metadata
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: backend)
+
+        exit_code = await _mod._run(_args(tmp_path))
+
+        assert exit_code != 0, (
+            'a truncated scan must abort with a non-zero exit, not surface as '
+            'an uncaught traceback'
+        )
+        # the finally: close() still runs even on the abort path
+        backend.close.assert_awaited_once()
+
+
 class TestCliCleanup:
     @pytest.mark.asyncio
     async def test_closes_the_backend(self, tmp_path, monkeypatch):
