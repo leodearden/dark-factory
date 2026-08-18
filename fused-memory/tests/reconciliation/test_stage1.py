@@ -3281,6 +3281,7 @@ class TestDedupFlagsCrossProjectWiring:
         await self._run_with_dedup_mock(stage, [self._make_flag()], dedup_mock)
 
         assert dedup_mock.await_count >= 1, 'dedup_flags must be called'
+        assert dedup_mock.await_args is not None
         kwargs = dedup_mock.await_args.kwargs
         assert kwargs.get('taskmaster') is stage.taskmaster, (
             'run() must pass taskmaster= to dedup_flags or the cross-project '
@@ -3308,6 +3309,7 @@ class TestDedupFlagsCrossProjectWiring:
         assert flag in report.items_flagged, (
             f'the flag must survive without cross-project routing; got {report.items_flagged!r}'
         )
+        assert dedup_mock.await_args is not None
         assert dedup_mock.await_args.kwargs.get('known_projects') == {}, (
             'the empty map must still be forwarded verbatim; got '
             f'{dedup_mock.await_args.kwargs.get("known_projects")!r}'
