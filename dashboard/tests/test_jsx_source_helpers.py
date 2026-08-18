@@ -237,3 +237,77 @@ class TestStripJsComments:
 
         assert 'const kept = 1;' in body, 'the code inside the stripped body survives'
         assert 'Math.max(...values' not in body, 'the comment inside the body is blanked'
+
+
+# The served assets whose per-module fixture copies conftest.py now owns.
+# One row per asset: adding a tenth shared asset is a one-line change here and
+# a one-line fixture in conftest.py.
+SHARED_ASSET_FIXTURES = {
+    'index_html_body': '/static/redux/index.html',
+    'data_js_body': '/static/redux/data.js',
+    'app_jsx_body': '/static/redux/app.jsx',
+    'shell_jsx_body': '/static/redux/shell.jsx',
+    'tabs_jsx_body': '/static/redux/tabs.jsx',
+    'charts_jsx_body': '/static/redux/charts.jsx',
+    'tab_analytics_jsx_body': '/static/redux/tab_escalation_analytics.jsx',
+    'tab_escalations_jsx_body': '/static/redux/tab_escalations.jsx',
+    'tab_tasks_jsx_body': '/static/redux/tab_tasks.jsx',
+}
+
+
+class TestSharedServedAssetFixtures:
+    """The `_client` and served-asset fixtures resolve from conftest.py.
+
+    This module defines none of them locally, so these tests can only pass
+    once conftest owns them — which is the point: nine modules used to carry
+    byte-identical copies.
+    """
+
+    def test_each_shared_fixture_serves_what_the_app_serves(self, request, _client) -> None:
+        """Every row resolves, is non-empty, and matches the live response.
+
+        Non-empty is asserted separately from the equality: a fixture wired to
+        a mistyped path would return a 404 body, and `body == _client.get(...)`
+        would compare that 404 to itself and pass.
+        """
+        for name, path in SHARED_ASSET_FIXTURES.items():
+            body = request.getfixturevalue(name)
+
+            assert isinstance(body, str), f'fixture {name!r} must yield the response TEXT'
+            assert body, (
+                f'fixture {name!r} is empty — {path} is probably not served under '
+                f'that exact path, and every probe built on it would then pass '
+                f'vacuously'
+            )
+            assert body == _client.get(path).text, (
+                f'fixture {name!r} does not serve {path} — it is wired to the '
+                f'wrong asset, so its consumers are asserting against the wrong file'
+            )
+
+    def test_client_is_module_scoped_not_function_scoped(self, request) -> None:
+        """One app lifespan per consuming MODULE, not per test.
+
+        The nine local copies being retired are all `scope='module'`, while
+        conftest's pre-existing `client` fixture is function-scoped.  Silently
+        satisfying `_client` from a function-scoped definition would stand up
+        and tear down `TestClient(app)` once per test across a ~1900-test
+        suite — correct, but a large and gratuitous slowdown that nothing
+        would report.
+
+        PRIVATE-API PIN.  `FixtureManager.getfixturedefs` is not public API,
+        so the lookup is asserted to have RESOLVED before its result is read:
+        a moved attribute must fail loudly here rather than degrade into a
+        skipped assertion, which would leave the scope unchecked forever.
+        """
+        fixturedefs = request._fixturemanager.getfixturedefs('_client', request.node)
+
+        assert fixturedefs, (
+            'could not resolve a `_client` fixture definition — either conftest '
+            'no longer defines it, or pytest moved '
+            'FixtureManager.getfixturedefs and this pin needs re-verifying'
+        )
+        # Least-specific first, so the definition actually in effect is last.
+        assert fixturedefs[-1].scope == 'module', (
+            f'`_client` is {fixturedefs[-1].scope}-scoped; it must be module-scoped '
+            f'so each consuming module pays exactly one app lifespan'
+        )
