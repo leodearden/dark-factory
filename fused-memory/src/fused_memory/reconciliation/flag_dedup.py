@@ -57,6 +57,20 @@ payload is ``json.dumps``-ed inside the best-effort try/except below, so an
 unserialisable LLM-authored value would otherwise be swallowed as a ledger
 WARNING and the marker would silently stop persisting at all.
 
+The persisted value is the UNION of the prior row's anchor and the current
+cycle's citations (:func:`_union_cited_tasks`), never the current cycle
+alone.  That distinction is the whole mechanism: persisting only the current
+cycle would ERASE the anchor on the very cycle it did its job — a
+citation-less cycle that suppressed on the prior anchor would rewrite the
+row without it, and the next cycle would resurface the finding — making the
+anchor single-use.  Persisting the union makes it self-carrying across
+arbitrarily many citation-less cycles.  Because the value therefore
+round-trips through this payload every cycle (persisted -> read back ->
+re-merged -> re-persisted), it is projected through
+:func:`_persistable_cited_tasks` before the write: identity-bearing entries
+only, capped at :data:`_MAX_PERSISTED_CITED_TASKS`, so the row is bounded by
+construction rather than growing without limit.
+
 Because the identity excludes run_id, ``ON CONFLICT`` on the full primary
 key guarantees **exactly one row survives** per (task_id, flag_type)
 regardless of how many times the signature has recurred — across cycles
@@ -923,6 +937,19 @@ async def dedup_flags(
     inside the best-effort try/except below can never fail on LLM-authored
     content and silently skip the marker write.
 
+    What is persisted is the UNION of the prior row's anchor and this cycle's
+    citations (:func:`_union_cited_tasks`), computed ONCE into ``merged_cited``
+    and shared with the suppression gate below, so the gate provably resolves
+    against exactly the set that was just written.  Persisting the current
+    cycle alone would make the anchor single-use — a citation-less cycle that
+    suppressed on it would rewrite the row without it and the next cycle would
+    resurface the finding.  Since the union therefore round-trips through the
+    payload every cycle, it is projected through
+    :func:`_persistable_cited_tasks` (identity-bearing entries only, capped at
+    :data:`_MAX_PERSISTED_CITED_TASKS`) so the row is bounded by construction:
+    an entry lacking ``(project_id, task_id)`` cannot be de-duplicated by the
+    union and would otherwise accumulate one fresh copy per cycle forever.
+
     Cross-project fix-task suppression (task 4381 / esc-3841-1): this is the
     SECOND way ``dedup_flags`` can drop a flag, alongside ``filter_suppressed``
     above.  When the OPTIONAL keyword-only *taskmaster* and *known_projects*
@@ -940,7 +967,10 @@ async def dedup_flags(
       CURRENT-CYCLE one.  :func:`_union_cited_tasks` merges them (deduped on
       ``(project_id, task_id)``, current first), so a carried-forward finding
       stays resolved even on a cycle whose LLM output re-emits no citation at
-      all — which is precisely what the payload enrichment above buys.
+      all — which is precisely what the payload enrichment above buys.  The
+      merged value is the same object that was persisted this cycle, so the
+      anchor survives EVERY cycle (suppressing or not) and the property holds
+      for arbitrarily many consecutive citation-less cycles, not just one.
     * **Foreign-project-only.** See
       :func:`_resolve_live_cross_project_fix_task` — a finding's own subject
       task is routinely its own first citation.
@@ -949,9 +979,9 @@ async def dedup_flags(
       site is unaffected.
     * **The upsert still runs first.** Suppression happens AFTER the ledger
       write, so a suppressed-but-still-recurring signature keeps its row,
-      refreshes its 14-day TTL, and re-persists ``cited_tasks``.  Skipping the
-      write would let the marker age out and lose the recurrence history the
-      cancelled-fix-task path depends on.
+      refreshes its 14-day TTL, and re-persists the merged ``cited_tasks``.
+      Skipping the write would let the marker age out and lose the recurrence
+      history the cancelled-fix-task path depends on.
 
     Args:
         memory_service: Service exposing ``recon_ledger`` (may be absent/None).
@@ -1102,6 +1132,13 @@ async def dedup_flags(
         # Free-form JSON off a ledger row — validated by _union_cited_tasks,
         # never trusted for shape.
         prior_cited: Any = None
+        # The single merged anchor: computed ONCE and used by BOTH the payload
+        # written below and the suppression gate further down, so the gate
+        # provably resolves against exactly the set that was just persisted.
+        # Initialised to the current-cycle-only union, which is the correct
+        # value for the no-ledger path and for a ledger read that raises
+        # before any prior row is seen.
+        merged_cited: list[dict[str, Any]] = _union_cited_tasks(cited_tasks, None)
 
         payload: dict[str, Any] = {
             'source': 'stage1_flag_marker',
@@ -1113,8 +1150,6 @@ async def dedup_flags(
         }
         if deduped_against:
             payload['deduped_against'] = list(deduped_against)
-        if cited_tasks:
-            payload['cited_tasks'] = cited_tasks
 
         # Best-effort (module docstring / public-API contract): a ledger read
         # or write failure — including a malformed/non-JSON payload_json on a
@@ -1136,6 +1171,20 @@ async def dedup_flags(
                             tid,
                             ftype,
                         )
+                # Outside the `if prior is not None` branch on purpose: a MISS
+                # must still end up with the current-cycle-only union.
+                merged_cited = _union_cited_tasks(cited_tasks, prior_cited)
+                # The UNION is what gets persisted — not the current cycle
+                # alone.  Persisting only the current cycle would erase the
+                # anchor on the very cycle it did its job, making it
+                # single-use.  Projected through _persistable_cited_tasks
+                # precisely BECAUSE it round-trips through this payload every
+                # cycle and must be bounded by construction.  Assigned only
+                # when non-empty, mirroring the `deduped_against` idiom, so a
+                # citation-less flag persists the six-key literal verbatim.
+                persistable = _persistable_cited_tasks(merged_cited)
+                if persistable:
+                    payload['cited_tasks'] = persistable
                 now = datetime.now(UTC)
                 await ledger.upsert(ReconLedgerRecord(
                     project_id=project_id,
@@ -1176,7 +1225,7 @@ async def dedup_flags(
                 taskmaster,
                 known_projects,
                 project_id,
-                _union_cited_tasks(flag.get('cited_tasks'), prior_cited),
+                merged_cited,
             )
             if fix_cite is not None:
                 logger.info(
