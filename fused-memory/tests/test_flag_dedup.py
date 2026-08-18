@@ -3308,6 +3308,143 @@ class TestFilterFalsePhantomTaskCreationFlags:
 
 
 # ---------------------------------------------------------------------------
+# ---- task 4381 step-3 ----
+# RED: _cited_fix_task_live — the RULED status policy layered on top of
+# _cited_task_corroborated ("filed and not cancelled", Leo 2026-08-17).
+# ---------------------------------------------------------------------------
+
+
+class TestCitedFixTaskLive:
+    """Tests for ``_cited_fix_task_live(cited, get_task_result) -> bool``.
+
+    Layers the ruled status policy on top of :func:`_cited_task_corroborated`:
+    a cited fix task counts as LIVE when it is positively present, its title
+    corroborates the citation, and its status is any filed status OTHER than
+    ``cancelled``.
+
+    RED until step-4 adds ``_cited_fix_task_live`` to flag_dedup.py.
+    """
+
+    CITED = {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix the thing'}
+
+    @pytest.mark.parametrize(
+        'status',
+        [
+            'pending',
+            'blocked',
+            'in-progress',
+            'review',
+            'deferred',
+            'infra-hold',
+            'merge-deferred',
+            'done',
+        ],
+        ids=[
+            'pending',
+            'blocked',
+            'in-progress',
+            'review',
+            'deferred',
+            'infra-hold',
+            'merge-deferred',
+            'done',
+        ],
+    )
+    def test_true_for_any_filed_non_cancelled_status(self, status):
+        """A FILED-and-not-cancelled task of ANY status counts — the ruling
+        verbatim. The flag's complaint is 'no fix task has been filed', which a
+        pending or blocked task already answers."""
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        result = {'id': 3839, 'title': 'Fix the thing', 'status': status}
+        assert _cited_fix_task_live(self.CITED, result) is True, (
+            f'status {status!r} must count as a live filed fix task; got {result!r}'
+        )
+
+    def test_false_for_cancelled(self):
+        """The explicit guard against permanent silent suppression: a cancelled
+        fix task must NOT satisfy the complaint, or it is silenced forever."""
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        result = {'id': 3839, 'title': 'Fix the thing', 'status': 'cancelled'}
+        assert _cited_fix_task_live(self.CITED, result) is False, (
+            f'a cancelled fix task must never suppress; got {result!r}'
+        )
+
+    @pytest.mark.parametrize(
+        'result',
+        [
+            {'id': 3839, 'title': 'Fix the thing'},
+            {'id': 3839, 'title': 'Fix the thing', 'status': None},
+            {'id': 3839, 'title': 'Fix the thing', 'status': 5},
+            {'id': 3839, 'title': 'Fix the thing', 'status': ['pending']},
+        ],
+        ids=['status-absent', 'status-none', 'status-int', 'status-list'],
+    )
+    def test_false_for_absent_or_non_str_status(self, result):
+        """An absent/non-str status is INCONCLUSIVE, matching the module's
+        suppress-only-on-positive-confirmation posture."""
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        assert _cited_fix_task_live(self.CITED, result) is False, (
+            f'an inconclusive status must not suppress; got {result!r}'
+        )
+
+    def test_false_on_title_mismatch(self):
+        """Id-collision / hallucinated-citation guard inherited from
+        _cited_task_corroborated: task ids are per-project sequential integers,
+        so a bare id match is routinely an unrelated task."""
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        result = {'id': 3839, 'title': 'A completely unrelated task', 'status': 'pending'}
+        assert _cited_fix_task_live(self.CITED, result) is False, (
+            f'a title mismatch must not suppress; got {result!r}'
+        )
+
+    def test_true_on_title_match_with_different_case_and_whitespace(self):
+        """Title normalisation (casefold + whitespace-collapse) is inherited."""
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        result = {'id': 3839, 'title': '  FIX   THE    THING ', 'status': 'pending'}
+        assert _cited_fix_task_live(self.CITED, result) is True, (
+            f'incidental case/spacing differences must still corroborate; got {result!r}'
+        )
+
+    @pytest.mark.parametrize(
+        'result',
+        [
+            {
+                'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 3839',
+                'error_type': 'TaskNotFoundError',
+            },
+            {'error': 'Connection timeout', 'error_type': 'TimeoutError'},
+            None,
+            {},
+            'not-a-dict',
+            42,
+            [],
+        ],
+        ids=[
+            'not-found-error',
+            'inconclusive-error',
+            'none',
+            'empty-dict',
+            'str',
+            'int',
+            'list',
+        ],
+    )
+    def test_false_for_absent_inconclusive_and_malformed_results(self, result):
+        """Absent, inconclusive and malformed lookups all fail safe."""
+        from fused_memory.reconciliation.flag_dedup import _cited_fix_task_live
+
+        assert _cited_fix_task_live(self.CITED, result) is False, (
+            f'a non-corroborating lookup must not suppress; got {result!r}'
+        )
+
+
+
+# ---------------------------------------------------------------------------
 # task-1654 step-1 — RED: compute_content_fingerprint_signature tests
 # ---------------------------------------------------------------------------
 
