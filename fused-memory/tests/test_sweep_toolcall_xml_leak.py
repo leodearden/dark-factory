@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -466,6 +467,16 @@ def _service(
     service.scan_memory_content = AsyncMock(return_value=scan_result)
     service.delete_memory = AsyncMock(return_value={'deleted': True})
     service.add_memory = AsyncMock(return_value=_ok_response())
+    # Stubbed EXPLICITLY rather than left to AsyncMock's auto-attribute, whose
+    # return value is a truthy child mock that happens to read as "the point
+    # survived". The delete-landed probe (task 3243) turns that value into an
+    # ADJUDICATION, so the tests that depend on it must assert against a stated
+    # stub. The default is the conservative one — a live point, i.e. the delete
+    # did NOT land, i.e. nothing was destroyed — so a test only sees a
+    # content-lost verdict when it deliberately arranges one.
+    service.get_memory_by_id = AsyncMock(
+        return_value={'id': 'surviving-point', 'content': _BODY, 'metadata': {}}
+    )
     return service
 
 
@@ -1053,6 +1064,128 @@ class TestProbeDeleteLanded:
             service = self._probe_service(get_memory_by_id=stub)
             _, note = await _mod.probe_delete_landed(service, 'dark_factory', 'm-1')
             assert note.strip()
+
+
+class TestRunApplyAdjudicatesARaisedDelete:
+    """A delete that RAISED while the point is actually gone is a content loss,
+    not an unknown — the measured 7d073281 regression (task 3243).
+
+    Before this, ``delete_memory`` sat OUTSIDE any ``try`` in
+    ``_repair_record``, so a raise unwound to ``run()``'s per-record catch-all
+    and became ``record_error`` — documented as "whether that record's delete
+    landed is UNKNOWN". On the real 2026-08-05 ``--apply`` the traceback was
+    INSIDE ``delete_memory`` (mem0's SQLite history write), and mem0 removes
+    the Qdrant point BEFORE that write, so the delete HAD landed: a
+    ``content_lost_in_flight`` in substance, reported as an unknown.
+
+    The exit-code contract does not move — both flags are already in
+    ``HUMAN_ADJUDICATION_FLAGS`` and both already force non-zero. This is
+    purely about what the report SAYS.
+    """
+
+    # The exact class + text the measured incident produced.
+    _READONLY_DB = sqlite3.OperationalError('attempt to write a readonly database')
+
+    @staticmethod
+    def _two_record_service(*, delete_raises, probe) -> AsyncMock:
+        """Record 'b' fails its delete; record 'c' is a healthy control that
+        must still be repaired — one bad record never shrinks the sweep."""
+        service = _service([_match('b', _DUPLICATE_LEAK), _match('c', _TAIL_LEAK)])
+        service.delete_memory = AsyncMock(side_effect=[delete_raises, {'deleted': True}])
+        service.get_memory_by_id = probe
+        return service
+
+    @pytest.mark.asyncio
+    async def test_a_raised_delete_whose_point_is_gone_is_content_lost_not_unknown(self):
+        service = self._two_record_service(
+            delete_raises=self._READONLY_DB,
+            probe=AsyncMock(return_value=None),  # the point is ABSENT
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        lost = _record_for(report, 'b')
+        assert lost['content_lost_in_flight'] is True
+        assert 'record_error' not in lost
+        assert lost['repaired'] is False
+        assert lost['delete_landed'] is True
+        # The report is the only surviving copy of both texts.
+        assert lost['content'] == _DUPLICATE_LEAK
+        assert lost['repaired_content'] == _BODY
+        # The ORIGINAL delete error, not the probe's verdict, is the fact a
+        # human needs to understand what happened.
+        assert 'attempt to write a readonly database' in lost['error']
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_a_raised_delete_whose_point_survived_stays_a_record_error(self):
+        """The control that makes the assertion above mean something: nothing
+        was destroyed, so claiming content-lost would send an operator to
+        hand-restore a record that is still live, producing a duplicate."""
+        service = self._two_record_service(
+            delete_raises=self._READONLY_DB,
+            probe=AsyncMock(return_value={'id': 'b', 'content': _DUPLICATE_LEAK}),
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        failed = _record_for(report, 'b')
+        assert failed['record_error'] is True
+        assert failed['delete_landed'] is False
+        assert 'content_lost_in_flight' not in failed
+        assert failed['repaired'] is False
+        assert 'attempt to write a readonly database' in failed['error']
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_an_unanswerable_probe_stays_a_record_error_and_keeps_the_real_error(self):
+        """``record_error`` has always meant "a human must go and check this
+        id", which is the honest label for a genuine unknown. The probe's own
+        failure must NOT displace the delete error in ``error``."""
+        service = self._two_record_service(
+            delete_raises=self._READONLY_DB,
+            probe=AsyncMock(side_effect=TimeoutError('qdrant read timed out')),
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        failed = _record_for(report, 'b')
+        assert failed['record_error'] is True
+        assert failed['delete_landed'] is None
+        assert 'content_lost_in_flight' not in failed
+        assert 'attempt to write a readonly database' in failed['error']
+        assert 'qdrant read timed out' not in failed['error']
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.parametrize(
+        'probe',
+        [
+            pytest.param(AsyncMock(return_value=None), id='point-absent'),
+            pytest.param(AsyncMock(return_value={'id': 'b'}), id='point-survived'),
+            pytest.param(AsyncMock(side_effect=TimeoutError('read')), id='probe-failed'),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_the_sweep_continues_to_later_records_under_every_verdict(self, probe):
+        """Whatever the adjudication, one record's failure must never shrink
+        the sweep's coverage — the report's central safety promise."""
+        service = self._two_record_service(delete_raises=self._READONLY_DB, probe=probe)
+
+        report = await _mod.run(_args(apply=True), service)
+
+        assert _record_for(report, 'c')['repaired'] is True
+        assert report['repaired'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_probe_only_runs_when_the_delete_actually_raised(self):
+        """A clean run must not pay for an extra store read per record — and a
+        delete that RETURNED is already direct evidence that it landed."""
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        assert _record_for(report, 'b')['repaired'] is True
+        service.get_memory_by_id.assert_not_awaited()
 
 
 class TestRunApplyVerifiesPersistence:
