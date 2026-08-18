@@ -33,7 +33,7 @@ from escalation.models import (
     max_severity,
 )
 from escalation.pins import classify_pins
-from escalation.queue import EscalationQueue
+from escalation.queue import AmendmentOutcome, EscalationQueue
 from escalation.queue import observed_submit_response as _observed_submit_response
 
 logger = logging.getLogger(__name__)
@@ -1829,12 +1829,13 @@ def create_server(
              'amendment_recorded': <bool>, 'amendments': <int>}
 
         ``amendment_recorded`` is True when THIS call's framing was appended.
-        It is derived from what actually moved on the record — the amendment
-        count growing, OR the truncation counter growing (an append that hits
-        the cap sheds an entry, so the length stays put) — never from asserting
-        that a write happened: a framing-free or framing-identical re-promote
-        moves neither and correctly reports False.  ``amendments`` is the
-        resulting list length, which saturates at ``queue._MAX_AMENDMENTS``.
+        It is reported by ``add_members_to_l2`` from inside its own write lock
+        (``queue.AmendmentOutcome``), so it describes this call's write exactly
+        — not a difference inferred from a pre-read, which cost an extra record
+        parse per fold and raced concurrent folds in either direction.  A
+        framing-free or framing-identical re-promote appends nothing and
+        correctly reports False.  ``amendments`` is the resulting list length,
+        which saturates at ``queue._MAX_AMENDMENTS``.
 
         ``severity`` reports what was ACTUALLY filed, which for a caller that
         omitted the argument is how the inherited value becomes visible — and
@@ -1906,16 +1907,14 @@ def create_server(
             # which case add_members_to_l2 leaves the severity untouched.
             # Upward-only inside add_members_to_l2, so an append can never
             # quiet an existing L2.
-            # Pre-call amendment count, so `amendment_recorded` reports what
-            # ACTUALLY grew rather than asserting a write happened.  A record
-            # that could not be read (None) reads as 0, which can only
-            # under-claim.
-            before = queue.get(existing_id)
-            amendments_before = len(before.amendments) if before is not None else 0
-            # Same pre-call read serves the INV-4 storm escape below: a GROWN
-            # truncation counter is the event worth counting, and reading it
-            # from the record means no second source of truth.
-            truncated_before = before.amendments_truncated if before is not None else 0
+            # What this fold did to `amendments` is reported BY THE WRITER,
+            # from inside `escalation_id_lock` where it is already computed —
+            # not re-derived here from a pre-read plus a "did the count grow"
+            # heuristic.  That heuristic cost a second full read+parse per fold
+            # and was a real TOCTOU: the queue is built for cross-process
+            # mutators, so a concurrent fold between the pre-read and the call
+            # made the flag wrong in either direction.
+            outcome: AmendmentOutcome = {'recorded': False, 'dropped': 0}
             updated = queue.add_members_to_l2(
                 existing_id,
                 list(dict.fromkeys(member_ids)),
@@ -1928,25 +1927,15 @@ def create_server(
                 options=list(options),
                 summary=summary,
                 agent_role=agent_role,
+                outcome=outcome,
             )
             if updated is not None:
-                # A TRUNCATING append leaves the list sitting AT the cap, so a
-                # grown length alone under-reports: once `amendments` holds
-                # _MAX_AMENDMENTS entries it can never grow again, and every
-                # subsequent fold would falsely report its framing as dropped.
-                # A grown truncation counter is the other observable half —
-                # add_members_to_l2 only ever trims immediately after an append
-                # — so the OR of the two is exact.  A framing-identical
-                # re-promote appends nothing and moves neither, so it still
-                # correctly reports False.
-                truncated = updated.amendments_truncated > truncated_before
-                amendment_recorded = (
-                    len(updated.amendments) > amendments_before or truncated
-                )
                 # INV-4: repeated truncation gets a HEARER, not just a WARNING.
-                # Purely additive — _report_amendment_truncation_storm never
-                # raises, so a failed report can never fail this fold.
-                if truncated:
+                # The trigger is this call's OWN shed count, so it fires on the
+                # event rather than on an inferred difference.  Purely additive —
+                # _report_amendment_truncation_storm never raises, so a failed
+                # report can never fail this fold.
+                if outcome['dropped']:
                     _report_amendment_truncation_storm(existing_id, task_id)
                 return {
                     'id': existing_id,
@@ -1957,7 +1946,7 @@ def create_server(
                     'severity': updated.severity,
                     # Report the preservation, so a caller LEARNS its framing
                     # landed instead of having to re-read the record to find out.
-                    'amendment_recorded': amendment_recorded,
+                    'amendment_recorded': outcome['recorded'],
                     'amendments': len(updated.amendments),
                 }
             # Race: the pending L2 was resolved/archived between find and update.

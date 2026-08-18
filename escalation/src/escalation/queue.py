@@ -13,7 +13,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from shared.timestamps import parse_timestamp_or_warn
 
@@ -122,6 +122,33 @@ _MAX_AMENDMENTS = 20
 _MAX_AMENDMENT_LINE_CHARS = 300
 _MAX_AMENDMENT_DETAIL_CHARS = 1200
 _MAX_AMENDMENT_OPTIONS = 6
+
+
+class AmendmentOutcome(TypedDict):
+    """What ONE :meth:`EscalationQueue.add_members_to_l2` call did to ``amendments``.
+
+    An OUT-PARAM rather than a widened return value: the ``Escalation`` is that
+    method's primary result and every existing call site reads it directly, so
+    returning a tuple/NamedTuple would churn all of them into saying
+    ``.escalation`` for a fact only one caller wants.
+
+    WHY IT EXISTS: ``server.promote_to_l2`` reports ``amendment_recorded`` to its
+    caller and triggers the truncation storm escape.  Both are facts the write
+    path already computes INSIDE ``escalation_id_lock``.  Re-deriving them in the
+    server from a pre-call ``queue.get`` plus a "did the count grow, or did the
+    truncation counter grow" heuristic cost a second full read+parse on every
+    fold AND was a real TOCTOU: this queue is explicitly built for cross-process
+    mutators (the sidecar flocks), so a concurrent fold landing between the
+    pre-read and the call made the reported flag wrong in either direction — this
+    call's framing landing but reading False, or another caller's append making a
+    suppressed repeat read True.  Reported from inside the lock, it is exact.
+
+    Both keys are populated on EVERY return path — including the not-found and
+    no-op early returns — so a caller never reads a stale or missing key.
+    """
+
+    recorded: bool  # THIS call appended an amendment
+    dropped: int    # entries THIS call shed at the _MAX_AMENDMENTS cap
 
 
 def _elide(text: str, limit: int) -> tuple[str, int]:
@@ -1022,6 +1049,7 @@ class EscalationQueue:
         *, severity_floor: str | None = None,
         root_cause: str = '', evidence: str = '', options: list[str] | None = None,
         summary: str = '', agent_role: str = '',
+        outcome: AmendmentOutcome | None = None,
     ) -> Escalation | None:
         """Append *new_member_ids* to a pending L2 escalation's ``members`` list.
 
@@ -1111,7 +1139,17 @@ class EscalationQueue:
         there is nothing to append and no floor to apply).  Returns ``None``
         when *escalation_id* is not found in the queue root (unknown id or
         archived).
+
+        Pass *outcome* to learn what this call did to ``amendments`` — whether
+        it recorded one, and how many it shed — as computed HERE, inside the
+        lock, rather than inferred by a caller from a racy pre-read.  See
+        :class:`AmendmentOutcome`.  It is filled on every return path.
         """
+        # Defaults FIRST: the two early returns below leave them as-is, so the
+        # caller's dict is complete no matter which path this call takes.
+        if outcome is not None:
+            outcome['recorded'] = False
+            outcome['dropped'] = 0
         with escalation_id_lock(self.queue_dir, escalation_id):
             path = self.queue_dir / f'{escalation_id}.json'
             if not path.exists():
@@ -1145,6 +1183,7 @@ class EscalationQueue:
             # append, so it lands in the same single _rewrite below — no second
             # write path, no new durability story.
             amendment_recorded = False
+            dropped_entries = 0
             if incoming_framing:
                 candidate, chars_elided = _build_amendment(
                     root_cause=root_cause, summary=summary, evidence=evidence,
@@ -1176,15 +1215,15 @@ class EscalationQueue:
                     # lands in the same single _rewrite as the append and there
                     # is no durable window in which an over-cap list exists.
                     if len(esc.amendments) > _MAX_AMENDMENTS:
-                        dropped = len(esc.amendments) - _MAX_AMENDMENTS
-                        del esc.amendments[:dropped]
-                        esc.amendments_truncated += dropped
+                        dropped_entries = len(esc.amendments) - _MAX_AMENDMENTS
+                        del esc.amendments[:dropped_entries]
+                        esc.amendments_truncated += dropped_entries
                         logger.warning(
                             'add_members_to_l2: %s shed %d oldest amendment(s) at '
                             'the _MAX_AMENDMENTS=%d cap (running total '
                             "truncated=%d); the record's own original framing is "
                             'unaffected',
-                            escalation_id, dropped, _MAX_AMENDMENTS,
+                            escalation_id, dropped_entries, _MAX_AMENDMENTS,
                             esc.amendments_truncated,
                         )
 
@@ -1203,6 +1242,11 @@ class EscalationQueue:
                     len(appended), escalation_id, len(esc.members), esc.severity,
                     ' [promoted]' if severity_changed else '', len(esc.amendments),
                 )
+            # Reported from INSIDE the lock, so it describes THIS call's write
+            # and cannot be invalidated by a concurrent fold.
+            if outcome is not None:
+                outcome['recorded'] = amendment_recorded
+                outcome['dropped'] = dropped_entries
             return esc
 
     def stamp_triage(

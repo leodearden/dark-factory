@@ -22,6 +22,7 @@ from escalation.queue import (
     _MAX_AMENDMENT_LINE_CHARS,
     _MAX_AMENDMENT_OPTIONS,
     _MAX_AMENDMENTS,
+    AmendmentOutcome,
     EscalationQueue,
     iter_all_escalation_paths,
 )
@@ -3180,6 +3181,75 @@ class TestAddMembersToL2:
         )
         # And the byte loss is counted, not silent.
         assert record.amendments_chars_elided > 0
+
+    def test_add_members_reports_its_amendment_outcome(self, tmp_path: Path):
+        """The WRITER reports what it did, on every return path.
+
+        `promote_to_l2` needs two facts per fold — did this call record framing,
+        and did it shed any — to report `amendment_recorded` and to trigger the
+        truncation storm escape.  Re-deriving them in the server from a pre-read
+        plus a "did the count grow" heuristic cost a second full record parse per
+        fold and raced: this queue is built for cross-process mutators, so a
+        concurrent fold between the pre-read and the call made the flag wrong in
+        either direction.  Computed inside `escalation_id_lock`, it is exact.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+
+        def fresh() -> AmendmentOutcome:
+            return {'recorded': False, 'dropped': 0}
+
+        # (a) NOT FOUND — filled, not left missing, so the caller can read it
+        # without guarding.
+        missing = fresh()
+        assert queue.add_members_to_l2(
+            'esc-does-not-exist', ['esc-l1-9'], outcome=missing,
+        ) is None
+        assert missing == {'recorded': False, 'dropped': 0}
+
+        # (b) NO-OP early return (no members, no floor, no framing).
+        noop = fresh()
+        queue.add_members_to_l2(l2.id, [], outcome=noop)
+        assert noop == {'recorded': False, 'dropped': 0}
+
+        # (c) a bare member append records nothing.
+        bare = fresh()
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], outcome=bare)
+        assert bare == {'recorded': False, 'dropped': 0}
+
+        # (d) framing recorded, nothing shed.
+        framing = {
+            'root_cause': 'canonical root cause v2',
+            'evidence': 'first evidence',
+            'summary': 'first hypothesis',
+        }
+        recorded = fresh()
+        queue.add_members_to_l2(l2.id, [], outcome=recorded, **framing)
+        assert recorded == {'recorded': True, 'dropped': 0}
+
+        # (e) a framing-identical repeat is suppressed — and says so.
+        repeat = fresh()
+        queue.add_members_to_l2(l2.id, [], outcome=repeat, **framing)
+        assert repeat == {'recorded': False, 'dropped': 0}, (
+            'a suppressed repeat must not report a write'
+        )
+
+        # (f) at the cap, an append SHEDS — and the count is this call's own,
+        # not a difference inferred from a racy pre-read.
+        for i in range(_MAX_AMENDMENTS):
+            queue.add_members_to_l2(
+                l2.id, [], root_cause=f'fill {i}', evidence=f'fill evidence {i}',
+            )
+        truncating = fresh()
+        queue.add_members_to_l2(
+            l2.id, [], outcome=truncating,
+            root_cause='one past the cap', evidence='overflow evidence',
+        )
+        assert truncating == {'recorded': True, 'dropped': 1}, (
+            f'a truncating append must report both facts, got {truncating}'
+        )
+        capped = queue.get(l2.id)
+        assert capped is not None and len(capped.amendments) == _MAX_AMENDMENTS
 
     def test_amendment_list_is_capped_and_truncation_is_loud(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
