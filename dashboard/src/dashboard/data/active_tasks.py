@@ -140,11 +140,26 @@ _TASKS_PER_PROJECT_BUDGET = 7.0
 # None of them may be raised toward ``memory.mcp_tool_call``'s 10 s default.
 _TASKS_TOTAL_BUDGET = 20.0
 
-# Defensive-visibility threshold: the live-PRD terminal-member exemption (see
-# _shape_one_project) never drops rows — "all live members" is the contract,
-# not "up to N" — but a PRD with an unusually large number of live done/
-# cancelled members beyond the per-bucket cap logs a warning so a
+# Defensive-visibility threshold: a PRD with an unusually large number of live
+# done/cancelled members beyond the per-bucket cap logs a warning, so a
 # pathological case is visible rather than silently inflating the payload.
+#
+# This comment used to also assert that the exemption "never drops rows —
+# 'all live members' is the contract, not 'up to N'". _TERMINAL_FETCH_WINDOW
+# made that FALSE and the correction belongs here, at the site that states the
+# contract, not only in _shape_one_project's docstring: the exemption can only
+# exempt rows that were FETCHED, so a live PRD's done/cancelled members with
+# ids below the window's high-id end are absent from `tasks` and can never be
+# exempted at all. On a tree with more terminal tasks than the window
+# (dark-factory has ~4000 against a 400-row window) the contract in
+# plans/dashboard-taskgraph-legibility-prd.md is therefore no longer met, and
+# front-end PRD member aggregation under-counts by exactly those rows.
+#
+# Left as a disclosed narrowing rather than silently widened here: raising the
+# window to restore it trades directly against the payload budget this task
+# exists to bound, and that trade is a product decision about the PRD contract
+# rather than a defect in this module. Tracked as follow-up (see the task-3857
+# review notes) — do not "fix" it by quietly bumping the window.
 _LIVE_PRD_EXEMPTION_WARN_THRESHOLD = 200
 
 
@@ -500,6 +515,14 @@ async def _shape_one_project(
 
     # (1) active rows, SQL-filtered server-side, and (2) the compact
     # {id: status} map — concurrently, since neither depends on the other.
+    #
+    # (2) is UNCONDITIONAL, including on the scheduler path where done_count is
+    # discarded. It looks gateable on `wants_terminal` and is not: the map is
+    # also _resolve_deps' only bounded fallback for a dependency outside the
+    # fetched rows, so skipping it would silently drop dependency chips — the
+    # exact regression that fallback was added to prevent — on every render
+    # that path serves. done_count is the map's cheapest product, not its only
+    # one.
     fetched, status_map = await asyncio.gather(
         fetch_tasks(client, config, project_root, statuses=sorted(_ACTIVE_STATUSES)),
         fetch_statuses(client, config, project_root),
