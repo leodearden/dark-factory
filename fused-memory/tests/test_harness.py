@@ -7103,8 +7103,11 @@ class TestHarnessFilteredTaskTreeWiring:
         this test instead proves the ORDERING invariant that distinguishes a
         correct implementation from a buggy one: the threaded instant must be
         >= the moment the fetch returned and strictly < a timestamp recorded
-        inside the stage loop that follows it, using a real (unpatched) 50ms
-        sleep to manufacture a measurable, jitter-proof gap.
+        inside the stage loop that follows it. Stage 0's mock sleeps a real
+        (unpatched) 50ms BEFORE taking that stage_ran_at stamp, so the gap is
+        manufactured directly rather than resting on the incidental wall-clock
+        cost of the awaits in between (census fetch, graphiti health, index
+        drift, journal writes).
         """
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
@@ -7120,8 +7123,11 @@ class TestHarnessFilteredTaskTreeWiring:
         stage_state: dict = {}
 
         async def _record_stage_ran(stage):
-            stage_state['stage_ran_at'] = datetime.now(UTC)
+            # Sleep BEFORE the stamp, not after: the assertion below is
+            # fetched_at < stage_ran_at, so the manufactured gap must land
+            # ahead of the stamp to actually pad that comparison.
             await asyncio.sleep(0.05)
+            stage_state['stage_ran_at'] = datetime.now(UTC)
 
         _mock_stage_run(harness.stages[0], before_return=_record_stage_ran)
         _mock_stage_run(harness.stages[1])
@@ -13895,9 +13901,11 @@ class TestRemediationSnapshotClockPinnedToTreeRead:
     covered separately by
     TestHarnessFilteredTaskTreeWiring.test_run_full_cycle_threads_the_pre_stage_tree_read_instant_into_remediation.
 
-    All four cases sit 9 minutes clear of the 10-minute TTL boundary in
+    All five cases sit 9 minutes clear of the 10-minute TTL boundary in
     either direction, so no realistic clock drift during the test can flip a
-    verdict.
+    verdict. (The fifth, a naive-datetime instant, falls back to the same
+    fresh-now() path as the no-instant-supplied case — see
+    test_supplied_naive_instant_falls_back_to_now_with_warning.)
     """
 
     @staticmethod
@@ -14224,6 +14232,82 @@ class TestRemediationSnapshotClockPinnedToTreeRead:
         assert suppressed == [], (
             f'Expected NO suppression log; got affected_ids: '
             f'{[r.__dict__.get("affected_ids") for r in suppressed]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_supplied_naive_instant_falls_back_to_now_with_warning(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """ROBUSTNESS — a naive (tzinfo-less) filtered_task_tree_fetched_at must be
+        treated the same as a missing one, never handed to corroboration_for_task
+        as-is.
+
+        has_live_claimant compares the instant against timezone-aware
+        heartbeats; a naive datetime raises TypeError there, which is caught
+        and swallowed several frames up, leaving corroborated=None and
+        silently SUPPRESSING every stranded-work escalation in the pass — the
+        opposite of the fail-safe direction this gate is meant to take.
+        Falling back to a fresh now() — logged at WARNING with
+        reason='naive_datetime' — keeps the gate loud and evaluable instead
+        of silently swallowing the malformed input.
+
+        heartbeat_at=now-22min, naive fetched_at supplied => falls back to a
+        fresh now() => heartbeat reads as ~22 minutes old => escalates, same
+        outcome as the no-instant-at-all case, but via the naive-datetime leg
+        of the fallback.
+        """
+        from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+        now = datetime.now(UTC)
+        naive_fetched_at = (now - timedelta(minutes=21)).replace(tzinfo=None)
+        cited_task = {
+            'id': 599,
+            'title': 'In-progress task',
+            'status': 'in-progress',
+            'claimant_run_id': 'run-dbfa3df8',
+            'heartbeat_at': (now - timedelta(minutes=22)).isoformat(),
+            'metadata': {'task_kind': 'normal'},
+            'dependencies': [],
+        }
+        tree = FilteredTaskTree(active_tasks=[cited_task], total_count=1)
+
+        stranded, suppressed, received = await self._run_gate_direct(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=cited_task,
+            filtered_task_tree=tree,
+            filtered_task_tree_fetched_at=naive_fetched_at,
+        )
+
+        assert received == [False], (
+            f'Expected corroborated=False — a naive instant must fall back to '
+            f'a fresh now() rather than reach corroboration_for_task as-is; '
+            f'got {received!r}'
+        )
+        assert len(stranded) >= 1, (
+            'Expected a stranded-work escalation under the naive-instant fallback'
+        )
+        assert suppressed == [], (
+            f'Expected NO suppression log; got affected_ids: '
+            f'{[r.__dict__.get("affected_ids") for r in suppressed]}'
+        )
+
+        fallback_warnings = [
+            r for r in caplog.records
+            if r.getMessage() == 'reconciliation.remediation_tree_read_instant_missing'
+        ]
+        assert len(fallback_warnings) == 1, (
+            f'Expected exactly one fallback log record; got records: '
+            f'{[(r.levelno, r.getMessage()) for r in caplog.records]}'
+        )
+        assert fallback_warnings[0].levelno == logging.WARNING, (
+            f'Expected the fallback log at WARNING; got level '
+            f'{fallback_warnings[0].levelno}'
+        )
+        assert fallback_warnings[0].__dict__.get('reason') == 'naive_datetime', (
+            f"Expected reason='naive_datetime'; got "
+            f"{fallback_warnings[0].__dict__.get('reason')!r}"
         )
 
 
