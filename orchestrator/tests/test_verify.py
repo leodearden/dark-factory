@@ -9816,3 +9816,95 @@ class TestVersionPinSurvivesScoping:
         assert verify._scope_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE]) == (
             f'npx pyright {_ESC_3805_FILE}'
         )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end capstone: the pin must survive the REAL committed config (task 3931)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT_3931 = Path(__file__).resolve().parents[2]
+_DF_CONFIG_PATH_3931 = _REPO_ROOT_3931 / 'dark-factory-orchestrator.yaml'
+
+
+class TestFleetTypeCheckPinSurvivesTheRealFallbackPath:
+    """The committed config's pyright pin must reach the dispatched command.
+
+    Task 3931 / esc-3805-1. Every other guard in this task is over a LOCAL
+    literal or a single helper; this one runs the whole path end-to-end over
+    the config file the fleet actually loads, and it is the only assertion
+    that would have caught a DECORATIVE YAML-only pin.
+
+    This is precisely the esc-3805-1 shape: a diff touching one `.py` file
+    under a single subproject. `_build_fallback_config` takes the FILE_SCOPED
+    branch, `_scope_to_keyword` folds away the leading `cd fused-memory &&` and
+    emits `npx pyright <repo-root-relative-file>` to run FROM THE WORKTREE
+    ROOT — which is why that leg saw root-scoped pyright's 14 errors while
+    pre-commit's package-scoped leg saw 0 (closed by step 2's extraPaths
+    change).
+
+    MEASURED against the committed YAML before step 8:
+        type_check_command -> 'npx pyright orchestrator/tests/test_run_vllm_eval.py'
+    and with the same code against a pinned chain:
+        type_check_command -> 'npx pyright@1.1.408 orchestrator/tests/test_run_vllm_eval.py'
+    So the parse/render (step 4) and truncation (step 6) changes already carry
+    a pin end-to-end; what remains RED here is only that the committed chain
+    is not pinned yet.
+    """
+
+    def _fallback_type_command(self) -> str:
+        from orchestrator.config import load_config
+
+        config = load_config(_DF_CONFIG_PATH_3931)
+        mc = _build_fallback_config([_ESC_3805_FILE], config=config)
+        assert mc is not None, (
+            '_build_fallback_config returned None for a single-.py diff (task '
+            '3931) — it only does that for a zero-.py diff, so the FILE_SCOPED '
+            'path this guard exists to cover was not exercised at all'
+        )
+        return mc.type_check_command
+
+    def test_the_real_config_dispatches_a_version_pinned_pyright(self):
+        cmd = self._fallback_type_command()
+        assert 'pyright@' in cmd, (
+            f'the fallback type_check_command for the esc-3805-1 diff is {cmd!r} '
+            '— it runs an UNPINNED pyright (task 3931). Whatever version npx '
+            'last cached decides this gate, so the same diff can be green today '
+            'and red tomorrow with no code change. Note a YAML-only pin does '
+            'NOT fix this on its own: it was measured to be stripped here.'
+        )
+
+    def test_the_dispatched_pin_is_the_version_uv_lock_resolves(self):
+        """Ties the dispatched command to pre-commit's checker, not just to
+        *some* frozen version — the same equality
+        ``tests/scripts/test_fallback_verify_config.py`` asserts on the raw
+        YAML, restated here on the command actually dispatched."""
+        import tomllib
+
+        lock = tomllib.loads((_REPO_ROOT_3931 / 'uv.lock').read_text(encoding='utf-8'))
+        locked = sorted(
+            {p['version'] for p in lock.get('package', []) if p.get('name') == 'pyright'}
+        )
+        assert len(locked) == 1, f'ambiguous locked pyright version {locked} (task 3931)'
+        cmd = self._fallback_type_command()
+        assert f'npx pyright@{locked[0]} ' in cmd, (
+            f'dispatched fallback type command {cmd!r} does not pin pyright at '
+            f'the {locked[0]!r} that uv.lock resolves (task 3931) — verify and '
+            "pre-commit's `uv run pyright` would run different type-checkers."
+        )
+
+    def test_the_scoped_command_still_targets_only_the_touched_file(self):
+        """Regression floor: pinning must not disturb the FILE_SCOPED shape.
+
+        If the version were mistaken for a target (the ToolKind.NPX misparse
+        that step 4 fixed), `scope_to` would replace `pyright@<version>` with
+        the touched file and the command would lose either its tool or its
+        target. Asserting the exact whole string is what pins that.
+        """
+        cmd = self._fallback_type_command()
+        assert cmd.endswith(f' {_ESC_3805_FILE}'), cmd
+        assert cmd.count(_ESC_3805_FILE) == 1, cmd
+        assert 'cd ' not in cmd, (
+            f'{cmd!r} still carries a `cd` clause (task 3931) — the FILE_SCOPED '
+            'path runs from the worktree root, so a surviving cd would '
+            'misresolve the root-relative file path just scoped in'
+        )
