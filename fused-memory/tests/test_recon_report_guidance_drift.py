@@ -682,3 +682,102 @@ class TestFallbackIsDerivedFromTheSameRenderer:
             '_FROZEN_RECON_REPORT_SIGNATURE_SPECS in reconciliation/prompts/__init__.py '
             'to match.'
         )
+
+
+class TestEveryRegisteredToolReachesTheAgentSomehow:
+    """The end-to-end contract task 3878 was filed to close, asserted as ONE thing.
+
+    Every registered recon-report tool must be documented on at least the
+    surface its classification requires:
+
+    - ALL of them in ``RECON_REPORT_INSTRUCTIONS`` — the stage-agnostic
+      server-level listing FastMCP hands any MCP client on connect.
+    - every SHARED-GUIDANCE tool additionally in
+      ``render_recon_report_tool_guidance()`` — the block interpolated into all
+      three stage prompts, which is the only surface a stage agent actually
+      reads.
+
+    Both halves are asserted individually elsewhere in this module
+    (:class:`TestEveryRegisteredToolIsDocumented` and
+    :class:`TestSharedGuidanceToolsAreAllRendered`); they are re-asserted here
+    through the same helpers so the two halves read as one contract rather than
+    two unrelated guards a future edit can quietly split.
+
+    CANDOUR about what this proves, mirroring this module's docstring:
+
+    - The ``RECON_REPORT_INSTRUCTIONS`` half is FULLY independent. Those
+      instructions are hand-written prose that is never generated from the
+      signatures, so nothing about the tool set is being compared against
+      itself.
+    - The guidance half is only PARTIALLY independent.
+      ``render_recon_report_tool_guidance()`` derives from the same live
+      signatures this test re-reads, so it catches a filtering, lookup, or
+      placement bug — the delete_finding regression below was exactly that —
+      but it CANNOT catch a signature-source bug, because a tool missing from
+      ``get_recon_report_tool_signatures()`` disappears from both sides at
+      once. :class:`TestRendererCoversEverySignatureItIsGiven` is the
+      assertion that is independent in KIND: it injects a synthetic tool the
+      renderer has never heard of. Do not mistake this test for that one.
+    """
+
+    @pytest.mark.parametrize(
+        'tool_name', _LIVE_REPORT_TOOL_NAMES, ids=list(_LIVE_REPORT_TOOL_NAMES)
+    )
+    def test_registered_tool_reaches_the_surface_its_classification_requires(self, tool_name):
+        assert tool_name in RECON_REPORT_INSTRUCTIONS, (
+            f'`{tool_name}` is registered on the live recon_report server but is named '
+            'nowhere in RECON_REPORT_INSTRUCTIONS (server/recon_report.py) — a '
+            'registered tool absent from RECON_REPORT_INSTRUCTIONS is invisible to any '
+            'MCP client that reads the server instructions — add it there.'
+        )
+        if tool_name not in _SHARED_GUIDANCE_REPORT_TOOLS:
+            return
+        assert list(_iter_call_openers(render_recon_report_tool_guidance(), tool_name)), (
+            f'`{tool_name}` is a shared-guidance tool but no call example for it appears '
+            'in render_recon_report_tool_guidance()\'s output, so no stage agent is ever '
+            'told it exists. Either render it, or classify it in '
+            'HARNESS_CALLED_REPORT_TOOLS / STAGE_GATED_REPORT_TOOLS '
+            '(server/recon_report.py).'
+        )
+
+    def test_delete_finding_regression_stays_closed(self):
+        """delete_finding: registered and denied by no stage, but unadvertised.
+
+        Asserted BY NAME, not only through the derived sets, so the fix cannot
+        be quietly undone by reclassifying delete_finding as harness-called or
+        stage-gated — which would satisfy every derived assertion in this
+        module while putting the agent back exactly where task 3878 found it.
+        """
+        assert 'delete_finding' in _SHARED_GUIDANCE_REPORT_TOOLS, (
+            'delete_finding is no longer classified as a shared-guidance tool. It is '
+            'registered and appears in NO disallow list in cli_stage_runner.py, so every '
+            'stage can call it; classifying it otherwise hides a callable tool from the '
+            'agent, which is the exact regression task 3878 fixed.'
+        )
+        assert list(_iter_call_openers(render_recon_report_tool_guidance(), 'delete_finding')), (
+            'the rendered guidance no longer shows a delete_finding call example — task '
+            '3878 added it because an agent that filed a finding in error had no '
+            'advertised way to retract it.'
+        )
+
+    def test_write_entity_standing_decision_regression_stays_closed(self):
+        """write_entity_standing_decision: registered, but absent from the server listing.
+
+        The mirror-image regression, and asserted by name for the mirror-image
+        reason: it must stay documented in the stage-agnostic server
+        instructions AND stay stage-gated, because Stage 1 and Stage 3 deny it
+        via DISALLOW_RECON_REPORT_LEDGER_WRITES. Reclassifying it as
+        shared-guidance would advertise a durable SQLite-ledger write to two
+        stages that cannot make one.
+        """
+        assert 'write_entity_standing_decision' in RECON_REPORT_INSTRUCTIONS, (
+            'write_entity_standing_decision has been dropped from '
+            'RECON_REPORT_INSTRUCTIONS — task 3878 added it because it was the only '
+            'registered tool the server-level listing never named.'
+        )
+        assert 'write_entity_standing_decision' in STAGE_GATED_REPORT_TOOLS, (
+            'write_entity_standing_decision is no longer stage-gated. It is denied in '
+            'Stage 1 and Stage 3 via DISALLOW_RECON_REPORT_LEDGER_WRITES '
+            '(cli_stage_runner.py); if that is genuinely no longer true, the disallow '
+            'list is what should have changed first.'
+        )
