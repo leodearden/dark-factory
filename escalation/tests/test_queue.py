@@ -3217,19 +3217,24 @@ class TestAddMembersToL2:
         queue.add_members_to_l2(l2.id, ['esc-l1-1'], outcome=bare)
         assert bare == {'recorded': False, 'dropped': 0}
 
-        # (d) framing recorded, nothing shed.
-        framing = {
-            'root_cause': 'canonical root cause v2',
-            'evidence': 'first evidence',
-            'summary': 'first hypothesis',
-        }
+        # (d) framing recorded, nothing shed.  One definition of the framing
+        # text, used by both this call and the repeat below, so (e) is a true
+        # byte-identical re-promote by construction.
+        def fold(outcome: AmendmentOutcome) -> None:
+            queue.add_members_to_l2(
+                l2.id, [], outcome=outcome,
+                root_cause='canonical root cause v2',
+                evidence='first evidence',
+                summary='first hypothesis',
+            )
+
         recorded = fresh()
-        queue.add_members_to_l2(l2.id, [], outcome=recorded, **framing)
+        fold(recorded)
         assert recorded == {'recorded': True, 'dropped': 0}
 
         # (e) a framing-identical repeat is suppressed — and says so.
         repeat = fresh()
-        queue.add_members_to_l2(l2.id, [], outcome=repeat, **framing)
+        fold(repeat)
         assert repeat == {'recorded': False, 'dropped': 0}, (
             'a suppressed repeat must not report a write'
         )
