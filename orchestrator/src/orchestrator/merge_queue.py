@@ -15044,12 +15044,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # conditions -- an empty _redispatch is not the same as an
                 # empty _verifier_queue -- and cost a free host and real,
                 # ready work every time it fired while the queue was
-                # non-empty. Re-predicating onto "is _verifier_queue actually
-                # empty" (a prior revision of this comment) was still too
-                # narrow: it forfeits an item that arrives a moment *after*
-                # the guard evaluates, even though a host is free and the
-                # item is imminent (see
-                # test_late_arrival_dispatched_to_free_host_while_head_verify_runs).
+                # non-empty.
                 #
                 # The clause is gone outright: tracing every path shows it was
                 # redundant, not merely mis-predicated. With self._redispatch
@@ -15066,31 +15061,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 #      tasks via asyncio.wait(..., FIRST_COMPLETED), so a
                 #      verify completing first always ends the wait and falls
                 #      through to FINALIZE-HEAD (the esc-1735-5 anti-block
-                #      property pinned by TestLastItemOfBurstFinalizes);
-                #      otherwise (no running inflight, or no free host) the
-                #      else there breaks straight to FINALIZE-HEAD.
+                #      property); otherwise (no running inflight, or no free
+                #      host) the else there breaks straight to FINALIZE-HEAD.
                 # So the "would deadlock when the queue is empty after a
                 # cascade" hazard the original comment named cannot occur --
                 # that property was always provided by path 3 above, not by
                 # this clause. Deleting it also removes the very
                 # redispatch-sourced-vs-queue-sourced divergence that
                 # produced the bug: both kinds of dispatch now continue
-                # filling under the exact same rule (see
-                # test_empty_queue_after_redispatch_drain_still_finalizes_head
-                # for the fenced anti-deadlock invariant, and
-                # test_second_host_dispatched_from_verifier_queue_in_same_fill_pass
-                # for the primary repro this fixes).
-                #
-                # is_from_verifier_queue remains live -- it is not unused --
-                # it still selects the from_state (AWAITING_VERIFY vs
-                # REDISPATCH_PARKED) for the _note_transition call above.
+                # filling under the exact same rule. See
+                # test_merge_queue_dispatch_fill_redispatch.py for the pinned
+                # invariants this argument backs (primary repro, late
+                # arrival, and the anti-deadlock fence).
                 #
                 # Do NOT add a free_host_count() == 0 special case here for
                 # single-host: that clause already covers it -- with one
                 # slot, dispatch acquires it, free_host_count() drops to 0,
                 # and the fill loop stops after one entry, preserving the
                 # SINGLE-HOST serial degeneracy documented in this method's
-                # docstring and pinned by TestSingleHostSerialByteIdentical.
+                # docstring.
                 allocator = self._ensure_host_allocator(entry.item.request.config)
                 if allocator.free_host_count() == 0:
                     fill_done = True
