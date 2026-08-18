@@ -384,8 +384,7 @@ class TestCleanupConfigDirArchivesFirst:
         workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
         workflow.worktree = cwd
         assert workflow._config_dir is not None
-        old_path = workflow._config_dir.path
-        _src, payload = self._plant_transcript(workflow, sid='sess-wedged')
+        src, payload = self._plant_transcript(workflow, sid='sess-wedged')
 
         workflow._recycle_config_dir()
 
@@ -394,10 +393,14 @@ class TestCleanupConfigDirArchivesFirst:
             / task_assignment.task_id / ENC / 'sess-wedged.jsonl'
         )
         assert archived.read_bytes() == payload
-        assert not old_path.exists()
-        # ...and the recycle still did its job: a fresh dir is in place.
+        # The recycle rebuilds at the SAME path (TaskConfigDir is named from
+        # the task id), so "the dir is gone" is not the observable here — the
+        # transcript having left it is.
+        assert not src.exists()
+        # ...and the recycle still did its job: a fresh, empty dir is in place.
         assert workflow._config_dir is not None
         assert workflow._config_dir.path.exists()
+        assert list(workflow._config_dir.path.glob('projects/**/*.jsonl')) == []
 
     async def test_an_archiver_error_never_blocks_the_teardown(
         self, monkeypatch, git_repo, git_ops, task_assignment
