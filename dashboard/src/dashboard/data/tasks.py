@@ -71,6 +71,19 @@ from dashboard.data.utils import resolve_now
 # this inner cache.  Worst-case combined staleness ≈ caller TTL + inner TTL
 # ≈ 10 s + 20 s = 30 s — at the PRD's upper bound; intentional for a
 # monitoring view where brief staleness is preferable to MCP hammering.
+DEFAULT_PER_CALL_TIMEOUT = 2.0
+"""Per-HTTP-request budget for every ``fetch_tasks`` MCP call.
+
+Deliberately shares its public name with
+:data:`dashboard.data.task_runtime.DEFAULT_PER_CALL_TIMEOUT` so the idiom is
+recognisable across probe callers, and is the single source of the
+per-request term that ``active_tasks``'s whole-handler budget invariant
+reads (it must never be restated as a literal there).
+
+Strictly tighter than :func:`dashboard.data.memory.mcp_tool_call`'s own 10 s
+default: this seam only ever narrows a budget, never widens one.
+"""
+
 _FETCH_TASKS_TTL_SECONDS = 20.0
 _fetch_tasks_cache: TTLCache[list[dict] | dict] = TTLCache(
     ttl_seconds=lambda: _FETCH_TASKS_TTL_SECONDS
@@ -188,6 +201,11 @@ async def fetch_tasks(
     client: httpx.AsyncClient,
     config: DashboardConfig,
     project_root: str | bytes | os.PathLike[str],
+    *,
+    statuses: list[str] | None = None,
+    page_size: int | None = None,
+    offset: int = 0,
+    timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> list[dict] | dict:
     """Fetch the dashboard-shaped task list for *project_root* via MCP.
 
@@ -222,12 +240,62 @@ async def fetch_tasks(
     the tree but already done per the status map).  The pre-existing 10 s
     caller caches had this property at a narrower window; the 20 s inner cache
     widens it uniformly across all callers.
+
+    **Server-side narrowing.** *statuses*, *page_size* and *offset* are
+    forwarded to the ``get_tasks`` MCP tool. Each is added to the arguments
+    dict only when actually requested, so a caller that narrows nothing sends
+    a dict byte-identical to the pre-narrowing shape — the four full-tree
+    callers (``app._load_task_cards``, ``data.orchestrator``,
+    ``data.merge_queue``, ``data.burndown``) are unaffected.
+
+    What the substrate does with each, established by tracing
+    ``server/tools.py::get_tasks`` → ``TaskInterceptor.get_tasks`` →
+    ``SqliteTaskBackend._get_tasks_internal`` for task 3857:
+
+    * *statuses* is a REAL server-side row filter — it becomes
+      ``WHERE tag = ? AND status IN (...)`` in SQL, so narrowing with it cuts
+      backend work, not just wire bytes. ``None`` (the default) means "no
+      filter"; an EMPTY LIST is a valid, distinct "return nothing" request and
+      is therefore sent rather than dropped. A bare string is rejected
+      server-side with a ``ValidationError``.
+    * *page_size*/*offset* are a POST-FETCH in-memory slice in the tool body,
+      over a list already ordered by ascending ``id``. They cut wire bytes but
+      not backend work, and ascending id is their only ordering key — which is
+      why reaching the high-id end requires a computed *offset* rather than a
+      ``LIMIT``. *offset* is meaningless on its own and is omitted from the
+      wire unless *page_size* is set.
+
+    Two substrate gaps bound what any caller here can do, and are recorded as
+    fused-memory-side follow-up rather than faked client-side: ``get_tasks``
+    offers NO field/column projection (the backend is a hardcoded
+    ``SELECT *`` feeding a fixed 14-key row, so the heavy
+    ``description``/``details``/``testStrategy``/``metadata`` fields cannot be
+    dropped from the dashboard), and NO ``ORDER BY updated_at`` (so "the N
+    most recently updated" is not expressible server-side).
+
+    **Per-request budget.** *timeout* is threaded into
+    :func:`dashboard.data.memory.mcp_tool_call`, whose docstring is the
+    authority: it is a PER-HTTP-REQUEST budget bounding connect/read/write and
+    pool acquisition, NOT a whole-operation bound. A cold session performs
+    three posts (``initialize``, ``notifications/initialized``,
+    ``tools/call``), so the worst case here is roughly ``3 * timeout`` plus
+    the server's think time — and that is before the fan-out tries a second
+    URL. A caller needing a hard bound must still wrap this in
+    ``asyncio.wait_for``; ``active_tasks.collect_tasks_with_counts`` does, and
+    the two layers are complementary rather than redundant.
     """
     project_root_str = str(project_root)
 
+    arguments: dict = {'project_root': project_root_str}
+    if statuses is not None:
+        arguments['statuses'] = statuses
+    if page_size is not None:
+        arguments['page_size'] = page_size
+        arguments['offset'] = offset
+
     async def _call(url: str) -> list[dict]:
         result = await mcp_tool_call(
-            client, url, 'get_tasks', {'project_root': project_root_str},
+            client, url, 'get_tasks', arguments, timeout=timeout,
         )
         if 'error' in result and 'tasks' not in result:
             raise ValueError(str(result.get('error')))

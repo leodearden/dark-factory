@@ -375,7 +375,7 @@ class TestFetchTasksCache:
             'dependencies': [], 'metadata': {},
         }
 
-        async def _per_root(client, url, tool, args):
+        async def _per_root(client, url, tool, args, **_kw):
             root = args.get('project_root', '')
             if root == '/proj/A':
                 return {'tasks': [task_a_raw]}
@@ -533,7 +533,7 @@ class TestFetchTasksCache:
 
         gate = asyncio.Event()
 
-        async def _gated(client, url, tool, args):
+        async def _gated(client, url, tool, args, **_kw):
             await gate.wait()
             return _CANNED_GET_TASKS_RESULT
 
@@ -783,7 +783,7 @@ class TestFanoutStreakIsolationAcrossProjectRoots:
     @staticmethod
     def _per_root_side_effect(root_a: str, payload: dict):
         """Raise ConnectError for root A; return *payload* for any other root."""
-        async def _call(client, url, tool, args):
+        async def _call(client, url, tool, args, **_kw):
             if args.get('project_root') == root_a:
                 raise httpx.ConnectError('refused')
             return payload
