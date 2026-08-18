@@ -693,6 +693,79 @@ The server runs the same checks as a backstop, in this order:
 """
 
 
+# The Scope Boundary section shared (in substance) by IMPLEMENTER, DEBUGGER,
+# and SIMPLE_TASK (task 4370): the sandbox enforces WORKTREE containment, not
+# per-file plan scope, so every file inside the worktree is writable and
+# staying within the plan's assigned files is the agent's own responsibility,
+# self-reported via `escalate_blocker(category='scope_violation')`.
+#
+# Split into a shared factual paragraph (_SCOPE_BOUNDARY_FACTS) plus a
+# role-specific recourse paragraph (task 4370 review, suggestion 3), so the
+# facts have exactly one source of truth instead of two independently-worded
+# copies that can drift apart. The EACCES/EROFS sentence below is
+# deliberately conditioned on the sandbox actually being active: `SandboxConfig`
+# allows `enabled: false` / `backend: none`, and `resolve_active_backend` can
+# fall through to an UNSANDBOXED run when the requested/auto backend is
+# unavailable (agents/sandbox_dispatch.py) -- role prompts are static and
+# shared across every project this orchestrator dispatches for, so an
+# unconditional enforcement promise would be false on a host or project that
+# runs unsandboxed (task 4370 review, suggestion 1). Composed the same way
+# BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE compose
+# BACKGROUND_WAIT_GUIDANCE above: each half is self-contained with its own
+# leading/trailing blank line, plain `+` concatenation.
+#
+# SCOPE_BOUNDARY_GUIDANCE / SCOPE_BOUNDARY_GUIDANCE_SIMPLE remain the public
+# splice units, spliced the same way as BACKGROUND_WAIT_GUIDANCE above, so the
+# sites cannot silently drift apart and test_roles_scope_boundary.py can guard
+# the splice structurally (`SCOPE_BOUNDARY_GUIDANCE in role.system_prompt`)
+# instead of pinning prose.
+_SCOPE_BOUNDARY_FACTS = """
+## Scope Boundary
+
+The sandbox enforces worktree containment, not per-file plan scope. When
+the OS sandbox is active, writes outside this worktree — the main
+checkout, sibling task worktrees, other tasks' `.task-meta/` directories,
+`git update-ref refs/heads/main`, `~/.claude` — fail with EACCES or EROFS.
+But do not rely on that: the sandbox is not always active (some hosts or
+projects run unsandboxed), so treat everything outside this worktree as
+off-limits regardless. Every file INSIDE this worktree, by contrast, IS
+writable, including files never listed in the plan's assigned scope —
+nothing in the sandbox stops you from editing outside scope, and nothing
+else detects it either.
+
+Staying within the plan's assigned files is therefore your responsibility,
+not the sandbox's.
+"""
+
+
+# IMPLEMENTER/DEBUGGER's recourse: escalate and keep working in this same
+# session. Concatenated onto _SCOPE_BOUNDARY_FACTS below -- never used alone.
+_SCOPE_BOUNDARY_RECOURSE = """
+If you genuinely need to modify files outside your assigned scope, that is
+the ONLY mechanism to request it: call `escalate_blocker` with
+`category='scope_violation'` BEFORE making the edit, rather than widening
+scope on your own.
+"""
+
+
+# SIMPLE_TASK's deliberately different recourse: it routes an out-of-scope
+# write back to the architect rather than just naming the escalation call,
+# since SIMPLE_TASK has no separate architect phase of its own to fall back
+# on mid-session -- stopping and letting the full architect+implementer path
+# pick the task back up IS its recourse. Concatenated onto
+# _SCOPE_BOUNDARY_FACTS below -- never used alone.
+_SCOPE_BOUNDARY_RECOURSE_SIMPLE = """
+If you need to modify files outside scope, that's a signal the task does
+not fit the simple path. Call `escalate_blocker` with
+`category='scope_violation'` — it is the only mechanism to request scope
+expansion — then stop and let the architect take over.
+"""
+
+
+SCOPE_BOUNDARY_GUIDANCE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE
+SCOPE_BOUNDARY_GUIDANCE_SIMPLE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE_SIMPLE
+
+
 ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
@@ -852,17 +925,7 @@ The workflow for each step is:
 2. Run tests to verify
 3. Stage and commit ONLY the code: `git add -- .`
 4. Call `mark_step_done(step_id, commit_sha)` to record the step as complete
-
-## Scope Boundary
-
-Your write access is restricted to the files assigned to this task. If you attempt
-to modify files outside these directories, you will get a permission error. This is
-intentional — it prevents cross-task interference during concurrent execution.
-
-If you genuinely need to modify files outside your assigned scope, this indicates
-the task's scope needs expansion. Use the escalate_blocker tool to request scope
-expansion rather than trying to work around the restriction.
-
+""" + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
 - Run tests frequently to verify your work.
@@ -917,17 +980,7 @@ git add -- .
 
 As a backstop, a pre-commit hook silently strips any `.task/` path that
 still ends up staged.
-
-## Scope Boundary
-
-Your write access is restricted to the files assigned to this task. If you attempt
-to modify files outside these directories, you will get a permission error. This is
-intentional — it prevents cross-task interference during concurrent execution.
-
-If you genuinely need to modify files outside your assigned scope, this indicates
-the task's scope needs expansion. Use the escalate_blocker tool to request scope
-expansion rather than trying to work around the restriction.
-
+""" + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
 - Read the failing test/code carefully before making changes.
@@ -1915,13 +1968,7 @@ git add -- .
 # WRONG — force-adds .task/ past the gitignore (never do this):
 # git add -f .task/plan.json
 ```
-
-## Scope Boundary
-
-Your write access is restricted to the files assigned to this task. If you
-need to modify files outside scope, that's a signal the task does not fit
-the simple path — stop and let the architect take over.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash',
         *_ESCALATION_TOOLS,
