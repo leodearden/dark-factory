@@ -519,6 +519,53 @@ kind, so a future fifth structural path is covered by construction.
 # they cannot yet distinguish "swept a complete corpus" from "swept what we
 # could fetch".  Filed as ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH.
 #
+# MEASURED COST of paging, and the keyset rewrite it rules out.  Measured
+# 2026-08-18 against localhost:6379, warm, 3 repeats, median reported; the
+# whole enumeration (census + every page), page_size 5000:
+#
+#     graph          read          UNPAGINATED     PAGED       rows
+#     dark_factory   entity nodes     860 ms      862 ms      16262
+#     dark_factory   valid edges      771 ms     3301 ms      25382
+#     reify          entity nodes    3326 ms     1498 ms      23671
+#     reify          valid edges     3126 ms     3685 ms      31783
+#
+# The UNPAGINATED column is the OLD behaviour and returned 10000 truncated
+# rows for its money, so it is a cost floor, not a comparable answer.  One
+# full detect_stale_with_edges (both reads) costs ~4.2 s on dark_factory —
+# about +2.6 s per reconciliation cycle — and ~5.2 s on reify, which is
+# FASTER than the ~6.5 s the two truncated reads used to cost there.  Paging
+# a large result set in 5000-row chunks beats transferring one 10000-row set.
+#
+# KEYSET/SEEK PAGINATION WAS TRIED AND DECLINED, on measurement rather than
+# on taste.  The concern it answers is real in principle: ORDER BY ... SKIP k
+# LIMIT n re-scans and re-sorts the whole matched population per page, so an
+# enumeration is O(P * N log N) where a seek would be O(N log N).  For the
+# node read the seek form is available — `WHERE n.uuid > $last ORDER BY
+# n.uuid LIMIT k` over the RANGE index ensure_indices creates on
+# Entity(uuid).  Measured head to head, running SEEK FIRST each round so any
+# warm-cache advantage favoured it:
+#
+#     graph          node SEEK (keyset)        node SKIP (offset)
+#     dark_factory   [781, 904, 862] ms        [796, 862, 1610] ms
+#     reify          [1414, 1310, 1577] ms     [1814, 1498, 1214] ms
+#
+# Indistinguishable — identical medians on dark_factory, ~6% on reify, well
+# inside the run-to-run spread.  The asymptotic argument does not bite at
+# this N: 4-5 pages over ~16-24k rows, where the sort is not the bottleneck.
+# So a second paging mode in _paged_ro_query would buy no measured latency
+# and cost a second code path to keep correct.  Re-open only WITH a
+# measurement showing the sort dominating — and note the edge read, which is
+# the expensive one, cannot use it anyway: its ORDER BY is the composite
+# (e.uuid, n.uuid) needed for a total order over ROWS.
+#
+# DOWNSTREAM FAN-OUT, the other cost this fix moved.  detect_stale_dry_run
+# issues one get_valid_edges_for_node per non-empty-summary entity, and now
+# runs over the COMPLETE node set instead of a truncated 10000.  Measured
+# 0.70 ms/entity amortised at max_concurrency=10 on dark_factory (0.39 ms on
+# reify), so the full fan-out is ~9.0 s against ~7.0 s before (dark_factory)
+# and ~8.8 s against ~3.9 s (reify).  Seconds, bounded, and it is the price
+# of the answer being right; it is not a liveness risk at these sizes.
+#
 # RESIDUAL LEFT OPEN DELIBERATELY, and not an oversight: a materially-short
 # INCOMPLETE_SHORT_READ still returns a partial collection that the
 # force=True path (memory_service.py:5826-5834, MemoryService.rebuild_entity_summaries)
@@ -770,18 +817,13 @@ async def _paged_ro_query(
       the design warns rather than raises on them: raising would take down
       the reconciliation rebuild for something that self-heals next cycle.
 
-    KNOWN RESIDUAL, left open deliberately (task 4340).  A materially-short
-    ``INCOMPLETE_SHORT_READ`` still returns a partial collection, and the
-    ``force=True`` rebuild path (memory_service.py, ``rebuild_entity_summaries``)
-    will write ``''`` back over the summary of any entity whose edges fell in
-    the missing remainder.  Tightening this guard into a raise is the WRONG
-    fix and must not be done here: guard 4 fires on any shortfall at all,
-    including a single concurrently-invalidated edge, so raising would take
-    down the live rebuild for exactly the transient described above.  The
-    right fix is a policy on *how short is too short*, applied at the
-    consumer, where the destructive write is actually decided — the same
-    place ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH (wire the completeness signal
-    through to consumers) has to touch.
+    KNOWN RESIDUAL, left open deliberately (task 4340): a materially-short
+    ``INCOMPLETE_SHORT_READ`` still returns a partial collection that the
+    ``force=True`` rebuild path writes back.  Tightening guard 4 into a raise
+    is the WRONG fix — it fires on a single concurrently-invalidated edge, so
+    it would take down the live rebuild for exactly the transient described
+    above.  Full statement, the affected call site, and the ticket that closes
+    it are in the RESULT-SET CAP AUDIT block at the top of this module.
 
     Args:
         graph: FalkorDB graph handle exposing ``async ro_query(cypher, params)``.
@@ -2217,48 +2259,21 @@ class GraphitiBackend:
 
         PAGINATED (task 4340).  This read is NOT a single query: FalkorDB
         truncates every result set at a server-wide RESULTSET_SIZE ceiling,
-        silently, and this query exceeds it on the live corpus.  Measured
-        2026-08-17 with RESULTSET_SIZE=10000::
+        silently, and this query exceeded it by roughly 2x on the live corpus
+        — about HALF the valid-edge population was invisible to every caller,
+        with no error and no marker.  Do not "simplify" it back to one query.
+        The measured row counts, the paging cost, and the per-query audit that
+        found this live in the RESULT-SET CAP AUDIT block at the top of this
+        module (the single place they are recorded, so a re-measurement is a
+        one-block edit); the ORDER BY and completeness rules that make paging
+        safe are in _paged_ro_query.
 
-            graph          rows    distinct edges   an unpaginated read saw
-            dark_factory   24938        12506       10000 rows / 6376 edges (51%)
-            reify          31621        15871       10000 rows
-
-        So roughly HALF the valid-edge corpus was invisible to every caller,
-        with no error and no marker.  Do not "simplify" this back to one
-        query; see _paged_ro_query for the ORDER BY and completeness rules
-        that make paging safe.
-
-        INCOMPLETENESS POLICY — SPLIT BY KIND, and the split is the point:
-
-          STRUCTURAL (``INCOMPLETE_STRUCTURAL_KINDS``) -> RAISES
-          ``IncompleteEnumerationError``.  A refusal issues zero queries, so
-          its emptiness is fabricated, not observed; a page-cap read returns a
-          PREFIX in uuid order, so entities sorting into the unread tail look
-          edge-less.  Returning either as a dict is indistinguishable from a
-          real answer, and the consumer downstream is a WRITE that blanks
-          summaries — see IncompleteEnumerationError.
-
-          EMPIRICAL (census unavailable, or a short read) -> WARNs naming the
-          numbers and returns what it fetched, exactly as before.
-
-        This is NOT a reversal of the warn-not-raise decision; that decision
-        was reasoned about the CENSUS-DISAGREEMENT case, which is transient —
-        these graphs are written to continuously, so raising there would take
-        down rebuild_entity_summaries, both reconciliation sweeps and a
-        cleanup script for something that self-heals next cycle.  A structural
-        failure is not transient: it issues zero queries, is fully determined
-        by configuration, and reproduces identically on retry.  Neither
-        structural kind is even reachable at the shipped defaults (page_size
-        5000 < cap 10000; max_pages 1000 x 5000 = 5,000,000 rows against a
-        live maximum near 32,000), so this raise cannot fire in production
-        today — it fires only under the misconfiguration or downward re-tune
-        that would otherwise silently corrupt the graph.  Safety at zero flap
-        risk, which is the opposite of the trade-off that decision rejected.
-
-        The completeness signal is also available as a first-class value from
-        enumerate_all_valid_edges, which never raises, for consumers that want
-        to inspect it rather than be interrupted by it.
+        Incompleteness is handled by the shared _apply_incompleteness_policy:
+        STRUCTURAL kinds raise IncompleteEnumerationError, EMPIRICAL ones warn
+        and return what was fetched.  See that helper for the policy and
+        IncompleteEnumerationError for why a structural non-read must not be
+        handed back as a collection.  enumerate_all_valid_edges returns the
+        same completeness signal as a value and never raises.
 
         Args:
             group_id: Project graph to query.
@@ -3607,11 +3622,9 @@ class GraphitiBackend:
         group_id filter is needed in the Cypher itself.  Uses ro_query since
         no writes are performed.
 
-        PAGINATED (task 4340).  Measured 2026-08-17 with RESULTSET_SIZE=10000::
-
-            graph          Entity nodes   an unpaginated read saw
-            dark_factory       16038          10000  (62%)
-            reify              23589          10000  (42%)
+        PAGINATED (task 4340).  This read was truncated at the same server-wide
+        RESULTSET_SIZE ceiling as get_all_valid_edges — measured counts in the
+        RESULT-SET CAP AUDIT block at the top of this module.
 
         THE COMPOUNDING HAZARD, and the reason this method is in scope for a
         task nominally about edges: ``detect_stale_with_edges`` calls this
@@ -3623,15 +3636,9 @@ class GraphitiBackend:
         rather than merely under-reporting, which is why it was fixed rather
         than deferred.
 
-        Like get_all_valid_edges, this applies the SPLIT incompleteness
-        policy: it RAISES ``IncompleteEnumerationError`` on a structurally
-        incomplete enumeration (``INCOMPLETE_STRUCTURAL_KINDS`` — a read that
-        was never validly performed, whose emptiness or prefix is fabricated
-        rather than observed), and WARNs-and-returns on an empirically
-        incomplete one (a census disagreement, which on a continuously-written
-        graph is a transient that self-heals next cycle).  See
-        get_all_valid_edges for the full rationale, and enumerate_entity_nodes
-        for the never-raising variant that returns the signal instead.
+        Incompleteness is handled by the same shared
+        _apply_incompleteness_policy get_all_valid_edges uses; see that helper.
+        enumerate_entity_nodes returns the signal as a value and never raises.
 
         Args:
             group_id: Project graph to query.

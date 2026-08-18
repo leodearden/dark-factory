@@ -113,13 +113,14 @@ rate; do not re-open them:
    are unaffected; what does not stand is the scope of the ruling-out.
    Those grounds covered query FILTERS only and were silent about
    server-side TRUNCATION.  Task 4340 measured a FalkorDB
-   ``RESULTSET_SIZE=10000`` cap silently truncating that very query:
-   10000 of 24938 rows on dark_factory, i.e. 6376 of 12506 distinct valid
-   edges — 51%.  So at the time of the task-2613 investigation this sweep
-   saw roughly HALF the valid-edge corpus, and the miss rate was computed
-   against a truncated denominator.  ``get_all_valid_edges`` is paginated
-   as of task 4340 and the truncation is gone, but the RATE has not been
-   recomputed: a re-measurement against the now-complete corpus is
+   ``RESULTSET_SIZE`` cap silently truncating that very query to roughly
+   HALF the valid-edge corpus on dark_factory (exact figures: the
+   RESULT-SET CAP AUDIT block in ``backends/graphiti_client.py``, which is
+   the one place they are recorded).  So at the time of the task-2613
+   investigation this sweep saw about half the edges, and the miss rate was
+   computed against a truncated denominator.  ``get_all_valid_edges`` is
+   paginated as of task 4340 and the truncation is gone, but the RATE has
+   not been recomputed: a re-measurement against the now-complete corpus is
    warranted, and the residuals list above is calibrated against the old
    figure.  Filed as ticket tkt_0RSJP92VQNATQB0FSR20YMXGW8 (a TICKET id,
    not a task id — the curator resolves it to a task asynchronously).  Do
@@ -134,10 +135,11 @@ Why a regex in this module gets a performance test at all:
 ``sweep_stale_status_snapshot_edges`` calls
 ``extract_snapshot_edge_task_ids`` once per valid edge from an UNGUARDED
 dict comprehension with no per-edge timeout, over the whole group's edge
-set (~12506 edges on dark_factory, ~15871 on reify, measured 2026-08-17).
-Extractor cost is therefore a whole-cycle LIVENESS property — one
-pathological fact stalls the entire reconciliation cycle — not a
-micro-optimisation. (amendment, task 3079)
+set (tens of thousands of edges; current figures in the RESULT-SET CAP
+AUDIT block in ``backends/graphiti_client.py``).  Extractor cost is
+therefore a whole-cycle LIVENESS property — one pathological fact stalls
+the entire reconciliation cycle — not a micro-optimisation. (amendment,
+task 3079)
 
 The figure was ~5868 in the task-3042 record; that number is consistent
 with a truncated enumeration and has been corrected upward by task 4340's
@@ -145,7 +147,11 @@ live census (see the amendment to ruled-out hypothesis 1 above). The
 LIVENESS argument gets STRONGER, not weaker: with the truncation removed
 the per-edge extractor now runs over roughly twice as many edges per
 cycle, so the per-edge cost this test guards matters more than the
-original number implied, not less. (amendment, task 4340)
+original number implied, not less.  The read that feeds it was timed
+2026-08-18 at ~3.3 s per full enumeration on dark_factory (~3.7 s on
+reify) — bounded, and roughly +2.6 s per cycle over the old truncated
+read; see the MEASURED COST section of that same audit block, so this
+claim rests on a number rather than on an estimate. (amendment, task 4340)
 """
 
 from __future__ import annotations
