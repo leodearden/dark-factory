@@ -1056,18 +1056,39 @@ fi
 # bring-up on precisely the state we chose not to auto-fix. Contrast the
 # orchestrator gate above, which may fail — that one guards an install this
 # script actually performs.
-if [ ! -f "$REPO_ROOT/scripts/check_lms_unit_parity.py" ] \
+# Same exit-2 overloading as the gates above: 2 is the checker's own benign
+# "not installed", AND python3 refusing to open a renamed script, AND argparse
+# rejecting a renamed flag. Only the first carries the checker's own
+# [lms_unit_parity] tag, so the status is not read as a verdict without one.
+# The tag is on every emitted line by construction (LOG_TAG in
+# check_lms_unit_parity.py), so its absence is conclusive rather than a
+# heuristic. Warn-only here too: a gate that did not run must be loud, but it
+# still must not brick bring-up.
+_lms_parity_script="$REPO_ROOT/scripts/check_lms_unit_parity.py"
+
+if [ ! -f "$_lms_parity_script" ] \
    || [ ! -f "$REPO_ROOT/scripts/local-model-serving/lms-arm@.service" ]; then
   # A checkout without the checker is not a host with a drop-in. Reporting it
   # as one is the same credibility leak as warning on exit 2.
   info "lms-arm@ unit: parity checker not present in this checkout — skipped"
-elif python3 "$REPO_ROOT/scripts/check_lms_unit_parity.py" \
-       --installed-dir "$UNIT_DIR" \
-       --repo-root     "$REPO_ROOT"; then
-  ok "lms-arm@ unit: parity with the committed template (effective configuration verified)"
 else
-  _lms_parity_exit=$?
-  if [ "$_lms_parity_exit" -eq 2 ]; then
+  # 2>&1 keeps a report written to stderr out of the operator's blind spot.
+  # The `&& x=0 || x=$?` idiom is what keeps `set -e` from aborting here.
+  _lms_parity_out="$(python3 "$_lms_parity_script" \
+       --installed-dir "$UNIT_DIR" \
+       --repo-root     "$REPO_ROOT" 2>&1)" && _lms_parity_exit=0 || _lms_parity_exit=$?
+  printf '%s\n' "$_lms_parity_out"
+
+  # Matched in bash, not through a pipe to grep — see the orchestrator gate
+  # above for why a `printf | grep -q` here can report "it did not run" on a
+  # report that carries the tag.
+  if [[ "$_lms_parity_out" != *'[lms_unit_parity]'* ]]; then
+    warn "lms-arm@ unit: parity gate produced no [lms_unit_parity] report"
+    warn "  (status $_lms_parity_exit) — it did not run, so its status says"
+    warn "  nothing about this host. Check the script path and its flags."
+  elif [ "$_lms_parity_exit" -eq 0 ]; then
+    ok "lms-arm@ unit: parity with the committed template (effective configuration verified)"
+  elif [ "$_lms_parity_exit" -eq 2 ]; then
     info "lms-arm@ unit: not installed on this host (install with scripts/local-model-serving/install-lms-units.sh)"
   else
     # Exit 1 is "drift OR unverifiable" — it also covers a drop-in override and

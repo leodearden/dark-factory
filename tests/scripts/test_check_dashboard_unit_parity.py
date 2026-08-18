@@ -2732,13 +2732,20 @@ _PARITY_SCRIPT_RE = re.compile(
 
 # Deliberate, updated by hand when a site is added or removed. Today: the
 # orchestrator gate, the section-8 dashboard pre-install gate, the section-12
-# fused-memory health check, and the section-12 dashboard post-install check.
+# fused-memory health check, the section-12 dashboard post-install check, and
+# the section-12 lms-arm@ health check.
+#
+# The lms-arm@ site is why this number is 5 and not 4: it landed on main from
+# task 3775 while this change was in flight, carrying the same bare `-eq 2`
+# read, and the sweep DISCOVERED it rather than being told about it. That is
+# the mechanism working, not a surprise to paper over — the count moved in the
+# same commit that fixed the site.
 #
 # An inequality would let the post-install site — the one this change fixes —
 # be deleted outright with the guard still green, and the sweep below runs one
 # case per DISCOVERED site, so there is no cap to keep a new one from being
 # inspected.
-_KNOWN_PARITY_CALL_SITES = 4
+_KNOWN_PARITY_CALL_SITES = 5
 
 
 def _parity_call_sites() -> list[tuple[int, str, str]]:
@@ -2782,7 +2789,7 @@ def test_the_sweep_finds_every_known_parity_call_site():
 
     assert len(sites) == _KNOWN_PARITY_CALL_SITES, (
         f"Expected {_KNOWN_PARITY_CALL_SITES} parity call sites (orchestrator, "
-        f"dashboard pre-install, fused-memory, dashboard post-install); found "
+        f"dashboard pre-install, fused-memory, dashboard post-install, lms-arm@); found "
         f"{len(sites)}: {[(lineno, name) for lineno, name, _ in sites]}. "
         "Adding or removing a site is a deliberate act — update the count here "
         "in the same change. If the sweep below stops matching, it silently "
@@ -2798,6 +2805,36 @@ def test_the_sweep_finds_every_known_parity_call_site():
 _PARITY_CALL_SITES = _parity_call_sites()
 
 
+# A repo file a block refuses to run without, named literally in one of its
+# `[ -f "$REPO_ROOT/..." ]` guards. The lms-arm@ gate has two such inputs (its
+# checker AND the committed unit template); the other four have only the
+# checker, which they reach through their `_<gate>_parity_script` variable and
+# so never spell here.
+_GUARDED_REPO_INPUT_RE = re.compile(
+    r"\[\s*!?\s*-f\s+\"\$\{?REPO_ROOT\}?/(?P<path>[\w./@+-]+)\"\s*\]"
+)
+
+
+def _materialize_guarded_inputs(repo: pathlib.Path, block: str, checker: str):
+    """Create every OTHER repo input the block's existence guards require.
+
+    Without this, a gate guarding on a second file short-circuits to its
+    "inputs absent" arm and never reaches the status handling under test — a
+    vacuous case. Not silent if this stops matching: the case-1 assertion below
+    demands a loud line, and a short-circuited block emits none.
+
+    The checker itself is deliberately NOT created here; whether it exists is
+    exactly what the two cases vary.
+    """
+    for match in _GUARDED_REPO_INPUT_RE.finditer(block):
+        path = match.group("path")
+        if path.endswith(checker):
+            continue
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()
+
+
 @pytest.mark.parametrize(
     "lineno,checker,block",
     _PARITY_CALL_SITES,
@@ -2811,9 +2848,29 @@ def test_every_parity_call_site_refuses_a_status_the_checker_did_not_produce(
     Exit 2 is overloaded three ways — the checker's own benign verdict,
     `python3` refusing to open a missing script, and argparse rejecting an
     unknown flag. So each site is RUN here against both non-checker sources of
-    a 2, and must speak only in `fail()`: no `OK `, no `WARN `, no `==> `,
-    because every one of those is the block telling the operator something
-    about a host nothing examined.
+    a 2, and neither may end in a verdict about this host.
+
+    ASSERTED PER CASE, because the two differ in what a site can honestly say:
+
+    * The checker EXISTS and exits 2 without reporting (a renamed flag). The
+      block ran something and got back a status it cannot interpret, so it must
+      refuse LOUDLY — a `FAIL ` or a `WARN ` — and may not answer with `OK ` or
+      an `==> ` info, which are the shapes of a verdict about the host. This
+      case is what pins the rule at every site: an existence guard cannot
+      short-circuit it, so the status handling always runs.
+    * The checker is ABSENT. A site with an existence guard never invokes
+      `python3` at all and says so — at whatever severity its gate speaks in,
+      `fail()` for the four that may fail, `info()` for the warn-only lms-arm@
+      gate whose own suite forbids `fail` outright
+      (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
+      Both are honest, and severity alone cannot tell an honest "the checker is
+      not here" from a dishonest "not installed on this host". So this case
+      pins only the outcome no vocabulary makes acceptable: never `OK `, never
+      a claim of parity from a checker that could not even be opened.
+
+    Requiring `fail()` specifically, as this test first did, was a vocabulary
+    assumption rather than a rule: it could not be satisfied by a gate that is
+    deliberately warn-only, which is what the lms-arm@ site is.
 
     Behavioural on purpose. The predecessor asserted on setup-host.sh's SOURCE
     SPELLING (a literal `grep -q`, a POSIX `[ -f `), which rejected strictly
@@ -2831,7 +2888,8 @@ def test_every_parity_call_site_refuses_a_status_the_checker_did_not_produce(
     the output validation refuses that status exactly as before — so the
     epistemics survive and only the operator-facing wording gets worse. The
     marker check is the load-bearing guard; the existence test is legibility.
-    Deleting the output validation instead (the real defect) does fail here.
+    Deleting the output validation instead (the real defect) does fail here —
+    at every site, in the renamed-flag case.
     """
     cases = (
         ("a renamed or moved checker (python3 itself exits 2)", None, False),
@@ -2846,6 +2904,7 @@ def test_every_parity_call_site_refuses_a_status_the_checker_did_not_produce(
         work = tmp_path / f"case{index}"
         work.mkdir()
         repo = checker_repo(work, checker, body=body, with_checker=with_checker)
+        _materialize_guarded_inputs(repo, block, checker)
         result = run_section(
             work,
             block,
@@ -2856,15 +2915,25 @@ def test_every_parity_call_site_refuses_a_status_the_checker_did_not_produce(
         )
         out = result.stdout + result.stderr
 
-        assert "FAIL " in out, (
+        assert "OK " not in out, (
+            f"The parity call site at setup-host.sh:{lineno} reported PARITY "
+            f"with {label} — a green verdict on the strength of an exit status "
+            f"its checker never produced.\n{out}\n---\n{block}"
+        )
+
+        if not with_checker:
+            # Nothing was invoked, so saying so at any severity is honest; see
+            # the docstring for why severity cannot separate the two cases here.
+            continue
+
+        assert "FAIL " in out or "WARN " in out, (
             f"The parity call site at setup-host.sh:{lineno} ran with {label} "
             f"and never said so. A status the checker did not produce must be "
             f"reported loudly, not read as a verdict.\n{out}\n---\n{block}"
         )
-        for prefix, kind in (("OK ", "ok"), ("WARN ", "warn"), ("==> ", "info")):
-            assert prefix not in out, (
-                f"The parity call site at setup-host.sh:{lineno} emitted a "
-                f"{kind}() line with {label} — it reported something about "
-                f"this host on the strength of an exit status the checker "
-                f"never produced.\n{out}\n---\n{block}"
-            )
+        assert "==> " not in out, (
+            f"The parity call site at setup-host.sh:{lineno} emitted an info() "
+            f"line with {label} — it reported something about this host on the "
+            f"strength of an exit status the checker never produced.\n{out}\n"
+            f"---\n{block}"
+        )
