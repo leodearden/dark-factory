@@ -2522,6 +2522,138 @@ class TestPromoteToL2SeverityInheritance:
 
 
 # ---------------------------------------------------------------------------
+# TestPromoteToL2SeverityInResponse: the response reports what was filed
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2SeverityInResponse:
+    """promote_to_l2 reports the severity it ACTUALLY filed (task 3976).
+
+    A caller that omits `severity` now gets a value it did not choose, so it
+    must be able to see what it inherited — otherwise the rotation digest can
+    only report what the watcher *asked for*, which is no longer the same
+    thing.  Purely additive: the existing keys are untouched.
+    """
+
+    def _seed_l1(
+        self, queue: EscalationQueue, esc_id: str, task_id: str, severity: str,
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity=severity,
+            category='design_concern',
+            summary='L1 cluster member',
+            level=1,
+        )
+        queue.submit(esc)
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_create_response_reports_the_inherited_severity(
+        self, tmp_path: Path,
+    ):
+        """(a) An inherited severity is visible in the response and matches disk."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+
+        assert result['severity'] == 'info', (
+            f'Response must report the inherited severity, got: {result}'
+        )
+        assert result['severity'] == queue.get(result['id']).severity
+
+    @pytest.mark.asyncio
+    async def test_create_response_reports_an_explicit_severity(
+        self, tmp_path: Path,
+    ):
+        """(b) An explicit severity round-trips through the response."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'member_ids': ['esc-l1-info'],
+                'severity': 'critical',
+            },
+        )
+
+        assert result['severity'] == 'critical', f'Got: {result}'
+        assert result['severity'] == queue.get(result['id']).severity
+
+    @pytest.mark.asyncio
+    async def test_create_response_reports_the_fail_safe_severity(
+        self, tmp_path: Path,
+    ):
+        """(c) The fail-safe value is reported too — silence must stay legible."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-1']},
+        )
+
+        assert result['severity'] == 'blocking', f'Got: {result}'
+        assert result['severity'] == queue.get(result['id']).severity
+
+    @pytest.mark.asyncio
+    async def test_update_response_reports_the_post_floor_severity(
+        self, tmp_path: Path,
+    ):
+        """(d) On an append the response carries the RAISED value, not the pre-append one."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+        assert first['severity'] == 'info'
+
+        self._seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
+        second = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
+        )
+
+        assert second['status'] == 'updated'
+        assert second['severity'] == 'blocking', (
+            f'Response must report the post-floor severity, got: {second}'
+        )
+        assert second['severity'] == queue.get(second['id']).severity
+
+    @pytest.mark.asyncio
+    async def test_existing_response_keys_are_unchanged_on_both_paths(
+        self, tmp_path: Path,
+    ):
+        """(e) The added key is purely additive — no existing consumer breaks."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        created = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+        updated = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-other']},
+        )
+
+        assert created['status'] == 'created'
+        assert updated['status'] == 'updated'
+        for result in (created, updated):
+            assert {'id', 'status', 'members'} <= result.keys(), (
+                f'An existing response key went missing: {result}'
+            )
+
+
+# ---------------------------------------------------------------------------
 # TestPromoteToL2SeverityFloorOnUpdate: post-mint monotonicity
 # ---------------------------------------------------------------------------
 
