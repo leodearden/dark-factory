@@ -6988,6 +6988,55 @@ class TestSweepStalePersistenceMarkers:
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) >= 1
 
+    @pytest.mark.asyncio
+    async def test_kind_only_member_emits_no_drift_warning_single_variant_pool(self, caplog):
+        """The under-tagged-marker drift diagnostic (task 3915 step-8) is
+        gated to `len(filter_variants) > 1` so the two single-dict callers
+        keep byte-for-byte unchanged log output — this pool
+        (_sweep_stale_persistence_markers, enum_filters=None) is one of
+        them. A member carrying only 'kind' with no 'source' key is exactly
+        the drifted shape the diagnostic looks for on the multi-variant
+        stage1_flag_marker pool, but here — reached via the single
+        {'source': 'stage2_persistence_marker'} filter, meaning a real
+        Qdrant scroll could never have returned it in the first place — no
+        drift WARNING must fire regardless. A future refactor that dropped
+        the multi-variant gate would leave the two existing drift tests on
+        TestSweepStaleMem0FlagMarkers green while silently changing this
+        sweep's log output; this test pins that it does not."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_persistence_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'kind-only',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage2_persistence_marker', 'flag_id': 'f1'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_persistence_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now,
+            )
+
+        # The member is still deleted normally (age-GC does not consult
+        # 'source'/'kind' at all) — only the drift diagnostic is at issue.
+        assert result == 1
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'under-tagged' in rec.message.lower()
+            for rec in caplog.records
+        )
+
 
 class TestSweepStaleMem0FlagMarkers:
     """_sweep_stale_mem0_flag_markers age-GCs the legacy stage1_flag_marker Mem0
@@ -7621,15 +7670,20 @@ class TestSweepStaleMem0FlagMarkers:
     @pytest.mark.asyncio
     async def test_kind_only_members_emit_metadata_drift_warning(self, caplog):
         """Task 3915 step-8: the union filter now REACHES kind-only,
-        source-less members (root cause C), but the LLM add_memory writer
-        that produces them is still live and unconstrained. Mirroring
-        _warn_on_flag_for_stage2_type_drift's posture (task 2966), the
-        sweep must emit exactly ONE loud, purely-diagnostic WARNING naming
-        the count of under-tagged members and the log_name, so a
-        still-drifting writer surfaces instead of silently refilling the
-        pool the fix just drained. The warning must never affect the
-        sweep's own delete/return behaviour — all three members here are
-        stale and unprotected, so all three must still be deleted."""
+        source-less members (root cause C) — records written before (or
+        outside) the task-2596 add_memory gate that now rejects that exact
+        shape for 'recon-stage-*' agent_ids (server/tools.py:2978-2993).
+        Mirroring _warn_on_flag_for_stage2_type_drift's posture (task 2966),
+        the sweep must emit exactly ONE loud, purely-diagnostic WARNING
+        naming the count of under-tagged members and the log_name, so any
+        residual non-'recon-stage-*' writer surfaces instead of silently
+        refilling the pool the fix just drained. The warning must never
+        affect the sweep's own delete/return behaviour — all three members
+        here are stale and unprotected, so all three must still be
+        deleted. get_memories_by_metadata is filter-aware (side_effect)
+        so this pins that the `kind`-only members are actually surfaced by
+        the `{'kind': ...}` variant's scroll, not just present in an
+        unrealistic filter-blind mock return."""
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _sweep_stale_mem0_flag_markers,
         )
@@ -7661,9 +7715,17 @@ class TestSweepStaleMem0FlagMarkers:
             filters = kwargs.get('filters') or {}
             return 1 if filters == {'kind': 'stage1_flag_marker'} else 0
 
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                return [m for m in members if m['metadata'].get('source') == 'stage1_flag_marker']
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return [m for m in members if m['metadata'].get('kind') == 'stage1_flag_marker']
+            return []
+
         memory_service = AsyncMock()
         memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
         with caplog.at_level(
@@ -7698,7 +7760,12 @@ class TestSweepStaleMem0FlagMarkers:
         """Complementary case (task 3915 step-7): when every enumerated
         member carries 'source', there is no under-tagged cohort and the
         drift WARNING must stay silent — the diagnostic must not fire on
-        the canonical, correctly-tagged shape."""
+        the canonical, correctly-tagged shape. get_memories_by_metadata is
+        filter-aware (side_effect) so canonical-2 (source only, no 'kind'
+        key) is returned ONLY by the {'source': ...} variant's scroll —
+        the same realistic per-filter shape a live Qdrant scroll would
+        produce — rather than an unrealistic mock that would return it
+        from a {'kind': ...} filter it could never actually match."""
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _sweep_stale_mem0_flag_markers,
         )
@@ -7725,9 +7792,17 @@ class TestSweepStaleMem0FlagMarkers:
             filters = kwargs.get('filters') or {}
             return 1 if filters == {'source': 'stage1_flag_marker'} else 0
 
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                return [m for m in members if m['metadata'].get('source') == 'stage1_flag_marker']
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return [m for m in members if m['metadata'].get('kind') == 'stage1_flag_marker']
+            return []
+
         memory_service = AsyncMock()
         memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
-        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
         with caplog.at_level(
@@ -7744,6 +7819,131 @@ class TestSweepStaleMem0FlagMarkers:
             and 'under-tagged' in rec.message.lower()
             for rec in caplog.records
         )
+
+    @pytest.mark.asyncio
+    async def test_falsy_id_members_are_skipped_and_do_not_mask_across_variants(self):
+        """The merge loop skips a member with a falsy id BEFORE checking
+        seen_ids (task 3915), so a None/'' id surfaced by one variant's
+        scroll can never occupy the seen-ids set and mask a DIFFERENT
+        id-less member surfaced by the other variant. Here each variant
+        contributes one falsy-id member (empty string from 'source', None
+        from 'kind') alongside one validly-id'd member; only the two
+        validly-id'd members must be deleted, and neither falsy-id member
+        may block or be conflated with the other."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        source_members = [
+            {
+                'id': '',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't-empty'},
+            },
+            {
+                'id': 'valid-source',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+        ]
+        kind_members = [
+            {
+                'id': None,
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't-none'},
+            },
+            {
+                'id': 'valid-kind',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't2'},
+            },
+        ]
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                return source_members
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return kind_members
+            return []
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert memory_service.get_memories_by_metadata.await_count == 2
+        assert result == 2
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'valid-source', 'valid-kind'}
+
+    @pytest.mark.asyncio
+    async def test_scroll_cap_warning_emitted_once_per_variant_naming_its_filter(self, caplog):
+        """Each filter variant has its own scroll_limit budget (task 3915):
+        when BOTH variants independently hit the cap, two separate
+        scroll-cap WARNINGs must be emitted — one per variant — each
+        naming that variant's own filter dict, so an operator can tell
+        which key spelling is backlogged rather than seeing one
+        undifferentiated warning (or a warning naming the wrong filter)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        scroll_limit = 2
+        source_members = [
+            {
+                'id': f'src-{i}',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': f's{i}'},
+            }
+            for i in range(scroll_limit)
+        ]
+        kind_members = [
+            {
+                'id': f'kind-{i}',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': f'k{i}'},
+            }
+            for i in range(scroll_limit)
+        ]
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                return source_members
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return kind_members
+            return []
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.stages.task_knowledge_sync'
+        ):
+            await _sweep_stale_mem0_flag_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now, scroll_limit=scroll_limit,
+            )
+
+        scroll_cap_warnings = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING and 'scroll cap reached' in rec.message
+        ]
+        assert len(scroll_cap_warnings) == 2, (
+            f'expected one scroll-cap WARNING per variant, got: '
+            f'{[r.message for r in scroll_cap_warnings]}'
+        )
+        messages = [rec.message for rec in scroll_cap_warnings]
+        assert any("{'source': 'stage1_flag_marker'}" in m for m in messages)
+        assert any("{'kind': 'stage1_flag_marker'}" in m for m in messages)
 
 
 class TestSweepStaleMem0FlagForStage2Markers:
