@@ -57,7 +57,7 @@ def read_scheduler_state(project_root: Path) -> dict:
     return _empty_skeleton()
 
 
-def effective_lock_depth(project_root, default):
+def effective_lock_depth(project_root: str | Path, default: int) -> int:
     """Return the scheduler's effective ``lock_depth`` for one project.
 
     fused-memory is ONE server serving MANY projects, and each project's
@@ -85,6 +85,17 @@ def effective_lock_depth(project_root, default):
     irrelevant pool entry, while a falsely-fine key under-matches and costs a
     DUPLICATE TASK, which is the failure the curator exists to prevent.
     """
+    # A falsy project_root means "unknown project" — take the coarse default
+    # before touching the filesystem. ``Path('')`` normalises to ``Path('.')``,
+    # so without this the read is CWD-relative and silently hands back the
+    # depth of whatever project the fused-memory server process happens to be
+    # rooted in: a cross-project leak, strictly worse than the coarse
+    # fallback. Deliberately narrow — falsy only. Relative paths are NOT
+    # rejected here; that would be a behaviour change beyond this guard, and
+    # the wire boundary (``_normalize_project_root`` -> ``validate_project_root``)
+    # is where absoluteness is enforced for the production path.
+    if not project_root:
+        return default
     try:
         state = read_scheduler_state(Path(project_root))
     except Exception as exc:  # defensive: never let depth resolution raise
