@@ -17,7 +17,7 @@ import html.parser
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body
+from _dashboard_helpers import extract_function_body, strip_js_comments
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures
@@ -46,11 +46,8 @@ def tab_memory_evals_jsx_code(tab_memory_evals_jsx_body):
     POSITION also matters, callers additionally anchor to the accessing
     expression (`lim.alpha`, `storm.alarm_count`, ...) rather than the bare
     name.
-
-    Safe to strip naively: the source contains no `//` inside a string literal
-    (no URLs) and no regex literals, so no `/`-bearing code is eaten.
     """
-    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', tab_memory_evals_jsx_body)
+    return strip_js_comments(tab_memory_evals_jsx_body)
 
 
 @pytest.fixture(scope='module')
@@ -83,11 +80,8 @@ def memory_evals_fmt_js_code(memory_evals_fmt_js_body):
     it, so a whole-file grep for a parity state is satisfied by a MENTION in
     the comment above the table.  `alarmed_open` and `clear` were once
     asserted present by exactly such a grep, matching only prose.
-
-    Safe to strip naively for the same reason: no `//` inside a string
-    literal and no regex literals in the source.
     """
-    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', memory_evals_fmt_js_body)
+    return strip_js_comments(memory_evals_fmt_js_body)
 
 
 # ---------------------------------------------------------------------------

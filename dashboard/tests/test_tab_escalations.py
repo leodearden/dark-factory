@@ -11,7 +11,7 @@ import html.parser
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body
+from _dashboard_helpers import extract_function_body, strip_js_comments
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures
@@ -27,11 +27,8 @@ def tab_escalations_jsx_code(tab_escalations_jsx_body):
     of the identifiers the render code also names, so a whole-file substring
     grep is satisfied by a MENTION — delete the render site, leave the comment,
     and the assertion stays green.
-
-    Safe to strip naively: the source contains no `//` inside a string literal
-    (no URLs) and no regex literals, so no `/`-bearing code is eaten.
     """
-    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', tab_escalations_jsx_body)
+    return strip_js_comments(tab_escalations_jsx_body)
 
 
 # ---------------------------------------------------------------------------
