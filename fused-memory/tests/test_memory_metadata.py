@@ -177,6 +177,33 @@ class TestNormalizeSupersedes:
         assert normalize_supersedes(once) == once
 
 
+class TestFullUuidPredicateSingleHome:
+    """The canonical-full-UUID predicate has ONE home (task 3132, leaf η)."""
+
+    def test_module_uses_the_canonical_predicate_not_a_local_copy(self):
+        """Identity, not equality — a re-typed local copy is what INV-5 forbids.
+
+        This module legitimately IMPORTS the predicate: it calls it in
+        `validate_memory_metadata`'s `supersedes` member-shape guard and its
+        `parent_id` shape guard.  Pinned here so the surviving import is not
+        mistaken for a leftover of the retired alias and "cleaned up".
+        """
+        from fused_memory import memory_metadata as mm
+        from fused_memory.utils import validation
+
+        assert mm.is_full_uuid is validation.is_full_uuid
+
+    def test_the_private_back_compat_alias_is_gone(self):
+        """`memory_metadata` must not be a re-export proxy for a rule it does
+        not own: a reader of a consumer that imports `_is_full_uuid` from here
+        would believe the rule lives in this module.  Task 3942 retired the
+        alias once `scripts/retro_stamp_topics.py` was repointed.
+        """
+        from fused_memory import memory_metadata as mm
+
+        assert not hasattr(mm, '_is_full_uuid')
+
+
 class TestKindRegistry:
     """`KIND_REGISTRY` — PRD D3's closed registry, grandfathered from the census.
 
