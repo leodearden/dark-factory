@@ -51,6 +51,7 @@ growing a second glob.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import shutil
@@ -274,7 +275,29 @@ def _move_to_archive(
         src.unlink()
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
-    os.rename(src, dest)
+    try:
+        os.rename(src, dest)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        # EXDEV — source and destination are on different filesystems, so a
+        # rename is physically impossible and no retry of it will ever work.
+        # Fall back to the COPY this module already has: _archive_one stages
+        # to a sibling, mirrors the mtime with os.utime (which the rename got
+        # for free) and os.replace's it into place, so the canonical archive
+        # path still only ever holds a complete, correctly-stamped transcript.
+        # Then unlink the source, because deletion-after-archival is the whole
+        # contract and a cross-device host must not silently degrade into an
+        # unbounded hold.
+        #
+        # Unreachable on the measured host: .worktrees and data/orchestrator
+        # report the same st_dev, so every archive takes the rename above.
+        # Retained anyway per PRD §9 Q4 — an st_dev is an ephemeral mount
+        # handle, an operator can mount either path elsewhere tomorrow, and
+        # "assume same-device forever" is exactly the assumption that turns a
+        # remount into silent data loss. Its only exercise is the test suite.
+        _archive_one(src, projects_root, archive_root, task_id)
+        src.unlink()
     return True
 
 
