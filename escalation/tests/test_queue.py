@@ -2934,8 +2934,8 @@ class TestAddMembersToL2:
             f'updated_at, got {bumped_at!r} -> {again.updated_at!r}'
         )
 
-        # But a genuine reframing — including a return to an EARLIER position —
-        # is new relative to what the record currently says, so it IS recorded.
+        # But a genuine reframing is new relative to what the record currently
+        # says, so it IS recorded.
         changed = queue.add_members_to_l2(
             l2.id, [], **{**framing, 'summary': 'a genuinely different hypothesis'},
         )
@@ -2943,6 +2943,102 @@ class TestAddMembersToL2:
         assert len(changed.amendments) == 2, (
             f'a changed framing must be recorded, got {changed.amendments!r}'
         )
+
+        # A -> B -> A: returning to an EARLIER position is new relative to what
+        # the record currently says, so it is recorded too.  This is the whole
+        # justification for comparing against the LAST position rather than the
+        # whole list — without this call, an "optimisation" that deduped against
+        # every past amendment would pass this suite untouched.
+        returned = queue.add_members_to_l2(l2.id, [], **framing)
+        assert returned is not None
+        assert len(returned.amendments) == 3, (
+            f'a return to an earlier framing must be recorded, got '
+            f'{returned.amendments!r}'
+        )
+        first_view, last_view = (
+            {k: a[k] for k in ('root_cause', 'summary', 'detail', 'options')}
+            for a in (returned.amendments[0], returned.amendments[-1])
+        )
+        assert last_view == first_view, (
+            f'the re-submitted framing must round-trip verbatim (timestamp aside): '
+            f'{first_view!r} -> {last_view!r}'
+        )
+        assert returned.amendments[-1]['timestamp'] != returned.amendments[0]['timestamp'], (
+            'each amendment is stamped at ITS OWN write time; two entries sharing '
+            'a timestamp would mean the queue reused the first stamp'
+        )
+
+    def test_repromote_identical_to_the_records_own_framing_is_a_no_op(
+        self, tmp_path: Path,
+    ):
+        """The FIRST re-promote is compared against the record's OWN framing.
+
+        An L2's first re-promote is the one most likely to carry text
+        byte-identical to the create — the watcher recomputes the same cluster
+        and re-sends the same framing.  Treating "no amendments yet" as
+        "nothing to compare against" recorded a verbatim copy of the record's
+        own root_cause/detail/options/summary: one spurious `updated_at` bump
+        per L2, which re-triggers the watcher's stamp-then-skip re-assess
+        protocol (the contract task 3976 pinned) on a genuine no-op, plus one
+        cap slot burned on text already durably on the record.
+
+        The record's own framing IS the implicit `amendments[-1]`.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+        assert l2.updated_at is None
+
+        result = queue.add_members_to_l2(
+            l2.id,
+            ['esc-l1-0'],  # already a member: nothing new to append either
+            # Byte-identical to what _framed_l2 created the record with.
+            root_cause='Bad merge strategy',
+            evidence='ORIGINAL evidence text',
+            options=['A: fix', 'B: rollback'],
+            summary='ORIGINAL one-line hypothesis',
+            agent_role='escalation-watcher-auto',
+        )
+
+        assert result is not None
+        assert result.amendments == [], (
+            'framing identical to the record\'s OWN framing contributes nothing '
+            f'and must not be recorded, got {result.amendments!r}'
+        )
+        assert result.updated_at is None, (
+            'a no-op must not bump updated_at — that bump re-triggers the '
+            f'watcher re-assess protocol on nothing, got {result.updated_at!r}'
+        )
+        # DURABILITY: not merely absent from the returned object.
+        on_disk = self._on_disk(queue, l2.id)
+        assert on_disk.amendments == []
+        assert on_disk.updated_at is None
+
+    def test_repromote_differing_only_in_root_cause_whitespace_is_a_no_op(
+        self, tmp_path: Path,
+    ):
+        """The dedup KEY is compared stripped, mirroring how the fold was routed.
+
+        `find_pending_l2_by_root_cause` matches on `root_cause.strip()`, and the
+        create path stores the stripped value — so a fold whose key differs only
+        in surrounding whitespace found THIS L2 by that very key.  Recording it
+        as new framing would contradict the lookup that routed it here.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._framed_l2(queue)
+
+        result = queue.add_members_to_l2(
+            l2.id, [],
+            root_cause='  Bad merge strategy\n',
+            evidence='ORIGINAL evidence text',
+            options=['A: fix', 'B: rollback'],
+            summary='ORIGINAL one-line hypothesis',
+        )
+
+        assert result is not None
+        assert result.amendments == [], (
+            f'whitespace on the dedup key is not a reframing, got {result.amendments!r}'
+        )
+        assert result.updated_at is None
 
     def test_amendment_list_is_capped_and_truncation_is_loud(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,

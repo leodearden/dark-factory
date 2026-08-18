@@ -100,11 +100,53 @@ _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
 _MAX_AMENDMENTS = 20
 
 
-def _is_repeat_framing(
-    esc: Escalation, *, root_cause: str, summary: str, evidence: str,
-    options: list[str] | None,
-) -> bool:
-    """True when this framing is byte-identical to the LAST amendment recorded.
+def _build_amendment(
+    *, root_cause: str, summary: str, evidence: str, options: list[str] | None,
+    agent_role: str, timestamp: str,
+) -> Amendment:
+    """Build one :class:`~escalation.models.Amendment` from a fold's framing.
+
+    THE single site that maps the promote's ARGUMENT names onto the Amendment's
+    KEY names — notably *evidence* onto ``detail``, the same field the create
+    path writes that argument into.  It builds both the entry actually appended
+    AND the projection of the record's OWN framing that repeat detection
+    compares against (see :func:`_is_repeat_framing`), so those two can never
+    drift into comparing differently-shaped dicts.
+    """
+    return {
+        'timestamp': timestamp,
+        'agent_role': agent_role,
+        'root_cause': root_cause,
+        'summary': summary,
+        'detail': evidence,
+        'options': list(options or []),
+    }
+
+
+def _framing_view(a: Amendment) -> tuple[str, str, str, list[str]]:
+    """The comparable framing of *a*: WHAT was said, normalised.
+
+    ``agent_role`` is deliberately excluded — it records WHO said it, not WHAT
+    was said, and two roles submitting identical framing is not new framing.
+    ``timestamp`` likewise: the queue stamps it, so it always differs and would
+    defeat the comparison entirely.
+
+    ``root_cause`` is compared STRIPPED because the create path stores
+    ``root_cause.strip()`` on the record itself and
+    ``find_pending_l2_by_root_cause`` matches on that stripped key — a fold
+    differing only in surrounding whitespace found this very L2 BY that key, so
+    treating it as new framing would contradict the lookup that routed it here.
+    """
+    return (
+        a.get('root_cause', '').strip(),
+        a.get('summary', ''),
+        a.get('detail', ''),
+        list(a.get('options', [])),
+    )
+
+
+def _is_repeat_framing(esc: Escalation, candidate: Amendment) -> bool:
+    """True when *candidate* repeats the framing the record ALREADY carries.
 
     A watcher rotation re-promoting the same cluster with UNCHANGED text has
     contributed nothing: recording it again would (a) manufacture a spurious
@@ -114,24 +156,27 @@ def _is_repeat_framing(
     earlier framings out via the drop-oldest policy.  Both are the opposite of
     what preserving framing is for.
 
-    Compared against the LAST amendment only, not all of them: an A -> B -> A
+    THE BASELINE IS THE RECORD'S CURRENT POSITION, which is the LAST amendment
+    when there is one and **the record's OWN framing when there is not**.  The
+    empty-list case is not a special case to skip: an L2's first re-promote is
+    exactly the one most likely to carry text byte-identical to the create
+    (the watcher recomputes the same cluster and re-sends the same framing),
+    and treating "no amendments yet" as "nothing to compare against" recorded a
+    verbatim copy of the record's own root_cause/detail/options/summary — one
+    spurious ``updated_at`` bump per L2, one wasted cap slot, and a re-assess
+    re-triggered on a genuine no-op.  The record's own framing IS the implicit
+    ``amendments[-1]``, so it is projected through :func:`_build_amendment` and
+    compared the same way.
+
+    Compared against the LAST position only, not all of them: an A -> B -> A
     reframing genuinely returns to a previous position and IS new relative to
     what the record currently says.
-
-    ``agent_role`` is deliberately NOT compared — it records WHO said it, not
-    WHAT was said, and two roles submitting identical framing is not new
-    framing.  ``timestamp`` likewise: this method stamps it, so it always
-    differs and would defeat the comparison entirely.
     """
-    if not esc.amendments:
-        return False
-    last = esc.amendments[-1]
-    return (
-        last.get('root_cause') == root_cause
-        and last.get('summary') == summary
-        and last.get('detail') == evidence
-        and last.get('options') == list(options or [])
+    baseline = esc.amendments[-1] if esc.amendments else _build_amendment(
+        root_cause=esc.root_cause, summary=esc.summary, evidence=esc.detail,
+        options=esc.options, agent_role='', timestamp='',
     )
+    return _framing_view(baseline) == _framing_view(candidate)
 
 
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
@@ -944,10 +989,15 @@ class EscalationQueue:
         The incoming *evidence* is stored under the amendment's ``detail`` key —
         the same field the create path writes that argument into.  Passing no
         framing appends no amendment, so every existing two-positional-arg
-        caller is byte-unchanged.  Framing byte-identical to the LAST recorded
-        amendment is likewise not re-recorded (see :func:`_is_repeat_framing`):
-        a re-promote with unchanged text has contributed nothing, so it stays a
-        true no-op and does NOT bump ``updated_at``.
+        caller is byte-unchanged.  Framing byte-identical to what the record
+        ALREADY says is likewise not re-recorded (see
+        :func:`_is_repeat_framing`): a re-promote with unchanged text has
+        contributed nothing, so it stays a true no-op and does NOT bump
+        ``updated_at``.  "What the record already says" is the LAST amendment
+        when there is one and **the record's OWN framing when there is not** —
+        so the FIRST re-promote of a freshly-created L2, the one most likely to
+        re-send the create's exact text, is a no-op too rather than a verbatim
+        copy of the record's own fields.
 
         **The list is capped at** :data:`_MAX_AMENDMENTS`.  THIS METHOD is the
         trimmer, at write time, in the same critical section and the same single
@@ -1013,34 +1063,34 @@ class EscalationQueue:
             # append, so it lands in the same single _rewrite below — no second
             # write path, no new durability story.
             amendment_recorded = False
-            if incoming_framing and not _is_repeat_framing(
-                esc, root_cause=root_cause, summary=summary,
-                evidence=evidence, options=options,
-            ):
-                amendment: Amendment = {
-                    'timestamp': datetime.now(UTC).isoformat(),
-                    'agent_role': agent_role,
-                    'root_cause': root_cause,
-                    'summary': summary,
-                    'detail': evidence,
-                    'options': list(options or []),
-                }
-                esc.amendments.append(amendment)
-                amendment_recorded = True
-                # Enforce the cap in the SAME critical section, so the trim lands
-                # in the same single _rewrite as the append and there is no
-                # durable window in which an over-cap list exists.
-                if len(esc.amendments) > _MAX_AMENDMENTS:
-                    dropped = len(esc.amendments) - _MAX_AMENDMENTS
-                    del esc.amendments[:dropped]
-                    esc.amendments_truncated += dropped
-                    logger.warning(
-                        'add_members_to_l2: %s shed %d oldest amendment(s) at the '
-                        '_MAX_AMENDMENTS=%d cap (running total truncated=%d); the '
-                        "record's own original framing is unaffected",
-                        escalation_id, dropped, _MAX_AMENDMENTS,
-                        esc.amendments_truncated,
-                    )
+            if incoming_framing:
+                candidate = _build_amendment(
+                    root_cause=root_cause, summary=summary, evidence=evidence,
+                    options=options, agent_role=agent_role,
+                    timestamp=datetime.now(UTC).isoformat(),
+                )
+                # Built BEFORE the repeat check, and the check reads the built
+                # entry: the stored form is what a later fold will be compared
+                # against, so comparing anything else would let two entries the
+                # record cannot tell apart both be recorded.
+                if not _is_repeat_framing(esc, candidate):
+                    esc.amendments.append(candidate)
+                    amendment_recorded = True
+                    # Enforce the cap in the SAME critical section, so the trim
+                    # lands in the same single _rewrite as the append and there
+                    # is no durable window in which an over-cap list exists.
+                    if len(esc.amendments) > _MAX_AMENDMENTS:
+                        dropped = len(esc.amendments) - _MAX_AMENDMENTS
+                        del esc.amendments[:dropped]
+                        esc.amendments_truncated += dropped
+                        logger.warning(
+                            'add_members_to_l2: %s shed %d oldest amendment(s) at '
+                            'the _MAX_AMENDMENTS=%d cap (running total '
+                            "truncated=%d); the record's own original framing is "
+                            'unaffected',
+                            escalation_id, dropped, _MAX_AMENDMENTS,
+                            esc.amendments_truncated,
+                        )
 
             if appended or severity_changed or amendment_recorded:
                 esc.members.extend(appended)
