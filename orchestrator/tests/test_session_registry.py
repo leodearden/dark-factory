@@ -5166,6 +5166,31 @@ class TestAtomicWriteSemantics:
         assert target.read_text() == '{"original": true}'
         assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
 
+    def test_writes_non_ascii_json_as_utf8_regardless_of_locale(
+        self, tmp_path, monkeypatch
+    ):
+        """Task 3387 regression: encoding is pinned utf-8, not the ambient locale.
+
+        ``os.fdopen(fd, 'w')`` with no explicit encoding would otherwise pick
+        up ``locale.getpreferredencoding(False)``. Simulate a non-UTF-8
+        preferred encoding and confirm the on-disk bytes are still valid
+        utf-8.
+        """
+        import locale
+
+        monkeypatch.setattr(locale, 'getpreferredencoding', lambda do_setlocale=True: 'ascii')
+
+        target = tmp_path / 'record.json'
+        text = '{"note": "café"}'
+
+        sr._atomic_write_text(target, text)
+
+        raw = target.read_bytes()
+        assert raw.decode('utf-8') == text, (
+            'on-disk bytes must be valid utf-8 even when getpreferredencoding() lies'
+        )
+        assert raw == text.encode('utf-8')
+
     def test_write_record_creates_missing_nested_dir_and_round_trips(self, tmp_path):
         """End-to-end: write_record into a non-existent nested root still works."""
         root = tmp_path / 'does' / 'not' / 'exist'

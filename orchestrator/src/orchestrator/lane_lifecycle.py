@@ -16,7 +16,6 @@ mixing those in would break the pool's purity and its existing 2-value
 from __future__ import annotations
 
 import json
-import locale
 import logging
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -306,13 +305,15 @@ class LaneLifecycle:
         ``mkdir=True`` for the parent-dir create, ``mode=0o600`` matching the
         :func:`tempfile.mkstemp` create, and no fsync.
 
-        ``encoding`` is passed as the process's preferred encoding because the
-        old body used a bare ``os.fdopen(fd, 'w')``, which is locale-dependent.
-        That is a latent bug — JSON written under a non-UTF-8 locale — but
-        changing it is out of scope for a consolidation (the task explicitly
-        forbids silently changing per-site encoding while consolidating), so it
-        is preserved verbatim and stated here at the call site rather than
-        hidden in the shared helper's default.
+        Task 3223 reproduced the old inlined body's behaviour verbatim: a bare
+        ``os.fdopen(fd, 'w')``, which is locale-dependent, was preserved rather
+        than silently upgraded (that consolidation explicitly forbade changing
+        per-site encoding). Task 3387 fixed the resulting latent bug: this
+        payload is JSON (``record.to_json()``), and RFC 8259 requires JSON on
+        disk to be UTF-8 — a non-UTF-8 locale wrote JSON that
+        ``shared.safe_io.load_json_or_warn`` would later quarantine as
+        corrupt. ``encoding`` is now pinned ``'utf-8'`` regardless of the
+        ambient locale.
 
         Tracked as ticket ``tkt_0RRXRPD1EW9KP7JE2RDB0YXFWX``. That is a TICKET
         id, not a task id — the curator resolves tickets to tasks
@@ -322,7 +323,7 @@ class LaneLifecycle:
         safe_io.atomic_write_text(
             self._record_path(lane),
             record.to_json(),
-            encoding=locale.getpreferredencoding(False),
+            encoding='utf-8',
             mode=0o600,
             mkdir=True,
         )

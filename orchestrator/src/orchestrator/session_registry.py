@@ -627,9 +627,15 @@ def _atomic_write_text(path: Path, text: str) -> None:
     is strictly better than a module that cannot be imported by its own
     documented entrypoint.
 
-    ``os.fdopen(fd, 'w')`` is locale-dependent rather than utf-8. That is a
-    latent bug — JSON written under a non-UTF-8 locale — but it is the
-    behaviour this module has always had, and changing it is out of scope here.
+    ``os.fdopen(fd, 'w')`` with no explicit encoding defaults to
+    ``locale.getpreferredencoding(False)``, which is locale-dependent. Task
+    3387 fixed the resulting latent bug: the payload is always JSON
+    (``record.to_json()``), and RFC 8259 requires JSON on disk to be UTF-8 —
+    a non-UTF-8 locale wrote JSON that ``shared.safe_io.load_json_or_warn``
+    would later quarantine as corrupt. The encoding is now pinned
+    ``'utf-8'`` explicitly, regardless of the ambient locale. This needs no
+    import (unlike ``locale.getpreferredencoding``) and so does not violate
+    this module's stdlib-only, no-extra-import constraint above.
 
     Error policy stays with the callers: write_record lets a failure propagate
     (its sole caller, the CLI main(), provides the outer fail-soft boundary);
@@ -643,7 +649,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
         dir=str(path.parent),
     )
     try:
-        with os.fdopen(fd, 'w') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(text)
         os.replace(tmp_path_str, str(path))
     except Exception:

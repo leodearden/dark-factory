@@ -10,6 +10,7 @@ Step test-quarantine: RED — quarantine method absent.
 from __future__ import annotations
 
 import json
+import locale
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -577,16 +578,14 @@ class TestDelegatesToSharedAtomicWriter:
     """``LaneLifecycle._write`` delegates to ``shared.safe_io.atomic_write_text``.
 
     Task 3223 consolidated the repo's tmp+rename writers into ``shared.safe_io``.
-    These pin that this site's semantics survived the move — in particular the
-    LOCALE-dependent encoding, which the inlined ``os.fdopen(fd, 'w')`` produced
-    and which this task deliberately preserves rather than silently upgrading
-    to utf-8.
+    These pin that this site's semantics survived the move. Task 3387 fixed
+    the encoding: this site's payload is JSON (RFC 8259 requires JSON on disk
+    to be UTF-8), so the encoding is pinned utf-8 rather than following the
+    process's locale, regardless of the ambient ``LC_ALL``/``LANG``.
     """
 
     def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):
-        """One delegated call carrying mkdir=True, 0600, locale encoding, no fsync."""
-        import locale
-
+        """One delegated call carrying mkdir=True, 0600, utf-8 encoding, no fsync."""
         import shared.safe_io as _safe_io
 
         calls = []
@@ -605,8 +604,25 @@ class TestDelegatesToSharedAtomicWriter:
         assert kwargs.get('mkdir') is True, 'this site created its parent dir'
         assert kwargs.get('mode') == 0o600, 'mkstemp created 0600; must not widen'
         assert not kwargs.get('fsync'), 'this site never fsynced'
-        assert kwargs.get('encoding') == locale.getpreferredencoding(False), (
-            'locale-dependent encoding must be PRESERVED, not upgraded to utf-8'
+        assert kwargs.get('encoding') == 'utf-8', (
+            'JSON payloads must be written utf-8 regardless of ambient locale (task 3387)'
+        )
+
+    def test_writes_non_ascii_json_as_utf8_regardless_of_locale(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end: non-ASCII JSON round-trips as utf-8 bytes on disk, even
+        under a non-UTF-8 ambient locale (task 3387 regression pin)."""
+        monkeypatch.setattr(locale, 'getpreferredencoding', lambda do_setlocale=True: 'ascii')
+
+        lifecycle = _lifecycle(tmp_path)
+        record = lifecycle.transition(
+            tmp_path / 'lane-1', LaneState.SEED, seeded_from_sha='café'
+        )
+
+        raw = lifecycle._record_path('lane-1').read_bytes()
+        assert raw.decode('utf-8') == record.to_json(), (
+            'on-disk bytes must be valid utf-8 even when getpreferredencoding() lies'
         )
 
     def test_transition_creates_missing_state_dir_and_round_trips(self, tmp_path):
