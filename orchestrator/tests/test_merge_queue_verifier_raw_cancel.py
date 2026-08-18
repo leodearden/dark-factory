@@ -43,6 +43,7 @@ from test_merge_queue_concurrent_verify import (
 from test_merge_queue_dispatch_fill_redispatch import (
     _drive_fill,
     _make_real_item,
+    _teardown_fill_drive,
 )
 
 from orchestrator.config import OrchestratorConfig
@@ -270,3 +271,141 @@ class TestRawCancelTerminatesParkedVerifierLoop:
             pending = worker._pending_verifier_get
             pending.cancel()
             await asyncio.gather(pending, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# step-3: getter-only-cancel preservation fence (NOT a RED/GREEN pair)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestGetterOnlyCancelPreservesQueueItems:
+    """A cancel aimed at ``_pending_verifier_get`` ALONE must still be recovered
+    from, losing no queue item -- task 4306.
+
+    **NOT a RED/GREEN pair.** This test is green both before and after the
+    task-4306 fix, by design (same shape as the task-3276 module's
+    ``TestCascadeAntiDeadlockPreserved``). It is a permanent preservation
+    fence: it pins the "no queue item is lost" intent the recovery clause was
+    originally written for, and is what proves the new
+    ``current_task().cancelling() > 0`` discriminator does not OVER-trigger and
+    turn a getter-only cancel into loop death. A reviewer seeing it pass on
+    unfixed code is seeing the intended behaviour, not a broken RED.
+    """
+
+    async def test_getter_only_cancel_recovers_and_loses_no_item(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """Cancel ONLY the captured getter; the loop must survive and keep working.
+
+        Same parked-on-reused-getter steady state as the raw-cancel test, but
+        the getter is captured into a local BEFORE the loop nulls the
+        attribute -- once the loop has parked on it, that local reference is
+        the only way a test can reach it. Cancelling it is exactly the shape
+        stop()'s ordering race would produce: the loop task itself is
+        untouched, so its ``cancelling()`` stays 0 and the recovery clause must
+        still run.
+
+        A later-queued item_b must then still be dispatched: the recovery
+        ``get()`` picks work up and nothing is dropped.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        allocator = _inject_two_host_allocator(worker, _make_fake_remote('laptop'))
+        assert allocator.free_host_count() == 2, 'precondition: two free hosts'
+
+        drive = _drive_fill(worker, allocator)
+
+        item_a = _make_real_item(git_ops, config, 'goc-a', 'aaa')
+        item_b = _make_real_item(git_ops, config, 'goc-b', 'bbb')
+        worker._register_item(item_a, initial=ItemLifecycleState.AWAITING_VERIFY)
+        worker._register_item(item_b, initial=ItemLifecycleState.AWAITING_VERIFY)
+
+        # item_a is queued up front; item_b is held back until after the
+        # getter-only cancel, so its dispatch proves the recovery get() works.
+        await worker._verifier_queue.put(item_a)
+
+        task = asyncio.ensure_future(worker._verifier_loop())
+        worker._verifier_task = task
+
+        try:
+            await asyncio.wait_for(drive.first_dispatched.wait(), timeout=MERGE_RESULT_TIMEOUT)
+        except TimeoutError:
+            await _teardown_fill_drive(drive, task, worker)
+            pytest.fail(
+                'item_a was never dispatched within '
+                f'{MERGE_RESULT_TIMEOUT}s -- the parked-persistent-getter '
+                'steady state this test is about was never reached.'
+            )
+
+        launched = await _poll_until(lambda: worker._pending_verifier_get is not None)
+        if not launched:
+            await _teardown_fill_drive(drive, task, worker)
+            pytest.fail(
+                '_pending_verifier_get stayed None after the first dispatch: '
+                'the DISPATCH-FILL QueueEmpty fill-ahead race never launched '
+                'the persistent getter, so there is no getter to cancel.'
+            )
+
+        # CAPTURE the getter now, BEFORE the FINALIZE-HEAD reuse branch reads
+        # and nulls the attribute -- afterwards it is unreachable from a test.
+        getter = worker._pending_verifier_get
+        assert getter is not None, 'the persistent getter must be capturable here'
+
+        drive.gate.set()
+        try:
+            await asyncio.wait_for(item_a.request.result, timeout=MERGE_RESULT_TIMEOUT)
+        except TimeoutError:
+            await _teardown_fill_drive(drive, task, worker)
+            pytest.fail(
+                "item_a's result Future was never resolved within "
+                f'{MERGE_RESULT_TIMEOUT}s of its gated verify completing -- '
+                'FINALIZE-HEAD was never reached.'
+            )
+
+        parked = await _poll_until(
+            lambda: worker._pending_verifier_get is None and not task.done()
+        )
+        if not parked:
+            await _teardown_fill_drive(drive, task, worker)
+            pytest.fail(
+                'the loop never reached the parked-on-reused-getter signature '
+                '(_pending_verifier_get is None AND the loop task is still '
+                'running): _pending_verifier_get='
+                f'{worker._pending_verifier_get!r}, task.done()={task.done()}.'
+            )
+
+        # Cancel ONLY the inner getter. The loop task is untouched, so its
+        # cancelling() count stays 0 and the recovery clause must run.
+        getter.cancel()
+        await asyncio.sleep(_STATE_POLL_INTERVAL * 5)
+
+        assert not task.done(), (
+            'the loop died on a getter-only cancel: the task-4306 '
+            'discriminator over-triggered and re-raised a cancellation that '
+            'was never aimed at the loop task. Only _pending_verifier_get was '
+            'cancelled here -- exactly the ordering race the recovery clause '
+            'exists for -- so the loop must recover with a fresh get(), not '
+            f'terminate. task.cancelled()={task.cancelled()}'
+        )
+
+        await worker._verifier_queue.put(item_b)
+        try:
+            await asyncio.wait_for(drive.second_dispatched.wait(), timeout=MERGE_RESULT_TIMEOUT)
+        except TimeoutError:
+            await _teardown_fill_drive(drive, task, worker)
+            pytest.fail(
+                'item_b was never dispatched within '
+                f'{MERGE_RESULT_TIMEOUT}s of being queued after a getter-only '
+                'cancel. The recovery clause left the loop unable to pick up '
+                'new work -- a queue item is effectively lost, which is the '
+                'exact property that clause exists to preserve.'
+            )
+
+        assert drive.dispatched == [item_a, item_b], (
+            'expected [item_a, item_b] dispatched in order (nothing dropped '
+            f'across the getter-only cancel), got {drive.dispatched!r}'
+        )
+
+        await _teardown_fill_drive(drive, task, worker)
