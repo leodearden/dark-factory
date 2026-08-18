@@ -1969,3 +1969,347 @@ async def test_collect_active_tasks_live_prd_exemption_no_warning_under_threshol
     assert not any('live-PRD exemption' in rec.message for rec in caplog.records), (
         'a small exemption count must not trigger the pathological-case warning'
     )
+
+
+# ---------------------------------------------------------------------------
+# TestShapeOneProjectNarrowing — _shape_one_project must request only what it
+# renders, and derive counts from the compact seam (task 3857 step-7)
+# ---------------------------------------------------------------------------
+
+
+def _canned_mcp(rows, status_map):
+    """Return ``(mcp_tool_call_fake, calls)`` emulating the fused-memory substrate.
+
+    Faithful to what was traced for task 3857, because the whole point of the
+    narrowing work is that the SERVER does the filtering:
+
+    * ``get_tasks`` applies ``statuses`` as a row filter (SQL ``status IN``),
+      then slices ``page_size``/``offset`` over a list ordered by ASCENDING
+      ``id`` — so reaching the high-id end requires a computed offset.
+    * ``get_statuses`` returns the compact ``{id: status}`` map.
+
+    *rows* are raw MCP rows (string ids); *status_map* is ``{int id: status}``.
+    """
+    calls: list[dict] = []
+
+    async def _mcp(client, url, tool, args, **_kw):
+        calls.append({'tool': tool, 'args': dict(args)})
+        if tool == 'get_statuses':
+            return {'statuses': {str(k): v for k, v in status_map.items()}}
+        if tool == 'get_tasks':
+            statuses = args.get('statuses')
+            selected = [
+                r for r in rows
+                if statuses is None or r.get('status') in statuses
+            ]
+            selected.sort(key=lambda r: int(r['id']))  # ORDER BY id ASC
+            page_size = args.get('page_size')
+            if page_size is not None:
+                start = args.get('offset', 0)
+                selected = selected[start:start + page_size]
+            return {'tasks': selected}
+        raise AssertionError(f'unexpected tool {tool!r}')
+
+    return _mcp, calls
+
+
+def _raw_row(task_id, status, *, title=None, updated_at=None):
+    return {
+        'id': str(task_id),
+        'title': title or f'task {task_id}',
+        'status': status,
+        'dependencies': [],
+        'metadata': {},
+        'updatedAt': updated_at or f'2026-01-01T00:00:{task_id % 60:02d}+00:00',
+    }
+
+
+class TestShapeOneProjectNarrowing:
+    """The Tasks-tab fetch must have a ceiling that does not grow with the tree.
+
+    Asserted at the MCP wire, through the real ``fetch_tasks`` /
+    ``fetch_statuses``, because "the dashboard discards the done rows
+    afterwards" is precisely the defect — what matters is which rows the
+    server was asked for.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch):
+        import dashboard.data.tasks as tasks_mod
+        tasks_mod._fetch_tasks_cache_clear()
+        _register_runtime(monkeypatch, {})
+        yield
+        tasks_mod._fetch_tasks_cache_clear()
+
+    @staticmethod
+    def _one_project_config(tmp_path):
+        root = tmp_path / 'dark-factory'
+        root.mkdir(parents=True, exist_ok=True)
+        return DashboardConfig(project_root=root)
+
+    @staticmethod
+    def _get_tasks_calls(calls):
+        return [c for c in calls if c['tool'] == 'get_tasks']
+
+    async def test_scheduler_path_never_asks_for_a_terminal_row(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(a) caps 0/0 → exactly two calls, and 'done' never crosses the wire."""
+        from dashboard.data.active_tasks import _ACTIVE_STATUSES, _shape_one_project
+
+        rows = [_raw_row(1, 'in-progress'), _raw_row(2, 'pending')]
+        rows += [_raw_row(i, 'done') for i in range(10, 60)]
+        status_map = {int(r['id']): r['status'] for r in rows}
+        mcp, calls = _canned_mcp(rows, status_map)
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
+
+        config = self._one_project_config(tmp_path)
+        active, offline, done_count = await _shape_one_project(
+            dummy_client, config, config.project_root,
+            max_done_per_project=0, max_cancelled_per_project=0,
+        )
+
+        assert offline is False
+        assert len(calls) == 2, f'expected exactly 2 MCP calls, got {calls}'
+        tools = sorted(c['tool'] for c in calls)
+        assert tools == ['get_statuses', 'get_tasks']
+
+        get_tasks_call = self._get_tasks_calls(calls)[0]
+        assert get_tasks_call['args'].get('statuses') == sorted(_ACTIVE_STATUSES)
+        for call in calls:
+            requested = call['args'].get('statuses') or []
+            assert 'done' not in requested and 'cancelled' not in requested, (
+                f'the scheduler path must never request terminal rows: {call}'
+            )
+        assert {r['title'] for r in active} == {'task 1', 'task 2'}
+        assert done_count == 50
+
+    async def test_tasks_tab_path_issues_a_bounded_terminal_window(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(b) caps 50/50 → three calls, the third a bounded high-id window."""
+        import dashboard.data.active_tasks as at_mod
+        from dashboard.data.active_tasks import _ACTIVE_STATUSES, _shape_one_project
+
+        rows = [_raw_row(1, 'in-progress')]
+        rows += [_raw_row(i, 'done') for i in range(100, 120)]
+        rows += [_raw_row(i, 'cancelled') for i in range(200, 205)]
+        status_map = {int(r['id']): r['status'] for r in rows}
+        n_terminal = sum(1 for s in status_map.values() if s in ('done', 'cancelled'))
+        mcp, calls = _canned_mcp(rows, status_map)
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
+
+        config = self._one_project_config(tmp_path)
+        await _shape_one_project(
+            dummy_client, config, config.project_root,
+            max_done_per_project=50, max_cancelled_per_project=50,
+        )
+
+        assert len(calls) == 3, f'expected exactly 3 MCP calls, got {calls}'
+        get_tasks_calls = self._get_tasks_calls(calls)
+        assert len(get_tasks_calls) == 2
+        active_call, terminal_call = get_tasks_calls
+        assert active_call['args'].get('statuses') == sorted(_ACTIVE_STATUSES)
+        assert terminal_call['args'].get('statuses') == ['cancelled', 'done']
+        window = at_mod._TERMINAL_FETCH_WINDOW
+        assert terminal_call['args'].get('page_size') == window
+        assert terminal_call['args'].get('offset') == max(0, n_terminal - window)
+
+    async def test_done_count_comes_from_the_compact_map_not_the_rows(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(c) The status map has MORE done tasks than the window can return.
+
+        A ``done_count`` still derived from returned rows is provably wrong
+        here — that is the whole reason it moved to the compact seam.
+        """
+        import dashboard.data.active_tasks as at_mod
+        from dashboard.data.active_tasks import _shape_one_project
+
+        monkeypatch.setattr(at_mod, '_TERMINAL_FETCH_WINDOW', 4)
+        rows = [_raw_row(1, 'in-progress')]
+        rows += [_raw_row(i, 'done') for i in range(100, 120)]  # 20 done rows
+        status_map = {int(r['id']): r['status'] for r in rows}
+        mcp, _calls = _canned_mcp(rows, status_map)
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
+
+        config = self._one_project_config(tmp_path)
+        active, offline, done_count = await _shape_one_project(
+            dummy_client, config, config.project_root,
+            max_done_per_project=50, max_cancelled_per_project=50,
+        )
+
+        assert offline is False
+        emitted_done = [r for r in active if r.get('status') == 'done']
+        assert len(emitted_done) == 4, 'sanity: the window really did bound the rows'
+        assert done_count == 20, (
+            f'done_count must come from the compact status map (20), not the '
+            f'{len(emitted_done)} rows the window returned'
+        )
+
+    async def test_window_reaches_the_high_id_end(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """The offset must select the HIGHEST ids, not the oldest ones.
+
+        ``page_size``/``offset`` slice an ASCENDING-id list, so a naive
+        ``offset=0`` would return the oldest terminal rows — the opposite of
+        what the tab renders.
+        """
+        import dashboard.data.active_tasks as at_mod
+        from dashboard.data.active_tasks import _shape_one_project
+
+        monkeypatch.setattr(at_mod, '_TERMINAL_FETCH_WINDOW', 3)
+        rows = [_raw_row(1, 'in-progress')]
+        rows += [_raw_row(i, 'done') for i in range(100, 110)]
+        status_map = {int(r['id']): r['status'] for r in rows}
+        mcp, _calls = _canned_mcp(rows, status_map)
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
+
+        config = self._one_project_config(tmp_path)
+        active, _offline, _done = await _shape_one_project(
+            dummy_client, config, config.project_root,
+            max_done_per_project=50, max_cancelled_per_project=50,
+        )
+
+        emitted = sorted(
+            int(r['id'].rsplit(':', 1)[-1])
+            for r in active if r.get('status') == 'done'
+        )
+        assert emitted == [107, 108, 109], (
+            f'the window must reach the high-id end, got {emitted}'
+        )
+
+    async def test_no_truncation_when_population_fits_the_window(
+        self, monkeypatch, tmp_path, dummy_client, caplog
+    ):
+        """(d) n_terminal <= window → offset 0, every terminal row present, no WARNING."""
+        import logging
+
+        import dashboard.data.active_tasks as at_mod
+        from dashboard.data.active_tasks import _shape_one_project
+
+        monkeypatch.setattr(at_mod, '_TERMINAL_FETCH_WINDOW', 10)
+        rows = [_raw_row(1, 'in-progress')]
+        rows += [_raw_row(i, 'done') for i in range(100, 104)]
+        rows += [_raw_row(i, 'cancelled') for i in range(200, 202)]
+        status_map = {int(r['id']): r['status'] for r in rows}
+        mcp, calls = _canned_mcp(rows, status_map)
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
+
+        config = self._one_project_config(tmp_path)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.active_tasks'):
+            active, _offline, _done = await _shape_one_project(
+                dummy_client, config, config.project_root,
+                max_done_per_project=50, max_cancelled_per_project=50,
+            )
+
+        terminal_call = self._get_tasks_calls(calls)[1]
+        assert terminal_call['args'].get('offset') == 0
+        terminal_rows = [r for r in active if r.get('status') in ('done', 'cancelled')]
+        assert len(terminal_rows) == 6, 'every terminal row must be present'
+        assert not [
+            r for r in caplog.records
+            if r.name == 'dashboard.data.active_tasks' and r.levelno >= logging.WARNING
+        ], 'no truncation WARNING may fire when the population fits'
+
+    async def test_truncation_warns_naming_project_and_counts(
+        self, monkeypatch, tmp_path, dummy_client, caplog
+    ):
+        """(e) n_terminal > window → a WARNING naming the project, count and window.
+
+        No silent cap: the window is a real behaviour change (selection by
+        descending id rather than updated_at), so a reader has to be able to
+        see when it bit.
+        """
+        import logging
+
+        import dashboard.data.active_tasks as at_mod
+        from dashboard.data.active_tasks import _shape_one_project
+
+        monkeypatch.setattr(at_mod, '_TERMINAL_FETCH_WINDOW', 3)
+        rows = [_raw_row(1, 'in-progress')]
+        rows += [_raw_row(i, 'done') for i in range(100, 112)]  # 12 terminal
+        status_map = {int(r['id']): r['status'] for r in rows}
+        mcp, _calls = _canned_mcp(rows, status_map)
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
+
+        config = self._one_project_config(tmp_path)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.active_tasks'):
+            await _shape_one_project(
+                dummy_client, config, config.project_root,
+                max_done_per_project=50, max_cancelled_per_project=50,
+            )
+
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'dashboard.data.active_tasks' and r.levelno >= logging.WARNING
+        ]
+        assert any(
+            'dark-factory' in m and '12' in m and '3' in m for m in messages
+        ), f'expected a truncation WARNING naming project/count/window, got {messages}'
+
+    async def test_offline_active_fetch_still_reports_the_project_offline(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(f) The existing offline contract is preserved by the new call shape."""
+        import httpx
+
+        from dashboard.data.active_tasks import _shape_one_project
+
+        async def _refuse(client, url, tool, args, **_kw):
+            raise httpx.ConnectError('refused')
+
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _refuse)
+
+        config = self._one_project_config(tmp_path)
+        active, offline, done_count = await _shape_one_project(
+            dummy_client, config, config.project_root,
+            max_done_per_project=50, max_cancelled_per_project=50,
+        )
+
+        assert offline is True
+        assert active == []
+        assert done_count == 0
+
+    async def test_status_map_offline_degrades_the_count_not_the_project(
+        self, monkeypatch, tmp_path, dummy_client, caplog
+    ):
+        """A failed compact-map read must not declare an otherwise-healthy project offline."""
+        import logging
+
+        import httpx
+
+        from dashboard.data.active_tasks import _shape_one_project
+
+        rows = [_raw_row(1, 'in-progress'), _raw_row(100, 'done')]
+
+        async def _statuses_fail(client, url, tool, args, **_kw):
+            if tool == 'get_statuses':
+                raise httpx.ConnectError('refused')
+            statuses = args.get('statuses')
+            selected = [
+                r for r in rows
+                if statuses is None or r.get('status') in statuses
+            ]
+            return {'tasks': selected}
+
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _statuses_fail)
+
+        config = self._one_project_config(tmp_path)
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.active_tasks'):
+            active, offline, done_count = await _shape_one_project(
+                dummy_client, config, config.project_root,
+                max_done_per_project=50, max_cancelled_per_project=50,
+            )
+
+        assert offline is False, 'the active fetch succeeded — the project is not offline'
+        assert [r['title'] for r in active if r.get('status') == 'in-progress'] == ['task 1']
+        assert done_count == 1, 'done_count degrades to a count over returned rows'
+        assert any(
+            r.name == 'dashboard.data.active_tasks'
+            and r.levelno >= logging.WARNING
+            and 'dark-factory' in r.getMessage()
+            for r in caplog.records
+        ), 'the degraded count must be logged, not silent'
+
