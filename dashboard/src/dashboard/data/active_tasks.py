@@ -597,7 +597,27 @@ async def _shape_one_project(
             offset=max(0, n_terminal - window),
         )
         if isinstance(terminal, list):
-            tasks.extend(terminal)
+            # DEDUP, not concatenate. The two fetches are separate cached
+            # reads, so a task that completed between them appears in BOTH:
+            # once from the active read, once from the terminal read. Emitting
+            # both yields two rows sharing one _task_uid — the id the React
+            # tab uses as a map key and as its selection identity — so the
+            # task renders twice, as pending AND as done.
+            #
+            # This is not a narrow race. fetch_tasks caches per (root,
+            # narrowing) for the TTL, and the terminal key embeds an offset
+            # that changes on EVERY completion — so a completion mints a fresh
+            # terminal key (cold, sees 'done') while the active key is still
+            # served from an entry up to a full TTL old (still 'pending').
+            # Every completion would duplicate a row for up to the TTL window.
+            # The pre-narrowing single fetch made this structurally impossible;
+            # splitting the read is what introduced it.
+            #
+            # The terminal snapshot WINS: it is the newer of the two reads by
+            # exactly the reasoning above, so its status is the more current.
+            merged = {t.get('id'): t for t in tasks}
+            merged.update({t.get('id'): t for t in terminal})
+            tasks = list(merged.values())
         else:
             logger.warning(
                 'project %s: terminal-window fetch failed (%s) — done and '
@@ -716,10 +736,11 @@ async def collect_tasks_with_counts(
     max_cancelled_per_project: int = 0,
     resolve_external: bool = False,
     now: datetime | None = None,
-) -> tuple[list[dict], list[str], dict[str, int], list[str]]:
+) -> tuple[list[dict], list[str], dict[str, int], list[str], list[str]]:
     """Aggregate active tasks and per-project done counts in a single MCP pass.
 
-    Returns ``(active_tasks, offline_projects, done_counts, degraded_projects)``
+    Returns ``(active_tasks, offline_projects, done_counts,
+    degraded_projects, count_unknown_projects)``
     where:
 
     - *active_tasks* is the list of active (and optionally bounded done) rows
@@ -790,6 +811,14 @@ async def collect_tasks_with_counts(
     offline_projects: list[str] = []
     done_counts: dict[str, int] = {}
     degraded_projects: list[str] = []
+    # Roots whose ACTIVE rows loaded fine but whose compact status map did
+    # not, so done_count is UNKNOWN and the terminal window was skipped.
+    # These are NOT offline (their rows are good and current) and NOT
+    # degraded (nothing timed out), so without a list of their own they
+    # would appear in no marker at all — and the front end would render
+    # them as a healthy project with a confident "0 done". That is the
+    # invisible-failure class this task exists to close.
+    count_unknown_projects: list[str] = []
     for root in _all_project_roots(config):
         label = _project_label(root)
         remaining = deadline - loop.time()
@@ -858,11 +887,16 @@ async def collect_tasks_with_counts(
             offline_projects.append(label)
         elif done_count is not None:
             done_counts[label] = done_count
-        # done_count is None => the compact status map read failed for an
-        # otherwise-healthy project. Omitting the label (rather than writing a
-        # fabricated 0) is the established UNKNOWN channel: the front end
-        # treats a missing DONE_COUNTS entry as "no authoritative count" and
-        # falls back to its own row count. See _shape_one_project's docstring.
+        else:
+            # done_count is None => the compact status map read failed for an
+            # otherwise-healthy project. Omitting the label from done_counts
+            # keeps a fabricated 0 off the wire, but omission ALONE is not
+            # enough: the client's fallback counts the done rows it received,
+            # and the terminal window was deliberately skipped for exactly
+            # these projects, so that fallback is always 0 and renders as a
+            # confident "0 done". Naming the root here is what lets the
+            # banner and the header say UNKNOWN instead.
+            count_unknown_projects.append(label)
         all_active.extend(active)
 
     if resolve_external:
@@ -922,7 +956,10 @@ async def collect_tasks_with_counts(
                     else:
                         entry['status'] = status_map.get(entry['id'], 'unknown')
 
-    return all_active, offline_projects, done_counts, degraded_projects
+    return (
+        all_active, offline_projects, done_counts,
+        degraded_projects, count_unknown_projects,
+    )
 
 
 async def collect_active_tasks(
@@ -961,7 +998,7 @@ async def collect_active_tasks(
     need to distinguish "unknown" from "reachable and empty" must use
     ``collect_tasks_with_counts`` directly.
     """
-    active, offline, _, _ = await collect_tasks_with_counts(
+    active, offline, _, _, _ = await collect_tasks_with_counts(
         client, config,
         max_done_per_project=max_done_per_project,
         max_cancelled_per_project=max_cancelled_per_project,

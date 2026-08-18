@@ -18,7 +18,7 @@ function endpointsFor(win) {
   return {
     '/api/v2/dashboard/orchestrators':                ['ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK'],
     '/api/v2/dashboard/tasks':                        ['ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-                                                       'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT',
+                                                       'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS', 'TASKS_PROJECT_COUNT',
                                                        'DONE_COUNTS'],
     '/api/v2/dashboard/memory':                       ['MEMORY_STATUS'],
     '/api/v2/dashboard/memory-graphs':                ['MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN'],
@@ -64,6 +64,7 @@ window.DF_DATA = {
   // population TASKS_OFFLINE_PROJECTS is drawn from — PROJECTS (orchestrator-
   // derived) is a different one. 0 pre-fetch, which the banner reads as "no
   // count yet" rather than dividing by it.
+  TASKS_COUNT_UNKNOWN_PROJECTS: [],
   TASKS_PROJECT_COUNT: 0,
   DONE_COUNTS: {},
   PERFORMANCE: {},

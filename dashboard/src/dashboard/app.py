@@ -833,6 +833,11 @@ async def api_tasks(request: Request) -> JSONResponse:
       data unavailable") actually describes.
     - ``TASKS_OFFLINE_PROJECTS`` — the roots whose fetch DEMONSTRABLY failed.
       Non-empty with ``TASKS_OFFLINE`` false is the normal partial case.
+    - ``TASKS_COUNT_UNKNOWN_PROJECTS`` — roots whose ACTIVE rows loaded fine
+      but whose compact status map did not, so the done count is UNKNOWN and
+      the terminal window was skipped. Neither offline nor degraded: without
+      a list of their own they would render as a healthy project with a
+      confident "0 done".
     - ``TASKS_DEGRADED_PROJECTS`` — roots the handler ran out of budget for
       (see ``collect_tasks_with_counts``). Their state is UNKNOWN, not bad:
       nothing was proven unreachable, so they never raise the offline flag,
@@ -863,7 +868,10 @@ async def api_tasks(request: Request) -> JSONResponse:
     # no second fetch_statuses round-trip". That described the unnarrowed
     # whole-tree fetch this handler was changed to stop issuing, and
     # fetch_statuses is now exactly the second round-trip it denied.
-    active, offline_projects, done_counts, degraded_projects = await collect_tasks_with_counts(
+    (
+        active, offline_projects, done_counts,
+        degraded_projects, count_unknown_projects,
+    ) = await collect_tasks_with_counts(
         http_client, config,
         max_done_per_project=_MAX_DONE_PER_PROJECT,
         max_cancelled_per_project=_MAX_CANCELLED_PER_PROJECT,
@@ -881,6 +889,7 @@ async def api_tasks(request: Request) -> JSONResponse:
             'TASKS_OFFLINE': bool(total_roots) and len(offline_projects) == total_roots,
             'TASKS_OFFLINE_PROJECTS': offline_projects,
             'TASKS_DEGRADED_PROJECTS': degraded_projects,
+            'TASKS_COUNT_UNKNOWN_PROJECTS': count_unknown_projects,
             'TASKS_PROJECT_COUNT': total_roots,
             'DONE_COUNTS': done_counts,
         }

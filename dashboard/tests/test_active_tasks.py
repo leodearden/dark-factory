@@ -3136,3 +3136,98 @@ class TestCollectTasksBudget:
         # A degraded project is NOT offline here either — the marker is
         # dropped by this narrower contract, not silently reclassified.
         assert offline == []
+
+
+class TestActiveAndTerminalReadsAreDeduped:
+    """Splitting one fetch into two must not double-emit a task.
+
+    Regression for the task-3857 review finding. The active and terminal
+    reads are separately cached, so a task completing between them appears
+    in BOTH — and both loops emit a row sharing one ``_task_uid``, the id
+    the React tab uses as its map key and selection identity.
+    """
+
+    @staticmethod
+    def _one_project_config(tmp_path):
+        return TestShapeOneProjectNarrowing._one_project_config(tmp_path)
+
+    async def test_a_task_in_both_reads_emits_exactly_one_row(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """id 7 is 'pending' per the active read and 'done' per the terminal read."""
+        from dashboard.data.active_tasks import _shape_one_project
+
+        async def _skewed(client, url, tool, args, **_kw):
+            if tool == 'get_statuses':
+                return {'statuses': {1: 'in-progress', 7: 'done'}}
+            statuses = args.get('statuses') or []
+            if 'done' in statuses:
+                # The terminal read is the NEWER snapshot: 7 has completed.
+                return {'tasks': [_raw_row(7, 'done')]}
+            # The active read is served from a cache entry predating that.
+            return {'tasks': [_raw_row(1, 'in-progress'), _raw_row(7, 'pending')]}
+
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _skewed)
+
+        config = self._one_project_config(tmp_path)
+        active, offline, _done = await _shape_one_project(
+            dummy_client, config, config.project_root,
+            max_done_per_project=50, max_cancelled_per_project=50,
+        )
+
+        assert offline is False
+        ids = [r['id'] for r in active]
+        assert len(set(ids)) == len(ids), (
+            f'a task present in both reads must emit ONE row; got {ids}'
+        )
+        seven = [r for r in active if r['id'].endswith('T-7')]
+        assert len(seven) == 1, f'expected exactly one row for task 7, got {seven}'
+        assert seven[0]['status'] == 'done', (
+            'the terminal read is the newer snapshot and must win the dedup'
+        )
+
+
+class TestCountUnknownProjectsAreNamedOnTheWire:
+    """A project whose count is UNKNOWN must not look healthy-with-zero."""
+
+    @staticmethod
+    def _one_project_config(tmp_path):
+        return TestShapeOneProjectNarrowing._one_project_config(tmp_path)
+
+    async def test_status_map_offline_project_is_named_count_unknown(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        import httpx
+
+        from dashboard.data.active_tasks import collect_tasks_with_counts
+
+        rows = [_raw_row(1, 'in-progress'), _raw_row(100, 'done')]
+
+        async def _statuses_fail(client, url, tool, args, **_kw):
+            if tool == 'get_statuses':
+                raise httpx.ConnectError('refused')
+            statuses = args.get('statuses')
+            return {'tasks': [
+                r for r in rows
+                if statuses is None or r.get('status') in statuses
+            ]}
+
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _statuses_fail)
+
+        config = self._one_project_config(tmp_path)
+        (
+            _active, offline_projects, done_counts,
+            degraded, count_unknown,
+        ) = await collect_tasks_with_counts(
+            dummy_client, config,
+            max_done_per_project=50, max_cancelled_per_project=50,
+        )
+
+        assert offline_projects == [], 'the active fetch succeeded — not offline'
+        assert degraded == [], 'nothing timed out — not degraded'
+        assert 'dark-factory' not in done_counts, 'no fabricated count'
+        assert count_unknown == ['dark-factory'], (
+            'a project that is neither offline nor degraded but whose count was '
+            'never measured must still be NAMED, or it renders as a healthy '
+            f'project with a confident "0 done"; got {count_unknown!r}'
+        )

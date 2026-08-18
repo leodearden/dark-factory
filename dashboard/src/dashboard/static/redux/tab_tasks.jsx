@@ -684,12 +684,14 @@ function TasksTab({ projectFilter, search }) {
     offline: !!DF_T.TASKS_OFFLINE,
     offlineProjects: DF_T.TASKS_OFFLINE_PROJECTS || [],
     degradedProjects: DF_T.TASKS_DEGRADED_PROJECTS || [],
+    countUnknownProjects: DF_T.TASKS_COUNT_UNKNOWN_PROJECTS || [],
     totalProjects: DF_T.TASKS_PROJECT_COUNT || 0,
   });
   const bannerTestIds = {
     global: 'tasks-offline-banner',
     partial: 'tasks-partial-banner',
     degraded: 'tasks-degraded-banner',
+    'count-unknown': 'tasks-count-unknown-banner',
   };
 
   function statusMatches(s) {
@@ -777,9 +779,17 @@ function TasksTab({ projectFilter, search }) {
               // The fallback counts only the bounded done rows loaded into ACTIVE_TASKS
               // (≤50 per project). If we hit that cap without a server count, show
               // "50+" so the user knows the displayed number is a lower bound.
+              // A MISSING DONE_COUNTS entry means the count was never
+              // measured — it does NOT mean zero. Falling through to
+              // _fallbackDone here rendered a confident "0 done", because the
+              // server skips the terminal window for exactly these projects
+              // so no done row was ever sent. Show unknown instead; the
+              // banner's 'count-unknown' notice names which projects.
               complete: (DF_T.DONE_COUNTS && DF_T.DONE_COUNTS[p.id] != null)
                 ? DF_T.DONE_COUNTS[p.id]
-                : (_fallbackDone >= 50 ? '50+' : _fallbackDone),
+                : ((DF_T.TASKS_COUNT_UNKNOWN_PROJECTS || []).indexOf(p.id) !== -1
+                    ? '—'
+                    : (_fallbackDone >= 50 ? '50+' : _fallbackDone)),
             };
             const isOpen = openMap[p.id] !== false; // default-open
             const groupByPrd = groupByPrdMap[p.id] === 'prd';

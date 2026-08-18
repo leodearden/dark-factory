@@ -79,6 +79,7 @@ function countPhrase(k, total) {
  *                "fused-memory offline": fused-memory is demonstrably
  *                reachable in this state.
  *   'degraded' — the handler ran out of budget before reaching these roots.
+ *   'count-unknown' — rows are current but the done count was not measured.
  *                Nothing was proven unreachable, so this never claims an
  *                outage; it says the view is partial. Composes with 'partial'
  *                (a project can fail while a different one times out).
@@ -91,6 +92,7 @@ function tasksBannerNotices(state) {
   const s = state || {}
   const offlineProjects = asList(s.offlineProjects)
   const degradedProjects = asList(s.degradedProjects)
+  const countUnknownProjects = asList(s.countUnknownProjects)
 
   // The server already decided whether this is a total outage; do not
   // re-derive it from the lists here (see the header note on drift).
@@ -118,6 +120,20 @@ function tasksBannerNotices(state) {
         'the task fetch timed out for ' +
         countPhrase(degradedProjects.length, s.totalProjects) +
         ' (' + nameList(degradedProjects) + ') — this view is partial, not empty',
+    })
+  }
+
+  // Neither offline nor degraded: the rows are current, but the done count
+  // was never measured and the terminal window was skipped. Without this
+  // notice the project renders as healthy with a confident "0 done".
+  if (countUnknownProjects.length > 0) {
+    notices.push({
+      kind: 'count-unknown',
+      text:
+        'the completed-task count is unavailable for ' +
+        countPhrase(countUnknownProjects.length, s.totalProjects) +
+        ' (' + nameList(countUnknownProjects) + ') — their rows below are ' +
+        'current, but done counts show as unknown',
     })
   }
 
