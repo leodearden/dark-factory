@@ -15,6 +15,7 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import ValidationError
 from shared.branch_names import canonical_queued_branch_name
+from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from escalation import sweep as _sweep
@@ -429,6 +430,25 @@ def _compact_escalation(d: dict[str, Any], fields: tuple[str, ...]) -> dict[str,
     return row
 
 
+# INV-4 storm escape for L2 amendment truncation (task 3997).  Sizing: with
+# ``queue._MAX_AMENDMENTS`` = 20, ONE L2 has to fold 21+ times inside the window
+# to truncate even ONCE, so three truncations in an hour is not routine churn.
+# It says either the cap is systematically wrong for the live fold rate, or
+# root-cause matching is over-folding unrelated clusters into a single L2 — and
+# task 3998 canonicalises that matching, which RAISES the fold rate BY DESIGN.
+# Both readings are worth a human-adjacent signal rather than a WARNING nobody
+# reads; the durable per-record ``amendments_truncated`` counter remains the
+# primary structured fact (INV-8), this is the notification layered on it.
+#
+# Module constants rather than a config leaf, following the sanctioned
+# precedent of ``reconciliation/harness.py``'s ``_PLACEHOLDER_DROP_STORM_*``,
+# whose stated reason — the counter is private to this module — holds
+# identically here.  They are still passed per ``record()`` call because that
+# is ``StormCounter``'s API (see its RELOAD SAFETY note).
+_AMENDMENT_TRUNCATION_STORM_THRESHOLD = 3
+_AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS = 3600.0  # 1 h
+
+
 # Task statuses from which a recovery/redispatch is still possible.  A record
 # on a task outside this set pins nothing: there is no recovery to block.
 _RECOVERABLE_STATUSES = frozenset({'in-progress', 'blocked'})
@@ -667,6 +687,89 @@ def create_server(
             # (still carrying esc.level, so the 'level' echo is never missing).
             return _observed_submit_response(queue, esc_id, fallback_level=esc.level)
         return _dedupe_submit_or_dedupe(queue, esc, cfg)
+
+    # --- Amendment-truncation storm escape (INV-4, task 3997) ---
+
+    # PROCESS-LOCAL and per-instance BY CONSTRUCTION.  StormCounter documents
+    # its state as resetting on restart and not bleeding between servers (or
+    # between tests), and server.py otherwise holds zero module-level mutable
+    # state — every module-level name above is a frozen constant.  Keeping the
+    # counter in this closure is what preserves that property.
+    _amendment_truncation_storm = StormCounter()
+
+    def _report_amendment_truncation_storm(l2_id: str, task_id: str) -> None:
+        """File ONE info escalation when amendment truncation BURSTS.
+
+        ``queue.add_members_to_l2`` already counts every dropped amendment on
+        the record itself (``amendments_truncated``) and logs a WARNING.  The
+        counter stays the PRIMARY structured fact — the contract is assertable
+        from the record, never by log-scrape (INV-8) — but a WARNING has no
+        audience.  This is the rate-thresholded NOTIFICATION layered on top,
+        which is what INV-4 asks for: a hearer, at a threshold.
+
+        Deliberately lives here and not in ``queue.py``.  That module is a pure
+        storage leaf, and a self-file from inside ``add_members_to_l2`` would
+        re-enter ``make_id``/``submit``/``_atomic_write`` while still holding
+        ``escalation_id_lock``.  ``promote_to_l2`` already calls ``queue.submit``
+        on its create path and runs outside that flock.
+
+        PURELY ADDITIVE, NEVER FATAL, mirroring the house analogues
+        ``emit_markup_storm_escalation`` and
+        ``emit_residual_candidate_key_escalation``: nothing raised in here may
+        fail the promote that triggered it.  A dropped report costs a
+        notification; a raised one would cost the fold.
+        """
+        try:
+            storm = _amendment_truncation_storm.record(
+                threshold=_AMENDMENT_TRUNCATION_STORM_THRESHOLD,
+                window_seconds=_AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS,
+                # The label is load-bearing, not decoration: it is what lets the
+                # report name WHICH L2s truncated instead of blaming whichever
+                # call happened to cross the threshold.
+                label=l2_id,
+            )
+            # None means below threshold, or a previous fire is still inside the
+            # window (one report per window, so a runaway escalates once).
+            if storm is None:
+                return
+            labels = ', '.join(storm['labels']) or l2_id
+            _submit_or_dedupe(Escalation(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='escalation-server',
+                # A report about lost framing is a notification, not a page:
+                # 'info' keeps it off the born-at-L2 human-direct route.
+                severity='info',
+                category='infra_issue',
+                summary=(
+                    f"L2 amendment truncation storm: {storm['count']} truncations "
+                    f"in {storm['window_seconds']}s "
+                    f"(threshold {storm['threshold']}); L2s: {labels}"
+                ),
+                detail=(
+                    f"OBSERVED: {storm['count']} amendment truncations within "
+                    f"{storm['window_seconds']}s across L2 escalation(s): {labels}.\n"
+                    f"Each truncation drops the OLDEST entry of that L2's "
+                    f"`amendments` list at the queue._MAX_AMENDMENTS cap; the "
+                    f"record's own `amendments_truncated` field holds the durable "
+                    f"per-L2 total, and its own root_cause/detail/options/summary "
+                    f"are never touched.\n"
+                    f"Hypothesis: either the cap is too low for the live fold "
+                    f"rate, or root-cause matching is over-folding unrelated L1 "
+                    f"clusters into one L2."
+                ),
+                suggested_action=(
+                    'Read the named L2s and compare each record\'s own framing '
+                    'against its amendments to judge whether those folds belong '
+                    'together; then either raise queue._MAX_AMENDMENTS or tighten '
+                    'root-cause matching.'
+                ),
+            ))
+        except Exception as e:  # pragma: no cover - defensive, never fatal
+            logger.exception(
+                'amendment-truncation storm report failed for L2 %s (non-fatal): %s',
+                l2_id, e,
+            )
 
     # --- Terminal-task chokepoint helper ---
 
@@ -1725,10 +1828,13 @@ def create_server(
              'severity': <severity_after_floor>,
              'amendment_recorded': <bool>, 'amendments': <int>}
 
-        ``amendment_recorded`` is True when THIS call's framing was appended
-        (derived from the record's amendment count actually growing, so a
-        framing-free re-promote does not falsely claim a write);
-        ``amendments`` is the resulting list length.
+        ``amendment_recorded`` is True when THIS call's framing was appended.
+        It is derived from what actually moved on the record — the amendment
+        count growing, OR the truncation counter growing (an append that hits
+        the cap sheds an entry, so the length stays put) — never from asserting
+        that a write happened: a framing-free or framing-identical re-promote
+        moves neither and correctly reports False.  ``amendments`` is the
+        resulting list length, which saturates at ``queue._MAX_AMENDMENTS``.
 
         ``severity`` reports what was ACTUALLY filed, which for a caller that
         omitted the argument is how the inherited value becomes visible — and
@@ -1806,6 +1912,10 @@ def create_server(
             # under-claim.
             before = queue.get(existing_id)
             amendments_before = len(before.amendments) if before is not None else 0
+            # Same pre-call read serves the INV-4 storm escape below: a GROWN
+            # truncation counter is the event worth counting, and reading it
+            # from the record means no second source of truth.
+            truncated_before = before.amendments_truncated if before is not None else 0
             updated = queue.add_members_to_l2(
                 existing_id,
                 list(dict.fromkeys(member_ids)),
@@ -1820,6 +1930,24 @@ def create_server(
                 agent_role=agent_role,
             )
             if updated is not None:
+                # A TRUNCATING append leaves the list sitting AT the cap, so a
+                # grown length alone under-reports: once `amendments` holds
+                # _MAX_AMENDMENTS entries it can never grow again, and every
+                # subsequent fold would falsely report its framing as dropped.
+                # A grown truncation counter is the other observable half —
+                # add_members_to_l2 only ever trims immediately after an append
+                # — so the OR of the two is exact.  A framing-identical
+                # re-promote appends nothing and moves neither, so it still
+                # correctly reports False.
+                truncated = updated.amendments_truncated > truncated_before
+                amendment_recorded = (
+                    len(updated.amendments) > amendments_before or truncated
+                )
+                # INV-4: repeated truncation gets a HEARER, not just a WARNING.
+                # Purely additive — _report_amendment_truncation_storm never
+                # raises, so a failed report can never fail this fold.
+                if truncated:
+                    _report_amendment_truncation_storm(existing_id, task_id)
                 return {
                     'id': existing_id,
                     'status': 'updated',
@@ -1829,7 +1957,7 @@ def create_server(
                     'severity': updated.severity,
                     # Report the preservation, so a caller LEARNS its framing
                     # landed instead of having to re-read the record to find out.
-                    'amendment_recorded': len(updated.amendments) > amendments_before,
+                    'amendment_recorded': amendment_recorded,
                     'amendments': len(updated.amendments),
                 }
             # Race: the pending L2 was resolved/archived between find and update.
