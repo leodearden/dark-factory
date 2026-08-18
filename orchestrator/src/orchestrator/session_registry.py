@@ -627,9 +627,27 @@ def _atomic_write_text(path: Path, text: str) -> None:
     is strictly better than a module that cannot be imported by its own
     documented entrypoint.
 
-    ``os.fdopen(fd, 'w')`` is locale-dependent rather than utf-8. That is a
-    latent bug — JSON written under a non-UTF-8 locale — but it is the
-    behaviour this module has always had, and changing it is out of scope here.
+    ``os.fdopen(fd, 'w')`` with no explicit encoding defaults to the ambient
+    locale's encoding, which is host-dependent. Task 3387 fixed the resulting
+    latent bug: the payload is always JSON (``record.to_json()``), and RFC 8259
+    requires JSON on disk to be UTF-8 — under a non-UTF-8 locale this wrote
+    bytes that THIS MODULE'S OWN READERS then reject. Name them precisely, so
+    the next investigator does not go looking in the wrong module:
+    ``read_record`` raises ``CorruptSessionRecord`` (the decode error is a
+    ``UnicodeDecodeError``, a ``ValueError`` subclass, so it lands in that
+    function's ``except`` clause), ``list_decisions`` and ``reap_stale_leases``
+    log and SKIP the file, and ``_mutate_decision`` returns ``None``. (An
+    earlier version of this paragraph cited
+    ``shared.safe_io.load_json_or_warn``. That helper never reads session,
+    decision or lease records — its callers are ``b3_gate``, ``chronic_flake``,
+    ``landed_outbox`` and ``merge_queue_store``.)
+
+    The encoding is now pinned ``'utf-8'`` explicitly at both halves of the
+    round-trip — here on write, and on every ``read_text()`` in this module —
+    so neither half follows the ambient locale. The literal is preferred over
+    ``locale.getpreferredencoding(False)`` because it is locale-INDEPENDENT,
+    which is the entire point; ``locale`` is stdlib and importing it would not
+    have violated this module's stdlib-only constraint above.
 
     Error policy stays with the callers: write_record lets a failure propagate
     (its sole caller, the CLI main(), provides the outer fail-soft boundary);
@@ -643,7 +661,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
         dir=str(path.parent),
     )
     try:
-        with os.fdopen(fd, 'w') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(text)
         os.replace(tmp_path_str, str(path))
     except Exception:
@@ -673,7 +691,7 @@ def read_record(slug: str, root: Path | str | None = None) -> SessionRecord:
     if not path.is_file():
         raise FileNotFoundError(str(path))
     try:
-        return SessionRecord.from_json(path.read_text())
+        return SessionRecord.from_json(path.read_text(encoding='utf-8'))
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise CorruptSessionRecord(f'unparseable session record at {path}') from exc
 
@@ -798,7 +816,7 @@ def list_decisions(root: Path | str | None = None) -> list[DecisionRecord]:
     decisions: list[DecisionRecord] = []
     for path in sorted(base.glob('*.json')):
         try:
-            decisions.append(DecisionRecord.from_json(path.read_text()))
+            decisions.append(DecisionRecord.from_json(path.read_text(encoding='utf-8')))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             logger.error('list_decisions: skipping unreadable %s', path, exc_info=True)
             continue
@@ -839,7 +857,7 @@ def _mutate_decision(
     path = decision_path_for_id(decision_id, root=root)
     try:
         with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
+            record = DecisionRecord.from_json(path.read_text(encoding='utf-8'))
             mutate(record)
             if not write_decision(record, root=root):
                 return None
@@ -977,7 +995,7 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
     Usage::
 
         with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
+            record = DecisionRecord.from_json(path.read_text(encoding='utf-8'))
             record.some_field = new_value
             write_decision(record, root=root)
     """
@@ -1125,7 +1143,7 @@ def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> s
     if candidate is None:
         return None
     try:
-        data = json.loads(candidate.read_text())
+        data = json.loads(candidate.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError, ValueError):
         return None
     status = data.get('status') if isinstance(data, dict) else None
@@ -2229,7 +2247,7 @@ def _read_lease_holder_state(
         return None, False, LEASE_HEARTBEAT_TTL.total_seconds() + 1.0
     age_secs = (now - datetime.fromtimestamp(mtime, tz=UTC)).total_seconds()
     try:
-        holder = LeaseHolder.from_json(path.read_text())
+        holder = LeaseHolder.from_json(path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None, False, age_secs
     return holder, _pid_alive(holder.pid), age_secs
@@ -2636,7 +2654,7 @@ def reap_stale_leases(
         stale = age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
 
         try:
-            holder = LeaseHolder.from_json(lease_path.read_text())
+            holder = LeaseHolder.from_json(lease_path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             reason = 'corrupt' if stale else None
         else:
