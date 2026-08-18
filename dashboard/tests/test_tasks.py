@@ -327,6 +327,7 @@ class TestFetchTasksCache:
 
         RED until step-2: no cache → call_count == 2.
         """
+        import dashboard.data.tasks as tasks_mod
         from dashboard.data.tasks import fetch_tasks
 
         mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
@@ -338,9 +339,14 @@ class TestFetchTasksCache:
             f'expected exactly 1 MCP call within TTL, got {mock_mcp.call_count}'
         )
         # The single call was 'get_tasks' for the correct project_root.
-        positional = mock_mcp.call_args_list[0].args
+        # The unnarrowed arguments dict must stay byte-identical to the
+        # pre-narrowing shape (the four full-tree callers depend on it); the
+        # per-request budget rides as a keyword, never inside the dict.
+        call = mock_mcp.call_args_list[0]
+        positional = call.args
         assert positional[2] == 'get_tasks'
         assert positional[3] == {'project_root': '/proj/A'}
+        assert call.kwargs.get('timeout') == tasks_mod.DEFAULT_PER_CALL_TIMEOUT
         # Both calls return equal shaped lists.
         assert isinstance(result1, list)
         assert result1 == result2
@@ -549,6 +555,194 @@ class TestFetchTasksCache:
             f'on the same project_root), got {mock_mcp.call_count}'
         )
         assert result1 == result2
+
+
+# ---------------------------------------------------------------------------
+# TestFetchTasksNarrowing — server-side narrowing args on the get_tasks wire
+# (task 3857 step-1 RED; step-3 adds the cache-key discrimination tests)
+# ---------------------------------------------------------------------------
+
+
+class TestFetchTasksNarrowing:
+    """``fetch_tasks``'s narrowing arguments as a wire contract.
+
+    The whole point of the narrowing work is that the *server* does the
+    filtering, so what matters is the arguments dict that actually crosses
+    the MCP boundary — not what the dashboard discards afterwards. These
+    tests therefore assert on ``mcp_tool_call``'s recorded call args.
+
+    The unnarrowed shape is pinned byte-identical because four callers
+    (``app._load_task_cards``, ``data/orchestrator.py``,
+    ``data/merge_queue.py``, ``data/burndown.py``) still need the full tree
+    and must be unaffected by this change.
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_fetch_tasks_cache(self):
+        import dashboard.data.tasks as tasks_mod
+        tasks_mod._fetch_tasks_cache_clear()
+        yield
+        tasks_mod._fetch_tasks_cache_clear()
+
+    @staticmethod
+    def _args_of(mock_mcp, index=0):
+        """Return the arguments dict of the *index*-th recorded MCP call."""
+        return mock_mcp.call_args_list[index].args[3]
+
+    async def test_unnarrowed_call_sends_project_root_only(
+        self, dummy_client, dummy_config
+    ):
+        """(a) No narrowing → the arguments dict is EXACTLY {'project_root': ...}.
+
+        Backward-compatibility guard for the four full-tree callers: no
+        ``statuses``, no ``page_size``, no ``offset`` key may appear.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(dummy_client, dummy_config, '/proj/A')
+
+        assert mock_mcp.call_count == 1
+        assert self._args_of(mock_mcp) == {'project_root': '/proj/A'}, (
+            'the unnarrowed arguments dict must stay byte-identical for the '
+            'four full-tree callers'
+        )
+
+    async def test_statuses_forwarded_verbatim(self, dummy_client, dummy_config):
+        """(b) ``statuses`` crosses the wire verbatim — not re-sorted, not coerced."""
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(
+                dummy_client, dummy_config, '/proj/A',
+                statuses=['in-progress', 'pending'],
+            )
+
+        assert self._args_of(mock_mcp) == {
+            'project_root': '/proj/A',
+            'statuses': ['in-progress', 'pending'],
+        }
+
+    async def test_empty_statuses_list_is_sent_not_dropped(
+        self, dummy_client, dummy_config
+    ):
+        """``statuses=[]`` is a valid 'return nothing' request, distinct from None.
+
+        A falsy-check implementation would drop it and silently request the
+        whole tree — the exact defect this task exists to remove.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value={'tasks': []})
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(dummy_client, dummy_config, '/proj/A', statuses=[])
+
+        assert self._args_of(mock_mcp) == {'project_root': '/proj/A', 'statuses': []}
+
+    async def test_page_size_and_offset_added_together(
+        self, dummy_client, dummy_config
+    ):
+        """(c) ``page_size``/``offset`` add exactly those two keys."""
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(
+                dummy_client, dummy_config, '/proj/A', page_size=100, offset=25,
+            )
+
+        assert self._args_of(mock_mcp) == {
+            'project_root': '/proj/A',
+            'page_size': 100,
+            'offset': 25,
+        }
+
+    async def test_offset_omitted_when_page_size_is_none(
+        self, dummy_client, dummy_config
+    ):
+        """(c) ``offset`` is meaningless without ``page_size`` per the tool docstring."""
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(dummy_client, dummy_config, '/proj/A', offset=25)
+
+        assert self._args_of(mock_mcp) == {'project_root': '/proj/A'}, (
+            'offset without page_size must not reach the wire'
+        )
+
+    async def test_statuses_and_page_size_compose(self, dummy_client, dummy_config):
+        """The terminal-window call shape: narrowed statuses PLUS a bounded window."""
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(
+                dummy_client, dummy_config, '/proj/A',
+                statuses=['cancelled', 'done'], page_size=400, offset=3600,
+            )
+
+        assert self._args_of(mock_mcp) == {
+            'project_root': '/proj/A',
+            'statuses': ['cancelled', 'done'],
+            'page_size': 400,
+            'offset': 3600,
+        }
+
+    @pytest.mark.parametrize('kwargs', [
+        {},
+        {'statuses': ['pending']},
+        {'page_size': 10, 'offset': 5},
+    ])
+    async def test_every_call_carries_the_per_request_budget(
+        self, dummy_client, dummy_config, kwargs
+    ):
+        """(d) Every call — narrowed or not — passes ``timeout=`` as a keyword."""
+        import dashboard.data.tasks as tasks_mod
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(dummy_client, dummy_config, '/proj/A', **kwargs)
+
+        call = mock_mcp.call_args_list[0]
+        assert call.kwargs.get('timeout') == tasks_mod.DEFAULT_PER_CALL_TIMEOUT
+
+    async def test_explicit_timeout_overrides_the_default(
+        self, dummy_client, dummy_config
+    ):
+        """A caller may tighten the per-request budget further."""
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(dummy_client, dummy_config, '/proj/A', timeout=0.5)
+
+        assert mock_mcp.call_args_list[0].kwargs.get('timeout') == 0.5
+
+    def test_default_per_call_timeout_only_ever_tightens(self):
+        """(d) The budget must be strictly BELOW ``mcp_tool_call``'s own default.
+
+        Standing guard for the plan's MUST NOT: this task never raises a
+        probe budget. Read out of the live signature so a future widening of
+        ``mcp_tool_call``'s default cannot silently relax this.
+        """
+        import inspect
+
+        import dashboard.data.memory as memory_mod
+        import dashboard.data.tasks as tasks_mod
+
+        mcp_default = inspect.signature(
+            memory_mod.mcp_tool_call
+        ).parameters['timeout'].default
+        assert isinstance(mcp_default, (int, float))
+        assert mcp_default > tasks_mod.DEFAULT_PER_CALL_TIMEOUT, (
+            f'DEFAULT_PER_CALL_TIMEOUT={tasks_mod.DEFAULT_PER_CALL_TIMEOUT} must be '
+            f'strictly tighter than mcp_tool_call default={mcp_default}'
+        )
+        assert tasks_mod.DEFAULT_PER_CALL_TIMEOUT > 0
 
 
 # ---------------------------------------------------------------------------
