@@ -4710,6 +4710,249 @@ class TestDedupFlagsCrossProjectFixTaskSuppression:
         )
         taskmaster.get_task.assert_not_called()
 
+    # ---- task 4381 step-9: the persisted anchor carries the fix across cycles ----
+
+    @pytest.mark.asyncio
+    async def test_persisted_anchor_alone_suppresses(self, ledger_memory_service):
+        """(a) HEADLINE: the prior payload's cited_tasks — precisely the row
+        step-2 now writes — suppresses even when THIS cycle's LLM output
+        re-emits no citation of its own.
+
+        This is the whole point of the ledger enrichment: a carried-forward
+        finding need not re-cite its fix task every cycle to stay resolved.
+        """
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag()
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
+            run_id='r1', extra_payload={'cited_tasks': [self.FIX_CITE]},
+        )
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(),
+            known_projects=self.KNOWN,
+        )
+
+        assert result == [], (
+            f'the persisted anchor alone must suppress a carried-forward flag; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_current_citation_suppresses_when_persisted_one_is_cancelled(
+        self, ledger_memory_service
+    ):
+        """(b) UNION: prior anchor cites a CANCELLED task, the current cycle
+        cites a live one -> suppressed via the current citation."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        old_cite = {'project_id': 'dark_factory', 'task_id': '3833', 'title': 'Old fix'}
+
+        async def _get_task(task_id, project_root):
+            if str(task_id) == '3833':
+                return {'id': 3833, 'title': 'Old fix', 'status': 'cancelled'}
+            return {'id': 3839, 'title': 'Fix', 'status': 'pending'}
+
+        flag = self._make_flag([self.FIX_CITE])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
+            run_id='r1', extra_payload={'cited_tasks': [old_cite]},
+        )
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(side_effect=_get_task),
+            known_projects=self.KNOWN,
+        )
+
+        assert result == [], (
+            f'the current cycle\'s live citation must suppress; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_persisted_citation_suppresses_when_current_one_is_cancelled(
+        self, ledger_memory_service
+    ):
+        """(b, mirror) The persisted anchor is live and the current citation is
+        cancelled -> still suppressed. Either side alone suffices."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        cancelled_cite = {'project_id': 'dark_factory', 'task_id': '3833', 'title': 'Old fix'}
+
+        async def _get_task(task_id, project_root):
+            if str(task_id) == '3833':
+                return {'id': 3833, 'title': 'Old fix', 'status': 'cancelled'}
+            return {'id': 3839, 'title': 'Fix', 'status': 'pending'}
+
+        flag = self._make_flag([cancelled_cite])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
+            run_id='r1', extra_payload={'cited_tasks': [self.FIX_CITE]},
+        )
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(side_effect=_get_task),
+            known_projects=self.KNOWN,
+        )
+
+        assert result == [], (
+            f'the persisted live citation must suppress; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_union_is_deduplicated_by_project_and_task_id(self, ledger_memory_service):
+        """(b, dedup) A task cited by BOTH the prior payload and the current
+        flag is looked up ONCE, not twice."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        other_cite = {'project_id': 'dark_factory', 'task_id': '3833', 'title': 'Old fix'}
+
+        async def _get_task(task_id, project_root):
+            return {'id': int(task_id), 'title': 'Nope', 'status': 'pending'}
+
+        # prior cites {3839}; current cites {3839, 3833} — one shared, one new.
+        flag = self._make_flag([self.FIX_CITE, other_cite])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
+            run_id='r1', extra_payload={'cited_tasks': [self.FIX_CITE]},
+        )
+        taskmaster = self._taskmaster(side_effect=_get_task)
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, f'titles do not corroborate, so nothing is suppressed; got {result!r}'
+        assert taskmaster.get_task.call_count == 2, (
+            'the union must be de-duplicated on (project_id, task_id) — the shared '
+            f'citation must not be looked up twice; got {taskmaster.get_task.call_count}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'prior_cited',
+        ['a-bare-string', {'project_id': 'dark_factory'}, ['not-a-dict', 7], 42, None],
+        ids=['str', 'dict', 'list-of-non-dicts', 'int', 'none'],
+    )
+    async def test_malformed_persisted_anchor_never_raises(
+        self, ledger_memory_service, prior_cited
+    ):
+        """(c) A malformed prior cited_tasks payload degrades to 'no prior
+        anchor' — the flag is simply returned."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag()
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
+            run_id='r1', extra_payload={'cited_tasks': prior_cited},
+        )
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(),
+            known_projects=self.KNOWN,
+        )
+
+        assert len(result) == 1, (
+            f'a malformed persisted anchor must degrade, not raise or suppress; got {result!r}'
+        )
+        assert result[0]['persisted_from_run'] == 'r1'
+
+    @pytest.mark.asyncio
+    async def test_marker_survives_suppression_with_refreshed_ttl(self, ledger_memory_service):
+        """(d) MARKER SURVIVES SUPPRESSION: the row stays active, its payload
+        advances to the current run_id, its cited_tasks are re-persisted, and
+        its TTL moves forward — so a suppressed-but-recurring signature never
+        ages out and loses its recurrence history."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        seeded_expiry = '2026-01-15T00:00:00+00:00'
+        flag = self._make_flag([self.SUBJECT_CITE, self.FIX_CITE])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(
+            ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype,
+            run_id='r1', expires_at=seeded_expiry,
+        )
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(),
+            known_projects=self.KNOWN,
+        )
+        assert result == []
+
+        row = await _get_marker(ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype)
+        assert row is not None, 'suppression must not remove the marker row'
+        assert row.state == 'active', f'the marker must stay active; got {row.state!r}'
+        payload = json.loads(row.payload_json)
+        assert payload['last_seen_run_id'] == 'r2', (
+            f'the upsert must run before suppression; got {payload!r}'
+        )
+        assert payload['cited_tasks'] == [self.SUBJECT_CITE, self.FIX_CITE], (
+            f'cited_tasks must be re-persisted on the suppressed cycle; got {payload!r}'
+        )
+        assert row.expires_at is not None and row.expires_at > seeded_expiry, (
+            f'the 14-day TTL must be pushed forward; got {row.expires_at!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_suppression_emits_structured_info_log(self, ledger_memory_service, caplog):
+        """(e) OBSERVABILITY: the drop names the fix task that drove it — the
+        only channel that distinguishes this drop cause from filter_suppressed's."""
+        import logging
+
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._make_flag([self.SUBJECT_CITE, self.FIX_CITE])
+        tid, ftype = self._signature(flag)
+        await _seed_marker(ledger_memory_service.recon_ledger, self.PROJECT, tid, ftype, run_id='r1')
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.flag_dedup'):
+            result = await dedup_flags(
+                memory_service=ledger_memory_service,
+                project_id=self.PROJECT,
+                run_id='r2',
+                flags=[flag],
+                taskmaster=self._taskmaster(),
+                known_projects=self.KNOWN,
+            )
+
+        assert result == []
+        messages = [r.message for r in caplog.records]
+        assert any(
+            'stage1_flag_cross_project_fix_task_suppressed' in m
+            and 'fix_project_id=dark_factory' in m
+            and 'fix_task_id=3839' in m
+            for m in messages
+        ), f'expected a structured suppression log naming the fix task; got {messages!r}'
+
 
 # ---------------------------------------------------------------------------
 # task-1656 step-3 — RED: dedup_flags write-guard integration tests
