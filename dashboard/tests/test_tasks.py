@@ -961,6 +961,219 @@ class TestFetchTasksNarrowing:
 
 
 # ---------------------------------------------------------------------------
+# TestFetchTasksNegativeCache — a failing root must stop being the expensive
+# path (task 3857 step-5 RED)
+# ---------------------------------------------------------------------------
+
+
+class TestFetchTasksNegativeCache:
+    """``cache_ok`` stores successes only, so failure is the expensive path.
+
+    A healthy root rides the ~20 s positive TTL; a broken one re-walks its
+    whole tree on every 3 s UI poll. The fix is a SECOND, much shorter TTL
+    cache for offline markers — the retry is suppressed, the degradation
+    signal is not.
+    """
+
+    @pytest.fixture(autouse=True)
+    def reset_fetch_tasks_cache(self):
+        import dashboard.data.tasks as tasks_mod
+        tasks_mod._fetch_tasks_cache_clear()
+        yield
+        tasks_mod._fetch_tasks_cache_clear()
+
+    async def test_second_attempt_within_negative_ttl_is_suppressed(
+        self, dummy_client, dummy_config
+    ):
+        """(a) The retry is suppressed; the offline marker is still returned."""
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(side_effect=httpx.ConnectError('refused'))
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            first = await fetch_tasks(dummy_client, dummy_config, '/proj/NEG')
+            calls_after_first = mock_mcp.call_count
+            second = await fetch_tasks(dummy_client, dummy_config, '/proj/NEG')
+
+        assert calls_after_first >= 1, 'the first attempt must actually try'
+        assert mock_mcp.call_count == calls_after_first, (
+            'the second attempt within the negative TTL must issue no MCP call, '
+            f'got {mock_mcp.call_count - calls_after_first} extra'
+        )
+        # Degradation stays visible to BOTH callers — only the retry is suppressed.
+        for marker in (first, second):
+            assert isinstance(marker, dict)
+            assert marker.get('offline') is True
+            assert 'error' in marker
+
+    async def test_negative_ttl_expiry_retries(
+        self, monkeypatch, dummy_client, dummy_config
+    ):
+        """(b) A zero negative TTL makes every attempt live again."""
+        import dashboard.data.tasks as tasks_mod
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(side_effect=httpx.ConnectError('refused'))
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(dummy_client, dummy_config, '/proj/NEG2')
+            after_first = mock_mcp.call_count
+            await fetch_tasks(dummy_client, dummy_config, '/proj/NEG2')
+            assert mock_mcp.call_count == after_first, 'sanity: suppressed while fresh'
+
+            monkeypatch.setattr(
+                tasks_mod, '_FETCH_TASKS_NEGATIVE_TTL_SECONDS', 0.0,
+            )
+            await fetch_tasks(dummy_client, dummy_config, '/proj/NEG2')
+
+        assert mock_mcp.call_count > after_first, (
+            'an expired negative entry must let the next call retry'
+        )
+
+    async def test_negative_entry_does_not_suppress_a_different_narrowing(
+        self, dummy_client, dummy_config
+    ):
+        """(c) The negative entry shares the positive key function.
+
+        A broken narrowed read must not mask a healthy differently-narrowed
+        one — otherwise one failing call would blind the whole tab.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        async def _fail_only_active(client, url, tool, args, **_kw):
+            if args.get('statuses') == ['in-progress']:
+                raise httpx.ConnectError('refused')
+            return {'tasks': [{
+                'id': '1', 'title': 'OK ROW', 'status': 'done',
+                'dependencies': [], 'metadata': {},
+            }]}
+
+        mock_mcp = AsyncMock(side_effect=_fail_only_active)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            broken = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/NEG3', statuses=['in-progress'],
+            )
+            other = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/NEG3', statuses=['done'],
+            )
+
+        assert isinstance(broken, dict) and broken.get('offline') is True
+        assert isinstance(other, list), (
+            'a negative entry for one narrowing must not suppress another'
+        )
+        assert [t['title'] for t in other] == ['OK ROW']
+
+    async def test_negative_entry_does_not_suppress_a_different_root(
+        self, dummy_client, dummy_config
+    ):
+        """(c) One broken root must not blind a healthy sibling root."""
+        from dashboard.data.tasks import fetch_tasks
+
+        async def _fail_one_root(client, url, tool, args, **_kw):
+            if args['project_root'] == '/proj/BROKEN':
+                raise httpx.ConnectError('refused')
+            return {'tasks': [{
+                'id': '1', 'title': 'HEALTHY ROW', 'status': 'pending',
+                'dependencies': [], 'metadata': {},
+            }]}
+
+        mock_mcp = AsyncMock(side_effect=_fail_one_root)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            broken = await fetch_tasks(dummy_client, dummy_config, '/proj/BROKEN')
+            healthy = await fetch_tasks(dummy_client, dummy_config, '/proj/HEALTHY')
+
+        assert isinstance(broken, dict) and broken.get('offline') is True
+        assert isinstance(healthy, list)
+        assert [t['title'] for t in healthy] == ['HEALTHY ROW']
+
+    async def test_cache_clear_drops_the_negative_entry_too(
+        self, dummy_client, dummy_config
+    ):
+        """(d) The test/admin clear hook must reset BOTH stores."""
+        import dashboard.data.tasks as tasks_mod
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(side_effect=httpx.ConnectError('refused'))
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(dummy_client, dummy_config, '/proj/NEG4')
+            after_first = mock_mcp.call_count
+            tasks_mod._fetch_tasks_cache_clear()
+            await fetch_tasks(dummy_client, dummy_config, '/proj/NEG4')
+
+        assert mock_mcp.call_count > after_first, (
+            '_fetch_tasks_cache_clear() must clear the negative cache as well, '
+            'else a cleared cache still suppresses retries'
+        )
+
+    async def test_success_never_lands_in_the_negative_cache(
+        self, dummy_client, dummy_config
+    ):
+        """(e) The positive path is untouched by the negative cache."""
+        import dashboard.data.tasks as tasks_mod
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            first = await fetch_tasks(dummy_client, dummy_config, '/proj/NEG5')
+            second = await fetch_tasks(dummy_client, dummy_config, '/proj/NEG5')
+
+        assert mock_mcp.call_count == 1, 'positive TTL still single-flights'
+        assert isinstance(first, list) and first == second
+        key = tasks_mod._fetch_tasks_cache_key('/proj/NEG5', None, None, 0)
+        assert tasks_mod._fetch_tasks_negative_cache.get_fresh(key) is None, (
+            'a successful fetch must never be stored as a negative entry'
+        )
+
+    async def test_offline_marker_still_never_lands_in_the_positive_cache(
+        self, dummy_client, dummy_config
+    ):
+        """(e) The existing "offline markers are not cached positively" contract."""
+        import dashboard.data.tasks as tasks_mod
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(side_effect=httpx.ConnectError('refused'))
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(dummy_client, dummy_config, '/proj/NEG6')
+
+        key = tasks_mod._fetch_tasks_cache_key('/proj/NEG6', None, None, 0)
+        assert tasks_mod._fetch_tasks_cache.get_fresh(key) is None, (
+            'an offline marker must not pin itself in the positive cache'
+        )
+
+    def test_negative_ttl_sits_between_the_poll_and_the_positive_ttl(self):
+        """The 5 s choice is pinned against the two real clocks it was picked from.
+
+        Shorter than the positive TTL so an outage is re-probed several times
+        per success window; longer than ``data.js``'s 3 s ``POLL_INTERVAL_MS``
+        so a broken root costs at most one attempt per two polls rather than
+        one per poll.
+        """
+        import re
+        from pathlib import Path
+
+        import dashboard.data.tasks as tasks_mod
+
+        data_js = (
+            Path(tasks_mod.__file__).resolve().parents[1]
+            / 'static' / 'redux' / 'data.js'
+        )
+        match = re.search(
+            r'POLL_INTERVAL_MS\s*=\s*(\d+)', data_js.read_text(),
+        )
+        assert match is not None, f'POLL_INTERVAL_MS not found in {data_js}'
+        poll_seconds = int(match.group(1)) / 1000.0
+
+        negative = tasks_mod._FETCH_TASKS_NEGATIVE_TTL_SECONDS
+        assert negative > poll_seconds, (
+            f'negative TTL {negative}s must exceed the {poll_seconds}s UI poll '
+            'interval, else a broken root is re-walked on every poll'
+        )
+        assert negative < tasks_mod._FETCH_TASKS_TTL_SECONDS, (
+            f'negative TTL {negative}s must be shorter than the positive TTL '
+            f'{tasks_mod._FETCH_TASKS_TTL_SECONDS}s so an outage is re-probed '
+            'several times per success window'
+        )
+
+
+# ---------------------------------------------------------------------------
 # cross-project fan-out streak isolation (task 4133)
 # ---------------------------------------------------------------------------
 
