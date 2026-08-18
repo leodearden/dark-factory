@@ -333,6 +333,9 @@ _MIGRATED_MODULES = (
     'test_tab_escalation_analytics.py',
     'test_tab_escalations.py',
     'test_tab_memory_evals.py',
+    'test_tab_orchestrators.py',
+    'test_tab_tasks_runtime.py',
+    'test_tab_tasks_status_counts.py',
 )
 
 # Symbols a migrated module must import rather than define, mapped to what it
@@ -416,3 +419,40 @@ class TestNoDuplicateHelperCopies:
         synthetic = 'from _dashboard_helpers import extract_function_body\n'
 
         assert not (_module_level_defs(synthetic) & _RETIRED_SYMBOLS.keys())
+
+
+class TestNestedDeclarationAgainstRealSource:
+    """The charter's "known limitation", pinned against the served asset.
+
+    This may already pass the moment `extract_function_body` exists — the
+    brace-walk variant never had the limitation.  Its job is not to catch a
+    bug today but to make the newly-acquired capability an explicit,
+    permanent contract: the retired variant's line-anchored
+    `^function NAME\\(` regex plus slice-to-next-top-level-`function` looks
+    like a simpler spelling of the same thing, and a future simplification
+    back to it must fail here rather than quietly re-lose the ability to
+    scope an indented declaration.
+
+    Ground truth in tab_tasks.jsx: `function statusMatches(s) {` is declared
+    INSIDE `TasksTab`, and `flipFilter` is a sibling const in the same
+    enclosing function — so a fallback to the enclosing body is detectable.
+    """
+
+    def test_status_matches_is_scoped_out_of_its_enclosing_component(
+        self, tab_tasks_jsx_body: str
+    ) -> None:
+        body = extract_function_body(tab_tasks_jsx_body, 'statusMatches')
+
+        assert body, 'the nested `statusMatches` declaration could not be sliced out'
+        for status in ('in-progress', 'blocked', 'merge-deferred'):
+            assert status in body, (
+                f'{status!r} is missing from the extracted `statusMatches` body — '
+                f'either the status disjunction changed or the extractor returned '
+                f'the wrong slice'
+            )
+        assert 'flipFilter' not in body, (
+            'the extracted body contains `flipFilter`, a sibling const declared in '
+            'the ENCLOSING `TasksTab` — so the extractor fell back to the whole '
+            'enclosing component instead of scoping to the nested declaration, '
+            'which is exactly the limitation this task fixed'
+        )
