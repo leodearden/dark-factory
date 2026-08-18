@@ -6605,3 +6605,38 @@ class TestPerProjectLockDepth:
             'module keys must reflect each project\'s own depth; identical keys '
             'mean a single global scalar is still in use'
         )
+
+    def test_falsy_project_root_falls_back_coarse_not_ambient_cwd(
+        self, tmp_path, monkeypatch,
+    ):
+        """A falsy project_root must NOT leak the ambient project's depth.
+
+        ``Path('')`` normalises to ``Path('.')``, so without a guard the
+        helper reads ``./data/orchestrator/scheduler_state.json`` — the
+        snapshot of whatever project the fused-memory server process happens
+        to be rooted in. The task's user-observable signal requires the coarse
+        fallback "rather than raising or silently using another project's
+        value", and a silent cross-project leak is strictly worse than a
+        coarse key (see the asymmetry argument in ``effective_lock_depth``).
+
+        DEFENCE IN DEPTH, not a live production bug: the production path
+        reaches the curator through ``submit_task``, whose
+        ``_normalize_project_root`` -> ``validate_project_root`` already hard-
+        rejects an empty/non-absolute project_root (task 3291). The guard
+        matters because ``effective_lock_depth`` is a module-level public
+        helper importable by callers that do not cross that wire boundary —
+        ``middleware/recon_write_policy.py`` already imports this module's
+        ``read_scheduler_state`` directly.
+        """
+        self._write_snapshot(tmp_path, 12)
+        monkeypatch.chdir(tmp_path)
+
+        # Sanity: the ambient CWD really does publish a depth-12 snapshot, so
+        # a 2 below is the guard working and not an empty tmp dir.
+        assert effective_lock_depth(str(tmp_path), 2) == 12
+
+        assert effective_lock_depth('', 2) == 2
+        # None today reaches the fallback only incidentally, via the broad
+        # ``except`` (logging a NoneType/__fspath__ warning) rather than by a
+        # deliberate guard. Pin it so it stays a decision.
+        assert effective_lock_depth(None, 2) == 2
