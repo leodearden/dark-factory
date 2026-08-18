@@ -66,6 +66,9 @@ const EXPECTED_WINDOW_GLOBALS = {
   'spark_path.js': 'DF_SPARK_PATH',
   'memory_evals_fmt.js': 'DF_MEMORY_EVALS_FMT',
   'tasks_offline_banner.js': 'DF_TASKS_OFFLINE_BANNER',
+  'task_strand_badge.js': 'DF_TASK_STRAND_BADGE',
+  'burndown_bands.js': 'DF_BURNDOWN_BANDS',
+  'pins_recovery.js': 'DF_PINS_RECOVERY',
 };
 
 function readIndexHtml() {
