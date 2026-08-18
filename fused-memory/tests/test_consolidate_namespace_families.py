@@ -1125,6 +1125,56 @@ class TestMergeGraphFamily:
 
 
 # ===========================================================================
+# Tests: CLI parser
+# ===========================================================================
+
+class TestCliParser:
+    """The --max-pages flag: the page budget the exhaustion WARNING tells the
+    operator to raise.
+
+    Before this, run() called the scroll with page_size only, so
+    DEFAULT_SCROLL_MAX_PAGES was unreachable from the CLI -- yet the
+    budget-exhaustion WARNING said "raise the page budget" and --limit's help
+    quoted a fixed "(200 pages)" that no flag could change. The advertised
+    knob did not exist. Mirrors census_memory_metadata.py's _build_parser
+    shape and its TestCliParser.
+    """
+
+    def test_exposes_the_documented_flags(self):
+        parser = _mod._build_parser()
+        args = parser.parse_args([])
+        assert args.apply is False
+        assert args.limit == 1000
+        assert args.max_pages == _mod.DEFAULT_SCROLL_MAX_PAGES
+        assert args.config is None
+
+    def test_max_pages_override_parses(self):
+        args = _mod._build_parser().parse_args(['--max-pages', '7'])
+        assert args.max_pages == 7
+
+    def test_overrides_parse_together(self):
+        args = _mod._build_parser().parse_args([
+            '--apply', '--limit', '250', '--max-pages', '7', '--config', '/tmp/c.yaml',
+        ])
+        assert (args.apply, args.limit, args.max_pages) == (True, 250, 7)
+        assert args.config == '/tmp/c.yaml'
+
+    def test_the_budget_remediation_text_names_a_flag_that_exists(self):
+        """The WARNING must not advise raising a knob the CLI does not expose.
+
+        Asserted against the parser itself rather than a hardcoded string, so
+        renaming the flag cannot leave the remediation text stale.
+        """
+        flags = {
+            option
+            for action in _mod._build_parser()._actions
+            for option in action.option_strings
+        }
+        assert '--max-pages' in flags
+        assert '--limit' in flags
+
+
+# ===========================================================================
 # Tests: scroll_collection_points
 # ===========================================================================
 
@@ -2333,7 +2383,7 @@ class TestRunApply:
         )
         memory_service = _make_run_memory_service(graphiti, qdrant_client)
 
-        report = await _mod.run(_run_args(apply=True), memory_service, limit=2)
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=2, max_pages=7)
 
         # Every COLLECTION_MERGES entry is visited (the other three are empty
         # in this fixture); the one under test is fused_dark-factory.
@@ -2348,6 +2398,11 @@ class TestRunApply:
             'path is unchanged and still needs it'
         )
         assert merge_kwargs['page_size'] == 2, '--limit is the phase-2 chunk size too'
+        assert merge_kwargs['max_pages'] == 7, (
+            'the phase-2 drain runs under the SAME page budget as the '
+            'preflight -- a merge bounded more tightly than the count that '
+            'authorised it would silently truncate the migration'
+        )
 
         upsert_calls = [
             c for c in qdrant_client.upsert.call_args_list
@@ -2377,7 +2432,7 @@ class TestRunApply:
         _patch_merge_primitives(monkeypatch)
         memory_service, _, qdrant_client = self._scenario()
 
-        await _mod.run(_run_args(apply=True), memory_service, limit=250)
+        await _mod.run(_run_args(apply=True), memory_service, limit=250, max_pages=7)
 
         assert seen, 'the collection-merge section must scroll at least one collection'
         for backend, _collection, kwargs in seen:
@@ -2386,6 +2441,32 @@ class TestRunApply:
                 'memory_service.mem0._get_async_qdrant()\'s raw client'
             )
             assert kwargs['page_size'] == 250
+            assert kwargs['max_pages'] == 7, (
+                '--max-pages must reach the preflight -- an unreachable page '
+                'budget is what made the exhaustion WARNING unactionable'
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_defaults_max_pages_to_the_module_default(self, monkeypatch):
+        """A caller that omits max_pages still gets the module default, so
+        pre-existing call sites (and every run() test that predates the flag)
+        keep working unchanged."""
+        seen: list = []
+        real_scroll = _mod.scroll_collection_points
+
+        async def _spy_scroll(backend, collection, **kwargs):
+            seen.append(dict(kwargs))
+            return await real_scroll(backend, collection, **kwargs)
+
+        monkeypatch.setattr(_mod, 'scroll_collection_points', _spy_scroll)
+        _patch_merge_primitives(monkeypatch)
+        memory_service, _, _ = self._scenario()
+
+        await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        assert seen
+        for kwargs in seen:
+            assert kwargs['max_pages'] == _mod.DEFAULT_SCROLL_MAX_PAGES
 
     @pytest.mark.asyncio
     async def test_apply_deletes_zero_count_junk_key_and_leaves_nonzero_unresolved(self, monkeypatch):
