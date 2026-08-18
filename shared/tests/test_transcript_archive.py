@@ -491,6 +491,164 @@ class TestArchiveBeforeDelete:
         assert (root / '3619' / ENC / 'sess-twice.jsonl').exists()
 
 
+class TestArchiveBeforeDeleteHoldsOnlyTheTranscript:
+    """D1 / INV-7: a failing archive must not become a hold on credentials.
+
+    The obvious way to honour "never delete an un-archived transcript" is to
+    abort the whole teardown on a failure — and that trades one bounded loss
+    for a worse unbounded one: a permanently-failing archive (a full or
+    read-only archive root) would leave every task's ``.credentials.json``,
+    its ``~/.claude`` settings symlinks, its ``sessions/`` and its
+    ``telemetry/`` on disk forever, defeating the per-task credential
+    isolation the config dir exists to provide.
+
+    So the hold is SCOPED: exactly the un-archivable ``.jsonl`` stays, and
+    every other member of the directory is deleted unconditionally. The held
+    file is owned by the next process start's sweeper, so the hold is bounded
+    by a restart rather than unbounded in time.
+    """
+
+    @staticmethod
+    def _build_realistic_config_dir(tmp_path):
+        """A config dir shaped like TaskConfigDir builds one, plus transcripts."""
+        config_dir = tmp_path / 'claude-config-3619'
+        config_dir.mkdir(parents=True)
+
+        creds = config_dir / '.credentials.json'
+        creds.write_bytes(b'{"claudeAiOauth":{"accessToken":"SECRET"}}')
+        creds.chmod(0o600)
+
+        # Mirrors TaskConfigDir._setup_symlinks: a SYMLINK into ~/.claude.
+        # The purge must unlink the link and never follow it — deleting the
+        # user's real settings.json would be a far worse bug than the one
+        # this task fixes.
+        settings_target = tmp_path / 'home-claude' / 'settings.json'
+        _write(settings_target, b'{"real":"settings"}')
+        (config_dir / 'settings.json').symlink_to(settings_target)
+
+        _write(config_dir / 'sessions' / 'x.json', b'{"session":1}')
+        _write(config_dir / 'telemetry' / 'y.log', b'telemetry line\n')
+
+        good = _write(config_dir / 'projects' / ENC / 'sess-good.jsonl', b'{"g":1}\n')
+        bad = _write(config_dir / 'projects' / ENC / 'sess-bad.jsonl', b'{"b":1}\n')
+        return config_dir, settings_target, good, bad
+
+    @staticmethod
+    def _deny(monkeypatch, predicate):
+        """Make both archive routes raise EACCES for sources matching *predicate*."""
+        real_rename = os.rename
+        real_copyfile = transcript_archive_module.shutil.copyfile
+
+        def fake_rename(src, dst, **kwargs):
+            if predicate(str(src)):
+                raise PermissionError(errno.EACCES, 'Permission denied')
+            return real_rename(src, dst, **kwargs)
+
+        def fake_copyfile(src, dst, **kwargs):
+            if predicate(str(src)):
+                raise PermissionError(errno.EACCES, 'Permission denied')
+            return real_copyfile(src, dst, **kwargs)
+
+        monkeypatch.setattr(transcript_archive_module.os, 'rename', fake_rename)
+        monkeypatch.setattr(
+            transcript_archive_module.shutil, 'copyfile', fake_copyfile
+        )
+
+    def test_a_total_archive_failure_still_purges_every_credential(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        config_dir, settings_target, good, bad = self._build_realistic_config_dir(
+            tmp_path
+        )
+        self._deny(monkeypatch, lambda src: True)
+
+        transcript_archive_module._reset_archival_failures()
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        # (a) Every non-transcript member is gone, unconditionally.
+        assert not (config_dir / '.credentials.json').exists()
+        assert not (config_dir / 'settings.json').is_symlink()
+        assert not (config_dir / 'sessions').exists()
+        assert not (config_dir / 'telemetry').exists()
+        # ...and the symlink was UNLINKED, never followed.
+        assert settings_target.read_bytes() == b'{"real":"settings"}'
+
+        # (b) Only the un-archivable transcripts are held.
+        assert good.exists()
+        assert bad.exists()
+        assert set(outcome.held) == {good, bad}
+        assert outcome.archived == 0
+        assert outcome.already_current == 0
+        assert outcome.config_dir_removed is False
+        assert config_dir.exists()
+
+        # (c) The EXISTING counter advanced once per failed file, and each
+        # carries the structured shape an operator greps for.
+        assert transcript_archive_module._archival_failures() == 2
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2
+        assert {r.errno for r in warnings} == {errno.EACCES}
+        assert {r.task_id for r in warnings} == {task_id}
+        assert {r.path for r in warnings} == {str(good), str(bad)}
+        # (d) Nothing was raised — reaching here at all is the assertion.
+
+    def test_one_failing_transcript_does_not_hold_its_sibling(
+        self, tmp_path, monkeypatch
+    ):
+        """Partial failure: the archivable one still leaves; the purge still runs."""
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        config_dir, settings_target, good, bad = self._build_realistic_config_dir(
+            tmp_path
+        )
+        self._deny(monkeypatch, lambda src: 'sess-bad' in src)
+
+        transcript_archive_module._reset_archival_failures()
+        outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        assert (root / task_id / ENC / 'sess-good.jsonl').read_bytes() == b'{"g":1}\n'
+        assert not good.exists()
+        assert bad.exists()
+        assert outcome.archived == 1
+        assert outcome.held == (bad,)
+        assert outcome.config_dir_removed is False
+        assert transcript_archive_module._archival_failures() == 1
+
+        # The credential purge is NOT contingent on a clean archive run.
+        assert not (config_dir / '.credentials.json').exists()
+        assert not (config_dir / 'settings.json').is_symlink()
+        assert not (config_dir / 'sessions').exists()
+        assert not (config_dir / 'telemetry').exists()
+        assert settings_target.exists()
+
+    def test_the_held_transcript_keeps_its_content_and_its_path(
+        self, tmp_path, monkeypatch
+    ):
+        """A hold means UNTOUCHED — the sweeper must find it where it was.
+
+        The startup sweeper globs ``<worktree>/.task/claude-config-*/projects/
+        **/*.jsonl``, so a held file relocated or emptied by the purge would be
+        unrecoverable. Its ancestor directories under ``projects/`` therefore
+        survive too.
+        """
+        root = tmp_path / 'archive'
+        config_dir, _settings_target, _good, bad = self._build_realistic_config_dir(
+            tmp_path
+        )
+        self._deny(monkeypatch, lambda src: True)
+
+        transcript_archive_module._reset_archival_failures()
+        archive_before_delete(config_dir, '3619', archive_root=root)
+
+        assert bad.read_bytes() == b'{"b":1}\n'
+        assert bad.parent.is_dir()
+        assert (config_dir / 'projects').is_dir()
+
+
 class TestDurableArchivePathLookup:
     """B1/B2/B4 — the read side: locate one session's archived transcript.
 
