@@ -8,6 +8,7 @@ the same process.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from collections.abc import Sequence
@@ -658,3 +659,86 @@ async def make_recon_db(
     async with aiosqlite.connect(str(db_path)) as conn:
         conn.row_factory = aiosqlite.Row
         yield conn
+
+
+# ---------------------------------------------------------------------------
+# JSX source slicing.
+#
+# There is no JS runtime in this project, so the dashboard suite asserts
+# structural contracts against the *served* .jsx text.  Nearly every such
+# assertion must first scope itself to one function's body — otherwise a token
+# appearing anywhere else in the file satisfies it and the test proves nothing.
+#
+# These two helpers used to be private copies in nine test modules (task 3549),
+# under two names covering FOUR distinct implementations, so a fix had to be
+# applied nine times or not at all.  Their contract lives in
+# test_jsx_source_helpers.py.
+# ---------------------------------------------------------------------------
+
+
+def extract_function_body(source: str, func_name: str) -> str:
+    """Return the brace-delimited body of a ``function <func_name>(`` declaration.
+
+    The returned slice starts at the body's opening ``{`` and ends at its
+    matching ``}``, both included — the SIGNATURE AND PARAMETER LIST ARE
+    EXCLUDED.  Only named ``function`` declarations are matched: an arrow
+    function bound to a const, and a class method spelled ``Foo(a) {``, carry
+    no ``function`` keyword and are misses.
+
+    Paren-depth walks past the parameter list before looking for the body's
+    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
+    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
+    taking the first ``{`` after the opening ``(`` would return just the
+    destructuring pattern (e.g. ``{ a, b }``) instead of the function body.
+
+    The search regex is deliberately NOT line-anchored, so a declaration
+    NESTED inside another function is found and scoped to its own body (the
+    real instance is ``function statusMatches(s) {`` indented inside
+    ``TasksTab`` in tab_tasks.jsx).  Its trailing ``\\s*\\(`` is equally
+    load-bearing in the other direction: without it a prefix sibling declared
+    earlier would shadow the target — ``function TaskGraphEdges(`` at
+    tab_tasks.jsx:33 precedes ``function TaskGraph(`` at :151.
+
+    RAISES ``AssertionError`` on any miss rather than returning ``''``.  An
+    empty body makes every downstream ABSENCE assertion pass vacuously, which
+    is a permanent false GREEN that no amount of care at the call site can
+    detect; a loud failure naming the function is strictly better.
+    """
+    def _miss(what: str) -> AssertionError:
+        return AssertionError(
+            f'Could not locate the `function {func_name}(` body: {what}. Either '
+            f'the function was removed or renamed, or it was rewritten as an '
+            f'arrow function or a class method — neither is matched, only a '
+            f'named `function` declaration is. This cannot silently return an '
+            f'empty body: an absence assertion over one would pass vacuously.'
+        )
+
+    match = re.search(rf'\bfunction\s+{re.escape(func_name)}\s*\(', source)
+    if match is None:
+        raise _miss('no such declaration in this source')
+
+    paren_depth = 1
+    i = match.end()
+    while i < len(source) and paren_depth > 0:
+        if source[i] == '(':
+            paren_depth += 1
+        elif source[i] == ')':
+            paren_depth -= 1
+        i += 1
+    if paren_depth != 0:
+        raise _miss('its parameter list is never closed')
+
+    start = source.find('{', i)
+    if start == -1:
+        raise _miss('no opening brace follows its parameter list')
+
+    depth = 0
+    for j in range(start, len(source)):
+        char = source[j]
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                return source[start : j + 1]
+    raise _miss('its body brace is never closed')
