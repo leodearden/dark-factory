@@ -39,18 +39,26 @@ from orchestrator.agents.roles import (
     TOOL_CALL_REJECTION_GUIDANCE,
 )
 
-# A role gets this guidance iff its system_prompt is LITERAL Python text
-# rather than built from a `PromptSpec` — i.e. `role.prompt_spec is None`.
-# All 9 roles hold `Read`, so `Read` capability draws no line at all; this
-# line has a mechanism behind it instead. `reviewer_comprehensive` is the
-# sole exclusion: it is the only role whose `system_prompt` is built by
-# `_reviewer_role` (roles.py:1108) from a `PromptSpec`, whose heuristics half
-# a pinned prompt artifact may override at runtime — so a splice into the
-# literal template could be silently dropped in exactly the sessions it was
-# meant to protect. Splicing into its frozen `_REVIEWER_CONTRACT_TEMPLATE`
-# (roles.py:1049) instead would force a `_REVIEWER_PROMPT_HARNESS_VERSION`
-# (roles.py:1091) bump that invalidates every pinned reviewer artifact.
-_LITERAL_PROMPT_ROLES = frozenset({
+# Membership is decided by a PROMPT-CONSTRUCTION detail — `role.prompt_spec
+# is None`, i.e. the role's system_prompt is literal Python text rather than
+# built from a `PromptSpec` — but that detail is NOT the reason a role needs
+# this guidance. The need is capability-based: every role that can issue a
+# tool call and hit `InputValidationError` needs to know how to read the
+# rejection, and `reviewer_comprehensive` (which holds `Read`, `Grep`, `Glob`
+# and `Bash(git:*)` same as `judge`) is no exception. It is left OUT of this
+# set only because it is the sole role whose `system_prompt` is built by
+# `_reviewer_role` from a `PromptSpec`, whose heuristics half a pinned prompt
+# artifact may override at runtime — so a splice into the literal template
+# could be silently dropped in exactly the sessions it was meant to protect.
+# That makes the exclusion a DEFERRED COVERAGE GAP, not a judgment that the
+# role is exempt on the merits: closing it means splicing into the frozen
+# `_REVIEWER_CONTRACT_TEMPLATE` instead, which requires bumping
+# `_REVIEWER_PROMPT_HARNESS_VERSION` (a bump that invalidates every pinned
+# reviewer artifact, which is why it is not done here) and moving the role
+# into this set — not leaving it exempt. Symbol names only, no `roles.py:NNN`
+# line citations: they drift the moment the cited symbol moves and this very
+# task shifted every one of them by 53 lines from the numbers first drafted.
+_UNPINNED_PROMPT_ROLES = frozenset({
     'architect',
     'debugger',
     'deep_reviewer',
@@ -89,24 +97,7 @@ def test_tool_call_rejection_guidance_is_nonempty() -> None:
     )
 
 
-def test_tool_call_rejection_guidance_has_no_literal_braces() -> None:
-    """No literal `{`/`}` — same invariant `WAIT_PATTERN_GUIDANCE` holds.
-
-    Defensive, NOT load-bearing: this constant reaches role prompts only by
-    plain `+` concatenation, which is brace-safe by construction — role
-    prompts are deliberately NOT f-strings (see the `MANDATED_STAGING_COMMAND`
-    note in roles.py) precisely because they contain literal braces. Held
-    brace-free anyway so it stays interpolation-safe if a future splice site
-    needs it, exactly as `WAIT_PATTERN_GUIDANCE` is.
-    """
-    assert '{' not in TOOL_CALL_REJECTION_GUIDANCE and '}' not in TOOL_CALL_REJECTION_GUIDANCE, (
-        'TOOL_CALL_REJECTION_GUIDANCE contains a literal brace. It is held '
-        'brace-free so it stays safe at any future interpolating splice site '
-        '— remove the brace or a future interpolation could break at runtime.'
-    )
-
-
-def test_literal_prompt_role_set_matches_prompt_spec_capability() -> None:
+def test_unpinned_prompt_role_set_matches_prompt_spec_capability() -> None:
     """Drift tripwire: the hand-maintained role set still equals the derived one.
 
     Mirrors `test_background_capable_role_set_matches_bash_capability`. Passes
@@ -116,22 +107,22 @@ def test_literal_prompt_role_set_matches_prompt_spec_capability() -> None:
     """
     derived = {name for name, role in ROLES.items() if role.prompt_spec is None}
 
-    assert derived == _LITERAL_PROMPT_ROLES, (
+    assert derived == _UNPINNED_PROMPT_ROLES, (
         'A role gained or lost a literal (non-PromptSpec) system_prompt, so '
         'the set of roles eligible for TOOL_CALL_REJECTION_GUIDANCE has '
-        f'changed: gained={sorted(derived - _LITERAL_PROMPT_ROLES)} '
-        f'lost={sorted(_LITERAL_PROMPT_ROLES - derived)}. A newly '
-        'literal-prompt role must be added to _LITERAL_PROMPT_ROLES AND given '
+        f'changed: gained={sorted(derived - _UNPINNED_PROMPT_ROLES)} '
+        f'lost={sorted(_UNPINNED_PROMPT_ROLES - derived)}. A newly '
+        'unpinned-prompt role must be added to _UNPINNED_PROMPT_ROLES AND given '
         'TOOL_CALL_REJECTION_GUIDANCE; if it is genuinely exempt, justify the '
         'exclusion in the comment above the set.'
     )
 
 
-def test_literal_prompt_roles_carry_tool_call_rejection_guidance() -> None:
-    """Every literal-prompt role's system_prompt embeds the guidance block."""
+def test_unpinned_prompt_roles_carry_tool_call_rejection_guidance() -> None:
+    """Every unpinned-prompt role's system_prompt embeds the guidance block."""
     offenders = sorted(
         name
-        for name in _LITERAL_PROMPT_ROLES
+        for name in _UNPINNED_PROMPT_ROLES
         if TOOL_CALL_REJECTION_GUIDANCE not in ROLES[name].system_prompt
     )
 
@@ -143,26 +134,33 @@ def test_literal_prompt_roles_carry_tool_call_rejection_guidance() -> None:
 
 
 def test_artifact_pinned_role_does_not_carry_guidance() -> None:
-    """The negative half: a role outside `_LITERAL_PROMPT_ROLES` must NOT carry it.
+    """The negative half: a role outside `_UNPINNED_PROMPT_ROLES` must NOT carry it.
 
-    The two tests above catch a role GAINING a literal prompt and a covered
+    The two tests above catch a role GAINING an unpinned prompt and a covered
     role LOSING the block. Neither catches an accidental splice into an
     excluded role. Mirrors `test_excluded_roles_do_not_carry_combined_guidance`
-    for the wait block, and makes the stated `reviewer_comprehensive` exclusion
-    enforced rather than aspirational.
+    for the wait block.
+
+    `reviewer_comprehensive`'s exclusion (see the comment above
+    `_UNPINNED_PROMPT_ROLES`) is a DEFERRED coverage gap, not a claim that the
+    role is exempt on the merits — this test enforces the gap, it does not
+    justify it.
     """
     offenders = sorted(
         name
         for name in ROLES
-        if name not in _LITERAL_PROMPT_ROLES
+        if name not in _UNPINNED_PROMPT_ROLES
         and TOOL_CALL_REJECTION_GUIDANCE in ROLES[name].system_prompt
     )
 
     assert offenders == [], (
-        f'Roles carrying TOOL_CALL_REJECTION_GUIDANCE without a literal prompt: '
-        f'{offenders}. A PromptSpec-backed role may silently drop a splice at '
-        'runtime — either remove it, or if the role genuinely gained a literal '
-        'prompt, add it to _LITERAL_PROMPT_ROLES.'
+        f'Roles carrying TOOL_CALL_REJECTION_GUIDANCE without an unpinned '
+        f'prompt: {offenders}. A PromptSpec-backed role may silently drop a '
+        'splice at runtime — either remove it, or if the role genuinely '
+        'gained an unpinned prompt, add it to _UNPINNED_PROMPT_ROLES. '
+        "`reviewer_comprehensive`'s absence from that set is a deferred "
+        'coverage gap (closing it needs a _REVIEWER_PROMPT_HARNESS_VERSION '
+        'bump), not an exemption on the merits.'
     )
 
 
@@ -171,13 +169,13 @@ def test_guidance_appears_exactly_once_per_role() -> None:
 
     Scoped to catching a stale duplicate splice left beside a new one, NOT to
     enforcing presence — that is
-    `test_literal_prompt_roles_carry_tool_call_rejection_guidance`'s job. A
+    `test_unpinned_prompt_roles_carry_tool_call_rejection_guidance`'s job. A
     role where the block is entirely absent is skipped here rather than
     flagged, so a role that has not yet received the splice fails exactly one
     test for that one root cause instead of two.
     """
     offenders = {}
-    for name in sorted(_LITERAL_PROMPT_ROLES):
+    for name in sorted(_UNPINNED_PROMPT_ROLES):
         count = ROLES[name].system_prompt.count(TOOL_CALL_REJECTION_GUIDANCE)
         if count == 0:
             continue
@@ -216,7 +214,7 @@ def test_guidance_placement_is_structural() -> None:
     that dropped the splice.
     """
     offenders = {}
-    for name in sorted(_LITERAL_PROMPT_ROLES):
+    for name in sorted(_UNPINNED_PROMPT_ROLES):
         prompt = ROLES[name].system_prompt
         idx = prompt.find(TOOL_CALL_REJECTION_GUIDANCE)
         if idx == -1:
