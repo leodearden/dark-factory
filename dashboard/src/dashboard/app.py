@@ -32,6 +32,7 @@ from dashboard.data import redux_api
 from dashboard.data.active_tasks import (
     _MAX_CANCELLED_PER_PROJECT,
     _MAX_DONE_PER_PROJECT,
+    _all_project_roots,
     collect_tasks_with_counts,
 )
 from dashboard.data.burndown import (
@@ -822,22 +823,46 @@ async def api_tasks(request: Request) -> JSONResponse:
     Each task in ACTIVE_TASKS includes a ``meta_files`` field (taskmaster
     ``metadata.files``) that is retained on the wire for debugging and tooling.
     No frontend UI reads it directly — lock display routes through D.SCHEDULER.
+
+    **Three distinct failure facts, deliberately not collapsed:**
+
+    - ``TASKS_OFFLINE`` — EVERY configured project root failed, i.e.
+      fused-memory itself is unreachable. One fused-memory URL serves every
+      root, so all-roots-failed is the observable proxy for that claim, and it
+      is the only state the global banner's copy ("fused-memory offline — task
+      data unavailable") actually describes.
+    - ``TASKS_OFFLINE_PROJECTS`` — the roots whose fetch DEMONSTRABLY failed.
+      Non-empty with ``TASKS_OFFLINE`` false is the normal partial case.
+    - ``TASKS_DEGRADED_PROJECTS`` — roots the handler ran out of budget for
+      (see ``collect_tasks_with_counts``). Their state is UNKNOWN, not bad:
+      nothing was proven unreachable, so they never raise the offline flag,
+      not even when every root degrades.
+
+    ``TASKS_OFFLINE`` used to be ``bool(offline_projects)``. That is what made
+    the banner claim a total outage over eight healthy projects' rows carried
+    in the very same payload — one unreachable root out of nine was enough.
+    Collapsing any of these three into the others reintroduces that lie.
     """
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
     # Single-pass: fetch_tasks once per project, derive both active rows and
     # done counts from the same snapshot — no second fetch_statuses round-trip.
-    active, offline_projects, done_counts, _degraded_projects = await collect_tasks_with_counts(
+    active, offline_projects, done_counts, degraded_projects = await collect_tasks_with_counts(
         http_client, config,
         max_done_per_project=_MAX_DONE_PER_PROJECT,
         max_cancelled_per_project=_MAX_CANCELLED_PER_PROJECT,
         resolve_external=True,
     )
+    # Same enumerator the collector walks, so N here is the same N it fanned
+    # out over. ``bool(total_roots)`` guards the degenerate no-roots config:
+    # 0 == 0 would otherwise declare an outage with nothing configured to fail.
+    total_roots = len(_all_project_roots(config))
     return JSONResponse(
         {
             'ACTIVE_TASKS': active,
-            'TASKS_OFFLINE': bool(offline_projects),
+            'TASKS_OFFLINE': bool(total_roots) and len(offline_projects) == total_roots,
             'TASKS_OFFLINE_PROJECTS': offline_projects,
+            'TASKS_DEGRADED_PROJECTS': degraded_projects,
             'DONE_COUNTS': done_counts,
         }
     )

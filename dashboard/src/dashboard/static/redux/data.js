@@ -17,7 +17,8 @@ function endpointsFor(win) {
   const w = encodeURIComponent(win);
   return {
     '/api/v2/dashboard/orchestrators':                ['ORCHESTRATORS', 'PROJECTS', 'ORCHESTRATORS_SPARK'],
-    '/api/v2/dashboard/tasks':                        ['ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS'],
+    '/api/v2/dashboard/tasks':                        ['ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+                                                       'TASKS_DEGRADED_PROJECTS', 'DONE_COUNTS'],
     '/api/v2/dashboard/memory':                       ['MEMORY_STATUS'],
     '/api/v2/dashboard/memory-graphs':                ['MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN'],
     '/api/v2/dashboard/recon':                        ['RECON_STATE', 'AGENTS'],
@@ -53,6 +54,10 @@ window.DF_DATA = {
   ACTIVE_TASKS: [],
   TASKS_OFFLINE: false,
   TASKS_OFFLINE_PROJECTS: [],
+  // Projects the tasks handler ran out of budget for — state UNKNOWN, not
+  // offline. Defaulted here (not just on the wire) because the first render
+  // happens before any fetch completes.
+  TASKS_DEGRADED_PROJECTS: [],
   DONE_COUNTS: {},
   PERFORMANCE: {},
   MEMORY_STATUS: {
