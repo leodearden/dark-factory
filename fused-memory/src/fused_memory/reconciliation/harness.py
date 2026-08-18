@@ -4827,14 +4827,16 @@ class ReconciliationHarness:
         a fetched tree (e.g. run_full_cycle) should pass it through to avoid a
         redundant taskmaster round-trip.
 
-        filtered_task_tree_fetched_at must accompany filtered_task_tree: it is
-        the instant that tree was READ (task 4115), consumed below to age
-        cited tasks' heartbeats against the read rather than against a fresh
-        clock taken after this pass's S1→S2→S3 stages. Ignored when
-        filtered_task_tree is None (the self-fetch path stamps its own
-        instant); if filtered_task_tree is given without it, falls back to
-        datetime.now(UTC) — the pre-4115 behaviour existing direct callers
-        depend on.
+        filtered_task_tree_fetched_at must accompany filtered_task_tree and be
+        timezone-aware: it is the instant that tree was READ (task 4115),
+        consumed below to age cited tasks' heartbeats against the read rather
+        than against a fresh clock taken after this pass's S1→S2→S3 stages.
+        Ignored when filtered_task_tree is None (the self-fetch path stamps
+        its own instant); if filtered_task_tree is given without it, or with
+        a naive (tzinfo-less) datetime, falls back to datetime.now(UTC) with a
+        WARNING log — the pre-4115 behaviour existing direct callers depend on
+        for the omitted case, extended to fail loud rather than silently
+        suppressing every escalation in the pass on a malformed one.
         """
         project_root = scope.project_root
         # Defense-in-depth assert deliberately omitted.  A registry-bound check such
@@ -4872,12 +4874,23 @@ class ReconciliationHarness:
         # (ref: task 455, task 478 for the caller-supplied-tree short-circuit
         # itself), so a caller's read instant can never be paired with a tree
         # it does not describe. Caller-supplied tree: honour the caller's read
-        # instant when given; otherwise fall back to a fresh now() with a
-        # DEBUG trace — the exact pre-4115 behaviour, which the ~30 existing
-        # direct _run_remediation_pass callers that pass a tree without an
-        # instant depend on. Self-fetch: always stamp a fresh now() — a caller
-        # instant (if one was even supplied) describes a different tree, or no
-        # tree at all, and must never leak onto the tree just fetched here.
+        # instant when given AND timezone-aware; otherwise fall back to a
+        # fresh now() with a WARNING trace — loud rather than silent, since a
+        # caller that drops or malforms the instant regresses straight back to
+        # the pre-4115 bug this task fixes (repo loud-over-silent-degradation
+        # norm). A naive (tzinfo-less) instant is treated the same as a
+        # missing one rather than handed to corroboration_for_task as-is:
+        # has_live_claimant compares it against timezone-aware heartbeats, and
+        # the resulting TypeError is caught and swallowed several frames down
+        # (see the `except Exception as _corr_exc` below), which would
+        # otherwise leave corroborated=None and silently suppress every
+        # stranded-work escalation in the pass — the opposite of this gate's
+        # fail-safe direction. The WARNING fallback is otherwise exactly the
+        # pre-4115 behaviour, which the ~30 existing direct
+        # _run_remediation_pass callers that pass a tree without an instant
+        # depend on. Self-fetch: always stamp a fresh now() — a caller instant
+        # (if one was even supplied) describes a different tree, or no tree at
+        # all, and must never leak onto the tree just fetched here.
         #
         # Task 2964: `_tasks_snapshot_at` is the instant the per-task snapshot
         # below (task_by_id, and therefore every heartbeat_at it carries) was
@@ -4903,12 +4916,23 @@ class ReconciliationHarness:
         _tasks_snapshot_at: datetime
         if filtered_task_tree is not None:
             remediation_tree = filtered_task_tree
-            if filtered_task_tree_fetched_at is not None:
+            if (
+                filtered_task_tree_fetched_at is not None
+                and filtered_task_tree_fetched_at.tzinfo is not None
+            ):
                 _tasks_snapshot_at = filtered_task_tree_fetched_at
             else:
-                logger.debug(
+                logger.warning(
                     'reconciliation.remediation_tree_read_instant_missing',
-                    extra={'project_id': project_id, 'parent_run_id': parent_run_id},
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'reason': (
+                            'naive_datetime'
+                            if filtered_task_tree_fetched_at is not None
+                            else 'not_supplied'
+                        ),
+                    },
                 )
                 _tasks_snapshot_at = datetime.now(UTC)
         else:
