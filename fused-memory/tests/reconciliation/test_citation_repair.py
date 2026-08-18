@@ -318,6 +318,108 @@ class TestRepairCorroborationGates:
             await journal.close()
 
 
+class TestRepairProjectScoping:
+    """``caller_project_id`` confines a repair to the caller's own project.
+
+    The journal is shared across every project the process reconciles, so
+    ``get_run`` alone provides no isolation. The parameter is optional
+    *by design*: omitting it is the out-of-band operator bypass the
+    ``repair_recon_citation`` script relies on, which is the intended path for a
+    genuine cross-project correction.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mismatched_caller_project_refused_before_any_lookup(self, tmp_path):
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            project_id='other_project',
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                caller_project_id='dark_factory',
+            )
+
+            assert outcome['error'] == 'project_mismatch'
+            assert outcome['error_type'] == 'ReconCitationProjectMismatch'
+            assert outcome['caller_project_id'] == 'dark_factory'
+            assert outcome['target_project_id'] == 'other_project'
+            # Refused before the corroboration reads, which would otherwise have
+            # been issued in the OTHER project's mem0 scope.
+            assert memory.calls == []
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_matching_caller_project_repairs(self, tmp_path):
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            project_id='reify',
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                caller_project_id='reify',
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert memory.calls == [('reify', DANGLING), ('reify', SUCCESSOR)]
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_omitted_caller_project_is_the_operator_bypass(self, tmp_path):
+        """No caller project (the operator script) repairs across projects."""
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            project_id='other_project',
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='operator:repair_recon_citation',
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert outcome['project_id'] == 'other_project'
+        finally:
+            await journal.close()
+
+
 class TestRepairResolutionErrors:
     """Shape and resolution refusals, every one leaving the blob untouched."""
 

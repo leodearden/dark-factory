@@ -2473,6 +2473,14 @@ class ReconReportState:
         journal. It never touches in-process state — no ``_persist_run``, no
         ``_Finding`` field — so every existing behaviour here is unaffected.
 
+        The caller's entry also supplies the PROJECT the repair is confined to:
+        ``reconciliation.data_dir`` is a single per-process journal holding runs
+        for every project, so ``caller_project_id=entry.project_id`` is passed
+        down and a ``target_run_id`` owned by another project is refused with
+        ``project_mismatch`` before any Mem0 read or journal write. That keeps
+        this path inside the same containment every ``cite_*`` tool already has
+        (``cite_memory`` scopes its backend read to ``finding_entry.project_id``).
+
         Returns ``citation_repair``'s outcome, or ``run_id_unknown`` /
         ``journal_unavailable`` / ``service_not_configured``.
         """
@@ -2495,6 +2503,7 @@ class ReconReportState:
             store=store,
             replacement_memory_id=replacement_memory_id,
             repaired_by=f'run:{run_id}',
+            caller_project_id=entry.project_id,
             # Every run this process still holds report state for is "live" for
             # repair purposes, whatever its journal row says.
             live_run_ids=frozenset(rid for (rid, _stage) in self._state),
@@ -2986,10 +2995,17 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         ever repair provenance — it can never rewrite a live claim, and it can
         never install a second unresolvable id.
 
+        The repair is confined to YOUR OWN project: the reconciliation journal
+        is shared across every project this process reconciles, so a
+        target_run_id owned by another project is refused (project_mismatch)
+        before any lookup or write. A genuine cross-project correction goes
+        through the out-of-band repair_recon_citation operator script.
+
         Structured errors: invalid_uuid_shape (either id is not a canonical
         36-char UUID); unsupported_store (only 'mem0' can be corroborated —
         get_memory_by_id is a Mem0/Qdrant point read and would false-flag every
-        graphiti citation as dangling); target_run_not_found; finding_unknown;
+        graphiti citation as dangling); target_run_not_found; project_mismatch
+        (the target run belongs to another project); finding_unknown;
         citation_not_present (also the idempotent no-op on a re-run);
         citation_not_dangling (the cited memory still resolves);
         replacement_not_found; verification_error (a lookup RAISED — unknown is

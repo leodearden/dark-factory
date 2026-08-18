@@ -27,8 +27,10 @@ accessors — no new table, no new SQL.
 victim citation must be CONFIRMED absent and the replacement must resolve; a
 raised backend read is *unknown*, not *absent*, and never licenses a mutation.
 Those gates are what keep this from being a provenance-falsification surface —
-the worst it can do is retarget a claim that already had no backing. It reuses
-``citation_verifier``'s lookup primitive and its found/None/raised branching so
+the worst it can do is retarget a claim that already had no backing, and (for an
+in-agent caller) only within its own project: the journal is shared across every
+project the process reconciles, so ``caller_project_id`` confines the repair to
+runs the caller actually owns. It reuses ``citation_verifier``'s lookup primitive and its found/None/raised branching so
 the two halves cannot disagree about what a backend timeout means.
 """
 
@@ -138,6 +140,19 @@ _ERR_VERIFICATION_ERROR: dict[str, str] = {
 _ERR_RUN_STILL_LIVE: dict[str, str] = {
     'error': 'run_still_live',
     'error_type': 'ReconCitationRunStillLive',
+}
+
+# Cross-project isolation. ``reconciliation.data_dir`` holds ONE journal for
+# every project this process reconciles, so ``get_run(target_run_id)`` will
+# happily resolve a run owned by someone else. Without this gate a Stage-1/
+# Stage-2 agent reconciling project A could rewrite the durable audit record of
+# a completed run owned by project B — and issue B-scoped Mem0 point reads to do
+# it. Every other citation path scopes its backend read to the CALLER's own
+# project (``cite_memory`` uses ``finding_entry.project_id``); this keeps the
+# repair path in that same containment story.
+_ERR_PROJECT_MISMATCH: dict[str, str] = {
+    'error': 'project_mismatch',
+    'error_type': 'ReconCitationProjectMismatch',
 }
 
 
@@ -288,6 +303,7 @@ async def repair_memory_citation(
     store: str,
     replacement_memory_id: str | None,
     repaired_by: str,
+    caller_project_id: str | None = None,
     live_run_ids: frozenset[str] = frozenset(),
     apply: bool = True,
 ) -> dict[str, Any]:
@@ -305,6 +321,15 @@ async def repair_memory_citation(
     reads, and returns it without writing, so the operator script's dry-run and
     the MCP tool traverse one code path (INV-5) and a dry-run tells the operator
     whether the gates pass before anything is written.
+
+    ``caller_project_id`` is the project the CALLER is scoped to. When supplied
+    (the MCP tool always supplies it, from its own ``_resolve_entry(run_id)``
+    entry) a target run owned by any other project is refused with
+    ``project_mismatch`` BEFORE any Mem0 read or journal write, so an in-agent
+    caller can never reach across the shared journal into another project's
+    audit record. ``None`` is the deliberate operator bypass: the
+    ``repair_recon_citation`` script runs out-of-band with no owning project and
+    is the intended path for a cross-project correction.
     """
     # ── Shape gates (no I/O; cheapest refusals first) ─────────────────────
     for role, candidate in (
@@ -341,6 +366,25 @@ async def repair_memory_citation(
     run = await journal.get_run(target_run_id)
     if run is None:
         return _ERR_TARGET_RUN_NOT_FOUND | {'target_run_id': target_run_id}
+
+    # Cross-project isolation, checked before the liveness gate and therefore
+    # before any Mem0 read: the corroboration reads below are issued in
+    # ``run.project_id``'s scope, so a mismatch must refuse BEFORE them, not
+    # merely before the write.
+    if caller_project_id is not None and run.project_id != caller_project_id:
+        return _ERR_PROJECT_MISMATCH | {
+            'target_run_id': target_run_id,
+            'caller_project_id': caller_project_id,
+            'target_project_id': run.project_id,
+            'hint': (
+                f'run {target_run_id} is owned by project '
+                f'{run.project_id!r}, but this caller is scoped to '
+                f'{caller_project_id!r}. The reconciliation journal is shared '
+                'across projects; a repair may only touch a run owned by the '
+                "caller's own project. A genuine cross-project correction goes "
+                'through the out-of-band repair_recon_citation operator script.'
+            ),
+        }
 
     # Terminal runs only — checked before any Mem0 read. Two halves because the
     # journal row and the in-process view can disagree: a row can already read

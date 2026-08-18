@@ -199,6 +199,95 @@ class TestStateRepairMemoryCitation:
         finally:
             await journal.close()
 
+    @pytest.mark.asyncio
+    async def test_cross_project_target_run_is_refused_before_any_lookup(self, tmp_path):
+        """A caller in project A may not repair a run owned by project B.
+
+        ``reconciliation.data_dir`` is ONE journal per process holding runs for
+        every project, so ``get_run(target_run_id)`` resolves another project's
+        run perfectly well. Without the caller-project gate a Stage-1/Stage-2
+        agent reconciling A would rewrite B's durable audit record — and issue
+        the corroboration point reads in B's mem0 scope to do it. Asserting on
+        ``memory.calls`` is the load-bearing half: the refusal must land BEFORE
+        any cross-project read, not merely before the write.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=TARGET_RUN,
+            project_id='other_project',
+            status='completed',
+            findings=[_finding('f-1', DANGLING)],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='dark_factory'
+            )
+
+            outcome = await state.repair_memory_citation(
+                run_id=CALLER_RUN,
+                target_run_id=TARGET_RUN,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+            )
+
+            assert outcome['error'] == 'project_mismatch'
+            assert outcome['caller_project_id'] == 'dark_factory'
+            assert outcome['target_project_id'] == 'other_project'
+            # No mem0 point read was issued in the other project's scope.
+            assert memory.calls == []
+            # And the other project's audit record is byte-for-byte untouched.
+            run = await journal.get_run(TARGET_RUN)
+            assert run is not None
+            report = run.stage_reports['memory_consolidator']
+            assert isinstance(report, StageReport)
+            finding = report.items_flagged[0]
+            assert finding['cited_memories'] == [
+                {'memory_id': DANGLING, 'store': 'mem0'}
+            ]
+            assert 'citation_repairs' not in finding
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_same_project_target_run_still_repairs(self, tmp_path):
+        """The gate is a project COMPARISON, not a blanket cross-run refusal.
+
+        Guards the obvious over-correction: the whole point of task 3065 is
+        repairing ANOTHER run's finding, so the isolation gate must stay silent
+        when that run is owned by the caller's own project.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=TARGET_RUN,
+            project_id='reify',
+            status='completed',
+            findings=[_finding('f-1', DANGLING)],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+            state = _state(memory_service=memory, journal=journal)
+            state.start_report(
+                run_id=CALLER_RUN, stage='memory_consolidator', project_id='reify'
+            )
+
+            outcome = await state.repair_memory_citation(
+                run_id=CALLER_RUN,
+                target_run_id=TARGET_RUN,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert outcome['project_id'] == 'reify'
+        finally:
+            await journal.close()
+
 
 class TestRepairToolViaFastMCP:
     """The MCP surface: registration, signature, end-to-end call, docs."""
