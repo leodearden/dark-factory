@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -2518,3 +2520,287 @@ class TestDepsOutsideTheTerminalWindow:
 
         assert deps[7]['done'] is False, 'a blocked dep must never render as done'
         assert deps[7]['title'] == ''
+
+
+# ---------------------------------------------------------------------------
+# collect_tasks_with_counts whole-handler budget (task 3857 steps 13/14)
+# ---------------------------------------------------------------------------
+
+
+# Far beyond any budget exercised below, so a project that sleeps this long can
+# only ever end by being CUT OFF. Picking a number near the budget instead would
+# make "did the deadline fire?" a race rather than a fact.
+_BUDGET_SLOW = 5.0
+
+
+def _register_shaper(monkeypatch, delays, *, offline=(), done_counts=None):
+    """Patch ``_shape_one_project`` with a per-project coroutine that sleeps.
+
+    *delays* maps project label -> seconds to sleep before returning; a label
+    absent from it returns immediately. Labels in *offline* return the offline
+    marker triple ``([], True, 0)`` — a fetch that demonstrably FAILED, which
+    must stay distinguishable from a project the budget never reached.
+
+    Returns the list of labels ``_shape_one_project`` was actually INVOKED
+    with, in order. That record is what makes "never got its turn" a checkable
+    fact rather than an inference from an absence in the output.
+    """
+    invoked: list[str] = []
+    counts = done_counts or {}
+
+    async def _fake_shape(
+        client, config, project_root, *,
+        max_done_per_project=0, max_cancelled_per_project=0,
+        now=None, runtime=None,
+    ):
+        label = project_root.name
+        invoked.append(label)
+        delay = delays.get(label, 0.0)
+        if delay:
+            await asyncio.sleep(delay)
+        if label in offline:
+            return [], True, 0
+        row = {'id': f'{label}/T-1', 'project': label, 'status': 'in-progress'}
+        return [row], False, counts.get(label, 0)
+
+    monkeypatch.setattr('dashboard.data.active_tasks._shape_one_project', _fake_shape)
+    return invoked
+
+
+def _budget_config(tmp_path, labels):
+    """A DashboardConfig whose project roots are *labels*, primary first."""
+    roots = []
+    for label in labels:
+        root = tmp_path / label
+        root.mkdir(parents=True, exist_ok=True)
+        roots.append(root)
+    return DashboardConfig(project_root=roots[0], known_project_roots=roots[1:])
+
+
+class TestCollectTasksBudget:
+    """The Tasks-tab aggregation must be bounded as a WHOLE, and degrade honestly.
+
+    ``collect_tasks_with_counts`` walks every configured project root
+    sequentially with no deadline anywhere, so its worst case is the SUM of
+    every project's worst case — unbounded in the number of roots. The fix is
+    the ``/healthz`` shape: one ``loop.time()`` deadline for the handler, one
+    ``asyncio.wait_for`` per project, and — the part that is easy to get wrong
+    — an explicit marker for every project the budget did not reach.
+
+    That last part is the real contract here. A truncated-but-confident payload
+    (rows for the projects that finished, silence for the rest) renders as "no
+    active work" on those projects, which is the same invisible-failure class
+    the fan-out logging policy was raised to WARNING to close. *degraded*
+    (budget expired — state UNKNOWN) is a strictly different fact from
+    *offline* (fetch demonstrably failed), and the two must never be merged.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_runtime_fanout(self, monkeypatch):
+        """Runtime fan-out returns instantly, so every measured second is the loop's."""
+        _register_runtime(monkeypatch, {})
+
+    @staticmethod
+    def _tighten(monkeypatch, *, total, per_project):
+        monkeypatch.setattr('dashboard.data.active_tasks._TASKS_TOTAL_BUDGET', total)
+        monkeypatch.setattr(
+            'dashboard.data.active_tasks._TASKS_PER_PROJECT_BUDGET', per_project
+        )
+
+    async def test_returns_four_element_tuple_with_degraded_projects(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(a) the return shape gains a fourth element: degraded_projects."""
+        _register_shaper(monkeypatch, {}, done_counts={'alpha': 3, 'beta': 5})
+        config = _budget_config(tmp_path, ['alpha', 'beta'])
+
+        result = await collect_tasks_with_counts(client=dummy_client, config=config)
+
+        assert len(result) == 4, (
+            f'expected (active, offline, done_counts, degraded), got {len(result)} '
+            'elements — a project the budget never reached has nowhere to be '
+            'reported without this fourth list'
+        )
+        _active, offline, counts, degraded = result
+        assert degraded == []
+        assert offline == []
+        assert counts == {'alpha': 3, 'beta': 5}
+
+    async def test_deadline_expiry_marks_unreached_projects_degraded(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(b) projects the handler never reached are named, not silently dropped.
+
+        Budgets are chosen so the arithmetic is one-directional rather than a
+        race: ``alpha`` returns instantly, then ``beta`` and ``gamma`` each
+        sleep far past their per-project budget and so consume 0.2s + 0.1s =
+        the entire 0.3s handler budget. Timers overshoot and never undershoot,
+        so ``delta`` and ``epsilon`` are guaranteed to find a non-positive
+        remaining budget — they can only be reached by the deadline branch.
+        """
+        invoked = _register_shaper(
+            monkeypatch,
+            {'beta': _BUDGET_SLOW, 'gamma': _BUDGET_SLOW},
+            done_counts={'alpha': 7},
+        )
+        self._tighten(monkeypatch, total=0.3, per_project=0.2)
+        config = _budget_config(
+            tmp_path, ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
+        )
+
+        active, offline, counts, degraded = await collect_tasks_with_counts(
+            client=dummy_client, config=config,
+        )
+
+        # The project that completed still contributes its rows and its count.
+        assert [row['project'] for row in active] == ['alpha']
+        assert counts == {'alpha': 7}
+
+        # Everything the budget did not deliver is NAMED.
+        assert set(degraded) == {'beta', 'gamma', 'delta', 'epsilon'}
+
+        # ...and the two never-reached projects are provably never-reached:
+        # they were not invoked at all, so their degraded marker cannot have
+        # come from a per-project timeout.
+        assert 'delta' not in invoked and 'epsilon' not in invoked, (
+            f'expected the handler deadline to skip delta/epsilon, but it '
+            f'invoked {invoked}'
+        )
+
+        # Never proven unreachable -> never reported offline.
+        assert offline == []
+        # No count was measured -> none is fabricated (not even a 0, which
+        # would render as a real "this project has zero done tasks").
+        assert 'delta' not in counts and 'epsilon' not in counts
+
+    async def test_slow_project_is_cut_off_and_the_next_one_still_runs(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(c) one slow project must not starve its neighbours of their turn.
+
+        The handler budget is left generous here so the ONLY thing that can
+        cut ``beta`` short is its own per-project budget — which is what makes
+        ``gamma`` completing a fact about per-project containment rather than
+        a coincidence of the total.
+        """
+        invoked = _register_shaper(
+            monkeypatch,
+            {'beta': _BUDGET_SLOW},
+            done_counts={'alpha': 1, 'gamma': 2},
+        )
+        self._tighten(monkeypatch, total=10.0, per_project=0.2)
+        config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
+
+        started = time.monotonic()
+        active, offline, counts, degraded = await collect_tasks_with_counts(
+            client=dummy_client, config=config,
+        )
+        elapsed = time.monotonic() - started
+
+        assert degraded == ['beta']
+        assert offline == []
+        assert 'gamma' in invoked, 'the project after the slow one never got its turn'
+        assert {row['project'] for row in active} == {'alpha', 'gamma'}
+        assert counts == {'alpha': 1, 'gamma': 2}
+        assert elapsed < 1.0, (
+            f'elapsed {elapsed:.3f}s — beta sleeps {_BUDGET_SLOW}s, so anything '
+            'near that means the per-project budget did not fire'
+        )
+
+    async def test_degraded_and_offline_are_disjoint(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(d) a project is either demonstrably offline or unknown — never both.
+
+        Merging the lists would let an operator read "the budget ran out" as
+        "fused-memory is down", which sends them to restart a healthy service.
+        """
+        _register_shaper(
+            monkeypatch,
+            {'gamma': _BUDGET_SLOW},
+            offline=('beta',),
+            done_counts={'alpha': 4},
+        )
+        self._tighten(monkeypatch, total=10.0, per_project=0.2)
+        config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma'])
+
+        _active, offline, counts, degraded = await collect_tasks_with_counts(
+            client=dummy_client, config=config,
+        )
+
+        assert offline == ['beta']
+        assert degraded == ['gamma']
+        assert set(offline).isdisjoint(degraded)
+        # An offline project already had no count; a degraded one must not
+        # acquire a fabricated one either.
+        assert counts == {'alpha': 4}
+
+    async def test_total_wall_time_is_bounded_by_the_handler_budget(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(e) the whole call is bounded, not merely each project within it."""
+        import dashboard.data.active_tasks as active_tasks_mod
+
+        delays = {label: _BUDGET_SLOW for label in ('beta', 'gamma', 'delta')}
+        _register_shaper(monkeypatch, delays)
+        self._tighten(monkeypatch, total=0.5, per_project=0.2)
+        config = _budget_config(tmp_path, ['alpha', 'beta', 'gamma', 'delta'])
+
+        started = time.monotonic()
+        await collect_tasks_with_counts(client=dummy_client, config=config)
+        elapsed = time.monotonic() - started
+
+        sum_of_sleeps = sum(delays.values())
+        assert elapsed < sum_of_sleeps / 2, (
+            f'elapsed {elapsed:.3f}s is not well under the {sum_of_sleeps}s sum '
+            'of per-project sleeps — the walk is still additive in the number '
+            'of roots'
+        )
+        # +0.5s of tolerance for event-loop scheduling, the same convention as
+        # test_healthz_deadline.py's elapsed assertions.
+        assert elapsed < active_tasks_mod._TASKS_TOTAL_BUDGET + 0.5, (
+            f'elapsed {elapsed:.3f}s exceeded the whole-handler budget of '
+            f'{active_tasks_mod._TASKS_TOTAL_BUDGET}s'
+        )
+
+    async def test_happy_path_is_unchanged_by_the_budget(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(f) with fast projects, nothing degrades and the payload is identical."""
+        _register_shaper(monkeypatch, {}, done_counts={'alpha': 11, 'beta': 22})
+        # Shipped constants deliberately NOT tightened here: the happy path
+        # must hold under the values that actually ship.
+        config = _budget_config(tmp_path, ['alpha', 'beta'])
+
+        active, offline, counts, degraded = await collect_tasks_with_counts(
+            client=dummy_client, config=config,
+        )
+
+        assert degraded == []
+        assert offline == []
+        assert counts == {'alpha': 11, 'beta': 22}
+        assert [row['id'] for row in active] == ['alpha/T-1', 'beta/T-1']
+
+    async def test_collect_active_tasks_still_returns_two_elements(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """(g) the scheduler's caller keeps its two-element contract.
+
+        ``data/scheduler.py`` unpacks ``(active, offline)``; the fourth element
+        is absorbed by ``collect_active_tasks``, not leaked to it.
+        """
+        _register_shaper(monkeypatch, {'beta': _BUDGET_SLOW}, done_counts={'alpha': 1})
+        self._tighten(monkeypatch, total=10.0, per_project=0.2)
+        config = _budget_config(tmp_path, ['alpha', 'beta'])
+
+        result = await collect_active_tasks(client=dummy_client, config=config)
+
+        assert len(result) == 2, (
+            f'collect_active_tasks must keep its (active, offline) shape, got '
+            f'{len(result)} elements'
+        )
+        active, offline = result
+        assert [row['project'] for row in active] == ['alpha']
+        # A degraded project is NOT offline here either — the marker is
+        # dropped by this narrower contract, not silently reclassified.
+        assert offline == []
