@@ -70,8 +70,12 @@ class _FillDrive:
 
     ``dispatched``       : items passed to the stubbed ``_dispatch_item``, in
                             call order.
-    ``first_dispatched``: set synchronously inside the stub on the FIRST call.
-    ``second_dispatched``: set synchronously inside the stub on the SECOND call.
+    ``first_dispatched``: set inside the stub once the FIRST call's lease is
+                            held (i.e. after ``allocator.acquire()`` returns
+                            non-None) -- so a waiter observes
+                            ``free_host_count()`` already reflecting the
+                            dispatch, not merely "acquire() was called".
+    ``second_dispatched``: same, for the SECOND call.
     ``gate``              : shared, test-controlled ``asyncio.Event``. Every
                             dispatched entry's ``verify_task`` blocks on
                             ``gate.wait()`` -- so real verify/git machinery
@@ -100,13 +104,19 @@ def _drive_fill(worker: SpeculativeMergeWorker, allocator: HostAllocator) -> _Fi
 
     async def _fake_dispatch_item(item: Any) -> InflightEntry | None:
         drive.dispatched.append(item)
+        lease = await allocator.acquire(lambda: MagicMock())
+        if lease is None:
+            return None
+        # Signal only after the lease is confirmed held, not merely
+        # requested: a waiter on first_dispatched/second_dispatched must
+        # observe free_host_count() already reflecting this dispatch. This
+        # happens to hold either way today (HostAllocator.acquire has no
+        # real await point), but pin the ordering explicitly rather than
+        # relying on that incidental property.
         if len(drive.dispatched) == 1:
             drive.first_dispatched.set()
         elif len(drive.dispatched) == 2:
             drive.second_dispatched.set()
-        lease = await allocator.acquire(lambda: MagicMock())
-        if lease is None:
-            return None
         return InflightEntry(
             item=item,
             lease=lease,
@@ -172,13 +182,18 @@ async def _teardown_fill_drive(
     returns.  This reproduces on the pre-task-3276 baseline for a purely
     queue-sourced dispatch (a shape the DISPATCH-FILL guard never gated), and
     is reachable in production from ``SpeculativeMergeWorker.run()``'s own raw
-    ``cancel()``/``gather()`` shutdown path; it is filed as its own follow-up.
+    ``cancel()``/``gather()`` shutdown path; it is filed as its own follow-up,
+    task 4306.
     These tests fence the DISPATCH-FILL predicate, not cancellation semantics,
     so they must not depend on that path being clean -- the loop's own
     docstring already flags raw external cancellation as an accepted edge case.
     """
     drive.gate.set()
-    with contextlib.suppress(BaseException):
+    # Exception, not BaseException: this must not swallow a CancelledError
+    # aimed at the enclosing test task (or a KeyboardInterrupt) -- only
+    # absorb worker.stop()'s own failures, so a genuine stop() regression
+    # is never silently masked into a falsely-clean teardown.
+    with contextlib.suppress(Exception):
         await worker.stop()
     if not task.done():
         task.cancel()
