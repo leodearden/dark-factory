@@ -11,29 +11,12 @@ import html.parser
 import re
 
 import pytest
+from _dashboard_helpers import extract_function_body
 from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def data_js_body(_client):
-    return _client.get('/static/redux/data.js').text
-
-
-@pytest.fixture(scope='module')
-def tab_escalations_jsx_body(_client):
-    return _client.get('/static/redux/tab_escalations.jsx').text
 
 
 @pytest.fixture(scope='module')
@@ -50,21 +33,6 @@ def tab_escalations_jsx_code(tab_escalations_jsx_body):
     (no URLs) and no regex literals, so no `/`-bearing code is eaten.
     """
     return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', tab_escalations_jsx_body)
-
-
-@pytest.fixture(scope='module')
-def app_jsx_body(_client):
-    return _client.get('/static/redux/app.jsx').text
-
-
-@pytest.fixture(scope='module')
-def shell_jsx_body(_client):
-    return _client.get('/static/redux/shell.jsx').text
-
-
-@pytest.fixture(scope='module')
-def index_html_body(_client):
-    return _client.get('/static/redux/index.html').text
 
 
 # ---------------------------------------------------------------------------
@@ -105,47 +73,6 @@ def _extract_df_data_block(src: str, key: str) -> str:
 # ---------------------------------------------------------------------------
 # Helper: extract a named JS/JSX function body (brace-aware)
 # ---------------------------------------------------------------------------
-
-
-def _extract_function_body(src: str, fn_name: str) -> str:
-    """Return the body block of a ``function <fn_name>(`` declaration, braces included.
-
-    Uses the same brace-depth walk as ``_extract_df_data_block``.  Only matches
-    named ``function`` declarations — not arrow functions or class methods.
-    Returns the empty string if the function is not found.
-
-    Paren-depth walks past the parameter list before looking for the body's
-    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
-    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
-    taking the first ``{`` after the opening ``(`` would return just the
-    destructuring pattern (e.g. ``{ a, b }``) instead of the function body.
-    """
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    if m is None:
-        return ''
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        return ''
-    start = src.find('{', i)
-    if start == -1:
-        return ''
-    depth = 0
-    for j in range(start, len(src)):
-        c = src[j]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : j + 1]
-    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +472,7 @@ def test_tab_escalations_task_sort_and_expand_collapse(tab_escalations_jsx_body:
     )
     # Numeric-aware comparator uses Number() — scoped to the sortRows function body
     # so we don't get a false pass from Number() appearing in an unrelated context.
-    sort_fn = _extract_function_body(tab_escalations_jsx_body, 'sortRows')
+    sort_fn = extract_function_body(tab_escalations_jsx_body, 'sortRows')
     assert sort_fn, (
         'tab_escalations.jsx does not define a `function sortRows(` — '
         'add a named sortRows function to sort escalation rows by numeric task_id.'
@@ -895,7 +822,7 @@ def test_tab_escalations_strip_mounted_and_wired(tab_escalations_jsx_body: str) 
 
     # (3) Scoped to the EscalationStatStrip body: reads the analytics payload,
     # renders StatTile.
-    strip_fn = _extract_function_body(body, 'EscalationStatStrip')
+    strip_fn = extract_function_body(body, 'EscalationStatStrip')
     assert strip_fn, (
         'tab_escalations.jsx does not define a `function EscalationStatStrip(` body — '
         'add the component definition.'
@@ -910,7 +837,7 @@ def test_tab_escalations_strip_mounted_and_wired(tab_escalations_jsx_body: str) 
 
     # (4) Scoped to the EscalationsTab body: strip mounts before the level-filter
     # controls (top-of-tab placement).
-    tab_fn = _extract_function_body(body, 'EscalationsTab')
+    tab_fn = extract_function_body(body, 'EscalationsTab')
     assert tab_fn, (
         'tab_escalations.jsx does not define a `function EscalationsTab(` body.'
     )
@@ -949,7 +876,7 @@ def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> No
     (d) churn — references churn_daily.
     (e) at least four <C.StatTile tiles are rendered.
     """
-    strip_fn = _extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
+    strip_fn = extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
     assert strip_fn, (
         'tab_escalations.jsx does not define a `function EscalationStatStrip(` body — '
         'add the component definition.'
@@ -1026,7 +953,7 @@ def test_tab_escalations_strip_window_anchored_7d(tab_escalations_jsx_body: str)
     body = tab_escalations_jsx_body
 
     # (1) windowCutoffDate helper, generatedAt-anchored, no Date.now()
-    cutoff_fn = _extract_function_body(body, 'windowCutoffDate')
+    cutoff_fn = extract_function_body(body, 'windowCutoffDate')
     assert cutoff_fn, (
         'tab_escalations.jsx does not define `function windowCutoffDate(` — add a '
         'local generated_at-anchored cutoff helper (copy the pattern from '
@@ -1042,7 +969,7 @@ def test_tab_escalations_strip_window_anchored_7d(tab_escalations_jsx_body: str)
     )
 
     # (2)/(3) EscalationStatStrip anchors to generated_at, never Date.now()
-    strip_fn = _extract_function_body(body, 'EscalationStatStrip')
+    strip_fn = extract_function_body(body, 'EscalationStatStrip')
     assert strip_fn, (
         'tab_escalations.jsx does not define a `function EscalationStatStrip(` body.'
     )
@@ -1086,7 +1013,7 @@ def test_tab_escalations_strip_sparklines_and_churn_retained(tab_escalations_jsx
         tile label / churn_daily reference (co-occurrence, not bare
         presence — a stray spark= elsewhere wouldn't prove churn has one).
     """
-    strip_fn = _extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
+    strip_fn = extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
     assert strip_fn, (
         'tab_escalations.jsx does not define a `function EscalationStatStrip(` body.'
     )
@@ -1183,7 +1110,7 @@ def test_focus_handoff_retries_then_reports_a_miss(
     #     module-scope seed capture reads `DF.ESCALATIONS` too, and it is a
     #     different thing — the frozen pre-fetch reference, which correctly
     #     must NOT appear in the deps.
-    tab_body = _extract_function_body(code, 'EscalationsTab')
+    tab_body = extract_function_body(code, 'EscalationsTab')
     assert tab_body, 'could not extract the EscalationsTab body.'
     esc_local = re.search(r'const\s+(\w+)\s*=\s*DF\.ESCALATIONS', tab_body)
     assert esc_local is not None, (
@@ -1277,7 +1204,7 @@ def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
 
     # (a) data.js records the marker inside applyKey — the one place that knows
     #     a real server value was applied.
-    apply_body = _extract_function_body(data_js_body, 'applyKey')
+    apply_body = extract_function_body(data_js_body, 'applyKey')
     assert apply_body, 'could not extract data.js\'s applyKey body.'
     marker = re.search(r'([\w.$]+)\[\s*key\s*\]\s*=\s*true', apply_body)
     assert marker is not None, (
@@ -1309,7 +1236,7 @@ def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
     )
 
     # (d) tab_escalations.jsx reads THAT marker, keyed on its own payload key.
-    loaded_body = _extract_function_body(code, 'escalationsLoaded')
+    loaded_body = extract_function_body(code, 'escalationsLoaded')
     assert loaded_body, 'could not extract the escalationsLoaded body.'
     assert leaf in loaded_body, (
         f'escalationsLoaded does not read data.js\'s `{leaf}` marker registry: '

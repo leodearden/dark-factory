@@ -17,49 +17,12 @@ import html.parser
 import re
 
 import pytest
+from _dashboard_helpers import extract_function_body
 from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def data_js_body(_client):
-    return _client.get('/static/redux/data.js').text
-
-
-@pytest.fixture(scope='module')
-def index_html_body(_client):
-    return _client.get('/static/redux/index.html').text
-
-
-@pytest.fixture(scope='module')
-def tabs_jsx_body(_client):
-    return _client.get('/static/redux/tabs.jsx').text
-
-
-@pytest.fixture(scope='module')
-def app_jsx_body(_client):
-    return _client.get('/static/redux/app.jsx').text
-
-
-@pytest.fixture(scope='module')
-def shell_jsx_body(_client):
-    return _client.get('/static/redux/shell.jsx').text
-
-
-@pytest.fixture(scope='module')
-def tab_escalations_jsx_body(_client):
-    return _client.get('/static/redux/tab_escalations.jsx').text
 
 
 @pytest.fixture(scope='module')
@@ -166,47 +129,6 @@ def _extract_df_data_block(src: str, key: str) -> str:
 # ---------------------------------------------------------------------------
 # Helper: extract a named JS/JSX function body (brace-aware)
 # ---------------------------------------------------------------------------
-
-
-def _extract_function_body(src: str, fn_name: str) -> str:
-    """Return the body block of a ``function <fn_name>(`` declaration, braces included.
-
-    Uses the same brace-depth walk as ``_extract_df_data_block``.  Only matches
-    named ``function`` declarations — not arrow functions or class methods.
-    Returns the empty string if the function is not found.
-
-    Paren-depth walks past the parameter list before looking for the body's
-    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
-    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
-    taking the first ``{`` after the opening ``(`` would return just the
-    destructuring pattern (e.g. ``{ a, b }``) instead of the function body.
-    """
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    if m is None:
-        return ''
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        return ''
-    start = src.find('{', i)
-    if start == -1:
-        return ''
-    depth = 0
-    for j in range(start, len(src)):
-        c = src[j]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : j + 1]
-    return ''
 
 
 # ---------------------------------------------------------------------------
@@ -1699,7 +1621,7 @@ def test_parity_vocabulary_fully_covered(memory_evals_fmt_js_code: str) -> None:
         'spelling if the producer renamed the state.'
     )
 
-    badge_body = _extract_function_body(code, 'verdictBadge')
+    badge_body = extract_function_body(code, 'verdictBadge')
     assert badge_body, 'could not extract the verdictBadge body.'
     labels = _return_label_exprs(badge_body)
     assert labels, 'verdictBadge returns no `label`.'
@@ -1856,7 +1778,7 @@ def test_unknown_verdict_is_visibly_unrenderable(
     # un-say it, and the composed label would then assert both halves of the
     # distinction at once ("no verdict · unrecognised verdict" — absent in the
     # first clause, present-but-unreadable in the second).
-    badge_body = _extract_function_body(code, 'verdictBadge')
+    badge_body = extract_function_body(code, 'verdictBadge')
     assert badge_body, 'could not extract the verdictBadge body.'
     assigned = re.findall(r"\bbase\s*=\s*'([^']*)'", badge_body)
     assert assigned, 'verdictBadge assigns no literal `base` label.'
@@ -1942,7 +1864,7 @@ def test_verdict_badges_driven_by_persisted_verdict(
         )
 
     # A null/absent verdict renders its own state, not a defaulted one.
-    badge_body = _extract_function_body(fmt_code, 'verdictBadge')
+    badge_body = extract_function_body(fmt_code, 'verdictBadge')
     assert badge_body, 'could not extract the verdictBadge body.'
     # (i) THE PARITY SHORT-CIRCUIT — that no parity branch may discard the
     #     verdict-derived label — now lives in
@@ -2138,7 +2060,7 @@ def test_no_client_side_alarm_derivation(
     #     characters that appear in prose (an `->` arrow, a "<Chart" reference)
     #     are not comparisons, and failing on them would push the next author
     #     to reword a correct comment rather than fix real code.
-    badge_body = _extract_function_body(code, 'verdictBadge')
+    badge_body = extract_function_body(code, 'verdictBadge')
     assert badge_body, (
         'could not extract the verdictBadge body from memory_evals_fmt.js. '
         'This assertion is the anti-vacuity guard for everything below it: if '
@@ -2331,7 +2253,7 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
     """
     code = tab_memory_evals_jsx_code
 
-    row_body = _extract_function_body(code, 'MemoryEvalMetricRow')
+    row_body = extract_function_body(code, 'MemoryEvalMetricRow')
     assert row_body, 'could not extract the MemoryEvalMetricRow body.'
 
     # (a) something must MEASURE the series length. Nothing did.
@@ -2652,7 +2574,7 @@ def test_limits_provenance_rendered(
     # LimitsProvenance must early-return its own element when `ev.limits` is
     # falsy.  Pinning the operator-facing sentence would fail the suite on any
     # rewording while proving nothing extra about the branch.
-    prov_body = _extract_function_body(code, 'LimitsProvenance')
+    prov_body = extract_function_body(code, 'LimitsProvenance')
     assert prov_body, 'could not extract the LimitsProvenance body.'
     # The local's NAME is derived from the `ev.limits` read rather than pinned,
     # so renaming `lim` is not a test failure; what must hold is that whatever
@@ -2740,7 +2662,7 @@ def test_limits_provenance_open_state_is_per_eval(
     """
     code = tab_memory_evals_jsx_code
 
-    prov_body = _extract_function_body(code, 'LimitsProvenance')
+    prov_body = extract_function_body(code, 'LimitsProvenance')
     assert prov_body, 'could not extract the LimitsProvenance body.'
 
     # (a) the `open=` attribute is a bare identifier, not a call.
@@ -3004,7 +2926,7 @@ def test_tabs_jsx_memory_tab_renders_evals_section(
     )
 
     # (c) rendered inside MemoryTab and nowhere else; NOT a DF_TABS entry.
-    memory_tab_body = _extract_function_body(body, 'MemoryTab')
+    memory_tab_body = extract_function_body(body, 'MemoryTab')
     assert memory_tab_body, 'could not extract the MemoryTab body.'
     assert '<MemoryEvalsSection' in memory_tab_body, (
         'MemoryTab must render <MemoryEvalsSection ... /> (PRD DD3: the eval '

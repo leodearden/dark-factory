@@ -47,75 +47,16 @@ import shutil
 import subprocess
 
 import pytest
+from _dashboard_helpers import extract_function_body
 from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
-# Fixtures — served-asset text, same idiom as test_charts_null_samples.py:49-59
-# and test_esc_flow_diagram.py:53.  Reading through the app's own static route
-# rather than the filesystem also proves the asset is actually SERVED, which is
-# the property the cache-buster assertion below depends on.
+# The served-asset fixtures (`charts_jsx_body`, `tab_analytics_jsx_body`,
+# `index_html_body`) and the `_client` they read through now live in
+# conftest.py (task 3549).  Reading through the app's own static route rather
+# than the filesystem still proves the asset is actually SERVED, which is the
+# property the cache-buster assertion below depends on.
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def charts_jsx(_client) -> str:
-    return _client.get('/static/redux/charts.jsx').text
-
-
-@pytest.fixture(scope='module')
-def analytics_jsx(_client) -> str:
-    return _client.get('/static/redux/tab_escalation_analytics.jsx').text
-
-
-@pytest.fixture(scope='module')
-def index_html_body(_client) -> str:
-    return _client.get('/static/redux/index.html').text
-
-
-def _extract_function_body(src: str, fn_name: str) -> str:
-    """Return the body block of a ``function <fn_name>(`` declaration, braces included.
-
-    Copied from test_charts_null_samples.py:62-97 — copying rather than
-    importing across test modules is this suite's established convention.  The
-    paren-depth walk past the parameter list is load-bearing: all three
-    components here take a destructured parameter whose own ``{``/``}`` sits
-    INSIDE the parameter list, so a naive first-``{`` scan would return the
-    destructuring pattern instead of the body.
-    """
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    if m is None:
-        return ''
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        return ''
-    start = src.find('{', i)
-    if start == -1:
-        return ''
-    depth = 0
-    for j in range(start, len(src)):
-        c = src[j]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : j + 1]
-    return ''
 
 
 def _extract_signature(src: str, fn_name: str) -> str:
@@ -145,7 +86,7 @@ def _extract_signature(src: str, fn_name: str) -> str:
 
 
 def _component_body(src: str, name: str) -> str:
-    body = _extract_function_body(src, name)
+    body = extract_function_body(src, name)
     assert body, (
         f'could not slice the body of `function {name}(` out of the served '
         'source — it was renamed, moved, or converted to an arrow/const '
@@ -154,14 +95,14 @@ def _component_body(src: str, name: str) -> str:
     return body
 
 
-def _default_format_y(charts_jsx: str) -> str:
+def _default_format_y(charts_jsx_body: str) -> str:
     """The ``formatY = ...`` default from the ``StackedAreaChart`` signature.
 
     The default arrow contains neither a comma nor a brace (``v => String(v)``
     before the fix, ``v => String(Math.round(v))`` after), so a ``[^,}]+`` run
     over the signature slice captures exactly it.
     """
-    signature = _extract_signature(charts_jsx, 'StackedAreaChart')
+    signature = _extract_signature(charts_jsx_body, 'StackedAreaChart')
     m = re.search(r'formatY\s*=\s*([^,}]+)', signature)
     assert m is not None, (
         'StackedAreaChart no longer declares a `formatY = <default>` in its '
@@ -214,13 +155,13 @@ def _tick_generator(body: str) -> str:
     return f'{ticks.group(1)}\n  {y_ticks.group(1)}'
 
 
-def _workflow_panel_format_y(analytics_jsx: str) -> str:
+def _workflow_panel_format_y(tab_analytics_jsx_body: str) -> str:
     """WorkflowPanel's own percent formatter, from its ``<C.StackedAreaChart>`` call.
 
     Non-greedy up to ``} />``, which correctly steps over the ``${...}`` brace
     pair inside the template literal.
     """
-    body = _component_body(analytics_jsx, 'WorkflowPanel')
+    body = _component_body(tab_analytics_jsx_body, 'WorkflowPanel')
     m = re.search(r'<C\.StackedAreaChart\b[^>]*?formatY=\{(.*?)\}\s*/>', body)
     assert m is not None, (
         'WorkflowPanel no longer passes a `formatY={...}` to <C.StackedAreaChart> '
@@ -297,14 +238,14 @@ console.log(JSON.stringify(out));
 # ---------------------------------------------------------------------------
 
 
-def test_stacked_area_chart_does_not_pre_round_the_tick_before_format_y(charts_jsx: str) -> None:
+def test_stacked_area_chart_does_not_pre_round_the_tick_before_format_y(charts_jsx_body: str) -> None:
     """StackedAreaChart must not snap the tick to an integer before formatY sees it.
 
     Pre-rounding destroys the fractional information every percent/decimal
     formatter needs — the caller's own formatter is the only thing that knows
     the axis UNITS. FAILED before the fix at charts.jsx:186.
     """
-    body = _component_body(charts_jsx, 'StackedAreaChart')
+    body = _component_body(charts_jsx_body, 'StackedAreaChart')
 
     assert 'formatY(Math.round(' not in body, (
         "StackedAreaChart's body still calls `formatY(Math.round(...))`, "
@@ -321,7 +262,7 @@ def test_stacked_area_chart_does_not_pre_round_the_tick_before_format_y(charts_j
 # ---------------------------------------------------------------------------
 
 
-def test_workflow_panel_percent_axis_reads_0_25_50_75_100(charts_jsx: str, analytics_jsx: str) -> None:
+def test_workflow_panel_percent_axis_reads_0_25_50_75_100(charts_jsx_body: str, tab_analytics_jsx_body: str) -> None:
     """The 100%-normalized Workflow axis renders every intermediate tick correctly.
 
     Runs the REAL extracted expressions — StackedAreaChart's tick generator at
@@ -334,14 +275,14 @@ def test_workflow_panel_percent_axis_reads_0_25_50_75_100(charts_jsx: str, analy
     0/0.25/0.5/0.75/1 are exact binary fractions, so ``Math.round(0.25 * 100)``
     is exactly 25 and no tolerance is needed.
     """
-    body = _component_body(charts_jsx, 'StackedAreaChart')
+    body = _component_body(charts_jsx_body, 'StackedAreaChart')
 
     labels = _run_node(
         _axis_labels_program(
             label_arg=_tick_label_arg(body),
             tick_map_param=_tick_map_param(body),
             tick_gen=_tick_generator(body),
-            format_y=_workflow_panel_format_y(analytics_jsx),
+            format_y=_workflow_panel_format_y(tab_analytics_jsx_body),
             max_vs=[1],
         )
     )['1']
@@ -354,7 +295,7 @@ def test_workflow_panel_percent_axis_reads_0_25_50_75_100(charts_jsx: str, analy
     )
 
 
-def test_default_format_y_callers_keep_integer_count_axes(charts_jsx: str) -> None:
+def test_default_format_y_callers_keep_integer_count_axes(charts_jsx_body: str) -> None:
     """The three no-formatY callers still render whole-number axes.
 
     tabs.jsx:1259, tabs.jsx:1329 and tab_escalation_analytics.jsx:244 pass no
@@ -365,14 +306,14 @@ def test_default_format_y_callers_keep_integer_count_axes(charts_jsx: str) -> No
     into the default, and these are the exact labels the pre-fix composition
     produced, pinned so the equivalence is checked rather than argued.
     """
-    body = _component_body(charts_jsx, 'StackedAreaChart')
+    body = _component_body(charts_jsx_body, 'StackedAreaChart')
 
     axes = _run_node(
         _axis_labels_program(
             label_arg=_tick_label_arg(body),
             tick_map_param=_tick_map_param(body),
             tick_gen=_tick_generator(body),
-            format_y=_default_format_y(charts_jsx),
+            format_y=_default_format_y(charts_jsx_body),
             max_vs=[7, 10],
         )
     )
@@ -388,7 +329,7 @@ def test_default_format_y_callers_keep_integer_count_axes(charts_jsx: str) -> No
     )
 
 
-def test_line_chart_hands_format_y_the_raw_tick(charts_jsx: str) -> None:
+def test_line_chart_hands_format_y_the_raw_tick(charts_jsx_body: str) -> None:
     """LineChart already handed formatY the raw tick — pin that, change nothing else.
 
     LineChart's non-rounding default is DELIBERATELY left alone by task 4059;
@@ -398,7 +339,7 @@ def test_line_chart_hands_format_y_the_raw_tick(charts_jsx: str) -> None:
     LineChart's own label expression against a recording formatter rather than
     by matching its source text.
     """
-    body = _component_body(charts_jsx, 'LineChart')
+    body = _component_body(charts_jsx_body, 'LineChart')
 
     received = _run_node(f"""
 const received = [];
@@ -482,7 +423,7 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
 """
 
 
-def test_probes_and_extractors_actually_fire_on_pre_fix_source(analytics_jsx: str) -> None:
+def test_probes_and_extractors_actually_fire_on_pre_fix_source(tab_analytics_jsx_body: str) -> None:
     """Every probe and extractor above still detects the real pre-fix code.
 
     Without this, a reformat that inserts a space, a variable rename, or a
@@ -515,7 +456,7 @@ def test_probes_and_extractors_actually_fire_on_pre_fix_source(analytics_jsx: st
             label_arg=_tick_label_arg(body),
             tick_map_param=_tick_map_param(body),
             tick_gen=_tick_generator(body),
-            format_y=_workflow_panel_format_y(analytics_jsx),
+            format_y=_workflow_panel_format_y(tab_analytics_jsx_body),
             max_vs=[1],
         )
     )['1']
