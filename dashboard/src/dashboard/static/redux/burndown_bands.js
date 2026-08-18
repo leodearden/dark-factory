@@ -92,6 +92,14 @@
 // there is the project's own snapshot row, not the cross-project union, so a
 // band wired to a field from a different block would both overrun and
 // index-shift its series while still drawing a plausible-looking chart.
+//
+// A null/undefined block or palette is tolerated and yields the five bands
+// with undefined `values` / `color` rather than throwing — the same tolerance
+// the sibling extractions state for strandBadgeState and pinningSummary.
+// BurnTab renders before the first burndown payload has necessarily arrived,
+// and throwing here would blank the whole tab rather than draw an empty chart.
+// Both `|| {}` arms below are pinned by burndown_bands.test.mjs, so neither is
+// deletable in silence.
 function burndownStacks(block, palette) {
   const b = block || {};
   const cp = palette || {};
@@ -136,7 +144,7 @@ function burndownLegend(palette) {
 }
 
 // ── Should the concurrency-parity banner draw, and what does it say? ──
-// Returns `{peak, cap, count, who, text}` or null for "draw nothing".
+// Returns `{peak, cap, text}` or null for "draw nothing".
 //
 // THE VERDICT IS COMPUTED SERVER-SIDE and this only renders it. Each snapshot
 // is judged against the cap stored ON that snapshot: max_concurrent_tasks is
@@ -150,10 +158,17 @@ function burndownLegend(palette) {
 // never breached; returning null unconditionally would silently drop a real
 // breach. A one-sided test would catch only the second.
 //
-// `count` falls back to 0 rather than undefined, so the text never reads
-// "undefined snapshots over". `who` is the offending-project suffix: the
-// aggregate view passes the breaching subset, the per-project view passes null
-// because naming a project inside its own panel says nothing.
+// EVERY FIELD RETURNED IS RENDERED. The sole call site (tabs.jsx BurnTab's
+// parityBanner closure) interpolates peak, cap and text and nothing else, so
+// the breach count and the offending-project suffix are folded INTO `text`
+// rather than ALSO exposed as fields nobody reads. An unread public field
+// attracts coverage aimed at an output no operator ever sees, which reads as
+// tested behaviour and is not; both are asserted through `text` instead.
+//
+// The count falls back to 0 rather than undefined, so the text never reads
+// "undefined snapshots over". The project suffix is the aggregate view's
+// breaching subset; the per-project view passes null, because naming a project
+// inside its own panel says nothing.
 //
 // Returns the DECISION, not markup — the `<div className="badge bad">` that
 // wraps it stays in tabs.jsx.
@@ -164,8 +179,6 @@ function parityBannerState(block, projects) {
   return {
     peak: block.parity_peak,
     cap: block.parity_cap,
-    count: n,
-    who,
     text: ` · ${n} snapshot${n !== 1 ? 's' : ''} over${who}`,
   };
 }

@@ -189,6 +189,42 @@ test('burndownStacks: palette slots reach the bands they name', () => {
   });
 });
 
+test('burndownStacks: tolerates a null/undefined block without throwing', () => {
+  // BurnTab renders before the first burndown payload has necessarily arrived.
+  // The band SET is structural and must survive that — an empty chart, not a
+  // blanked tab. This is what makes the `const b = block || {}` arm real: delete
+  // it and this test throws instead of passing.
+  for (const empty of [null, undefined]) {
+    const stacks = burndownStacks(empty, CP);
+
+    assert.equal(stacks.length, 5, `a ${empty} block should still define five bands`);
+    assert.deepEqual(stacks.map(s => s.key), [
+      'done',
+      'in_progress_live',
+      'in_progress_stranded',
+      'blocked',
+      'pending',
+    ]);
+    // No series to draw, but the palette slots still resolve: an absent block
+    // must not also cost the colours.
+    assert.ok(stacks.every(s => s.values === undefined), 'an absent block should yield no series');
+    assert.equal(stacks.find(s => s.key === 'in_progress_stranded').color, CP.stranded);
+  }
+});
+
+test('burndownStacks: tolerates a missing palette without throwing', () => {
+  // Symmetric to the block arm above: `const cp = palette || {}`. A caller that
+  // has not resolved CP yet gets colourless bands, not an exception.
+  for (const nopalette of [null, undefined]) {
+    const stacks = burndownStacks(mkBlock(), nopalette);
+
+    assert.equal(stacks.length, 5);
+    assert.ok(stacks.every(s => s.color === undefined), 'an absent palette should yield no colours');
+    // The series still arrive — losing the palette must not also lose the data.
+    assert.deepEqual(stacks.find(s => s.key === 'pending').values, [9, 10]);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // burndownLegend — the key to the bands above, which must agree with them
 // ---------------------------------------------------------------------------
@@ -218,6 +254,19 @@ test('burndownLegend: legend colours match the stack colours pairwise, in order'
   }
 });
 
+test('burndownLegend: tolerates a missing palette without throwing', () => {
+  // The legend is derived from burndownStacks, so it inherits that tolerance —
+  // asserted here rather than assumed, because the derivation is the very thing
+  // a future edit might unpick.
+  for (const nopalette of [undefined, null]) {
+    const legend = burndownLegend(nopalette);
+
+    assert.equal(legend.length, 5);
+    assert.deepEqual(legend.map(e => e.label), ['done', 'live', 'stranded', 'blocked', 'pending']);
+    assert.ok(legend.every(e => e.color === undefined), 'an absent palette should yield no colours');
+  }
+});
+
 // ---------------------------------------------------------------------------
 // parityBannerState — draws ONLY on a server-computed alarm
 // ---------------------------------------------------------------------------
@@ -244,13 +293,21 @@ test('parityBannerState: exposes the verdict when the alarm fires', () => {
   assert.notEqual(state, null);
   assert.equal(state.peak, 43);
   assert.equal(state.cap, 24);
-  assert.equal(state.count, 7);
+  // The breach count is asserted through the rendered text, not through a
+  // separate field: `text` is what the banner actually shows, and every field
+  // this descriptor returns is one the call site interpolates.
+  assert.ok(state.text.includes('7 snapshots over'), `breach count missing from text: ${state.text}`);
+  assert.deepEqual(Object.keys(state).sort(), ['cap', 'peak', 'text']);
 });
 
 test('parityBannerState: a missing breach count reads as zero rather than undefined', () => {
+  // The `?? 0` arm. Pinned on the rendered text, which is where a regression
+  // would actually be seen: without the fallback the banner reads "undefined
+  // snapshots over" at the operator.
   const state = parityBannerState({ parity_alarm: true, parity_peak: 43, parity_cap: 24 }, null);
 
-  assert.equal(state.count, 0);
+  assert.ok(state.text.includes('0 snapshots'), `expected a zero count, got: ${state.text}`);
+  assert.ok(!state.text.includes('undefined'), `undefined leaked into the banner: ${state.text}`);
 });
 
 test('parityBannerState: pluralises the snapshot count', () => {
@@ -269,24 +326,19 @@ test('parityBannerState: pluralises the snapshot count', () => {
 test('parityBannerState: names the offending projects only when there are any', () => {
   // The aggregate view passes b.parity_projects (the breaching subset); the
   // per-project view passes null, because naming a project inside its own
-  // panel says nothing.
-  const withProjects = parityBannerState(
-    { parity_alarm: true, parity_peak: 43, parity_cap: 24, parity_breach_count: 2 },
-    ['a', 'b'],
-  );
-  assert.equal(withProjects.who, ' · a, b');
+  // panel says nothing. Asserted on the rendered text: the project suffix is
+  // folded into it rather than exposed as a field no call site reads.
+  const state = projects =>
+    parityBannerState(
+      { parity_alarm: true, parity_peak: 43, parity_cap: 24, parity_breach_count: 2 },
+      projects,
+    ).text;
 
-  const noProjects = parityBannerState(
-    { parity_alarm: true, parity_peak: 43, parity_cap: 24, parity_breach_count: 2 },
-    null,
-  );
-  assert.equal(noProjects.who, '');
-
-  const emptyProjects = parityBannerState(
-    { parity_alarm: true, parity_peak: 43, parity_cap: 24, parity_breach_count: 2 },
-    [],
-  );
-  assert.equal(emptyProjects.who, '');
+  assert.equal(state(['a', 'b']), ' · 2 snapshots over · a, b');
+  // Both empty forms must render the bare count with NO dangling separator —
+  // a trailing ' · ' would read as a truncated project list.
+  assert.equal(state(null), ' · 2 snapshots over');
+  assert.equal(state([]), ' · 2 snapshots over');
 });
 
 test('parityBannerState: the trailing text carries the project list when present', () => {
