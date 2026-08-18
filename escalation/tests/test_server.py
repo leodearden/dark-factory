@@ -2237,6 +2237,287 @@ class TestPromoteToL2Dedup:
 
 
 # ---------------------------------------------------------------------------
+# TestPromoteToL2SeverityInheritance: severity is inherited from the members
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2SeverityInheritance:
+    """An omitted `severity` inherits max(member severities) (task 3976).
+
+    Before this, `promote_to_l2(severity=...)` defaulted to `'blocking'`, so an
+    L2 clustering purely-informational L1s was born `blocking` and paged a
+    human.  The default was also NON-DETERMINISTIC in practice: identical
+    inputs landed at `info` or `blocking` purely on whether the LLM caller
+    happened to type the argument.
+
+    The explicit argument stays fully honoured — a cluster of individually
+    informational findings CAN be collectively blocking, and the watcher must
+    still be able to say so.
+    """
+
+    def _seed_l1(
+        self, queue: EscalationQueue, esc_id: str, task_id: str, severity: str,
+    ) -> Escalation:
+        """Seed a pending L1 at *severity* (mirrors TestPromoteToL2Cascade._seed_l1)."""
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity=severity,
+            category='design_concern',
+            summary='L1 cluster member',
+            level=1,
+        )
+        queue.submit(esc)
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_lone_info_member_yields_info_l2(self, tmp_path: Path):
+        """(a) The esc-3037 regression: an info L1 must not mint a blocking L2.
+
+        Observed incident: esc-3037-1 (L0, info, architect) → esc-3037-3 (L1,
+        info, harness-orphan-reaper — severity faithfully preserved) →
+        esc-3037-4 (L2, *blocking*, escalation-watcher-auto,
+        members=['esc-3037-3'], later closed as benign).  The inflation happens
+        at the promotion seam and only there.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'info', (
+            f'Lone info member must yield an info L2, got {record.severity!r}'
+        )
+        assert record.level == 2, f'Expected level=2, got {record.level}'
+
+    @pytest.mark.asyncio
+    async def test_all_info_members_yield_info_l2(self, tmp_path: Path):
+        """(b) An all-info member set inherits 'info'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-a', 'task-1', 'info')
+        self._seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-a', 'esc-l1-b']},
+        )
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'info', f'Expected info, got {record.severity!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'order', [['esc-l1-info', 'esc-l1-blk'], ['esc-l1-blk', 'esc-l1-info']],
+    )
+    async def test_mixed_set_takes_the_max_not_the_first(
+        self, tmp_path: Path, order: list[str],
+    ):
+        """(c) info + blocking → blocking, in BOTH member orders.
+
+        An order-dependent fold is the bug fixed in models.SEVERITY_RANK; this
+        pins it end-to-end through the tool.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+        self._seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
+
+        result = await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': order})
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'blocking', (
+            f'member_ids={order}: expected blocking, got {record.severity!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'order', [['esc-l1-info', 'esc-l1-crit'], ['esc-l1-crit', 'esc-l1-info']],
+    )
+    async def test_critical_member_wins_in_both_orders(
+        self, tmp_path: Path, order: list[str],
+    ):
+        """(d) info + critical → critical, in BOTH orders.
+
+        This is the assertion that fails if the rank table is left incomplete:
+        with the old {'info': 0, 'blocking': 1}, 'critical' fell to rank 0 and
+        the ['esc-l1-info', 'esc-l1-crit'] order would have yielded 'info'.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+        self._seed_l1(queue, 'esc-l1-crit', 'task-2', 'critical')
+
+        result = await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': order})
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'critical', (
+            f'member_ids={order}: expected critical, got {record.severity!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('explicit', ['blocking', 'critical'])
+    async def test_explicit_override_stays_upward_capable(
+        self, tmp_path: Path, explicit: str,
+    ):
+        """(e) The task's hard constraint: info members CAN be filed higher.
+
+        A cluster of individually-informational findings can be collectively
+        blocking, and the watcher's RCA must still be able to say so.  This must
+        never become a hard ban on promoting info members.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-a', 'task-1', 'info')
+        self._seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'member_ids': ['esc-l1-a', 'esc-l1-b'],
+                'severity': explicit,
+            },
+        )
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == explicit, (
+            f'Explicit upward override to {explicit!r} was not honoured: '
+            f'got {record.severity!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_override_is_honoured_downward_at_mint(self, tmp_path: Path):
+        """(f) At MINT time the caller is the authority in both directions.
+
+        The monotonic floor added on the update path governs only post-mint
+        appends; a fresh L2 takes exactly what the caller asked for.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-blk', 'task-1', 'blocking')
+
+        result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk'], 'severity': 'info'},
+        )
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'info', (
+            f'Explicit downward override at mint was not honoured: {record.severity!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_members_fail_safe_up_to_blocking(
+        self, tmp_path: Path, caplog,
+    ):
+        """(g) Nothing resolves → 'blocking', loudly.
+
+        Member ids are opaque strings that are never existence-checked, so a
+        promotion whose members cannot be read must not be silently dropped nor
+        silently quieted — it fails UP with a WARNING naming the ids.  This is
+        also the compatibility guarantee for the pre-existing
+        TestPromoteToL2Create/Dedup suites, which promote phantom ids
+        throughout.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            result = await _promote_to_l2(
+                server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-1']},
+            )
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'blocking', (
+            f'Unresolvable member set must fail safe UP, got {record.severity!r}'
+        )
+        warned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'esc-phantom-1' in r.getMessage()
+        ]
+        assert warned, (
+            'Expected a WARNING naming the unresolved member id; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_resolution_derives_from_the_resolvable_subset(
+        self, tmp_path: Path, caplog,
+    ):
+        """(h) A phantom sibling must not drag a known-info set up to blocking.
+
+        Throwing away a resolvable info member because one id was unreadable
+        would reintroduce the very inflation this task removes.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            result = await _promote_to_l2(
+                server,
+                **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info', 'esc-phantom-2']},
+            )
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'info', (
+            'Partial resolution must derive from the resolvable subset, '
+            f'got {record.severity!r}'
+        )
+        warned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'esc-phantom-2' in r.getMessage()
+        ]
+        assert warned, (
+            'Expected a WARNING naming the unresolved member id; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_severity_validation_still_runs_before_derivation(
+        self, tmp_path: Path,
+    ):
+        """(i) A bad explicit severity is rejected and mints NOTHING.
+
+        Guards against reordering the KNOWN_SEVERITIES gate behind the new
+        derive branch — the gate is case-sensitive and must stay ahead of every
+        queue mutation.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'member_ids': ['esc-l1-info'],
+                'severity': 'CRITICAL',
+            },
+        )
+
+        assert 'error' in result, f'Expected an error for CRITICAL, got: {result}'
+        pending_l2 = await _get_pending(server, level=2)
+        assert pending_l2 == [], (
+            f'A rejected severity must mint no L2; found: {pending_l2}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestPromoteToL2Cascade: end-to-end integration through MCP tools
 # ---------------------------------------------------------------------------
 
