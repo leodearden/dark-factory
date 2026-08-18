@@ -598,6 +598,35 @@ def archive_task_transcripts(
     return count
 
 
+def resolve_archive_root(project_root: Any, root: Any) -> Path:
+    """Compose the durable archive root: ``project_root / transcript_archive.root``.
+
+    The ONE home for that composition (INV-5, the same argument this module
+    already makes for ``_archive_one`` / ``_move_to_archive`` /
+    :func:`durable_archive_path` sharing one destination layout). It was
+    open-coded at five call sites — two teardown sites, the producer hook, the
+    boot-time sweeper and the storm escalation's detail text — in two different
+    spellings (``Path(config.project_root) / ta.root`` at some,
+    ``config.project_root / ta.root`` at others, the latter leaning on
+    project_root already being a Path). A layout with one home in read and
+    write but five in composition can still drift; this closes that.
+
+    Deliberately takes the two operands rather than an OrchestratorConfig:
+    this module is on the PURE_STDLIB_LEAVES contract
+    (shared/tests/test_pure_stdlib_leaves.py) and must not import the
+    orchestrator's config model.
+
+    NOT total, and that is deliberate. ``Path(project_root)`` raises TypeError
+    on a ``None``/non-PathLike project_root, and ``/ root`` raises on a
+    malformed root — a config regression, which callers on the dispatch path
+    already guard and log explicitly rather than paper over here (see
+    ``Harness._archive_available``'s handler). Swallowing it into some
+    fallback path would turn "the config is wrong" into "archives silently go
+    somewhere else".
+    """
+    return Path(project_root) / root
+
+
 def durable_archive_path(
     archive_root: Path,
     task_id: str,
