@@ -609,12 +609,16 @@ async def scroll_collection_points(
     *,
     page_size: int = 1000,
     max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
-) -> tuple[list, bool]:
-    """Read-only PAGED scroll of every point in *collection*, WITH vectors.
+) -> tuple[int, bool]:
+    """Read-only PREFLIGHT: COUNT every point in *collection*, without vectors.
 
-    ``with_vectors=True`` is essential: omitting it drops embeddings from
-    the returned points, which would silently destroy them once re-upserted
-    into the target collection (see ``merge_collection``).
+    ``with_vectors=False`` is deliberate. This establishes ``point_count``
+    for the report and ``capped`` for the caller's guard -- nothing
+    downstream reads the points themselves, because ``merge_collection``
+    performs the sole with-vectors drain. Fetching embeddings here would
+    transfer and hold multi-GB to produce a number a counter already gives.
+    No point list is accumulated either, so peak memory is O(1) regardless
+    of collection size.
 
     Drains ``Mem0Backend.scroll_collection_pages``, which walks Qdrant's
     ``next_offset`` to exhaustion. This used to issue exactly ONE scroll and
@@ -625,15 +629,14 @@ async def scroll_collection_points(
     ``reify_reify``) that a ``Scope`` structurally cannot produce, which is
     why this enters at the collection-addressed backend layer.
 
-    The full result set (with vectors) is held in memory, so *page_size* x
-    *max_pages* still bounds peak memory.
-
     Returns:
-        ``(points, capped)``. ``capped`` can no longer be inferred from
-        ``len(points)`` -- a fully-drained multi-page scroll returns any
-        count -- so it is returned explicitly. The caller's
+        ``(point_count, capped)``. ``capped`` can no longer be inferred from
+        the count -- a fully-drained multi-page scroll returns any count --
+        so it is returned explicitly. The caller's
         ``if args.apply and not capped`` guard is what stops
-        ``merge_collection`` deleting a source it only half-migrated.
+        ``merge_collection`` running at all against a collection this
+        preflight could not fully enumerate, so an UNRESOLVED item still
+        means nothing was written.
 
     A ``ScrollPageBudgetExhausted`` is CAUGHT, never propagated: a raising
     sub-operation must not abort the whole consolidation run, because
@@ -643,15 +646,15 @@ async def scroll_collection_points(
     -- item UNRESOLVED, no upsert, no source delete, non-zero exit -- so the
     externally visible behaviour on a too-large collection is unchanged.
     """
-    points: list = []
+    point_count = 0
     try:
-        async for point in backend.scroll_collection_pages(
+        async for _point in backend.scroll_collection_pages(
             collection,
             page_size=page_size,
             max_pages=max_pages,
-            with_vectors=True,
+            with_vectors=False,
         ):
-            points.append(point)
+            point_count += 1
     except ScrollPageBudgetExhausted:
         logger.warning(
             "consolidate_namespace_families: scroll of collection '%s' exhausted "
@@ -660,10 +663,10 @@ async def scroll_collection_points(
             'UNRESOLVED and its source will not be deleted (see '
             'merge_collection). Re-run with a higher --limit (page size) or '
             'raise the page budget.',
-            collection, max_pages, page_size, len(points),
+            collection, max_pages, page_size, point_count,
         )
-        return points, True
-    return points, False
+        return point_count, True
+    return point_count, False
 
 
 async def merge_collection(
@@ -954,9 +957,11 @@ async def run(
     collection_items: list[dict] = []
     for source, target in COLLECTION_MERGES.items():
         # The backend pages; --limit is this scroll's PAGE SIZE. `capped` is
-        # the flag the scroll returns, NOT len(points) >= limit -- a
-        # fully-drained multi-page scroll can return any count.
-        points, capped = await scroll_collection_points(
+        # the flag the scroll returns, NOT point_count >= limit -- a
+        # fully-drained multi-page scroll can return any count. This
+        # preflight is vectorless and holds no point list; merge_collection
+        # below runs the sole with-vectors drain.
+        point_count, capped = await scroll_collection_points(
             memory_service.mem0, source, page_size=limit,
         )
         canonical_user_id = canonical_user_id_for(target)
@@ -964,7 +969,7 @@ async def run(
             'source': source,
             'target': target,
             'canonical_user_id': canonical_user_id,
-            'point_count': len(points),
+            'point_count': point_count,
             'disposition': 'UNRESOLVED' if capped else 'MERGE',
         }
         # Guarded exactly like the graph-family branch above: a capped
