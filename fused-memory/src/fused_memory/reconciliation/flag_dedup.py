@@ -700,6 +700,44 @@ def _sanitize_cited_tasks(flag: dict[str, Any]) -> list[dict[str, Any]] | None:
     return sanitized or None
 
 
+def _union_cited_tasks(current: Any, prior: Any) -> list[dict[str, Any]]:
+    """Merge a flag's *current* ``cited_tasks`` with the *prior* persisted anchor.
+
+    Both sides are run through the same validation as
+    :func:`_sanitize_cited_tasks` (each is wrapped as a flag-shaped dict), so a
+    malformed value on either side — a bare string, a dict, a list of
+    non-dicts, ``None`` — degrades to "no citations from that side" rather
+    than raising.  This matters most for *prior*, which is free-form JSON read
+    back off a ledger row that may predate this key or have been written by an
+    older/other producer.
+
+    Entries are de-duplicated on the ``(str(project_id), str(task_id))``
+    identity — the same ``"project_id:task_id"`` convention
+    ``server/recon_report`` uses for citation fingerprints — with first-seen
+    order preserved and *current* taking precedence, so a task cited by BOTH
+    sides is looked up exactly once.  An entry lacking either identity field
+    is kept (it is harmless; the resolver skips it) but never collapses with
+    another.
+
+    Pure, sync, no I/O — never raises.
+    """
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for side in (current, prior):
+        for entry in _sanitize_cited_tasks({'cited_tasks': side}) or []:
+            project_id = entry.get('project_id')
+            task_id = entry.get('task_id')
+            if project_id is None or task_id is None:
+                merged.append(entry)
+                continue
+            key = (str(project_id), str(task_id))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(entry)
+    return merged
+
+
 def _is_completion_flag(flag: dict[str, Any]) -> bool:
     """Return True iff *flag* explicitly marks itself as ONE-TIME completed work.
 
@@ -821,6 +859,12 @@ async def dedup_flags(
     * **HIT-only.** A first-cycle finding is never suppressed — the point is to
       stop re-asserting a complaint that has already been converted into
       tracked work, not to pre-empt the first report of it.
+    * **Two anchors, either sufficient.** The prior row's persisted
+      ``cited_tasks`` is the CROSS-CYCLE anchor; the flag's own is the
+      CURRENT-CYCLE one.  :func:`_union_cited_tasks` merges them (deduped on
+      ``(project_id, task_id)``, current first), so a carried-forward finding
+      stays resolved even on a cycle whose LLM output re-emits no citation at
+      all — which is precisely what the payload enrichment above buys.
     * **Foreign-project-only.** See
       :func:`_resolve_live_cross_project_fix_task` — a finding's own subject
       task is routinely its own first citation.
@@ -977,6 +1021,11 @@ async def dedup_flags(
         ledger = getattr(memory_service, 'recon_ledger', None)
         flag = dict(flag)
         persisted_from_run: str | None = None
+        # The prior row's cited_tasks is the CROSS-CYCLE anchor (task 4381):
+        # it survives a cycle whose LLM output re-emits no citation at all.
+        # Free-form JSON off a ledger row — validated by _union_cited_tasks,
+        # never trusted for shape.
+        prior_cited: Any = None
 
         payload: dict[str, Any] = {
             'source': 'stage1_flag_marker',
@@ -1004,6 +1053,7 @@ async def dedup_flags(
                 if prior is not None:
                     prior_payload = json.loads(prior.payload_json)
                     persisted_from_run = prior_payload.get('run_id') or 'unknown'
+                    prior_cited = prior_payload.get('cited_tasks')
                     if persisted_from_run == 'unknown':
                         logger.debug(
                             'flag_dedup: prior marker for task=%s flag_type=%s has malformed run_id metadata',
@@ -1047,7 +1097,10 @@ async def dedup_flags(
         # suppressed.
         if persisted_from_run is not None and taskmaster and known_projects:
             fix_cite = await _resolve_live_cross_project_fix_task(
-                taskmaster, known_projects, project_id, flag.get('cited_tasks')
+                taskmaster,
+                known_projects,
+                project_id,
+                _union_cited_tasks(flag.get('cited_tasks'), prior_cited),
             )
             if fix_cite is not None:
                 logger.info(
