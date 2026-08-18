@@ -962,9 +962,15 @@ async def _check_canonical_uniqueness(
     * θ was necessary bookkeeping but nearly irrelevant to blast radius.
       ``enforce`` rejects WRITES and never re-validates the corpus, so
       normalizing records at rest moved the measured false-rejection rate
-      by ~1/week (~20 → ~19).  Rejections come from NEW writes by writers
-      who were never told the rule: ``_MEMORY_INSTRUCTIONS`` still carries
-      no slug guidance.  THE REAL PRECONDITION is leaf ι (task 3202).
+      by ~1/week (~20 → ~19).  Rejections came from NEW writes by writers
+      who had never been told the rule — and that precondition, leaf ι
+      (task 3202), is now DISCHARGED: ``_MEMORY_INSTRUCTIONS`` carries the
+      metadata vocabulary section, topic-slug shape included, pinned to
+      this module's registry by
+      ``fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py``.
+      What that leaves open for 3626 is narrower and strictly empirical:
+      whether the measured false-rejection rate ACTUALLY fell once writers
+      were told the rule.  Re-measure it; do not assume it did.
 
     STILL TRUE AFTER TASK 3523, and deliberately so.  Wiring this seam into
     ``update_memory`` added a third write path, but its enforcement is
