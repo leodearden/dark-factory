@@ -942,6 +942,119 @@ class TestReaddPersistedPredicate:
         assert _mod.readd_persisted(_ok_response(stores_written=['mem0']))[0] is True
 
 
+class TestProbeDeleteLanded:
+    """``probe_delete_landed(service, project_id, memory_id) -> (bool|None, note)``.
+
+    The measured 7d073281 incident (task 3243, ``investigation.md`` §4): the
+    traceback landed INSIDE ``delete_memory`` — mem0 removes the Qdrant point
+    BEFORE writing its SQLite history — so the delete HAD landed while the
+    report said ``record_error`` / "unknown". The runbook's remedy for exactly
+    that cell is a READ-ONLY id lookup, and the runbook says the check "is not
+    optional — it is what established the delete had landed". This probe
+    automates the step the operator was already told to perform.
+
+    It MEASURES rather than infers. Sniffing the exception's type or message
+    for ``sqlite3.OperationalError`` / "readonly database" would encode mem0's
+    internal delete-then-write-history ORDERING as a string match in a repair
+    script, and would mis-attribute silently the day mem0 reorders those two
+    halves.
+
+    The verdict is deliberately THREE-valued. Collapsing "the probe could not
+    answer" into either verdict just re-creates the defect pointing the other
+    way: claiming content-lost on no evidence sends an operator to hand-restore
+    a record that is still live (producing a duplicate), and claiming the
+    delete did not land hides a real loss.
+    """
+
+    @staticmethod
+    def _probe_service(**overrides) -> AsyncMock:
+        service = _service([])
+        for name, value in overrides.items():
+            setattr(service, name, value)
+        return service
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_not_found_means_the_delete_landed(self):
+        """``get_memory_by_id`` returns ``None`` ONLY on a genuine not-found —
+        it propagates a read timeout rather than collapsing it into ``None``,
+        which is the whole reason that ``None`` can be trusted as evidence."""
+        service = self._probe_service(get_memory_by_id=AsyncMock(return_value=None))
+
+        landed, note = await _mod.probe_delete_landed(service, 'dark_factory', 'm-1')
+
+        assert landed is True
+        assert note
+
+    @pytest.mark.asyncio
+    async def test_a_surviving_point_means_the_delete_did_not_land(self):
+        service = self._probe_service(
+            get_memory_by_id=AsyncMock(return_value={'id': 'm-1', 'content': _TAIL_LEAK})
+        )
+
+        landed, note = await _mod.probe_delete_landed(service, 'dark_factory', 'm-1')
+
+        assert landed is False
+        assert note
+
+    @pytest.mark.parametrize(
+        'exc', [TimeoutError('qdrant read timed out'), RuntimeError('transport exploded')]
+    )
+    @pytest.mark.asyncio
+    async def test_a_raising_probe_is_unknown_and_never_propagates(self, exc):
+        """An escaping probe would replace the caller's ORIGINAL delete error
+        with its own, destroying the very fact a human needs most."""
+        service = self._probe_service(get_memory_by_id=AsyncMock(side_effect=exc))
+
+        landed, note = await _mod.probe_delete_landed(service, 'dark_factory', 'm-1')
+
+        assert landed is None
+        assert note
+
+    @pytest.mark.asyncio
+    async def test_a_service_without_the_method_is_unknown_not_a_crash(self):
+        """Same fail-safe for a stub or an older service: unanswerable stays
+        unanswered rather than being collapsed into a verdict."""
+        service = self._probe_service()
+        del service.get_memory_by_id
+
+        landed, note = await _mod.probe_delete_landed(service, 'dark_factory', 'm-1')
+
+        assert landed is None
+        assert note
+
+    @pytest.mark.asyncio
+    async def test_the_probe_is_read_only_and_addresses_this_run_and_record(self):
+        """It runs at the worst possible moment — right after a delete raised —
+        so it must not be able to mutate anything further."""
+        service = self._probe_service(get_memory_by_id=AsyncMock(return_value=None))
+
+        await _mod.probe_delete_landed(service, 'reify', 'm-42')
+
+        service.get_memory_by_id.assert_awaited_once()
+        # Tolerant of positional or keyword calling: MemoryService's signature
+        # is (project_id, memory_id) and either spelling is correct.
+        call = service.get_memory_by_id.await_args
+        addressed = {**dict(zip(('project_id', 'memory_id'), call.args, strict=False)), **call.kwargs}
+        assert addressed == {'project_id': 'reify', 'memory_id': 'm-42'}
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_every_verdict_carries_a_non_empty_note(self):
+        """The note is what a human reads in the report to see HOW the verdict
+        was reached — a blank one would make the field unauditable, which is
+        the same defect as a blank ``collection``."""
+        cases = [
+            AsyncMock(return_value=None),
+            AsyncMock(return_value={'id': 'm-1'}),
+            AsyncMock(side_effect=TimeoutError('boom')),
+        ]
+        for stub in cases:
+            service = self._probe_service(get_memory_by_id=stub)
+            _, note = await _mod.probe_delete_landed(service, 'dark_factory', 'm-1')
+            assert note.strip()
+
+
 class TestRunApplyVerifiesPersistence:
     """The failure that ACTUALLY happens: a non-raising add that did not persist.
 
