@@ -876,29 +876,40 @@ _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE = 'stage2_persistence_marker_gc_sweep
 # markers, _sweep_terminal_task_flag_markers) on the assumption that the
 # ledger gc() pass fully replaced them; it does not reach Mem0, so the
 # pre-2406 Mem0 pool was left with no in-cycle collector for any project.
-# The canonical write path is retired, but it is not the ONLY one (task
-# 3915): an LLM recon agent via the add_memory MCP tool can still write a
+# The canonical write path is retired. A second path also produced this
+# shape (task 3915): an LLM recon agent's add_memory call wrote a
 # stage1_flag_marker record directly to Mem0, tagged with metadata.kind
 # rather than metadata.source (measured live counts: know_live 0 records
 # under {'source': 'stage1_flag_marker'} vs 1 under
-# {'kind': 'stage1_flag_marker'} — marker a5732b3b). See
-# _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS below. 14 days reuses the
-# STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS / task-1944 convention as a
-# conservative, consistent aging cutoff rather than deleting immediately.
+# {'kind': 'stage1_flag_marker'} — marker a5732b3b, agent_id
+# 'recon-stage-task_knowledge_sync', 37 days old at measurement time).
+# That write is now REJECTED outright by the task-2596 add_memory gate
+# (server/tools.py:2978-2993, error flag_marker_write_blocked) for any
+# 'recon-stage-*' agent_id — the leaked marker predates that gate rather
+# than evidencing a live bypass; the only residual write hole is a
+# non-'recon-stage-*' agent_id, which the gate's prefix check does not
+# reach. See _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS below. 14 days
+# reuses the STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS / task-1944 convention
+# as a conservative, consistent aging cutoff rather than deleting
+# immediately.
 _STAGE1_FLAG_MARKER_MEM0_SOURCE = 'stage1_flag_marker'
 STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS: int = 14
 _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
 
 # Enumeration filter variants for the pool above (task 3915). The canonical
 # retired writer (flag_dedup._persist_marker, flag_dedup.py:849-856) always
-# set BOTH 'source' and 'kind' to 'stage1_flag_marker'. But at least one
-# live record (measured: know_live marker a5732b3b, 37 days old) was
-# instead written by an LLM recon agent via the add_memory MCP tool, which
-# set 'kind' but omitted 'source' entirely — nothing at the add_memory
-# write boundary normalizes these keys, the same un-normalized-LLM-metadata
-# failure class task 2966 already documented for flag_for_stage2 (see the
-# type-drift note below). A {'source': ...}-only filter therefore silently
-# misses that cohort forever: measured live counts are know_live: 0 under
+# set BOTH 'source' and 'kind' to 'stage1_flag_marker'. At least one legacy
+# record (measured: know_live marker a5732b3b, 37 days old, agent_id
+# 'recon-stage-task_knowledge_sync') was instead written by an LLM recon
+# agent via the add_memory MCP tool, which set 'kind' but omitted 'source'
+# entirely — the same un-normalized-LLM-metadata failure class task 2966
+# already documented for flag_for_stage2 (see the type-drift note below).
+# That specific write shape now predates the task-2596 add_memory gate
+# (server/tools.py:2978-2993), which rejects it outright for any
+# 'recon-stage-*' agent_id; the residual write hole is a
+# non-'recon-stage-*' agent_id, which nothing at the add_memory boundary
+# normalizes. A {'source': ...}-only filter therefore silently misses that
+# cohort forever: measured live counts are know_live: 0 under
 # {'source': 'stage1_flag_marker'} vs 1 under {'kind': 'stage1_flag_marker'}.
 # Qdrant payload filters are AND-only within one dict, so a
 # source=X OR kind=X predicate cannot be expressed in a single call — each
@@ -1315,6 +1326,12 @@ async def _sweep_stale_mem0_pool(
         # shape) is treated the same as a non-zero result, mirroring the
         # isinstance(..., int) strictness _warn_on_flag_for_stage2_type_drift
         # already established for this same kind of probe.
+        #
+        # Breaks out as soon as one variant fails to confirm zero (task
+        # 3915 review, efficiency finding): the outcome is already decided
+        # at that point — no later variant's result can flip
+        # all_variants_confirmed_zero back to True — so probing the
+        # remaining variants would be a wasted round-trip per variant.
         all_variants_confirmed_zero = True
         for variant_filters in filter_variants:
             try:
@@ -1326,6 +1343,7 @@ async def _sweep_stale_mem0_pool(
                 count = None
             if not isinstance(count, int) or count != 0:
                 all_variants_confirmed_zero = False
+                break
         if all_variants_confirmed_zero:
             return 0
 
@@ -1337,7 +1355,7 @@ async def _sweep_stale_mem0_pool(
     # the same fail-safe posture as the prior single-filter enumeration.
     try:
         members: list[dict] = []
-        merged_by_id: dict = {}
+        seen_ids: set = set()
         for variant_filters in filter_variants:
             variant_members = await memory_service.get_memories_by_metadata(
                 project_id=project_id,
@@ -1360,13 +1378,13 @@ async def _sweep_stale_mem0_pool(
                 mid = member.get('id')
                 # Skip falsy ids here too — exactly as the age-filter loop
                 # below already does — so a None/'' id from one variant's
-                # scroll can never occupy the merge dict and mask a
+                # scroll can never occupy the seen-ids set and mask a
                 # DIFFERENT id-less member surfaced by another variant.
                 if not mid:
                     continue
-                if mid in merged_by_id:
+                if mid in seen_ids:
                     continue
-                merged_by_id[mid] = member
+                seen_ids.add(mid)
                 members.append(member)
     except Exception:
         logger.warning(
@@ -1384,10 +1402,15 @@ async def _sweep_stale_mem0_pool(
         # filter above now REACHES a member carrying only the drifted `kind`
         # spelling with no `source` key at all — the exact shape that let
         # marker a5732b3b hide from the pre-fix {'source': ...}-only filter
-        # for 37 days. Reaping the backlog fixes the SYMPTOM, but the WRITER
-        # (an LLM `add_memory` call with un-normalized metadata) is still
-        # live and unconstrained, so without a loud signal the pool would
-        # simply resume filling under whatever key spelling drifts next.
+        # for 37 days. Reaping the backlog fixes the SYMPTOM; the WRITE PATH
+        # that produced it (an LLM `add_memory` call with un-normalized
+        # metadata) is now REJECTED for 'recon-stage-*' agent_ids by the
+        # task-2596 add_memory gate (server/tools.py:2978-2993, error
+        # flag_marker_write_blocked) — the measured leaked record predates
+        # that gate rather than evidencing a live bypass. The residual hole
+        # is a non-'recon-stage-*' agent_id, which the gate's prefix check
+        # does not reach, so a loud signal here still earns its keep rather
+        # than sending an operator hunting for an already-gated writer.
         # Mirrors _warn_on_flag_for_stage2_type_drift's posture (task 2966)
         # for the identical un-normalized-LLM-metadata failure class:
         # purely diagnostic, never raises, never alters `members` or the
@@ -1406,8 +1429,12 @@ async def _sweep_stale_mem0_pool(
             if under_tagged_count > 0:
                 logger.warning(
                     'reconciliation.%s: %d %s record(s) carry kind=%r with no source '
-                    'key — invisible to the pre-3915 {"source": ...}-only filter; a '
-                    'live add_memory writer is still emitting under-tagged markers '
+                    'key — invisible to the pre-3915 {"source": ...}-only filter. '
+                    'These under-tagged records predate (or bypass) the task-2596 '
+                    'add_memory gate (server/tools.py:2978, error '
+                    'flag_marker_write_blocked), which rejects this exact shape for '
+                    'any recon-stage-* agent_id; if this recurs, check for a '
+                    'non-recon-stage-* writer, which the gate does not cover '
                     '(task 3915).',
                     log_name, under_tagged_count, source, source,
                     extra={
@@ -1636,7 +1663,10 @@ async def _sweep_stale_mem0_flag_markers(
     single ``{'source': ...}`` filter (task 3915: this pool cannot be
     identified that way; measured live counts are know_live 0 records under
     ``{'source': 'stage1_flag_marker'}`` vs 1 under
-    ``{'kind': 'stage1_flag_marker'}``) — plus a distinct delete ``_source``
+    ``{'kind': 'stage1_flag_marker'}`` — a legacy record that predates the
+    task-2596 add_memory gate, server/tools.py:2978-2993, which now rejects
+    that write shape for any ``recon-stage-*`` agent_id) — plus a distinct
+    delete ``_source``
     tag and max-age constant from :func:`_sweep_stale_persistence_markers` —
     see that function's docstring for the fail-safe posture and for its
     protected-mirror invariant (task 3041): a ``kind='cycle_summary'`` /
@@ -1644,9 +1674,10 @@ async def _sweep_stale_mem0_flag_markers(
     whatever this pool's filter(s) match.
 
     Passes ``count_short_circuit=True`` (task 2853 review, efficiency
-    finding): this pool's canonical write path is fully retired (task 3915:
-    not the ONLY write path — see above), so once the legacy records age
-    past the cutoff and are drained, every subsequent cycle
+    finding): this pool's canonical write path is fully retired, and the
+    task-2596 add_memory gate (server/tools.py:2978-2993) now blocks the
+    ``recon-stage-*`` write path too (task 3915) — so once the legacy
+    records age past the cutoff and are drained, every subsequent cycle
     would otherwise re-scroll an already-empty pool forever. Cheap
     ``count_memories_by_metadata`` probes short-circuit that steady state —
     one probe per :data:`_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS`
@@ -3368,14 +3399,16 @@ class TaskKnowledgeSync(BaseStage):
         # source on the assumption that the ledger gc() pass replaced it —
         # it does not reach Mem0, so the pre-2406 pool was left uncollected
         # for every project (the operational sweep_orphan_flag_markers.py
-        # systemd timer only targets dark_factory by default). The canonical
-        # write path is retired, but an LLM recon add_memory write can still
-        # land a stage1_flag_marker record in Mem0 tagged only with
-        # metadata.kind, not metadata.source (measured: know_live 0 under
+        # systemd timer only targets dark_factory by default). A second
+        # write path — an LLM recon agent's add_memory call — also landed a
+        # stage1_flag_marker record in Mem0 tagged only with metadata.kind,
+        # not metadata.source (measured: know_live 0 under
         # {'source': 'stage1_flag_marker'} vs 1 under
-        # {'kind': 'stage1_flag_marker'}) — this sweep enumerates the union
-        # of both spellings for exactly that reason (task 3915). Runs
-        # unconditionally every cycle, per-project, so each project
+        # {'kind': 'stage1_flag_marker'}), before the task-2596 add_memory
+        # gate (server/tools.py:2978-2993) started rejecting that write for
+        # any 'recon-stage-*' agent_id — this sweep enumerates the union of
+        # both spellings to reap that legacy backlog regardless (task 3915).
+        # Runs unconditionally every cycle, per-project, so each project
         # self-heals its own legacy pool; explicit zero for the same reason
         # as the two GC stats above.
         report.stats['stale_mem0_flag_markers_gc_swept'] = await _sweep_stale_mem0_flag_markers(
