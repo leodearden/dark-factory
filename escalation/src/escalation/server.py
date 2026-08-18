@@ -29,6 +29,7 @@ from escalation.models import (
     RESOLUTION_CLASSES,
     Escalation,
     EvidenceEntry,
+    max_severity,
 )
 from escalation.pins import classify_pins
 from escalation.queue import EscalationQueue
@@ -66,6 +67,68 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
     through to the downgrade path instead of raising ``AttributeError``.
     """
     return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
+
+
+def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str:
+    """Return max(member severities) for a promoted L2; 'blocking' if none resolve.
+
+    This is what an OMITTED ``promote_to_l2(severity=...)`` argument resolves
+    to (task 3976).  The old literal ``'blocking'`` default inflated every
+    cluster of purely-informational L1s into a human-paging L2 — and did so
+    non-deterministically, since the outcome hinged on whether the LLM caller
+    happened to type the argument at all.
+
+    Members are read through ``queue.get()`` rather than the queue root
+    directly, so a member already resolved and archived between the watcher's
+    drain and its promote still contributes its true severity (``get`` falls
+    back to the archive), and repeated lookups of a genuinely nonexistent id
+    are negative-cached rather than re-scanning the archive each time.
+
+    **Fail-safe direction is UP, loudly.**  Member ids are opaque strings that
+    this tool never existence-checks, so when NOTHING resolves we return
+    ``'blocking'`` — today's behaviour, unchanged — and WARN naming the ids,
+    rather than rejecting the promotion (which would silently drop a promotion
+    the caller believed it had made) or quieting it to ``'info'``.  This
+    matches ``escalation.pins`` link 2: an unknown severity fails safe to
+    pinning, never to conversion.
+
+    A PARTIALLY resolvable set derives from the resolvable subset only —
+    discarding a known-info member because a sibling id was unreadable would
+    reintroduce the very inflation this exists to remove.  The fold is
+    therefore seeded from the first RESOLVED member rather than from
+    ``'info'``: an empty-ish seed would be indistinguishable from a real info
+    member, and the explicit nothing-resolved branch is what carries the
+    fail-safe.
+    """
+    resolved: list[str] = []
+    unresolved: list[str] = []
+    for mid in member_ids:
+        member = queue.get(mid)
+        if member is None:
+            unresolved.append(mid)
+        else:
+            resolved.append(member.severity)
+
+    if not resolved:
+        logger.warning(
+            'promote_to_l2: no member escalation resolved for %s — cannot derive '
+            "severity from members; failing safe UP to 'blocking'. "
+            'Unresolved ids: %s',
+            member_ids, ', '.join(unresolved) or '(none)',
+        )
+        return 'blocking'
+
+    if unresolved:
+        logger.warning(
+            'promote_to_l2: %d of %d member escalation(s) did not resolve; '
+            'deriving severity from the resolvable subset only. Unresolved ids: %s',
+            len(unresolved), len(member_ids), ', '.join(unresolved),
+        )
+
+    derived = resolved[0]
+    for sev in resolved[1:]:
+        derived = max_severity(derived, sev)
+    return derived
 
 
 # The role the steward's own filings carry (orchestrator.steward
@@ -1455,7 +1518,7 @@ def create_server(
         options: list[str],
         summary: str,
         category: str = 'design_concern',
-        severity: str = 'blocking',
+        severity: str | None = None,
     ) -> dict[str, Any]:
         """Promote one or more L1 escalations to an L2 cluster (human-facing).
 
@@ -1477,7 +1540,9 @@ def create_server(
         (create path) or ``queue.add_members_to_l2()`` (update path).  The
         terminal-task auto-resolve gate and severity→level=2 gate in
         ``_chokepoint_or_submit`` are intentionally bypassed — L2 is set
-        explicitly by this tool.
+        explicitly by this tool.  Because that severity→level gate is bypassed
+        by design, nothing else reconciles an L2's severity with the records it
+        clusters; the inherited default below is what does it.
 
         **Identity gate** (PRD task-status-authority C8/D7): the create side
         is gated by ``escalation.authority.PROMOTE_ALLOWED`` — a connection
@@ -1508,10 +1573,28 @@ def create_server(
         category:
             Escalation category; defaults to ``'design_concern'``.
         severity:
-            Severity tag; defaults to ``'blocking'``.  Decoupled from
-            ``level=2`` — the tool sets ``level=2`` explicitly.  Must be one
-            of ``models.KNOWN_SEVERITIES``; unknown values return
-            ``{'error': ...}`` (mirrors ``escalate_blocker`` validation).
+            Severity tag, decoupled from ``level=2`` — the tool sets
+            ``level=2`` explicitly.  **Omit it (or pass ``None``) and the L2
+            INHERITS ``max(member severities)``** — this is the correct default
+            in the overwhelming majority of cases, and is what stops a cluster
+            of purely-informational L1s from being born ``'blocking'`` and
+            paging a human (task 3976).
+
+            An EXPLICIT value overrides the derivation in BOTH directions at
+            mint time.  Upward in particular stays fully available and is not
+            discouraged: a cluster of individually-informational findings CAN
+            be collectively blocking, and a caller whose RCA concluded that
+            should say so explicitly.  (Post-mint the update path applies a
+            monotonic floor and will not accept a demotion — see
+            **Root-cause dedup**.)
+
+            When NO member id resolves, the derivation fails safe UP to
+            ``'blocking'`` and logs a WARNING naming the unresolved ids; a
+            partially resolvable set derives from the resolvable subset.
+
+            An explicit value must be one of ``models.KNOWN_SEVERITIES``;
+            unknown values return ``{'error': ...}`` (mirrors
+            ``escalate_blocker`` validation) and mint nothing.
 
         Response shapes
         ---------------
@@ -1543,13 +1626,21 @@ def create_server(
             return {'error': 'member_ids must be a non-empty list'}
         if not root_cause.strip():
             return {'error': 'root_cause must be a non-empty string'}
-        if severity not in KNOWN_SEVERITIES:
+        if severity is not None and severity not in KNOWN_SEVERITIES:
             return {
                 'error': (
                     f'invalid severity {severity!r}; '
                     f'expected one of {sorted(KNOWN_SEVERITIES)}'
                 ),
             }
+
+        # Validate FIRST, derive second — an invalid explicit severity must mint
+        # nothing and must never be reachable past the derive branch.  Derived
+        # from the RAW member_ids: the fold is order-independent by
+        # construction, and deduplicating the id list is a storage concern.
+        effective_severity = (
+            severity if severity is not None else _derive_l2_severity(queue, member_ids)
+        )
 
         # Dedup check: look for an existing pending L2 with the same root_cause.
         existing_id = queue.find_pending_l2_by_root_cause(root_cause)
@@ -1577,7 +1668,7 @@ def create_server(
             id=queue.make_id(task_id),
             task_id=task_id,
             agent_role=agent_role,
-            severity=severity,
+            severity=effective_severity,
             category=category,
             summary=summary,
             detail=evidence,
