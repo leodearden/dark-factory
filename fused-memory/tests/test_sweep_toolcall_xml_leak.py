@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -394,6 +395,17 @@ def _match(memory_id: str, content: str, *, payload: dict | None = None, **paylo
     }
 
 
+# The collection name a post-fix ``scan_memory_content`` reports (task 3243).
+# Realistic: ``Scope(project_id='dark_factory').mem0_collection_name('fused')``.
+_SCANNED_COLLECTION = 'fused_dark_factory'
+
+# Distinguishes "the scan returned collection=''" from "the scan returned no
+# collection key at all" — the shape EVERY pre-3243 backend returned, and the
+# one whose silent ``.get(..., '')`` default put a blank field into two
+# committed live artifacts. A plain None default would collapse the two.
+_OMIT_KEY = object()
+
+
 def _ok_response(**overrides) -> SimpleNamespace:
     """A REALISTIC successful ``MemoryService.add_memory`` response.
 
@@ -415,7 +427,13 @@ def _ok_response(**overrides) -> SimpleNamespace:
 
 
 def _service(
-    matches, *, scanned=None, truncated=False, enforce=False, enforce_kind_registry=False
+    matches,
+    *,
+    scanned=None,
+    truncated=False,
+    enforce=False,
+    enforce_kind_registry=False,
+    collection=_SCANNED_COLLECTION,
 ) -> AsyncMock:
     """An AsyncMock ``MemoryService`` for the sweep.
 
@@ -426,6 +444,11 @@ def _service(
     silently turn every repair test into a skip. Both default to the SHIPPED
     defaults (warn-mode, kind registry not enforced), so the mock matches what a
     live sweep would actually see today.
+
+    ``collection`` defaults to a realistic name so every test here exercises
+    the POST-fix scan shape (task 3243 made ``scan_payload_text`` report the
+    collection it walked). Pass ``_OMIT_KEY`` to model the pre-fix backend that
+    returned no such key at all.
     """
     service = AsyncMock()
     service.config = SimpleNamespace(
@@ -433,13 +456,14 @@ def _service(
             enforce=enforce, enforce_kind_registry=enforce_kind_registry
         )
     )
-    service.scan_memory_content = AsyncMock(
-        return_value={
-            'matches': matches,
-            'scanned': len(matches) if scanned is None else scanned,
-            'truncated': truncated,
-        }
-    )
+    scan_result = {
+        'matches': matches,
+        'scanned': len(matches) if scanned is None else scanned,
+        'truncated': truncated,
+    }
+    if collection is not _OMIT_KEY:
+        scan_result['collection'] = collection
+    service.scan_memory_content = AsyncMock(return_value=scan_result)
     service.delete_memory = AsyncMock(return_value={'deleted': True})
     service.add_memory = AsyncMock(return_value=_ok_response())
     return service
@@ -528,6 +552,91 @@ class TestRunDiscovery:
 
         with pytest.raises(TimeoutError):
             await _mod.run(_args(), service)
+
+
+class TestRunReportsWhichCollectionItSwept:
+    """A report that does not say WHICH collection it swept is not a
+    measurement of that collection (task 3243).
+
+    ``run`` reads ``collection`` off the scan result with a ``.get(..., '')``
+    default. That silent default is how a whole authoritative 21,089-point
+    live ``--apply`` run emitted a blank field unnoticed: the backend never
+    returned the key, and nothing anywhere said so. Two committed artifacts
+    under ``docs/toolcall-xml-leak-sweep-2026-08-05/`` still carry
+    ``"collection": ""`` as a result.
+
+    Fixing the missing key upstream closes that instance; making the
+    blankness LOUD closes the class. It stays a warning rather than a raise
+    because the sweep's overriding promise is that the report always survives
+    — for a ``content_lost_in_flight`` record it is the only copy of the
+    original text — so a cosmetic metadata gap must never be able to abort a
+    run or break a stubbed service.
+    """
+
+    @staticmethod
+    def _blank_warnings(caplog) -> list[str]:
+        return [
+            r.message % r.args if r.args else r.message
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and 'collection' in str(r.msg)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_reported_collection_is_carried_verbatim_and_says_nothing(self, caplog):
+        service = _service([_match('a', _BODY)], collection='fused_dark_factory')
+
+        with caplog.at_level(logging.WARNING):
+            report = await _mod.run(_args(), service)
+
+        assert report['collection'] == 'fused_dark_factory'
+        assert self._blank_warnings(caplog) == [], caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_missing_collection_key_is_warned_about_not_swallowed(self, caplog):
+        """The pre-3243 backend shape: no ``collection`` key at all."""
+        service = _service([_match('a', _BODY)], collection=_OMIT_KEY)
+
+        with caplog.at_level(logging.WARNING):
+            report = await _mod.run(_args(), service)
+
+        warnings = self._blank_warnings(caplog)
+        assert warnings, caplog.text
+        assert any('sweep_toolcall_xml_leak' in w for w in warnings), warnings
+        # The report still survives, degraded rather than absent.
+        assert report['collection'] == ''
+
+    @pytest.mark.asyncio
+    async def test_a_blank_collection_string_is_warned_about_too(self, caplog):
+        """A key present but empty is the same unusable answer as no key —
+        this is what the two committed 2026-08-05 artifacts actually contain."""
+        service = _service([_match('a', _BODY)], collection='')
+
+        with caplog.at_level(logging.WARNING):
+            report = await _mod.run(_args(), service)
+
+        assert self._blank_warnings(caplog), caplog.text
+        assert report['collection'] == ''
+
+    @pytest.mark.asyncio
+    async def test_a_blank_collection_never_raises_so_a_stub_cannot_abort_a_run(self):
+        """The report is the only copy of a lost record's original text, so it
+        must survive a service that reports no collection at all."""
+        service = _service([_match('b', _TAIL_LEAK)], collection=_OMIT_KEY)
+
+        report = await _mod.run(_args(apply=True), service)
+
+        assert _record_for(report, 'b')['repaired'] is True
+        assert report['collection'] == ''
+
+    @pytest.mark.asyncio
+    async def test_a_blank_collection_does_not_change_the_exit_code(self):
+        """A cosmetic provenance gap is NOT a corpus-coverage failure. Only
+        truncation, manual_review, and the human-adjudication flags are."""
+        service = _service([_match('b', _TAIL_LEAK)], collection=_OMIT_KEY)
+
+        report = await _mod.run(_args(apply=True), service)
+
+        assert _mod.resolve_exit_code(report) == 0
 
 
 class TestRunDryRun:
