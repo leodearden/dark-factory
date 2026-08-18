@@ -691,7 +691,7 @@ def read_record(slug: str, root: Path | str | None = None) -> SessionRecord:
     if not path.is_file():
         raise FileNotFoundError(str(path))
     try:
-        return SessionRecord.from_json(path.read_text())
+        return SessionRecord.from_json(path.read_text(encoding='utf-8'))
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise CorruptSessionRecord(f'unparseable session record at {path}') from exc
 
@@ -816,7 +816,7 @@ def list_decisions(root: Path | str | None = None) -> list[DecisionRecord]:
     decisions: list[DecisionRecord] = []
     for path in sorted(base.glob('*.json')):
         try:
-            decisions.append(DecisionRecord.from_json(path.read_text()))
+            decisions.append(DecisionRecord.from_json(path.read_text(encoding='utf-8')))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             logger.error('list_decisions: skipping unreadable %s', path, exc_info=True)
             continue
@@ -857,7 +857,7 @@ def _mutate_decision(
     path = decision_path_for_id(decision_id, root=root)
     try:
         with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
+            record = DecisionRecord.from_json(path.read_text(encoding='utf-8'))
             mutate(record)
             if not write_decision(record, root=root):
                 return None
@@ -995,7 +995,7 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
     Usage::
 
         with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
+            record = DecisionRecord.from_json(path.read_text(encoding='utf-8'))
             record.some_field = new_value
             write_decision(record, root=root)
     """
@@ -1143,7 +1143,7 @@ def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> s
     if candidate is None:
         return None
     try:
-        data = json.loads(candidate.read_text())
+        data = json.loads(candidate.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError, ValueError):
         return None
     status = data.get('status') if isinstance(data, dict) else None
@@ -2247,7 +2247,7 @@ def _read_lease_holder_state(
         return None, False, LEASE_HEARTBEAT_TTL.total_seconds() + 1.0
     age_secs = (now - datetime.fromtimestamp(mtime, tz=UTC)).total_seconds()
     try:
-        holder = LeaseHolder.from_json(path.read_text())
+        holder = LeaseHolder.from_json(path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None, False, age_secs
     return holder, _pid_alive(holder.pid), age_secs
@@ -2654,7 +2654,7 @@ def reap_stale_leases(
         stale = age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
 
         try:
-            holder = LeaseHolder.from_json(lease_path.read_text())
+            holder = LeaseHolder.from_json(lease_path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             reason = 'corrupt' if stale else None
         else:

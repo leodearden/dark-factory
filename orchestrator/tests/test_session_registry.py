@@ -673,6 +673,58 @@ def test_read_record_returns_equal_record(tmp_path: Path) -> None:
     assert sr.read_record(r.session_slug, root=tmp_path) == r
 
 
+def test_read_record_decodes_with_an_explicit_utf8_encoding(tmp_path, monkeypatch):
+    """The READ half of task 3387's round-trip names utf-8 too.
+
+    Pinning only ``_atomic_write_text`` left the round-trip ASYMMETRIC: on a
+    genuinely non-UTF-8 host a record holding non-ASCII bytes was written
+    correctly and then failed to DECODE on the way back in, and because
+    ``UnicodeDecodeError`` subclasses ``ValueError`` it lands in
+    ``read_record``'s ``except`` clause and resurfaces as
+    ``CorruptSessionRecord`` — the exact unreadable-record outcome the write
+    fix exists to prevent. Every ``read_text`` in the module is now explicit;
+    this pins the one on the primary read path.
+
+    A BOUNDARY SPY rather than a write-then-read-back round-trip, for the same
+    measured reason the write pins below are shaped the way they are:
+    ``Path.read_text()`` with no encoding resolves its codec through the
+    C-level locale (``io.text_encoding()`` returns the ``"locale"`` sentinel),
+    unreachable from an in-process monkeypatch, and under this suite's UTF-8
+    ambient locale a round-trip passes either way. Spying the argument fails on
+    EVERY host instead: a locale-dependent read passes no ``encoding`` kwarg at
+    all. (``TestAtomicWriteSemantics``'s strict child covers the write half
+    end-to-end; a second child for the read half would buy nothing this does
+    not already localise.)
+    """
+    r = _make_record()
+    sr.write_record(r, root=tmp_path)
+
+    seen: list[dict] = []
+    real_read_text = Path.read_text
+
+    def _spy(self, *args, **kwargs):
+        seen.append(dict(kwargs))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'read_text', _spy)
+
+    # The spy delegates, so the read really completed — this pin cannot pass
+    # by disabling the thing it is measuring.
+    assert sr.read_record(r.session_slug, root=tmp_path) == r
+
+    assert len(seen) == 1, f'expected exactly one read_text call, recorded {seen}'
+    encoding = seen[0].get('encoding')
+    assert encoding is not None, (
+        'the record was read with no encoding= argument, so it decodes in '
+        'whatever the ambient locale happens to be — the task 3387 bug, '
+        'mirrored onto the read half'
+    )
+    assert _names_the_utf8_codec(encoding), (
+        f'JSON on disk is utf-8 (RFC 8259) and must be decoded as utf-8 '
+        f'regardless of ambient locale (task 3387); got encoding={encoding!r}'
+    )
+
+
 def test_update_status_mutates_status_and_exit_code_in_place(tmp_path: Path) -> None:
     r = _make_record(status=sr.Status.LAUNCHING, exit_code=None)
     sr.write_record(r, root=tmp_path)

@@ -586,8 +586,14 @@ class TestDelegatesToSharedAtomicWriter:
     process's locale — regardless of the ambient ``LC_ALL``/``LANG`` AND of how
     the platform happens to spell its UTF-8 alias.
 
-    Both pins below monkeypatch ``locale.getpreferredencoding``, and here that
-    patch is LOAD-BEARING rather than decorative: the pre-3387 body called
+    Task 3387 also pins the READ half of that round-trip
+    (``test_read_decodes_with_an_explicit_utf8_encoding``) — writing utf-8 and
+    then decoding by locale would leave a record that is written correctly and
+    read back as ``CorruptLaneRecord``, which is the failure the write fix
+    exists to prevent, merely relocated.
+
+    Both WRITE pins below monkeypatch ``locale.getpreferredencoding``, and here
+    that patch is LOAD-BEARING rather than decorative: the pre-3387 body called
     ``locale.getpreferredencoding(False)`` explicitly, at the Python level,
     so the patch genuinely reaches it and both pins fail against that source on
     EVERY host. (``session_registry``'s twin pin is deliberately NOT this
@@ -691,6 +697,58 @@ class TestDelegatesToSharedAtomicWriter:
             'getpreferredencoding() reports a non-UTF-8 codec'
         )
         assert 'café' in raw.decode('utf-8')
+
+    def test_read_decodes_with_an_explicit_utf8_encoding(self, tmp_path, monkeypatch):
+        """The READ half of the round-trip names utf-8 too (task 3387).
+
+        Pinning only the write left the round-trip ASYMMETRIC: on a genuinely
+        non-UTF-8 host a record containing non-ASCII bytes was written
+        correctly and then failed to DECODE on the way back in, and because
+        ``UnicodeDecodeError`` subclasses ``ValueError`` it lands in
+        ``_read_or_raise``'s ``except`` clause and resurfaces as
+        ``CorruptLaneRecord`` — the exact quarantined-as-corrupt outcome the
+        write fix exists to prevent.
+
+        A BOUNDARY SPY rather than a write-then-read-back round-trip, and
+        deliberately so: a round-trip CANNOT discriminate here.
+        ``Path.read_text()`` with no encoding resolves its codec through the
+        C-level locale (``io.text_encoding()`` returns the ``"locale"``
+        sentinel), which no in-process monkeypatch can reach — the same
+        measured hazard that made ``session_registry``'s first write pin inert.
+        Under this suite's UTF-8 ambient locale a round-trip therefore passes
+        either way. Spying the argument fails on EVERY host instead: against a
+        locale-dependent read there is no ``encoding`` kwarg at all to
+        accidentally agree with.
+        """
+        lifecycle = _lifecycle(tmp_path)
+        lifecycle.transition(tmp_path / 'lane-1', LaneState.SEED)
+
+        seen: list[dict] = []
+        real_read_text = Path.read_text
+
+        def _spy(self, *args, **kwargs):
+            seen.append(dict(kwargs))
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', _spy)
+
+        record = lifecycle.read(tmp_path / 'lane-1')
+
+        # The spy delegates, so the read really completed — this pin cannot
+        # pass by disabling the thing it is measuring.
+        assert record is not None, 'the delegated read must still return a record'
+        assert record.state == LaneState.SEED
+        assert len(seen) == 1, f'expected exactly one read_text call, recorded {seen}'
+        encoding = seen[0].get('encoding')
+        assert encoding is not None, (
+            'the record was read with no encoding= argument, so it decodes in '
+            'whatever the ambient locale happens to be — the task 3387 bug, '
+            'mirrored onto the read half'
+        )
+        assert codecs.lookup(encoding).name == 'utf-8', (
+            f'JSON on disk is utf-8 (RFC 8259) and must be decoded as utf-8 '
+            f'regardless of ambient locale (task 3387); got encoding={encoding!r}'
+        )
 
     def test_transition_creates_missing_state_dir_and_round_trips(self, tmp_path):
         """End-to-end: a first transition creates state_dir and the record reloads."""

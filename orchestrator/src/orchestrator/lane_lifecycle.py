@@ -275,7 +275,7 @@ class LaneLifecycle:
         if not path.is_file():
             return None
         try:
-            return LaneRecord.from_json(path.read_text())
+            return LaneRecord.from_json(path.read_text(encoding='utf-8'))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise CorruptLaneRecord(f'unparseable lane record at {path}') from exc
 
