@@ -37,6 +37,18 @@ payload and a self-refreshing 14-day ``expires_at`` TTL — every recurrence
 pushes the expiry back out, so a still-recurring marker never ages out;
 only a finding that stops recurring for 14 days is GC'd.
 
+The payload also carries the finding's ``cited_tasks`` when it has any
+(task 4381, provenance esc-3841-1), sanitized by
+:func:`_sanitize_cited_tasks` down to the three canonical keys
+``{project_id, task_id, title}`` with scalar values only.  This is the
+marker's only PROJECT-QUALIFIED identity — the ledger's ``task_id`` column
+is a bare per-project integer (or comma-join, or ``fp:`` key) — so it is
+what lets a later cycle resolve a fix task that was filed in a DIFFERENT
+known project.  Sanitizing is load-bearing rather than cosmetic: the
+payload is ``json.dumps``-ed inside the best-effort try/except below, so an
+unserialisable LLM-authored value would otherwise be swallowed as a ledger
+WARNING and the marker would silently stop persisting at all.
+
 Because the identity excludes run_id, ``ON CONFLICT`` on the full primary
 key guarantees **exactly one row survives** per (task_id, flag_type)
 regardless of how many times the signature has recurred — across cycles
@@ -623,6 +635,56 @@ def _extract_deduped_against_uuids(flag: dict[str, Any]) -> list[str]:
     return sorted(collected)
 
 
+#: The only ``cited_tasks`` entry keys carried into a ``stage1_flag_marker``
+#: payload (task 4381).  Matches the shape ``server/recon_report.cite_task``
+#: appends — ``{project_id, task_id, title}`` — which is also what
+#: :func:`_cited_task_corroborated` reads.
+_CITED_TASK_PAYLOAD_KEYS: tuple[str, ...] = ('project_id', 'task_id', 'title')
+
+
+def _sanitize_cited_tasks(flag: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Project *flag*'s ``cited_tasks`` down to a payload-safe list, or ``None``.
+
+    Each surviving entry keeps ONLY the three canonical keys in
+    :data:`_CITED_TASK_PAYLOAD_KEYS`, and only when the value is a scalar
+    (``str``/``int``/``float``/``bool``) or ``None``.  Entries that are not
+    dicts are skipped entirely, and an entry that projects down to nothing is
+    dropped rather than persisted as an empty dict.
+
+    Sanitizing is NOT decorative.  The result is embedded in the payload that
+    ``dedup_flags`` ``json.dumps``-es inside its best-effort try/except, so an
+    unserialisable LLM-authored value (a nested object, a datetime, a mock)
+    would today be swallowed as a ledger WARNING and the marker would silently
+    stop persisting at all — a regression on the module's core cross-cycle
+    dedup guarantee, not merely a lost annotation.  Restricting the value
+    domain to JSON scalars makes that failure mode unreachable by
+    construction.
+
+    Returns ``None`` (rather than ``[]``) when ``cited_tasks`` is absent, not
+    a list, empty, or entirely junk, so the caller's ``if cited_tasks:`` gate
+    omits the payload key exactly as it does for ``deduped_against``.
+
+    Input order is preserved.  Pure, sync, no I/O — never raises.
+    """
+    cited_tasks = flag.get('cited_tasks')
+    if not isinstance(cited_tasks, list) or not cited_tasks:
+        return None
+    sanitized: list[dict[str, Any]] = []
+    for entry in cited_tasks:
+        if not isinstance(entry, dict):
+            continue
+        projected: dict[str, Any] = {}
+        for key in _CITED_TASK_PAYLOAD_KEYS:
+            if key not in entry:
+                continue
+            value = entry[key]
+            if value is None or isinstance(value, (str, int, float, bool)):
+                projected[key] = value
+        if projected:
+            sanitized.append(projected)
+    return sanitized or None
+
+
 def _is_completion_flag(flag: dict[str, Any]) -> bool:
     """Return True iff *flag* explicitly marks itself as ONE-TIME completed work.
 
@@ -717,6 +779,18 @@ async def dedup_flags(
     omit it — they are already resolvable anchors and their payload is
     unchanged.
 
+    Cited-tasks enrichment (task 4381 / esc-3841-1): the flag's
+    ``cited_tasks``, sanitized by :func:`_sanitize_cited_tasks` to the three
+    canonical keys with scalar values only, is threaded into the payload as
+    ``cited_tasks`` — an OPTIONAL key exactly like ``deduped_against``, so a
+    flag with no citations persists the historical six-key payload verbatim.
+    Unlike ``deduped_against`` this is NOT scoped to ``fp:``-keyed markers:
+    the marker's own ``task_id`` is a bare per-project value, so
+    ``cited_tasks`` is the only project-qualified anchor a marker of ANY
+    shape carries.  The value is sanitized precisely so the ``json.dumps``
+    inside the best-effort try/except below can never fail on LLM-authored
+    content and silently skip the marker write.
+
     Returns the (possibly annotated) flag list.
     """
     # --- Authoritative suppression gate (task-1186) ---
@@ -764,6 +838,12 @@ async def dedup_flags(
             if is_content_fingerprint_task_id(tid)
             else None
         )
+        # Cross-project anchor enrichment (task 4381 / esc-3841-1): unlike
+        # deduped_against above, this is NOT scoped to fp:-keyed markers —
+        # cited_tasks is meaningful for every marker shape, because it is the
+        # only project-qualified identity a marker carries and a fix task for
+        # the finding routinely lives in a DIFFERENT project.
+        cited_tasks = _sanitize_cited_tasks(flag)
         if deduped_against and not flag.get('deduped_against'):
             # Observability (task-2047 amendment): _DEDUPED_AGAINST_FLAG_FIELDS
             # unions several undocumented alias fields alongside the canonical
@@ -856,6 +936,8 @@ async def dedup_flags(
         }
         if deduped_against:
             payload['deduped_against'] = list(deduped_against)
+        if cited_tasks:
+            payload['cited_tasks'] = cited_tasks
 
         # Best-effort (module docstring / public-API contract): a ledger read
         # or write failure — including a malformed/non-JSON payload_json on a
