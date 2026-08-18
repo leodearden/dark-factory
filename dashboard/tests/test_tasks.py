@@ -745,6 +745,221 @@ class TestFetchTasksNarrowing:
         assert tasks_mod.DEFAULT_PER_CALL_TIMEOUT > 0
 
 
+    # -----------------------------------------------------------------
+    # Cache-key discrimination (task 3857 step-3)
+    #
+    # fetch_tasks has five callers and only ONE of them narrows. Keying the
+    # TTL cache on the bare project_root would let active_tasks' narrowed
+    # entry be served to app._load_task_cards / merge_queue.load_task_titles
+    # / burndown.collect_snapshot / data.orchestrator, silently truncating
+    # them for up to the 20 s TTL — non-deterministically, depending on
+    # which caller raced in first.
+    #
+    # Each test below uses distinct per-narrowing payloads so a cross-served
+    # entry is detectable by CONTENT, not merely by call count.
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _payload(task_id: int, title: str, status: str = 'pending') -> dict:
+        return {'tasks': [{
+            'id': str(task_id), 'title': title, 'status': status,
+            'dependencies': [], 'metadata': {},
+        }]}
+
+    async def test_differing_statuses_key_separately(
+        self, dummy_client, dummy_config
+    ):
+        """(a) Same root, different ``statuses``, within TTL → two MCP calls."""
+        from dashboard.data.tasks import fetch_tasks
+
+        active_payload = self._payload(1, 'ACTIVE ROW', 'in-progress')
+        terminal_payload = self._payload(2, 'TERMINAL ROW', 'done')
+
+        async def _by_statuses(client, url, tool, args, **_kw):
+            if args.get('statuses') == ['in-progress']:
+                return active_payload
+            if args.get('statuses') == ['done']:
+                return terminal_payload
+            raise AssertionError(f'unexpected statuses: {args.get("statuses")!r}')
+
+        mock_mcp = AsyncMock(side_effect=_by_statuses)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            active = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/K', statuses=['in-progress'],
+            )
+            terminal = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/K', statuses=['done'],
+            )
+
+        assert mock_mcp.call_count == 2, (
+            f'differing statuses must key separately, got {mock_mcp.call_count} call(s)'
+        )
+        assert [t['title'] for t in active] == ['ACTIVE ROW']
+        assert [t['title'] for t in terminal] == ['TERMINAL ROW'], (
+            'the second narrowing was served the first narrowing’s rows'
+        )
+
+    async def test_narrowed_entry_never_served_to_the_full_tree_caller(
+        self, dummy_client, dummy_config
+    ):
+        """(b) A narrowed call must not poison the unnarrowed callers' entry.
+
+        This is the concrete production bug: ``active_tasks`` narrows while
+        ``app._load_task_cards`` / ``merge_queue.load_task_titles`` /
+        ``burndown.collect_snapshot`` do not.
+        """
+        from dashboard.data.tasks import fetch_tasks
+
+        narrowed_payload = self._payload(1, 'NARROWED ONLY', 'in-progress')
+        full_payload = {'tasks': [
+            {'id': '1', 'title': 'NARROWED ONLY', 'status': 'in-progress',
+             'dependencies': [], 'metadata': {}},
+            {'id': '2', 'title': 'FULL TREE EXTRA', 'status': 'done',
+             'dependencies': [], 'metadata': {}},
+        ]}
+
+        async def _by_narrowing(client, url, tool, args, **_kw):
+            return narrowed_payload if 'statuses' in args else full_payload
+
+        mock_mcp = AsyncMock(side_effect=_by_narrowing)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(
+                dummy_client, dummy_config, '/proj/L', statuses=['in-progress'],
+            )
+            full = await fetch_tasks(dummy_client, dummy_config, '/proj/L')
+
+        assert mock_mcp.call_count == 2, (
+            'the unnarrowed caller must issue its own MCP call, not ride the '
+            f'narrowed entry (got {mock_mcp.call_count} call(s))'
+        )
+        assert [t['title'] for t in full] == ['NARROWED ONLY', 'FULL TREE EXTRA'], (
+            'the full-tree caller was served a status-filtered subset'
+        )
+
+    async def test_unnarrowed_entry_never_served_to_the_narrowed_caller(
+        self, dummy_client, dummy_config
+    ):
+        """(b, reversed) Order must not matter — the full entry is not a narrowed one."""
+        from dashboard.data.tasks import fetch_tasks
+
+        async def _by_narrowing(client, url, tool, args, **_kw):
+            if 'statuses' in args:
+                return self._payload(1, 'NARROWED ONLY', 'in-progress')
+            return {'tasks': [
+                {'id': '1', 'title': 'NARROWED ONLY', 'status': 'in-progress',
+                 'dependencies': [], 'metadata': {}},
+                {'id': '2', 'title': 'FULL TREE EXTRA', 'status': 'done',
+                 'dependencies': [], 'metadata': {}},
+            ]}
+
+        mock_mcp = AsyncMock(side_effect=_by_narrowing)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_tasks(dummy_client, dummy_config, '/proj/M')
+            narrowed = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/M', statuses=['in-progress'],
+            )
+
+        assert mock_mcp.call_count == 2
+        assert [t['title'] for t in narrowed] == ['NARROWED ONLY']
+
+    async def test_none_statuses_keys_distinctly_from_empty_list(
+        self, dummy_client, dummy_config
+    ):
+        """``statuses=None`` and ``statuses=[]`` are opposite requests, not one key."""
+        from dashboard.data.tasks import fetch_tasks
+
+        async def _by_narrowing(client, url, tool, args, **_kw):
+            if args.get('statuses') == []:
+                return {'tasks': []}
+            return self._payload(1, 'FULL TREE', 'pending')
+
+        mock_mcp = AsyncMock(side_effect=_by_narrowing)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            full = await fetch_tasks(dummy_client, dummy_config, '/proj/N')
+            empty = await fetch_tasks(dummy_client, dummy_config, '/proj/N', statuses=[])
+
+        assert mock_mcp.call_count == 2
+        assert [t['title'] for t in full] == ['FULL TREE']
+        assert empty == []
+
+    async def test_differing_page_size_and_offset_key_separately(
+        self, dummy_client, dummy_config
+    ):
+        """(c) The window position is part of the identity of a result."""
+        from dashboard.data.tasks import fetch_tasks
+
+        async def _by_window(client, url, tool, args, **_kw):
+            return self._payload(
+                args.get('offset', 0) or 1,
+                f'window p={args.get("page_size")} o={args.get("offset")}',
+            )
+
+        mock_mcp = AsyncMock(side_effect=_by_window)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            first = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/O', page_size=10, offset=0,
+            )
+            second = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/O', page_size=10, offset=10,
+            )
+            third = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/O', page_size=20, offset=10,
+            )
+
+        assert mock_mcp.call_count == 3, (
+            f'page_size/offset must key separately, got {mock_mcp.call_count} call(s)'
+        )
+        assert first[0]['title'] == 'window p=10 o=0'
+        assert second[0]['title'] == 'window p=10 o=10'
+        assert third[0]['title'] == 'window p=20 o=10'
+
+    async def test_identical_narrowing_still_single_flights(
+        self, dummy_client, dummy_config
+    ):
+        """(d) Regression guard — the existing single-flight contract is unchanged."""
+        from dashboard.data.tasks import fetch_tasks
+
+        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            first = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/P',
+                statuses=['pending'], page_size=50, offset=5,
+            )
+            second = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/P',
+                statuses=['pending'], page_size=50, offset=5,
+            )
+
+        assert mock_mcp.call_count == 1, (
+            f'identical narrowing within TTL must reuse the entry, got '
+            f'{mock_mcp.call_count} call(s)'
+        )
+        assert first == second
+        assert isinstance(first, list)
+
+    async def test_narrowed_keys_stay_per_project_root(
+        self, dummy_client, dummy_config
+    ):
+        """The same narrowing on two roots must not collapse onto one entry."""
+        from dashboard.data.tasks import fetch_tasks
+
+        async def _by_root(client, url, tool, args, **_kw):
+            return self._payload(1, f'row for {args["project_root"]}')
+
+        mock_mcp = AsyncMock(side_effect=_by_root)
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            a = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/Q', statuses=['pending'],
+            )
+            b = await fetch_tasks(
+                dummy_client, dummy_config, '/proj/R', statuses=['pending'],
+            )
+
+        assert mock_mcp.call_count == 2
+        assert a[0]['title'] == 'row for /proj/Q'
+        assert b[0]['title'] == 'row for /proj/R'
+
+
 # ---------------------------------------------------------------------------
 # cross-project fan-out streak isolation (task 4133)
 # ---------------------------------------------------------------------------
