@@ -2476,6 +2476,119 @@ def _cited_fix_task_live(cited: dict[str, Any], get_task_result: object) -> bool
     return isinstance(status, str) and status != 'cancelled'
 
 
+async def _resolve_live_cross_project_fix_task(
+    taskmaster: Any,
+    known_projects: dict[str, str] | None,
+    project_id: str,
+    cited_tasks: Any,
+) -> dict[str, Any] | None:
+    """Return the first *cited_tasks* entry naming a live FOREIGN fix task, else ``None``.
+
+    Deliberately shaped as a copy of
+    :func:`filter_false_phantom_task_creation_flags`' proven cross-project
+    resolution: resolve each citation's ``project_id`` through
+    *known_projects*, look the resolvable ones up concurrently in ONE flat
+    ``asyncio.gather``, and classify each result.  The returned value is the
+    corroborating cited entry itself (not a bool) so the caller can name the
+    specific task that drove its decision in a log line.
+
+    **FOREIGN-ONLY.** Citations whose ``project_id`` equals *project_id* (the
+    running project) are skipped and issue no lookup at all.  This is not an
+    optimisation — it is the correctness core of the helper.  A finding's own
+    SUBJECT task is routinely its own first citation: the live repro flag
+    e3527208 cites ``know_live:598`` — itself — alongside the real fix tasks
+    ``dark_factory:3833``/``3839``.  Consulting same-project citations would
+    resolve the finding's own subject task, which is trivially "live", and so
+    every flag with a live subject task would self-suppress on the very next
+    cycle.  Note this is the OPPOSITE scope from
+    :func:`filter_already_tracked_systemic_patterns`, which queries ALL known
+    projects — that filter matches on TEXT coverage, where a same-project
+    match is genuine evidence, whereas this one matches on citation IDENTITY.
+
+    **Fail-open in every direction**, matching this module's
+    suppress-only-on-positive-confirmation posture: a falsy *taskmaster* or
+    *known_projects*, a non-list *cited_tasks*, an entry missing
+    ``project_id``/``task_id``, a ``project_id`` absent from *known_projects*,
+    a lookup exception, a not-found result, a title mismatch, and a cancelled
+    task all resolve to ``None`` (no suppression).
+
+    A near-miss — a cited task that is positively PRESENT but not live per
+    :func:`_cited_fix_task_live` (renamed fix task, title-less LLM-authored
+    citation, cancelled task) — is logged at INFO before returning ``None``,
+    so a non-suppression that *nearly* fired is observable rather than
+    silent.
+
+    Args:
+        taskmaster: Object with an async ``get_task(task_id, project_root)``.
+        known_projects: Map of ``project_id -> project_root``.
+        project_id: The project the current reconciliation run belongs to;
+            citations naming it are skipped (see FOREIGN-ONLY above).
+        cited_tasks: The finding's ``cited_tasks`` value, in whatever shape an
+            LLM emitted it — validated here, never trusted.
+
+    Returns:
+        The first cited entry for which :func:`_cited_fix_task_live` is True,
+        or ``None``.
+    """
+    if not taskmaster or not known_projects or not isinstance(cited_tasks, list):
+        return None
+
+    async def _safe_get_task(task_id: Any, project_root: str) -> Any:
+        """Fetch task with normalised exception handling.
+
+        Returns the raw get_task result on success, or a normalised
+        ``{'error': ..., 'error_type': ...}`` dict on any exception, so that
+        :func:`_cited_fix_task_live` classifies both paths identically.  This
+        normalisation is what lets the gather below stay a PLAIN
+        ``asyncio.gather`` (no ``return_exceptions=True``, which
+        ``tests/test_gather_convention_guard.py`` would otherwise route
+        through ``utils/async_utils``) — structurally the same closure as
+        ``filter_false_phantom_task_creation_flags._safe_get_task``.
+        """
+        try:
+            return await taskmaster.get_task(task_id, project_root)
+        except Exception as exc:
+            return {'error': str(exc), 'error_type': type(exc).__name__}
+
+    lookup_cited: list[dict[str, Any]] = []
+    lookup_coros = []
+    for cited in cited_tasks:
+        if not isinstance(cited, dict):
+            continue
+        cited_task_id = cited.get('task_id')
+        cited_project_id = cited.get('project_id')
+        if cited_task_id is None or cited_project_id is None:
+            continue
+        if str(cited_project_id) == str(project_id):
+            continue  # FOREIGN-ONLY: never resolve the finding's own subject
+        root = known_projects.get(cited_project_id)
+        if not root:
+            continue  # unresolvable project -> not corroborated -> skip lookup
+        lookup_cited.append(cited)
+        lookup_coros.append(_safe_get_task(cited_task_id, root))
+
+    if not lookup_coros:
+        return None
+
+    lookup_results: list[Any] = await asyncio.gather(*lookup_coros)
+
+    near_misses: list[dict[str, Any]] = []
+    for cited, result in zip(lookup_cited, lookup_results, strict=True):
+        if _cited_fix_task_live(cited, result):
+            return cited
+        if confirm_task_present(result):
+            near_misses.append(cited)
+
+    for cited in near_misses:
+        logger.info(
+            'reconciliation.cross_project_fix_task_present_but_uncorroborated '
+            'cited_project_id=%s cited_task_id=%s',
+            cited.get('project_id'),
+            cited.get('task_id'),
+        )
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Phantom task-creation guard (task-2525)
 # --------------------------------------------------------------------------- #
