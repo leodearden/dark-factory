@@ -1655,25 +1655,97 @@ class TestUpdateTaskMetadataSerialization:
         )
         assert 'append' not in arguments
 
+    # NOTE: test_update_task_metadata_mode_wins_over_append used to live here.
+    # It asserted that metadata_mode='merge' + append=True forwards
+    # metadata_mode='merge' — i.e. it certified that the caller's additive
+    # intent was silently dropped on the wire (the nested-metadata clobber this
+    # task fixes).  That pair now RAISES; see
+    # test_update_task_merge_plus_append_true_raises immediately below.  The
+    # legitimate half of what it covered — that an explicit metadata_mode beats
+    # append — is re-established by the ('replace', True) and ('additive', True)
+    # non-regression cells further down, which pin the precedence rule on the
+    # cells where precedence is actually meaningful.
+
     @pytest.mark.asyncio
-    async def test_update_task_metadata_mode_wins_over_append(
+    async def test_update_task_merge_plus_append_true_raises(
         self, scheduler: Scheduler, monkeypatch
     ):
-        """Explicit metadata_mode beats append=True (metadata_mode > append precedence).
+        """metadata_mode='merge' alongside append=True is a CONTRADICTION, and is REJECTED.
 
-        If both append=True and metadata_mode='merge' are supplied, the explicit
-        metadata_mode='merge' must win — the scheduler resolves client-side and
-        sends metadata_mode='merge' with no append on the wire.
+        ``append=True`` means exactly one thing — 'additive', the recursive
+        union merge — while ``'merge'`` is shallow last-write-wins, so the pair
+        asks for two incompatible resolutions of the same write.  It used to
+        resolve silently to 'merge' and forward that on the wire, shallow-
+        clobbering nested metadata: a task's whole ``memory_hints`` key
+        (authored ``entities``/``queries`` and all) overwritten wholesale by the
+        incoming stub.
 
-        NB (task 3581): this no longer "mirrors" the backend for THIS cell. The
-        backend's _resolve_metadata_mode precedence is metadata_mode > append >
-        default with one carve-out — metadata_mode='merge' alongside append=True
-        on a metadata write is now REJECTED as a contradiction, because silently
-        resolving it to 'merge' shallow-overwrote nested keys (a whole
-        memory_hints blob). The wire assertions below stay valid precisely
-        because the scheduler never forwards `append`, so the conflicting pair
-        never reaches the backend guard; but the client-side resolution is the
-        same silent-preference defect one layer up and is filed as follow-up.
+        The guard must REFUSE the write, not merely complain about it — hence
+        the ``captured_args == []`` assertion.  A warn-and-proceed would destroy
+        the additive intent just as thoroughly, only with a log line about it.
+        """
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        with pytest.raises(ValueError) as excinfo:
+            await scheduler.update_task(
+                '1', {'files': ['backend']}, append=True, metadata_mode='merge'
+            )
+
+        msg = str(excinfo.value)
+        assert 'additive' in msg, (
+            f"message must point the caller at the 'additive' escape hatch; got: {msg!r}"
+        )
+        # The unsafe write must NOT have reached the wire.  This is the
+        # load-bearing difference between raising and logging a WARNING.
+        assert captured_args == [], (
+            f'A rejected update_task must not reach the wire; got: {captured_args}'
+        )
+        # NB: as with the sibling backend guard, deliberately do NOT assert on
+        # the incident number or the full prose — the load-bearing contract is
+        # that the caller is told about the actionable 'additive' resolution.
+
+    @pytest.mark.asyncio
+    async def test_update_task_explicit_merge_without_append_forwards_merge(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """An explicit metadata_mode='merge' with append omitted is honored.
+
+        Non-regression cell pinning the guard's narrowness: it keys on
+        ``append is True``, so the default-safe explicit-merge path (the #4271
+        contract) is untouched.
+        """
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task('1', {'files': ['backend']}, metadata_mode='merge')
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        assert arguments.get('metadata_mode') == 'merge', (
+            f"Explicit metadata_mode='merge' must be forwarded; got: {arguments}"
+        )
+        assert 'append' not in arguments
+
+    @pytest.mark.asyncio
+    async def test_update_task_replace_plus_append_true_forwards_replace(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """('replace', append=True) stays honored — explicit metadata_mode wins.
+
+        Non-regression cell: ``'replace'`` is the sanctioned destructive
+        co-signal, and the contradictory-pair guard is exactly one cell wide,
+        so this combination must keep resolving to 'replace'.
         """
         captured_args: list[dict] = []
 
@@ -1684,13 +1756,42 @@ class TestUpdateTaskMetadataSerialization:
         monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
 
         await scheduler.update_task(
-            '1', {'files': ['backend']}, append=True, metadata_mode='merge'
+            '1', {'files': ['backend']}, append=True, metadata_mode='replace'
         )
 
         assert len(captured_args) == 1
         arguments = captured_args[0]['arguments']
-        assert arguments.get('metadata_mode') == 'merge', (
-            f"Explicit metadata_mode='merge' must win over append=True; got: {arguments}"
+        assert arguments.get('metadata_mode') == 'replace', (
+            f"Explicit metadata_mode='replace' must win over append=True; got: {arguments}"
+        )
+        assert 'append' not in arguments
+
+    @pytest.mark.asyncio
+    async def test_update_task_additive_plus_append_true_forwards_additive(
+        self, scheduler: Scheduler, monkeypatch
+    ):
+        """('additive', append=True) stays honored — the two signals agree.
+
+        Non-regression cell: this pair is not a contradiction at all (both mean
+        the recursive union merge), so the guard must not sweep it up.
+        """
+        captured_args: list[dict] = []
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            captured_args.append(payload)
+            return {}
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        await scheduler.update_task(
+            '1', {'files': ['backend']}, append=True, metadata_mode='additive'
+        )
+
+        assert len(captured_args) == 1
+        arguments = captured_args[0]['arguments']
+        assert arguments.get('metadata_mode') == 'additive', (
+            'append=True alongside metadata_mode=\'additive\' must forward '
+            f"'additive'; got: {arguments}"
         )
         assert 'append' not in arguments
 
