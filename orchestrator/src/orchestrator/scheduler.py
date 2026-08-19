@@ -4372,7 +4372,9 @@ class Scheduler:
             preserved, supplied keys overwrite wholesale.  This is the #4271
             fix: no-append callers (prd-tagger, module-tagger, auto-eval
             back-link) now preserve sibling keys like _causation_id and
-            memory_hints instead of silently clobbering them.
+            memory_hints instead of silently clobbering them.  Passing
+            ``'merge'`` together with ``append=True`` is a contradiction and
+            raises :class:`ValueError` — see the ``append`` parameter below.
             ``'additive'``: recursive list-union, dict-recursive, scalar
             OLD-wins.  Use for list-growth writes (e.g. dry_run_proposals).
             ``'replace'``: whole-blob overwrite, delete-by-omission.  Also
@@ -4383,9 +4385,47 @@ class Scheduler:
             ``metadata_mode='replace'`` call to repair.
         append:
             Legacy shorthand kept for back-compat.  Resolved to
-            ``'additive'`` when ``True``.  Ignored when ``metadata_mode``
-            is set explicitly.  Precedence: metadata_mode > append > merge.
+            ``'additive'`` when ``True``.  Precedence: ``metadata_mode`` >
+            ``append`` > merge, with ONE carve-out: ``metadata_mode='merge'``
+            alongside ``append=True`` is **rejected** as a contradiction
+            rather than silently letting 'merge' win (see Raises).  The other
+            explicit/append combinations are honored unchanged —
+            ``('replace', True)`` stays 'replace' (the sanctioned destructive
+            co-signal) and ``('additive', True)`` stays 'additive' (both
+            signals agree).
+
+        Raises
+        ------
+        ValueError
+            If ``metadata_mode='merge'`` is passed alongside ``append=True``.
         """
+        # The contradictory-pair guard has to live HERE, client-side, and not be
+        # delegated downwards: because 'append' is deliberately never forwarded
+        # on the wire (see below), the pair can never reach the backend's
+        # _resolve_metadata_mode, so without this check every orchestrator
+        # caller would be permanently exempt from any backend-side rejection of
+        # it.  Task 3581 is the sibling backend fix for the same contradiction
+        # one layer down; it is unmerged at the time of writing, so this guard
+        # is currently the ONLY one that exists on this path — do not read it as
+        # redundant belt-and-braces.  Deliberately exactly one cell wide:
+        # ('replace', True) and ('additive', True) stay honored, and it keys on
+        # `append is True` so ('merge', append=False/omitted) — the default-safe
+        # #4271 path — is untouched.
+        if metadata_mode == 'merge' and append is True:
+            raise ValueError(
+                "Refusing a contradictory metadata_mode='merge' + append=True "
+                'update_task call: append=True asks for the ADDITIVE recursive '
+                "union merge while metadata_mode='merge' asks for a SHALLOW "
+                'last-write-wins overwrite, and there is no coherent way to do '
+                "both.  Resolving it silently to 'merge' overwrote nested keys "
+                "wholesale — a task's whole memory_hints blob (authored "
+                'entities/queries and all) replaced by the incoming stub '
+                'instead of unioned with it.  State intent explicitly: pass '
+                "metadata_mode='additive' (or append=True alone) to UNION "
+                'nested list/dict fields into the existing blob, or drop '
+                "append=True and keep metadata_mode='merge' to CONFIRM a "
+                'shallow top-level last-write-wins overwrite.'
+            )
         # Resolve mode: explicit metadata_mode wins; append=True → additive;
         # default → merge (the #4271 fix — NOT replace).
         # NEVER forward 'append' on the wire: append=False resolves to REPLACE
