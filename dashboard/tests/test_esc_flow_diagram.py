@@ -25,9 +25,19 @@ times or not at all — and the one worth making (scoping to a NESTED
 declaration) went unmade for exactly that reason.  `_client` is now the
 module-scoped fixture in conftest.py and `extract_function_body` is imported
 from `_dashboard_helpers`; test_jsx_source_helpers.py owns their contract and
-guards against the copies returning.  The script-order helpers below
-(_ScriptTagCollector, _find_script_position, _assert_script_loads_before) are
-still local copies from test_tab_escalation_analytics.py.
+guards against the copies returning.
+
+That retirement stopped at the two JSX-slicing helpers, DELIBERATELY, and the
+remaining copies are tracked rather than forgotten — read the paragraph above
+as scoped to those two, not as a claim that this file holds no copies.  The
+script-order helpers below (_ScriptTagCollector, _find_script_position,
+_assert_script_loads_before) are still local copies from
+test_tab_escalation_analytics.py, and are copied again in test_index_html.py,
+test_tab_escalations.py and test_tab_memory_evals.py; `_extract_df_data_block`
+stands in three modules; test_charts_axis_labels.py's `_extract_signature`
+re-derives the paren-depth walk `extract_function_body` now owns.  Moving them
+needs test_index_html.py, which task 3549 held no lock on, so it filed
+ticket tkt_0RSN5VVGAVK7BQ8K9GX4PM2YBZ for the rest.
 """
 
 from __future__ import annotations
