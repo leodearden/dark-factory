@@ -13851,3 +13851,249 @@ async def test_transition_legality_gate_still_runs_after_the_consolidation_gate(
     assert result['error'] == 'consolidation_not_closed'
     assert order == ['pre_done_hook', 'consolidation_scroll']
     taskmaster.set_task_status.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 3122: the FILELESS soft-signal trigger for the dormant adjudicator
+# ---------------------------------------------------------------------------
+
+
+def _soft_scope_registry(interceptor, tmp_path):
+    """Wire a two-project (reify + dark-factory) registry onto *interceptor*."""
+    from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+
+    (tmp_path / 'reify').mkdir()
+    (tmp_path / 'reify' / 'crates').mkdir()
+    (tmp_path / 'reify' / 'gui').mkdir()
+    (tmp_path / 'dark-factory').mkdir()
+    (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+    (tmp_path / 'dark-factory' / 'orchestrator').mkdir()
+    registry = ProjectPrefixRegistry.from_roots(
+        [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+    )
+    interceptor._prefix_registry = registry
+    return registry
+
+
+def _stub_adjudicator(interceptor, verdict=None):
+    """Attach a recording stub adjudicator and return it."""
+    from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+    stub = MagicMock()
+    stub.adjudicate = AsyncMock(
+        return_value=verdict
+        or AdjudicationVerdict(verdict='allow', reason='incidental', llm_used=True)
+    )
+    interceptor._path_scope_adjudicator = stub
+    return stub
+
+
+class _SpyEscalator:
+    def __init__(self):
+        self.calls: list = []
+
+    def report_rejection(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+@pytest.mark.asyncio
+class TestSoftScopeSignalTrigger:
+    """The trigger contract only — marker/escalation behaviour is later steps.
+
+    The class this exists for is the FILELESS misfile: no metadata.files and
+    no repo-relative prose prefix, so every existing guard returns a
+    non-rejection verdict and _path_guard_or_skip leaves at its EARLY return.
+    """
+
+    async def test_fileless_strong_signal_adjudicates_and_never_blocks(
+        self, interceptor, tmp_path,
+    ):
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        df_root = registry.root_for_project('dark_factory')
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': f'ALL of the asked work is in {df_root}',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None, f'soft signal must never block, got {result!r}'
+        stub.adjudicate.assert_awaited_once()
+        call = stub.adjudicate.await_args.kwargs
+        assert call['project_id'] == 'reify'
+        assert call['suggested_project'] == 'dark_factory'
+        assert call['title'] == 'dark-factory: wire the recurring timer'
+        assert df_root in call['description']
+        assert call['matched_paths']
+
+    async def test_weak_only_signal_never_spends_an_llm_call(
+        self, interceptor, tmp_path,
+    ):
+        """The bare-name rule fires at 20.6% / 3.2%. It must not pay."""
+        _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                'title': 'wire the recurring timer',
+                'description': 'this is dark-factory-side context, work is local',
+            },
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        assert result is None
+        stub.adjudicate.assert_not_awaited()
+
+    async def test_no_signal_at_all_never_adjudicates(self, interceptor, tmp_path):
+        _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'wire the recurring timer', 'description': 'ordinary work'},
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        assert result is None
+        stub.adjudicate.assert_not_awaited()
+
+    async def test_no_adjudicator_configured_is_todays_behaviour(
+        self, interceptor, tmp_path,
+    ):
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        interceptor._path_scope_adjudicator = None
+        df_root = registry.root_for_project('dark_factory')
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': f'ALL of the asked work is in {df_root}',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+
+
+@pytest.mark.asyncio
+class TestSoftScopeTriggerLeavesExistingExitsAlone:
+    """One pin per pre-existing exit of _path_guard_or_skip.
+
+    Each asserts the exit's own observable outcome is unchanged AND that the
+    adjudicator was never awaited — the soft branch attaches to exactly one
+    exit and must not re-open a decision another branch already made.
+    """
+
+    async def test_routing_override_stays_a_bypass(self, interceptor, tmp_path):
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        df_root = registry.root_for_project('dark_factory')
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': f'ALL of the asked work is in {df_root}',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs,
+            str(tmp_path / 'reify'),
+            'reify',
+            routing_override_reason='operator confirmed this belongs here',
+        )
+
+        assert result is None
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        stub.adjudicate.assert_not_awaited()
+
+    async def test_files_certain_reject_still_rejects(self, interceptor, tmp_path):
+        _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        interceptor._scope_violation_escalator = _SpyEscalator()
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': 'mixed declaration',
+            'metadata': {'files': ['orchestrator/scheduler.py', 'crates/foo.rs']},
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+        stub.adjudicate.assert_not_awaited()
+
+    async def test_cross_repo_allow_and_tag_is_untouched(self, interceptor, tmp_path):
+        _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': 'the deliverable lands on the dark-factory branch',
+            'metadata': {
+                'files': ['orchestrator/scheduler.py', 'fused-memory/src/x.py']
+            },
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None
+        meta = kwargs.get('metadata') or {}
+        assert meta.get('cross_repo') is True
+        assert meta.get('cross_repo_project') == 'dark_factory'
+        assert 'possible_scope_mismatch' not in meta
+        stub.adjudicate.assert_not_awaited()
+
+    async def test_attribution_suppressed_prose_is_not_reopened(
+        self, interceptor, tmp_path, caplog,
+    ):
+        """Task 3106 decided this with the CERTAIN classifier. Leave it decided."""
+        _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        interceptor._scope_violation_escalator = _SpyEscalator()
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': 'mirror the logic in fused-memory/src/harness.py',
+            'metadata': {'files': ['crates/foo.rs']},
+        }
+        with caplog.at_level(logging.INFO):
+            result = await interceptor._path_guard_or_skip(
+                kwargs, str(tmp_path / 'reify'), 'reify',
+            )
+
+        assert result is None
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert any(
+            'PROSE ADVISORY SUPPRESSED' in record.message for record in caplog.records
+        )
+        stub.adjudicate.assert_not_awaited()
+        assert interceptor._scope_violation_escalator.calls == []
+
+    async def test_prose_advisory_stamps_exactly_one_marker(
+        self, interceptor, tmp_path,
+    ):
+        _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        interceptor._scope_violation_escalator = _SpyEscalator()
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': 'edit fused-memory/src/harness.py directly',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None
+        marker = (kwargs.get('metadata') or {}).get('possible_scope_mismatch')
+        assert marker is not None
+        assert marker['source'] == 'prose'
+        assert marker['suggested_project'] == 'dark_factory'
+        assert len(interceptor._scope_violation_escalator.calls) == 1
+        stub.adjudicate.assert_not_awaited()
