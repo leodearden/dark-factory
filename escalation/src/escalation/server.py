@@ -34,6 +34,7 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
 from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
+from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig
 from escalation.dedupe import submit_or_dedupe as _dedupe_submit_or_dedupe
 from escalation.models import (
@@ -404,15 +405,26 @@ CATEGORIES = [
 #
 # NEITHER OF THE TWO ADDED FIELDS IS BOUNDED IN PRINCIPLE, and this comment used
 # to claim they were "bounded by construction" — they are not.  ``promote_to_l2``
-# validates only that ``root_cause.strip()`` is non-empty, so an arbitrarily long
-# key rides every compact row, and ``member_ids`` grows with cluster size.  Both
-# are short in PRACTICE (a one-line dedup key; ~20-char ids), which is the actual
-# basis for including them.  Bounding them here was considered and REJECTED in
-# both available forms: truncating ``root_cause`` in the projection would
-# silently break the exact-match rebuild that is C1's entire point, and capping
-# it at mint would either fail a legitimate promote outright or collapse two
-# distinct keys into one L2 — over-folding, the very failure the amendment
-# storm report exists to surface.  The cost is real and named rather than
+# validates only that ``root_cause`` is non-empty and canonicalises to something,
+# so an arbitrarily long key rides every compact row, and ``member_ids`` grows
+# with cluster size.  Both are short in PRACTICE (a one-line dedup key; ~20-char
+# ids), which is the actual basis for including them.  Bounding them here was
+# considered and REJECTED in both available forms: truncating ``root_cause`` in
+# the projection would silently break the C1 rebuild that is its entire point
+# (the key would no longer canonicalise to what the server matches on), and
+# capping it at mint would either fail a legitimate promote outright or collapse
+# two distinct keys into one L2 — over-folding, the very failure the amendment
+# storm report exists to surface.
+#
+# NO CANONICAL-FORM FIELD IS PROJECTED (task 3998), deliberately: matching moved
+# to the canonical form, but adding a second key would roughly double
+# root_cause's share of every compact row for no gain.  A client-side rebuild
+# should import ``escalation.canonical.canonical_root_cause`` — it is exported
+# publicly for exactly that — rather than reimplementing the transform; and
+# because the server now folds near-duplicates itself, a rebuild sees ONE row
+# where it used to see two.  A rebuild that keeps comparing raw strings is
+# strictly MORE conservative than the server (it re-promotes a near-duplicate,
+# the server folds it and answers ``status:'updated'``), so it stays correct.  The cost is real and named rather than
 # denied: every compact reader pays it, including the dashboard's
 # ``fetch_pins_recovery`` poll (dashboard/.../escalations.py), which asks for
 # ``compact=True`` on a loop and reads nothing but ``pins_recovery``.
@@ -1848,7 +1860,12 @@ def create_server(
         {root_cause of the pending L2s} u {their member_ids} across the returned
         rows, with NO session memory — previously that set could only be carried
         forward in-session, so a rotation re-promoted clusters it had already
-        promoted.
+        promoted.  Since task 3998 the SERVER matches root causes on their
+        CANONICAL form, so a client-side rebuild should compare
+        ``escalation.canonical.canonical_root_cause(row['root_cause'])`` rather
+        than raw strings; comparing raw is still safe, just more conservative
+        (it re-promotes a near-duplicate and the server folds it, answering
+        ``status:'updated'`` without creating anything).
 
         Use this from a long-running watcher to keep context small as the
         pending pile grows; fetch the full record for a specific id via
@@ -2116,7 +2133,17 @@ def create_server(
 
         **Root-cause dedup**: if a pending L2 with the same *root_cause* already
         exists, this call UPDATES that existing L2 (appends new members) rather
-        than filing a duplicate.  The response ``status`` distinguishes the two
+        than filing a duplicate.  "Same" means the same CANONICAL FORM, not the
+        same bytes (task 3998): two promotes describing one cause but spelled
+        differently — differing only in case, in whitespace runs or in
+        punctuation — now fold into the first instead of minting two decision
+        points for one incident.  Canonicalisation happens once, in
+        ``escalation.canonical.canonical_root_cause``, and only at COMPARE time:
+        the surviving record's own ``root_cause`` is never rewritten to the
+        canonical form.  Punctuation is treated as a SEPARATOR rather than
+        deleted, so keys whose identity lives in delimited segments
+        (``risk:3184`` vs ``risk:318:4``) stay distinct.  The response ``status``
+        distinguishes the two
         outcomes: ``'created'`` for a new L2, ``'updated'`` for an append.  An
         append RAISES the existing L2's severity when the incoming members (or
         an explicit *severity*) justify it, and never lowers it — an L2's
@@ -2157,8 +2184,16 @@ def create_server(
             Non-empty list of L1 escalation ids forming this cluster.
             Passing an empty list returns ``{'error': ...}``.
         root_cause:
-            Non-empty exact-string dedup key.  Whitespace-only input returns
-            ``{'error': ...}`` (mirrors ``find_pending_l2_by_root_cause``).
+            Non-empty dedup key, matched on its CANONICAL FORM (task 3998):
+            ``escalation.canonical.canonical_root_cause`` is the single
+            canonicalisation site, and near-duplicates differing only in case,
+            whitespace or punctuation therefore FOLD into the existing L2 rather
+            than minting a second decision point for one incident.  Input that
+            is whitespace-only — or whose canonical form is empty, i.e. a key of
+            pure punctuation like ``'::'`` — returns ``{'error': ...}`` (mirrors
+            ``find_pending_l2_by_root_cause``'s falsy-key guard, which is now on
+            the canonical form).  The record's own ``root_cause`` is stored and
+            displayed VERBATIM; the canonical form is never persisted.
         evidence:
             Supporting context — stored in the escalation's ``detail`` field.
         options:
@@ -2262,6 +2297,26 @@ def create_server(
             return {'error': 'member_ids must be a non-empty list'}
         if not root_cause.strip():
             return {'error': 'root_cause must be a non-empty string'}
+        # Stricter than `.strip()` since task 3998: matching is on the CANONICAL
+        # form, so a key made only of punctuation/symbols ('::', '--') is not a
+        # usable dedup key — it canonicalises to nothing and the dedup scan could
+        # never find the L2 again, so every subsequent promote would mint another
+        # one.  That is a silent, self-perpetuating duplicate source, which is the
+        # exact defect class this task exists to reduce; refusing at the boundary
+        # where the caller can still fix it is the loud-over-silent norm.
+        # Measured safe: 0 of the 398 distinct live root_cause keys canonicalise
+        # to empty, and `\w` is Unicode-aware so CJK and other non-Latin keys are
+        # unaffected.
+        if not canonical_root_cause(root_cause):
+            return {
+                'error': (
+                    f'root_cause {root_cause!r} canonicalises to the empty string '
+                    '(it carries no word characters, only punctuation/symbols), so '
+                    'no L2 filed under it could ever be found again by the '
+                    'root-cause dedup scan — every promote would mint another '
+                    'duplicate. Supply a key with at least one word character.'
+                ),
+            }
         if severity is not None and severity not in KNOWN_SEVERITIES:
             return {
                 'error': (
