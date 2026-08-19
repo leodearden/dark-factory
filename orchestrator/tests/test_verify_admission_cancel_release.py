@@ -173,3 +173,95 @@ async def test_cancel_mid_acquire_releases_the_slot_the_thread_later_wins(tmp_pa
 
     with acquire_task_slot('task', slots_dir=slots_dir, n=1, wait=False) as held:
         assert held is True, 'LEAK: a subsequent acquire is blocked by a never-released slot'
+
+
+class _GatedRaisingAcquire:
+    """Fake stand-in for ``acquire_task_slot`` whose ``__enter__`` blocks the
+    calling thread on a gate and then raises ``OSError`` — used to pin
+    ``_release_if_acquired``'s ``fut.exception() is not None`` guard: the
+    done-callback must NOT call ``__exit__`` on a context manager whose
+    ``__enter__`` never successfully completed. Adapted from
+    ``_DeterministicAcquire`` (test_verify_admission_integration_gate.py:
+    193-261), copied module-local (not imported) per that file's own stated
+    helpers-are-module-local rationale.
+
+    ``self.gate`` is a ``threading.Event``, NOT ``asyncio.Event`` —
+    ``_admission_slot`` drives ``__enter__``/``__exit__`` from a real
+    executor worker thread via ``run_in_executor``, so only a
+    thread-blocking primitive can hold it there.
+    """
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.gate = threading.Event()
+        self.raised = threading.Event()
+        self.exit_calls = 0
+
+    def __call__(
+        self, role: str, *, slots_dir: Path, n: int, wait: bool = True,
+    ) -> _GatedRaisingAcquire:
+        return self
+
+    def __enter__(self) -> bool:
+        self.started.set()
+        self.gate.wait()
+        try:
+            raise OSError(5, 'simulated acquire failure')
+        finally:
+            self.raised.set()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        self.exit_calls += 1
+        return False
+
+
+@pytest.mark.real_verify_admission
+@pytest.mark.asyncio
+async def test_cancel_mid_acquire_does_not_exit_a_cm_whose_enter_raised(tmp_path):
+    # slots_dir need not exist -- the fake never touches the filesystem.
+    slots_dir = tmp_path / 'slots'
+    config = OrchestratorConfig(
+        verify_admission_slots_dir=str(slots_dir),
+        verify_admission_task_slots=1,
+    )
+    fake = _GatedRaisingAcquire()
+    body_ran = False
+    loop_errors: list[Any] = []
+    asyncio.get_running_loop().set_exception_handler(
+        lambda loop, context: loop_errors.append(context),
+    )
+
+    async def _run() -> None:
+        nonlocal body_ran
+        async with _admission_slot('task', config):
+            body_ran = True
+
+    with patch('orchestrator.verify.acquire_task_slot', fake):
+        task = asyncio.create_task(_run())
+        try:
+            await _await_flag(fake.started, msg='worker thread never started __enter__')
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert body_ran is False, (
+                'CM body must never run on the cancelled-mid-acquire path'
+            )
+        finally:
+            # Unblock the worker thread even if an assertion above failed, so
+            # it never sits parked in the process-lifetime _admission_executor().
+            fake.gate.set()
+
+        await _await_flag(
+            fake.raised, msg='worker thread never reached the simulated OSError',
+        )
+        # Bounded settle window (not a bare sleep): fake.raised already proves the
+        # future resolved and the done-callback was scheduled; this just gives it
+        # a fair chance to run before we assert on its absence of effect.
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+
+    assert fake.exit_calls == 0, '__exit__ called on a CM that never entered'
+    assert loop_errors == [], (
+        f'expected no unretrieved-exception loop errors, got {loop_errors!r}'
+    )
