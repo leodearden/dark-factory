@@ -1873,6 +1873,31 @@ async def _resolve_renamed_plan_path(
     requires the resolved path to be in the touched set.  So an ambiguous
     or coincidental basename cannot silently satisfy the gate.
 
+    Known, ACCEPTED limitation of keying on ``current``: none of the four
+    bounds above can distinguish "the hop's file was relocated again as
+    separate delete+add commits" (the case the ``current`` key exists to
+    resolve) from "the hop's file was genuinely DELETED OUTRIGHT" (removed,
+    never re-added anywhere).  If an unrelated file elsewhere in the tree
+    happens to share the dead hop's basename, mechanism 2 resolves the
+    declared path to that unrelated file even though nothing on the branch
+    actually delivered against it.  This is NOT a new class of risk
+    introduced by keying on ``current`` — the no-chain case (``current ==
+    norm``) already has it, since a path that was committed and later
+    deleted outright still has git history under its own name, so
+    :func:`_path_existed_in_branch_history` does not stop it either; keying
+    on ``current`` only extends the SAME accepted tradeoff to chained
+    renames, where a hop's basename is more likely to be generic (``mod.rs``,
+    ``__init__.py``, ``index.ts``) than the originally declared path's.  A
+    tighter bound is possible (e.g. requiring the candidate to have been
+    ADDED at-or-after the commit that deleted ``current``) but is
+    deliberately not implemented here.  The tradeoff is bounded in practice
+    by the surrounding invariants — EXACTLY ONE candidate, the resolved
+    path must additionally be in the touched set — and every resolution
+    that passes is logged loudly at WARNING regardless of mechanism, so the
+    false-positive class this paragraph documents is never silent.  See
+    ``TestHopBasenameAcceptedTradeoff`` in the test module for the pinned
+    shape.
+
     *tree_paths* is an async provider, not a list, so the (single) tree
     listing is shelled out at most ONCE per gate invocation, shared across
     every stale entry and every hop, and never computed at all when no

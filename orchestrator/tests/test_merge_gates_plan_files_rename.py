@@ -743,6 +743,97 @@ class TestBasenameFallbackUsesLastResolvedHop:
         assert result.missing_from_tree == [declared]
 
 
+@pytest.mark.asyncio
+class TestHopBasenameAcceptedTradeoff:
+    """Documents a KNOWN, ACCEPTED limitation of keying mechanism 2's
+    basename lookup on ``current`` (the last resolved hop) rather than
+    ``norm`` — see the "Known, ACCEPTED limitation" paragraph in
+    ``_resolve_renamed_plan_path``'s docstring.
+
+    None of mechanism 2's four bounds can distinguish "the hop's file was
+    relocated again as separate delete+add commits" (the case the
+    ``current`` key exists to resolve — see
+    ``TestBasenameFallbackUsesLastResolvedHop``) from "the hop's file was
+    genuinely DELETED OUTRIGHT" (removed, never re-added anywhere).  If an
+    UNRELATED file elsewhere in the tree happens to share the dead hop's
+    basename, mechanism 2 resolves the declared path to that unrelated
+    file even though nothing on the branch delivered against it.
+
+    This is not a NEW class of risk introduced by keying on ``current``:
+    the no-chain case (``current == norm``) already has it — a declared
+    path that was committed and later deleted outright still has git
+    history under its own name, so ``_path_existed_in_branch_history``
+    does not stop it either.  Keying on ``current`` only extends the SAME
+    accepted tradeoff to chained renames, where a hop's basename is more
+    likely to be generic than the originally declared path's.  This test
+    pins the CURRENT, INTENTIONAL behaviour so a future change to it is a
+    deliberate decision, not an incidental regression.
+    """
+
+    async def test_hop_deleted_outright_still_resolves_via_unrelated_basename(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        declared = 'crates/tests/topo_e2e.rs'
+        hop1 = 'crates/tests/harness_topo/topo_suite.rs'
+        unrelated = 'crates/other/topo_suite.rs'
+
+        await _commit_on_main(
+            git_repo, {declared: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _rename_on_main(
+            git_repo, declared, hop1, 'harness: hop 1 rename + retarget',
+        )
+        # hop1 is deleted OUTRIGHT — no re-add anywhere, unlike
+        # `_relocate_as_delete_then_add`'s delete-then-add-elsewhere shape.
+        rc, _, err = await _run(['git', 'rm', '--quiet', hop1], cwd=git_repo)
+        assert rc == 0, f'git rm {hop1} failed: {err}'
+        await _commit_on_main(git_repo, {}, f'remove {hop1} outright')
+        # An unrelated file, added independently, happens to share hop1's
+        # basename — nothing connects it to the topo_e2e relocation.
+        await _commit_on_main(
+            git_repo, {unrelated: 'fn other() {}\n'}, 'add unrelated file',
+        )
+
+        wt = (await git_ops.create_worktree('hop-deleted-outright')).path
+        base = await _head_of(wt)
+        (wt / unrelated).write_text('fn other() { /* branch edit */ }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                [declared], base, head, git_ops, task_id='hop-deleted-outright',
+            )
+
+        # This is the ACCEPTED tradeoff documented on
+        # `_resolve_renamed_plan_path`, not a desired outcome: nothing on
+        # the branch actually delivered against `declared`, yet the gate
+        # PASSES because the dead hop's basename coincidentally matches an
+        # unrelated file the branch happened to touch.
+        assert result.resolved_renames == {declared: unrelated}, (
+            'pins the accepted tradeoff: a coincidental basename match on '
+            'the dead hop resolves even though hop1 was deleted outright, '
+            'not relocated'
+        )
+        assert result.not_touched == []
+        assert result.missing_from_tree == []
+
+        # Not silent, even though it is a coincidental match: every
+        # resolution that passes the gate is logged loudly.
+        msg = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'gate PASSES' in msg, (
+            f'a resolution that passes the gate must still be logged loudly, '
+            f'even under this accepted tradeoff; got: {msg!r}'
+        )
+        assert declared in msg
+        assert unrelated in msg
+
+
 # ---------------------------------------------------------------------------
 # Classification — missing_from_tree, and the two no-false-NEGATIVE guards
 # ---------------------------------------------------------------------------
