@@ -14,6 +14,7 @@ import json
 import logging
 import time
 import types
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -7353,10 +7354,13 @@ class TestRootCauseOverfoldReport:
     once an L2 has already blown the 20-entry amendment cap, so it is deaf to an
     over-fold at five or six distinct causes.
 
-    Dedupe is disabled here deliberately, for the same reason the truncation
-    suite disables it: under the stock infra_issue config a second report would
-    FOLD into the first and a "filed exactly once" assertion would pass for the
-    wrong reason.
+    Dedupe is disabled in most tests here deliberately, for the same reason the
+    truncation suite disables it: under the stock infra_issue config a second
+    report would FOLD into the first and a "filed exactly once" assertion would
+    pass for the wrong reason.  The one exception is
+    `test_crossings_on_two_l2s_fold_under_the_stock_dedupe_config`, which leaves
+    the stock config in place precisely to exercise that fold as the shipped
+    behaviour it is.
     """
 
     @staticmethod
@@ -7557,4 +7561,95 @@ class TestRootCauseOverfoldReport:
 
         assert self._overfold_reports(queue) == [], (
             'distinct causes in distinct L2s are not an over-fold'
+        )
+
+
+    @staticmethod
+    def _other_spelling(i: int) -> str:
+        """Spellings of a SECOND canonical key, disjoint from `_spelling`'s.
+
+        Same shape as `_spelling` — only case and punctuation vary, so all of
+        them canonicalise to 'merge lane wedged' — but no member of this family
+        canonicalises to `_spelling`'s key, so the two families drive two
+        SEPARATE L2s to the threshold.
+        """
+        return ['Merge lane wedged', 'merge-lane-wedged', 'MERGE LANE WEDGED',
+                'Merge.Lane.Wedged', 'merge:lane:wedged',
+                'MERGE-lane.WEDGED', 'merge   lane   wedged'][i]
+
+    async def _drive_one_l2_to_the_threshold(
+        self, server, spelling: Callable[[int], str], members: str,
+    ) -> str:
+        """Mint one L2 and fold it to exactly `_THRESHOLD` distinct spellings.
+
+        Returns the L2's id.  *members* namespaces the member ids so two calls
+        never contend for one L1.  The first promote seeds variant 1 from the
+        record's own root_cause, so the threshold is reached on fold
+        `_THRESHOLD - 1` — the same arithmetic
+        `test_report_fires_exactly_once_at_the_threshold_crossing` spells out.
+        """
+        created = await self._fold(server, spelling(0), f'esc-l1-{members}-0')
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+        for i in range(1, _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD):
+            folded = await self._fold(server, spelling(i), f'esc-l1-{members}-{i}')
+            assert folded['status'] == 'updated', f'Expected a fold, got {folded}'
+        return created['id']
+
+    @pytest.mark.asyncio
+    async def test_crossings_on_two_l2s_fold_under_the_stock_dedupe_config(
+        self, tmp_path: Path,
+    ):
+        """Fleet-wide burst control is REAL, asserted against the STOCK config.
+
+        Every other test in this class disables dedupe, so nothing exercises the
+        shipped path in which the report's own `severity='info'` /
+        `category='infra_issue'` routes through `_submit_or_dedupe`.  That left
+        `_report_root_cause_overfold`'s load-bearing docstring claim — that the
+        summary's LEADING tokens are held stable and the varying parts (the count,
+        the L2 id) placed after, so a hundred simultaneous crossings fold under
+        `summary_dedupe_key`'s first-three-token key — pinned by nothing.  An edit
+        that moved `{variants}` or `{l2_id}` to the front, or dropped 'L2
+        root-cause' from the lead, would give every crossing in a burst its own
+        record with the whole suite still green.
+
+        Asserted BEHAVIOURALLY: two DIFFERENT L2s each cross the threshold and the
+        second report folds into the first as a dedupe child.  Asserting the
+        summary's wording instead would only restate the f-string, and would still
+        pass if the key function ever changed underneath it.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        # STOCK DedupeConfig — infra_issue folding ON, exactly as shipped.
+        server = create_server(queue)
+
+        first_l2 = await self._drive_one_l2_to_the_threshold(
+            server, self._spelling, 'a',
+        )
+        reports = self._overfold_reports(queue)
+        assert len(reports) == 1, (
+            f'the first crossing must file one report, got {[r.id for r in reports]}'
+        )
+        parent = reports[0]
+        assert parent.dedupe_count == 0, f'nothing has folded yet: {parent.dedupe_count}'
+
+        second_l2 = await self._drive_one_l2_to_the_threshold(
+            server, self._other_spelling, 'b',
+        )
+        assert second_l2 != first_l2, (
+            'setup wrong: the two spelling families must drive two distinct L2s'
+        )
+
+        # The second crossing DID file — and folded, leaving one record on disk.
+        reports = self._overfold_reports(queue)
+        assert [r.id for r in reports] == [parent.id], (
+            'a fleet-wide burst of crossings must fold under one dedupe parent, '
+            f'got {[r.id for r in reports]}'
+        )
+        refreshed = queue.get(parent.id)
+        assert refreshed is not None
+        assert refreshed.dedupe_count == 1, (
+            'the second crossing must fold into the first rather than never firing '
+            f'— dedupe_count is what tells the two apart: {refreshed.dedupe_count}'
+        )
+        assert len(refreshed.dedupe_children) == 1, (
+            f'the folded child must be recorded: {refreshed.dedupe_children!r}'
         )
