@@ -731,18 +731,28 @@ async def merge_collection(
 
     Returns:
         ``{'points_upserted': n, 'source_deleted': bool,
-        'enumeration_incomplete': bool}``. ``points_upserted`` tallies what
-        ACTUALLY reached *target*, not what was enumerated -- a chunk still
-        buffered when the drain died was never sent and is not counted.
+        'enumeration_incomplete': bool, 'delete_failed': bool}``.
+        ``points_upserted`` tallies what ACTUALLY reached *target*, not what
+        was enumerated -- a chunk still buffered when the drain died was
+        never sent and is not counted. ``enumeration_incomplete`` and
+        ``delete_failed`` are DISTINCT because they describe different
+        states: the first means part of the source never reached the target
+        (a re-run must finish the migration), the second means every point
+        landed but the now-redundant source could not be dropped (a re-run
+        or a manual delete tidies up, and no data is at risk). ``run()``
+        folds EITHER into an UNRESOLVED disposition.
 
-    ANY drain failure is CAUGHT, never propagated, for the same reason
-    ``scroll_collection_points`` catches its own: budget exhaustion, a
+    ANY failure is CAUGHT, never propagated, for the same reason
+    ``preflight_collection_points`` catches its own: budget exhaustion, a
     ``TimeoutError`` from ``scroll_collection_pages``'s per-page
-    ``asyncio.wait_for``, or a transport error -- a raising sub-operation
-    must not abort the whole consolidation run, because earlier
-    keys/sections of the same ``--apply`` pass may already hold committed
-    mutations (the ``delete_empty_collection`` idiom). Both branches withhold
-    the source delete; only the budget branch advises raising the budget.
+    ``asyncio.wait_for``, a transport error, or a raising
+    ``delete_collection`` -- a raising sub-operation must not abort the whole
+    consolidation run, because earlier keys/sections of the same ``--apply``
+    pass may already hold committed mutations, and the later sections (junk
+    keys, empty collections) would be skipped entirely, handing the operator
+    a traceback instead of a manifest (the ``delete_empty_collection``
+    idiom). Every branch leaves the source in place; only the budget branch
+    advises raising the budget.
     """
     from qdrant_client.http import models as qmodels  # noqa: PLC0415
 
@@ -791,6 +801,7 @@ async def merge_collection(
             'points_upserted': points_upserted,
             'source_deleted': False,
             'enumeration_incomplete': True,
+            'delete_failed': False,
         }
     except Exception as e:
         # Same withheld delete, no raise-the-budget advice -- see the sibling
@@ -807,13 +818,37 @@ async def merge_collection(
             'points_upserted': points_upserted,
             'source_deleted': False,
             'enumeration_incomplete': True,
+            'delete_failed': False,
         }
 
-    await qdrant_client.delete_collection(source)
+    # The delete is guarded for the SAME reason the drain is: a raising
+    # sub-operation must not abort a pass whose earlier keys/sections may
+    # already hold committed mutations. Withholding it is also harmless --
+    # every point is already in the target, so the source is now a redundant
+    # copy an operator can drop by hand or on a re-run (which re-upserts
+    # id-keyed and idempotent).
+    try:
+        await qdrant_client.delete_collection(source)
+    except Exception as e:
+        logger.warning(
+            "consolidate_namespace_families: collection '%s' was fully merged "
+            'into %r (%d point(s)) but deleting the source FAILED: %s -- the '
+            'collection is reported UNRESOLVED so the run exits non-zero. No '
+            'data is at risk: the target holds every point, and the source is '
+            'now a redundant copy that can be dropped by hand or by re-running.',
+            source, target, points_upserted, e, exc_info=True,
+        )
+        return {
+            'points_upserted': points_upserted,
+            'source_deleted': False,
+            'enumeration_incomplete': False,
+            'delete_failed': True,
+        }
     return {
         'points_upserted': points_upserted,
         'source_deleted': True,
         'enumeration_incomplete': False,
+        'delete_failed': False,
     }
 
 
@@ -1032,13 +1067,13 @@ async def run(
                 page_size=limit, max_pages=max_pages,
             )
             item.update(summary)
-            # A phase-2 drain that died mid-merge upserted only part of the
-            # source and withheld the delete, so the item is NOT a clean
-            # MERGE -- fold it into UNRESOLVED exactly like the graph-family
-            # post-merge downgrade above, so has_unresolved picks it up and
-            # the run exits non-zero rather than reporting a partial
-            # migration as done.
-            if summary['enumeration_incomplete']:
+            # A drain that died mid-merge upserted only part of the source,
+            # and a merge whose terminal delete failed left the source behind
+            # -- neither is a clean MERGE, so fold both into UNRESOLVED
+            # exactly like the graph-family post-merge downgrade above, so
+            # has_unresolved picks them up and the run exits non-zero rather
+            # than reporting an incomplete migration as done.
+            if summary['enumeration_incomplete'] or summary['delete_failed']:
                 item['disposition'] = 'UNRESOLVED'
         collection_items.append(item)
 

@@ -1567,6 +1567,7 @@ class TestMergeCollection:
             'points_upserted': 3,
             'source_deleted': True,
             'enumeration_incomplete': False,
+            'delete_failed': False,
         }
         client.delete_collection.assert_called_once_with('reify_reify')
 
@@ -1586,6 +1587,7 @@ class TestMergeCollection:
             'points_upserted': 0,
             'source_deleted': True,
             'enumeration_incomplete': False,
+            'delete_failed': False,
         }
         client.delete_collection.assert_called_once_with('reify_reify')
 
@@ -1666,6 +1668,50 @@ class TestMergeCollection:
         )
         assert not any('--max-pages' in m for m in messages), (
             'raise-the-budget is wrong advice after a transport failure'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_raising_delete_is_caught_and_reported_rather_than_propagating(self, caplog):
+        """The TERMINAL delete is guarded like every other sub-operation.
+
+        It used to sit OUTSIDE the try, so a transport failure on
+        delete_collection propagated out of merge_collection and out of run()
+        -- aborting the whole consolidation pass, skipping the later sections
+        (junk keys, empty collections) entirely, and handing the operator a
+        traceback instead of a manifest, even though earlier sections of the
+        same --apply pass already held committed mutations. That is exactly
+        the outcome this function's docstring says must not happen, and the
+        sibling delete_empty_collection already catches Exception -> WARNING
+        -> UNRESOLVED.
+
+        The failure is reported as delete_failed, NOT enumeration_incomplete:
+        every point DID reach the target, so nothing is at risk and no re-run
+        is needed to preserve data -- the source is merely a redundant copy
+        that could not be dropped. Conflating the two would tell an operator
+        the migration was partial when it was complete.
+        """
+        backend = _make_backend_pager([[_make_point('p1'), _make_point('p2')]])
+        client = _make_qdrant_mock()
+        client.delete_collection = AsyncMock(side_effect=RuntimeError('connection reset'))
+
+        with caplog.at_level('WARNING'):
+            result = await _mod.merge_collection(
+                backend, client, 'reify_reify', 'fused_reify', 'reify',
+            )
+
+        assert result == {
+            'points_upserted': 2,
+            'source_deleted': False,
+            'enumeration_incomplete': False,
+            'delete_failed': True,
+        }
+        messages = [rec.message for rec in caplog.records]
+        assert any('reify_reify' in m for m in messages), messages
+        assert any('connection reset' in m for m in messages), (
+            f'the WARNING must name the exception; got {messages}'
+        )
+        assert not any('--max-pages' in m for m in messages), (
+            'raise-the-budget is wrong advice for a failed delete'
         )
 
 
@@ -2733,6 +2779,61 @@ class TestRunApply:
             if c.args and c.args[0] == 'fused_dark-factory'
         ]
         assert stale_deletes == [], 'the source must survive a partial merge'
+
+    @pytest.mark.asyncio
+    async def test_apply_raising_source_delete_stays_unresolved_without_aborting_the_run(
+        self, monkeypatch,
+    ):
+        """A transport failure on the terminal delete_collection must be
+        reported, not propagated.
+
+        Before this, the delete sat outside merge_collection's try and run()
+        did not wrap the call either, so a raising delete aborted the whole
+        pass: the LATER sections (junk keys, empty collections) never ran and
+        the operator got a traceback instead of a manifest -- while the
+        graph-family merges from earlier in the same --apply pass were already
+        committed. The run must still produce a full report, mark this
+        collection UNRESOLVED, and exit non-zero.
+        """
+        _patch_merge_primitives(monkeypatch)
+        points = [_make_point('p1', payload={'user_id': 'dark-factory'})]
+        graphiti = _make_run_graphiti_mock(
+            total_count_by_key={'my-project': 3, 'test-project': 0},
+        )
+        qdrant_client = _make_run_qdrant_mock(
+            points_by_collection={'fused_dark-factory': points},
+        )
+        ok_delete = qdrant_client.delete_collection
+
+        async def _delete(collection, *args, **kwargs):
+            if collection == 'fused_dark-factory':
+                raise RuntimeError('connection reset')
+            return await ok_delete(collection, *args, **kwargs)
+
+        qdrant_client.delete_collection = AsyncMock(side_effect=_delete)
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        item = {i['source']: i for i in report['collection_merges']}['fused_dark-factory']
+        assert item['points_upserted'] == 1, 'the merge itself succeeded'
+        assert item['source_deleted'] is False
+        assert item['delete_failed'] is True
+        assert item['enumeration_incomplete'] is False, (
+            'the enumeration was COMPLETE -- every point reached the target; '
+            'only the redundant source could not be dropped'
+        )
+        assert item['disposition'] == 'UNRESOLVED'
+        assert _mod.has_unresolved(report) is True, 'an UNRESOLVED item must exit non-zero'
+
+        # The sections AFTER the collection merges still ran -- the whole
+        # point of catching rather than propagating.
+        junk_by_key = {i['key']: i for i in report['junk_key_deletions']}
+        assert junk_by_key['test-project']['disposition'] == 'DELETE'
+        assert junk_by_key['my-project']['disposition'] == 'UNRESOLVED'
+        assert report['empty_collection_deletions'], (
+            'the empty-collection section must still be reached and reported'
+        )
 
     @pytest.mark.asyncio
     async def test_apply_deletes_zero_count_empty_collection_and_leaves_nonzero_unresolved(self, monkeypatch):
