@@ -56,6 +56,7 @@ from orchestrator.pytest_markers import (
     deselecting_expression_for_targets,
     expression_definitely_deselects,
     module_level_marker_names,
+    per_item_marker_names,
     resolve_marker_expression,
 )
 from orchestrator.verify import run_scoped_verification
@@ -301,6 +302,148 @@ class TestModuleLevelMarkerNames:
 
     def test_none_source_is_empty(self):
         assert module_level_marker_names(None) == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# per_item_marker_names (step-1: RED)
+# ---------------------------------------------------------------------------
+
+#: The real shape at tests/scripts/test_pump_web_ui_installed_unit_parity.py:
+#: 187-223, condensed — validated by AST against the live file before any
+#: assertion here was written.  Both top-level tests carry
+#: ``@pytest.mark.integration``; the second also carries a ``skipif``.
+_ALL_DECORATED_SOURCE = """\
+import shutil
+
+import pytest
+
+SYSTEMCTL_SKIP_REASON = 'systemctl unavailable'
+
+
+@pytest.mark.integration
+def test_installed_unit_file_restart_backoff_effective() -> None:
+    pass
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(shutil.which('systemctl') is None, reason=SYSTEMCTL_SKIP_REASON)
+def test_installed_unit_manager_restart_steps_effective() -> None:
+    pass
+"""
+
+#: The real shape at tests/scripts/test_know_live_installed_unit_parity.py:
+#: 122-459, condensed to one representative of each kind found there: a
+#: leading private helper (contributes nothing), an integration-decorated
+#: test, a parametrize-only test, and a bare undecorated test — validated by
+#: AST against the live file before any assertion here was written.
+_MIXED_DECORATED_SOURCE = """\
+import pytest
+
+
+def _argv_from_exec_start_show(exec_start_value: str) -> str | None:
+    return None
+
+
+@pytest.mark.integration
+def test_installed_unit_file_restart_backoff_effective() -> None:
+    pass
+
+
+@pytest.mark.parametrize('exec_start_value', ['a'])
+def test_config_arg_from_exec_start_returns_value_or_none(exec_start_value) -> None:
+    pass
+
+
+def test_argv_from_exec_start_show_extracts_argv_segment() -> None:
+    pass
+"""
+
+
+class TestPerItemMarkerNames:
+    """``per_item_marker_names(source) -> tuple[frozenset[str], ...] | None``.
+
+    THE SECOND, ADDITIVE PROOF TIER: one guaranteed (lower-bound) marker set
+    per top-level test item — ``module_level_marker_names(source)`` unioned
+    with that item's own ``pytest.mark.NAME`` decorators — but ONLY when this
+    walk can see every item pytest would collect from *source*.  Refuses
+    (returns None) whenever that is not provable; see the refusal cases in the
+    ``-- refusals --`` sub-section below (step-3) for the enumeration
+    guarantee this tier depends on.  A parsed module with zero top-level test
+    functions yields ``()``, distinct from the None refusal, and still
+    refused downstream by the caller.
+    """
+
+    def test_all_decorated_real_shape_yields_one_set_per_item_in_source_order(self):
+        """tests/scripts/test_pump_web_ui_installed_unit_parity.py — the acceptance case.
+
+        Both items are individually proven deselected by ``not integration``;
+        this is the shape that returns rc=5 today (task 4459's defect).
+        """
+        assert per_item_marker_names(_ALL_DECORATED_SOURCE) == (
+            frozenset({'integration'}),
+            frozenset({'integration', 'skipif'}),
+        )
+
+    def test_mixed_real_shape_yields_one_set_per_test_function_only(self):
+        """tests/scripts/test_know_live_installed_unit_parity.py — the control.
+
+        The leading helper contributes nothing, and the bare test's set is
+        EMPTY — so the tuple carries no all-quantified proof and widening
+        must not fire on this shape.
+        """
+        assert per_item_marker_names(_MIXED_DECORATED_SOURCE) == (
+            frozenset({'integration'}),
+            frozenset({'parametrize'}),
+            frozenset(),
+        )
+
+    def test_module_level_pytestmark_is_unioned_into_every_items_set(self):
+        """The two tiers compose rather than compete."""
+        source = (
+            'import pytest\n\n'
+            'pytestmark = pytest.mark.slow\n\n\n'
+            '@pytest.mark.integration\n'
+            'def test_a():\n    pass\n\n\n'
+            'def test_b():\n    pass\n'
+        )
+        assert per_item_marker_names(source) == (
+            frozenset({'slow', 'integration'}),
+            frozenset({'slow'}),
+        )
+
+    def test_zero_top_level_test_functions_yields_empty_tuple_not_none(self):
+        """Distinct from the None refusal; the caller still refuses this downstream."""
+        assert per_item_marker_names('import pytest\n\n\ndef helper():\n    pass\n') == ()
+
+    def test_item_hood_is_name_startswith_test_including_async(self):
+        """A name is an item iff it starts with ``test``; ``async def`` counts too."""
+        source = (
+            'def test_a():\n    pass\n\n\n'
+            'def testfoo():\n    pass\n\n\n'
+            'def _test_helper():\n    pass\n\n\n'
+            'def check_test():\n    pass\n\n\n'
+            'def setup_module():\n    pass\n\n\n'
+            'async def test_async_thing():\n    pass\n'
+        )
+        assert per_item_marker_names(source) == (frozenset(), frozenset(), frozenset())
+
+    def test_non_marker_decorator_contributes_nothing_and_does_not_suppress_siblings(self):
+        source = (
+            'from unittest import mock\n\n\n'
+            "@mock.patch('os.getenv')\n"
+            '@pytest.mark.slow\n'
+            '@some_alias\n'
+            'def test_a(mock_getenv):\n    pass\n'
+        )
+        assert per_item_marker_names(source) == (frozenset({'slow'}),)
+
+    # -- never raises ----------------------------------------------------------
+
+    def test_none_source_is_none(self):
+        assert per_item_marker_names(None) is None
+
+    def test_syntax_error_is_none_not_a_raise(self):
+        assert per_item_marker_names('def broken(:\n') is None
 
 
 # ---------------------------------------------------------------------------
