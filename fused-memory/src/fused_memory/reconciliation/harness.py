@@ -4936,6 +4936,32 @@ class ReconciliationHarness:
             for stage in stages:
                 current_stage_name = stage.stage_id.value
 
+                # Task 4186 — pre-Stage-3 cycle_summary flush, kept structurally
+                # identical to run_full_cycle's (see the long WHY comment there;
+                # do not let the two spellings drift). Same defect on this
+                # driver: a Stage-2 in-stage write that failed transiently is
+                # only re-attempted in the finally below, i.e. AFTER this pass's
+                # own Stage 3 has already read the ledger and ruled the summary
+                # genuinely absent. The stakes differ — this driver's Stage-3
+                # findings feed the persistence-gated escalation path, so a
+                # false "summary missing" here costs an escalation rather than a
+                # second remediation pass — but the window is the same one.
+                #
+                # Anchored at run.started_at because this driver has no separate
+                # cycle_start_time local, exactly as its own finally already is.
+                # The Stage 1 call is INERT here by that arm's
+                # run_type != RunType.remediation gate (a remediation pass's
+                # Stage 1 deliberately writes no summary of its own), so it can
+                # never fabricate a Stage-1 row; it is kept only so the two
+                # drivers' flushes read identically.
+                if current_stage_name == StageId.integrity_check.value:
+                    await self._ensure_stage1_cycle_summary(
+                        run, run_id, project_id, current_stage_name, run.started_at,
+                    )
+                    await self._ensure_stage2_cycle_summary(
+                        run, run_id, project_id, run.started_at,
+                    )
+
                 report = await stage.run(
                     [], watermark, reports, run_id, model=tier.model,
                 )
@@ -5259,6 +5285,13 @@ class ReconciliationHarness:
             )
 
         finally:
+            # TERMINAL backstop, mirroring run_full_cycle's: task 4186 hoisted a
+            # copy of these two calls to the top of the Stage-3 iteration above
+            # (the pre-Stage-3 flush). These stay as the last resort for the
+            # paths that flush cannot reach — a stage that raised before Stage 3
+            # — and as the second attempt after a flush attempt that did not
+            # CONFIRM. A flush that DID confirm makes these no-op via
+            # _cycle_summary_ledger_write_missing's write-recovered exclusion.
             await self._ensure_stage1_cycle_summary(
                 run, run_id, project_id, current_stage_name, run.started_at,
             )
