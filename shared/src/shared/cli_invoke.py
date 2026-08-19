@@ -69,6 +69,13 @@ _WATCHDOG_POLL_SECS = 5.0
 # Minimum poll duration — prevents the poll from degenerating to 0.0 when both
 # time_to_grace and time_to_ceiling have already elapsed (would otherwise cause an
 # asyncio.wait(timeout=0) tight-spin hammering count_transcript_turns).
+# Task 3925 did NOT retire this floor — it changed the shape of the failure the
+# floor prevents.  The transcript reads now run in the default executor
+# (asyncio.to_thread), so a degenerate 0.0 poll no longer blocks the event loop
+# inline; instead it floods that executor with queued whole-file transcript
+# parses.  That is arguably worse: the pool is process-wide and shared by every
+# concurrent agent, so one spinning watchdog starves every other role's offload
+# (and the loop still burns a full core scheduling the hops).  Keep the floor.
 _WATCHDOG_MIN_POLL_SECS = 0.01
 # Coarse poll cadence for the WORKING-regime progress extension (task 2360).
 # Once seen_turn latches AND working_idle_secs/absolute_cap_secs are both set,
@@ -3364,6 +3371,30 @@ async def _run_subprocess(
             # valid, since there is no PIPE for it to try to re-write.
             comm_task = asyncio.ensure_future(proc.communicate())
 
+            # ── INVARIANT (task 3925): every transcript read below is OFF-LOOP ─
+            # All four transcript reads in _run_subprocess — the two watchdog
+            # polls in this loop, the one-shot re-read in the except-TimeoutError
+            # handler, and the normal-exit read after it — go through
+            # `await asyncio.to_thread(...)`.  They are blocking whole-file reads
+            # (glob + open + json.loads per line; 1.0-1.3 MB for a mature
+            # session), and the orchestrator runs EVERY role of EVERY concurrent
+            # task on ONE event loop (orchestrator/src/orchestrator/cli.py,
+            # `asyncio.run(_main())`), so an inline read stalls every other
+            # agent's I/O for its whole duration.  Sibling offloads of the same
+            # shape: harness.py:7965 (run_substrate_recheck) and
+            # harness.py:10925 (write_heartbeat).  The deliberate COUNTER-example
+            # is workflow.py:12475-12487, whose archive hook is synchronous on
+            # purpose — it is a WRITE, and the to_thread there was a cancellation
+            # point that lost transcripts.  These four are side-effect-free READS,
+            # so that argument does not transfer.
+            #
+            # Pass the function as a BARE POSITIONAL REFERENCE
+            # (`asyncio.to_thread(count_transcript_turns, config_dir, session_id)`).
+            # Do NOT hoist a functools.partial or a module-scope alias: that would
+            # bind the real function at import time and silently defeat every
+            # existing `patch('shared.cli_invoke.count_transcript_turns', ...)`
+            # module-global patch, which would then do real FS reads against
+            # empty tmp_paths and pass vacuously.
             while True:
                 elapsed = time.monotonic() - watchdog_start
                 # Extension engages once liveness is proven (seen_turn) AND the
@@ -3456,7 +3487,9 @@ async def _run_subprocess(
                     # max_concurrent_tasks agents would each block it inline
                     # here.  Same rationale (and same to_thread shape) as the
                     # run_substrate_recheck / write_heartbeat offloads in
-                    # orchestrator/src/orchestrator/harness.py.
+                    # orchestrator/src/orchestrator/harness.py.  See the INVARIANT
+                    # block above the poll loop before changing how this call is
+                    # spelled.
                     n = await asyncio.to_thread(count_transcript_turns, config_dir, session_id)
                     if n is None:
                         if not unreadable_escape_fired:
@@ -3714,7 +3747,7 @@ async def _run_subprocess(
     # transcript_turns / ended_awaiting_background enrichment on a run that is
     # being torn down anyway.  Note the deliberate contrast with the
     # archive_task_transcripts hook in workflow.py's `_invoke` finally
-    # (:12475-12488), which now treats its to_thread as a liability: that one
+    # (:12475-12487), which now treats its to_thread as a liability: that one
     # is a WRITE whose in-flight transcripts a cancel would lose.  These four
     # are READS with no side effects, so that argument does not transfer and
     # the offload remains correct here.

@@ -14,7 +14,9 @@ Each of these reads globs ``<config_dir>/projects/*/<session_id>.jsonl``, opens
 the whole file and ``json.loads`` every line — a 1.0-1.3 MB JSONL for a mature
 agent session.  Executed inline on the loop by up to ``max_concurrent_tasks``
 agents, that blocking work starves every other coroutine in the process.  The
-sibling rationale is stated at ``orchestrator/src/orchestrator/workflow.py:12399-12403``.
+sibling rationale is stated at ``orchestrator/src/orchestrator/harness.py:7965``
+(``run_substrate_recheck``), and the invariant itself is restated in the source at
+the top of ``_run_subprocess``'s watchdog poll loop.
 
 HOW IT IS TESTED — thread identity, not wall clock
 ──────────────────────────────────────────────────
@@ -44,6 +46,7 @@ tmp_path dirs instead of failing loudly.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 import uuid
@@ -267,10 +270,8 @@ class TestStartupRegimePollOffLoop:
                 )
         finally:
             ticker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await ticker_task
-            except asyncio.CancelledError:
-                pass
 
         assert deltas, 'Expected the blocking transcript read to have run at least once'
         assert deltas[0] >= 1, (
