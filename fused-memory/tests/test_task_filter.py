@@ -3328,6 +3328,89 @@ class TestClauseSplitRe:
             f'returns clauses only.\npattern={_CLAUSE_SPLIT_RE.pattern!r}'
         )
 
+    # ------------------------------------------------------------------ #
+    # consumer set: the safety case is a claim about WHO imports this
+    # ------------------------------------------------------------------ #
+
+    def test_clause_split_re_has_no_out_of_module_consumers(self):
+        """_CLAUSE_SPLIT_RE is module-private BY CONTRACT — scanned, not asserted
+        in prose.
+
+        Widening the splitter is only defensible because of who reads it: both
+        consumers (find_conflicting_task_status_ids,
+        find_present_tense_completion_claim_task_ids) feed early-return
+        SOFT-BLOCK write gates in server/tools.py, where the widening's
+        characterized over-fire
+        (test_widened_clause_tags_both_coordinated_ids, and its mirror in
+        TestFindPresentTenseCompletionClaimTaskIds) costs an author a
+        rephrase-and-retry and nothing else. The argument is restated in the
+        comment block above the constant and in those two tests' docstrings —
+        but a restatement is not an enforcement.
+
+        That contract was already violated once, before anything checked it:
+        the task 3403 review found services/completion_claim_gate.py importing
+        this constant while durably tagging episodes as unverified and filing
+        operator escalations, which made the shipped bounded-blast-radius claim
+        false as written. It now takes STRICT_CLAUSE_BOUNDARY_RE instead. Absent
+        this test, the NEXT such importer would invalidate the safety case just
+        as silently — every existing test would still pass, because they pin the
+        splitter's alphabet and arity, not its blast radius.
+
+        The scan is AST-based rather than textual on purpose: the name appears
+        in prose all over this subsystem (comment blocks, docstrings,
+        cross-references in audit_duplicate_memories), and only a CODE-level
+        reference — an import, a Name, an attribute access — can actually
+        propagate the widening. ast.walk sees none of the prose.
+
+        A new importer must first show its fail-safe direction matches the two
+        soft-block consumers'. If a longer clause on its path costs anything
+        that does not self-heal next cycle — a retired edge, a durable tag, an
+        escalation already in the human queue — it wants
+        STRICT_CLAUSE_BOUNDARY_RE, and adding itself to the allowlist below is
+        the wrong fix.
+        """
+        import ast
+        from pathlib import Path
+
+        package_root = Path(__file__).resolve().parents[1]
+        # Every file allowed to reference the private constant in CODE.
+        allowlist = {'src/fused_memory/reconciliation/task_filter.py'}
+        skip_parts = {'.venv', 'site-packages', '__pycache__'}
+
+        consumers: set[str] = set()
+        scanned = 0
+        for root in (package_root / 'src', package_root / 'scripts'):
+            for path in sorted(root.rglob('*.py')):
+                if skip_parts.intersection(path.parts):
+                    continue
+                scanned += 1
+                tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+                for node in ast.walk(tree):
+                    if (
+                        (isinstance(node, ast.Name) and node.id == '_CLAUSE_SPLIT_RE')
+                        or (isinstance(node, ast.Attribute) and node.attr == '_CLAUSE_SPLIT_RE')
+                        or (
+                            isinstance(node, ast.ImportFrom)
+                            and any(alias.name == '_CLAUSE_SPLIT_RE' for alias in node.names)
+                        )
+                    ):
+                        consumers.add(path.relative_to(package_root).as_posix())
+                        break
+
+        assert scanned > 50, (
+            f'Expected the scan to reach the package sources; only {scanned} files '
+            f'were parsed, so a passing result would be vacuous.\nroot={package_root}'
+        )
+        assert consumers == allowlist, (
+            f'_CLAUSE_SPLIT_RE gained an out-of-module consumer. The widening is '
+            f'only safe for callers that fail toward a SOFT BLOCK; if a longer '
+            f'clause on this path retires an edge, writes a durable tag, or files '
+            f'an escalation, import task_filter.STRICT_CLAUSE_BOUNDARY_RE instead '
+            f'(see completion_claim_gate for the worked example).'
+            f'\nunexpected={sorted(consumers - allowlist)!r}'
+            f'\nmissing={sorted(allowlist - consumers)!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Task-reference grammar — TASK_REF_RE (task 3403)
@@ -4282,6 +4365,52 @@ class TestFindPresentTenseCompletionClaimTaskIds:
         assert find_present_tense_completion_claim_task_ids(text) == {5252}, (
             f'Expected {{5252}} — a clause boundary isolates the aspirational 5253.'
             f'\ntext={text!r}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # clause-granularity caveat (task 3403): the mirror of
+    # TestConflictingTaskStatusFraming.test_widened_clause_tags_both_coordinated_ids
+    # ------------------------------------------------------------------ #
+
+    def test_widened_clause_tags_both_coordinated_ids(self):
+        """The same over-fire as the sibling detector's — pinned HERE because
+        this is the arm that actually rejects an author's write.
+
+        Task 3403 widened _CLAUSE_SPLIT_RE's dot to '\\.(?!\\w)' so dotted
+        technical tokens stop shattering a sentence. Residual (i) of that change
+        is that clauses are longer, so the clause-granularity caveat documented
+        above (a clause naming several ids tags ALL of them — the detector binds
+        no status marker to its NEAREST ref) fires more often. MEASURED on this
+        fixture: set() before the widening, {1985, 1986} after.
+
+        find_conflicting_task_status_ids pins the same fixture, but the
+        consequence differs in kind. This detector feeds
+        _premature_completion_block in server/tools.py, which cross-checks the
+        ids against LIVE statuses and returns
+        premature_completion_claim_write_blocked for any that are non-terminal.
+        So on a sentence like this one — which is CORRECT, and which explicitly
+        says 1986 is still pending — the write is rejected whenever 1986 really
+        is in-progress. That is the residual costing an author a rejected write,
+        not just a tagged id.
+
+        It is a soft block: an early-return error dict with a rephrase hint, no
+        exception and no write, and the bound holds only while this constant's
+        consumer set stays the two soft-block detectors (enforced by
+        TestClauseSplitRe.test_clause_split_re_has_no_out_of_module_consumers).
+        Suppressing the over-fire needs nearest-ref proximity binding — an
+        association-algorithm redesign, filed as a follow-up. Pinning it in both
+        detectors means a later narrowing has to move both trade-offs visibly
+        together.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'df 1985 landed in orchestrator.yaml and task 1986 is still pending.'
+        assert find_present_tense_completion_claim_task_ids(text) == {1985, 1986}, (
+            f'Expected {{1985, 1986}} — the widened clause carries the completion '
+            f'phrase across every id in the sentence, including the one the '
+            f'sentence calls pending.\ntext={text!r}'
         )
 
 
