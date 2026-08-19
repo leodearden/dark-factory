@@ -54,6 +54,36 @@ class ScrollPageBudgetExhausted(RuntimeError):
     """
 
 
+class ScrollPointBudgetExhausted(RuntimeError):
+    """A paged scroll consumed a caller-supplied *max_points* cap.
+
+    Raised, not returned short, for the same reason as its sibling: the
+    primitive never truncates silently (INV-2 no-silent-fail-soft).  A caller
+    that wants a quiet capped read converts this into its own flag; a caller
+    that does not pass ``max_points`` can never see it.
+
+    Deliberately a STANDALONE sibling of :class:`ScrollPageBudgetExhausted` —
+    neither is a subclass of the other.  They are different events and the
+    split is what lets the CALLER choose the posture per event:
+
+    * *max_points* is a cap the caller explicitly asked for, so being stopped
+      by it is an expected outcome that a caller may reasonably fold into a
+      ``truncated`` flag (:meth:`Mem0Backend.scan_payload_text` does exactly
+      this, keeping the flag-and-WARNING posture it had before its walk moved
+      onto the shared pager).
+    * *max_pages* is a safety backstop nobody asked for, so exhausting it is
+      an error that should keep propagating even in a caller that tolerates
+      the first — reporting a backstop truncation as if the caller had asked
+      for it would hand a sweep a plausible-looking undercount.
+
+    An inheritance link in either direction would collapse that choice back
+    into one, and would additionally change what
+    ``scripts/census_memory_metadata``'s ``except CensusScanIncomplete``
+    (an alias of the page-budget class) catches — for a cap the census does
+    not pass.
+    """
+
+
 def is_missing_collection_error(exc: BaseException) -> bool:
     """True iff *exc* is Qdrant's "that collection doesn't exist" 404.
 
