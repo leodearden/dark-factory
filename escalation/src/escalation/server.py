@@ -414,7 +414,10 @@ CATEGORIES = [
 # (the key would no longer canonicalise to what the server matches on), and
 # capping it at mint would either fail a legitimate promote outright or collapse
 # two distinct keys into one L2 — over-folding, the very failure the amendment
-# storm report exists to surface.
+# storm report exists to surface.  The cost is real and named rather than
+# denied: every compact reader pays it, including the dashboard's
+# ``fetch_pins_recovery`` poll (dashboard/.../escalations.py), which asks for
+# ``compact=True`` on a loop and reads nothing but ``pins_recovery``.
 #
 # NO CANONICAL-FORM FIELD IS PROJECTED (task 3998), deliberately: matching moved
 # to the canonical form, but adding a second key would roughly double
@@ -424,10 +427,8 @@ CATEGORIES = [
 # because the server now folds near-duplicates itself, a rebuild sees ONE row
 # where it used to see two.  A rebuild that keeps comparing raw strings is
 # strictly MORE conservative than the server (it re-promotes a near-duplicate,
-# the server folds it and answers ``status:'updated'``), so it stays correct.  The cost is real and named rather than
-# denied: every compact reader pays it, including the dashboard's
-# ``fetch_pins_recovery`` poll (dashboard/.../escalations.py), which asks for
-# ``compact=True`` on a loop and reads nothing but ``pins_recovery``.
+# the server folds it and answers ``status:'updated'``), so it stays correct.
+#
 # The triage-ack fields (triaged_at, triaged_by, triage_note, updated_at) are
 # included so a compact drain can decide stamp-then-skip without a per-record
 # get_escalation round-trip.

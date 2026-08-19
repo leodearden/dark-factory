@@ -1066,6 +1066,26 @@ class EscalationQueue:
         case, in whitespace runs or in punctuation — used to mint two L2s for one
         incident; they now fold into the first.
 
+        THE CALLER CONTRACT WIDENED WITH THAT CHANGE, and a RESOLVE-by-key caller
+        must account for it.  This used to answer "the pending L2 filed under
+        EXACTLY this key"; it now answers "the OLDEST pending L2 whose key is
+        CANONICALLY EQUAL to this one" — which is what the fold path wants, but is
+        strictly weaker than identity.  The one resolve-by-root-cause site in the
+        repo, ``orchestrator.harness.Harness._resolve_watcher_outage_l2``, feeds
+        the returned id straight into ``resolve(..., 'watcher recovered')``, so a
+        pending L2 filed under a case- or trailing-punctuation variant of
+        ``watcher_supervisor_down`` (``WATCHER_SUPERVISOR_DOWN``,
+        ``watcher_supervisor_down.``) would be auto-resolved by a supervisor that
+        never filed it.  Unrealised today — that constant has a single spelling in
+        the repo and the live corpus holds no variant of it, and the plausible
+        hyphenated re-spelling ``watcher-supervisor-down`` does NOT fold anyway
+        (``_`` is a word character and survives, ``-`` becomes a separator, so the
+        two canonicalise apart) — but the widening is real.  A caller that wants
+        IDENTITY rather than a fold must re-check ``esc.root_cause`` against its
+        own key on the returned record; this function deliberately grows no
+        exact-match mode, because one matcher with one policy is the whole point
+        (INV-5).
+
         Algorithm:
         1. Canonicalise *root_cause* via
            :func:`escalation.canonical.canonical_root_cause` — THE single
