@@ -6664,7 +6664,7 @@ class TestRunWorktreeMissing:
 
 
 async def _wait_for_child_pid(
-    pid_file: Path, *, timeout: float = 5.0, interval: float = 0.1,
+    pid_file: Path, *, timeout: float = 30.0, interval: float = 0.1,
 ) -> int:
     """Poll for *pid_file* to appear and return its pid.
 
@@ -6677,6 +6677,25 @@ async def _wait_for_child_pid(
     (task 3851). Mirrors the monotonic-deadline + ``timeout``/``interval``
     convention used by ``wait_for_pgid_file`` in
     test_laptop_warm_verify_boundary.py.
+
+    After task 4109, this poll is the sole remaining startup-timing bound in
+    ``TestRunCancellationReapsChild``. ``timeout`` here is a diagnostic
+    CEILING, not a deadline that must be beaten: the loop returns the
+    instant ``pid_file`` exists, so the value is paid only when the child
+    genuinely never starts. Widening it therefore costs nothing in the green
+    path while removing the last load-sensitive number from the class.
+    Budget: worst case is this 30s arrange ceiling plus
+    ``_assert_child_reaped``'s 5s assertion window plus the contract guard's
+    0.5s startup delay ~= 35.5s, comfortably inside the 60s
+    ``timeout``/``timeout_method = "thread"`` cap configured in
+    ``orchestrator/pyproject.toml``. That headroom matters: a genuine
+    never-started child still surfaces as this function's own ``pytest.fail``
+    message below rather than being replaced by a generic thread-method
+    timeout kill. Contrast ``_assert_child_reaped``'s 5.0s, which is
+    deliberately left unwidened — that is an ASSERTION window (prompt
+    reaping is the property under test), not an arrange wait, and widening
+    it would weaken the assertion rather than merely cost more in the
+    diagnostic-only path.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
