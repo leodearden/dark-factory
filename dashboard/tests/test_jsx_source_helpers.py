@@ -24,6 +24,9 @@ here: blanking real code would disarm every absence assertion downstream.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
 from _dashboard_helpers import extract_function_body, strip_js_comments
 
@@ -91,22 +94,75 @@ class TestExtractFunctionBody:
             f'the prefix-sibling FooEdges shadowed Foo: {body!r}'
         )
 
+    def test_a_brace_inside_a_string_literal_does_not_end_the_body(self) -> None:
+        """`const s = '}';` must not be read as the body's closing brace.
+
+        A depth walk that counts every `{`/`}` character stops at the literal
+        and hands back a TRUNCATED, unbalanced slice — silently.  Everything
+        after the literal (which is most of a real component) then simply is
+        not there, so every ABSENCE probe over the result passes vacuously
+        against a two-line stub: the same permanent false GREEN that
+        raise-on-miss exists to prevent, reached by a different route.
+        """
+        src = "function Foo(a) {\n  const s = '}';\n  const banned = (v / max) * 100;\n}"
+        body = extract_function_body(src, 'Foo')
+
+        assert '(v / max) * 100' in body, (
+            f'the walk stopped at the `}}` inside the string literal, so the rest '
+            f'of the body is missing from {body!r}'
+        )
+        assert body.endswith('\n}'), (
+            f'the body must end at the real closing brace, got {body!r}'
+        )
+
+    def test_a_brace_inside_a_comment_does_not_end_the_body(self) -> None:
+        """The same hazard spelled as a comment rather than a literal."""
+        src = 'function Foo(a) { /* } */ const kept = 1; }'
+        body = extract_function_body(src, 'Foo')
+
+        assert 'const kept = 1;' in body, (
+            f'the walk stopped at the `}}` inside the block comment: {body!r}'
+        )
+
+    def test_an_unbalanced_body_raises_rather_than_returning_a_truncated_slice(self) -> None:
+        """When the body cannot be closed, the answer is an error, never a prefix.
+
+        The literal's `}` is the ONLY `}` in this source, and it is not a
+        closing brace.  Returning the slice up to it would be a well-formed
+        looking string — which is exactly why it has to raise instead.
+        """
+        src = "function Foo(a) {\n  const s = '}';\n  const banned = (v / max) * 100;"
+
+        with pytest.raises(AssertionError, match='Foo'):
+            extract_function_body(src, 'Foo')
+
+    def test_a_declaration_inside_a_comment_is_not_the_declaration(self) -> None:
+        """A commented-out `function Foo(` must not answer a request for `Foo`.
+
+        Real instance: tweaks-panel.jsx documents its edit-mode protocol with a
+        commented-out `function App() {` block, and a scan that does not know
+        about comments slices that prose as if it were the component.
+        """
+        src = '// function Foo(a) { const commented = 1; }\nconst x = 2;'
+
+        with pytest.raises(AssertionError, match='Foo'):
+            extract_function_body(src, 'Foo')
+
     def test_missing_function_raises_with_a_naming_diagnostic(self) -> None:
-        """A miss is LOUD, and the message names the function and the known limits.
+        """A miss is LOUD, and the message names the function that missed.
 
         Returning `''` here (the retired behaviour) made every downstream
         absence assertion pass vacuously — a permanent false GREEN that no
         amount of downstream care can detect.
+
+        Only the NAME is pinned.  The message also spells out the known limits
+        (arrow function, class method) and that prose is worth having, but
+        pinning it would turn a rewording into a red suite while proving
+        nothing further about behaviour.
         """
         src = 'function Foo(a) { const x = 1; }'
 
         with pytest.raises(AssertionError, match='NotDeclared'):
-            extract_function_body(src, 'NotDeclared')
-
-        with pytest.raises(AssertionError, match='arrow function'):
-            extract_function_body(src, 'NotDeclared')
-
-        with pytest.raises(AssertionError, match='class method'):
             extract_function_body(src, 'NotDeclared')
 
     def test_arrow_function_binding_is_not_matched(self) -> None:
@@ -219,6 +275,51 @@ class TestStripJsComments:
             'was treated as a comment and the following code was blanked'
         )
 
+    def test_an_apostrophe_in_jsx_text_raises_instead_of_swallowing_comments(self) -> None:
+        """`don't` in a label is read as an opening quote — that must be LOUD.
+
+        This is the scanner's likeliest real-world blind spot, and its silent
+        failure is nasty in both directions: everything from the apostrophe to
+        the next `'` anywhere later in the file is treated as string contents,
+        so real comments inside that stretch are handed back UNSTRIPPED (prose
+        the consumers then probe as if it were code — a false RED for an
+        absence assertion and a false GREEN for a presence one) and real braces
+        inside it are not counted.
+        """
+        src = (
+            'function Foo(a) {\n'
+            "  return <div>don't panic</div>; // Math.max(...values, 1) was the old scrub\n"
+            '}\n'
+        )
+
+        with pytest.raises(AssertionError, match='never closed'):
+            strip_js_comments(src)
+
+    def test_a_quote_literal_spanning_a_newline_raises(self) -> None:
+        """The same misparse when a later `'` does eventually "close" it.
+
+        JS forbids a raw newline inside a `'`/`"` literal, so a literal that
+        spans one is a misparse rather than a long string — and unlike the
+        unterminated case it leaves the scan looking perfectly healthy.  Here
+        the apostrophe in `don't` pairs with the quote of `'ok'` two lines
+        later, blanking nothing and swallowing the comment between them.
+        """
+        src = "const a = 1; // keep\nconst label = <b>don't panic</b>;\nconst b = 'ok';"
+
+        with pytest.raises(AssertionError, match='spans a newline'):
+            strip_js_comments(src)
+
+    def test_a_template_literal_may_span_newlines(self) -> None:
+        """A backtick literal legitimately spans lines and must NOT raise.
+
+        tabs.jsx contains one, so this is the case the newline rule above has
+        to leave alone.
+        """
+        stripped = strip_js_comments('const t = `line one\nline two`; // Math.max(...v, 1)\n')
+
+        assert 'line two' in stripped, 'the template literal must survive intact'
+        assert 'Math.max(...v' not in stripped, 'the trailing comment is still blanked'
+
     def test_composes_with_the_extractor_over_the_same_source(self) -> None:
         """Stripping first must not cost the extractor the function it needs.
 
@@ -241,7 +342,9 @@ class TestStripJsComments:
 
 # The served assets whose per-module fixture copies conftest.py now owns.
 # One row per asset: adding a tenth shared asset is a one-line change here and
-# a one-line fixture in conftest.py.
+# a one-line fixture in conftest.py — and until BOTH land,
+# `test_every_conftest_body_fixture_has_a_row` below fails, so this table
+# cannot silently fall behind conftest.
 _SHARED_ASSET_FIXTURES = {
     'index_html_body': '/static/redux/index.html',
     'data_js_body': '/static/redux/data.js',
@@ -254,6 +357,74 @@ _SHARED_ASSET_FIXTURES = {
     'tab_tasks_jsx_body': '/static/redux/tab_tasks.jsx',
 }
 
+_CONFTEST_PATH = Path(__file__).with_name('conftest.py')
+
+
+def _dashboard_conftest():
+    """Return the loaded `dashboard/tests/conftest.py` module, found BY PATH.
+
+    Deliberately not `import conftest`: a root-level pytest run loads several
+    subprojects' conftests in one process and they all compete for
+    `sys.modules['conftest']` — the very collision `_dashboard_helpers.py`
+    exists to sidestep (see its module docstring).  Matching on `__file__`
+    names the right one unambiguously, whatever it was registered as.
+    """
+    for module in list(sys.modules.values()):
+        path = getattr(module, '__file__', None)
+        if path and Path(path) == _CONFTEST_PATH:
+            return module
+    raise AssertionError(
+        f'{_CONFTEST_PATH} is not loaded — pytest must import it to collect '
+        f'this file, so either the tests moved or the import mechanism changed'
+    )
+
+
+def _conftest_body_fixture_names() -> set[str]:
+    """Every served-asset fixture conftest defines, by name.
+
+    Name-based ON PURPOSE.  Asking pytest "is this object a fixture?" is the
+    version-unstable question — `@pytest.fixture` marked the function itself
+    with `_pytestfixturefunction` through 8.3 and returns a
+    `FixtureFunctionDefinition` wrapper on 9.x — whereas the `_body` suffix is
+    this suite's own convention for a served-asset fixture and conftest defines
+    nothing else that ends in it.  A future non-fixture `*_body` name there
+    fails this loudly rather than going uncovered, which is the right direction.
+    """
+    return {name for name in vars(_dashboard_conftest()) if name.endswith('_body')}
+
+
+def _resolved_client_scope(request) -> str | None:
+    """The scope of the `_client` fixture definition in effect, or None.
+
+    Both routes into pytest's fixture registry are private API, so this tries
+    them in order and reports None if they have ALL moved, letting the caller
+    xfail with an explanation rather than fail the run for a non-defect:
+
+    1. `FixtureManager.getfixturedefs` — the definition actually in effect,
+       which is the stronger answer.  Its signature changed inside the 8.x line
+       (nodeid string before 8.1, node after), so both are attempted.
+    2. the marker on the fixture object conftest defines — reachable under both
+       the pre-9 (`_pytestfixturefunction`) and 9.x (`_fixture_function_marker`)
+       spellings.  Weaker: it reads the DECLARATION rather than the resolution.
+    """
+    getfixturedefs = getattr(getattr(request, '_fixturemanager', None), 'getfixturedefs', None)
+    if getfixturedefs is not None:
+        for node_arg in (request.node, request.node.nodeid):
+            try:
+                fixturedefs = getfixturedefs('_client', node_arg)
+            except Exception:
+                continue
+            if fixturedefs:
+                # Least-specific first, so the definition in effect is last.
+                return getattr(fixturedefs[-1], 'scope', None)
+
+    fixture = getattr(_dashboard_conftest(), '_client', None)
+    for attr in ('_fixture_function_marker', '_pytestfixturefunction'):
+        marker = getattr(fixture, attr, None)
+        if marker is not None:
+            return getattr(marker, 'scope', None)
+    return None
+
 
 class TestSharedServedAssetFixtures:
     """The `_client` and served-asset fixtures resolve from conftest.py.
@@ -263,7 +434,14 @@ class TestSharedServedAssetFixtures:
     byte-identical copies.
     """
 
-    def test_each_shared_fixture_serves_what_the_app_serves(self, request, _client) -> None:
+    @pytest.mark.parametrize(
+        ('name', 'path'),
+        sorted(_SHARED_ASSET_FIXTURES.items()),
+        ids=sorted(_SHARED_ASSET_FIXTURES),
+    )
+    def test_each_shared_fixture_serves_what_the_app_serves(
+        self, request, _client, name: str, path: str
+    ) -> None:
         """Every row resolves, is served with HTTP 200, and matches that response.
 
         THE STATUS CHECK IS THE LOAD-BEARING ONE — do not weaken it back to a
@@ -277,27 +455,53 @@ class TestSharedServedAssetFixtures:
 
         Non-emptiness is still asserted, but for a DIFFERENT failure that the
         status cannot catch: an asset genuinely served, yet empty.
-        """
-        for name, path in _SHARED_ASSET_FIXTURES.items():
-            body = request.getfixturevalue(name)
-            # One request per row, reused by both assertions below.
-            resp = _client.get(path)
 
-            assert isinstance(body, str), f'fixture {name!r} must yield the response TEXT'
-            assert resp.status_code == 200, (
-                f'fixture {name!r} is wired to {path}, which the app does not '
-                f'serve (HTTP {resp.status_code}) — its consumers would be probing '
-                f'a {len(resp.text)}-character error body, so every absence '
-                f'assertion built on it would pass vacuously'
-            )
-            assert body, (
-                f'fixture {name!r} is empty — {path} is served, but with no '
-                f'content, so every probe built on it would pass vacuously'
-            )
-            assert body == resp.text, (
-                f'fixture {name!r} does not serve {path} — it is wired to the '
-                f'wrong asset, so its consumers are asserting against the wrong file'
-            )
+        PARAMETRIZED, not a loop over the table: two mis-wired rows must report
+        as two failures.  Inside one test the first would mask the rest and the
+        second typo would survive the fix of the first.
+        """
+        body = request.getfixturevalue(name)
+        # One request per row, reused by both assertions below.
+        resp = _client.get(path)
+
+        assert isinstance(body, str), f'fixture {name!r} must yield the response TEXT'
+        assert resp.status_code == 200, (
+            f'fixture {name!r} is wired to {path}, which the app does not '
+            f'serve (HTTP {resp.status_code}) — its consumers would be probing '
+            f'a {len(resp.text)}-character error body, so every absence '
+            f'assertion built on it would pass vacuously'
+        )
+        assert body, (
+            f'fixture {name!r} is empty — {path} is served, but with no '
+            f'content, so every probe built on it would pass vacuously'
+        )
+        assert body == resp.text, (
+            f'fixture {name!r} does not serve {path} — it is wired to the '
+            f'wrong asset, so its consumers are asserting against the wrong file'
+        )
+
+    def test_every_conftest_body_fixture_has_a_row(self) -> None:
+        """`_SHARED_ASSET_FIXTURES` must mirror conftest exactly, both ways.
+
+        Without this the table is a hand-maintained copy of conftest, and the
+        failure it is meant to make impossible reappears one level up: a tenth
+        `*_body` fixture added to conftest and not listed here is served to its
+        consumers with NOTHING checking that it is wired to the asset its name
+        claims — silently uncovered by the very test that exists to cover it.
+
+        The other direction is checked by the same equality: a row naming a
+        fixture conftest no longer defines would otherwise error only as an
+        obscure fixture-lookup failure in the parametrized test above.
+        """
+        rows = set(_SHARED_ASSET_FIXTURES)
+        defined = _conftest_body_fixture_names()
+
+        assert rows == defined, (
+            f'the shared-asset table and conftest have drifted apart — '
+            f'in conftest but unlisted here (so UNCOVERED): '
+            f'{sorted(defined - rows) or "none"}; listed here but not defined '
+            f'in conftest: {sorted(rows - defined) or "none"}'
+        )
 
     def test_client_is_module_scoped_not_function_scoped(self, request) -> None:
         """One app lifespan per consuming MODULE, not per test.
@@ -309,22 +513,25 @@ class TestSharedServedAssetFixtures:
         suite — correct, but a large and gratuitous slowdown that nothing
         would report.
 
-        PRIVATE-API PIN.  `FixtureManager.getfixturedefs` is not public API,
-        so the lookup is asserted to have RESOLVED before its result is read:
-        a moved attribute must fail loudly here rather than degrade into a
-        skipped assertion, which would leave the scope unchecked forever.
+        PRIVATE-API PIN, DEGRADING TO XFAIL.  Every route to a fixture's scope
+        is pytest-internal (see `_resolved_client_scope`), so a pytest bump can
+        move all of them.  That is not a defect in this repo and must not turn
+        the suite red for whoever does the bump — but it must not silently stop
+        checking either, so it xfails with instructions instead of skipping.
         """
-        fixturedefs = request._fixturemanager.getfixturedefs('_client', request.node)
+        scope = _resolved_client_scope(request)
 
-        assert fixturedefs, (
-            'could not resolve a `_client` fixture definition — either conftest '
-            'no longer defines it, or pytest moved '
-            'FixtureManager.getfixturedefs and this pin needs re-verifying'
-        )
-        # Least-specific first, so the definition actually in effect is last.
-        assert fixturedefs[-1].scope == 'module', (
-            f'`_client` is {fixturedefs[-1].scope}-scoped; it must be module-scoped '
-            f'so each consuming module pays exactly one app lifespan'
+        if scope is None:
+            pytest.xfail(
+                'pytest moved every known route to a fixture definition '
+                '(FixtureManager.getfixturedefs and the fixture-marker '
+                'attribute) — re-verify this pin against the new API and update '
+                '_resolved_client_scope; `_client` is UNCHECKED until then'
+            )
+
+        assert scope == 'module', (
+            f'`_client` is {scope}-scoped; it must be module-scoped so each '
+            f'consuming module pays exactly one app lifespan'
         )
 
 
