@@ -1860,10 +1860,11 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
 
     Verifies the essential delegation contract: prompt, system_prompt, model,
     usage_gate, output_schema, and timeout are wired through correctly.
-    Fine-grained knobs (max_turns, permission_mode, disallowed_tools) are
-    implementation details covered by shared/tests/test_cli_invoke.py and, for
-    the schema-carrying invariants specifically, by
-    test_call_judge_cli_passes_judge_verdict_schema below.
+    Fine-grained knobs (permission_mode, disallowed_tools) are implementation
+    details covered by shared/tests/test_cli_invoke.py.  ``max_turns`` is NOT
+    one of them despite this test not asserting it — it is pinned by
+    test_call_judge_cli_passes_judge_verdict_schema below, along with the other
+    schema-carrying invariants.
     """
     from unittest.mock import AsyncMock
 
@@ -1930,12 +1931,14 @@ async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
     - ``output_schema is JUDGE_VERDICT_SCHEMA`` — the contract is attached.
     - ``disallowed_tools == ['*']`` — the judge keeps passing the wildcard
       VERBATIM.  Expanding it into the ``StructuredOutput``-preserving
-      real-builtins deny-list is cli_invoke's job (:1533-1536), not the
-      caller's, so the judge inherits future central fixes instead of pinning a
-      stale copy of the CLI's built-in list.
-    - ``max_turns >= 3`` — the schema mechanism burns a tool-use turn, so
-      ``max_turns=1`` is incompatible with ``--json-schema``
-      (task_curator.py:2366-2372); 3 is the floor both migrated siblings use.
+      real-builtins deny-list is cli_invoke's job (its wildcard→real-builtins
+      expansion over ``_REAL_BUILTIN_TOOLS_DENYLIST``), not the caller's, so the
+      judge inherits future central fixes instead of pinning a stale copy of the
+      CLI's built-in list.
+    - ``max_turns >= 3`` — a cap of 1 leaves no room for the prose turn the
+      model emits before calling ``StructuredOutput``, so the CLI returns
+      ``error_max_turns`` with no payload (see ``_JUDGE_CLI_MAX_TURNS``); 3 is
+      the floor both migrated siblings use.
     - ``system_prompt`` is unchanged — JUDGE_SYSTEM_PROMPT's "## Output Format"
       block stays because it is the ONLY output contract the anthropic/openai
       provider branches have (they never see ``--json-schema``).
@@ -1971,9 +1974,10 @@ async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
     assert call_kwargs['output_schema'] is JUDGE_VERDICT_SCHEMA
     assert call_kwargs['disallowed_tools'] == ['*']
     assert call_kwargs['max_turns'] >= 3, (
-        'max_turns=1 is incompatible with --json-schema: the schema mechanism '
-        'burns a tool-use turn and the CLI returns error_max_turns even when '
-        'the payload is attached (task_curator.py:2366-2372)'
+        'max_turns=1 leaves no room for the prose turn the model emits before '
+        'calling StructuredOutput, so the CLI returns error_max_turns with NO '
+        'payload attached and the call hard-fails (measured 0/6 at max_turns=1 '
+        'on Claude CLI 2.1.236; see _JUDGE_CLI_MAX_TURNS)'
     )
     assert call_kwargs['system_prompt'] == JUDGE_SYSTEM_PROMPT
 
