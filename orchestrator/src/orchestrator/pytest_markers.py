@@ -19,11 +19,13 @@ CONTENT arrives as a string (or None), and the composed entry point takes a
 seam exactly rather than introducing a second I/O seam.
 
 FAIL-SAFE IN EXACTLY ONE DIRECTION.  Any unreadable file, TOML/AST/shlex failure,
-unsupported expression node, or merely-unknown marker resolves to "no widening" —
-i.e. precisely today's behaviour.  Widening is only ever chosen on positive
-proof.  Nothing here raises: ``verify._safe_derive_verify_plan_dict`` swallows
-exceptions and returns None, so a raise on a mid-edit ``pyproject.toml`` would
-silently destroy the ENTIRE plan record.
+unsupported expression node, merely-unknown marker, module shape the per-item
+tier cannot exhaustively enumerate (see :func:`per_item_marker_names`), or a
+module with zero collected items resolves to "no widening" — i.e. precisely
+today's behaviour.  Widening is only ever chosen on positive proof.  Nothing
+here raises: ``verify._safe_derive_verify_plan_dict`` swallows exceptions and
+returns None, so a raise on a mid-edit ``pyproject.toml`` would silently
+destroy the ENTIRE plan record.
 """
 from __future__ import annotations
 
@@ -225,7 +227,10 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     A name ABSENT from this set is therefore UNKNOWN, not absent — which is
     precisely what makes :func:`expression_definitely_deselects`' Kleene
     treatment sound.  Excluding decorators makes the detector under-fire on some
-    genuinely-deselected files, which is the safe direction.
+    genuinely-deselected files, which is the safe direction.  Per-function and
+    per-class decorators are instead handled by the separate, enumeration-guarded
+    tier :func:`per_item_marker_names`, which this function's own contract is
+    unaffected by.
 
     Accepted value shapes: a bare ``pytest.mark.NAME``, a ``pytest.mark.NAME(...)``
     call, or a list/tuple of either.  Only ``tree.body`` is walked (never
@@ -423,17 +428,32 @@ def deselecting_expression_for_targets(
 
     The composed entry point: resolve the module's marker expression
     (:func:`resolve_marker_expression`), then require every target to be
-    provably fully deselected by it (:func:`module_level_marker_names` +
-    :func:`expression_definitely_deselects`).  ALL, not ANY — a single target
-    that still collects means the file-scoped run is not empty.  The EXPRESSION
-    is returned rather than a bool so the caller can name it in the
+    provably fully deselected by it under a TWO-TIER proof, tried in order per
+    target:
+
+    1. the PRIMARY tier — :func:`module_level_marker_names` +
+       :func:`expression_definitely_deselects` — a module-wide lower bound that
+       alone covers test classes, imported test classes and dynamically
+       generated items;
+    2. only if that fails to prove deselection, the FALLBACK tier —
+       :func:`per_item_marker_names` — which enumerates every collected item's
+       own (module-level union per-decorator) marker set and requires EVERY
+       one of them to be individually, definitely deselected.
+
+    The second tier is strictly ADDITIVE: it only ever turns a tier-1 refusal
+    into a proof, never the reverse, so this function can never refuse a
+    target it already accepts today.  ALL, not ANY — across both tiers and
+    across every target — a single target (or a single item within a target)
+    that still collects means the file-scoped run is not empty.  The
+    EXPRESSION is returned rather than a bool so the caller can name it in the
     operator-facing ``PlannedRun.reason``.
 
     *read_source* mirrors ``verify_plan``'s injected ``worktree_reader``
     (``Callable[[str], str | None]``) exactly, so no new I/O seam is introduced
     and its content cache is shared: a touched test file already read for
-    STRUCTURAL detection costs zero extra disk I/O.  A ``None`` answer (missing
-    or unreadable) proves nothing and refuses.
+    STRUCTURAL detection costs zero extra disk I/O.  Each target's source is
+    read EXACTLY ONCE regardless of how many tiers consult it.  A ``None``
+    answer (missing or unreadable) proves nothing and refuses.
 
     COST BOUND: with no ``-m`` expression resolved this performs ZERO target
     reads — it short-circuits BEFORE calling *read_source* at all.  The added
@@ -452,7 +472,12 @@ def deselecting_expression_for_targets(
     if expr is None:
         return None
     for target in targets:
-        guaranteed = module_level_marker_names(read_source(target))
-        if not expression_definitely_deselects(expr, guaranteed):
+        source = read_source(target)
+        if expression_definitely_deselects(expr, module_level_marker_names(source)):
+            continue
+        item_markers = per_item_marker_names(source)
+        if not item_markers:
+            return None
+        if not all(expression_definitely_deselects(expr, markers) for markers in item_markers):
             return None
     return expr
