@@ -738,3 +738,58 @@ def durable_archive_path(
             },
         )
         return None
+
+
+def restore_archived_transcript(
+    archive_root: Path,
+    task_id: str,
+    session_id: str,
+    config_dir: Path,
+) -> Path | None:
+    """Rehydrate *session_id*'s archived transcript into *config_dir*.
+
+    The write-back sibling of :func:`durable_archive_path`, and the inverse of
+    :func:`_archive_one`: the read side gains the one consumer that puts a
+    transcript BACK, so producer and restorer stay on one layout (INV-5).
+    Returns the destination path, or ``None`` when there is nothing to restore.
+
+    Why this exists: the orchestrator recovers a session id from a sidecar and
+    arms ``--resume``, but under pooled warm lanes the lane it re-dispatches
+    into has never seen that session's JSONL — the config dir that held it was
+    destroyed at teardown. Restoring the archived copy makes the resume real
+    instead of a silent fresh start.
+
+    **The destination mirrors the archive's own relative path VERBATIM** —
+    ``<config_dir>/projects/<encoded-cwd>/<session_id>.jsonl``, with the
+    encoded-cwd component carried across untouched rather than re-derived from
+    the new lane's cwd. That is measured, not assumed: on Claude Code CLI
+    2.1.236 a session resumed successfully with its transcript sitting under
+    an entirely unrelated ``projects/<enc>/`` directory while running from a
+    different cwd, so the CLI scans every ``projects/*/`` subdir by session id
+    and ignores both the directory name and the ``cwd`` recorded inside the
+    records. Mirroring is therefore already lane-portable; a cwd re-encoder
+    would be a second implementation obliged to agree with the CLI's private
+    encoding forever, for no behavioural gain.
+
+    The source is located by CALLING :func:`durable_archive_path` — never a
+    second glob. Its I-E contract makes it the sole session-id-keyed lookup
+    into the archive precisely so a restore cannot grow a rival derivation
+    that must agree with it byte-for-byte forever.
+
+    The archived mtime is mirrored onto the restored copy with :func:`os.utime`
+    for the same reason :func:`_archive_one` mirrors it outbound: a copy
+    stamped ``now`` reads to the next archival pass as newer than its own
+    archive and is pointlessly re-archived over it.
+    """
+    archived = durable_archive_path(archive_root, task_id, session_id)
+    if archived is None:
+        return None
+
+    config_dir = Path(config_dir)
+    rel = archived.relative_to(Path(archive_root) / str(task_id))
+    dest = config_dir / 'projects' / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    st = archived.stat()
+    shutil.copyfile(archived, dest)
+    os.utime(dest, (st.st_atime, st.st_mtime))
+    return dest
