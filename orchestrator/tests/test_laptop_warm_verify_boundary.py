@@ -686,6 +686,78 @@ def wait_subtree_gone(pgid: int, *, timeout: float, interval: float = 0.1) -> bo
     return subtree_and_leader_gone(pgid)
 
 
+def kill_holder_tree(
+    proc: subprocess.Popen,
+    *,
+    timeout: float | None = None,
+    _ppid_map_provider=read_ppid_map,
+    _kill=os.kill,
+    _killpg=os.killpg,
+) -> None:
+    """SIGKILL *proc* and every descendant it forked, including start_new_session escapes.
+
+    Mirrors :func:`orchestrator.verify_cancel.cancel_request`'s algorithm --
+    snapshot the ``/proc`` PPID map before sending any signal, collect
+    descendants, SIGKILL them, then SIGKILL+reap the leader -- but walks
+    descendants from ``proc.pid`` rather than a recorded pgid.
+
+    Walking from ``proc.pid`` (rather than
+    ``os.killpg(os.getpgid(proc.pid), SIGKILL)``, the obvious one-liner) is
+    what makes this helper safe at every ``spawn_verify_merge`` call site in
+    this module, including ones that never pass ``--request-id`` (e.g. the
+    lane-lock holder): ``cli.py`` only calls
+    :func:`~orchestrator.verify_cancel.start_own_process_group`
+    (``os.setsid``) inside ``if request_id is not None:``, and
+    ``spawn_verify_merge`` itself passes no ``start_new_session=``, so a
+    holder started without ``--request-id`` stays in the CALLER's (this
+    test process's) own process group -- ``os.getpgid(holder.pid) ==
+    os.getpgid(0)``.  An unconditional ``killpg`` there would SIGKILL the
+    pytest worker running this very test.  The descendant walk has no such
+    hazard: the caller is always an ANCESTOR of the holder, never a
+    descendant -- the same argument
+    :func:`~orchestrator.verify_cancel.start_own_process_group` makes for
+    ``sshd`` never being a descendant of the pgid ``cancel_request`` walks.
+
+    *timeout* defaults to :data:`ROW5_HOLDER_TEARDOWN_CEILING_SECS`,
+    resolved when the call actually runs rather than at import time -- the
+    same lazy-default convention :func:`wait_for_pgid_file` and
+    :func:`wait_subtree_live` use above, needed here because that constant
+    is defined later in this module.  This is the ONLY blocking wait the
+    helper performs (the descendant sweep is pure signalling, no polling
+    loop), so the budget ``_ROW5_WORST_CASE_FIXED_SECS`` derives from stays
+    valid unchanged.
+
+    *_ppid_map_provider* / *_kill* / *_killpg* are private injectable seams,
+    mirroring :func:`cancel_request`'s own convention, so tests can pin the
+    session-escape reap deterministically with zero risk of signalling
+    anything unintended.
+    """
+    timeout = ROW5_HOLDER_TEARDOWN_CEILING_SECS if timeout is None else timeout
+
+    # Snapshot BEFORE sending any signal -- killing the leader first
+    # reparents survivors to init and severs the /proc parent chain, making
+    # a session-escaped descendant unfindable (the same invariant
+    # cancel_request documents at verify_cancel.py:246-250).
+    ppid_map = _ppid_map_provider()
+    descendants = collect_descendants(proc.pid, ppid_map)
+
+    # SIGKILL every descendant.  Already-dead and not-ours are both expected
+    # outcomes, not errors.
+    for pid in descendants:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            _kill(pid, signal.SIGKILL)
+
+    # SIGKILL + reap the leader, unless it has already exited.
+    if proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            _kill(proc.pid, signal.SIGKILL)
+    proc.wait(timeout=timeout)
+
+    if proc.stdin is not None:
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
+
+
 def worktree_base_for(repo: Path) -> Path:
     """Derive worktree_base exactly as the spawned CLI does: GitOps(config.git, repo).worktree_base."""
     config = OrchestratorConfig(project_root=repo)
