@@ -68,6 +68,7 @@ from setup_host_parsing import (
 from setup_host_parsing import (
     declared_orchestrator_units as _units_installed_by_setup_host,
 )
+from setup_host_sections import slice_section
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_orchestrator_unit_parity.py"
@@ -1547,6 +1548,100 @@ def test_parity_gate_distinguishes_exit_2_from_exit_1():
         "non-fatal: drift declines the unit install, it does not abort the "
         "installer.\n" + block
     )
+
+
+# ---------------------------------------------------------------------------
+# The SHARED slicer must anchor on CODE and support a derived end anchor
+# ---------------------------------------------------------------------------
+#
+# This module is about to run its own slices through
+# tests/scripts/setup_host_sections.slice_section rather than its private
+# copies, and it needs two things that module does not yet do. Both are pinned
+# here because this is the suite whose slices depend on them.
+
+# The gate block's own anchor, hoisted to a module constant to match the
+# `_SECTION_8_*` / `_GATE_*` convention the dashboard and fused-memory suites
+# use. CODE, and unique to this site — the assignment the structural sweep in
+# test_check_dashboard_unit_parity.py also keys on.
+_ORCH_GATE_START = "_orch_parity_script="
+_ORCH_GATE_END = "\nfi\n"
+
+
+def test_slice_section_anchors_on_code_not_comment_prose():
+    """The start marker is located on a NON-COMMENT line.
+
+    MEASURED before the fix: `slice_section("_orch_parity_script=", "\\nfi\\n")`
+    started at setup-host.sh:146 — a COMMENT that quotes the anchor while
+    stating the harness constraint — and returned a 189-line slice reaching
+    back over real installer code, including
+    `install -m 0755 ... "$HOME/bin/..."`. A test executing that slice runs it
+    against the developer's REAL home directory: exactly the hazard the comment
+    at setup-host.sh:246-248 warns about, and which only prose prevents.
+
+    setup_host_sections' own docstring already declares "MARKERS ARE CODE, NOT
+    COMMENT PROSE", and the sweep's `_parity_call_sites` already skips
+    `line.lstrip().startswith("#")`. This makes the shared slicer agree with
+    both rather than rely on nobody quoting an anchor.
+    """
+    section = slice_section(_ORCH_GATE_START, _ORCH_GATE_END)
+
+    first = section.splitlines()[0]
+    assert not first.lstrip().startswith("#"), (
+        f"Slice starts on a COMMENT line, not the assignment:\n  {first}"
+    )
+    assert first.startswith(_ORCH_GATE_START), (
+        f"Slice must start at the {_ORCH_GATE_START!r} assignment. Got:\n  {first}"
+    )
+    assert "install -m 0755" not in section, (
+        "The slice reaches back over installer code that writes outside the "
+        "tmp tree. This section is EXECUTED by tests below."
+    )
+    assert '"$HOME/' not in section, (
+        "The slice can reach the developer's real home directory."
+    )
+
+
+def test_slice_section_end_after_runs_through_an_inner_construct():
+    """`end_after` lets a slice terminate at a LATER same-token close.
+
+    The installer slice must end at the column-0 `fi` closing the INSTALL
+    construct, not at the gate's own `fi` — which is the first one after the
+    start marker. Expressed as a third derived ANCHOR
+    (setup_host_parsing.INSTALL_LOOP_CP), deliberately not as a counted
+    occurrence: "the second `fi`" shifts silently the moment the block is
+    reflowed, whereas a missing anchor fails loudly.
+    """
+    section = slice_section(
+        _ORCH_GATE_START, _ORCH_GATE_END, end_after=_INSTALL_LOOP_CP
+    )
+
+    assert section.splitlines()[0].startswith(_ORCH_GATE_START), section.splitlines()[0]
+    assert _INSTALL_LOOP_CP in section, (
+        "end_after must carry the slice THROUGH the install loop's copy."
+    )
+    assert section.rstrip("\n").splitlines()[-1] == "fi", (
+        f"Slice must end on a column-0 `fi`. Got:\n  "
+        f"{section.rstrip(chr(10)).splitlines()[-1]!r}"
+    )
+    # ... and it genuinely ran PAST the gate's own close, which is what the
+    # keyword is for: the plain slice stops strictly earlier.
+    assert len(section) > len(slice_section(_ORCH_GATE_START, _ORCH_GATE_END)), (
+        "end_after produced no more text than the plain slice, so it did not "
+        "skip the gate's own `fi`."
+    )
+
+
+def test_slice_section_missing_end_after_marker_fails_by_name():
+    """A renamed `end_after` anchor fails LOUDLY, naming itself.
+
+    Same contract as the two existing markers. The silent alternative is a
+    slice of the wrong region that runs cleanly and produces a vacuously green
+    test — the "reported green because it never ran" failure this whole harness
+    exists to catch.
+    """
+    bogus = 'if cp "$REPO_ROOT/scripts/$_unit" "$RENAMED_DIR/"; then'
+    with pytest.raises(AssertionError, match=re.escape(bogus)):
+        slice_section(_ORCH_GATE_START, _ORCH_GATE_END, end_after=bogus)
 
 
 # ---------------------------------------------------------------------------
