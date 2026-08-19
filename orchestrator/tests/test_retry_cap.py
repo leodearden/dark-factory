@@ -143,8 +143,9 @@ class TestIsTransientApiRequeue:
         """INV-5: the scheduler must IMPORT the canonical 5xx band rather
         than re-encode ``500 <= n <= 599`` (mirrors the re-export identity
         pin in shared/tests/test_server_error.py)."""
-        import orchestrator.scheduler as sched
         from shared.cli_invoke import is_server_error_status
+
+        import orchestrator.scheduler as sched
 
         assert sched.is_server_error_status is is_server_error_status
 
