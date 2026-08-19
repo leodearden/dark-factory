@@ -14202,3 +14202,166 @@ class TestSoftScopeCensusWarnOnly:
         assert not [
             r for r in caplog.records if 'soft_scope_lint.flagged' in r.getMessage()
         ]
+
+
+@pytest.mark.asyncio
+class TestSoftScopeEnforceMode:
+    """FUSED_SOFT_SCOPE_ENFORCE=1 — the maximum action is still ADVISORY.
+
+    Enforcement here means "stamp a marker and file a non-blocking
+    escalation", never "reject". The measured prose precision of this signal
+    family is 10.7%, so hard-gating on it is forbidden by the task's own
+    scope note.
+    """
+
+    async def _run(self, interceptor, tmp_path, verdict, *, metadata=..., raises=False):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        if raises:
+            stub = MagicMock()
+            stub.adjudicate = AsyncMock(side_effect=RuntimeError('boom'))
+            interceptor._path_scope_adjudicator = stub
+        else:
+            _stub_adjudicator(interceptor, verdict or AdjudicationVerdict())
+        interceptor._scope_violation_escalator = _SpyEscalator()
+        df_root = registry.root_for_project('dark_factory')
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': f'ALL of the asked work is in {df_root}',
+        }
+        if metadata is not ...:
+            kwargs['metadata'] = metadata
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+        return result, kwargs, interceptor._scope_violation_escalator.calls
+
+    async def test_confirmed_misroute_stamps_and_escalates_without_blocking(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        result, kwargs, calls = await self._run(
+            interceptor,
+            tmp_path,
+            AdjudicationVerdict(
+                verdict='reject',
+                reason='the asked work is entirely dark-factory-side',
+                llm_used=True,
+            ),
+        )
+
+        assert result is None, 'enforce mode must still never block creation'
+
+        marker = (kwargs.get('metadata') or {}).get('possible_scope_mismatch')
+        assert marker is not None
+        assert marker['source'] == 'soft-signal'
+        assert marker['suggested_project'] == 'dark_factory'
+        assert marker['matched_paths']
+
+        assert len(calls) == 1
+        call = calls[0]
+        assert call['advisory'] is True
+        assert call['suggested_project'] == 'dark_factory'
+        assert call['suggested_root'] is not None
+        assert call['llm_reason'] == 'the asked work is entirely dark-factory-side'
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [None, '{"execution_class": "code_tdd"}', {'execution_class': 'code_tdd'}],
+    )
+    async def test_metadata_normalisation_is_inherited(
+        self, interceptor, tmp_path, monkeypatch, metadata,
+    ):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', 'yes')
+        _, kwargs, _ = await self._run(
+            interceptor,
+            tmp_path,
+            AdjudicationVerdict(verdict='reject', reason='r'),
+            metadata=metadata,
+        )
+
+        meta = kwargs.get('metadata') or {}
+        assert meta.get('possible_scope_mismatch', {}).get('source') == 'soft-signal'
+
+    @pytest.mark.parametrize(
+        ('verdict', 'failed'),
+        [('allow', False), ('uncertain', False), ('reject', True)],
+    )
+    async def test_only_a_confirmed_misroute_acts(
+        self, interceptor, tmp_path, monkeypatch, verdict, failed,
+    ):
+        """The step-7 polarity contract, observed at the call site."""
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        result, kwargs, calls = await self._run(
+            interceptor,
+            tmp_path,
+            AdjudicationVerdict(verdict=verdict, failed=failed, reason='r'),
+        )
+
+        assert result is None
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert calls == []
+
+    async def test_adjudicator_exception_degrades_to_silence(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        """Infrastructure failure must not manufacture a false accusation."""
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        result, kwargs, calls = await self._run(
+            interceptor, tmp_path, None, raises=True,
+        )
+
+        assert result is None
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert calls == []
+
+    async def test_no_adjudicator_configured_stamps_nothing(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        """The confirmation step is MANDATORY — a soft signal alone never acts."""
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        interceptor._path_scope_adjudicator = None
+        interceptor._scope_violation_escalator = _SpyEscalator()
+        df_root = registry.root_for_project('dark_factory')
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': f'ALL of the asked work is in {df_root}',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert interceptor._scope_violation_escalator.calls == []
+
+    async def test_existing_prose_advisory_keeps_source_prose(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        """The discriminator must actually discriminate: 3119's marker is unmoved."""
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        _soft_scope_registry(interceptor, tmp_path)
+        _stub_adjudicator(interceptor)
+        interceptor._scope_violation_escalator = _SpyEscalator()
+
+        kwargs: dict[str, Any] = {
+            'title': 'investigate a deadlock',
+            'description': 'edit fused-memory/src/harness.py directly',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None
+        marker = (kwargs.get('metadata') or {}).get('possible_scope_mismatch')
+        assert marker is not None
+        assert marker['source'] == 'prose'
