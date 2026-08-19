@@ -8498,6 +8498,7 @@ class Scheduler:
         run_id: str,
         cost_usd: float,
         counts_against_cap: bool = True,
+        api_error_status: int | None = None,
     ) -> int:
         """Append a requeue record and return the new *genuine* cumulative count.
 
@@ -8515,10 +8516,16 @@ class Scheduler:
            signal for the WarmLanePoolExhausted case that drives this route is
            the pool-level structural-exhaustion L2, NOT a per-task retry-cap
            escalation.
-        2. Transient API requeue (HTTP 5xx "agent API error" summaries,
-           classified by ``is_transient_api_requeue``) — routed to
+        2. Transient API requeue (a server-side HTTP 5xx), classified by
+           ``is_transient_api_requeue`` — routed to
            ``_transient_requeue_counts`` (feeds ``config.transient_requeue_cap``);
-           does NOT increment the genuine ``_requeue_counts``.
+           does NOT increment the genuine ``_requeue_counts``.  As of task
+           3315 (PRD contract C2 / INV-1) this classification is FIELD-FIRST
+           on the structured *api_error_status* threaded here from
+           ``TerminalReport -> TaskReport``; the ``agent API error: HTTP <n>``
+           marker in *reason* is retained only as the legacy fallback for
+           phases that do not yet carry the field.  The param defaults
+           ``None``, so every existing caller is unchanged.
         3. Genuine requeue (the default) — increments ``_requeue_counts``
            (feeds ``config.requeue_cap``); behaves exactly as before.
 
@@ -8536,7 +8543,7 @@ class Scheduler:
         if not counts_against_cap:
             # Route 1: history-only — neither counter moves.
             pass
-        elif is_transient_api_requeue(reason):
+        elif is_transient_api_requeue(reason, api_error_status=api_error_status):
             t_count = self._transient_requeue_counts.get(task_id, 0) + 1
             self._transient_requeue_counts[task_id] = t_count
         else:
