@@ -110,6 +110,44 @@ class TestIsTransientApiRequeue:
         cls = classify_agent_failure(result)
         assert is_transient_api_requeue(f'Planning failed: {cls.summary}') is True
 
+    # --- Task 3315 (PRD contract C2 / INV-1): FIELD-FIRST routing ----------
+    # The parametrizations above are unchanged and become the legacy-reason
+    # fallback coverage; these pin the structured field as the primary route.
+
+    @pytest.mark.parametrize('status', [500, 503, 529, 599])
+    def test_field_alone_routes_transient(self, status: int):
+        """The reason carries NO ``agent API error: HTTP <n>`` marker, so the
+        regex CANNOT be what routes this — only the structured field can."""
+        assert is_transient_api_requeue(
+            'implementer produced zero output', api_error_status=status,
+        ) is True
+
+    @pytest.mark.parametrize('status', [400, 401, 404, 429, None])
+    def test_non_5xx_field_with_marker_free_reason_is_false(self, status):
+        """4xx keeps its carve-outs (429's deliberate non-transient policy
+        survives the rewrite), and a ``None`` field is never evidence — the
+        absence of a structured status is not a server error."""
+        assert is_transient_api_requeue(
+            'implementer produced zero output', api_error_status=status,
+        ) is False
+
+    def test_legacy_marker_only_still_routes(self):
+        """A reason produced BEFORE the sibling PRD tasks γ/η/θ move each
+        phase onto the field still routes transient with no kwarg at all —
+        the fallback, and the old positional call shape, both stay live."""
+        assert is_transient_api_requeue(
+            'Planning failed: agent API error: HTTP 503',
+        ) is True
+
+    def test_inv5_single_source_5xx_predicate(self):
+        """INV-5: the scheduler must IMPORT the canonical 5xx band rather
+        than re-encode ``500 <= n <= 599`` (mirrors the re-export identity
+        pin in shared/tests/test_server_error.py)."""
+        import orchestrator.scheduler as sched
+        from shared.cli_invoke import is_server_error_status
+
+        assert sched.is_server_error_status is is_server_error_status
+
 
 # --- Counter mechanics --------------------------------------------------------
 
