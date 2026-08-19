@@ -387,6 +387,36 @@ class TestFindPathsRightBoundary:
         assert find_paths('crates/x.RS', ('crates/',)) == ['crates/']
         assert find_paths('docs/.env', ('docs/',)) == ['docs/']
 
+    def test_single_letter_extension_is_not_an_extension(self):
+        """Task 4160: a SINGLE-CHARACTER "extension" no longer lexes as a path.
+
+        The retention half of this test is the point of it: a naive ``{2,6}``
+        floor applied to the OLD dot-free stem class (``[A-Za-z0-9_\\-]*``)
+        would break the legitimate multi-dot filename 'gui/a.b.txt', because
+        the stem cannot reach past the first dot to expose 'txt' as the
+        extension — the matcher can only ever offer 'b', which then fails the
+        floor.  These retention assertions are what force the stem to widen
+        to a dot-inclusive class rather than a bare bound change.
+        """
+        # WIN — the reported dotted-initials false positive, plus its
+        # generalisation.
+        assert find_paths('not a backend/A.I. problem', ('backend/',)) == []
+        assert find_paths('backend/U.S. policy', ('backend/',)) == []
+
+        # COST: NEW missed-detection residue — a one-character extension is
+        # no longer an extension.  'crates/x.c' and 'backend/A.I.' are
+        # structurally identical, so no rule closes one and keeps the other
+        # — this is the accepted cost.
+        assert find_paths('crates/x.c', ('crates/',)) == []
+        assert find_paths('crates/x.h', ('crates/',)) == []
+
+        # RETENTION — the trap this test exists to catch.
+        assert find_paths('gui/a.b.txt', ('gui/',)) == ['gui/']
+        assert find_paths('see gui/package.json.', ('gui/',)) == [
+            'gui/'
+        ]  # sentence-final period
+        assert find_paths('docs/.env', ('docs/',)) == ['docs/']
+
     # ------------------------------------------------------------------
     # RETENTION: the task-1494 LEFT boundary survives the right-boundary change
     # ------------------------------------------------------------------
