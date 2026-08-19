@@ -29,7 +29,12 @@ keys on, so both mechanisms share one anchor.
 
 NOTHING HERE TOUCHES REAL SYSTEMD. `repo_root` and `unit_dir` are always
 tmp_path trees supplied by the caller, and `systemctl` is always a PATH stub
-that exits 0 — the sliced sections do call `systemctl --user enable`.
+that exits 0 — the sliced sections do call `systemctl --user enable`. That stub
+also RECORDS its argv into tmp_path, readable via `systemctl_calls` /
+`enabled_units`, so the enable half of an install is observable rather than
+merely assumed. Always, with no opt-in flag: a caller that never reads the log
+is unaffected, and a flag would give the harness two behaviours to reason about
+while letting a future caller silently lose the observability.
 
 Generalized from the reference implementation at
 tests/scripts/test_check_orchestrator_unit_parity.py:1044-1119 (task 3424).
@@ -59,6 +64,11 @@ _SHIMS = (
     "warn()  { printf 'WARN %s\\n' \"$*\"; }\n"
     "fail()  { printf 'FAIL %s\\n' \"$*\"; }\n"
 )
+
+
+# Where the systemctl stub appends one line per invocation, relative to the
+# caller's tmp_path.
+SYSTEMCTL_LOG = "systemctl-calls.log"
 
 
 def _preamble(repo_root: pathlib.Path, unit_dir: pathlib.Path) -> str:
@@ -184,14 +194,21 @@ def run_section(
 ) -> subprocess.CompletedProcess:
     """Execute *section_text* under bash with setup-host.sh's own preamble.
 
-    A stub `systemctl` that exits 0 is written into a tmp dir and PREPENDED to
-    PATH, so a slice containing `systemctl --user enable` neither touches the
-    host nor fails under `set -e`.
+    A stub `systemctl` is written into a tmp dir and PREPENDED to PATH, so a
+    slice containing `systemctl --user enable` neither touches the host nor
+    fails under `set -e`. It RECORDS its argv (one call per line) into
+    ``tmp_path / SYSTEMCTL_LOG`` before exiting 0 — see the module docstring
+    for why that is unconditional.
     """
     stub_bin = tmp_path / "stub-bin"
     stub_bin.mkdir(exist_ok=True)
     systemctl = stub_bin / "systemctl"
-    systemctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {tmp_path / SYSTEMCTL_LOG}\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
     systemctl.chmod(0o755)
 
     script = tmp_path / "section.sh"
@@ -206,6 +223,29 @@ def run_section(
     return subprocess.run(
         ["bash", str(script)], capture_output=True, text=True, env=env
     )
+
+
+def systemctl_calls(tmp_path: pathlib.Path) -> list[list[str]]:
+    """Every `systemctl` invocation the run made, as argv token lists."""
+    log = tmp_path / SYSTEMCTL_LOG
+    if not log.is_file():
+        return []
+    return [
+        line.split() for line in log.read_text(encoding="utf-8").splitlines() if line
+    ]
+
+
+def enabled_units(tmp_path: pathlib.Path) -> list[str]:
+    """The units passed to `systemctl ... enable <unit>` during the run.
+
+    Token-matched rather than substring-matched: `enable` naming one unit must
+    never be satisfied by a line naming a different one.
+    """
+    enabled: list[str] = []
+    for argv in systemctl_calls(tmp_path):
+        if "enable" in argv:
+            enabled.extend(argv[argv.index("enable") + 1 :])
+    return enabled
 
 
 def usage_error_checker(script_name: str, usage_flags: str, rejected: str) -> str:
