@@ -116,10 +116,17 @@ Status                Exit  Meaning and remedy
 
 Exit ``1`` (:data:`EXIT_RUN_FAILED`) is reserved for a run that could not
 complete at all — the store was unreachable, the requested corpus is
-unsatisfiable, or stdout could not be written (a downstream reader closed the
-pipe, as in ``--verify | head``; a full disk on ``> report.txt``). It is
-deliberately outside the table above so a caller can tell "the corpus is wrong"
-from "the check never ran".
+unsatisfiable, stdout could not be written (a downstream reader closed the
+pipe, as in ``--verify | head``; a full disk on ``> report.txt``), the manifest
+could not be written to ``--out`` (a full disk or an unwritable directory on
+the artifact path — distinct from the stdout case, which is a reader going away
+rather than the artifact failing to land), or a store defect blocked
+re-derivation under ``--verify`` (a duplicated episode uuid or an unparseable
+``created_at`` on a live row). That last one is 1 and not 5 on purpose: the
+artifact is fine, so no verdict about it was reached at all, and the row named
+in the ``error: ...`` line is what needs fixing. Exit 1 is deliberately outside
+the table above so a caller can tell "the corpus is wrong" from "the check
+never ran".
 
 A stdout failure can strike AFTER the manifest was written, on the trailing
 ``manifest: ...`` line. The exit code cannot express that, so the ``error: ...``
