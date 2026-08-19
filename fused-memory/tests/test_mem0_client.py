@@ -565,7 +565,7 @@ class TestMem0BackendPayloadFilterSingleHome:
         built = backend._build_payload_filter({}, text_needles=['alpha'])
 
         assert isinstance(built, qmodels.Filter)
-        assert built.should and len(built.should) == 1
+        assert isinstance(built.should, list) and len(built.should) == 1
 
     @pytest.mark.parametrize(
         ('filters', 'needles'),
@@ -875,7 +875,11 @@ class TestMem0BackendScrollCollectionPages:
         scripts/consolidate_namespace_families all pass no cap, so none of
         them can ever see ScrollPointBudgetExhausted.
         """
-        pages = [([self._make_mock_point(f'id-{i}')], f'off-{i}') for i in range(5)]
+        # Annotated because the comprehension alone narrows the offset to str,
+        # which then rejects the None-offset terminal page appended below.
+        pages: list[tuple[list, object]] = [
+            ([self._make_mock_point(f'id-{i}')], f'off-{i}') for i in range(5)
+        ]
         pages.append(([self._make_mock_point('last')], None))
         client = _paging_client(pages)
 
