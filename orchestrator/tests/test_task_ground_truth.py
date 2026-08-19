@@ -1096,6 +1096,37 @@ class TestClaimantRunIdIsComposedOrNone:
         )
         return (await resolver.derive_truth(tid)).live_claimant
 
+    async def test_well_formed_raw_payload_resolves_to_composed_identity(
+        self, tmp_path: Path,
+    ) -> None:
+        """POSITIVE CONTROL for the whole ``_write_plan_lock`` family.
+
+        Every other test fed by that helper asserts a DEGRADED outcome
+        (``run_id is None``), which a lock the resolver simply cannot SEE
+        would satisfy just as well as a guard that actually fired.  This one
+        asserts the opposite — a well-formed, fresh, live-pid payload MUST
+        compose — so if the helper ever writes somewhere the resolver does not
+        read, that goes red HERE instead of silently hollowing out the
+        ``except (ValueError, OSError)`` arm, the non-dict guard,
+        ``_lock_fresh`` and ``_pid_alive`` coverage its siblings provide
+        (task 4028).
+        """
+        _write_plan_lock(tmp_path, {
+            'session_id': 'sess-control-abc123',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+            'run_id': 'run-control-abc',
+        })
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        assert claimant.run_id == compose_claimant_run_id(
+            'run-control-abc', 'sess-control-abc123', os.getpid(),
+        )
+        assert claimant.session_id == 'sess-control-abc123'
+
     async def test_lock_with_run_id_resolves_to_composed_identity(
         self, tmp_path: Path,
     ) -> None:
