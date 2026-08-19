@@ -1293,9 +1293,14 @@ def test_render_report_capped_coverage_states_coded_digests_not_drawn_digests():
     report = _render(mining_result=_storm_capped_mining_result())
 
     coverage_line = _coverage_line(report)
-    assert "14" in coverage_line, "digests actually coded (10 healthy + 4 from the storm) must be stated"
-    assert "20" in coverage_line, "the drawn count must still be present, not silently dropped"
-    assert "drawn" in coverage_line.lower(), "the 20 figure must be labelled as drawn, not as coded/mined"
+    # One ordered-substring assertion, not separate bare-digit checks: two
+    # independent "14 in line" / "20 in line" checks would both still pass
+    # against a transposed rendering ("coded 20 of 14 ... drawn") -- exactly
+    # the off-by-field regression this test exists to catch.
+    assert "coded 14 of 20 session digest(s) drawn" in coverage_line, (
+        "digests actually coded (10 healthy + 4 from the storm) must lead, "
+        "with the drawn count still present alongside it, labelled as drawn"
+    )
     assert "mined 20 session digest(s)" not in coverage_line, (
         "the buggy rendering reported the drawn count as though all 20 had "
         "been coded -- this must no longer render"
@@ -2116,7 +2121,65 @@ def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
     # assert instead what this path actually renders (nothing), rather than
     # adding a cap this test never passed just to force it to appear.
     assert outcome.stop_reason == "exhausted"
-    assert "coverage" not in report_text.lower()
+    # Scoped to the Saturation section, not the whole report: synthesis_md,
+    # matrix_md and the cost note are assembled elsewhere by other fakes, so
+    # a whole-report check would fail this storm-detection test for reasons
+    # that have nothing to do with storms or capped coverage.
+    saturation_section = report_text.split("## Saturation", 1)[1].split("##", 1)[0]
+    assert "- coverage:" not in saturation_section
+
+
+def test_run_census_storm_batch_capped_reports_coded_of_drawn_end_to_end(tmp_path):
+    # Amendment: every render_report-level test above drives the coded/drawn
+    # split against a HAND-BUILT MiningResult (_storm_capped_mining_result),
+    # so BatchStats.succeeded/total are asserted by construction, never
+    # observed coming out of a real coding run. This drives the same storm
+    # shape as test_run_census_storm_batch_is_logged_and_noted_in_report
+    # above (2 of the batch's 3 digests fail to parse) through the real
+    # coder.code_digests pipeline, but with max_batches=1 so the
+    # capped-coverage branch (not just the uncapped cost note) renders.
+    batch = [
+        _hand_digest("bad-1", "x"),
+        _hand_digest("bad-2", "y"),
+        _hand_digest("dup-1", "z"),
+    ]
+
+    def storm_invoke(prompt, model):
+        if "bad-1" in prompt or "bad-2" in prompt:
+            return "not valid JSON -- this coding call fails to parse"
+        return json.dumps({"matches": [{"entry_id": "entry-a"}], "candidates": []})
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(storm_invoke),
+        batch_source=[batch],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+        max_batches=1,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    # The cap check fires right after the one batch is coded, before the
+    # (now-empty) source is ever polled again -- "capped", not "exhausted".
+    assert outcome.stop_reason == "capped"
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    coverage_line = _coverage_line(report_text)
+    assert "coded 1 of 3 session digest(s) drawn" in coverage_line, (
+        "only dup-1 coded successfully; bad-1 and bad-2 failed to parse -- "
+        "this count must come from a real coder.code_digests run, not a "
+        "hand-built BatchStats fixture"
+    )
+    lowered = coverage_line.lower()
+    assert "2 digest(s) failed to code" in lowered, (
+        "the 2 digests that failed to parse must be named as a shortfall on "
+        "this line, not just inferable from the per-batch bullet below it"
+    )
+    assert "no signal" in lowered
 
 
 # ---------------------------------------------------------------------------
