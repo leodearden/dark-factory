@@ -3492,67 +3492,76 @@ def test_sanitization_preserves_launcher_stamped_record_identity(
 # ===========================================================================
 
 
-def _write_absent_setsid_shim(bin_dir: pathlib.Path, marker: pathlib.Path) -> None:
-    """Write a fake ``setsid`` that records its argv to *marker*, then exits
-    127 WITHOUT exec'ing its arguments.
+def _write_setsid_shim(
+    bin_dir: pathlib.Path, marker: pathlib.Path, *, passthrough: bool
+) -> None:
+    """Write a fake ``setsid`` that appends its argv to *marker* (one line per
+    call), then either refuses to run its arguments or passes them through.
 
-    This reproduces stock macOS, where ``setsid(1)`` -- a util-linux tool --
-    is simply not installed: bash resolves nothing for the ``setsid ...``
-    command, the program it was asked to run never executes, and the caller
-    sees 127. ``_base_env`` prepends *bin_dir* to PATH, so this shim shadows
-    the host's real /usr/bin/setsid and the condition becomes reproducible
-    headlessly on the Linux merge worker instead of only on a Darwin host.
+    ``passthrough=False`` -- exit 127 WITHOUT exec'ing the arguments. This
+    reproduces stock macOS, where ``setsid(1)`` -- a util-linux tool -- is
+    simply not installed: the program setsid was asked to run never executes
+    and the caller sees 127. ``_base_env`` prepends *bin_dir* to PATH, so the
+    shim shadows the host's real /usr/bin/setsid and the condition becomes
+    reproducible headlessly on the Linux merge worker instead of only on a
+    Darwin host.
+
+    ``passthrough=True`` -- record, then ``exec "$@"`` so the launch still
+    proceeds. The positive counterpart, used by the scope guard below to
+    prove a branch still routes its launch through setsid.
 
     The argv marker is a positive signal a genuinely setsid-free PATH could
-    not give: it lets a test assert the mac lane invokes setsid ZERO times,
-    which is the actual fix contract.
+    not give: it lets a test assert that a branch invoked setsid ZERO times,
+    or that a particular launch was not prefixed with it -- which is the
+    actual fix contract. Note that spawn-claude.sh's ``_detach`` probes
+    setsid functionally (``setsid true``) before using it, so the marker also
+    records that probe's own argv line whenever the probe runs -- read it
+    per-line (``_recorded_argv_lines``), not as a whole.
     """
+    tail = 'exec "$@"' if passthrough else "exit 127"
     p = bin_dir / "setsid"
     p.write_text(
         f'#!/usr/bin/env bash\n'
         f'echo "$*" >> {marker!s}\n'
-        f'exit 127\n'
+        f'{tail}\n'
     )
     p.chmod(0o755)
 
 
-def _write_recording_setsid_shim(bin_dir: pathlib.Path, marker: pathlib.Path) -> None:
-    """Write a PASS-THROUGH fake ``setsid``: record argv to *marker*, then
-    ``exec "$@"`` so the launch still proceeds.
+def _recorded_argv_lines(marker: pathlib.Path) -> list[str]:
+    """Return the argv lines an argv-recording shim appended to *marker*.
 
-    The positive counterpart to ``_write_absent_setsid_shim``, used only by
-    the scope guard below to prove that a branch still routes its launch
-    through setsid.
+    Empty list when the shim was never invoked at all (the marker file is
+    only created by the first call), so callers can assert absence and
+    content through one accessor.
     """
-    p = bin_dir / "setsid"
-    p.write_text(
-        f'#!/usr/bin/env bash\n'
-        f'echo "$*" >> {marker!s}\n'
-        f'exec "$@"\n'
-    )
-    p.chmod(0o755)
+    if not marker.exists():
+        return []
+    return [line for line in marker.read_text().splitlines() if line.strip()]
 
 
-def _write_fake_open(bin_dir: pathlib.Path, marker: pathlib.Path) -> None:
-    """Write a fake macOS ``open`` that records its argv to *marker*, runs the
-    script it was handed, and returns immediately.
+def _write_fake_open(
+    bin_dir: pathlib.Path, marker: pathlib.Path, *, rc: int = 0
+) -> None:
+    """Write a fake macOS ``open`` that records its argv to *marker* and
+    returns immediately -- running the script it was handed when *rc* is 0.
 
     Mirrors real ``open -a Terminal <script>``: LaunchServices takes the
     handoff and ``open`` exits without waiting for Terminal.app -- which is
-    precisely why the mac lane is already detached and needs no setsid.
-    Linux ships no ``open`` at all, so this fake is what makes the branch
-    runnable headlessly.
+    precisely why the mac lane is already detached and needs no setsid, and
+    why it is the one sibling lane that can check its launcher's exit status
+    without giving up fire-and-forget. Linux ships no ``open`` at all, so
+    this fake is what makes the branch runnable headlessly.
 
-    Deliberately does NOT redirect the backgrounded script's stdio, so the
-    caller's captured pipe stays exposed and this fake doubles as a
-    pipe-holding check on spawn-claude.sh's own ``</dev/null >/dev/null
-    2>&1 &`` -- the same property
-    test_sibling_mode_foreground_emulator_is_fire_and_forget relies on.
+    A nonzero *rc* stands in for a genuine launch failure (Terminal.app
+    absent or unregistered, an unreadable tmpscript, a LaunchServices
+    error): the argv is still recorded, but nothing is executed.
     """
     p = bin_dir / "open"
     p.write_text(
         f'#!/usr/bin/env bash\n'
         f'echo "$*" >> {marker!s}\n'
+        f'[ {rc:d} -ne 0 ] && exit {rc:d}\n'
         f'shift 2\n'
         f'bash "$1" &\n'
         f'exit 0\n'
@@ -3587,7 +3596,7 @@ def test_mac_terminal_sibling_launches_child_without_setsid(
     _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=20)
 
     setsid_marker = tmp_path / "setsid_argv"
-    _write_absent_setsid_shim(bin_dir, setsid_marker)
+    _write_setsid_shim(bin_dir, setsid_marker, passthrough=False)
     open_marker = tmp_path / "open_argv"
     _write_fake_open(bin_dir, open_marker)
 
@@ -3605,31 +3614,38 @@ def test_mac_terminal_sibling_launches_child_without_setsid(
     assert not done_existed_at_return, (
         "the mac-terminal sibling lane must return WITHOUT waiting for the "
         "child to finish -- the done-marker must not exist yet at the moment "
-        "spawn-claude.sh returns, and the caller's stdout/stderr pipe must "
-        "not be held open by an undetached child"
+        "spawn-claude.sh returns"
     )
 
-    # THE RED ASSERTION: the child must actually have been launched. Before
-    # the fix the `setsid` prefix fails 127 into /dev/null, `open` is never
-    # invoked, and this marker never appears.
-    _wait_for_path_scaled(started, 5)
+    # THE RED GATE, waited on FIRST: reaching `open` at all is where the
+    # regression actually surfaces, so the failure carries that diagnosis
+    # rather than the generic started-marker timeout that would otherwise
+    # fire one assertion later and say nothing about the cause.
+    try:
+        _wait_for_path_scaled(open_marker, 5)
+    except AssertionError as exc:
+        raise AssertionError(
+            "the mac-terminal sibling lane must reach `open` -- with a "
+            "`setsid` prefix in place it never does, because setsid is "
+            "absent on macOS and the 127 is swallowed by >/dev/null"
+        ) from exc
 
-    assert open_marker.exists(), (
-        "the mac-terminal sibling lane must reach `open` -- with the setsid "
-        "prefix in place it never does, because setsid is absent on macOS"
-    )
     recorded_open = open_marker.read_text()
     assert "-a Terminal" in recorded_open, (
         f"`open` must still be handed the Terminal.app application flag, "
         f"got {recorded_open!r}"
     )
 
-    # Checked AFTER the started-wait above, so any invocation at all would
-    # already have been recorded by the time this runs.
-    setsid_argv = setsid_marker.read_text() if setsid_marker.exists() else ""
-    assert not setsid_marker.exists(), (
+    # Reaching `open` is necessary but not sufficient -- the child itself
+    # must actually come up.
+    _wait_for_path_scaled(started, 5)
+
+    # Checked AFTER the waits above, so any invocation at all would already
+    # have been recorded by the time this runs.
+    assert _recorded_argv_lines(setsid_marker) == [], (
         f"the mac-terminal branch must not invoke `setsid` at all -- macOS "
-        f"does not ship it -- but it was called with {setsid_argv!r}"
+        f"does not ship it -- but it was called with "
+        f"{_recorded_argv_lines(setsid_marker)!r}"
     )
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
@@ -3670,7 +3686,7 @@ def test_xterm_sibling_still_detaches_via_setsid(tmp_path: pathlib.Path) -> None
     _write_foreground_terminal(bin_dir, "xterm")
 
     setsid_marker = tmp_path / "setsid_argv"
-    _write_recording_setsid_shim(bin_dir, setsid_marker)
+    _write_setsid_shim(bin_dir, setsid_marker, passthrough=True)
 
     env = _base_env(bin_dir, "xterm")
     env["CLAUDE_SPAWN_MODE"] = "sibling"
@@ -3687,13 +3703,148 @@ def test_xterm_sibling_still_detaches_via_setsid(tmp_path: pathlib.Path) -> None
 
     _wait_for_path_scaled(started, 5)
 
-    assert setsid_marker.exists(), (
+    recorded = _recorded_argv_lines(setsid_marker)
+    assert recorded, (
         "the xterm sibling lane launches a real child process that must "
         "outlive this script, so it must STILL be prefixed with `setsid` -- "
         "the mac-terminal fix must not be applied to this branch"
     )
-    recorded = setsid_marker.read_text().strip()
-    assert recorded.split()[0] == "xterm", (
-        f"`setsid` must be the prefix of the xterm launch itself, got "
-        f"{recorded!r}"
+    # Per-line, and by the launch line specifically: _detach also probes
+    # `setsid true` for availability before using it, so mere marker
+    # presence would be satisfied by the probe alone.
+    assert any(line.split()[0] == "xterm" for line in recorded), (
+        f"`setsid` must prefix the xterm launch ITSELF, not merely be probed "
+        f"for availability; recorded calls: {recorded!r}"
+    )
+
+
+def test_custom_launcher_sibling_launches_child_on_a_setsid_free_host(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The custom-launcher (`*)`) sibling lane must launch its child on a host
+    where `setsid` does not work -- the same false-liveness bug the
+    mac-terminal lane had, one case below it.
+
+    macOS is the platform whose missing setsid(1) motivated this fix, and any
+    macOS user who points $CLAUDE_TERMINAL_CMD at a launcher other than
+    Terminal (iTerm, wezterm, alacritty, a wrapper script) lands here, not in
+    the mac-terminal branch: a literal ``setsid "${_emcmd[@]}" ...`` fails 127
+    into /dev/null, the emulator is never launched, and resolve_sibling stamps
+    the record RUNNING regardless. Point-patching only the mac-terminal branch
+    would have left that live.
+
+    The fix is spawn-claude.sh's ``_detach``, whose functional setsid probe
+    degrades to the plain ``&`` + stdio redirect when setsid cannot run --
+    a weaker detach than a new session, but a child that is actually
+    launched rather than a silent no-launch. Note this test does NOT assert
+    setsid is unused in general (see the xterm scope guard above, which
+    requires the opposite where setsid works) -- only that the LAUNCH is not
+    routed through a setsid that cannot run it.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    started = tmp_path / "started"
+    done = tmp_path / "done"
+    _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=20)
+    # "custom-term" matches no known emulator name, so it routes to the *)
+    # branch -- the same convention DETACHING_NAMES documents at the top.
+    _write_foreground_terminal(bin_dir, "custom-term")
+
+    setsid_marker = tmp_path / "setsid_argv"
+    _write_setsid_shim(bin_dir, setsid_marker, passthrough=False)
+
+    env = _base_env(bin_dir, "custom-term")
+    env["CLAUDE_SPAWN_MODE"] = "sibling"
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    # Snapshot immediately -- fire-and-forget must survive the degraded
+    # (setsid-less) detach too, so the caller is not left holding the pipe.
+    done_existed_at_return = done.exists()
+    assert not done_existed_at_return, (
+        "the custom-launcher sibling lane must return WITHOUT waiting for "
+        "the child to finish, even when it had to detach without setsid"
+    )
+
+    # THE RED ASSERTION: before the fix the literal `setsid` prefix fails 127
+    # into /dev/null and the emulator is never launched at all. Wrapped so
+    # the regression reports that diagnosis rather than a bare marker
+    # timeout that says nothing about the cause.
+    try:
+        _wait_for_path_scaled(started, 5)
+    except AssertionError as exc:
+        raise AssertionError(
+            "the custom-launcher sibling lane must launch its child even "
+            "where setsid cannot run -- a literal `setsid` prefix drops the "
+            "launch entirely, failing 127 into /dev/null"
+        ) from exc
+
+    recorded = _recorded_argv_lines(setsid_marker)
+    assert not any(line.split()[0] == "custom-term" for line in recorded), (
+        f"the launch must not be routed through a setsid that cannot run it "
+        f"-- doing so drops the launch entirely; recorded calls: {recorded!r}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.RUNNING, (
+        f"expected a best-effort refresh to RUNNING, got {record.status}"
+    )
+
+
+def test_mac_terminal_sibling_open_failure_yields_127_not_a_running_record(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A failed ``open`` in the mac-terminal sibling lane must surface as the
+    127 launcher-failure verdict, not as a RUNNING record.
+
+    Dropping the setsid prefix closes one cause of a false RUNNING stamp; a
+    discarded ``open`` exit status is another one of the same shape
+    (Terminal.app absent or unregistered, an unreadable tmpscript, a
+    LaunchServices error). ``open`` returns as soon as LaunchServices takes
+    the handoff, so this lane -- uniquely among the sibling lanes -- can
+    branch on that status without giving up fire-and-forget, which is why it
+    runs in the foreground rather than behind a trailing ``&``.
+
+    127 is the script's documented genuine-launcher-failure code and is what
+    the branch's own non-sibling path already returns for the same failure.
+    The record is left LAUNCHING (never refreshed to RUNNING) for the normal
+    stale-pid reaper.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    started = tmp_path / "started"
+    done = tmp_path / "done"
+    _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=20)
+
+    setsid_marker = tmp_path / "setsid_argv"
+    _write_setsid_shim(bin_dir, setsid_marker, passthrough=False)
+    open_marker = tmp_path / "open_argv"
+    _write_fake_open(bin_dir, open_marker, rc=1)
+
+    env = _base_env(bin_dir, "mac-terminal")
+    env["CLAUDE_SPAWN_MODE"] = "sibling"
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 127, (
+        f"a failed `open` must yield the 127 launcher-failure verdict, got "
+        f"{result.returncode}; stderr: {result.stderr.decode()}"
+    )
+    assert _recorded_argv_lines(open_marker), (
+        "the branch must have attempted the launch at all -- otherwise this "
+        "test would pass for the wrong reason"
+    )
+    assert not started.exists(), (
+        "nothing may have been launched when `open` itself failed"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.LAUNCHING, (
+        f"a session that never launched must not be stamped RUNNING -- the "
+        f"record must stay LAUNCHING for the stale-pid reaper, got "
+        f"{record.status}"
     )
