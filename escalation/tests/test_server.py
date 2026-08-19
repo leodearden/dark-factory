@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.models import Escalation
 from escalation.queue import _MAX_AMENDMENTS, EscalationQueue
@@ -28,6 +29,8 @@ from escalation.server import (
     _AMENDMENT_TRUNCATION_STORM_THRESHOLD,
     _AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS,
     _COMPACT_ESCALATION_FIELDS,
+    _ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID,
+    _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD,
     create_server,
 )
 
@@ -7330,4 +7333,221 @@ class TestPromoteToL2CanonicalFold:
 
         assert result.get('status') == 'created', (
             f'a non-Latin root_cause carries real identity and must mint: {result}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestRootCauseOverfoldReport: over-folding gets a HEARER (task 3998)
+# ---------------------------------------------------------------------------
+
+
+class TestRootCauseOverfoldReport:
+    """An L2 addressed by many DISTINCT spellings of one canonical key gets reported.
+
+    Canonicalising the root-cause match folds MORE promotes by design, so its
+    failure mode is OVER-folding: distinct causes silently merged under one
+    canonical key.  `root_cause_variants` is the durable primary fact (INV-8);
+    this is the thresholded, never-fatal NOTIFICATION layered on it (INV-4).
+
+    The existing amendment-truncation report cannot substitute: it only fires
+    once an L2 has already blown the 20-entry amendment cap, so it is deaf to an
+    over-fold at five or six distinct causes.
+
+    Dedupe is disabled here deliberately, for the same reason the truncation
+    suite disables it: under the stock infra_issue config a second report would
+    FOLD into the first and a "filed exactly once" assertion would pass for the
+    wrong reason.
+    """
+
+    @staticmethod
+    async def _fold(server, spelling: str, member: str) -> dict[str, Any]:
+        """Fold into the same canonical cluster under a DISTINCT spelling."""
+        return await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': [member],
+            'root_cause': spelling,
+            'evidence': f'evidence for {spelling}',
+            'summary': f'summary for {spelling}',
+        })
+
+    @staticmethod
+    def _spelling(i: int) -> str:
+        """Distinct spellings that all canonicalise to ONE key.
+
+        Only case and punctuation vary, so `canonical_root_cause` maps every one
+        of them onto 'watcher lease stolen' — which is precisely the over-fold
+        shape the report exists to surface.
+        """
+        return ['Watcher lease stolen', 'watcher-lease-stolen', 'WATCHER LEASE STOLEN',
+                'Watcher.Lease.Stolen', 'watcher_lease stolen'.replace('_', ':'),
+                'WATCHER-lease.STOLEN', 'watcher   lease   stolen',
+                'Watcher:Lease:Stolen'][i]
+
+    def _overfold_reports(self, queue: EscalationQueue) -> list[Escalation]:
+        return [
+            e for e in queue.get_pending()
+            if e.task_id == _ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID
+        ]
+
+    @pytest.mark.asyncio
+    async def test_report_fires_exactly_once_at_the_threshold_crossing(
+        self, tmp_path: Path,
+    ):
+        """(a)(b)(c) Silent below; ONE report at the crossing; nothing further after."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
+        )
+
+        created = await self._fold(server, self._spelling(0), 'esc-l1-0')
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+        l2_id = created['id']
+
+        # (a) Below the threshold: nothing filed.  The record's own spelling is
+        # seeded by the first fold, so variant N is reached after N-1 folds.
+        for i in range(1, _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD - 1):
+            folded = await self._fold(server, self._spelling(i), f'esc-l1-{i}')
+            assert folded['status'] == 'updated', f'Expected a fold, got {folded}'
+            assert self._overfold_reports(queue) == [], (
+                f'nothing may be filed below the threshold (after variant {i + 1})'
+            )
+
+        record = queue.get(l2_id)
+        assert record is not None
+        assert len(record.root_cause_variants) == (
+            _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD - 1
+        ), f'setup wrong: {record.root_cause_variants!r}'
+
+        # (b) The fold that CROSSES files exactly one report.
+        crossing_index = _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD - 1
+        crossed = await self._fold(
+            server, self._spelling(crossing_index), f'esc-l1-{crossing_index}',
+        )
+        assert crossed['status'] == 'updated', f'the fold must still succeed: {crossed}'
+
+        reports = self._overfold_reports(queue)
+        assert len(reports) == 1, (
+            f'expected exactly ONE report at the crossing, got {[r.id for r in reports]}'
+        )
+        report = reports[0]
+        assert report.severity == 'info', f'a notification, not a page: {report.severity!r}'
+        assert report.category == 'infra_issue', f'got {report.category!r}'
+        assert report.task_id == _ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID, (
+            'the condition is system-scoped and must not be attributed to '
+            f"whichever promote crossed it: {report.task_id!r}"
+        )
+        # The L2 id and the count are what make the report actionable.
+        assert l2_id in report.summary or l2_id in report.detail, (
+            f'the report must name the L2: {report.summary!r} / {report.detail!r}'
+        )
+        assert str(_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD) in (
+            report.summary + report.detail
+        ), f'the report must name the distinct count: {report.summary!r}'
+        # A causal claim must read as a hypothesis, never as fact.
+        assert 'Hypothesis:' in report.detail, (
+            f'the diagnosis must be marked as a hypothesis: {report.detail!r}'
+        )
+
+        # (c) Further folds past the threshold do NOT re-file: the crossing is
+        # once per L2, and the record's running count stays the primary fact.
+        for i in range(
+            crossing_index + 1, crossing_index + 3,
+        ):
+            more = await self._fold(server, self._spelling(i), f'esc-l1-{i}')
+            assert more['status'] == 'updated', f'Expected a fold, got {more}'
+        assert len(self._overfold_reports(queue)) == 1, (
+            'the report must fire once per L2, not once per fold past the threshold'
+        )
+
+    @pytest.mark.asyncio
+    async def test_report_failure_can_never_fail_the_fold(self, tmp_path: Path):
+        """(d) NEVER FATAL — a raising report costs a notification, not the fold."""
+        import escalation.server as server_mod
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
+        )
+
+        created = await self._fold(server, self._spelling(0), 'esc-l1-0')
+        assert created['status'] == 'created'
+
+        # Break the submit path the report helper uses.  The fold itself must be
+        # entirely unaffected.
+        original = server_mod._submit_or_dedupe
+
+        def exploding(*args: Any, **kwargs: Any):
+            raise RuntimeError('report submit is broken')
+
+        server_mod._submit_or_dedupe = exploding
+        try:
+            for i in range(1, _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD):
+                folded = await self._fold(server, self._spelling(i), f'esc-l1-{i}')
+                assert folded['status'] == 'updated', (
+                    f'a broken report must not fail the fold: {folded}'
+                )
+                assert folded['id'] == created['id']
+                assert f'esc-l1-{i}' in folded['members'], (
+                    f'the member must still be linked: {folded}'
+                )
+        finally:
+            server_mod._submit_or_dedupe = original
+
+    @pytest.mark.asyncio
+    async def test_record_fields_are_the_primary_fact_with_reporting_suppressed(
+        self, tmp_path: Path,
+    ):
+        """(e) INV-8 — the counts are assertable from the RECORD, never by log-scrape."""
+        import escalation.server as server_mod
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
+        )
+
+        created = await self._fold(server, self._spelling(0), 'esc-l1-0')
+        l2_id = created['id']
+
+        original = server_mod._report_root_cause_overfold
+        server_mod._report_root_cause_overfold = lambda *a, **k: None
+        try:
+            for i in range(1, _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD):
+                await self._fold(server, self._spelling(i), f'esc-l1-{i}')
+        finally:
+            server_mod._report_root_cause_overfold = original
+
+        record = queue.get(l2_id)
+        assert record is not None
+        distinct = (
+            len(record.root_cause_variants) + record.root_cause_variants_truncated
+        )
+        assert distinct == _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD, (
+            'the true distinct count must be readable from the record with the '
+            f'report suppressed entirely, got {record.root_cause_variants!r}'
+        )
+        # And every spelling really is one canonical cause.
+        assert len({canonical_root_cause(v) for v in record.root_cause_variants}) == 1
+
+    @pytest.mark.asyncio
+    async def test_distinct_causes_do_not_trip_the_report(self, tmp_path: Path):
+        """CONTROL: separate L2s accumulate one variant each and file nothing.
+
+        Without this the suite could pass on a report that fires on fold VOLUME
+        rather than on distinct-spelling accumulation within one cluster.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
+        )
+
+        for i in range(_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD + 2):
+            result = await _promote_to_l2(server, **{
+                **_L2_DEFAULTS,
+                'member_ids': [f'esc-l1-{i}'],
+                'root_cause': f'genuinely-distinct-cause:{i}',
+            })
+            assert result['status'] == 'created', f'expected distinct L2s, got {result}'
+
+        assert self._overfold_reports(queue) == [], (
+            'distinct causes in distinct L2s are not an over-fold'
         )
