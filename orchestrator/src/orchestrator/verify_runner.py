@@ -2859,8 +2859,14 @@ class DriftDetector:
                 ),
                 detail=(
                     f'merge_sha={merge_sha!r} local_runner={local.name!r} '
-                    f'({local_passed}) remote_runner={remote.name!r} ({remote_passed}). '
-                    f'A remote PASS / local FAIL split can land unverified code on main.'
+                    f'({local_passed}, local_category={local_category!r}) '
+                    f'remote_runner={remote.name!r} '
+                    f'({remote_passed}, remote_category={remote_category!r}). '
+                    f'A remote PASS / local FAIL split can land unverified code on main. '
+                    f'A category of "merge_flake_suppressed" on either arm means that '
+                    f"arm's green came from an isolated flake-suppression rerun "
+                    f'(verify.apply_merge_flake_suppression), not a clean first-pass '
+                    f'run -- weigh that when deciding which host is wrong.'
                 ),
                 suggested_action='Re-prove laptop env via run_verdict_parity; call pool.clear_quarantine after parity is restored.',
             )
@@ -2875,6 +2881,8 @@ class DriftDetector:
             verdict=DriftVerdict.DIVERGE,
             local_passed=local_passed,
             remote_passed=remote_passed,
+            local_category=local_category,
+            remote_category=remote_category,
             escalated=escalated,
             quarantined=True,
         )
