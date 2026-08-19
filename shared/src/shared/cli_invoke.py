@@ -3701,8 +3701,26 @@ async def _run_subprocess(
     #     success→failure downgrade.
     # Both fail safe when the transcript can't be located (records None →
     # transcript_turns None, ended_awaiting_background False).
+    # OFF-LOOP (task 3925) — the single largest of the four transcript reads:
+    # this one parses the FULL record list (not just a turn count) at the end of
+    # every successful run, so it is paid by every agent on every completion.
+    #
+    # Cancellation: unlike the other three sites this one is OUTSIDE both try
+    # blocks, so a CancelledError here is NOT caught by the
+    # `except asyncio.CancelledError:` handler above and propagates directly.
+    # That is safe and needs no asyncio.shield: comm_task has already completed
+    # (proc.communicate() returned), so the child has exited and been reaped —
+    # there is no process group left to orphan.  The only loss is the
+    # transcript_turns / ended_awaiting_background enrichment on a run that is
+    # being torn down anyway.  Note the deliberate contrast with
+    # workflow.py:12405-12410, which now treats its to_thread as a liability:
+    # that one is a WRITE whose in-flight transcripts a cancel would lose.
+    # These four are READS with no side effects, so that argument does not
+    # transfer and the offload remains correct here.
     transcript_records = (
-        read_transcript_records(config_dir, session_id) if (config_dir and session_id) else None
+        await asyncio.to_thread(read_transcript_records, config_dir, session_id)
+        if (config_dir and session_id)
+        else None
     )
     if transcript_records is None:
         transcript_turns = None
