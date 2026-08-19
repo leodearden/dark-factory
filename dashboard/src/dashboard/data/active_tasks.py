@@ -550,6 +550,16 @@ async def _shape_one_project(
     # exact regression that fallback was added to prevent — on every render
     # that path serves. done_count is the map's cheapest product, not its only
     # one.
+    #
+    # Its COST is bounded by fetch_statuses' own 5 s TTL cache rather than by a
+    # gate here. That matters because BOTH /api/v2/dashboard/tasks and
+    # /api/v2/dashboard/scheduler reach this function (via
+    # collect_tasks_with_counts) on every 3 s data.js poll: uncached, one
+    # unconditional call per root became two full-population get_statuses reads
+    # per root per poll — trading wire bytes for backend queries, which is not
+    # the trade this change set out to make. Cached, the two endpoints share
+    # one read and consecutive polls collapse. See
+    # tasks._FETCH_STATUSES_TTL_SECONDS for why 5 s.
     fetched, status_map = await asyncio.gather(
         fetch_tasks(client, config, project_root, statuses=sorted(_ACTIVE_STATUSES)),
         fetch_statuses(client, config, project_root),
@@ -796,9 +806,22 @@ async def collect_tasks_with_counts(
     its ``_shape_one_project`` call, mirroring the single-``now`` threading.
 
     Prefer this over calling ``collect_active_tasks`` and
-    ``collect_done_counts`` concurrently: it halves per-project MCP
-    round-trips and guarantees that DONE_COUNTS matches the same snapshot
-    as the ACTIVE_TASKS rows.
+    ``collect_done_counts`` concurrently: it still avoids a redundant
+    per-project fan-out (one walk of the roots, one shared *now*, one shared
+    runtime snapshot) rather than two independent ones.
+
+    It no longer HALVES the round-trips, and DONE_COUNTS is no longer the same
+    snapshot as the rows — both claims stood before the narrowing and neither
+    survives it, so do not rely on either:
+
+    * per project this issues the 2-3 calls enumerated in
+      ``_PER_PROJECT_MCP_CALLS``, not half of what the two collectors cost;
+    * DONE_COUNTS comes from the compact ``fetch_statuses`` map while the rows
+      come from ``fetch_tasks``. Both are cached, at 5 s and 20 s
+      respectively, so the count can be up to ~15 s NEWER than the rows it
+      sits beside. The skew is one-directional by construction (the count is
+      never the staler half) and is the same skew ``fetch_tasks``' own
+      "Data consistency" note documents.
     """
     effective_now = resolve_now(now)
     # The deadline is taken BEFORE the runtime fan-out, so that fan-out is
