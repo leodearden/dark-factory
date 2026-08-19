@@ -774,7 +774,7 @@ def run_in_new_session(
     pgid = p.pid
     try:
         out, err = p.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as expired:
         _kill_process_group(p, pgid)
         try:
             out, err = p.communicate(timeout=_POST_KILL_DRAIN_SECS)
@@ -782,10 +782,23 @@ def run_in_new_session(
             # Something still holds the pipe open despite the group kill.
             # Give up on the output rather than on the timeout: the caller
             # asked for a bound and gets one.
+            #
+            # Deliberately NOT bound with `as`: Python unbinds an `as` name at
+            # the end of its except block, so reusing the name here would clear
+            # the binding the re-raise below depends on.
             p.kill()
             _release_abandoned_child(p)
             out, err = ('', '') if text else (b'', b'')
-        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err) from None
+        # `expired.timeout`, not the `timeout` parameter, and not by accident.
+        # The parameter is `float | None`, but typeshed pins both
+        # `TimeoutExpired.__init__(cmd, timeout: float, ...)` and the attribute
+        # `TimeoutExpired.timeout: float` — and reaching this handler already
+        # implies a real timeout was passed, since `communicate(timeout=None)`
+        # never raises. So sourcing it from the caught exception is the honest
+        # narrowing, and is runtime-identical: CPython raises
+        # `TimeoutExpired(self.args, orig_timeout)`. Do not "simplify" it back
+        # to `timeout` — that is a reportArgumentType error (task 3960).
+        raise subprocess.TimeoutExpired(cmd, expired.timeout, output=out, stderr=err) from None
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
