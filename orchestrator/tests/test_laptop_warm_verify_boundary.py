@@ -748,7 +748,14 @@ def kill_holder_tree(
         pgid = os.getpgid(proc.pid)
     except ProcessLookupError:
         pgid = None
-    ppid_map = _ppid_map_provider()
+    # A /proc read losing a race with process exit degrades to an empty map
+    # rather than propagating -- this helper runs almost exclusively inside
+    # a finally block, where an exception would mask whatever real assertion
+    # failure the caller was cleaning up after.
+    try:
+        ppid_map = _ppid_map_provider()
+    except OSError:
+        ppid_map = {}
     descendants = collect_descendants(proc.pid, ppid_map)
 
     # SIGKILL every descendant.  Already-dead and not-ours are both expected
@@ -757,11 +764,21 @@ def kill_holder_tree(
         with contextlib.suppress(ProcessLookupError, PermissionError):
             _kill(pid, signal.SIGKILL)
 
-    # SIGKILL + reap the leader, unless it has already exited.
+    # SIGKILL + reap the leader, unless it has already exited (proc.poll()
+    # is not None -- already reaped, nothing to signal).
     if proc.poll() is None:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             _kill(proc.pid, signal.SIGKILL)
-    proc.wait(timeout=timeout)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # A leader that will not die must not mask the test's own failure by
+        # raising out of a finally -- surface it loudly instead.
+        warnings.warn(
+            f'kill_holder_tree: leader pid={proc.pid} did not exit within '
+            f'{timeout}s of SIGKILL',
+            stacklevel=2,
+        )
 
     # Guarded killpg backstop for same-group stragglers -- fires ONLY when
     # the holder is PROVABLY its own group leader (setsid ran, i.e. the CLI
