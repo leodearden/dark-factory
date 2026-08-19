@@ -27,15 +27,16 @@ middleware itself already do.
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastmcp.exceptions import ToolError
+from shared.mcp_markup_middleware import RepairPolicy
+from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
 
 from fused_memory.server.markup_guard import install_markup_guard
 from fused_memory.server.tools import create_mcp_server
-from shared.mcp_markup_middleware import RepairPolicy
-from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
 
 _PROJECT_ID = 'dark_factory'
 _PROJECT_ROOT = '/project'
@@ -87,7 +88,7 @@ def _pass_through(mock_service: AsyncMock, method: str) -> None:
     getattr(mock_service, method).return_value = result
 
 
-def _build_guarded_server(*methods: str) -> tuple[object, AsyncMock]:
+def _build_guarded_server(*methods: str) -> tuple[Any, AsyncMock]:
     """A real bundled-FastMCP server with the boundary guard installed.
 
     Shape copied from tests/test_tool_safe_wrapper.py::_build_server_with_tool:
