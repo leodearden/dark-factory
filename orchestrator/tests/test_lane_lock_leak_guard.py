@@ -3242,17 +3242,28 @@ class TestCancelledResetNeverOrphansTheLaneLock:
 # Task 3783 absorbed this at the two ACQUIRE-TIMEOUT sites, keyed on an EMPTY
 # result (`_settled_lane_lock_holder_pids`).  It deliberately did not cover the
 # two `holder_pids is None` branches — `_lane_lock_holder_facts` (git_ops.py
-# ~1868) and `_lane_lock_self_owned_leak` (git_ops.py ~2939) — which take their
-# OWN unabsorbed one-shot read.  That residue is live and measurable: the
-# staging read at `test_live_in_process_span_is_not_a_leak` goes through
+# ~1886) and `_lane_lock_self_owned_leak` (git_ops.py ~2932) — which take their
+# OWN one-shot read.  BE PRECISE ABOUT WHAT THAT RESIDUE IS.  Both production
+# call sites pass `holder_pids` explicitly (git_ops.py ~3331/~3343 and
+# ~10871/~10895, sourced from `_settled_lane_lock_holder_pids`, deliberately so
+# that one snapshot drives both the predicate and the message it is rendered
+# beside — task 3081).  So the `None` branches are reached only from TESTS, and
+# the cases below are a CONTRACT PIN on a public-ish two-argument seam, NOT a
+# reproduction of a live production misclassification.
+#
+# What they DO reproduce for real is the suite flake this task was filed on:
+# the staging read at `test_live_in_process_span_is_not_a_leak` goes through
 # `wait_for_lane_lock_holder` (task 3184's fix), but the two-arg
 # `_lane_lock_self_owned_leak(lock_path, 1.0)` calls beside it do not.  The
 # staging read was absorbed; the read UNDER TEST was not.
 #
-# In production that miss is not a flaky assert but a wrong classification: a
-# genuine self-owned B13 leak — the incident this whole module exists for —
-# read as ordinary foreign contention, with the forensics clause degrading to
-# "the kernel reports no FLOCK holder" in exactly the case it was written for.
+# And what the fix buys in PRODUCTION is upstream of here: every read inside
+# `_settled_lane_lock_holder_pids` is now a K-read union, so a lossy read no
+# longer starts its 0.5s settle poll by itself, and each of the ~25 iterations
+# behind it is tolerant in turn.  The pins below assert that a direct
+# two-argument caller inherits that same tolerance for free — which is the
+# whole scope-item-2 claim, since the fix lives in the reader all four sites
+# bind rather than in any one site.
 #
 # The reader under test is the GENUINE one (`verify_cancel.lane_lock_holder_
 # pids`), merely bound to a chunked table, because this is a root-cause task:
@@ -3298,6 +3309,12 @@ def _chunk_skipping_reader(
 class TestChunkSkippedReadStillClassifiesASelfOwnedLeak:
     """The `holder_pids is None` branches task 3783 left unabsorbed.
 
+    A CONTRACT PIN on the two-argument seam, not a production repro — both
+    production call sites pass `holder_pids` explicitly (see the block above).
+    What it asserts is that a caller taking its OWN read inherits exactly the
+    tolerance the settled path gets, because the fix lives in the reader all
+    four sites bind rather than in any one site.
+
     Both consequences are pinned, because they are separate defects sharing one
     cause: the PREDICATE silently flips (a leak reads as foreign contention),
     and the FORENSICS clause degrades to the very "no FLOCK holder" wording
@@ -3315,6 +3332,13 @@ class TestChunkSkippedReadStillClassifiesASelfOwnedLeak:
         human-escalating leak report the incident needed never fires.  The
         lane here is genuinely leaked (unregistered fd, no rendezvous); the
         only thing wrong is the snapshot.
+
+        Driven through the two-argument seam, where the read happens INSIDE the
+        predicate: that is the sharpest place to observe the flip, and it is
+        the arrangement the suite itself uses (`_lane_lock_self_owned_leak(
+        lock_path, 1.0)`).  Production reaches the same predicate with a
+        snapshot read tolerantly upstream, so this pins the equivalence of the
+        two routes rather than a live outage.
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
 
@@ -3331,8 +3355,9 @@ class TestChunkSkippedReadStillClassifiesASelfOwnedLeak:
             assert leak is not None, (
                 'a self-owned lane-lock leak was classified as foreign '
                 'contention because ONE chunked /proc/locks read dropped our '
-                'row — the merge then defers quietly for up to four hours, '
-                'the exact outage shape of the incident'
+                'row — wherever this predicate consumes a lossy snapshot, that '
+                'verdict is what routes a permanent leak into DF 3003\'s '
+                'bounded contended-defer arm instead of the loud report'
             )
 
             facts = git_ops_mod._lane_lock_holder_facts(lock_path)

@@ -2033,11 +2033,17 @@ async def _settled_lane_lock_holder_pids(
       TIME, which is why its trigger is emptiness and why it stays after the
       reader is fixed.
 
-    The reader layer strictly shrinks how often this one is reached; it cannot
-    replace it.  Deleting this helper as redundant would restore the "an empty
-    read contradicts the timeout that produced it" gap, and deleting the
-    reader's confirm loop would re-expose every OTHER call site — including the
-    two ``holder_pids is None`` branches below, which never had a settle layer.
+    The reader layer strictly shrinks how often this one is reached — the very
+    first read below is now a K-read union, so a lossy read no longer starts a
+    0.5s poll by itself — and it hardens each of the ~25 iterations that a
+    genuinely empty table still costs.  It cannot REPLACE this layer: deleting
+    this helper as redundant would restore the "an empty read contradicts the
+    timeout that produced it" gap.  Deleting the reader's confirm loop would
+    re-expose both layers' reads AND the two ``holder_pids is None`` branches
+    below, which never had a settle layer — though be accurate about those
+    two: no production call site takes them (both acquire-timeout sites pass
+    *holder_pids* explicitly), so they are a test-reached seam whose tolerance
+    is inherited, not a live production exposure.
 
     WHAT IT ABSORBS.  ``/proc/locks`` is a seq_file the kernel serves one PAGE
     per ``read(2)`` regardless of the caller's buffer (a 13062-byte table took
@@ -2174,15 +2180,18 @@ def _lane_lock_holder_facts(
     a second independent read could observe a different one and quietly
     misdescribe the decision during exactly the forensics this exists for.
 
-    ``None`` READS HERE, and that read is now CHUNK-TOLERANT (task 4227).  This
-    branch is one of the two task 3783 deliberately did not cover with
-    :func:`_settled_lane_lock_holder_pids`, so before the reader was fixed it
-    depended on a single lucky read: a chunked skip degraded this clause to
-    "the kernel reports no FLOCK holder" precisely when the lane WAS contended,
-    dropping the holder pid+pgid — the one datum DF 3003/3081 had to
-    reconstruct by hand.  Nothing was rewired to fix it; the tolerance lives in
-    the reader every site here binds, so all four consume it BY CONSTRUCTION
-    and per-site divergence is impossible.  That binding is itself pinned by
+    ``None`` READS HERE, and that read is now CHUNK-TOLERANT (task 4227) — but
+    note WHO takes it.  Both production callers pass *holder_pids* positionally
+    for the reason above (task 3081), so this branch is reached only from
+    TESTS; what the reader fix buys in production is that the snapshot handed
+    in was itself read tolerantly, by :func:`_settled_lane_lock_holder_pids`.
+    The tolerance here is the same property arriving by a different route: a
+    chunked skip would otherwise degrade this clause to "the kernel reports no
+    FLOCK holder" precisely when the lane WAS contended, dropping the holder
+    pid+pgid — the one datum DF 3003/3081 had to reconstruct by hand.  Nothing
+    was rewired to get it; the tolerance lives in the reader every site here
+    binds, so all four consume it BY CONSTRUCTION and per-site divergence is
+    impossible.  That binding is itself pinned by
     ``test_git_ops_binds_the_fail_safe_wrapper_not_the_strict_core``.
     """
     pids = lane_lock_holder_pids(lock_path) if holder_pids is None else holder_pids
@@ -3263,20 +3272,32 @@ class GitOps:
         predicate never evaluated.  ``None`` reads the table here instead,
         keeping direct callers (and the tests) two-argument.
 
-        THE ``None`` READ IS CHUNK-TOLERANT (task 4227), and this is the branch
-        where that matters most.  ``/proc/locks`` is served one page per
-        ``read(2)`` with each read restarting the walk from a positional index,
-        so a single read can silently DROP our row (measured: 1.54%, 144/9337,
-        under 24 churners).  The lane lock is ``LOCK_EX``, so the target inode
-        has at most ONE holder row — losing it surfaces as ``[]``, layer (1)
-        evaluates ``self_pid not in []``, and a genuine self-owned B13 leak is
-        returned as ordinary foreign contention, deferring quietly for up to
-        four hours.  That read SUCCEEDS, so no strict/errno-keyed variant can
-        see it.  Task 3783's settle poll covers the two acquire-timeout sites
-        only; this branch and ``_lane_lock_holder_facts``' were left
-        unabsorbed, and the fix therefore went into the READER both bind rather
-        than into either site — all four are tolerant by construction, and no
-        per-site divergence is possible.
+        EVERY read behind this predicate IS CHUNK-TOLERANT (task 4227), and
+        that is where the production win is — NOT in the ``None`` branch below.
+        ``/proc/locks`` is served one page per ``read(2)`` with each read
+        restarting the walk from a positional index, so a single read can
+        silently DROP our row (measured: 1.54%, 144/9337, under 24 churners).
+        The lane lock is ``LOCK_EX``, so the target inode has at most ONE
+        holder row — losing it surfaces as ``[]``, layer (1) evaluates
+        ``self_pid not in []``, and a genuine self-owned B13 leak reads as
+        ordinary foreign contention.  That read SUCCEEDS, so no strict /
+        errno-keyed variant can see it.  BOTH production callers reach here
+        with *holder_pids* already supplied by
+        :func:`_settled_lane_lock_holder_pids`, so what the reader fix hardens
+        for them is that helper's OWN reads: its first read is now a K-read
+        union (so the 0.5s settle poll is ENTERED less often at all), and each
+        of the ~25 poll iterations behind it is tolerant in turn.
+
+        The ``None`` branch itself is reached only from TESTS today — every
+        production call site passes *holder_pids* explicitly, deliberately, for
+        the snapshot-sharing reason above.  Its coverage in
+        ``test_lane_lock_leak_guard`` is therefore a CONTRACT PIN on a
+        public-ish seam, not a fix for a live outage: it says that a direct
+        two-argument caller gets the same tolerance the settled path gets.
+        That equivalence is free rather than wired, and that is the point — the
+        fix went into the READER every site binds rather than into any site, so
+        all four are tolerant by construction and per-site divergence is
+        impossible.
 
         WHY THE UNION IS SAFE FOR A LOUD PREDICATE.  The reader returns the
         union of the pids seen across its K back-to-back reads, which can only
