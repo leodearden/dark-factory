@@ -8,8 +8,11 @@ A candidate is rejected when its title / description / details / files
 cite a path prefix owned by a project other than the one being filed
 into.  "Cite" is two-sided (task 3120): the prefix must sit at a left word
 boundary AND be followed by something that looks like a path segment, so a
-bare MENTION ("see ``fused-memory/``") or an English slash-construction
-("not a ``backend/``timeout error") is not a hit.  The verdict's
+bare MENTION ("see ``fused-memory/``") or a TWO-element English
+slash-construction ("not a ``backend/``timeout error") is not a hit.  A
+THREE-OR-MORE-element slash-construction ("the ``client/``server/db split")
+is still a hit — known false-positive residue, see :func:`_build_pattern`
+(task 4160).  The verdict's
 ``suggested_project`` field carries the owning
 project_id of the first mismatched prefix so the caller can resubmit (or
 the LLM can re-route under the multi-project Stage 2 prompt).
@@ -142,10 +145,21 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
 
     RIGHT boundary (task 3120) — the token following ``<prefix>/`` must look
     like a path segment: either another ``/`` follows (``crates/reify/src.rs``)
-    or the token carries a file extension (``gui/package.json``).  Without
-    this, any English slash-construction whose left half happens to name a
-    registered top-level directory lexed as a path — "not a ``backend/``
-    timeout error", "``tools/``call", "``archive/``pause".
+    or the token carries a file extension (``gui/package.json``).  Task 3120
+    closed the TWO-element English slash-construction shape whose left half
+    happens to name a registered top-level directory — "not a
+    ``backend/``timeout error", "``tools/``call", "``archive/``pause"; a
+    THREE-OR-MORE-element one ("the ``client/``server/db split") still
+    satisfies the ``_SEG/`` alternative and survives as known false-positive
+    residue (task 4160, see below).  The extension alternative
+    (:data:`_EXT`) requires a 2-6 char ALPHABETIC extension over a
+    DOT-INCLUSIVE stem (task 4160): the previous ``[A-Za-z0-9]{1,6}``
+    accepted a purely numeric or single-character token, so a version
+    string (``backend/v1.2``), a decimal (``corpus/0.5``), and dotted
+    initials (``backend/A.I.``) all lexed as paths.  The stem is
+    dot-inclusive specifically so a multi-dot filename (``gui/a.b.txt``)
+    still survives the 2-char floor — the engine backtracks the stem past
+    the first dot to expose ``.txt``.
 
     A bare trailing ``<prefix>/`` at end-of-token deliberately does NOT match,
     because that is the bare-MENTION class ("see ``fused-memory/``", "the
@@ -167,8 +181,12 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
     file entries through :func:`check_files_for_scope` rather than rely on
     this heuristic scan.
 
-    KNOWN FAIL-OPEN residue, deliberately not closed (each is pinned by a
-    test so the gap stays visible rather than implied covered):
+    KNOWN residue, deliberately not closed — split into the two directions a
+    heuristic like this can fail, each entry pinned by an executing test so
+    the gap stays visible rather than implied covered:
+
+    (i) MISSED DETECTIONS (fail-open) — a real path reference is NOT
+    recognised:
 
     - extensionless right context — ``<prefix>/<dir>`` and extensionless
       filenames (``fused-memory/src``, ``crates/reify-eval``,
@@ -177,17 +195,45 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
       spelling; it is accepted anyway because admitting it would mean
       accepting any ``<word>/<word>``, which is exactly the English-
       punctuation shape this assertion exists to reject;
-    - extensions longer than 6 chars (the ``{1,6}`` cap) — ``docs/.gitignore``,
+    - extensions longer than 6 chars (the ``{2,6}`` cap) — ``docs/.gitignore``,
       ``crates/x.markdown``, ``crates/x.properties`` fail the extension
       alternative.  The mechanism is the LENGTH cap, NOT the leading dot: a
       short-extension dotfile such as ``docs/.env`` still matches;
     - glob spellings — the metacharacter in ``plans/*.md`` is in neither the
-      segment class nor the extension class.
+      segment class nor the extension class;
+    - single-character extensions (task 4160) — ``crates/x.c``, ``crates/x.h``
+      fail the ``{2,6}``-floored extension alternative.  ``crates/x.c`` and
+      ``backend/A.I.`` are structurally identical to the matcher (stem, dot,
+      one letter), so closing the dotted-initials FALSE positive necessarily
+      costs the single-letter extension — no rule closes one while keeping
+      the other;
+    - digit-bearing extensions (task 4160) — ``crates/x.mp3``, ``crates/x.h5``
+      fail the now-alphabetic-only extension alternative.
 
-    All three are MISSED detections, never false ones — the same conservative
-    direction ``project_prefix_registry`` already takes for
-    ``../other-repo/x.py`` and ``~user/...``.  Widening the character classes
-    to admit them would start re-admitting the punctuation shapes above.
+    (ii) FALSE POSITIVES (fail-loud) — prose is WRONGLY recognised as a path:
+
+    - three-or-more-element English slash-construction (task 4160) — ``the
+      client/server/db split``, ``a read/write/execute decision`` still
+      match via the ``_SEG/`` alternative, because each interior segment is
+      followed by another ``/``.  NOT closed: the only mechanical fix —
+      requiring the ``_SEG/`` chain to terminate in an extension — would
+      stop detecting genuine EXTENSIONLESS directory paths
+      (``fused-memory/src/fused_memory/middleware/``, ``crates/reify/src``),
+      a strictly larger and more common real-prose class in this repo than
+      the shape it would close, so closing it would be a net detection loss.
+      Blast radius is bounded: the prose advisory this feeds NEVER rejects a
+      submission outright (the module docstring's outcome (3)) and is
+      suppressed entirely by :func:`local_attesting_signals` (task 3106)
+      whenever the declared deliverables attest local work, so a false
+      positive only reaches a submission with no locally-attesting declared
+      files, where it stamps ``metadata.possible_scope_mismatch`` and files
+      an info-severity ``scope_violation`` escalation.
+
+    The MISSED-detection direction is the same conservative one
+    ``project_prefix_registry`` already takes for ``../other-repo/x.py`` and
+    ``~user/...``; widening the character classes to admit any of (i) would
+    start re-admitting the FALSE-positive punctuation shapes above and in
+    (ii).
 
     Cache note: ``_PATTERN_CACHE`` is keyed by the prefix tuple; the boundary
     class and the right-context assertion are both compile-time constants
