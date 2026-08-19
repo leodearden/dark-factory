@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
 from shared import safe_io
+from shared.cli_invoke import is_server_error_status
 from shared.locking import (
     files_to_modules,
     modules_conflict,
@@ -452,28 +453,48 @@ def is_transient_rejection(rejection: str | None) -> bool:
 _API_ERROR_REASON_RE = re.compile(r'agent API error: HTTP (\d{3})')
 
 
-def is_transient_api_requeue(reason: str | None) -> bool:
-    """True when *reason* encodes a transient server-side (HTTP 5xx) API error.
+def is_transient_api_requeue(
+    reason: str | None, *, api_error_status: int | None = None,
+) -> bool:
+    """True when a requeue was caused by a transient server-side (5xx) API error.
 
-    Matches the ``"agent API error: HTTP <status>"`` marker (present in
-    block_reason regardless of workflow phase) and classifies HTTP 5xx
-    (500-599, including 529 Overloaded) as transient.  HTTP 4xx (client/auth
-    errors) and non-API reasons return False and still count against
-    ``requeue_cap``.
+    FIELD-FIRST (task 3315, PRD contract C2 / INV-1 "structured field over
+    regex").  Two routes, in precedence order:
+
+    1. *api_error_status* — the STRUCTURED status threaded
+       ``TerminalReport -> TaskReport -> Scheduler.record_requeue`` from
+       ``AgentResult.api_error_status``.  This is the primary signal and
+       needs no cooperation from the prose of *reason*.
+    2. The ``"agent API error: HTTP <status>"`` marker in *reason* — retained
+       ONLY as a LEGACY FALLBACK, for reasons produced by phases that do not
+       yet carry the field (the producers land in the sibling PRD tasks γ
+       (execute), η (review) and θ (planning/simple_task)).  This is the one
+       and only site that still parses that marker.
+
+    Both routes classify through ``shared.cli_invoke.is_server_error_status``,
+    the single canonical definition of the 5xx band (INV-5) — the band is
+    deliberately NOT re-encoded here.  HTTP 4xx (client/auth errors) and
+    non-API reasons return False and still count against ``requeue_cap``; a
+    ``None`` status is not evidence of anything.
 
     Note: HTTP 429 (rate-limit / too-many-requests) is intentionally
     classified as non-transient.  Unlike a server-side 5xx overload that
     resolves on its own, a 429 signals a quota or rate-limiting configuration
     problem that benefits from human review.  To change this policy, also
     update the ``test_false_for_non_transient`` parametrize list and the
-    design decision in plan.json.
+    PRD's resolved decision 1 (``plans/server-side-api-error-handling-prd.md``).
+
+    *api_error_status* is keyword-only and defaults ``None``, so every
+    pre-existing positional caller is source-compatible.
     """
+    if is_server_error_status(api_error_status):
+        return True
     if not reason:
         return False
     m = _API_ERROR_REASON_RE.search(reason)
     if m is None:
         return False
-    return 500 <= int(m.group(1)) <= 599
+    return is_server_error_status(int(m.group(1)))
 
 
 @dataclass(frozen=True)
