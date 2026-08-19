@@ -496,6 +496,76 @@ def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path, monkeypatch: pytes
 
 
 # ---------------------------------------------------------------------------
+# LOG_TAG contract  (task 3909)
+# ---------------------------------------------------------------------------
+#
+# Modelled on the sibling pin at
+# tests/scripts/test_check_dashboard_unit_parity.py::test_main_every_emitted_line_carries_the_log_tag.
+#
+# setup-host.sh's fused-memory gate believes an exit status only when the
+# checker's own bracketed tag is present in the captured output. That test is
+# CONCLUSIVE rather than heuristic only if EVERY emitted line carries the tag —
+# an untagged continuation line is a line the gate cannot attribute, and a
+# report whose tag it cannot find reads to the gate as "it did not run".
+
+
+def test_main_every_emitted_line_carries_the_log_tag(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """Every printed line is prefixed with the log tag, INCLUDING continuations.
+
+    Driven down the MULTI-LINE drift path on purpose. This checker's drift
+    report is ONE print carrying a joined `  - {directive}` list:
+
+        [drift] <path>: missing required directives:
+          - Restart=on-failure
+          - RestartSec=5
+
+    so a tag prefixed only to the first physical line would leave every
+    continuation untagged — and the "absence of the tag is conclusive" claim
+    setup-host.sh's gate rests on would be false on the one path an operator
+    most needs to trust.
+    """
+    mod = _load_checker()
+    assert mod.LOG_TAG == "fused_memory_unit_parity"
+
+    # Missing FIVE required directives — comfortably past one, so the report is
+    # unambiguously multi-line and the continuation lines are exercised.
+    installed = _write_unit(tmp_path, _MISSING_RESTART_DIRECTIVES_UNIT)
+    rc = mod.main(["--installed", str(installed)])
+    captured = capsys.readouterr()
+
+    assert rc == 1, f"{captured.out}\n{captured.err}"
+    assert captured.out.strip(), "The checker must report something."
+    for line in (captured.out + captured.err).splitlines():
+        if not line.strip():
+            continue
+        assert line.startswith(f"[{mod.LOG_TAG}]"), f"Untagged output line: {line!r}"
+
+
+def test_log_tags_every_physical_line_of_a_multi_line_message(
+    capsys: pytest.CaptureFixture,
+):
+    """`_log` itself splits and tags, rather than prefixing the message once.
+
+    Pinned on the helper directly, not only through main(), because the
+    invariant is a property of the helper: this checker interpolates FOREIGN
+    text into its output (a captured `exc.stderr.decode()` in daemon_reload),
+    whose shape no test of main() can enumerate. Tagging per physical line is
+    what makes the invariant hold for text the checker did not author.
+    """
+    mod = _load_checker()
+
+    mod._log("first\nsecond")
+    out = capsys.readouterr().out
+
+    assert out.splitlines() == [
+        f"[{mod.LOG_TAG}] first",
+        f"[{mod.LOG_TAG}] second",
+    ], out
+
+
+# ---------------------------------------------------------------------------
 # CLI --fix residual (un-synthesizable prefix) tests  (amendment)
 # ---------------------------------------------------------------------------
 
