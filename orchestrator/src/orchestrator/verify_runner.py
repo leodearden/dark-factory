@@ -2781,7 +2781,9 @@ class DriftDetector:
         """Run *merge_sha* on both runners and compare verdicts.
 
         Returns DriftCheckResult.  Side-effects:
-        - AGREE   → emit verdict_parity_ok event (None-safe).
+        - AGREE   → emit verdict_parity_ok event (None-safe), whose data carries
+          merge_sha, local_runner, remote_runner, passed, and both arms'
+          local_category / remote_category ('' for a clean, sentinel-free arm).
         - DIVERGE → dedup'd L1 escalation (None-safe) + quarantine remote.
         - INCONCLUSIVE → no side-effects.
         """
@@ -2823,6 +2825,12 @@ class DriftDetector:
                         'local_runner': local.name,
                         'remote_runner': remote.name,
                         'passed': local_passed,
+                        # Emitted UNCONDITIONALLY ('' for a clean arm) so the
+                        # payload shape is uniform across every drift parity
+                        # event -- a consumer never has to tell an absent key
+                        # apart from a clean result.
+                        'local_category': local_category,
+                        'remote_category': remote_category,
                     },
                 )
             return DriftCheckResult(
