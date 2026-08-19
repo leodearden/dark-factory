@@ -7459,11 +7459,29 @@ class TestRootCauseOverfoldReport:
             'the report must fire once per L2, not once per fold past the threshold'
         )
 
-    @pytest.mark.asyncio
-    async def test_report_failure_can_never_fail_the_fold(self, tmp_path: Path):
-        """(d) NEVER FATAL — a raising report costs a notification, not the fold."""
-        import escalation.server as server_mod
+    @staticmethod
+    def _break_the_report_path(
+        queue: EscalationQueue, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Make the over-fold report raise, without touching the fold path.
 
+        `queue.make_id` is called by the report (to mint its own record) and by
+        promote's CREATE path, but NOT by `add_members_to_l2` — so once the L2
+        exists, breaking it isolates the report exactly.  The report helper is a
+        closure over `create_server`, so there is no module attribute to patch;
+        this reaches it through the one collaborator it does not share with the
+        fold.
+        """
+        def exploding(*args: Any, **kwargs: Any) -> str:
+            raise RuntimeError('report path is broken')
+
+        monkeypatch.setattr(queue, 'make_id', exploding)
+
+    @pytest.mark.asyncio
+    async def test_report_failure_can_never_fail_the_fold(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """(d) NEVER FATAL — a raising report costs a notification, not the fold."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(
             queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
@@ -7471,35 +7489,23 @@ class TestRootCauseOverfoldReport:
 
         created = await self._fold(server, self._spelling(0), 'esc-l1-0')
         assert created['status'] == 'created'
+        self._break_the_report_path(queue, monkeypatch)
 
-        # Break the submit path the report helper uses.  The fold itself must be
-        # entirely unaffected.
-        original = server_mod._submit_or_dedupe
-
-        def exploding(*args: Any, **kwargs: Any):
-            raise RuntimeError('report submit is broken')
-
-        server_mod._submit_or_dedupe = exploding
-        try:
-            for i in range(1, _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD):
-                folded = await self._fold(server, self._spelling(i), f'esc-l1-{i}')
-                assert folded['status'] == 'updated', (
-                    f'a broken report must not fail the fold: {folded}'
-                )
-                assert folded['id'] == created['id']
-                assert f'esc-l1-{i}' in folded['members'], (
-                    f'the member must still be linked: {folded}'
-                )
-        finally:
-            server_mod._submit_or_dedupe = original
+        for i in range(1, _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD + 1):
+            folded = await self._fold(server, self._spelling(i), f'esc-l1-{i}')
+            assert folded['status'] == 'updated', (
+                f'a broken report must not fail the fold: {folded}'
+            )
+            assert folded['id'] == created['id']
+            assert f'esc-l1-{i}' in folded['members'], (
+                f'the member must still be linked: {folded}'
+            )
 
     @pytest.mark.asyncio
     async def test_record_fields_are_the_primary_fact_with_reporting_suppressed(
-        self, tmp_path: Path,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
         """(e) INV-8 — the counts are assertable from the RECORD, never by log-scrape."""
-        import escalation.server as server_mod
-
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(
             queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
@@ -7507,15 +7513,16 @@ class TestRootCauseOverfoldReport:
 
         created = await self._fold(server, self._spelling(0), 'esc-l1-0')
         l2_id = created['id']
+        self._break_the_report_path(queue, monkeypatch)
 
-        original = server_mod._report_root_cause_overfold
-        server_mod._report_root_cause_overfold = lambda *a, **k: None
-        try:
-            for i in range(1, _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD):
-                await self._fold(server, self._spelling(i), f'esc-l1-{i}')
-        finally:
-            server_mod._report_root_cause_overfold = original
+        for i in range(1, _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD):
+            await self._fold(server, self._spelling(i), f'esc-l1-{i}')
 
+        # The report never landed...
+        assert self._overfold_reports(queue) == [], (
+            'setup wrong: the report path was supposed to be broken'
+        )
+        # ...and the fact is STILL fully readable from the record itself.
         record = queue.get(l2_id)
         assert record is not None
         distinct = (

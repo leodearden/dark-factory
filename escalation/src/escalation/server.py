@@ -633,6 +633,31 @@ def _markup_residue_prose(record: dict[str, Any]) -> str:
     ])
 
 
+# INV-4 storm escape for root-cause OVER-FOLDING (task 3998).  Canonicalising
+# the pending-L2 lookup folds more promotes BY DESIGN, so its failure mode is
+# over-folding: distinct causes silently merged under one canonical key.  The
+# signature is a single L2 addressed by many mutually-DISTINCT pre-canonical
+# spellings, counted durably in `Escalation.root_cause_variants` (+ _truncated),
+# which stays the primary structured fact (INV-8); this is the notification.
+#
+# THRESHOLD CALIBRATED AGAINST MEASUREMENT, NOT TASTE: over the live queue
+# (data/escalations root + archive, 398 distinct non-empty root_cause keys,
+# measured 2026-08-19) there are ZERO canonical classes holding more than one
+# spelling.  Five distinct spellings of ONE canonical key is therefore far
+# outside the observed baseline.  It also sits well below
+# `queue._MAX_ROOT_CAUSE_VARIANTS` = 20, so the cap never decides whether the
+# alarm fires.
+_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD = 5
+
+# Synthetic anchor, for the same reason as _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID:
+# the condition is system-scoped (is the MATCHING rule too loose?) and a burst
+# spans tasks, so attributing it to whichever promote crossed the threshold
+# would surface an unrelated infra record on that task and could land PENDING on
+# an already-terminal one (this helper bypasses the terminal-task chokepoint).
+# The affected L2 id is named in the summary and detail instead.
+_ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID = 'l2-root-cause-overfold'
+
+
 # Task statuses from which a recovery/redispatch is still possible.  A record
 # on a task outside this set pins nothing: there is no recovery to block.
 _RECOVERABLE_STATUSES = frozenset({'in-progress', 'blocked'})
@@ -1181,6 +1206,92 @@ def create_server(
         except Exception as e:  # pragma: no cover - defensive, never fatal
             logger.exception(
                 'amendment-truncation storm report failed for L2 %s (non-fatal): %s',
+                l2_id, e,
+            )
+
+    def _report_root_cause_overfold(l2_id: str, variants: int) -> None:
+        """File ONE info escalation when *l2_id* reaches the distinct-spelling threshold.
+
+        ``queue.add_members_to_l2`` already accumulates every DISTINCT
+        pre-canonical root_cause spelling on the record itself
+        (``root_cause_variants`` / ``root_cause_variants_truncated``).  Those
+        counters stay the PRIMARY structured fact — assertable from the record,
+        never by log-scrape (INV-8) — and this is the thresholded NOTIFICATION
+        layered on top, which is what INV-4 asks for: a hearer, at a threshold.
+
+        WHY A PER-RECORD CROSSING, NOT A ``StormCounter`` RATE (the one place
+        this deliberately diverges from ``_report_amendment_truncation_storm``,
+        which it otherwise copies line for line): the two conditions have
+        different shapes.  Truncation is an EVENT that bursts across many L2s, so
+        a rate-in-a-window counter fits it.  Over-folding is an ACCUMULATION on
+        ONE record — "this single cluster has now been addressed by five mutually
+        distinct spellings of one canonical key" — which a rate window would
+        either miss (slow accumulation) or spam (fast one).  Because the count is
+        monotone and increments by one, the caller's
+        ``variant_added and variants == THRESHOLD`` test fires exactly once per
+        L2 by construction, with no extra suppression state to keep.
+
+        WHY THE TRUNCATION REPORT DOES NOT ALREADY COVER THIS: it only fires once
+        an L2 has blown the 20-entry amendment cap, so it is deaf to an over-fold
+        at five or six distinct causes — exactly the range this one hears.
+
+        Fleet-wide burst control is still present and free: ``severity='info'`` /
+        ``category='infra_issue'`` routes through ``_submit_or_dedupe``, so a
+        hundred simultaneous crossings fold under ``summary_dedupe_key``'s
+        first-three-token key.  That is why the summary's LEADING tokens are kept
+        stable and the L2 id placed later in the string.
+
+        PURELY ADDITIVE, NEVER FATAL, like its neighbour: a dropped report costs
+        a notification; a raised one would cost the fold.
+        """
+        try:
+            _submit_or_dedupe(Escalation(
+                # Synthetic anchor, NOT the triggering promote's task_id — see
+                # _ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID.
+                id=queue.make_id(_ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID),
+                task_id=_ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID,
+                agent_role='escalation-server',
+                # A report about matching precision is a notification, not a
+                # page: 'info' keeps it off the born-at-L2 human-direct route.
+                severity='info',
+                category='infra_issue',
+                # Leading tokens FIXED so a fleet-wide burst folds under one
+                # dedupe parent; the varying parts come after.
+                summary=(
+                    f'L2 root-cause over-fold suspected: {variants} distinct '
+                    f'root_cause spellings folded into one L2 ({l2_id})'
+                ),
+                detail=(
+                    f'OBSERVED: L2 escalation {l2_id} has now been addressed by '
+                    f'{variants} mutually DISTINCT pre-canonical root_cause '
+                    f'spellings that all canonicalise to the same key (threshold '
+                    f'{_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD}).\n'
+                    f'The spellings themselves are on the record in '
+                    f'`root_cause_variants`; the TRUE distinct total is '
+                    f'len(root_cause_variants) + root_cause_variants_truncated, '
+                    f'and the L2\'s own root_cause/detail/options/summary are '
+                    f'never touched by a fold.\n'
+                    f'MEASURED BASELINE: across the live queue (398 distinct '
+                    f'non-empty root_cause keys, 2026-08-19) ZERO canonical '
+                    f'classes hold more than one spelling, so this is far '
+                    f'outside the observed norm.\n'
+                    f'Hypothesis: root-cause canonicalisation is OVER-folding — '
+                    f'merging genuinely distinct causes under one canonical key '
+                    f'— rather than the same cause simply being re-spelled by '
+                    f'successive watcher rotations.'
+                ),
+                suggested_action=(
+                    f'Read {l2_id} and compare its `root_cause_variants` entries '
+                    'against each other: if they name genuinely different causes, '
+                    'the canonicalisation policy in escalation/canonical.py is '
+                    'too aggressive and the wrongly-merged members need splitting '
+                    'into separate L2s; if they are re-spellings of one cause, '
+                    'this is working as intended and the report can be dismissed.'
+                ),
+            ))
+        except Exception as e:  # pragma: no cover - defensive, never fatal
+            logger.exception(
+                'root-cause over-fold report failed for L2 %s (non-fatal): %s',
                 l2_id, e,
             )
 
@@ -2396,6 +2507,15 @@ def create_server(
                 # report can never fail this fold.
                 if outcome['dropped']:
                     _report_amendment_truncation_storm(existing_id)
+                # INV-4 for the failure canonicalisation INTRODUCES: over-folding.
+                # Exactly-once per L2 by construction — `variants` is monotone
+                # and increments by one, so the equality can only hold on the
+                # single fold that crosses.  Never fatal, same as above.
+                if (
+                    outcome['variant_added']
+                    and outcome['variants'] == _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD
+                ):
+                    _report_root_cause_overfold(existing_id, outcome['variants'])
                 return {
                     'id': existing_id,
                     'status': 'updated',
