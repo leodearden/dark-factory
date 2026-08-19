@@ -2310,6 +2310,13 @@ def _parse_resets_at(text: str) -> datetime:
     which is why task 4042 did not simply delete it. Retiring or repairing this
     fork is a separate cleanup, not a rider on a regression fix; do not add new
     callers.
+
+    "Do not add new callers" is ENFORCED, not just asked for:
+    ``shared/tests/test_auth_failed.py::TestFabricatingForkHasNoProductionCallers``
+    AST-scans ``shared/src`` + ``orchestrator/src`` and fails on any call to the
+    bare ``_parse_resets_at`` name outside the module defining the strict copy.
+    If you are retiring this fork, delete that guard class along with this
+    definition.
     """
     # Relative: "resets in Xh", "resets in Xm", "resets in Xd"
     m = re.search(r'resets\s+in\s+(\d+)\s*([hmd])', text, re.IGNORECASE)

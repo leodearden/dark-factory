@@ -11,13 +11,16 @@ Covers:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from shared import invocation_outcome
 from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import AuthFailed, auth_failure_reason, classify_invocation
@@ -264,6 +267,106 @@ class TestAuthFailedPersistsResetsAt:
         details = json.loads(details_json)
         assert 'OAuth token has been revoked' in details['reason']
         assert 'resets_at' not in details
+
+
+#: shared/tests/test_auth_failed.py -> parents[0]=shared/tests, parents[1]=shared,
+#: parents[2]=repo root. Mirrors capability_manifest_corpus.REPO_ROOT; correct
+#: inside a `.worktrees/<id>` checkout too.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Package source trees that ship production code able to reach the fork. Scoped
+#: to `<pkg>/src` on purpose: `.worktrees/` sits at the REPO root, so unlike a
+#: root-level rglob (the trap capability_manifest_corpus.py documents) this walk
+#: cannot wander into a sibling task's checkout.
+_PRODUCTION_SRC_ROOTS = ('shared/src', 'orchestrator/src')
+
+#: The ONE module allowed to call the bare `_parse_resets_at` name: it is where
+#: the non-fabricating copy is defined, so an unqualified call there is
+#: unambiguous. Everywhere else the convention (already followed by
+#: shared/src/shared/usage_gate.py's `import ... as _parse_resets_at_strict`) is
+#: to import it under the explicit alias, so a reader can tell at the call site
+#: WHICH of the two copies is running.
+_STRICT_PARSE_OWNER = 'shared/src/shared/invocation_outcome.py'
+
+
+def _parse_resets_at_call_sites() -> list[str]:
+    """Every `_parse_resets_at(...)` CALL in the production source trees.
+
+    AST-based, not grep-based: the fork and its history are discussed at
+    length in comments and docstrings across both `usage_gate.py` copies, and
+    a textual scan would count that prose as callers. Only `ast.Call` nodes
+    count, so `_parse_resets_at_strict(...)` (a different name) and every
+    mention in prose are excluded by construction.
+    """
+    sites: list[str] = []
+    for rel_root in _PRODUCTION_SRC_ROOTS:
+        root = _REPO_ROOT / rel_root
+        # Loud, not silently narrowed: a guard that quietly stops scanning a
+        # tree it can no longer find is worse than no guard.
+        assert root.is_dir(), f'production source root missing: {root}'
+        for path in sorted(root.rglob('*.py')):
+            tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if isinstance(func, ast.Name):
+                    called = func.id
+                elif isinstance(func, ast.Attribute):
+                    called = func.attr
+                else:
+                    continue
+                if called == '_parse_resets_at':
+                    sites.append(f'{path.relative_to(_REPO_ROOT)}:{node.lineno}')
+    return sites
+
+
+class TestFabricatingForkHasNoProductionCallers:
+    """`usage_gate._parse_resets_at` (the fabricating fork) must stay caller-free.
+
+    Task 4042 moved the fork's ONE live call site — `_handle_auth_failure` —
+    onto the non-fabricating `shared.invocation_outcome` copy, because
+    restoring the 401/403 body snippet re-armed the `'resets' in reason.lower()`
+    branch: a body merely CONTAINING the substring "resets" without a parseable
+    phrase would otherwise persist an invented `now + 1h` recovery time onto a
+    revoked token (PRD 7.1.a — see `TestAuthFailedPersistsResetsAt` above).
+
+    DELETING the fork was deliberately out of scope: ~20 tests across `shared`
+    and `orchestrator` pin its `now + 1h` fallback contract, and
+    `orchestrator/src/orchestrator/usage_gate.py` re-exports it. So it stays
+    importable, and "do not wire new callers onto it" lived only as prose in a
+    docstring. This is the mechanical enforcement of that sentence: it fails
+    the moment production code calls the bare name anywhere outside the module
+    that DEFINES the strict copy.
+
+    If this fails because the fork was legitimately retired, delete the fork's
+    definition and this class together — do not relax the assertion.
+    """
+
+    def test_scan_finds_the_known_strict_call_site(self):
+        # Anti-vacuity: proves the AST walk actually resolves calls, so a
+        # future rename cannot turn the guard below into a no-op that passes
+        # because it found nothing at all.
+        sites = _parse_resets_at_call_sites()
+        assert sites, 'AST scan found no _parse_resets_at call anywhere — guard is vacuous'
+
+    def test_only_the_strict_copy_owner_calls_the_bare_name(self):
+        offenders = [s for s in _parse_resets_at_call_sites() if not s.startswith(_STRICT_PARSE_OWNER)]
+        assert offenders == [], (
+            'new production caller(s) of the bare `_parse_resets_at` name: '
+            f'{offenders}. Outside {_STRICT_PARSE_OWNER} this resolves to the '
+            'FABRICATING fork in shared/src/shared/usage_gate.py (or its '
+            'orchestrator re-export), which invents `now + 1h` on parse '
+            'failure. Import the strict copy as `_parse_resets_at_strict` '
+            'instead — see TestAuthFailedPersistsResetsAt for why.'
+        )
+
+    def test_handle_auth_failure_does_not_import_the_fork(self):
+        # Belt-and-braces on the specific regression: the module that owns
+        # _handle_auth_failure must reach the strict copy under its alias.
+        import shared.usage_gate as usage_gate_module
+
+        assert usage_gate_module._parse_resets_at_strict is invocation_outcome._parse_resets_at
 
 
 @pytest.mark.asyncio
