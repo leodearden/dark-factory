@@ -1102,3 +1102,68 @@ def test_merge_queue_fallback_path_when_unreachable(client):
         f'AC3: live entry 3112 must not appear in fallback path; got {task_ids}'
     )
     assert proj['active_approximate'] is True
+
+
+def test_tasks_offline_flag_survives_a_hang_that_degrades_most_roots(client):
+    """No root produced rows + at least one demonstrably failed IS the outage.
+
+    The handler's own budget caps how many roots can reach the offline state:
+    in a hang each root burns up to ``_TASKS_PER_PROJECT_BUDGET`` before
+    ``wait_for`` cuts it, and a cut root lands in ``degraded``, not
+    ``offline``. A stricter ``len(offline) == total_roots`` test therefore
+    made this flag unreachable on a nine-root config for the most likely total
+    outage — the payload would say "unavailable for 2 of 9" plus "timed out
+    for 7 of 9" and never the thing that was true: nothing loaded.
+    """
+    body = _tasks_body(
+        client,
+        offline_projects=['p0', 'p1'],
+        degraded_projects=['p2', 'p3', 'p4', 'p5', 'p6', 'p7', 'p8'],
+        total_roots=9,
+    )
+
+    assert body['TASKS_OFFLINE'] is True, (
+        'no root produced rows and two demonstrably failed — that is the '
+        'outage the global banner copy describes'
+    )
+    # The separate lists stay separate: the flag is an ADDITIONAL fact, and
+    # collapsing degraded into offline would report a timeout as a proven
+    # outage on the per-project list too.
+    assert body['TASKS_OFFLINE_PROJECTS'] == ['p0', 'p1']
+    assert len(body['TASKS_DEGRADED_PROJECTS']) == 7
+
+
+def test_tasks_one_healthy_root_vetoes_the_outage_flag(client):
+    """A single root that produced rows blocks the global claim, however bad the rest.
+
+    The flag's conjunct is "NO root produced rows" — a root missing from both
+    failure lists produced rows (the three lists are disjoint by
+    construction), so "task data unavailable" would be false.
+    """
+    body = _tasks_body(
+        client,
+        offline_projects=['p0'],
+        degraded_projects=['p1'],
+        total_roots=3,
+    )
+
+    assert body['TASKS_OFFLINE'] is False, (
+        'p2 produced rows — they are in this very payload'
+    )
+
+
+def test_tasks_count_unknown_root_vetoes_the_outage_flag(client):
+    """A count-unknown root produced current ROWS, so it is not an absence of data."""
+    body = _tasks_body(
+        client,
+        offline_projects=['p0'],
+        degraded_projects=[],
+        count_unknown_projects=['p1'],
+        total_roots=2,
+    )
+
+    assert body['TASKS_OFFLINE'] is False, (
+        "p1's rows loaded fine — only its done count is unknown, which is a "
+        'different (and separately reported) fact from an outage'
+    )
+    assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['p1']

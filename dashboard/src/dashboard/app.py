@@ -824,13 +824,28 @@ async def api_tasks(request: Request) -> JSONResponse:
     ``metadata.files``) that is retained on the wire for debugging and tooling.
     No frontend UI reads it directly — lock display routes through D.SCHEDULER.
 
-    **Three distinct failure facts, deliberately not collapsed:**
+    **Four distinct failure facts (plus a denominator), deliberately not
+    collapsed:**
 
-    - ``TASKS_OFFLINE`` — EVERY configured project root failed, i.e.
-      fused-memory itself is unreachable. One fused-memory URL serves every
-      root, so all-roots-failed is the observable proxy for that claim, and it
-      is the only state the global banner's copy ("fused-memory offline — task
+    - ``TASKS_OFFLINE`` — NO root produced rows and at least one root
+      DEMONSTRABLY failed. One fused-memory URL serves every root, so that is
+      the observable proxy for "fused-memory itself is unreachable", and it is
+      the only state the global banner's copy ("fused-memory offline — task
       data unavailable") actually describes.
+
+      The demonstrably-failed conjunct is what keeps a pure budget expiry
+      (every root merely degraded, nothing proven down) from claiming an
+      outage. The no-root-succeeded conjunct is why the test is *not* the
+      tighter ``len(offline) == total_roots``: the handler's own budget caps
+      how many roots can even reach the offline state. In the hang case each
+      root burns up to ``_TASKS_PER_PROJECT_BUDGET`` before ``wait_for`` cuts
+      it, and a cut root lands in ``degraded``, not ``offline`` — so with
+      ``_TASKS_TOTAL_BUDGET / _TASKS_PER_PROJECT_BUDGET`` under three, at most
+      a couple of roots per render can ever be marked offline. Requiring ALL
+      of them to be would have made this flag unreachable on a nine-root
+      config for the most likely total outage, leaving the payload to say
+      "unavailable for 2 of 9" plus "timed out for 7 of 9" and never the
+      thing that was actually true.
     - ``TASKS_OFFLINE_PROJECTS`` — the roots whose fetch DEMONSTRABLY failed.
       Non-empty with ``TASKS_OFFLINE`` false is the normal partial case.
     - ``TASKS_COUNT_UNKNOWN_PROJECTS`` — roots whose ACTIVE rows loaded fine
@@ -840,8 +855,9 @@ async def api_tasks(request: Request) -> JSONResponse:
       confident "0 done".
     - ``TASKS_DEGRADED_PROJECTS`` — roots the handler ran out of budget for
       (see ``collect_tasks_with_counts``). Their state is UNKNOWN, not bad:
-      nothing was proven unreachable, so they never raise the offline flag,
-      not even when every root degrades.
+      nothing was proven unreachable, so degradation ALONE never raises the
+      offline flag, not even when every root degrades. It can only ever fail
+      to VETO the flag, alongside a root that did demonstrably fail.
     - ``TASKS_PROJECT_COUNT`` — N: how many roots were fanned out over. The
       banner's "k of N" phrasing needs a denominator drawn from the SAME
       population as its numerator, and the client's only other candidate
@@ -854,7 +870,7 @@ async def api_tasks(request: Request) -> JSONResponse:
     ``TASKS_OFFLINE`` used to be ``bool(offline_projects)``. That is what made
     the banner claim a total outage over eight healthy projects' rows carried
     in the very same payload — one unreachable root out of nine was enough.
-    Collapsing any of these three into the others reintroduces that lie.
+    Collapsing any of these four into the others reintroduces that lie.
     """
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
@@ -881,12 +897,22 @@ async def api_tasks(request: Request) -> JSONResponse:
     # out over. ``bool(total_roots)`` guards the degenerate no-roots config:
     # 0 == 0 would otherwise declare an outage with nothing configured to fail.
     total_roots = len(_all_project_roots(config))
+    # "No root succeeded" — the three lists are disjoint by construction (each
+    # root appends to exactly one of them, then ``continue``s), so a root that
+    # is in neither of these two either produced rows or produced rows with an
+    # unknown count; both veto the flag. A set, not a sum, so a duplicate
+    # label can only ever UNDERcount and fail safe (flag stays False).
+    no_rows_anywhere = (
+        len(set(offline_projects) | set(degraded_projects)) == total_roots
+    )
     # ...and the same N goes on the wire as TASKS_PROJECT_COUNT, so the banner
     # denominates over the population its numerator is drawn from.
     return JSONResponse(
         {
             'ACTIVE_TASKS': active,
-            'TASKS_OFFLINE': bool(total_roots) and len(offline_projects) == total_roots,
+            'TASKS_OFFLINE': (
+                bool(total_roots) and bool(offline_projects) and no_rows_anywhere
+            ),
             'TASKS_OFFLINE_PROJECTS': offline_projects,
             'TASKS_DEGRADED_PROJECTS': degraded_projects,
             'TASKS_COUNT_UNKNOWN_PROJECTS': count_unknown_projects,
