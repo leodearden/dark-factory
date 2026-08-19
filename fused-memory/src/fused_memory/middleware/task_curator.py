@@ -2845,13 +2845,29 @@ class TaskCurator:
             system_prompt=system_prompt,
             cwd=cwd,
             model=self._config.curator.model,
-            # ``max_turns=1`` is incompatible with ``--json-schema`` because
-            # the schema mechanism burns a tool-use turn; the CLI returns
-            # ``error_max_turns`` after the schema turn, even when the
-            # structured payload is already attached. The configured floor
-            # is 3 (schema tool-use + optional reasoning + final response);
-            # the default of 8 leaves headroom for harder combine-vs-create
-            # decisions. Schema salvage in cli_invoke.py covers the boundary.
+            # ``max_turns=1`` is unsafe with ``--json-schema``, but not for the
+            # reason this comment used to give.  There is no fixed schema-turn
+            # tax: the model emits a PROSE turn before it calls
+            # ``StructuredOutput``, stochastically and prompt-sensitively, and a
+            # cap of 1 leaves no room for it.  The CLI then returns
+            # ``error_max_turns`` with NO structured payload — so the superseded
+            # claims that the payload "is already attached" and that "schema
+            # salvage in cli_invoke.py covers the boundary" were both false, and
+            # the second was the load-bearing error: there is nothing to salvage
+            # and no backstop here.  The call simply hard-fails.
+            #
+            # Measured (task 3241, Claude CLI 2.1.236) on the reconciliation
+            # VERIFY prompt/schema shape, not this one: mt=1 -> 0/6, mt=3 -> 4/6,
+            # mt=10 -> 6/6.  The curator's own shape was NOT re-measured, so the
+            # ``ge=3`` floor and the default of 8 are retained as established
+            # values rather than revalidated — the numbers above are cited to
+            # show that 1 is broken, not to tune this knob.  The superseded
+            # wording was a CLI 2.1.168-era observation whose CONCLUSION (never
+            # use 1) survived and whose mechanism did not.  Re-measure with
+            # fused-memory/scripts/probe_schema_max_turns.py.
+            #
+            # The default of 8 leaves headroom for harder combine-vs-create
+            # decisions.
             max_turns=self._config.curator.max_turns,
             max_budget_usd=budget,
             disallowed_tools=['*'],  # no tool access — this is a pure classifier
