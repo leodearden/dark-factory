@@ -655,8 +655,11 @@ resolve_detached() {
 }
 
 # resolve_sibling: called after a sibling-mode (Fleet Cockpit C7) child has
-# been launched detached (setsid, stdio redirected off this script's own
-# pipe -- see the emulator case dispatch below). Deliberately does NOT wait
+# been launched detached (setsid on the emulator branches that need it --
+# not the mac-terminal lane, where `open` already detaches via
+# LaunchServices and stock macOS ships no setsid at all -- plus stdio
+# redirected off this script's own pipe; see the emulator case dispatch
+# below). Deliberately does NOT wait
 # on the sentinel at all: the whole point of sibling mode is fire-and-forget
 # -- e.g. the /prd author->decompose handoff must spawn its sibling and exit
 # cleanly, not babysit it until it finishes. Best-effort refreshes the
@@ -818,12 +821,19 @@ case "$first_word" in
     printf '#!/usr/bin/env bash\n%s\n' "$inner" > "$tmpscript"
     chmod +x "$tmpscript"
     if [ "$spawn_mode" = "sibling" ]; then
-      # Detach explicitly, same as xterm/kitty above. Deliberately do NOT
-      # rm the tmpscript here (unlike the non-sibling path below) --
-      # Terminal.app is still reading/executing it after this script
-      # returns, so removing it now would race the launch; it is a
-      # best-effort leak reclaimed by normal OS tmp-dir cleanup.
-      setsid open -a Terminal "$tmpscript" </dev/null >/dev/null 2>&1 &
+      # NOT prefixed with setsid, unlike xterm/kitty/konsole above -- this
+      # branch is the deliberate exception. setsid(1) is util-linux and is
+      # not installed on stock macOS, the only platform that ever selects
+      # this branch, so the prefix made the launch fail 127 into /dev/null
+      # while resolve_sibling still stamped the record RUNNING: a false
+      # liveness signal for a child that was never launched at all. `open`
+      # hands off to LaunchServices and is already detached, so the `&`
+      # plus the stdio redirect are the whole detach this branch needs.
+      # Deliberately do NOT rm the tmpscript here (unlike the non-sibling
+      # path below) -- Terminal.app is still reading/executing it after
+      # this script returns, so removing it now would race the launch; it
+      # is a best-effort leak reclaimed by normal OS tmp-dir cleanup.
+      open -a Terminal "$tmpscript" </dev/null >/dev/null 2>&1 &
       resolve_sibling
     else
       open -a Terminal "$tmpscript" || { rm -f "$tmpscript" "$sentinel"; exit 127; }
