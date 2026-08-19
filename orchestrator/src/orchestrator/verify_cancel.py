@@ -528,11 +528,19 @@ def release_merge_verify_flock(fd: int) -> None:
 #: drive the parser from a fixture file.
 PROC_LOCKS_PATH: Path = Path('/proc/locks')
 
+#: How many back-to-back reads of the kernel lock table ONE holder query makes
+#: (task 4227).  A READ-COUNT bound, never a time bound: the loop does not
+#: sleep, so K procfs reads cost microseconds and no wall-clock figure anywhere
+#: moves.  See :func:`lane_lock_holder_pids_strict` for why more than one read
+#: is needed and why a union across them is safe.
+_LOCKS_CONFIRM_READS: int = 3
+
 
 def lane_lock_holder_pids_strict(
     path: Path,
     *,
     locks_path: Path = PROC_LOCKS_PATH,
+    confirm_reads: int | None = None,
 ) -> list[int]:
     """Return the pids currently holding an ``flock(2)`` on *path*, per the kernel.
 
@@ -591,33 +599,80 @@ def lane_lock_holder_pids_strict(
     system state.  The line drawn here is between "this ROW is odd" (skip) and
     "the whole ANSWER is unknown" (raise).
 
+    THE THIRD CASE — "this READ was SHORT" (task 4227), which is neither of the
+    two above and is why this reader takes MORE THAN ONE read.  ``/proc/locks``
+    is a seq_file the kernel serves one PAGE per ``read(2)`` regardless of the
+    caller's buffer (measured here: 4 ``read(2)`` calls returning
+    4049/4087/4083/3536 bytes for a 15755-byte table against a 1 MiB request),
+    and each read restarts the per-CPU lock-list walk from a POSITIONAL index —
+    so a lock released at an earlier position between chunks shifts every later
+    record down and ours is skipped outright.  That read SUCCEEDS.  Nothing
+    raises, so an errno-keyed retry (``require_lane_lock_holders``) never fires
+    on it, and both variants previously rendered it as a confident, WRONG
+    answer.  Measured at 1.54% of reads (144/9337) against a real held flock
+    with 24 concurrent churners — invisible in isolation, red under load.
+
+    The response is a bounded CONFIRM LOOP: read the table up to
+    *confirm_reads* times BACK-TO-BACK with NO sleep, and return the UNION of
+    the matching pids in first-seen order.  Union rather than
+    "re-read until two reads agree", because the defect is
+    FALSE-NEGATIVE-ONLY: a chunked read can DROP a record but can never INVENT
+    one — every row the parser sees was genuinely in the kernel table at some
+    instant during that read.  So the union is monotone-safe and needs no
+    convergence argument, where agreement-based stopping both may never
+    converge on a busy system-wide table and returns a confidently wrong answer
+    whenever two consecutive reads drop the SAME record.  The union misses only
+    if ALL K reads drop it.
+
+    *confirm_reads* defaults to ``None`` and is resolved from the module global
+    :data:`_LOCKS_CONFIRM_READS` INSIDE the body, so a ``monkeypatch.setattr``
+    on it is honoured — the same call-time-resolution seam
+    ``_settled_lane_lock_holder_pids`` and ``wait_for_lane_lock_holder``
+    document.  Passing it EXPLICITLY is the second knob, and not dead surface:
+    ``confirm_reads=1`` reproduces the pre-fix one-shot behaviour EXACTLY,
+    which is how the regression tests stage the defect beside the fix on
+    identical staging.
+
+    Note this is a READ-COUNT bound, never a time bound.  This function is
+    SYNCHRONOUS and is called from async contexts; this module's standing rule
+    — the stated reason ``GitOps._acquire_lane_flock_off_thread`` exists — is
+    that no synchronous poll may run on the event loop.  Back-to-back procfs
+    reads take microseconds, so K of them cannot stall the loop, and no
+    existing wall-clock figure (``_LANE_LOCK_HOLDER_SETTLE_SECS``, the 34.0s
+    foreign-holder stack) needs re-deriving.  ``os.stat(path)`` is taken ONCE,
+    before any read, so a held lane whose lock file was unlinked still raises
+    ``FileNotFoundError`` immediately having examined no rows (task 3604's
+    headline case) rather than paying a stat per read.
+
     Returns the matching pids de-duplicated, in first-seen order.
     """
     st = os.stat(path)
     target = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
 
-    raw = locks_path.read_text()
+    reads = _LOCKS_CONFIRM_READS if confirm_reads is None else confirm_reads
 
     pids: list[int] = []
     seen: set[int] = set()
-    for line in raw.splitlines():
-        fields = line.split()
-        if len(fields) < 2:
-            continue
-        fields = fields[1:]  # drop the leading '<id>:' token
-        if fields[0] == '->':
-            continue  # a blocked waiter, not a holder
-        if len(fields) < 5 or fields[0] != 'FLOCK':
-            continue
-        try:
-            pid = int(fields[3])
-            maj, minor, ino = fields[4].split(':')
-            record = (int(maj, 16), int(minor, 16), int(ino, 10))
-        except (ValueError, IndexError):
-            continue  # tolerate an unexpected row shape rather than raise
-        if record == target and pid not in seen:
-            seen.add(pid)
-            pids.append(pid)
+    for _ in range(reads):
+        raw = locks_path.read_text()
+        for line in raw.splitlines():
+            fields = line.split()
+            if len(fields) < 2:
+                continue
+            fields = fields[1:]  # drop the leading '<id>:' token
+            if fields[0] == '->':
+                continue  # a blocked waiter, not a holder
+            if len(fields) < 5 or fields[0] != 'FLOCK':
+                continue
+            try:
+                pid = int(fields[3])
+                maj, minor, ino = fields[4].split(':')
+                record = (int(maj, 16), int(minor, 16), int(ino, 10))
+            except (ValueError, IndexError):
+                continue  # tolerate an unexpected row shape rather than raise
+            if record == target and pid not in seen:
+                seen.add(pid)
+                pids.append(pid)
     return pids
 
 
@@ -625,11 +680,17 @@ def lane_lock_holder_pids(
     path: Path,
     *,
     locks_path: Path = PROC_LOCKS_PATH,
+    confirm_reads: int | None = None,
 ) -> list[int]:
     """Fail-safe :func:`lane_lock_holder_pids_strict`: an unreadable answer is ``[]``.
 
-    Identical parse — this is a thin wrapper, deliberately not a second copy,
-    so the two can never drift.  What it adds is one named FAIL-SAFE POLICY,
+    Identical parse AND identical read policy — this is a thin wrapper,
+    deliberately not a second copy, so the two can never drift.  *confirm_reads*
+    is forwarded straight through for that reason: the chunked-read tolerance
+    (task 4227) lives in the core, and a wrapper carrying its own copy would
+    re-open exactly the divergence
+    ``test_parses_identically_to_the_fail_safe_wrapper`` exists to forbid.
+    What this variant adds is one named FAIL-SAFE POLICY,
     mirroring :func:`read_lock_holder_pgid`: a missing lock file and a missing
     or unreadable lock table (a non-Linux host has no ``/proc/locks``) yield
     "no known holders" rather than raising.  Per-row parse tolerance lives in
@@ -649,7 +710,9 @@ def lane_lock_holder_pids(
     answer means.
     """
     try:
-        return lane_lock_holder_pids_strict(path, locks_path=locks_path)
+        return lane_lock_holder_pids_strict(
+            path, locks_path=locks_path, confirm_reads=confirm_reads,
+        )
     except OSError:
         return []
 
