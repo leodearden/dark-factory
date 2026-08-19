@@ -1545,6 +1545,247 @@ def _mark_step_committed(
 
 
 # ---------------------------------------------------------------------------
+# The boundary guard's escalation channel (task 4457)
+# ---------------------------------------------------------------------------
+#
+# ``MarkupGuardMiddleware`` takes its escalation emitter as an INJECTED
+# callable: ``shared`` is the base layer every other package imports, so it
+# cannot import ``escalation`` without a cycle. The registration site wires the
+# concrete emitter, against its own queue and its own project attribution —
+# this is that emitter for plan-tools.
+#
+# Shape copied from ``fused_memory.server.markup_tripwire.
+# emit_markup_storm_escalation``, the in-repo precedent for filing from an MCP
+# server process: same queue dir, same never-raises posture, same
+# log-and-return-None on any failure.
+
+#: Where the queue lives under project_root — the same relative path
+#: ``markup_tripwire._QUEUE_DIRNAME`` uses, so both guards file into ONE queue.
+_MARKUP_QUEUE_DIRNAME = 'data/escalations'
+
+#: Filed-by attribution. Names the GUARD, not the leaking agent: the middleware
+#: resolves ``agent_id`` from arguments named ``agent_id`` / ``project_root`` /
+#: ``project_id``, and NO plan-tools tool declares any of the three, so that
+#: field is structurally ``None`` on this server (it rides in the detail as the
+#: null it is, rather than being guessed at here).
+_MARKUP_AGENT_ROLE = 'plan-tools-markup-guard'
+
+#: Last-resort attribution for a residue record whose plan cannot be read and
+#: whose worktree has no name. Kept DISTINCT from the storm anchor below: a
+#: residue record is about one caller's payload, and folding it under the
+#: server-wide burst anchor would make the two indistinguishable to a reader.
+_MARKUP_RESIDUE_ANCHOR_TASK_ID = 'plan-tools-markup-residue'
+
+#: Only ever used for a record the middleware grew LATER and this sink does not
+#: recognise. Filing it under a visible fallback is the point: silently
+#: discarding a record kind is the fail-soft this PRD exists to end.
+_ESCALATION_FALLBACK_CATEGORY = 'mcp_markup_residue'
+_ESCALATION_FALLBACK_SUMMARY = (
+    'Unrecognised MCP markup-guard record filed by the plan-tools boundary '
+    'guard — see the detail below'
+)
+
+
+def _markup_project_root(worktree: Path) -> Path | None:
+    """The project root whose escalation queue this server files into.
+
+    ``--git-common-dir``, NOT ``--show-toplevel``: from a task worktree the
+    toplevel is the WORKTREE, while the common dir is the MAIN checkout's
+    ``.git`` — whose parent is project_root, the one queue every lane and every
+    watcher already reads. Measured in a live task worktree.
+
+    Never raises: a git failure degrades to a logged ``None``, which costs the
+    operator a queued record rather than turning a decided refusal into an
+    outage of its own.
+    """
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--git-common-dir'],
+            cwd=str(worktree),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning(
+            'markup guard: could not resolve project_root from %s (%s); the '
+            'residue will not be queued', worktree, exc,
+        )
+        return None
+    common_dir = result.stdout.strip()
+    if not common_dir:
+        logger.warning(
+            'markup guard: git named no common dir for %s; the residue will '
+            'not be queued', worktree,
+        )
+        return None
+    git_dir = Path(common_dir)
+    if not git_dir.is_absolute():
+        # A plain checkout answers with the relative ``.git``; a linked
+        # worktree answers with the main checkout's absolute path.
+        git_dir = (worktree / git_dir).resolve()
+    return git_dir.parent
+
+
+def _escalation_channel(project_root: Path) -> tuple[Any, Any] | None:
+    """Open ``(Escalation, EscalationQueue)`` for *project_root*, or ``None``.
+
+    THE IMPORT IS LAZY, and deliberately not hoisted to module scope.
+    plan-tools startup latency is load-bearing: the orchestrator spawns one of
+    these per agent invocation over stdio, and an import stall past
+    ``MCP_TIMEOUT`` gets this server silently dropped, producing 0-turn
+    ``error_empty_output`` failures (tasks 1775 / 1776 / 2942). This path runs
+    only on the measured 0.27% of calls that carry a leak, so it pays for
+    itself the first time it is needed and never before.
+
+    An ImportError degrades to a logged ``None`` exactly as
+    ``markup_tripwire``'s ``HAS_ESCALATION`` guard does — ``escalation`` is a
+    workspace dependency of orchestrator, so this is a defensive floor rather
+    than an expected branch.
+    """
+    try:
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+    except ImportError:
+        logger.warning(
+            'markup guard: the escalation package is unavailable, so the '
+            'residue of a refused call will not be preserved anywhere',
+        )
+        return None
+    try:
+        return Escalation, EscalationQueue(project_root / _MARKUP_QUEUE_DIRNAME)
+    except Exception:
+        logger.exception(
+            'markup guard: failed to open the escalation queue under %s', project_root,
+        )
+        return None
+
+
+def _markup_task_id(artifacts: TaskArtifacts) -> str:
+    """Attribute a residue record to a task, never to a guess.
+
+    The middleware cannot do this: :meth:`MarkupGuardMiddleware._identity`
+    reads its identity off the call's own arguments, and no plan-tools tool
+    declares ``agent_id``, ``project_root`` or ``project_id``. So the sink is
+    the only party that can attribute the record at all.
+
+    The plan's own ``task_id`` first; the worktree directory name when there is
+    no plan yet (a ``create_plan`` refused before any plan exists); the anchor
+    constant only when even that is empty. An unreadable plan degrades to the
+    same fallback rather than losing the record — the payload it carries is
+    the only copy that exists.
+    """
+    try:
+        plan = artifacts.read_plan()
+    except Exception:
+        logger.warning(
+            'markup guard: could not read the plan for attribution under %s; '
+            'falling back to the worktree name', artifacts.root,
+        )
+        plan = {}
+    task_id = plan.get('task_id') if isinstance(plan, dict) else None
+    if isinstance(task_id, str) and task_id:
+        return task_id
+    return artifacts.worktree.name or _MARKUP_RESIDUE_ANCHOR_TASK_ID
+
+
+def _markup_residue_detail(record: Mapping[str, Any]) -> str:
+    """The residue record's body — flat fields, then the payload VERBATIM.
+
+    The raw value is rendered last, unquoted and unescaped, because it is the
+    ONLY surviving copy of data the caller may never be able to resend: the
+    call was refused, so none of it reached plan.json. Everything above it is
+    diagnostic and is written with ``!r`` so an empty or ``None`` field reads
+    as itself rather than as a blank line.
+    """
+    return '\n'.join([
+        f'tool={record.get("tool")!r}',
+        f'field={record.get("field")!r}',
+        f'matched_pattern={record.get("matched_pattern")!r}',
+        f'agent_id={record.get("agent_id")!r}',
+        f'project={record.get("project")!r}',
+        '',
+        'The plan-tools MCP boundary guard refused this tool call: the value '
+        'below carries raw tool-call envelope markup whose own boundary cannot '
+        'be determined, so no repair was attempted and NOTHING was written. '
+        'Guessing would have silently dropped whatever arguments hide in the '
+        'residue.',
+        '',
+        'Recover the payload below for the caller if it is still needed, then '
+        'chase the harness serialization leak that produced it against '
+        'plans/toolcall-markup-containment-prd.md.',
+        '',
+        'RAW PAYLOAD (verbatim, the only surviving copy):',
+        str(record.get('raw_value')),
+    ])
+
+
+def _markup_escalation_sink(artifacts: TaskArtifacts) -> Callable[[dict[str, Any]], str | None]:
+    """Build the emitter the boundary guard files its records through.
+
+    Returns the id of the queued record, which the middleware folds into the
+    caller-facing refusal so the payload can be looked up — or ``None`` when
+    filing was impossible.
+
+    NEVER RAISES. The middleware's own ``_call_sink`` already contains a sink
+    that throws, but this keeps its own contract so it stays safe under any
+    future caller: the call's outcome is decided before either channel runs, so
+    a queue outage must cost an operator visibility, never turn a working guard
+    into an outage of its own.
+    """
+    project_root: Path | None = None
+    resolved = False
+
+    def sink(record: dict[str, Any]) -> str | None:
+        nonlocal project_root, resolved
+        # Resolved ONCE per server: it shells out to git, and the answer cannot
+        # change for the life of a worktree.
+        if not resolved:
+            project_root = _markup_project_root(artifacts.worktree)
+            resolved = True
+        if project_root is None:
+            return None
+
+        channel = _escalation_channel(project_root)
+        if channel is None:
+            return None
+        escalation_cls, queue = channel
+
+        try:
+            task_id = _markup_task_id(artifacts)
+            esc = escalation_cls(
+                id=queue.make_id(task_id),
+                task_id=task_id,
+                agent_role=_MARKUP_AGENT_ROLE,
+                # Anything above `blocking` is downgraded at the escalation
+                # chokepoint, so `blocking` is the correct filing severity even
+                # for the level-2 record the middleware declares.
+                severity='blocking',
+                # The middleware OWNS this vocabulary (INV-7). A second site
+                # re-deciding a record's category or level is exactly the
+                # two-mechanisms-on-one-boundary failure this leaf exists to
+                # rule against.
+                category=record.get('category', _ESCALATION_FALLBACK_CATEGORY),
+                summary=record.get('summary', _ESCALATION_FALLBACK_SUMMARY),
+                suggested_action=record.get('suggested_action', ''),
+                detail=_markup_residue_detail(record),
+                worktree=str(artifacts.worktree),
+                level=record.get('level', 0),
+            )
+            return queue.submit(esc)
+        except Exception:
+            logger.exception(
+                'markup guard: failed to file the %r record for %s.%s; the '
+                'refusal stands and the payload is lost',
+                record.get('error_type'), record.get('tool'), record.get('field'),
+            )
+            return None
+
+    return sink
+
+
+# ---------------------------------------------------------------------------
 # FastMCP server factory
 # ---------------------------------------------------------------------------
 
@@ -1574,8 +1815,28 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
     #   plan-tools tool declares a `metadata` parameter: the middleware drops
     #   the flag before dispatch rather than forwarding it as an unexpected
     #   argument.
+    #
+    # THE ESCALATION SINK IS WIRED, and that is not optional here. Contract C2
+    # is explicit that unrepairable input is refused AND its full raw payload
+    # preserved, and the middleware's refusal hint tells the caller its payload
+    # "is preserved verbatim in the escalation named above". Registering REJECT
+    # with `escalation_sink=None` would ship that promise with nothing behind
+    # it, on the largest unrepairable surface in the system — 52 of the 95
+    # measured specimens are plan-tools' — turning "corrupt but present in
+    # plan.json" into "silently absent".
+    #
+    # `fact_sink` is DELIBERATELY left unwired (its default None). Under
+    # REJECT_WITH_REPAIR every fact's content already reaches the one party
+    # that can act on it — the leaking caller — inside the rejection payload,
+    # and the operator-facing half rides the storm escalation. A second fact
+    # channel with no consumer would repeat exactly the defect this leaf is
+    # chartered to rule against.
     mcp.add_middleware(
-        MarkupGuardMiddleware(RepairPolicy.REJECT_WITH_REPAIR, exempt_tools=frozenset())
+        MarkupGuardMiddleware(
+            RepairPolicy.REJECT_WITH_REPAIR,
+            exempt_tools=frozenset(),
+            escalation_sink=_markup_escalation_sink(artifacts),
+        )
     )
 
     @mcp.tool()
