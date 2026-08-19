@@ -582,6 +582,9 @@ class _FakeQueue:
     ) -> None:
         self.submitted: list[Escalation] = []
         self.pending: list[Escalation] = []
+        #: Every ``get_by_task`` lookup, so "a residue record never dedups"
+        #: is assertable as "it never even looked", not merely as a count.
+        self.reads: list[tuple[str, str | None]] = []
         self.submit_error = submit_error
         self.read_error = read_error
 
@@ -596,6 +599,7 @@ class _FakeQueue:
         return escalation.id
 
     def get_by_task(self, task_id: str, status: str | None = None) -> list[Escalation]:
+        self.reads.append((task_id, status))
         if self.read_error is not None:
             raise self.read_error
         return [
@@ -612,10 +616,23 @@ class ResidueRig:
     the queue happens to have kept.
     """
 
-    def __init__(self, harness: Harness, queue: _FakeQueue, records: list[dict[str, Any]]):
+    def __init__(
+        self,
+        harness: Harness,
+        queue: _FakeQueue,
+        records: list[dict[str, Any]],
+        returns: list[str | None],
+    ):
         self.harness = harness
         self.queue = queue
         self.records = records
+        #: What the sink handed BACK for each record, in the same order. The
+        #: middleware discards a storm's return value, so this is the only way
+        #: to see that a deduped storm reported the still-open record's id.
+        self.returns = returns
+
+    def storm_records(self) -> list[dict[str, Any]]:
+        return [r for r in self.records if r.get('error_type') == 'mcp_markup_storm']
 
     async def refuse(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Drive one call that must be refused; return the refusal payload."""
@@ -637,6 +654,7 @@ def build_residue_rig(
     """
     queue = _FakeQueue() if queue is None else queue
     records: list[dict[str, Any]] = []
+    returns: list[str | None] = []
 
     monkeypatch.setattr(plan_tools, '_markup_project_root', lambda worktree: artifacts.worktree)
     monkeypatch.setattr(plan_tools, '_escalation_channel', lambda root: (Escalation, queue))
@@ -648,12 +666,14 @@ def build_residue_rig(
 
         def wrapper(record: dict[str, Any]):
             records.append(record)
-            return sink(record)
+            result = sink(record)
+            returns.append(result)
+            return result
 
         return wrapper
 
     monkeypatch.setattr(plan_tools, '_markup_escalation_sink', recording_factory)
-    return ResidueRig(Harness(artifacts), queue, records)
+    return ResidueRig(Harness(artifacts), queue, records, returns)
 
 
 class TestTheSpecimenIsReal:
@@ -825,3 +845,183 @@ class TestUnrepairableResidueIsPreserved:
 
         assert rig.harness.plan_bytes() == before
         assert rig.harness.plan()['design_decisions'] == []
+
+
+# ---------------------------------------------------------------------------
+# The storm escape (INV-4) and its dedup.
+# ---------------------------------------------------------------------------
+#
+# The middleware routes storm records through the SAME injected sink as residue
+# records (``_file_storm_escalation`` hands it ``{'error_type':
+# 'mcp_markup_storm', ...}``), so without a branch the sink would file a
+# residue-shaped record — one claiming to hold a caller payload it does not
+# have — for a burst.
+
+#: A SECOND real unrepairable ``add_design_decision.decision`` payload, so
+#: "residue records never dedup" is asserted across two DISTINCT caller
+#: payloads rather than the same one twice.
+SECOND_UNREPAIRABLE_SPECIMEN = _specimen('toolu_0183rUJqrD3dMjmWAx71mKmP')
+SECOND_UNREPAIRABLE_DECISION: str = SECOND_UNREPAIRABLE_SPECIMEN['value']
+
+
+class _Clock:
+    """A hand-cranked time source, so a 3600s window costs no wall clock."""
+
+    def __init__(self, now: float = 1_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def tune_storm(rig: ResidueRig, *, threshold: int, clock: _Clock) -> MarkupGuardMiddleware:
+    """Point the REGISTERED guard's burst detector at a fake clock.
+
+    Not a reach-around: ``StormCounter``'s reload-safety contract has the
+    middleware pass ``threshold`` and ``window_seconds`` PER record() call
+    precisely so a consumer can read them live, and the counters themselves are
+    created lazily on the first event — so tuning them on the constructed guard
+    before any call is exactly as supported as reading them from a config leaf.
+    The alternative is sleeping through the real 3600s window.
+    """
+    guard = next(
+        m for m in rig.harness.server.middleware if isinstance(m, MarkupGuardMiddleware)
+    )
+    guard._storm_threshold = threshold
+    guard._storm_time_provider = clock
+    return guard
+
+
+class TestTheStormEscape:
+    """A burst means the upstream serialization leak is running RIGHT NOW."""
+
+    @pytest.mark.asyncio
+    async def test_a_burst_files_exactly_one_storm_escalation(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(a) One alarm per window, naming the outcome that actually burst."""
+        rig = build_residue_rig(monkeypatch, artifacts)
+        clock = _Clock()
+        tune_storm(rig, threshold=2, clock=clock)
+        await rig.harness.seed_plan()
+
+        for _ in range(3):
+            await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        storms = rig.storm_records()
+        assert len(storms) == 1, 'the per-window rate limit is what keeps it one'
+        assert storms[0]['count'] == 2
+        assert storms[0]['threshold'] == 2
+        assert storms[0]['window_seconds'] == 3600.0
+        assert storms[0]['outcome'] == 'rejected'
+
+        assert len(rig.queue.submitted) == 1
+        filed = rig.queue.submitted[0]
+        assert filed.category == plan_tools._MARKUP_STORM_CATEGORY
+        assert filed.task_id == plan_tools._MARKUP_STORM_ANCHOR_TASK_ID, (
+            'the burst is a property of the SERVER window, not of one task '
+            "payload — pinning the anchor is what makes the dedup lookup stable"
+        )
+        assert 'plans/toolcall-markup-containment-prd.md' in filed.detail
+
+    @pytest.mark.asyncio
+    async def test_a_second_burst_folds_into_the_still_open_record(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(b) A leak running for hours must not file one record per window."""
+        rig = build_residue_rig(monkeypatch, artifacts)
+        clock = _Clock()
+        tune_storm(rig, threshold=2, clock=clock)
+        await rig.harness.seed_plan()
+
+        for _ in range(2):
+            await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+        # Past the window, so the counter may fire again — while the record
+        # filed by the first burst is still OPEN in the queue.
+        clock.advance(4_000.0)
+        for _ in range(2):
+            await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        assert len(rig.storm_records()) == 2, 'two bursts really did fire'
+        assert len(rig.queue.submitted) == 1, 'but only one record was filed'
+        assert rig.returns[-1] == rig.queue.submitted[0].id, (
+            'the deduped burst reports the OPEN record, so the caller-facing '
+            'trail still points somewhere real'
+        )
+        assert rig.queue.reads == [
+            (plan_tools._MARKUP_STORM_ANCHOR_TASK_ID, 'pending')
+        ] * 2
+
+    @pytest.mark.asyncio
+    async def test_residue_records_never_dedup(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(c) Each residue record is the only surviving copy of a DIFFERENT payload.
+
+        Folding them would destroy one. They share a task_id, so an
+        anchor-style dedup would have collapsed them.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': UNREPAIRABLE_DECISION})
+        await rig.refuse('add_design_decision', {'decision': SECOND_UNREPAIRABLE_DECISION})
+
+        assert len(rig.queue.submitted) == 2
+        first, second = rig.queue.submitted
+        assert first.id != second.id
+        assert UNREPAIRABLE_DECISION in first.detail
+        assert SECOND_UNREPAIRABLE_DECISION in second.detail
+        assert rig.queue.reads == [], (
+            'a residue record must not even LOOK for an open record to fold '
+            'into — the lookup itself is what would lose a payload'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_read_failure_falls_through_to_filing(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(d) Losing duplicate suppression beats losing the alarm."""
+        queue = _FakeQueue(read_error=OSError('queue is unreadable'))
+        rig = build_residue_rig(monkeypatch, artifacts, queue)
+        clock = _Clock()
+        tune_storm(rig, threshold=2, clock=clock)
+        await rig.harness.seed_plan()
+
+        for _ in range(2):
+            await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        assert len(rig.queue.submitted) == 1
+        assert rig.queue.submitted[0].category == plan_tools._MARKUP_STORM_CATEGORY
+
+    @pytest.mark.asyncio
+    async def test_a_storm_filing_failure_never_changes_the_refusal(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(e) The burst summary reaches the caller even when the queue is down.
+
+        The middleware folds ``storm`` into the payload BEFORE the sink is
+        consulted, so the one tier whose callers can learn of the burst is not
+        also the tier a queue outage silences.
+        """
+        queue = _FakeQueue(submit_error=OSError('queue is unwritable'))
+        rig = build_residue_rig(monkeypatch, artifacts, queue)
+        clock = _Clock()
+        tune_storm(rig, threshold=2, clock=clock)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+        payload = await rig.refuse(
+            'add_design_decision', {'decision': ABSORBED_RATIONALE}
+        )
+
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert payload['outcome'] == 'rejected'
+        assert payload['storm']['count'] == 2
+        assert payload['storm']['threshold'] == 2
+        assert payload['storm']['window_seconds'] == 3600.0
+        assert payload['storm']['outcome'] == 'rejected'
+        assert rig.queue.submitted == []
