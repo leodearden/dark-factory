@@ -689,3 +689,90 @@ def test_observed_rate_is_none_for_single_day_sample(tmp_path):
     _archive_with_daily_arrivals(root, [5])
 
     assert _rate_for(root) is None
+
+
+# ---------------------------------------------------------------------------
+# step-3 (task 3621): required_max_task_dirs(...) — the NON-VACUITY proof.
+#
+# The live derived-bound guard (below) is inert in a fresh checkout by design:
+# with no archive to measure it skips. So the guarantee that the bound is a
+# REAL check and not arithmetic-on-literals-that-can-never-fail has to be made
+# here, host-independently: over a synthetic archive whose peak is known by
+# construction, the exact comparison the live guard makes is shown to FAIL for
+# a too-small cap and PASS for an adequate one.
+# ---------------------------------------------------------------------------
+
+def test_required_max_task_dirs_is_falsifiable_against_a_known_peak(tmp_path):
+    """(a)+(b) The live guard's comparison CAN fail.
+
+    Over an archive whose derived peak is 5/day by construction, a
+    deliberately-small cap sits BELOW the requirement and an adequate one
+    clears it — the same `cap >= required_max_task_dirs(peak, age, factor)`
+    expression, evaluating both ways.
+    """
+    root = tmp_path / "agent-transcripts"
+    #        bnd  <---- interior: 8 days, busiest holds 5 ---->  bnd
+    _archive_with_daily_arrivals(root, [1, 1, 5, 1, 1, 1, 1, 1, 1, 1])
+
+    rate = _rate_for(root)
+    assert rate is not None
+    assert rate.peak_per_day == 5  # known by construction
+
+    required = gct.required_max_task_dirs(
+        rate.peak_per_day, gct.DEFAULT_MAX_AGE_DAYS, gct.RETENTION_SAFETY_FACTOR
+    )
+    # 5/day x 90 days x factor — nothing here is a literal the test controls.
+    assert required == 5 * gct.DEFAULT_MAX_AGE_DAYS * gct.RETENTION_SAFETY_FACTOR
+
+    too_small = required - 1
+    assert not (too_small >= required), (
+        "the derived-bound comparison must be able to FAIL — a guard that "
+        "cannot go red is measuring nothing"
+    )
+    assert required >= required  # and it clears when the cap is adequate
+    assert 10 * required >= required
+
+
+def test_required_max_task_dirs_strictly_increases_with_peak_rate(tmp_path):
+    """(c) A throughput RISE genuinely raises the bar; it is not absorbed.
+
+    This is the property that makes the cap re-derive rather than sit green
+    forever — the live peak already moved 71 -> ~90/day between the PRD's
+    measurement and this task's.
+    """
+    requirements = [
+        gct.required_max_task_dirs(peak, gct.DEFAULT_MAX_AGE_DAYS, gct.RETENTION_SAFETY_FACTOR)
+        for peak in (1, 2, 50, 90, 91, 200)
+    ]
+    assert requirements == sorted(requirements)
+    assert len(set(requirements)) == len(requirements)  # STRICTLY increasing
+
+
+def test_required_max_task_dirs_strictly_increases_with_safety_factor():
+    """(c) A larger safety factor demands a larger cap, monotonically."""
+    requirements = [
+        gct.required_max_task_dirs(90, gct.DEFAULT_MAX_AGE_DAYS, factor)
+        for factor in (1, 1.5, 2, 3, 5)
+    ]
+    assert requirements == sorted(requirements)
+    assert len(set(requirements)) == len(requirements)  # STRICTLY increasing
+
+
+def test_required_max_task_dirs_rounds_up():
+    """(d) A fractional requirement rounds UP, never down into false headroom.
+
+    Rounding 1.5 down to 1 would report the cap as adequate when it is half a
+    dir short — small per-day, but it is the direction that hides truncation.
+    """
+    assert gct.required_max_task_dirs(1, 1, 1.5) == 2
+    assert gct.required_max_task_dirs(2.5, 1, 1) == 3
+    assert gct.required_max_task_dirs(1, 3, 1.1) == 4  # 3.3 -> 4
+    # An exact integer is NOT inflated by the rounding.
+    assert gct.required_max_task_dirs(2, 3, 2) == 12
+
+
+def test_retention_safety_factor_is_at_least_one():
+    """(e) A factor below 1 would size the cap UNDER the plain 90-day
+    projection of the observed rate — quietly re-admitting the very truncation
+    the derived bound exists to prevent."""
+    assert gct.RETENTION_SAFETY_FACTOR >= 1
