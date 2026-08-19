@@ -257,6 +257,50 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     )
 
 
+def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | None:
+    """One guaranteed (lower-bound) marker set per top-level test item in *source*.
+
+    THE LOAD-BEARING ENUMERATION GUARANTEE: the returned tuple enumerates EVERY
+    item pytest can collect from this module, in source order — or the answer
+    is None.  This is a SECOND, additive proof tier alongside
+    :func:`module_level_marker_names` and does not weaken that function's own
+    module-wide LOWER BOUND contract: each element here is still a lower bound
+    on its item's actual marker set (``module_level_marker_names(source)``
+    unioned with that item's own ``pytest.mark.NAME`` decorators), so the
+    Kleene reading in :func:`expression_definitely_deselects` — a name outside
+    the set is UNKNOWN, never False — carries over unchanged.
+
+    None means "cannot enumerate every item this module collects" — refuse, no
+    proof.  ``()`` means "enumerated, and there are zero top-level test
+    functions" — a distinct, still-refused answer (see
+    :func:`deselecting_expression_for_targets`, which treats both alike).
+
+    ``source is None``, a ``SyntaxError``, or a ``ValueError`` yields None.
+    Never raises.
+    """
+    if not source:
+        return None
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+
+    module_markers = module_level_marker_names(source)
+    items: list[frozenset[str]] = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if not node.name.startswith('test'):
+            continue
+        decorator_markers = frozenset(
+            name
+            for name in (_marker_name(decorator) for decorator in node.decorator_list)
+            if name is not None
+        )
+        items.append(module_markers | decorator_markers)
+    return tuple(items)
+
+
 def _kleene(node: ast.expr, marker_names: frozenset[str]) -> bool | None:
     """Evaluate *node* under Kleene (strong 3-valued) logic; None is UNKNOWN.
 
