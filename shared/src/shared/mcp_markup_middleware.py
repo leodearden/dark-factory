@@ -183,6 +183,31 @@ _UNREPAIRABLE_HINT = (
     + _OVERRIDE_SENTENCE
 )
 
+def _coerce_recovered(
+    recovered: Mapping[str, str], properties: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Type a recovered value against the invoked tool's declared schema.
+
+    ``Repair.recovered`` is ``dict[str, str]`` and every value in it is a
+    VERBATIM slice of the absorbed tail (``shared.toolcall_markup`` invariant
+    D5). That is correct for the parsing layer and stays true — but it means a
+    parameter the tool declares as ``list[dict]`` receives a ``str``, and
+    pydantic then rejects the whole call before the tool body runs.
+
+    Parsing belongs to ``shared.toolcall_markup``; typing a recovered value
+    against the tool that is about to receive it is a BOUNDARY concern and
+    belongs here.
+    """
+    coerced: dict[str, Any] = dict(recovered)
+    for name, value in recovered.items():
+        declared = properties.get(name)
+        if not isinstance(declared, dict):
+            continue
+        if declared.get('type') in ('array', 'object'):
+            coerced[name] = json.loads(value)
+    return coerced
+
+
 #: The residue escalation's category, and the machine-readable owner that will
 #: exit the hold unprompted (INV-7). This is a queue-backed handoff, so the
 #: bound is the L2 watcher's standing age surfacing rather than a deadline of
@@ -441,8 +466,8 @@ class MarkupGuardMiddleware(Middleware):
     # -- schema resolution ------------------------------------------------
 
     @staticmethod
-    async def _schema_params(context, name: str) -> tuple[str, ...]:
-        """The invoked tool's LIVE parameter names.
+    async def _schema_properties(context, name: str) -> Mapping[str, Any]:
+        """The invoked tool's LIVE JSON-Schema ``properties`` map.
 
         Two measured substrate facts, both of which the PRD's section 6 table
         gets wrong for fastmcp 3.2.2: ``get_tool`` is a COROUTINE and must be
@@ -453,21 +478,32 @@ class MarkupGuardMiddleware(Middleware):
         to name has to be checked against the tool as it actually is, or the
         guard would validate against a schema that has since drifted.
 
-        Any failure to resolve one yields an EMPTY set, which makes repair()
+        Any failure to resolve one yields an EMPTY map, which makes repair()
         refuse rather than recover against a phantom schema. That is the same
         fail-safe direction ``_as_name_set`` already takes: with no schema,
         every recovered name is out-of-schema, so nothing can be fabricated.
+
+        The full map rather than only its keys, because two callers need two
+        different things out of ONE walk: :meth:`_schema_params` wants the
+        names, and :func:`_coerce_recovered` wants each parameter's declared
+        type. A second copy of this ``parameters`` -> ``properties`` traversal
+        is exactly the lock-step duplication INV-5 exists to end.
         """
         try:
             tool = await context.fastmcp_context.fastmcp.get_tool(name)
         except Exception:
             logger.exception('markup guard could not resolve the schema for %r', name)
-            return ()
+            return {}
         parameters = getattr(tool, 'parameters', None) or {}
         properties = parameters.get('properties') if isinstance(parameters, dict) else None
         if not isinstance(properties, dict):
-            return ()
-        return tuple(properties)
+            return {}
+        return properties
+
+    @classmethod
+    async def _schema_params(cls, context, name: str) -> tuple[str, ...]:
+        """The invoked tool's LIVE parameter names — the keys of the above."""
+        return tuple(await cls._schema_properties(context, name))
 
     # -- policy -----------------------------------------------------------
 
@@ -901,7 +937,16 @@ class MarkupGuardMiddleware(Middleware):
         invisible must not also be the one tier that is never told.
         """
         arguments[param] = fix.clean_value
-        arguments.update(fix.recovered)
+        # Typed against the invoked tool's LIVE schema before it lands. A
+        # verbatim str slice forwarded into a list-typed parameter does not
+        # coerce — pydantic raises ``list_type`` and the tool body never runs.
+        # See :func:`_coerce_recovered`.
+        arguments.update(
+            _coerce_recovered(
+                fix.recovered,
+                await self._schema_properties(context, context.message.name),
+            )
+        )
 
         result = await call_next(context)
 
