@@ -1563,6 +1563,122 @@ def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request
     )
 
 
+#: Anti-vacuity floor for the sweep below: an AST matcher that silently stops
+#: matching is a guard reporting PASS while guarding nothing.  "At minimum"
+#: -- the sweep may (and does, e.g. test_watchdog_timeout_env_override_fires_
+#: fast_without_heartbeat) match more holder teardowns than this names; the
+#: assertion below only requires this set to be a SUBSET of what was matched.
+_KNOWN_HOLDER_TEARDOWN_ROWS: frozenset[str] = frozenset({
+    'test_flock_contention_full_two_way_seam_blocks_and_escalates',       # Row 5
+    'test_live_verify_merge_holds_lane_lock_real_subprocess',             # lane lock
+})
+
+
+def _spawn_verify_merge_bound_names(func_node) -> set[str]:
+    """Local names *func_node* binds via a bare ``X = spawn_verify_merge(...)`` call."""
+    names: set[str] = set()
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Assign):
+            continue
+        call = node.value
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == 'spawn_verify_merge'
+        ):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    return names
+
+
+def _bare_kill_offenders(func_node, holder_names: set[str]) -> list[str]:
+    """``"func:lineno"`` for every swept holder's ``.kill()`` called directly in a
+    ``try`` handler/finalbody that does NOT also call ``kill_holder_tree``.
+
+    Each ``finally``/``except`` body is checked independently: a ``.kill()``
+    in one body is not excused by a ``kill_holder_tree`` call living in a
+    DIFFERENT body of the same ``try``.
+    """
+    offenders: list[str] = []
+    for try_node in ast.walk(func_node):
+        if not isinstance(try_node, ast.Try):
+            continue
+        bodies = [try_node.finalbody] + [handler.body for handler in try_node.handlers]
+        for body in bodies:
+            if not body:
+                continue
+            bare_kill_lines: list[int] = []
+            has_tree_kill = False
+            for stmt in body:
+                for sub in ast.walk(stmt):
+                    if not isinstance(sub, ast.Call):
+                        continue
+                    if (
+                        isinstance(sub.func, ast.Attribute)
+                        and sub.func.attr == 'kill'
+                        and isinstance(sub.func.value, ast.Name)
+                        and sub.func.value.id in holder_names
+                    ):
+                        bare_kill_lines.append(sub.lineno)
+                    elif isinstance(sub.func, ast.Name) and sub.func.id == 'kill_holder_tree':
+                        has_tree_kill = True
+            if bare_kill_lines and not has_tree_kill:
+                offenders.extend(
+                    f'{func_node.name}:{lineno}' for lineno in bare_kill_lines
+                )
+    return offenders
+
+
+def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
+    """Every spawn_verify_merge-bound holder's teardown goes through kill_holder_tree.
+
+    Enumeration-free sweep of this module's own AST (see the banner above
+    :func:`test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark`).
+    For every ``test_*`` function, collects the local names bound from a
+    bare ``X = spawn_verify_merge(...)`` call, then asserts that no ``try``
+    handler/finalbody in that function calls ``<holder>.kill()`` directly
+    unless the SAME body also calls ``kill_holder_tree`` -- a direct
+    ``.kill()``/``.wait()`` teardown SIGKILLs only the leader, orphaning any
+    session-escaped descendant (e.g. one of verify.py's ``start_new_session``
+    build commands) for the rest of its natural life (task 4092).
+
+    Carries the sibling sweep's anti-vacuity discipline: a matcher that
+    silently stops matching is a guard reporting PASS while guarding
+    nothing, so :data:`_KNOWN_HOLDER_TEARDOWN_ROWS` anchors the functions
+    the sweep must always find a spawn_verify_merge-bound holder in,
+    independent of whether their teardown currently passes or fails.
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
+    swept: dict[str, set[str]] = {}
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if not node.name.startswith('test_'):
+            continue
+        holder_names = _spawn_verify_merge_bound_names(node)
+        if not holder_names:
+            continue
+        swept[node.name] = holder_names
+        offenders.extend(_bare_kill_offenders(node, holder_names))
+
+    missing = sorted(_KNOWN_HOLDER_TEARDOWN_ROWS - set(swept))
+    assert not missing, (
+        f'the AST sweep matched no spawn_verify_merge-bound holder in {missing} '
+        f'-- a matcher that silently stops matching is a guard reporting PASS '
+        f'while guarding nothing (matched: {sorted(swept)})'
+    )
+
+    assert not offenders, (
+        'these holder teardown(s) call .kill() directly instead of routing '
+        'through kill_holder_tree, so a session-escaped descendant (e.g. a '
+        "verify.py start_new_session build command) survives the leader's "
+        'own death as an orphan:\n  ' + '\n  '.join(offenders)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task 2819 -- deterministic unit coverage for wait_for_marker_stable, the
 # create+utimensat settle helper that de-flakes the Row 5 marker-retention
