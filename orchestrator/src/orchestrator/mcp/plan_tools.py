@@ -1576,6 +1576,28 @@ _MARKUP_AGENT_ROLE = 'plan-tools-markup-guard'
 #: server-wide burst anchor would make the two indistinguishable to a reader.
 _MARKUP_RESIDUE_ANCHOR_TASK_ID = 'plan-tools-markup-residue'
 
+#: The two record kinds the middleware emits through this one channel. Matched
+#: by name rather than by shape: a record kind that grew a key later must not
+#: silently start taking the other branch.
+_MARKUP_RESIDUE_ERROR_TYPE = 'mcp_markup_unrepairable'
+_MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
+
+#: The burst alarm. Its OWN category and level, because the middleware's storm
+#: record declares neither — unlike the residue record, which carries both and
+#: whose vocabulary is therefore never re-decided here (INV-7).
+#:
+#: `level=1` matches ``markup_tripwire``'s storm record, the in-repo precedent
+#: for a burst alarm filed from an MCP server process: it is an operator-facing
+#: heads-up about a leak that is running now, not a hold on one caller's data.
+_MARKUP_STORM_CATEGORY = 'mcp_markup_boundary_storm'
+_MARKUP_STORM_LEVEL = 1
+
+#: The dedup anchor. A burst is a property of the SERVER's rolling window, not
+#: of the task whose call happened to cross the threshold, so it is filed under
+#: a stable id of its own — which is also what makes the open-record lookup
+#: stable enough to dedup against.
+_MARKUP_STORM_ANCHOR_TASK_ID = 'plan-tools-markup-storm'
+
 #: Only ever used for a record the middleware grew LATER and this sink does not
 #: recognise. Filing it under a visible fallback is the point: silently
 #: discarding a record kind is the fail-soft this PRD exists to end.
@@ -1721,6 +1743,121 @@ def _markup_residue_detail(record: Mapping[str, Any]) -> str:
     ])
 
 
+def _markup_storm_detail(record: Mapping[str, Any]) -> str:
+    """The burst alarm's body — the window's own numbers, then what to do.
+
+    Points at ``plans/toolcall-markup-containment-prd.md`` and NOT at DF 3083,
+    which is done and CLOSED to appends: nothing reads what is attached there.
+    """
+    return '\n'.join([
+        f'count={record.get("count")!r}',
+        f'threshold={record.get("threshold")!r}',
+        f'window_seconds={record.get("window_seconds")!r}',
+        f'outcome={record.get("outcome")!r}',
+        f'project={record.get("project")!r}',
+        '',
+        'The plan-tools MCP boundary guard saw multiple tool calls carrying '
+        'raw tool-call envelope markup inside one rolling window. A BURST '
+        'means the upstream harness serialization leak is ACTIVE right now, '
+        'not that the guard is misfiring — do NOT disable it, or further '
+        'specimens land permanently in the fleet\'s plan.json files.',
+        '',
+        'Identify the leaking caller from the guard\'s own log lines (grep the '
+        "orchestrator logs for 'markup guard:' and 'markup_guard_storm') and "
+        'report it against plans/toolcall-markup-containment-prd.md.',
+    ])
+
+
+def _file_markup_residue(
+    escalation_cls: Any, queue: Any, artifacts: TaskArtifacts, record: Mapping[str, Any]
+) -> str | None:
+    """File one residue record. NEVER deduped, and that is the point.
+
+    Each record is the ONLY surviving copy of a DIFFERENT caller payload, so
+    folding two of them into one open escalation would destroy one. The storm
+    anchor's dedup exists because a burst is the same alarm twice; this is the
+    opposite case, and the open-record lookup is not even performed.
+    """
+    task_id = _markup_task_id(artifacts)
+    esc = escalation_cls(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role=_MARKUP_AGENT_ROLE,
+        # Anything above `blocking` is downgraded at the escalation chokepoint,
+        # so `blocking` is the correct filing severity even for the level-2
+        # record the middleware declares.
+        severity='blocking',
+        # The middleware OWNS this vocabulary (INV-7). A second site re-deciding
+        # a record's category or level is exactly the two-mechanisms-on-one-
+        # boundary failure this leaf exists to rule against.
+        category=record.get('category', _ESCALATION_FALLBACK_CATEGORY),
+        summary=record.get('summary', _ESCALATION_FALLBACK_SUMMARY),
+        suggested_action=record.get('suggested_action', ''),
+        detail=_markup_residue_detail(record),
+        worktree=str(artifacts.worktree),
+        level=record.get('level', 0),
+    )
+    return queue.submit(esc)
+
+
+def _file_markup_storm(
+    escalation_cls: Any, queue: Any, artifacts: TaskArtifacts, record: Mapping[str, Any]
+) -> str | None:
+    """File one burst alarm, folding into an already-open one if there is one.
+
+    The anchor dedup matters beyond the counter's own per-window rate limit: a
+    leak running for hours would otherwise file one escalation per window, so
+    those collapse into the single open record until an operator resolves it.
+
+    A queue READ failure falls THROUGH to filing rather than bailing out —
+    losing duplicate suppression is strictly better than losing the alarm for
+    an actively running leak. Same posture ``markup_tripwire`` takes.
+    """
+    try:
+        existing = queue.get_by_task(_MARKUP_STORM_ANCHOR_TASK_ID, status='pending')
+    except Exception:
+        logger.exception(
+            'markup guard: could not check for an open burst alarm; filing a '
+            'new one rather than losing it',
+        )
+        existing = []
+    open_alarms = [
+        esc for esc in existing
+        if getattr(esc, 'category', None) == _MARKUP_STORM_CATEGORY
+    ]
+    if open_alarms:
+        logger.info(
+            'markup guard: %s is already open for this burst (%r now); not '
+            'filing a duplicate', open_alarms[0].id, record,
+        )
+        return open_alarms[0].id
+
+    esc = escalation_cls(
+        id=queue.make_id(_MARKUP_STORM_ANCHOR_TASK_ID),
+        task_id=_MARKUP_STORM_ANCHOR_TASK_ID,
+        agent_role=_MARKUP_AGENT_ROLE,
+        severity='blocking',
+        category=_MARKUP_STORM_CATEGORY,
+        summary=(
+            f'{record.get("count")} plan-tools tool call(s) {record.get("outcome")} '
+            f'for leaked envelope markup in {record.get("window_seconds")}s — the '
+            'serialization leak is ACTIVE '
+            '(see plans/toolcall-markup-containment-prd.md)'
+        ),
+        detail=_markup_storm_detail(record),
+        suggested_action=(
+            "identify the leaking caller from the guard's log lines and report "
+            'it against plans/toolcall-markup-containment-prd.md — DF task 3083 '
+            'is done and closed to appends'
+        ),
+        worktree=str(artifacts.worktree),
+        level=_MARKUP_STORM_LEVEL,
+    )
+    esc_id = queue.submit(esc)
+    logger.warning('markup guard: queued %s for the burst %r', esc_id, record)
+    return esc_id
+
+
 def _markup_escalation_sink(artifacts: TaskArtifacts) -> Callable[[dict[str, Any]], str | None]:
     """Build the emitter the boundary guard files its records through.
 
@@ -1752,28 +1889,21 @@ def _markup_escalation_sink(artifacts: TaskArtifacts) -> Callable[[dict[str, Any
             return None
         escalation_cls, queue = channel
 
+        error_type = record.get('error_type')
         try:
-            task_id = _markup_task_id(artifacts)
-            esc = escalation_cls(
-                id=queue.make_id(task_id),
-                task_id=task_id,
-                agent_role=_MARKUP_AGENT_ROLE,
-                # Anything above `blocking` is downgraded at the escalation
-                # chokepoint, so `blocking` is the correct filing severity even
-                # for the level-2 record the middleware declares.
-                severity='blocking',
-                # The middleware OWNS this vocabulary (INV-7). A second site
-                # re-deciding a record's category or level is exactly the
-                # two-mechanisms-on-one-boundary failure this leaf exists to
-                # rule against.
-                category=record.get('category', _ESCALATION_FALLBACK_CATEGORY),
-                summary=record.get('summary', _ESCALATION_FALLBACK_SUMMARY),
-                suggested_action=record.get('suggested_action', ''),
-                detail=_markup_residue_detail(record),
-                worktree=str(artifacts.worktree),
-                level=record.get('level', 0),
-            )
-            return queue.submit(esc)
+            if error_type == _MARKUP_STORM_ERROR_TYPE:
+                return _file_markup_storm(escalation_cls, queue, artifacts, record)
+            if error_type != _MARKUP_RESIDUE_ERROR_TYPE:
+                # A kind the middleware grew later. FILE IT rather than
+                # dropping it: silently discarding a record kind is the
+                # fail-soft this PRD exists to end, and an unfamiliar record in
+                # the queue is a question an operator can answer.
+                logger.warning(
+                    'markup guard: filing an unrecognised record kind %r as '
+                    'residue — the middleware emits something this sink does '
+                    'not know about', error_type,
+                )
+            return _file_markup_residue(escalation_cls, queue, artifacts, record)
         except Exception:
             logger.exception(
                 'markup guard: failed to file the %r record for %s.%s; the '
