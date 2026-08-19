@@ -9,6 +9,7 @@ back out of the implementation under test.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime
 
@@ -1671,3 +1672,47 @@ def test_forget_is_still_all_or_nothing_when_only_some_holds_are_stale():
 
     assert history.forget('T1') == 2
     assert history.open_modules('T1') == []
+
+
+# --- what the staleness warning tells the operator -------------------------
+#
+# This is the ONE channel that says which entries the backstop consumed, so a
+# message that over-claims sends an operator hunting a hold that is still live.
+# The two outcomes the sweep can now produce — a partial drop that still
+# answers, and an all-stale drop that refuses — must be distinguishable here.
+
+
+def test_the_stale_warning_names_only_the_holds_it_dropped(caplog):
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
+        assert history.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
+
+    records = [r for r in caplog.records if r.name == 'orchestrator.hold_history']
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert 'ghost/src' in message          # the hold actually consumed
+    assert 'fresh/src' not in message      # still live — not the backstop's doing
+    assert 'no prediction' not in message  # the call returned 60.0
+
+
+def test_the_stale_warning_reports_the_surviving_hold_count(caplog):
+    """The partial drop and the total drop must read differently."""
+    partial = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    partial.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    partial.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
+        assert partial.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
+    assert '1 open hold(s) remain' in caplog.records[-1].getMessage()
+
+    caplog.clear()
+    all_stale = _history_of({'a/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    all_stale.observe_acquired('T1', ['a/src'], at=_at(0))
+    all_stale.observe_acquired('T1', ['b/src'], at=_at(100))
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
+        assert all_stale.predicted_remaining('T1', now=_at(2000)) is None
+    assert '0 open hold(s) remain' in caplog.records[-1].getMessage()
