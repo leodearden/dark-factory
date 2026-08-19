@@ -1158,6 +1158,97 @@ def merge_decision_enrichment(
     )
 
 
+def merge_same_queue_refile(
+    existing: DecisionRecord,
+    incoming: DecisionRecord,
+) -> DecisionRecord:
+    """Fold the SAME watcher's re-filing of its OWN id into an existing record.
+
+    Deliberate SIBLING of merge_decision_enrichment above -- read the two
+    together. Same custody set, opposite treatment of the watcher-owned half.
+    This is the other axis of _run_write_decision's upsert: not two watchers
+    seeing one gate through two queues (that is enrichment), but ONE watcher
+    re-filing its own stable id across a restart, which both watcher SKILL.md
+    files promise is idempotent.
+
+    Field policy:
+
+    - ``text`` / ``severity`` / ``task_id`` / ``session_id`` /
+      ``escalation_id`` / ``options`` / ``escalations_dir`` -- from
+      *incoming*, VERBATIM, including a severity DOWNGRADE and a field going
+      EMPTY. The watcher is the sole authority on its own escalation, and
+      freezing the first values (enrichment's fill-if-empty +
+      _max_decision_severity) would strand stale prose and a stale severity
+      in the cockpit queue forever. This is the whole reason the same-queue
+      case is not just routed through merge_decision_enrichment.
+    - ``filed_at`` / ``state`` / ``manual_boost`` -- from *existing*
+      (CUSTODY), and it is the SAME set merge_decision_enrichment keeps,
+      because custody does not depend on which queue re-filed. ``filed_at``
+      is queue AGE, which drives the cockpit's ordering, and a restart is not
+      news about it. ``manual_boost`` is the OPERATOR's C5 field, written by
+      set_manual_boost. ``state`` is the operator's / reaper's DISPOSITION,
+      written by update_decision_state.
+    - ``id`` / ``project`` -- not forced here, unlike enrichment (which
+      rebuilds from *existing*): this helper rebuilds from *incoming*, and
+      its caller has already established both are equal -- the id is the
+      on-disk file key, and _run_write_decision reaches this arm only after
+      ``existing.project == project``. Do not widen those preconditions
+      without revisiting this line.
+
+    WHY ``state`` IS SAFE TO HOLD HERE BUT NOT CROSS-QUEUE (task 3872). This
+    helper is scoped by its caller to a SAME-project, SAME-queue re-file, and
+    within ONE queue an ``esc-<taskid>-<n>`` id is unique -- that is the
+    entire premise of task 3528's queue axis. So this is definitively the
+    same gate the human already answered or dropped, not a new ask, and
+    preserving their disposition is respecting a VERIFIED human act. Across
+    queues the id namespaces genuinely collide (dark_factory runs
+    ``data/escalations`` and ``data/reconciliation/escalations`` over one
+    namespace), so a non-open cross-queue filing may be an unrelated NEW ask;
+    _run_write_decision deliberately keeps today's full overwrite there.
+
+    WHY THIS IS NOT THE FAIL-CLOSED DIRECTION the reaper docstrings in this
+    module warn about. "An over-held decision is a human-triageable row,
+    while a falsely closed one is invisible" governs the REAPER's join across
+    an id namespace it CANNOT verify -- an automatic close on uncertain
+    evidence. Here identity is certain (above) and the closure came from an
+    operator's explicit C5b act (cockpit/app.py -> update_decision_state(...,
+    DROPPED)) or from the reaper resolving against an escalation in this SAME
+    queue. The alternative is not a benign over-surfacing but an UNBOUNDED
+    one: a watcher re-files on EVERY restart while an item stays parked, and
+    reap_answered_decisions skips a non-open record ("already resolved -- no
+    re-close"), so without this the operator's dismissal is undone forever
+    and C5b's drop action is inert for exactly the class of row it exists
+    for. The escape hatch for a genuinely NEW ask at a closed id survives on
+    both sides: the operator can re-open via update_decision_state, and the
+    watcher can file under a new id -- and _run_write_decision's divergence
+    WARNING is what tells it to.
+
+    ADDITIVE-SAFE: ``state`` is copied as an opaque ``str``, never coerced
+    through DecisionState -- mirrors DecisionRecord's own no-coercion note,
+    so a disposition a future writer adds round-trips instead of being reset
+    to 'open' by a module that has not been taught about it.
+
+    KNOWN RESIDUAL: a LEGACY unstamped (``escalations_dir=''``) non-open
+    record re-filed by its own watcher does NOT reach this helper, because
+    the caller's queue-equality test cannot resolve ``'' == stamp``. Guessing
+    whose namespace an unstamped record belongs to is precisely what
+    _merge_queue_and_escalation_id refuses to do, and task 3640's back-fill
+    is draining that population; it is left as the full overwrite rather than
+    papered over here.
+
+    PURE and side-effect-free -- including of LOGGING, which stays in the CLI
+    verb at the policy boundary (mirroring how enrichment's queue warnings
+    live in _merge_queue_and_escalation_id, not in the writer). Returns a NEW
+    record via dataclasses.replace and mutates neither argument.
+    """
+    return dataclasses.replace(
+        incoming,
+        filed_at=existing.filed_at,
+        state=existing.state,
+        manual_boost=existing.manual_boost,
+    )
+
+
 @contextlib.contextmanager
 def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterator[None]:
     """Per-decision-id exclusive advisory lock using a stable sidecar file.
