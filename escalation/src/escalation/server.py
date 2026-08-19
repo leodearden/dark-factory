@@ -2370,7 +2370,10 @@ def create_server(
             # and was a real TOCTOU: the queue is built for cross-process
             # mutators, so a concurrent fold between the pre-read and the call
             # made the flag wrong in either direction.
-            outcome: AmendmentOutcome = {'recorded': False, 'dropped': 0}
+            outcome: AmendmentOutcome = {
+                'recorded': False, 'dropped': 0,
+                'variant_added': False, 'variants': 0,
+            }
             updated = queue.add_members_to_l2(
                 existing_id,
                 list(dict.fromkeys(member_ids)),

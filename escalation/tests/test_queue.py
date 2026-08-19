@@ -3363,25 +3363,40 @@ class TestAddMembersToL2:
         l2 = self._framed_l2(queue)
 
         def fresh() -> AmendmentOutcome:
-            return {'recorded': False, 'dropped': 0}
+            # Deliberately seeded with WRONG values on every key, so "filled on
+            # every return path" is actually tested rather than assumed.
+            return {
+                'recorded': True, 'dropped': 9, 'variant_added': True, 'variants': 99,
+            }
 
-        # (a) NOT FOUND — filled, not left missing, so the caller can read it
-        # without guarding.
+        def amendment_facts(outcome: AmendmentOutcome) -> dict[str, object]:
+            """Just the amendment half — the variant half has its own suite."""
+            return {'recorded': outcome['recorded'], 'dropped': outcome['dropped']}
+
+        # (a) NOT FOUND — EVERY key filled, not left missing, so the caller can
+        # read any of them without guarding.
         missing = fresh()
         assert queue.add_members_to_l2(
             'esc-does-not-exist', ['esc-l1-9'], outcome=missing,
         ) is None
-        assert missing == {'recorded': False, 'dropped': 0}
+        assert missing == {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
 
         # (b) NO-OP early return (no members, no floor, no framing).
         noop = fresh()
         queue.add_members_to_l2(l2.id, [], outcome=noop)
-        assert noop == {'recorded': False, 'dropped': 0}
+        assert noop == {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
 
-        # (c) a bare member append records nothing.
+        # (c) a bare member append records nothing — and carries no spelling, so
+        # it seeds no variant either.
         bare = fresh()
         queue.add_members_to_l2(l2.id, ['esc-l1-1'], outcome=bare)
-        assert bare == {'recorded': False, 'dropped': 0}
+        assert bare == {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
 
         # (d) framing recorded, nothing shed.  One definition of the framing
         # text, used by both this call and the repeat below, so (e) is a true
@@ -3396,12 +3411,12 @@ class TestAddMembersToL2:
 
         recorded = fresh()
         fold(recorded)
-        assert recorded == {'recorded': True, 'dropped': 0}
+        assert amendment_facts(recorded) == {'recorded': True, 'dropped': 0}
 
         # (e) a framing-identical repeat is suppressed — and says so.
         repeat = fresh()
         fold(repeat)
-        assert repeat == {'recorded': False, 'dropped': 0}, (
+        assert amendment_facts(repeat) == {'recorded': False, 'dropped': 0}, (
             'a suppressed repeat must not report a write'
         )
 
@@ -3416,7 +3431,7 @@ class TestAddMembersToL2:
             l2.id, [], outcome=truncating,
             root_cause='one past the cap', evidence='overflow evidence',
         )
-        assert truncating == {'recorded': True, 'dropped': 1}, (
+        assert amendment_facts(truncating) == {'recorded': True, 'dropped': 1}, (
             f'a truncating append must report both facts, got {truncating}'
         )
         capped = queue.get(l2.id)

@@ -140,6 +140,20 @@ _MAX_AMENDMENT_LINE_CHARS = 300
 _MAX_AMENDMENT_DETAIL_CHARS = 1200
 _MAX_AMENDMENT_OPTIONS = 6
 
+# Hard cap on the NUMBER of Escalation.root_cause_variants entries — the DISTINCT
+# pre-canonical root_cause spellings one L2 has been addressed by (task 3998).
+# Same sole-writer/sole-trimmer, oldest-shed, count-every-drop policy as
+# `_MAX_AMENDMENTS` above, and sized against the same post-canonicalisation fold
+# rate; each entry is one elided LINE (a dedup key), so the whole list is bounded
+# by 20 * ~370 chars ~= 7 KB.
+# DELIBERATELY WELL ABOVE the server's over-fold alarm threshold
+# (`_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD = 5`): the cap must never be what
+# decides whether the signal fires, or a tighter cap would silently mute the
+# very alarm it is meant to feed.  Past the cap the count keeps climbing in
+# `root_cause_variants_truncated`, so the TRUE distinct total
+# (`len(list) + truncated`) never plateaus.
+_MAX_ROOT_CAUSE_VARIANTS = 20
+
 
 class AmendmentOutcome(TypedDict):
     """What ONE :meth:`EscalationQueue.add_members_to_l2` call did to ``amendments``.
@@ -166,6 +180,16 @@ class AmendmentOutcome(TypedDict):
 
     recorded: bool  # THIS call appended an amendment
     dropped: int    # entries THIS call shed at the _MAX_AMENDMENTS cap
+    # THIS call added a previously-unseen PRE-canonical root_cause spelling
+    # (task 3998).  Same TOCTOU argument as `recorded`: "is this spelling new to
+    # the record" is only answerable against the record as it is INSIDE the lock.
+    variant_added: bool
+    # The record's TRUE distinct-spelling total AFTER this call —
+    # `len(root_cause_variants) + root_cause_variants_truncated`, NOT the list
+    # length, so it keeps climbing past `_MAX_ROOT_CAUSE_VARIANTS` instead of
+    # plateauing exactly when a runaway makes it matter.  This is what the
+    # server's over-fold threshold crossing is tested against.
+    variants: int
 
 
 def _elide(text: str, limit: int) -> tuple[str, int]:
@@ -1195,16 +1219,35 @@ class EscalationQueue:
         when *escalation_id* is not found in the queue root (unknown id or
         archived).
 
-        Pass *outcome* to learn what this call did to ``amendments`` — whether
-        it recorded one, and how many it shed — as computed HERE, inside the
-        lock, rather than inferred by a caller from a racy pre-read.  See
-        :class:`AmendmentOutcome`.  It is filled on every return path.
+        **Distinct root-cause spellings are tracked (task 3998).**  Since the
+        pending-L2 lookup matches on the CANONICAL form, a fold can arrive
+        spelled differently from the record's own ``root_cause``.  Every such
+        PRE-canonical spelling is accumulated in ``esc.root_cause_variants``
+        (the record's own spelling seeded first), because canonicalisation's
+        failure mode is OVER-folding — distinct causes silently merged under one
+        canonical key — and the set of mutually-distinct spellings one cluster
+        has been addressed by is that failure's only observable signature.  This
+        method is the SOLE writer and sole trimmer: the list is oldest-shed at
+        ``_MAX_ROOT_CAUSE_VARIANTS`` with every drop counted in
+        ``root_cause_variants_truncated``, so the TRUE distinct count
+        (``len(variants) + truncated``) stays readable from the record and never
+        plateaus.  It lands in the SAME single ``_rewrite`` as everything else
+        above.
+
+        Pass *outcome* to learn what this call did to ``amendments`` and to
+        ``root_cause_variants`` — whether it recorded an amendment, how many it
+        shed, whether it added a new spelling, and the running distinct total —
+        as computed HERE, inside the lock, rather than inferred by a caller from
+        a racy pre-read.  See :class:`AmendmentOutcome`.  It is filled on every
+        return path.
         """
         # Defaults FIRST: the two early returns below leave them as-is, so the
         # caller's dict is complete no matter which path this call takes.
         if outcome is not None:
             outcome['recorded'] = False
             outcome['dropped'] = 0
+            outcome['variant_added'] = False
+            outcome['variants'] = 0
         with escalation_id_lock(self.queue_dir, escalation_id):
             path = self.queue_dir / f'{escalation_id}.json'
             if not path.exists():
@@ -1239,6 +1282,56 @@ class EscalationQueue:
             # write path, no new durability story.
             amendment_recorded = False
             dropped_entries = 0
+
+            # Track the DISTINCT pre-canonical root_cause spellings this cluster
+            # has been addressed by (task 3998).  Canonicalising the match makes
+            # more promotes fold BY DESIGN, so the failure it introduces is
+            # OVER-folding — distinct causes silently merged under one canonical
+            # key — and this list is that failure's only observable signature.
+            # Written in the SAME critical section and folded into the SAME
+            # single _rewrite as the member append and the amendment: no second
+            # write path, no new durability story, and cross-process
+            # union-preservation is inherited from the lock rather than
+            # re-established.
+            variant_added = False
+            # STRIPPED, exactly as `_framing_view` compares root_cause and as the
+            # create path stores it: a key differing only in surrounding
+            # whitespace was folded by the lookup even BEFORE canonicalisation,
+            # so it is not a distinct SPELLING and carries no over-fold
+            # information.  Recording it would also contradict the pinned
+            # contract that such a fold is a no-op (no spurious `updated_at`
+            # bump, hence no spurious re-assess trigger).
+            incoming_variant = root_cause.strip()
+            if incoming_variant:
+                # Seed the record's OWN spelling first, so the count reflects
+                # every spelling the cluster has EVER been addressed by rather
+                # than only the post-mint ones.
+                if not esc.root_cause_variants and esc.root_cause.strip():
+                    seeded, _ = _elide(esc.root_cause.strip(), _MAX_AMENDMENT_LINE_CHARS)
+                    esc.root_cause_variants.append(seeded)
+                # Elide through the SAME helper as amendment fields, so an
+                # over-long spelling is capped with the in-band marker rather
+                # than silently truncated — and so the comparison below is
+                # against the STORED form, exactly as _is_repeat_framing does.
+                incoming, _ = _elide(incoming_variant, _MAX_AMENDMENT_LINE_CHARS)
+                if incoming not in esc.root_cause_variants:
+                    esc.root_cause_variants.append(incoming)
+                    variant_added = True
+                    if len(esc.root_cause_variants) > _MAX_ROOT_CAUSE_VARIANTS:
+                        shed = len(esc.root_cause_variants) - _MAX_ROOT_CAUSE_VARIANTS
+                        del esc.root_cause_variants[:shed]
+                        esc.root_cause_variants_truncated += shed
+                        logger.warning(
+                            'add_members_to_l2: %s shed %d oldest root_cause '
+                            'variant(s) at the _MAX_ROOT_CAUSE_VARIANTS=%d cap '
+                            '(running total truncated=%d); the TRUE distinct '
+                            'count is still len(variants)+truncated=%d',
+                            escalation_id, shed, _MAX_ROOT_CAUSE_VARIANTS,
+                            esc.root_cause_variants_truncated,
+                            len(esc.root_cause_variants)
+                            + esc.root_cause_variants_truncated,
+                        )
+
             if incoming_framing:
                 candidate, chars_elided = _build_amendment(
                     root_cause=root_cause, summary=summary, evidence=evidence,
@@ -1282,7 +1375,10 @@ class EscalationQueue:
                             esc.amendments_truncated,
                         )
 
-            if appended or severity_changed or amendment_recorded:
+            # A new variant is a real content change, so it joins the existing
+            # write condition rather than getting a write of its own — a fold
+            # that ONLY re-spells the cause must still be durable.
+            if appended or severity_changed or amendment_recorded or variant_added:
                 esc.members.extend(appended)
                 esc.severity = new_severity
                 # Bump the "changed since triaged" signal — a member append, a
@@ -1302,6 +1398,13 @@ class EscalationQueue:
             if outcome is not None:
                 outcome['recorded'] = amendment_recorded
                 outcome['dropped'] = dropped_entries
+                outcome['variant_added'] = variant_added
+                # The TRUE distinct total, not the list length: past the cap the
+                # list stops growing, and reporting its length would make the
+                # over-fold signal plateau exactly when it matters most.
+                outcome['variants'] = (
+                    len(esc.root_cause_variants) + esc.root_cause_variants_truncated
+                )
             return esc
 
     def stamp_triage(
