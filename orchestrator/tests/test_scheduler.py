@@ -1796,6 +1796,79 @@ class TestUpdateTaskMetadataSerialization:
         assert 'append' not in arguments
 
 
+class TestFakeMetadataBackendMirrorsUpdateTaskRejection:
+    """The shared workflow test double must mirror Scheduler.update_task's rejection.
+
+    ``FakeMetadataBackend`` (tests/_workflow_helpers.py) advertises — in both
+    its class docstring and an inline comment — that it models
+    ``Scheduler.update_task``'s precedence exactly.  Left unfixed after the
+    contradictory-pair guard landed, that claim would be false for the
+    merge+append=True cell: the fake would still resolve it to 'merge' and
+    shallow-overwrite its blob, letting a future workflow test "prove" backend
+    state that production now refuses to produce.  These tests sit beside the
+    production contract in ``TestUpdateTaskMetadataSerialization`` above so the
+    two cannot drift apart again.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fake_metadata_backend_merge_plus_append_true_raises(self):
+        """The fake rejects the contradictory pair, and refuses the write outright."""
+        from _workflow_helpers import FakeMetadataBackend
+
+        initial = {'memory_hints': {'entities': ['Scheduler'], 'queries': ['locking']}}
+        backend = FakeMetadataBackend(initial)
+
+        with pytest.raises(ValueError) as excinfo:
+            await backend.update_task(
+                '1', {'memory_hints': {'entities': ['stub']}},
+                append=True, metadata_mode='merge',
+            )
+
+        assert 'additive' in str(excinfo.value), (
+            "message must point the caller at the 'additive' escape hatch; "
+            f'got: {str(excinfo.value)!r}'
+        )
+        # A refused write must leave backend STATE untouched — the fake must not
+        # half-apply before refusing.  This is the fake's analogue of the
+        # production test's `captured_args == []`.
+        assert backend.blob == initial, (
+            f'A rejected update_task must not mutate the blob; got: {backend.blob}'
+        )
+        assert backend.update_task_calls == [], (
+            'A rejected update_task must not be recorded as a write; '
+            f'got: {backend.update_task_calls}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fake_metadata_backend_additive_plus_append_true_still_merges(self):
+        """('additive', append=True) still performs the additive union on the fake.
+
+        Non-regression cell pinning that the fake's guard is exactly as narrow
+        as the scheduler's — this pair is not a contradiction, both signals mean
+        the same recursive-union merge.
+        """
+        from _workflow_helpers import FakeMetadataBackend
+
+        backend = FakeMetadataBackend(
+            {'memory_hints': {'entities': ['Scheduler'], 'queries': ['locking']}}
+        )
+
+        result = await backend.update_task(
+            '1', {'memory_hints': {'entities': ['ModuleLockTable']}},
+            append=True, metadata_mode='additive',
+        )
+
+        assert result is True
+        # Recursive union: the incoming entity is added, the untouched
+        # sibling 'queries' key survives.
+        assert backend.blob == {
+            'memory_hints': {
+                'entities': ['Scheduler', 'ModuleLockTable'],
+                'queries': ['locking'],
+            }
+        }, f'Expected an additive union; got: {backend.blob}'
+
+
 class TestUpdateTaskStructuredRejection:
     """update_task must return False when the wire response carries a structured rejection.
 
