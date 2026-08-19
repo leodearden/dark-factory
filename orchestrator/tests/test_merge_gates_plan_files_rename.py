@@ -228,6 +228,24 @@ def _is_existence_probe(cmd: Sequence[str]) -> bool:
     return list(cmd[:2]) == ['git', 'ls-tree'] and '--' in cmd and '-r' not in cmd
 
 
+def _is_rename_delete_probe(cmd: Sequence[str]) -> bool:
+    """True for the rename resolver's ``git log --diff-filter=D ... -- <path>``.
+
+    MUST require ``--diff-filter=D``.  ``_path_existed_in_branch_history``
+    also issues a bare ``git log -1 --format=%H <head> -- <path>`` on this
+    same code path with no such flag; a predicate that matched both would
+    fail THAT history probe closed too, mechanism 2 would then bail for a
+    different reason, and a test built on this predicate would pass against
+    buggy code without ever exercising the rename-probe arm it targets.
+    """
+    return list(cmd[:2]) == ['git', 'log'] and '--diff-filter=D' in cmd
+
+
+def _is_rename_show_probe(cmd: Sequence[str]) -> bool:
+    """True for the rename resolver's ``git show --name-status -M <sha>``."""
+    return list(cmd[:2]) == ['git', 'show'] and '--name-status' in cmd
+
+
 # ---------------------------------------------------------------------------
 # API surface — the two new PlanFilesTouchedResult fields
 # ---------------------------------------------------------------------------
@@ -897,4 +915,125 @@ class TestGitErrorArmsFailClosed:
         )
         assert 'tree-listing failed' in msg, (
             f'the degradation must be loud, not silent; got: {msg!r}'
+        )
+
+    async def test_rename_delete_probe_error_does_not_fall_through_to_basename(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A git error on the FIRST rename-probe arm must fail CLOSED.
+
+        Identical repo shape to
+        ``TestUniqueBasenameFallback.test_delete_then_add_resolves_by_unique_basename``
+        — mechanism 1 is unrecoverable (separate delete/add commits) but
+        mechanism 2 WOULD resolve this via a unique basename match.  Forcing
+        the ``git log --diff-filter=D`` probe itself to error is a DIFFERENT
+        fact from "mechanism 1 found no pair": the resolution is
+        unmeasurable, not merely inconclusive, so the gate must not silently
+        fall through to the basename heuristic and must block instead.
+        """
+        old = 'crates/tests/topo_e2e.rs'
+        new = 'crates/tests/harness_topo/topo_e2e.rs'
+
+        await _commit_on_main(
+            git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _relocate_as_delete_then_add(git_repo, old, new)
+
+        wt = (await git_ops.create_worktree('rename-delete-probe-error')).path
+        base = await _head_of(wt)
+        (wt / new).write_text('// branch edit\nfn topo() { assert_eq!(2, 2); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        spy = _RunSpy(fail_when=_is_rename_delete_probe)
+        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                [old], base, head, git_ops, task_id='rename-delete-error',
+            )
+
+        assert spy.count(_is_rename_delete_probe) >= 1, 'the fault must have fired'
+        assert result.not_touched == [old], (
+            'an unmeasurable rename probe still blocks — the gate fails CLOSED'
+        )
+        assert result.resolved_renames == {}, (
+            'a git error on the rename probe must never fall through to the '
+            'basename heuristic'
+        )
+        assert result.missing_from_tree == [old], (
+            'the existence probe DID succeed and DID measure a genuine absence; '
+            'only the rename RESOLUTION was unmeasurable, unlike '
+            'test_existence_probe_error_is_not_classified_missing'
+        )
+        msg = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'resolution abandoned' in msg, (
+            f'the degradation must be loud about abandoning resolution, not just '
+            f'the per-probe error; got: {msg!r}'
+        )
+
+    async def test_rename_show_probe_error_does_not_fall_through_to_basename(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A git error on the SECOND rename-probe arm must fail CLOSED.
+
+        Identical repo shape to
+        ``TestRenamedOnMainResolvesViaDeletingCommit.test_renamed_on_main_gate_passes``
+        — a single ``git mv`` commit, so ``git log --diff-filter=D`` finds
+        the deleting commit and the ``git show --name-status -M`` call is
+        actually reached.  Forcing THAT call to error must not silently
+        degrade to the basename heuristic either, even though it too would
+        resolve this shape (identical basename on both sides of the move).
+        """
+        old = 'crates/tests/topo_e2e.rs'
+        new = 'crates/tests/harness_topo/topo_e2e.rs'
+
+        await _commit_on_main(
+            git_repo, {old: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _rename_on_main(
+            git_repo, old, new, 'harness: consolidate topo tests',
+        )
+
+        wt = (await git_ops.create_worktree('rename-show-probe-error')).path
+        base = await _head_of(wt)
+        (wt / new).write_text('fn topo() { assert!(true); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        spy = _RunSpy(fail_when=_is_rename_show_probe)
+        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                [old], base, head, git_ops, task_id='rename-show-error',
+            )
+
+        assert spy.count(_is_rename_show_probe) >= 1, 'the fault must have fired'
+        assert result.not_touched == [old], (
+            'an unmeasurable rename probe still blocks — the gate fails CLOSED'
+        )
+        assert result.resolved_renames == {}, (
+            'a git error on the rename probe must never fall through to the '
+            'basename heuristic'
+        )
+        assert result.missing_from_tree == [old], (
+            'the existence probe DID succeed and DID measure a genuine absence; '
+            'only the rename RESOLUTION was unmeasurable, unlike '
+            'test_existence_probe_error_is_not_classified_missing'
+        )
+        msg = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'resolution abandoned' in msg, (
+            f'the degradation must be loud about abandoning resolution, not just '
+            f'the per-probe error; got: {msg!r}'
         )
