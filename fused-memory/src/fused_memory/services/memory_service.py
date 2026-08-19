@@ -83,7 +83,7 @@ from fused_memory.services.topic_anchor import (
     select_canonical_payload,
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
-from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.canonical_labels import Referent, parse_node_name
 from fused_memory.utils.referent_resolution import (
     REFERENT_SOURCES,
     ReferentResolution,
@@ -2821,6 +2821,136 @@ class MemoryService:
             )
         return fixed
 
+    async def _verify_episode_referents(
+        self, result: Any, *, group_id: str, referents: ReferentSet
+    ) -> ReferentStats:
+        """Verify each edge hangs off a node this write is actually ABOUT.
+
+        The write-time verification sub-pass (task 3671, PRD leaf zeta). Leaf
+        gamma resolves WHICH referents a write is about and leaf epsilon threads
+        that set through the durable queue to ``_execute_graphiti_write``; this
+        pass closes the loop by walking the committed episode's edges and asking,
+        per endpoint, whether the node the edge landed on is one of them.
+
+        DETECTS AND RECORDS ONLY — it performs no writes of any kind. The repair
+        (``ensure_entity_node`` -> ``reassign_edge`` -> ``refresh_entity_summary``)
+        and the repair-storm streak escalation are leaf ETA's; this pass's output
+        is the structured evidence eta acts on. A finding whose correct target
+        cannot be determined is RECORDED and LEFT ALONE, never guessed at.
+
+        RUNS LAST in ``_reconcile_episode_identity``, and that ordering is
+        load-bearing in one direction: any repair eta performs, and the
+        ``new_endpoint_uuid`` this pass resolves, must describe POST-normalization
+        topology. Minting a 'Task N' node before ``_normalize_task_node_names``
+        ran would create exactly the duplicate that pass exists to collapse.
+
+        The DETECTION verdict, by contrast, is deliberately invariant across that
+        normalization, because endpoint names are keyed through
+        :func:`~fused_memory.utils.canonical_labels.parse_node_name` rather than
+        compared as raw strings: ``parse_node_name('task #3127')`` and
+        ``parse_node_name('Task 3127')`` yield the IDENTICAL frozen
+        :class:`Referent`. That is what makes the in-memory ``result.nodes`` names
+        sufficient even though a rename or merge may have just moved out from
+        under them — and it is why this pass costs zero extra backend round-trips
+        on the clean path, rather than one ``get_node_text`` per endpoint
+        serialized inside the per-group identity lock.
+
+        Runs INSIDE ``_identity_lock_for`` (see ``_execute_graphiti_write``), so
+        no wrongly-attached state is ever externally visible between the write
+        and its verification.
+
+        THE C' POST-LLM VETO FOLDS IN HERE; it is not a second mechanism, and its
+        absence is not an oversight. Post-write, "extracted Task N was merged onto
+        the Task M node" is observationally IDENTICAL to "an edge about Task M is
+        attached to a Task N node" — which the checks below already detect. A
+        separate veto would be two sites that must agree byte-for-byte, the INV-5
+        lockstep duplication utils/canonical_labels.py exists to prevent. The PRD
+        says so outright: it is "not a distinct leaf".
+
+        SET MEMBERSHIP: an endpoint whose parsed referent is not in *referents* is
+        a node this write never declared itself to be about. This catches the
+        dominant measured live shape, whose defining signature is that the
+        landed-on number is never named by the fact at all.
+
+        An EMPTY *referents* makes the whole pass a no-op, honouring the contract
+        ``resolve_referents`` publishes in its own docstring ("an EMPTY
+        ``.referents`` carries nothing to test membership against, so a downstream
+        verifier must no-op on it regardless of ``.source``") and the PRD's
+        ``source='none'`` boundary row ("no repair attempted").
+
+        Args:
+            result: The value returned by ``add_episode`` (typically an
+                AddEpisodeResults object). ``None``, edgeless, and
+                missing-attribute results are all handled the same way the
+                sibling post-write sweeps handle them.
+            group_id: The project graph this episode was written to.
+            referents: The referent set leaf epsilon decoded off the queue
+                payload — what this write DECLARED itself to be about.
+
+        Returns:
+            A :class:`ReferentStats` recording what was walked and every finding.
+            All-zero with no findings means "every checkable endpoint agreed".
+        """
+        stats = ReferentStats()
+        if result is None or not referents:
+            return stats
+        edges = getattr(result, 'edges', None) or []
+        if not edges:
+            return stats
+
+        # The episode's own node names, which is all the detection needs — see
+        # the parse_node_name invariance note above. Same defensive
+        # `getattr(..., '') or ''` idiom the sibling sweeps use, since a mocked
+        # or partially-populated result must degrade rather than raise inside an
+        # already-committed write's critical section.
+        names_by_uuid: dict[str, str] = {}
+        for node in getattr(result, 'nodes', None) or []:
+            node_uuid = getattr(node, 'uuid', '') or ''
+            node_name = getattr(node, 'name', '') or ''
+            if node_uuid and node_name:
+                names_by_uuid[node_uuid] = node_name
+
+        # Membership is tested on Referent OBJECTS (frozen => hashable, equality
+        # on the (kind, project_id, number) triple), never on rendered names.
+        # `referent_names` is the human-readable rendering carried on the record.
+        referent_set = frozenset(referents)
+        referent_names = tuple(r.node_name for r in referents)
+
+        for edge in edges:
+            stats.edges_scanned += 1
+            edge_uuid = getattr(edge, 'uuid', '') or ''
+            for which_end, attr in (
+                ('source', 'source_node_uuid'), ('target', 'target_node_uuid'),
+            ):
+                endpoint_uuid = getattr(edge, attr, '') or ''
+                endpoint_name = names_by_uuid.get(endpoint_uuid, '')
+                if not endpoint_name:
+                    # This episode's result does not name the node this edge end
+                    # points at, so its name is unknown and it cannot be checked.
+                    # COUNTED rather than skipped silently: a check that did not
+                    # run is not a check that passed.
+                    stats.endpoints_unresolved += 1
+                    continue
+                endpoint_referent = parse_node_name(endpoint_name)
+                if endpoint_referent is None:
+                    # Not a task label at all ('MergeWorker'), or a name that
+                    # merely MENTIONS one ('Task 42 orchestrator' — parse_node_name
+                    # is anchored). Out of scope, and not a blind spot.
+                    continue
+                stats.endpoints_checked += 1
+                if endpoint_referent not in referent_set:
+                    stats.findings.append(ReferentFinding(
+                        edge_uuid=edge_uuid,
+                        which_end=which_end,
+                        check='set-membership',
+                        old_endpoint_uuid=endpoint_uuid,
+                        old_endpoint_name=endpoint_name,
+                        endpoint_referent=endpoint_referent,
+                        referent_set=referent_names,
+                    ))
+                    continue
+
+        return stats
     async def _reconcile_episode_identity(
         self, result: Any, *, group_id: str
     ) -> ReconcileStats:
