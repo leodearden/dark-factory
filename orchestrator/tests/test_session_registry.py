@@ -6248,6 +6248,141 @@ def test_main_write_decision_same_queue_refile_still_fully_overwrites(
     assert listed[0].manual_boost == 9  # the operator's boost survives
     assert listed[0].filed_at == filed_at  # queue age not restamped
 
+@pytest.mark.parametrize(
+    'closed_state',
+    [
+        sr.DecisionState.DROPPED,
+        sr.DecisionState.ANSWERED,
+        'deferred-by-hand',
+    ],
+)
+def test_main_write_decision_same_queue_refile_does_not_resurrect_a_closed_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    closed_state: str,
+) -> None:
+    """THE HEADLINE REGRESSION (task 3872), at the CLI boundary.
+
+    An operator dismisses a still-PARKED row in the cockpit decision queue
+    (C5b), and the watcher that filed it restarts. Both watcher SKILLs tell
+    an agent to re-file the same stable id on every restart while an item
+    stays parked -- so before this change the dismissal was silently undone
+    on the very next restart, and again, and again: the guarded upsert block
+    was scoped to an OPEN record, so a non-open one fell through to
+    ``record = incoming``, a freshly constructed record carrying state=open,
+    manual_boost=0 and a restamped filed_at. reap_answered_decisions likewise
+    skips a non-open decision, so nothing downstream re-closed it either.
+    C5b's drop action was therefore INERT for exactly the class of row it
+    exists for, and the operator's dismissal could never stick.
+
+    Arranged through the REAL cross-subsystem sequence rather than a
+    hand-built record: filed through the verb, then triaged via the same
+    set_manual_boost / update_decision_state helpers cockpit/app.py calls,
+    then re-filed through the verb from the SAME queue.
+
+    Parametrized over an unrecognized state as well as the two DecisionState
+    members, since DecisionRecord.state is a plain str with no from_dict
+    coercion -- a disposition a future writer adds must be held back too,
+    not silently reset to 'open' by a module that has not been taught it.
+
+    The final two asserts are what keep this from over-firing into "a closed
+    row is frozen": the watcher's OWN fields still land, so the row's prose
+    and severity stay current even while it stays closed.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    rc1 = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        task_id='5914',
+        escalations_dir=str(orch),
+    )
+    filed_at = sr.list_decisions(root=tmp_path)[0].filed_at
+    # The operator triages the row in the cockpit: boosts it, then dismisses
+    # it. Same two helpers cockpit/app.py's C5b drop action calls.
+    assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
+    assert sr.update_decision_state('esc-5914-1', closed_state, root=tmp_path) is not None
+
+    # ...and the watcher restarts, re-filing its own id from its own queue.
+    rc2 = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='reify? (rephrased)',
+        severity='info',
+        escalations_dir=str(orch),
+    )
+
+    assert rc1 == 0
+    assert rc2 == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    survivor = listed[0]
+    assert survivor.state == closed_state  # the operator's disposition STICKS
+    assert survivor.manual_boost == 9  # ...as does their boost
+    assert survivor.filed_at == filed_at  # ...and queue age is not restamped
+    assert survivor.text == 'reify? (rephrased)'  # but the row is not FROZEN
+    assert survivor.severity == 'info'  # ...a downgrade still lands
+
+
+def test_main_write_decision_cross_queue_refile_of_a_closed_record_still_overwrites(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The deliberately-UNCHANGED neighbour: the QUEUE is the discriminator.
+
+    Stated adjacently to the test above so a future reader cannot mistake
+    task 3872's change for "non-open records are now always protected". The
+    axis is the QUEUE, not the state: within ONE queue an ``esc-<taskid>-<n>``
+    id is unique (task 3528's premise), so a same-queue re-file is
+    definitively the same gate the human already dealt with. ACROSS queues
+    the id namespaces genuinely collide -- dark_factory runs
+    ``data/escalations`` and ``data/reconciliation/escalations`` over one
+    namespace -- so a non-open cross-queue filing may be an unrelated NEW
+    ask, and holding it closed would make a live gate invisible, which is
+    the fail-CLOSED direction _run_reap_decisions' docstring rules out.
+
+    Same rule test_main_write_decision_non_open_record_is_still_overwritten
+    pins; restated here with an operator boost on the record as well, so the
+    contrast with the same-queue case is visible in every custody field
+    rather than only in `state`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        escalations_dir=str(orch),
+    )
+    assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
+    assert (
+        sr.update_decision_state('esc-5914-1', sr.DecisionState.DROPPED, root=tmp_path)
+        is not None
+    )
+
+    # A DIFFERENT queue files the same id -- possibly an unrelated new ask.
+    rc = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='a brand new question that merely shares the id',
+        severity='info',
+        escalations_dir=str(recon),
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    survivor = listed[0]
+    assert survivor.state == sr.DecisionState.OPEN  # re-opened: a new ask
+    assert survivor.manual_boost == 0
+    assert survivor.text == 'a brand new question that merely shares the id'
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(recon)
+
 
 def test_main_write_decision_same_id_different_project_is_refused(
     monkeypatch: pytest.MonkeyPatch,
