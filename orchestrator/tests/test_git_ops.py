@@ -6705,6 +6705,48 @@ async def _assert_child_reaped(
     pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
 
 
+# Cancellation timeout for the wait_for-shaped caller in
+# TestRunCancellationReapsChild. NOT a tuned threshold: the child sleeps 60s
+# AFTER publishing its pid, and _start_hung_child does not return until that
+# pid is on disk, so this value only has to be SHORTER than 60s (a ~1200x
+# margin) and never has to outlast interpreter startup. It fails safe — a
+# slower box makes the timeout MORE likely to fire, never less. Contrast the
+# single 5.0s deadline this replaced, which had to do both jobs at once and
+# was tuned down to 0/40 misses on one box rather than eliminated (task 4109).
+_CANCEL_TIMEOUT = 0.05
+
+
+async def _start_hung_child(
+    pid_file: Path, *, startup_delay: float = 0.0,
+) -> tuple[asyncio.Task[tuple[int, str, str]], int]:
+    """Spawn a child that publishes its pid then sleeps, and confirm it started.
+
+    The single spawn-and-confirm arrange path shared by both tests in
+    ``TestRunCancellationReapsChild``. Returns only once the child has
+    PUBLISHED its pid, so the caller's cancellation is guaranteed to hit a
+    live child and no caller-side timeout has to cover interpreter startup
+    (task 4109). ``startup_delay`` exists so the contract guard can inject a
+    startup slower than any caller timeout.
+    """
+    script = (
+        'import os, time\n'
+        f'time.sleep({startup_delay!r})\n'
+        f"tmp = {str(pid_file)!r} + '.tmp'\n"
+        "open(tmp, 'w').write(str(os.getpid()))\n"
+        # Atomic tmp-write + rename — see _wait_for_child_pid (task 3851).
+        f"os.replace(tmp, {str(pid_file)!r})\n"
+        'time.sleep(60)\n'
+    )
+    task = asyncio.ensure_future(_run(['python3', '-c', script]))
+    try:
+        child_pid = await _wait_for_child_pid(pid_file)
+    except BaseException:
+        with contextlib.suppress(BaseException):
+            task.cancel()
+        raise
+    return task, child_pid
+
+
 @pytest.mark.asyncio
 class TestHungChildHelperContract:
     """Contract for the not-yet-defined ``_start_hung_child`` arrange helper.
