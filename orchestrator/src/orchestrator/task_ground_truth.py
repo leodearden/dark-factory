@@ -36,16 +36,14 @@ presence check or a ``.source`` check), so it changes no recovery outcome —
 it only makes the field COMPARABLE by ``escalation.pins``.
 
 SCOPE HONESTY on that last point: 3563 shipped the SHAPE contract, NOT
-end-to-end reachability. Two gaps outside its scope still gate the payoff.
-(1) The plan.lock leg of :meth:`TaskGroundTruth._resolve_live_claimant` reads
-``<worktree>/.task/plan.lock`` while the production writer targets the
-``.task-meta`` SIBLING, so on a real orchestrator run that leg can only ever
-find a pre-3563 legacy lock and resolves ``run_id=None`` — i.e. the
-composition branch is INERT in production today (task 4262 relocates the read;
-task 4028 tracks deleting the leg outright if that is the ruling instead).
-(2) The only production ``escalation.pins.classify_pins`` call site still
+end-to-end reachability. Its first gap is now CLOSED — the plan.lock leg of
+:meth:`TaskGroundTruth._resolve_live_claimant` reads the ``.task-meta``
+sibling the production writer targets (task 4028), so on a real orchestrator
+run that leg can find a live 3563-shaped lock and the composition branch is
+REACHABLE rather than inert. One gap outside 3563's scope still gates the
+payoff: the only production ``escalation.pins.classify_pins`` call site still
 passes ``live_claimant=False`` with no ``live_claimant_id`` (task 3541 wires
-it). Live-vs-dead filer discrimination becomes REACHABLE when those land; what
+it). Live-vs-dead filer discrimination becomes REACHABLE when that lands; what
 3563 delivers is that the identity is now expressible at all, and that the
 bare-``session_id`` shape which would have made that comparison UNSAFE is gone.
 """
@@ -537,10 +535,10 @@ class TaskGroundTruth:
            lock's own run_id/session_id/owner_pid, or left ``None`` when any
            component is missing or malformed — see the :class:`Claimant`
            docstring for why a partial composition is never acceptable
-           (task 3563).  That composition is INERT on a real orchestrator run
-           today: this leg reads the legacy lock path, which the production
-           writer no longer targets (see the PATH GAP comment at the read
-           site below, task 4262).
+           (task 3563).  That composition is REACHABLE on a real orchestrator
+           run: this leg reads the ``.task-meta`` root the production writer
+           targets, with no legacy fallback (task 4028 — see the comment at
+           the read site below).
 
         A present-but-stale db claimant (``is_stranded`` True) collapses
         straight to ``None`` — it deliberately does NOT fall through to the
@@ -566,7 +564,9 @@ class TaskGroundTruth:
         *worktree_path* is :meth:`derive_truth`'s single
         ``worktree_resolver(tid)`` resolution (also shared with
         ``worktree_present``, review finding #2) — this method makes no I/O
-        of its own beyond the plan.lock read under *worktree_path*.
+        of its own beyond the plan.lock read, which is addressed at
+        *worktree_path*'s ``.task-meta`` SIBLING, not inside it (task 4028;
+        see the comment on that leg below).
         """
         if self.scheduler.is_actively_held(tid):
             return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.IN_MEMORY)
@@ -581,20 +581,26 @@ class TaskGroundTruth:
                 source=ClaimantSource.DB,
             )
 
-        # PATH GAP — task 4262, deliberately NOT fixed by task 3563 (which
-        # normalises the identity SHAPE, not where the lock is looked up).
-        # No ``meta_root`` here, so this reads the LEGACY
-        # ``<worktree>/.task/plan.lock``, while the production writer
-        # (``TaskWorkflow``, workflow.py:2384-2385) targets the ``.task-meta``
-        # SIBLING and nothing bridges the two: ``ensure_lane_plan_symlink``
-        # (artifacts.py:354-386) relocates plan.json ONLY, and ``_read_path``
-        # has no new-then-old fallback (unlike ``Harness._resolve_recovery_
-        # artifact``). So on a real run this finds at most a PRE-3563 legacy
-        # lock, carrying no ``run_id``, and the composition below resolves to
-        # the fail-safe ``None``. Task 4028 tracks deleting this leg outright
-        # if that is the ruling instead of relocating the read.
+        # Addressed at the ``.task-meta`` SIBLING — where the lock's sole
+        # writer puts it (``TaskWorkflow`` builds its ``TaskArtifacts`` with
+        # ``_meta_root_for_worktree(self.worktree)``, workflow.py) — via
+        # ``meta_root_for``, the single owner of that path shape, so neither
+        # side hand-joins ``.task-meta`` (task 4028).
+        #
+        # Deliberately NO legacy fallback: nothing has written
+        # ``<worktree>/.task/plan.lock`` since the meta-root migration, so a
+        # new-then-old read (as in ``Harness._resolve_recovery_artifact``)
+        # would be dead code on arrival, and any legacy lock still on disk
+        # necessarily predates that migration and so fails ``_lock_fresh``
+        # below anyway. Pinned by
+        # ``TestPlanLockIsReadFromTheMetaRoot::test_lock_at_the_legacy_root_is_ignored``.
+        #
+        # Derived OUTSIDE the try: this is pure path algebra with no I/O, and
+        # must not be swallowed by the degradation arm below, which exists for
+        # a corrupt lock FILE — not for a mis-derived root.
+        meta_root = TaskArtifacts.meta_root_for(worktree_path.parent, worktree_path.name)
         try:
-            lock_data = TaskArtifacts(worktree_path).read_plan_lock()
+            lock_data = TaskArtifacts(worktree_path, meta_root).read_plan_lock()
         except (ValueError, OSError):
             # A truncated/corrupt plan.lock is a realistic outcome of the
             # very crash this resolver recovers from — degrade to "no
