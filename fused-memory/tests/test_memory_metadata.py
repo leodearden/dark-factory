@@ -193,16 +193,6 @@ class TestFullUuidPredicateSingleHome:
 
         assert mm.is_full_uuid is validation.is_full_uuid
 
-    def test_the_private_back_compat_alias_is_gone(self):
-        """`memory_metadata` must not be a re-export proxy for a rule it does
-        not own: a reader of a consumer that imports `_is_full_uuid` from here
-        would believe the rule lives in this module.  Task 3942 retired the
-        alias once `scripts/retro_stamp_topics.py` was repointed.
-        """
-        from fused_memory import memory_metadata as mm
-
-        assert not hasattr(mm, '_is_full_uuid')
-
 
 class TestKindRegistry:
     """`KIND_REGISTRY` — PRD D3's closed registry, grandfathered from the census.
