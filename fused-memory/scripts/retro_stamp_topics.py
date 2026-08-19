@@ -100,6 +100,15 @@ from fused_memory.memory_metadata import normalize_supersedes
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 from fused_memory.utils.validation import is_full_uuid
 
+# Convention: this list carries every imported helper the tests reach through the
+# module object, not only the names defined locally — ``TOPIC_SLUG_MAX_LEN``,
+# ``is_valid_topic_slug``, ``normalize_supersedes`` and ``is_full_uuid`` are all
+# foreign.  ``memory_metadata`` deliberately keeps ``is_full_uuid`` out of ITS
+# ``__all__``; the opposite treatments are both intentional.  That module is
+# importable, so re-exporting the predicate there would rebuild the re-export
+# proxy whose back-compat alias task 3942 retired.  This script is loaded by
+# path via ``importlib`` and cannot be imported from, so its ``__all__`` grants
+# the rule no second home.
 __all__ = [
     'CALIBRATION_FIXTURE_PATH',
     'CANONICAL_SCROLL_LIMIT',
