@@ -6327,9 +6327,13 @@ def test_main_write_decision_same_queue_refile_does_not_resurrect_a_closed_recor
     assert survivor.severity == 'info'  # ...a downgrade still lands
 
 
+@pytest.mark.parametrize(
+    'closed_state', [sr.DecisionState.DROPPED, sr.DecisionState.ANSWERED]
+)
 def test_main_write_decision_cross_queue_refile_of_a_closed_record_still_overwrites(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    closed_state: str,
 ) -> None:
     """The deliberately-UNCHANGED neighbour: the QUEUE is the discriminator.
 
@@ -6344,10 +6348,15 @@ def test_main_write_decision_cross_queue_refile_of_a_closed_record_still_overwri
     ask, and holding it closed would make a live gate invisible, which is
     the fail-CLOSED direction _run_reap_decisions' docstring rules out.
 
-    Same rule test_main_write_decision_non_open_record_is_still_overwritten
-    pins; restated here with an operator boost on the record as well, so the
-    contrast with the same-queue case is visible in every custody field
-    rather than only in `state`.
+    Absorbs (task 3872's amendment pass) the older
+    test_main_write_decision_non_open_record_is_still_overwritten, which
+    pinned this same orch-seed -> recon-file shape for an ANSWERED record and
+    is now parametrized in here instead of kept as a near-clone whose
+    docstring ("protection is scoped to an OPEN record") had gone false on
+    the same-queue axis. This version files through the CLI verb on both
+    sides and carries an operator boost as well, so the contrast with the
+    same-queue case is visible in every custody field rather than only in
+    `state`.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     orch, recon = _two_queues(tmp_path)
@@ -6360,10 +6369,7 @@ def test_main_write_decision_cross_queue_refile_of_a_closed_record_still_overwri
         escalations_dir=str(orch),
     )
     assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
-    assert (
-        sr.update_decision_state('esc-5914-1', sr.DecisionState.DROPPED, root=tmp_path)
-        is not None
-    )
+    assert sr.update_decision_state('esc-5914-1', closed_state, root=tmp_path) is not None
 
     # A DIFFERENT queue files the same id -- possibly an unrelated new ask.
     rc = _file_decision(
@@ -6561,43 +6567,78 @@ def test_main_write_decision_same_id_different_project_is_refused(
     assert 'df' in refusals[0].getMessage()  # ...and the incumbent
 
 
-def test_main_write_decision_non_open_record_is_still_overwritten(
+def test_main_write_decision_cross_project_filing_over_a_closed_record_overwrites(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Protection is scoped to an OPEN record, as the task words it.
+    """The cross-PROJECT refusal keeps its OPEN scoping (task 3872).
 
-    An ANSWERED record is a question the human already dealt with; a second
-    watcher filing that id is starting a NEW ask, not enriching a live one,
-    so it gets today's plain overwrite (which re-opens it -- state comes
-    from the incoming record). Enriching instead would silently graft the
-    new question onto a closed row's history.
+    The other half of the test above, and the arm task 3872 left deliberately
+    alone: the refusal fires only while the INCUMBENT is open, because
+    refusing exists to protect a LIVE row (with an operator's boost and
+    disposition on it) from being deleted. A closed incumbent is not such a
+    row, and two projects always run different queue dirs -- so a
+    cross-project collision is by construction a CROSS-queue filing, on the
+    axis where ``esc-<taskid>-<n>`` namespaces genuinely collide and a closed
+    record cannot be shown to be the same gate. Holding it closed there would
+    hide a live gate, the fail-CLOSED direction _run_reap_decisions rules
+    out, so it takes today's plain overwrite instead.
+
+    Pinned at the CLI boundary because the restructured guard in
+    _run_write_decision made ``existing.state == OPEN`` a NEW decision point
+    INSIDE the cross-project arm, whose false branch is this overwrite: with
+    nothing here, tightening that arm to refuse EVERY cross-project filing
+    (including against a closed incumbent) passes the whole decision suite.
+
+    The no-ERROR assert is half the point: a refusal here would be the
+    silent-drop failure -- the row overwritten or not, but this project's ask
+    never reaching the cockpit either way.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     orch, recon = _two_queues(tmp_path)
-    sr.write_decision(
-        _make_decision(
-            id='esc-5914-1',
-            project='df',
-            text='the old, answered question',
-            state=sr.DecisionState.ANSWERED,
-            escalations_dir=sr.normalize_escalations_dir(orch),
-        ),
-        root=tmp_path,
-    )
 
     _file_decision(
-        id='esc-5914-1',
+        id='esc-42-1',
         project='df',
-        text='a brand new question',
-        escalations_dir=str(recon),
+        text='Adopt the reify plan?',
+        severity='info',
+        escalations_dir=str(orch),
+    )
+    # The operator triages df's row in the cockpit and dismisses it.
+    assert sr.set_manual_boost('esc-42-1', 9, root=tmp_path) is not None
+    assert (
+        sr.update_decision_state('esc-42-1', sr.DecisionState.DROPPED, root=tmp_path)
+        is not None
     )
 
+    with caplog.at_level(logging.ERROR):
+        rc = _file_decision(
+            id='esc-42-1',
+            project='reify',
+            text='an unrelated reify gate that merely shares the id',
+            severity='critical',
+            escalations_dir=str(recon),
+        )
+
+    assert rc == 0
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
-    assert listed[0].text == 'a brand new question'
-    assert listed[0].state == sr.DecisionState.OPEN
-    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+    assert [d.id for d in listed] == ['esc-42-1']
+    survivor = listed[0]
+    # Fully overwritten -- not refused, and no custody held for the other
+    # project's dead row.
+    assert survivor.project == 'reify'
+    assert survivor.text == 'an unrelated reify gate that merely shares the id'
+    assert survivor.severity == 'critical'
+    assert survivor.state == sr.DecisionState.OPEN
+    assert survivor.manual_boost == 0
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(recon)
+    refusals = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and 'esc-42-1' in r.getMessage()
+    ]
+    assert not refusals, f'a closed incumbent must not be defended, got: {refusals}'
 
 
 def test_main_write_decision_enriches_a_legacy_unstamped_record(
