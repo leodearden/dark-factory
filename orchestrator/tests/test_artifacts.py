@@ -2747,15 +2747,38 @@ class TestWriteJsonFollowsSymlinks:
             f'the temp was created in {src.parent}, not beside the real file'
         )
 
+    @staticmethod
+    def _residue(directory: Path) -> list[str]:
+        """Whatever in *directory* looks like an unswept atomic-write temp.
+
+        ``safe_io._create_temp`` names its temp ``.<dest>.<uuid4hex>.tmp``, so
+        a ``.tmp`` suffix is the shape to look for; the same arm also catches
+        the fixed ``<dest>.tmp`` name a hand-rolled writer would leave behind.
+
+        A residue PREDICATE rather than an exact directory listing on
+        purpose.  An exact listing couples this test to the complete set of
+        artifacts ``init()`` happens to create today, so adding any new
+        init-time artifact (a base_commit sidecar, a lock file, …) would fail
+        a test whose message points at temp residue when nothing about
+        residue changed.
+        """
+        return sorted(
+            entry.name for entry in directory.iterdir()
+            if entry.name.endswith('.tmp')
+        )
+
     def test_no_temp_residue_in_either_directory(self, lane_and_meta):
         legacy, lane_plan, real_plan = lane_and_meta
 
         legacy.write_plan({'task_id': 'task-1', 'steps': []})
 
-        assert {p.name for p in lane_plan.parent.iterdir()} == {'plan.json'}
-        assert {p.name for p in real_plan.parent.iterdir()} == {
-            'plan.json', 'metadata.json', 'reviews', 'verdicts',
-        }
+        assert self._residue(lane_plan.parent) == []
+        assert self._residue(real_plan.parent) == []
+        # Not vacuous: the swept-clean directories are the ones the write
+        # actually went through and landed in.
+        assert {'plan.json'} <= {p.name for p in lane_plan.parent.iterdir()}
+        assert {'plan.json'} <= {p.name for p in real_plan.parent.iterdir()}
+        assert json.loads(real_plan.read_text())['task_id'] == 'task-1'
 
     def test_dangling_symlink_fails_loudly_without_materialising_a_file(
         self, worktree: Path
@@ -2800,4 +2823,94 @@ class TestWriteJsonFollowsSymlinks:
             'emitted_at': 't', 'verdict': {'complete': True},
         })
 
+        assert artifacts.read_verdict('judge') is not None
+
+
+# ---------------------------------------------------------------------------
+# task 3957 amendment — the DELEGATION contract of ``_write_json``.
+#
+# Everything else in this group asserts an observable property (torn reads,
+# mode, symlink write-through).  The two kwargs below have no observable
+# property to assert against on a live filesystem: dropping ``fsync=True``
+# leaves the whole orchestrator suite green while silently retiring the
+# durability half of the docstring's contract, and dropping ``mkdir=True``
+# only shows up as a FileNotFoundError on the first write into a directory
+# nothing has created yet.  So they are pinned directly.
+# ---------------------------------------------------------------------------
+
+
+class TestWriteJsonDelegatesToSharedSafeIo:
+    """`_write_json` calls the blessed writer, with the kwargs it promises.
+
+    ``fsync=True`` is a deliberate override of ``shared.safe_io``'s own
+    ``fsync=False`` default (see ``_write_json``'s docstring for the measured
+    ~5 ms/write it costs and the three reasons the artifacts pay it).  A
+    deliberate override needs a pin, or the next reader who measures the cost
+    silently deletes the kwarg and nothing anywhere goes red.
+    """
+
+    @staticmethod
+    def _spy(monkeypatch) -> list[dict]:
+        """Record every ``atomic_write_text`` call, then perform it for real.
+
+        Recording without performing would make the surrounding write a no-op
+        and let a `_write_json` that never wrote at all pass.
+        """
+        calls: list[dict] = []
+        real = safe_io.atomic_write_text
+
+        def spy(path, text, **kwargs):
+            # ``kwargs`` verbatim under a nested key, so a DROPPED kwarg reads
+            # back as None and trips the assertion below rather than dying
+            # with a bare KeyError at the exact seam this test explains.
+            calls.append({'path': Path(path), 'text': text, 'kwargs': kwargs})
+            return real(path, text, **kwargs)
+
+        monkeypatch.setattr(safe_io, 'atomic_write_text', spy)
+        return calls
+
+    def test_the_plan_write_is_fsynced_and_creates_its_parent(
+        self, artifacts: TaskArtifacts, monkeypatch
+    ):
+        calls = self._spy(monkeypatch)
+
+        artifacts.write_plan({'task_id': 'task-1', 'title': 'p', 'steps': []})
+
+        assert len(calls) == 1, (
+            f'expected exactly one delegated write, saw {len(calls)} — '
+            '_write_json must not re-implement or double-write'
+        )
+        call = calls[0]
+        assert call['path'] == artifacts.root / 'plan.json'
+        assert call['kwargs'].get('fsync') is True, (
+            "fsync=True is _write_json's stated durability contract, and "
+            'safe_io defaults it to False — so dropping or flipping the '
+            f'kwarg silently retires the guarantee.  Saw: {call["kwargs"]}'
+        )
+        assert call['kwargs'].get('mkdir') is True, (
+            f'mkdir=True creates the artifact\'s parent.  Saw: {call["kwargs"]}'
+        )
+        # The write really happened — the spy is not standing in for it.
+        assert json.loads((artifacts.root / 'plan.json').read_text())['title'] == 'p'
+
+    def test_a_nested_artifact_delegates_on_the_same_terms(
+        self, artifacts: TaskArtifacts, monkeypatch
+    ):
+        """The contract belongs to the seam, not to ``write_plan``.
+
+        ``verdicts/<role>.json`` also exercises ``mkdir=True`` for real: the
+        parent directory is what ``mkdir`` has to conjure.
+        """
+        import shutil
+        shutil.rmtree(artifacts.root / 'verdicts')
+        calls = self._spy(monkeypatch)
+
+        artifacts.write_verdict('judge', {
+            'role': 'judge', 'schema_version': 1, 'session_id': 's',
+            'emitted_at': 't', 'verdict': {'complete': True},
+        })
+
+        assert [c['kwargs'].get('fsync') for c in calls] == [True]
+        assert [c['kwargs'].get('mkdir') for c in calls] == [True]
+        assert calls[0]['path'] == artifacts.root / 'verdicts' / 'judge.json'
         assert artifacts.read_verdict('judge') is not None

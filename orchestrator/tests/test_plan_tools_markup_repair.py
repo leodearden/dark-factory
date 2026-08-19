@@ -43,10 +43,6 @@ from orchestrator.artifacts import (
 )
 from orchestrator.mcp import plan_tools
 
-#: What a failed atomic write may raise. The helper's own declared error, plus
-#: the serialization errors that fire before the temp is ever opened.
-PLAN_WRITE_FAILURES = (OSError, TypeError, ValueError)
-
 # ---------------------------------------------------------------------------
 # Sentinel BUILDERS — the only way markup enters this module.
 # ---------------------------------------------------------------------------
@@ -1539,12 +1535,21 @@ class TestRecoveryTargetsAreRealPlanKeys:
 # MOVED down to the layer that now owns it, `TaskArtifacts._write_json`, in
 # orchestrator/tests/test_artifacts.py:
 #
-#   temp in the target's own directory,   ->  TestWriteJsonIsAtomic
-#     fsync before replace, torn reads
+#   torn reads: a racing reader sees the  ->  TestWriteJsonIsAtomic
+#     complete old or complete new doc,
+#     and the name is never absent
 #   mode preservation across the swap,    ->  TestWriteJsonPreservesMode
 #     stat failures that must surface
-#   symlink write-through, temp beside    ->  TestWriteJsonFollowsSymlinks
-#     the REAL file, dangling refusal
+#   symlink write-through, the temp       ->  TestWriteJsonFollowsSymlinks
+#     BESIDE the real file, dangling
+#     refusal, no temp residue
+#   that `_write_json` asks safe_io       ->  TestWriteJsonDelegates
+#     for fsync=True / mkdir=True at all      ToSharedSafeIo
+#
+# One piece landed a layer FURTHER down, since `_write_json` no longer owns
+# the mechanism it delegates to: the fsync of the temp before the replace
+# (and of the parent directory after it) is pinned by
+# shared/tests/test_safe_io.py::TestAtomicWriteDurability.
 #
 # What stays HERE is the assertion that is genuinely plan-tools-level: the
 # repair write-back produces the same bytes the ordinary mutation path does.
