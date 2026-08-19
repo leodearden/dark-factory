@@ -927,6 +927,20 @@ class TaskReport:
     # Defaults True so DONE paths and any report built without it keep the
     # pre-2988 counting behaviour.
     counts_against_requeue_cap: bool = True
+    # Task 3315 (PRD contract C2): the STRUCTURED HTTP status of a
+    # server-side API failure, mapped from ``TerminalReport.api_error_status``
+    # in _run_slot and passed to
+    # ``scheduler.record_requeue(api_error_status=...)`` in _apply_retry_cap,
+    # where it is the PRIMARY transient-requeue routing signal (INV-1) —
+    # the ``agent API error: HTTP <n>`` marker regex over block_reason
+    # survives only as the legacy fallback.
+    #
+    # Like block_detail above, this is deliberately IN-MEMORY ONLY: it is
+    # neither persisted by run_store.save_task_result nor emitted on the
+    # EventType.task_completed payload.  The cap-exhaust forensics that would
+    # consume it (the transient breakdown / HTTP-status distribution) are PRD
+    # task θ's scope, and that is where the durability question belongs.
+    api_error_status: int | None = None
 
 
 @dataclass
@@ -8700,6 +8714,10 @@ class Harness:
                 # Task 2988: carry the disposition's cap-accounting policy
                 # through to _apply_retry_cap's record_requeue call.
                 counts_against_requeue_cap=terminal_report.counts_against_requeue_cap,
+                # Task 3315 (PRD C2): carry the structured 5xx evidence
+                # through to the same call, where it routes the requeue
+                # to the transient bucket (INV-1).
+                api_error_status=terminal_report.api_error_status,
             )
 
             if self.event_store:
@@ -9514,6 +9532,13 @@ class Harness:
                 # the retry-cap escalation; the pool-level structural-
                 # exhaustion L2 is the loud signal instead.
                 counts_against_cap=report.counts_against_requeue_cap,
+                # Task 3315 (PRD contract C2): the structured 5xx evidence is
+                # the PRIMARY transient-routing signal (INV-1).  A report
+                # without it (None) falls back to the legacy marker regex
+                # over block_reason inside is_transient_api_requeue.  This
+                # closes the TerminalReport -> TaskReport -> record_requeue
+                # -> _transient_requeue_counts chain.
+                api_error_status=report.api_error_status,
             )
             genuine_exhausted = count >= self.config.requeue_cap
             transient_exhausted = (

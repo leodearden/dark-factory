@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
 from shared import safe_io
+from shared.cli_invoke import is_server_error_status
 from shared.locking import (
     files_to_modules,
     modules_conflict,
@@ -443,37 +444,83 @@ def is_transient_rejection(rejection: str | None) -> bool:
     return any(name in rejection for name in TRANSIENT_ERROR_TYPES)
 
 
-# Marker produced solely by shared.cli_invoke.classify_agent_failure for
-# AgentFailureKind.API_ERROR (cli_invoke.py:362-366).  The planning and
-# execution phases write it into block_reason (workflow.py:2222/2298);
-# _run_simple_task (workflow.py:2599) uses it only as an internal REQUEUED
-# fall-through sentinel and does NOT write block_reason directly — that is
-# done later by the architect phase (workflow.py:2222/2298).
+# LEGACY FALLBACK ONLY as of task 3315 (PRD contract C2).  The PRIMARY
+# transient-routing signal is now the STRUCTURED ``api_error_status`` field,
+# threaded ``TerminalReport -> TaskReport -> Scheduler.record_requeue`` and
+# checked first by ``is_transient_api_requeue`` (INV-1 "structured field over
+# regex").  This regex survives only for reasons produced by phases that do
+# not yet carry the field — the producers land in the sibling PRD tasks γ
+# (execute), η (review) and θ (planning/simple_task) — and it is the one and
+# only site that still parses the marker.
+#
+# The marker itself is produced solely by
+# ``shared.cli_invoke.classify_agent_failure`` (its 5xx rule and its generic
+# ``api_error_status`` rule).  PLANNING is its sole producer in a block reason
+# today: the architect path writes it via ``_mark_blocked('Planning failed:
+# ...')`` and ``_handle_no_plan_failure``.  The EXECUTE phase never calls
+# ``classify_agent_failure`` at all (PRD background §3), and
+# ``_run_simple_task`` uses the classification only as an internal REQUEUED
+# fall-through sentinel — it does not write block_reason.
 _API_ERROR_REASON_RE = re.compile(r'agent API error: HTTP (\d{3})')
 
 
-def is_transient_api_requeue(reason: str | None) -> bool:
-    """True when *reason* encodes a transient server-side (HTTP 5xx) API error.
+def is_transient_api_requeue(
+    reason: str | None, *, api_error_status: int | None = None,
+) -> bool:
+    """True when a requeue was caused by a transient server-side (5xx) API error.
 
-    Matches the ``"agent API error: HTTP <status>"`` marker (present in
-    block_reason regardless of workflow phase) and classifies HTTP 5xx
-    (500-599, including 529 Overloaded) as transient.  HTTP 4xx (client/auth
-    errors) and non-API reasons return False and still count against
-    ``requeue_cap``.
+    FIELD-FIRST (task 3315, PRD contract C2 / INV-1 "structured field over
+    regex"), but POSITIVE-ONLY: EITHER signal suffices and NEITHER can veto
+    the other.  Two sources of 5xx evidence:
+
+    1. *api_error_status* — the STRUCTURED status threaded
+       ``TerminalReport -> TaskReport -> Scheduler.record_requeue`` from
+       ``AgentResult.api_error_status``.  This is the primary signal and
+       needs no cooperation from the prose of *reason*: a 5xx here
+       short-circuits True before *reason* is even looked at.
+    2. The ``"agent API error: HTTP <status>"`` marker in *reason* — retained
+       ONLY as a LEGACY FALLBACK, for reasons produced by phases that do not
+       yet carry the field (the producers land in the sibling PRD tasks γ
+       (execute), η (review) and θ (planning/simple_task)).  This is the one
+       and only site that still parses that marker.
+
+    Source 1 is consulted first, but a ``None`` OR NON-5xx status means only
+    "no evidence from the field" — never an authoritative False — so it falls
+    THROUGH to source 2.  Conflicting evidence (e.g. ``api_error_status=400``
+    alongside a ``HTTP 503`` marker in *reason*) therefore resolves
+    TRANSIENT; that disagreement is pinned both ways by
+    ``test_non_5xx_field_does_not_veto_legacy_marker`` and
+    ``test_5xx_field_wins_without_any_marker``.  The asymmetry is deliberate
+    (PRD resolved decision 5): the field defaults ``None`` at every product
+    construction site until tasks γ/η/θ land, so reading its absence as
+    authoritative-False would silently delete the existing planning-phase
+    transient lane.  Producers derive both signals from the same
+    ``AgentResult`` via ``classify_agent_failure``, so in practice they
+    cannot disagree today.
+
+    Both sources classify through ``shared.cli_invoke.is_server_error_status``,
+    the single canonical definition of the 5xx band (INV-5) — the band is
+    deliberately NOT re-encoded here.  HTTP 4xx (client/auth errors) and
+    non-API reasons return False and still count against ``requeue_cap``.
 
     Note: HTTP 429 (rate-limit / too-many-requests) is intentionally
     classified as non-transient.  Unlike a server-side 5xx overload that
     resolves on its own, a 429 signals a quota or rate-limiting configuration
     problem that benefits from human review.  To change this policy, also
     update the ``test_false_for_non_transient`` parametrize list and the
-    design decision in plan.json.
+    PRD's resolved decision 1 (``plans/server-side-api-error-handling-prd.md``).
+
+    *api_error_status* is keyword-only and defaults ``None``, so every
+    pre-existing positional caller is source-compatible.
     """
+    if is_server_error_status(api_error_status):
+        return True
     if not reason:
         return False
     m = _API_ERROR_REASON_RE.search(reason)
     if m is None:
         return False
-    return 500 <= int(m.group(1)) <= 599
+    return is_server_error_status(int(m.group(1)))
 
 
 @dataclass(frozen=True)
@@ -8477,6 +8524,7 @@ class Scheduler:
         run_id: str,
         cost_usd: float,
         counts_against_cap: bool = True,
+        api_error_status: int | None = None,
     ) -> int:
         """Append a requeue record and return the new *genuine* cumulative count.
 
@@ -8494,10 +8542,16 @@ class Scheduler:
            signal for the WarmLanePoolExhausted case that drives this route is
            the pool-level structural-exhaustion L2, NOT a per-task retry-cap
            escalation.
-        2. Transient API requeue (HTTP 5xx "agent API error" summaries,
-           classified by ``is_transient_api_requeue``) — routed to
+        2. Transient API requeue (a server-side HTTP 5xx), classified by
+           ``is_transient_api_requeue`` — routed to
            ``_transient_requeue_counts`` (feeds ``config.transient_requeue_cap``);
-           does NOT increment the genuine ``_requeue_counts``.
+           does NOT increment the genuine ``_requeue_counts``.  As of task
+           3315 (PRD contract C2 / INV-1) this classification is FIELD-FIRST
+           on the structured *api_error_status* threaded here from
+           ``TerminalReport -> TaskReport``; the ``agent API error: HTTP <n>``
+           marker in *reason* is retained only as the legacy fallback for
+           phases that do not yet carry the field.  The param defaults
+           ``None``, so every existing caller is unchanged.
         3. Genuine requeue (the default) — increments ``_requeue_counts``
            (feeds ``config.requeue_cap``); behaves exactly as before.
 
@@ -8515,7 +8569,7 @@ class Scheduler:
         if not counts_against_cap:
             # Route 1: history-only — neither counter moves.
             pass
-        elif is_transient_api_requeue(reason):
+        elif is_transient_api_requeue(reason, api_error_status=api_error_status):
             t_count = self._transient_requeue_counts.get(task_id, 0) + 1
             self._transient_requeue_counts[task_id] = t_count
         else:
@@ -8593,6 +8647,21 @@ class Scheduler:
         # triaging engineer sees which ceiling fired and how many of each kind
         # accumulated (avoids the misleading "10 iterations (cap=10)" when only
         # 8 were transient but total history also includes genuine ones).
+        #
+        # KNOWN DIVERGENCE (task 3315, PRD contract C2) — this breakdown is
+        # REGEX-ONLY and can therefore under-count ``n_transient`` relative to
+        # the routing that actually filled ``_transient_requeue_counts``.
+        # ``record_requeue`` classifies FIELD-FIRST on the structured
+        # ``api_error_status``, but ``RequeueRecord`` does not carry that field
+        # (deliberately: the PRD assigns the cap-exhaust forensics — this
+        # breakdown and the HTTP-status distribution — to sibling task θ), so a
+        # requeue routed transient on the field alone with a MARKER-FREE reason
+        # is recounted here as genuine.  Result: the report/escalation can read
+        # ``cap=<transient_requeue_cap>`` alongside ``n_transient=0``.  Do not
+        # trust this breakdown as the bucket of record; ``cap`` and
+        # ``transient_requeue_count()`` are authoritative.  The fix (stamp
+        # ``api_error_status`` onto ``RequeueRecord`` in ``record_requeue`` and
+        # pass it through here) belongs with task θ's report rework.
         n_transient = sum(
             1 for r in history if is_transient_api_requeue(r.reason)
         )
