@@ -942,8 +942,6 @@ class Mem0Backend:
                 'result as a clean corpus'
             )
 
-        from qdrant_client.http import models as qmodels  # noqa: PLC0415
-
         from fused_memory.utils.toolcall_xml_leak import (  # noqa: PLC0415
             PREFILTER_NEEDLES,
             find_toolcall_xml_leak,
@@ -952,17 +950,19 @@ class Mem0Backend:
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         client = await self._get_async_qdrant()
 
-        must: list[qmodels.Condition] = [
-            qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
-            for k, v in (filters or {}).items()
-        ]
-        should: list[qmodels.Condition] = []
-        if not exhaustive:
-            should = [
-                qmodels.FieldCondition(key=_MEM0_TEXT_KEY, match=qmodels.MatchText(text=needle))
-                for needle in (needles or PREFILTER_NEEDLES)
-            ]
-        scroll_filter = qmodels.Filter(must=must, should=should) if (must or should) else None
+        # Built at the shared home so an exhaustive scan and the count it is
+        # divided by cannot select different point sets (INV-5).  The call is
+        # GUARDED rather than unconditional: with neither arm populated
+        # (exhaustive, no filters) the builder correctly refuses to make a
+        # whole-collection Filter, but a whole-collection walk is exactly what
+        # this mode wants — expressed as scroll_filter=None, not as an
+        # unfiltered Filter.
+        needle_arm = None if exhaustive else list(needles or PREFILTER_NEEDLES)
+        scroll_filter = (
+            self._build_payload_filter(filters, text_needles=needle_arm)
+            if (filters or needle_arm)
+            else None
+        )
 
         matches: list[dict[str, Any]] = []
         scanned = 0
