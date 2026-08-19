@@ -358,17 +358,59 @@ NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
 #         task 3403 review found services/completion_claim_gate.py importing
 #         this constant while tagging episodes durably and filing operator
 #         escalations, which made the shipped bounded-blast-radius claim false.
-#         It now keeps its own copy of the ORIGINAL alphabet — see
-#         completion_claim_gate._CLAUSE_BOUNDARY_RE and the divergence comment
-#         above it — as the worked example of a consumer that had to diverge.
-#         A new importer must first show its fail-safe direction matches, or
-#         diverge the same way.
+#         Such a consumer takes STRICT_CLAUSE_BOUNDARY_RE below instead — the
+#         original alphabet, exported once so the divergence needs neither a
+#         second copy of the pattern nor a second copy of the argument. A new
+#         importer of THIS constant must first show its fail-safe direction
+#         matches; the property is enforced by
+#         TestClauseSplitRe.test_clause_split_re_has_no_out_of_module_consumers.
 #   (ii)  'e.g.' / 'i.e.' still split at their SECOND dot (the right-side-only
 #         rule). Harmless — that is a genuine phrase boundary, not a break
 #         between a ref and its status.
 #   (iii) A missing-space sentence boundary ('done.Task') no longer splits;
 #         rare in LLM prose, and the direction is the same over-firing as (i).
 _CLAUSE_SPLIT_RE: re.Pattern[str] = re.compile(r'\.(?!\w)|[;\n!?]')
+
+# The ORIGINAL, pre-task-3403 clause alphabet: the fail-safe-STRICT variant,
+# exported PUBLICLY for the consumers that must NOT track _CLAUSE_SPLIT_RE's
+# widening. This is the canonical home of that divergence rationale — importers
+# carry a one-line pointer here plus their own path-specific consequence, and
+# nothing else. (Hoisted here by the task 3403 review, which found the same
+# ~20-line argument written out twice, next to two byte-identical copies of
+# this pattern: free to drift apart, and needing every future fix applied
+# twice.)
+#
+# WHY A SECOND CONSTANT RATHER THAN JUST _CLAUSE_SPLIT_RE:
+#
+#   _CLAUSE_SPLIT_RE (above) scopes a task-ref-to-status association read by
+#   find_conflicting_task_status_ids / find_present_tense_completion_claim_
+#   task_ids, both of which feed early-return SOFT-BLOCK write gates in
+#   server/tools.py. A LONGER clause there costs the author a
+#   rephrase-and-retry and nothing else, so trading a little precision for the
+#   recall win of not shattering dotted technical tokens is the right trade.
+#
+#   A consumer on a DESTRUCTIVE or DURABLE-TAGGING path inverts that
+#   arithmetic: a longer clause absorbs more incidental material into a
+#   decision that does NOT self-heal on the next cycle — a retired Graphiti
+#   edge, an episode permanently tagged as contradicted, an operator
+#   escalation already sitting in the human queue. For those the original
+#   narrow alphabet is the fail-safe choice, even though it re-imports the
+#   dotted-token shatter as an accepted recall loss.
+#
+# Two consumers meet that test today; each states its own consequence at its
+# point of use rather than repeating the argument above:
+#   - reconciliation/stale_status_snapshot_edge_sweep._list_segment — closes a
+#     segment from which BARE DIGITS are harvested as task ids, ending in
+#     memory_service.update_edge(invalid_at=...)
+#   - services/completion_claim_gate._iter_clauses — scopes a claim written as
+#     extra['unverified_claim'] into the Graphiti source_description and every
+#     derived Mem0 fact's metadata, plus an operator escalation, on EVERY
+#     add_episode regardless of agent
+#
+# A THIRD importer must first show the same fail-safe direction. Wanting the
+# WIDENING instead means wanting _CLAUSE_SPLIT_RE, which is module-private by
+# contract (residual (i) above) — that is a design conversation, not an import.
+STRICT_CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'[.;\n!?]')
 
 
 def find_conflicting_task_status_ids(text: str) -> set[int]:

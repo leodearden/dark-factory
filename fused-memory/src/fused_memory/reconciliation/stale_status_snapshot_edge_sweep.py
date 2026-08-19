@@ -161,7 +161,11 @@ import logging
 import re
 from datetime import UTC, datetime
 
-from fused_memory.reconciliation.task_filter import INACTIVE_TASK_STATUSES, TASK_REF_RE
+from fused_memory.reconciliation.task_filter import (
+    INACTIVE_TASK_STATUSES,
+    STRICT_CLAUSE_BOUNDARY_RE,
+    TASK_REF_RE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -882,31 +886,6 @@ LIST_INTRODUCER_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# Clause-ish boundary used to close a colon-introduced list segment (no
-# closing delimiter of its own) and as a fallback for an unterminated
-# bracket segment.
-#
-# This DIVERGED from task_filter._CLAUSE_SPLIT_RE at task 3403, which narrowed
-# that one's dot to '\.(?!\w)' so dotted technical tokens stop shattering a
-# sentence. The narrowing is deliberately NOT copied here, despite the two
-# having started out identical, because the two splitters bound different
-# things with OPPOSITE fail-safe directions:
-#
-#   task_filter._CLAUSE_SPLIT_RE scopes a task-ref-to-status association
-#   feeding a SOFT-BLOCK write gate. A longer clause there costs a
-#   rephrase-and-retry, never data — so widening it is safe.
-#
-#   _CLAUSE_BOUNDARY_RE closes a segment from which BARE DIGITS are harvested
-#   as task ids, and that path ends in memory_service.update_edge(
-#   invalid_at=...) — a real Graphiti edge retirement. A longer segment here
-#   absorbs more incidental digits, i.e. over-selection, which this module's
-#   docstring explicitly forbids: under-selection self-heals next cycle or is
-#   caught by Stage 2, over-selection wrongly retires true facts.
-#
-# So keep the original narrow [.;\n!?] form. Copying the widening for symmetry
-# would trade a bounded soft-block for a permanent wrong invalidation.
-_CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'[.;\n!?]')
-
 # Bare digit token — used only within an already-detected, marker-anchored
 # span: an aggregate list segment, or a plural enumeration's 'ids' capture
 # group (task 3079). A bare '\d+' therefore never contributes a candidate id
@@ -915,6 +894,20 @@ _CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'[.;\n!?]')
 _BARE_DIGIT_RE: re.Pattern[str] = re.compile(r'\b\d+\b')
 
 
+# The clause-ish boundary that closes a colon-introduced list segment (which
+# has no closing delimiter of its own) and backstops an unterminated bracket
+# segment is task_filter.STRICT_CLAUSE_BOUNDARY_RE — the fail-safe-STRICT
+# alphabet [.;\n!?], NOT task_filter._CLAUSE_SPLIT_RE, which narrowed its dot
+# to '\.(?!\w)' at task 3403 so dotted technical tokens stop shattering a
+# sentence. The two started out identical; the canonical rationale for keeping
+# them apart lives next to STRICT_CLAUSE_BOUNDARY_RE. This module's stake in
+# it: the segment closed here is one from which BARE DIGITS are harvested as
+# task ids, and that path ends in memory_service.update_edge(invalid_at=...) —
+# a real Graphiti edge retirement. A longer segment absorbs more incidental
+# digits, i.e. over-selection, which this module's docstring explicitly
+# forbids: under-selection self-heals next cycle or is caught by Stage 2,
+# over-selection wrongly retires true facts. Copying the widening for symmetry
+# would trade a bounded soft-block for a permanent wrong invalidation.
 def _list_segment(text: str, start: int, open_char: str) -> str:
     """Return the list-segment substring of *text* beginning at *start*.
 
@@ -930,7 +923,7 @@ def _list_segment(text: str, start: int, open_char: str) -> str:
         if close != -1:
             return text[start:close]
 
-    boundary = _CLAUSE_BOUNDARY_RE.search(text, start)
+    boundary = STRICT_CLAUSE_BOUNDARY_RE.search(text, start)
     end = boundary.start() if boundary else len(text)
     return text[start:end]
 
