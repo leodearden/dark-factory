@@ -200,12 +200,23 @@ Check for all pending L2 escalations — **compact** to keep context small:
 mcp__escalation__get_pending_escalations(level=2, compact=True)
 ```
 
-`compact=True` returns the triage fields (`id`, `task_id`, `category`, `severity`, `level`,
-`status`, `summary`, `suggested_action`, `timestamp`) plus the triage-ack annotation fields
-(`triaged_at`, `triaged_by`, `triage_note`, `updated_at` — see "Reading a triage-ack annotation"
-below), and drops the heavy free-text/cluster fields (`detail`, `members`, `options`, `root_cause`,
-`train_state`, …). Triage from that; fetch the full record with `get_escalation(id)` **only** for
-the one item you're about to act on — and prefer doing that full read inside the handling sub-agent
+`compact=True` returns the triage fields plus the triage-ack annotation fields (`triaged_at`,
+`triaged_by`, `triage_note`, `updated_at` — see "Reading a triage-ack annotation" below), and
+drops the heavy free-text/cluster fields (`detail`, `options`, `train_state`, …). The tool's own
+docstring carries the authoritative list — read it there rather than trusting a copy in this
+file, which is how this paragraph went stale before.
+
+**`root_cause` and `member_ids` ARE returned** (task 3997) — they were dropped until then.
+Operationally that is what makes a drain self-sufficient: you can rebuild the already-promoted
+set as {`root_cause` of the pending L2s} ∪ {their `member_ids`} from the drain ALONE, so a
+rotation that inherits no session memory does not re-promote a cluster its predecessor already
+promoted. `member_ids` is the projection of the record's `members` list; the raw `members` key
+stays dropped, as does `detail` — the unbounded free-text field compact mode exists to keep out
+of your context.
+
+Triage from that; fetch the full record with `get_escalation(id)` **only** for
+the one item you're about to act on (and when you do, read its `amendments` —
+see "Reading preserved framing" below) — and prefer doing that full read inside the handling sub-agent
 (see Context Conservation). During an AFK window the pending pile grows, and a full-dict drain every
 cycle is the dominant context sink — `compact=True` is what keeps a long-running session alive.
 
@@ -809,7 +820,8 @@ above — **a starting point, not a verdict**.
 - `triaged_at` is older than roughly 6 hours, or
 - the record changed since triage — `updated_at` is **not** `None` **and** is newer than
   `triaged_at` (e.g. the L2 cluster gained a new member via `promote_to_l2` after the stamp was
-  written). `updated_at` defaults to `None` (never bumped) until the record's first real content
+  written, its severity was promoted, or a later fold carried in NEW FRAMING — see "Reading
+  preserved framing" below). `updated_at` defaults to `None` (never bumped) until the record's first real content
   change, so a triaged record with no changes since still reads `updated_at = None` — treat that as
   "not newer than `triaged_at`", never as an ordering comparison between `None` and a timestamp
   string.
@@ -826,6 +838,41 @@ cost two churn cycles and five separate `resolve_issue` calls before the item wa
 cannot be spoofed by the caller — the identical non-spoofable attribution contract this skill
 already documents for `resolved_by` (see "Recognizing the supervised auto-watcher's resolutions"
 below).
+
+### Reading preserved framing (`amendments`)
+
+A pending L2 is a **cluster**, and `escalation-watcher-auto` re-promotes the same cluster every
+time it finds more L1s matching that root cause. Each of those folds carries its own
+`root_cause`/`evidence`/`options`/`summary` — the promoting rotation's current read of the problem,
+which is often sharper than the first one. Until task 3997 all of it was discarded on the floor
+(measured: 336,875 characters). It is now kept.
+
+**When you pull the full record with `get_escalation(id)`, read `amendments` alongside the record's
+own framing.** The two are different things and the distinction is the whole point:
+
+- The record's OWN `root_cause` / `detail` / `options` / `summary` are the **original** framing,
+  from the promote that minted the L2. They are immutable — a fold never overwrites them, so the
+  decision context a human started reading cannot shift under them.
+- `amendments` is an append-only list of what **later folds** carried in, oldest first, each with
+  the `agent_role` that submitted it and a queue-stamped `timestamp`. The **last** entry is the
+  most recent read of the cluster; if it disagrees with the record's own framing, that disagreement
+  is the signal — either the cluster drifted, or root-cause matching folded in something that does
+  not belong.
+- Framing byte-identical to what the record already says is **not** re-recorded, so every entry
+  present is a genuine reframing rather than a re-promote echo.
+
+Two counters say what was NOT kept — check them before treating the list as complete:
+
+- `amendments_truncated > 0` — older entries were shed at the cap (oldest-first). The record's own
+  original framing is unaffected; only intermediate reframings were lost.
+- `amendments_chars_elided > 0` — individual fields were long enough to be clipped at the per-field
+  cap. Elision is marked in-band (`[... N char(s) elided ...]`), so a field ending in that marker is
+  the head of what was submitted, not all of it.
+
+A sustained burst of truncation files its own `info` infra escalation (under the synthetic
+`l2-amendment-truncation` task anchor, not against any real task) saying either the cap is too low
+for the live fold rate or root-cause matching is over-folding unrelated clusters into one L2. If you
+see one, the named L2s are where to look.
 
 ### `review_suggestions` (info)
 

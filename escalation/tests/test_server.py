@@ -22,8 +22,14 @@ import pytest
 
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.models import Escalation
-from escalation.queue import EscalationQueue
-from escalation.server import _COMPACT_ESCALATION_FIELDS, create_server
+from escalation.queue import _MAX_AMENDMENTS, EscalationQueue
+from escalation.server import (
+    _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
+    _AMENDMENT_TRUNCATION_STORM_THRESHOLD,
+    _AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS,
+    _COMPACT_ESCALATION_FIELDS,
+    create_server,
+)
 
 # ---------------------------------------------------------------------------
 # Cross-package orchestrator imports — used by TestMergeStatus.
@@ -98,6 +104,12 @@ async def _stamp_triage(server, **kwargs: Any) -> dict[str, Any]:
 async def _get_task_escalations(server, **kwargs: Any) -> list[dict[str, Any]]:
     tool = await server.get_tool('get_task_escalations')
     # get_task_escalations is a sync def, so tool.fn(...) returns directly
+    return tool.fn(**kwargs)
+
+
+async def _get_escalation(server, **kwargs: Any) -> dict[str, Any]:
+    tool = await server.get_tool('get_escalation')
+    # get_escalation is a sync def, so tool.fn(...) returns directly
     return tool.fn(**kwargs)
 
 
@@ -338,14 +350,15 @@ class TestGetPendingLevelFilter:
 class TestGetPendingCompact:
     """get_pending_escalations(compact=True) returns only the triage-relevant fields."""
 
-    _COMPACT_KEYS = {
-        'id', 'task_id', 'category', 'severity', 'level', 'status',
-        'summary', 'suggested_action', 'timestamp',
-        'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
-    }
-    # Heavy fields that compact mode must omit.
+    # DERIVED from the constant, never re-transcribed: a hand-copied literal here
+    # encodes the constant's VALUE instead of its NAME and silently drifts every
+    # time the projection is widened (it did — task 3997).
+    _COMPACT_KEYS = set(_COMPACT_ESCALATION_FIELDS)
+    # Heavy fields that compact mode must omit.  `members` stays here even though
+    # `member_ids` is now projected: the raw model key must never appear in a
+    # compact row, only its renamed projection.
     _HEAVY_KEYS = {
-        'detail', 'members', 'options', 'root_cause', 'train_state',
+        'detail', 'members', 'options', 'train_state',
         'workflow_state', 'worktree', 'dedupe_children', 'dedupe_fingerprint',
         'resolution',
     }
@@ -418,6 +431,105 @@ class TestGetPendingCompact:
         assert len(result) == 2, f"Expected 2 L2 rows, got {len(result)}: {result}"
         assert all(r['level'] == 2 for r in result)
         assert all(set(r.keys()) == self._COMPACT_KEYS for r in result)
+
+    # -- C1: root_cause + member_ids survive the projection (task 3997) ------
+
+    @pytest.mark.asyncio
+    async def test_compact_projection_carries_root_cause(self, tmp_path: Path):
+        """compact rows carry ``root_cause`` and ``member_ids`` (task 3997, C1).
+
+        A rotating L2 watcher must be able to answer "is this cluster already
+        promoted?" from the DRAIN ALONE — that needs the L2's ``root_cause``
+        (the dedup key ``find_pending_l2_by_root_cause`` matches on) and its
+        member ids, both of which compact mode used to drop.  ``detail`` stays
+        dropped: it is the unbounded free-text field the compact projection
+        exists to keep out of a long-running watcher's context.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_heavy(queue, 'task-A', level=2)
+
+        result = await _get_pending(server, level=2, compact=True)
+
+        assert len(result) == 1, f'Expected 1 result, got {len(result)}: {result}'
+        row = result[0]
+        assert row['root_cause'] == 'shared root cause hypothesis', (
+            f'root_cause missing or wrong in compact row: {row}'
+        )
+        # THE load-bearing assertion.  `member_ids` is NOT a key of to_dict()
+        # (the model field is `members`), so under the `if k in d` guard that
+        # pins_recovery's absent-means-UNKNOWN contract requires, a naive
+        # tuple-widening SILENTLY DROPS it.  This assertion is what makes that
+        # silent failure loud.
+        assert row['member_ids'] == ['esc-1-1', 'esc-1-2'], (
+            f'member_ids missing or wrong in compact row: {row}'
+        )
+        assert 'detail' not in row, (
+            f'the 4000-char free-text field must stay dropped: {sorted(row)}'
+        )
+        assert 'members' not in row, (
+            f'the contract key is member_ids; the raw model key stays dropped: {sorted(row)}'
+        )
+
+        # C1's sufficiency claim (boundary B2): a rotation with ZERO session
+        # memory rebuilds `already_promoted` from the returned rows alone.
+        second = Escalation(
+            id=queue.make_id('task-B'),
+            task_id='task-B',
+            agent_role='implementer',
+            severity='blocking',
+            category='design_concern',
+            summary='second cluster',
+            detail='y' * 4000,
+            suggested_action='manual_intervention',
+            level=2,
+            members=['esc-2-1'],
+            root_cause='a different root cause hypothesis',
+        )
+        queue.submit(second)
+
+        rows = await _get_pending(server, level=2, compact=True)
+
+        assert len(rows) == 2, f'Expected both L2 rows, got {rows}'
+        already_promoted = (
+            {r['root_cause'] for r in rows}
+            | {m for r in rows for m in r['member_ids']}
+        )
+        assert already_promoted == {
+            'shared root cause hypothesis',
+            'a different root cause hypothesis',
+            'esc-1-1',
+            'esc-1-2',
+            'esc-2-1',
+        }, f'drain-alone rebuild of already_promoted is incomplete: {already_promoted}'
+
+    @pytest.mark.asyncio
+    async def test_task_escalations_compact_carries_root_cause(self, tmp_path: Path):
+        """The OTHER apply site projects the same widened set (task 3997, C1).
+
+        The two compact apply sites fail in OPPOSITE ways under a naive
+        tuple-widening: the guarded ``get_pending_escalations`` projection
+        silently drops ``member_ids``, while this UNGUARDED
+        ``get_task_escalations`` one raises KeyError.  Both need a pin.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_heavy(queue, 'task-A', level=2)
+
+        result = await _get_task_escalations(server, task_id='task-A', compact=True)
+
+        assert len(result) == 1, f'Expected 1 result, got {result}'
+        row = result[0]
+        assert row['root_cause'] == 'shared root cause hypothesis', (
+            f'root_cause missing or wrong in compact row: {row}'
+        )
+        assert row['member_ids'] == ['esc-1-1', 'esc-1-2'], (
+            f'member_ids missing or wrong in compact row: {row}'
+        )
+        assert set(row.keys()) == set(_COMPACT_ESCALATION_FIELDS), (
+            f'compact row keys {sorted(row.keys())} != '
+            f'{sorted(_COMPACT_ESCALATION_FIELDS)}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2720,6 +2832,299 @@ class TestPromoteToL2SeverityInResponse:
             assert {'id', 'status', 'members'} <= result.keys(), (
                 f'An existing response key went missing: {result}'
             )
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteToL2FramingPreservation: a fold keeps the framing it carried in
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2FramingPreservation:
+    """A fold APPENDS its incoming framing instead of discarding it (task 3997, C2).
+
+    End-to-end through the MCP tool, which is the surface the auto-watcher
+    actually calls.  Before this, every re-promote of an already-pending cluster
+    threw away the root_cause/evidence/options/summary it carried (measured:
+    336,875 characters), and the caller could not even tell: the response said
+    'updated' either way.
+    """
+
+    @pytest.mark.asyncio
+    async def test_promote_fold_preserves_and_reports_incoming_framing(
+        self, tmp_path: Path,
+    ):
+        """A second promote's framing lands in `amendments` and is REPORTED back."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        created = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+
+        result = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-2'],
+            'evidence': 'SECOND-pass evidence, authored by this promote',
+            'options': ['C: a third way nobody proposed before'],
+            'summary': 'second-pass one-line hypothesis',
+        })
+
+        # (a) the pre-existing response shape is intact — 3976's `severity` key
+        # included; this must ADD to it, never regress it.
+        assert result['status'] == 'updated', f'Expected a fold, got {result}'
+        assert result['id'] == created['id']
+        assert set(result['members']) == {'esc-l1-1', 'esc-l1-2'}
+        assert result['severity'] == 'blocking', (
+            f'the post-floor severity must still be reported: {result}'
+        )
+
+        # (b) the caller LEARNS the framing landed, rather than only seeing
+        # id/status/members/severity and having to guess.
+        assert result['amendment_recorded'] is True, (
+            f'the fold recorded framing but did not report it: {result}'
+        )
+        assert result['amendments'] == 1, f'Expected 1 amendment, got {result}'
+
+        # (c) read the full record back: ORIGINAL framing intact, INCOMING
+        # framing present alongside it — nothing dropped either way.
+        record = await _get_escalation(server, escalation_id=created['id'])
+        assert record['root_cause'] == _L2_DEFAULTS['root_cause']
+        assert record['detail'] == _L2_DEFAULTS['evidence'], (
+            'the ORIGINAL evidence must survive the fold'
+        )
+        assert record['options'] == _L2_DEFAULTS['options'], (
+            'the ORIGINAL options must survive the fold'
+        )
+        amendment = record['amendments'][0]
+        assert amendment['detail'] == 'SECOND-pass evidence, authored by this promote'
+        assert amendment['options'] == ['C: a third way nobody proposed before']
+        assert amendment['summary'] == 'second-pass one-line hypothesis'
+        assert amendment['root_cause'] == _L2_DEFAULTS['root_cause']
+        assert amendment['agent_role'] == _L2_DEFAULTS['agent_role'], (
+            f'the submitting role must be attributed: {amendment}'
+        )
+
+        # (d) the zero-new-members fold — the exact case that used to return
+        # early and silently discard everything it was handed.
+        before = queue.get(created['id'])
+        assert before is not None
+        third = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-2'],  # already a member: nothing new to add
+            'evidence': 'THIRD-pass evidence',
+            'summary': 'third-pass hypothesis',
+        })
+
+        assert third['status'] == 'updated', f'Expected a fold, got {third}'
+        assert third['amendment_recorded'] is True, (
+            f'a zero-new-member fold still carries framing worth keeping: {third}'
+        )
+        assert third['amendments'] == 2, f'Expected 2 amendments, got {third}'
+        after = queue.get(created['id'])
+        assert after is not None
+        assert after.members == before.members, 'no new member ids were added'
+        assert after.updated_at is not None and after.updated_at > (before.updated_at or ''), (
+            f'new framing is a substantive change and must bump updated_at: '
+            f'{before.updated_at!r} -> {after.updated_at!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestAmendmentTruncationStorm: truncation gets a HEARER, not just a log line
+# ---------------------------------------------------------------------------
+
+
+class TestAmendmentTruncationStorm:
+    """Repeated amendment truncation files ONE info escalation per window.
+
+    Steps 8-9 gave amendment truncation a durable per-record counter
+    (``amendments_truncated``) and a WARNING.  A log line has no audience:
+    INV-4 asks WHO hears about it at a rate/streak threshold.  ``promote_to_l2``
+    drives a ``shared.storm_counter.StormCounter`` (the canonical task-1755
+    pattern) and files one info-severity escalation when truncations burst,
+    rate-limited to one fire per window.
+
+    Dedupe is disabled here deliberately: under the stock ``DedupeConfig``
+    (infra_issue, 600 s window) a second storm record would FOLD into the
+    first, so the rate-limit assertion would pass for the wrong reason.  With
+    dedupe off, "still exactly one record" can only be StormCounter's
+    one-fire-per-window contract.
+    """
+
+    @staticmethod
+    async def _fold(server, tag: str) -> dict[str, Any]:
+        """Promote the same root_cause again — always a fold, always framing."""
+        return await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-1'],  # already a member after the first call
+            'evidence': f'fold evidence {tag}',
+            'summary': f'fold summary {tag}',
+        })
+
+    @pytest.mark.asyncio
+    async def test_repeated_truncation_files_one_info_escalation(self, tmp_path: Path):
+        """Below threshold: silent.  At threshold: one info escalation.  Above: rate-limited."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
+        )
+
+        def pending_ids() -> set[str]:
+            return {e.id for e in queue.get_pending()}
+
+        created = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+        l2_id = created['id']
+        known = {l2_id}
+
+        # Fill the amendment list exactly to the cap — no truncation yet, so
+        # nothing may be filed.  Bound derived from the NAME, never the value.
+        for i in range(_MAX_AMENDMENTS):
+            filled = await self._fold(server, f'fill-{i}')
+            assert filled['status'] == 'updated', f'Expected a fold, got {filled}'
+        at_cap = queue.get(l2_id)
+        assert at_cap is not None
+        assert at_cap.amendments_truncated == 0, (
+            f'filling to the cap must not truncate: {at_cap.amendments_truncated}'
+        )
+        assert pending_ids() == known, (
+            'filling to the cap is not a storm and must file nothing'
+        )
+
+        # (a) BELOW threshold — truncation is happening, but not enough of it.
+        for i in range(_AMENDMENT_TRUNCATION_STORM_THRESHOLD - 1):
+            below = await self._fold(server, f'trunc-{i}')
+            assert below['status'] == 'updated', f'Expected a fold, got {below}'
+        rec = queue.get(l2_id)
+        assert rec is not None
+        assert rec.amendments_truncated == _AMENDMENT_TRUNCATION_STORM_THRESHOLD - 1, (
+            f'expected threshold-1 truncations, got {rec.amendments_truncated}'
+        )
+        assert pending_ids() == known, (
+            f'below the threshold nothing may be filed; new ids: '
+            f'{pending_ids() - known}'
+        )
+
+        # (b) AT threshold — exactly ONE additional pending escalation.
+        crossed = await self._fold(server, 'trunc-at-threshold')
+        new_ids = pending_ids() - known
+        assert len(new_ids) == 1, (
+            f'crossing the threshold must file exactly one storm escalation, '
+            f'got {len(new_ids)}: {sorted(new_ids)}'
+        )
+        storm = queue.get(next(iter(new_ids)))
+        assert storm is not None
+        assert storm.severity == 'info', (
+            f'a storm report is a notification, not a page: {storm.severity!r}'
+        )
+        assert storm.category == 'infra_issue', (
+            f'expected an infra-class category, got {storm.category!r}'
+        )
+        blob = f'{storm.summary}\n{storm.detail}'
+        assert l2_id in blob, (
+            f'the reader must be able to attribute the burst to the truncating '
+            f'L2 {l2_id}: {blob!r}'
+        )
+        assert str(_AMENDMENT_TRUNCATION_STORM_THRESHOLD) in blob, (
+            f'the observed count must be named so the burst is legible: {blob!r}'
+        )
+        assert str(_AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS) in blob, (
+            f'the window must be named so the rate is legible: {blob!r}'
+        )
+        # The condition is SYSTEM-scoped — cap sizing, or root-cause matching
+        # over-folding — and a burst routinely spans several L2s across several
+        # tasks.  Filing it against whichever promote crossed the threshold
+        # would put an unrelated infra record on that task's
+        # get_task_escalations, and (because the helper calls _submit_or_dedupe
+        # directly, bypassing the terminal-task chokepoint) could land it
+        # PENDING on an already-terminal task.  Same synthetic-anchor discipline
+        # as markup_tripwire._ANCHOR_TASK_ID.
+        assert storm.task_id == _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID, (
+            f'a system-scoped report must file under the synthetic anchor, not '
+            f'the triggering promote\'s task: {storm.task_id!r}'
+        )
+        assert storm.task_id != _L2_DEFAULTS['task_id']
+        on_triggering_task = {
+            e.id for e in queue.get_by_task(_L2_DEFAULTS['task_id'], status='pending')
+        }
+        assert storm.id not in on_triggering_task, (
+            f'the storm report must not surface on the triggering task: '
+            f'{sorted(on_triggering_task)}'
+        )
+        known |= new_ids
+
+        # (d) ADDITIVE-NEVER-FATAL — the promote that crossed the threshold
+        # still returned its normal update-path shape; the meta-escalation is a
+        # side effect that cannot fail the tool.
+        assert crossed['status'] == 'updated', f'Expected a fold, got {crossed}'
+        assert crossed['id'] == l2_id
+        assert crossed['amendment_recorded'] is True, f'framing must still land: {crossed}'
+        assert crossed['amendments'] == _MAX_AMENDMENTS, (
+            f'the list stays capped while truncating: {crossed}'
+        )
+        assert crossed['severity'] == 'blocking', f'severity must still report: {crossed}'
+        assert set(crossed['members']) == {'esc-l1-1'}, f'members must still report: {crossed}'
+
+        # (c) RATE-LIMITED — further truncations inside the same window are
+        # counted but file nothing more.
+        for i in range(_AMENDMENT_TRUNCATION_STORM_THRESHOLD + 1):
+            again = await self._fold(server, f'post-{i}')
+            assert again['status'] == 'updated', f'Expected a fold, got {again}'
+        assert pending_ids() == known, (
+            f'StormCounter fires at most once per window; extra records: '
+            f'{pending_ids() - known}'
+        )
+        drained = queue.get(l2_id)
+        assert drained is not None
+        assert drained.amendments_truncated > _AMENDMENT_TRUNCATION_STORM_THRESHOLD, (
+            'the per-record counter keeps counting even while the notification '
+            'is rate-limited (INV-8: the durable fact is on the record)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_storm_counter_is_per_server_instance(self, tmp_path: Path):
+        """A second create_server gets a FRESH counter — no cross-server bleed.
+
+        ``StormCounter`` documents its state as PROCESS-LOCAL and per-instance
+        "so no state bleeds between servers (or between tests)".  A
+        module-level counter would still be inside the first server's
+        rate-limit window here and would fire nothing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        cfg = DedupeConfig(infra_dedupe_enabled=False)
+        server = create_server(queue, dedupe_config=cfg)
+
+        def pending_ids() -> set[str]:
+            return {e.id for e in queue.get_pending()}
+
+        created = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+
+        # Fill to the cap, then burst past the threshold on server #1.
+        for i in range(_MAX_AMENDMENTS + _AMENDMENT_TRUNCATION_STORM_THRESHOLD):
+            await self._fold(server, f'first-{i}')
+        known = pending_ids()
+        assert len(known) == 2, (
+            f'expected the L2 plus one storm record, got {sorted(known)}'
+        )
+
+        # Server #2 over the SAME queue: the amendment list is already at the
+        # cap, so every fold truncates.  A fresh counter fires on its own
+        # threshold-th truncation; a shared one would still be rate-limited.
+        server2 = create_server(queue, dedupe_config=cfg, startup_sweep=False)
+        for i in range(_AMENDMENT_TRUNCATION_STORM_THRESHOLD):
+            await self._fold(server2, f'second-{i}')
+
+        fresh = pending_ids() - known
+        assert len(fresh) == 1, (
+            f'a second server must carry its own counter and fire its own '
+            f'storm report; new ids: {sorted(fresh)}'
+        )
 
 
 # ---------------------------------------------------------------------------

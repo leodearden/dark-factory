@@ -17,6 +17,24 @@ Structured-evidence field (default-empty; task 2558):
   evidence:   list of EvidenceEntry {observation, measured_at, ref} raw
               OBSERVATIONS backing the escalation (not causal diagnoses)
 
+Incoming-framing amendments (default-empty; task 3997):
+  amendments: append-only list of Amendment entries -- the framing
+              (root_cause/summary/detail/options) a fold carried in, preserved
+              instead of discarded.  NEVER overwrites the record's own fields
+              above: the original human-facing framing stays immutable.
+  amendments_truncated:
+              count of oldest entries shed to the `queue._MAX_AMENDMENTS` cap;
+              a durable structured fact so the loss is assertable from the
+              record rather than only by log-scrape.
+  amendments_chars_elided:
+              the BYTE-side counterpart: count of characters dropped by the
+              per-field caps (`queue._MAX_AMENDMENT_LINE_CHARS` /
+              `_MAX_AMENDMENT_DETAIL_CHARS` / `_MAX_AMENDMENT_OPTIONS`).  An
+              entry count alone bounds nothing when one field is unbounded free
+              text, so the two counters together are what make the list's size
+              envelope assertable from the record.
+  SOLE WRITER: `queue.add_members_to_l2`.
+
 Filing-identity field (default-None; task 3533):
   filing_claimant_run_id:
               the FILING incarnation's claimant id in
@@ -95,6 +113,49 @@ class EvidenceEntry(TypedDict):
     observation: str   # what was measured, e.g. "main red at abc123 (exit 134)"
     measured_at: str   # when/where measured, e.g. "HEAD=abc123 @ 2026-07-14T00:00:00+00:00"
     ref: str           # ref/context this was measured against, e.g. "rerun#2" or "HEAD=abc123"
+
+
+class Amendment(TypedDict):
+    """Framing a fold carried IN, appended rather than discarded (task 3997).
+
+    When `promote_to_l2` folds a new promote into an existing pending L2, the
+    incoming root_cause/evidence/options/summary used to be dropped on the floor
+    (measured: 336,875 characters lost).  Each such fold now appends one of these
+    to `Escalation.amendments`.  The record's OWN framing is never overwritten —
+    both the original and every incoming reframing survive, which is the point.
+
+    `detail` holds `promote_to_l2`'s ``evidence`` ARGUMENT — the same argument the
+    create path writes into the record's own `detail` — so a reader can diff an
+    amendment against the record like-for-like.  It is deliberately NOT called
+    `evidence`: `Escalation.evidence` is the semantically different structured
+    EvidenceEntry list (task 2558), and two different things called `evidence` on
+    one record would be a legibility trap.
+
+    `root_cause` is the PRE-canonical incoming value, which is what makes an
+    over-folding root-cause canonicaliser detectable after the fact.
+
+    `timestamp` is stamped by the queue at write time, never author-supplied —
+    the write chokepoint owns its clock (mirroring `stamp_triage`/`triaged_at`),
+    so a caller cannot backdate an amendment.
+
+    Every free-text field is stored ELIDED to the queue's per-field caps, with
+    an in-band marker naming what was dropped (`queue._build_amendment`), and
+    `options` is capped in length.  A field ending in that marker is the HEAD of
+    what was submitted, not all of it; the record-level `amendments_chars_elided`
+    holds the running character total.
+
+    Shape mirrors the EvidenceEntry / TrainState TypedDicts.  TypedDict at
+    runtime is a plain dict; existing from_dict / to_dict / asdict() paths are
+    unaffected — round-trip fidelity is unchanged.  Stored verbatim with no
+    shape validation, so a partial entry is accepted rather than rejected.
+    """
+
+    timestamp: str        # ISO, stamped by queue.add_members_to_l2 at write time
+    agent_role: str       # the session that submitted this framing
+    root_cause: str       # the PRE-canonical incoming root cause
+    summary: str          # incoming one-line hypothesis
+    detail: str           # incoming `evidence` argument (see docstring on the name)
+    options: list[str]    # incoming proposed resolution options
 
 
 # Severities that cause an escalation to be created directly at L2,
@@ -267,6 +328,24 @@ class Escalation:
     # _atomic_write / resolve / park / stamp_triage need NO change (they are
     # field-agnostic passthroughs or RMW-on-hydrated-record).
     filing_claimant_run_id: str | None = None
+    # Preserved incoming framing (task 3997).  APPEND-ONLY: an amendment NEVER
+    # overwrites this record's own root_cause / detail / options / summary — the
+    # original human-facing framing is immutable and every incoming reframing is
+    # kept alongside it.  `queue.add_members_to_l2` is the SOLE writer and also
+    # the sole trimmer (it sheds the OLDEST past `queue._MAX_AMENDMENTS`,
+    # counting each drop in amendments_truncated).  Zero migration, same pattern
+    # as members / evidence / train_state / the triage quad / granted_files /
+    # filing_claimant_run_id above: legacy JSON without these keys deserialises
+    # to the defaults via the from_dict __dataclass_fields__ filter below,
+    # to_dict's asdict() serialises them automatically, and queue.submit /
+    # submit_resolved / _atomic_write / resolve / park / stamp_triage need NO
+    # change (they are field-agnostic passthroughs or RMW-on-hydrated-record).
+    amendments: list[Amendment] = field(default_factory=list)
+    amendments_truncated: int = 0
+    # BYTE-side counterpart of amendments_truncated: characters dropped by the
+    # per-field caps that make the list's size (not merely its length) bounded.
+    # Same zero-migration story as the two fields above.
+    amendments_chars_elided: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -15,6 +15,7 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import ValidationError
 from shared.branch_names import canonical_queued_branch_name
+from shared.storm_counter import StormCounter
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from escalation import sweep as _sweep
@@ -32,7 +33,7 @@ from escalation.models import (
     max_severity,
 )
 from escalation.pins import classify_pins
-from escalation.queue import EscalationQueue
+from escalation.queue import AmendmentOutcome, EscalationQueue
 from escalation.queue import observed_submit_response as _observed_submit_response
 
 logger = logging.getLogger(__name__)
@@ -374,17 +375,42 @@ CATEGORIES = [
     'stranded_merge_failed',
 ]
 
-# Fields returned by get_pending_escalations(compact=True) — the triage-relevant
-# subset a long-running L2 watcher needs to decide whether to pull a full record.
-# The heavy fields (detail, members, options, root_cause, train_state,
-# workflow_state, worktree, dedupe_*) are dropped to keep the watcher's context
-# small as the pending pile grows during an AFK window. The triage-ack fields
-# (triaged_at, triaged_by, triage_note, updated_at) are included so a compact
-# drain can decide stamp-then-skip without a per-record get_escalation round-trip.
+# OUTPUT keys of a compact row — the triage-relevant subset a long-running L2
+# watcher needs to decide whether to pull a full record.  NOTE these are output
+# keys, not model field names: ``member_ids`` is a PROJECTION of the model's
+# ``members`` list (renamed once, in _compact_escalation below), so this tuple is
+# no longer a pure key subset of Escalation.to_dict().
+# The heavy fields (detail, options, train_state, workflow_state, worktree,
+# dedupe_*) are still dropped to keep the watcher's context small as the pending
+# pile grows during an AFK window; `detail` in particular is the unbounded
+# free-text field that motivated compact mode.  ``root_cause`` and
+# ``member_ids`` are what let a rotating watcher rebuild `already_promoted` from
+# the drain ALONE, with no session memory (task 3997, C1).  ``amendments`` is
+# deliberately NOT projected, so preserved incoming framing never inflates a
+# drain.
+#
+# NEITHER OF THE TWO ADDED FIELDS IS BOUNDED IN PRINCIPLE, and this comment used
+# to claim they were "bounded by construction" — they are not.  ``promote_to_l2``
+# validates only that ``root_cause.strip()`` is non-empty, so an arbitrarily long
+# key rides every compact row, and ``member_ids`` grows with cluster size.  Both
+# are short in PRACTICE (a one-line dedup key; ~20-char ids), which is the actual
+# basis for including them.  Bounding them here was considered and REJECTED in
+# both available forms: truncating ``root_cause`` in the projection would
+# silently break the exact-match rebuild that is C1's entire point, and capping
+# it at mint would either fail a legitimate promote outright or collapse two
+# distinct keys into one L2 — over-folding, the very failure the amendment
+# storm report exists to surface.  The cost is real and named rather than
+# denied: every compact reader pays it, including the dashboard's
+# ``fetch_pins_recovery`` poll (dashboard/.../escalations.py), which asks for
+# ``compact=True`` on a loop and reads nothing but ``pins_recovery``.
+# The triage-ack fields (triaged_at, triaged_by, triage_note, updated_at) are
+# included so a compact drain can decide stamp-then-skip without a per-record
+# get_escalation round-trip.
 _COMPACT_ESCALATION_FIELDS = (
     'id', 'task_id', 'category', 'severity', 'level', 'status',
     'summary', 'suggested_action', 'timestamp',
     'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
+    'root_cause', 'member_ids',
 )
 
 # get_pending_escalations(compact=True) additionally keeps its computed
@@ -392,6 +418,66 @@ _COMPACT_ESCALATION_FIELDS = (
 # here would blank the whole PINNING surface.  Kept as a separate tuple so
 # get_task_escalations — which never computes the annotation — is untouched.
 _COMPACT_PENDING_FIELDS = (*_COMPACT_ESCALATION_FIELDS, 'pins_recovery')
+
+
+def _compact_escalation(d: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    """Project one Escalation.to_dict() into a compact row over *fields*.
+
+    THE single site that knows compact rows expose ``member_ids`` where the model
+    says ``members`` (task 3997).  Both compact apply sites route through here so
+    the rename exists exactly once; widening _COMPACT_ESCALATION_FIELDS is then
+    enough to change both tools' wire shape.
+
+    Keys absent from *d* are OMITTED rather than defaulted.  That is not
+    defensive tidiness: ``pins_recovery`` is deliberately absent when it cannot
+    be computed, and emitting a false ``[]`` there reads as "nothing pins this
+    task" — the exact collapse (esc-3163) the omission contract exists to
+    prevent.
+    """
+    row: dict[str, Any] = {}
+    for k in fields:
+        if k == 'member_ids':
+            # Projection, not a model field: renamed from `members`.  Copied so a
+            # caller mutating the row cannot reach back into the loaded record.
+            row[k] = list(d.get('members', []))
+        elif k in d:
+            row[k] = d[k]
+    return row
+
+
+# INV-4 storm escape for L2 amendment truncation (task 3997).  Sizing: with
+# ``queue._MAX_AMENDMENTS`` = 20, ONE L2 has to fold 21+ times inside the window
+# to truncate even ONCE, so three truncations in an hour is not routine churn.
+# It says either the cap is systematically wrong for the live fold rate, or
+# root-cause matching is over-folding unrelated clusters into a single L2 — and
+# task 3998 canonicalises that matching, which RAISES the fold rate BY DESIGN.
+# Both readings are worth a human-adjacent signal rather than a WARNING nobody
+# reads; the durable per-record ``amendments_truncated`` counter remains the
+# primary structured fact (INV-8), this is the notification layered on it.
+#
+# Module constants rather than a config leaf, following the sanctioned
+# precedent of ``reconciliation/harness.py``'s ``_PLACEHOLDER_DROP_STORM_*``,
+# whose stated reason — the counter is private to this module — holds
+# identically here.  They are still passed per ``record()`` call because that
+# is ``StormCounter``'s API (see its RELOAD SAFETY note).
+_AMENDMENT_TRUNCATION_STORM_THRESHOLD = 3
+_AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS = 3600.0  # 1 h
+
+# A stable SYNTHETIC anchor (not a real task id), mirroring
+# ``markup_tripwire._ANCHOR_TASK_ID`` and its siblings.  The condition this
+# report describes — cap sizing, or root-cause matching over-folding unrelated
+# clusters — is SYSTEM-scoped, and a burst routinely spans several L2s across
+# several tasks, so filing it against whichever promote happened to cross the
+# threshold would be arbitrary attribution with two real costs:
+# ``get_task_escalations(that_task)`` would surface an infra record unrelated to
+# the task, and because this helper calls ``_submit_or_dedupe`` directly (it is
+# sync, and must never fail the promote) it bypasses the terminal-task
+# chokepoint, so the report could land PENDING on an already-terminal task.
+# The affected L2 ids stay named in the summary and detail, which is where the
+# attribution belongs.  The ids also form one greppable
+# ``esc-l2-amendment-truncation-N`` series.
+_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID = 'l2-amendment-truncation'
+
 
 # Task statuses from which a recovery/redispatch is still possible.  A record
 # on a task outside this set pins nothing: there is no recovery to block.
@@ -631,6 +717,96 @@ def create_server(
             # (still carrying esc.level, so the 'level' echo is never missing).
             return _observed_submit_response(queue, esc_id, fallback_level=esc.level)
         return _dedupe_submit_or_dedupe(queue, esc, cfg)
+
+    # --- Amendment-truncation storm escape (INV-4, task 3997) ---
+
+    # PROCESS-LOCAL and per-instance BY CONSTRUCTION.  StormCounter documents
+    # its state as resetting on restart and not bleeding between servers (or
+    # between tests), and server.py otherwise holds zero module-level mutable
+    # state — every module-level name above is a frozen constant.  Keeping the
+    # counter in this closure is what preserves that property.
+    _amendment_truncation_storm = StormCounter()
+
+    def _report_amendment_truncation_storm(l2_id: str) -> None:
+        """File ONE info escalation when amendment truncation BURSTS.
+
+        ``queue.add_members_to_l2`` already counts every dropped amendment on
+        the record itself (``amendments_truncated``) and logs a WARNING.  The
+        counter stays the PRIMARY structured fact — the contract is assertable
+        from the record, never by log-scrape (INV-8) — but a WARNING has no
+        audience.  This is the rate-thresholded NOTIFICATION layered on top,
+        which is what INV-4 asks for: a hearer, at a threshold.
+
+        Deliberately lives here and not in ``queue.py``.  That module is a pure
+        storage leaf, and a self-file from inside ``add_members_to_l2`` would
+        re-enter ``make_id``/``submit``/``_atomic_write`` while still holding
+        ``escalation_id_lock``.  ``promote_to_l2`` already calls ``queue.submit``
+        on its create path and runs outside that flock.
+
+        PURELY ADDITIVE, NEVER FATAL, mirroring the house analogues
+        ``emit_markup_storm_escalation`` and
+        ``emit_residual_candidate_key_escalation``: nothing raised in here may
+        fail the promote that triggered it.  A dropped report costs a
+        notification; a raised one would cost the fold.
+
+        Filed under ``_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID``, following the same
+        analogues, because the condition is system-scoped rather than a property
+        of whichever task's promote crossed the threshold.  The affected L2 ids
+        are named in the summary and detail instead.
+        """
+        try:
+            storm = _amendment_truncation_storm.record(
+                threshold=_AMENDMENT_TRUNCATION_STORM_THRESHOLD,
+                window_seconds=_AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS,
+                # The label is load-bearing, not decoration: it is what lets the
+                # report name WHICH L2s truncated instead of blaming whichever
+                # call happened to cross the threshold.
+                label=l2_id,
+            )
+            # None means below threshold, or a previous fire is still inside the
+            # window (one report per window, so a runaway escalates once).
+            if storm is None:
+                return
+            labels = ', '.join(storm['labels']) or l2_id
+            _submit_or_dedupe(Escalation(
+                # Filed under the synthetic anchor, NOT the triggering promote's
+                # task_id — see _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID.
+                id=queue.make_id(_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID),
+                task_id=_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
+                agent_role='escalation-server',
+                # A report about lost framing is a notification, not a page:
+                # 'info' keeps it off the born-at-L2 human-direct route.
+                severity='info',
+                category='infra_issue',
+                summary=(
+                    f"L2 amendment truncation storm: {storm['count']} truncations "
+                    f"in {storm['window_seconds']}s "
+                    f"(threshold {storm['threshold']}); L2s: {labels}"
+                ),
+                detail=(
+                    f"OBSERVED: {storm['count']} amendment truncations within "
+                    f"{storm['window_seconds']}s across L2 escalation(s): {labels}.\n"
+                    f"Each truncation drops the OLDEST entry of that L2's "
+                    f"`amendments` list at the queue._MAX_AMENDMENTS cap; the "
+                    f"record's own `amendments_truncated` field holds the durable "
+                    f"per-L2 total, and its own root_cause/detail/options/summary "
+                    f"are never touched.\n"
+                    f"Hypothesis: either the cap is too low for the live fold "
+                    f"rate, or root-cause matching is over-folding unrelated L1 "
+                    f"clusters into one L2."
+                ),
+                suggested_action=(
+                    'Read the named L2s and compare each record\'s own framing '
+                    'against its amendments to judge whether those folds belong '
+                    'together; then either raise queue._MAX_AMENDMENTS or tighten '
+                    'root-cause matching.'
+                ),
+            ))
+        except Exception as e:  # pragma: no cover - defensive, never fatal
+            logger.exception(
+                'amendment-truncation storm report failed for L2 %s (non-fatal): %s',
+                l2_id, e,
+            )
 
     # --- Terminal-task chokepoint helper ---
 
@@ -1289,15 +1465,31 @@ def create_server(
         ANY escalation ever exist for this task", use ``get_task_escalations``
         instead — an empty result here is not evidence of absence.
 
-        *compact* — when True, each returned dict is projected to only the
-        triage-relevant fields (``id``, ``task_id``, ``category``, ``severity``,
-        ``level``, ``status``, ``summary``, ``suggested_action``, ``timestamp``);
-        the heavy free-text/cluster fields (``detail``, ``members``, ``options``,
-        ``root_cause``, ``train_state``, ``workflow_state``, ``worktree``,
-        ``dedupe_*``) are omitted.  Use this from a long-running watcher to keep
-        context small as the pending pile grows; fetch the full record for a
-        specific id via ``get_escalation`` only when you are about to act on it.
-        Default False preserves the full-dict shape for existing callers.
+        *compact* — when True, each returned dict is projected to the
+        triage-relevant field subset, plus this tool's computed
+        ``pins_recovery`` (below).  The authoritative list is
+        :data:`_COMPACT_ESCALATION_FIELDS` — read it there rather than trusting
+        a prose copy, which is how this paragraph drifted before.  What is
+        DROPPED: the heavy free-text/cluster fields ``detail``, ``options``,
+        ``train_state``, ``workflow_state``, ``worktree`` and ``dedupe_*``, plus
+        ``amendments``.  ``detail`` is the unbounded free-text field compact mode
+        exists to keep out of a long-running watcher's context.
+
+        Two L2-cluster fields ARE returned, because they are bounded by
+        construction and load-bearing for triage (task 3997): ``root_cause``,
+        the one-line dedup key ``promote_to_l2`` folds on, and ``member_ids``,
+        the PROJECTION of the record's ``members`` list under a contract name
+        (the raw ``members`` key stays dropped).  Together they make a drain
+        SELF-SUFFICIENT: a rotating watcher rebuilds ``already_promoted`` as
+        {root_cause of the pending L2s} u {their member_ids} across the returned
+        rows, with NO session memory — previously that set could only be carried
+        forward in-session, so a rotation re-promoted clusters it had already
+        promoted.
+
+        Use this from a long-running watcher to keep context small as the
+        pending pile grows; fetch the full record for a specific id via
+        ``get_escalation`` only when you are about to act on it.  Default False
+        preserves the full-dict shape for existing callers.
 
         *pins_recovery* — each returned dict carries a computed
         ``pins_recovery`` list: ``[task_id]`` when THIS record is what stops
@@ -1344,10 +1536,12 @@ def create_server(
                 'unstamped records report UNKNOWN (key absent)', len(dicts),
             )
         if compact:
-            # `if k in d` because pins_recovery is deliberately absent when
-            # unknown — projecting it unconditionally would KeyError on
-            # exactly the degraded path the omission contract exists for.
-            return [{k: d[k] for k in _COMPACT_PENDING_FIELDS if k in d} for d in dicts]
+            # _compact_escalation OMITS absent keys because pins_recovery is
+            # deliberately absent when unknown — projecting it unconditionally
+            # would KeyError on exactly the degraded path the omission contract
+            # exists for.  The same helper also owns the members -> member_ids
+            # rename, so both compact tools share one projection (task 3997).
+            return [_compact_escalation(d, _COMPACT_PENDING_FIELDS) for d in dicts]
         return dicts
 
     @mcp.tool()
@@ -1410,7 +1604,7 @@ def create_server(
         )
         if compact:
             return [
-                {k: d[k] for k in _COMPACT_ESCALATION_FIELDS}
+                _compact_escalation(d, _COMPACT_ESCALATION_FIELDS)
                 for d in (e.to_dict() for e in escalations)
             ]
         return [e.to_dict() for e in escalations]
@@ -1563,7 +1757,13 @@ def create_server(
         append RAISES the existing L2's severity when the incoming members (or
         an explicit *severity*) justify it, and never lowers it — an L2's
         severity is monotonically non-decreasing after mint, so a record cannot
-        be quieted out from under a human already looking at it.
+        be quieted out from under a human already looking at it.  An append also
+        APPENDS this call's *root_cause*/*evidence*/*options*/*summary* to the
+        existing L2's ``amendments`` list rather than discarding them (task
+        3997): the record's OWN framing stays immutable, but the framing a fold
+        carried in is no longer lost.  That list is bounded — oldest-shed at
+        ``queue._MAX_AMENDMENTS``, with every drop counted in the record's
+        ``amendments_truncated``.
 
         **Members stay at L1**: the member L1 escalations are referenced but
         NOT promoted; they remain pending at L1 until the L2 is resolved.
@@ -1662,7 +1862,17 @@ def create_server(
         Update (existing pending L2 with same root_cause)::
 
             {'id': <existing_id>, 'status': 'updated', 'members': [<all_members>],
-             'severity': <severity_after_floor>}
+             'severity': <severity_after_floor>,
+             'amendment_recorded': <bool>, 'amendments': <int>}
+
+        ``amendment_recorded`` is True when THIS call's framing was appended.
+        It is reported by ``add_members_to_l2`` from inside its own write lock
+        (``queue.AmendmentOutcome``), so it describes this call's write exactly
+        — not a difference inferred from a pre-read, which cost an extra record
+        parse per fold and raced concurrent folds in either direction.  A
+        framing-free or framing-identical re-promote appends nothing and
+        correctly reports False.  ``amendments`` is the resulting list length,
+        which saturates at ``queue._MAX_AMENDMENTS``.
 
         ``severity`` reports what was ACTUALLY filed, which for a caller that
         omitted the argument is how the inherited value becomes visible — and
@@ -1734,12 +1944,36 @@ def create_server(
             # which case add_members_to_l2 leaves the severity untouched.
             # Upward-only inside add_members_to_l2, so an append can never
             # quiet an existing L2.
+            # What this fold did to `amendments` is reported BY THE WRITER,
+            # from inside `escalation_id_lock` where it is already computed —
+            # not re-derived here from a pre-read plus a "did the count grow"
+            # heuristic.  That heuristic cost a second full read+parse per fold
+            # and was a real TOCTOU: the queue is built for cross-process
+            # mutators, so a concurrent fold between the pre-read and the call
+            # made the flag wrong in either direction.
+            outcome: AmendmentOutcome = {'recorded': False, 'dropped': 0}
             updated = queue.add_members_to_l2(
                 existing_id,
                 list(dict.fromkeys(member_ids)),
                 severity_floor=severity_floor,
+                # The framing this promote carried in is APPENDED to the L2's
+                # `amendments` rather than discarded (task 3997, C2).  The
+                # record's OWN root_cause/detail/options/summary are untouched.
+                root_cause=root_cause,
+                evidence=evidence,
+                options=list(options),
+                summary=summary,
+                agent_role=agent_role,
+                outcome=outcome,
             )
             if updated is not None:
+                # INV-4: repeated truncation gets a HEARER, not just a WARNING.
+                # The trigger is this call's OWN shed count, so it fires on the
+                # event rather than on an inferred difference.  Purely additive —
+                # _report_amendment_truncation_storm never raises, so a failed
+                # report can never fail this fold.
+                if outcome['dropped']:
+                    _report_amendment_truncation_storm(existing_id)
                 return {
                     'id': existing_id,
                     'status': 'updated',
@@ -1747,6 +1981,10 @@ def create_server(
                     # Read off the returned Escalation, so this is the
                     # POST-floor value rather than the argument.
                     'severity': updated.severity,
+                    # Report the preservation, so a caller LEARNS its framing
+                    # landed instead of having to re-read the record to find out.
+                    'amendment_recorded': outcome['recorded'],
+                    'amendments': len(updated.amendments),
                 }
             # Race: the pending L2 was resolved/archived between find and update.
             # Fall through to the create path so the caller gets a valid result
