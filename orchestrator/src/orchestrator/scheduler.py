@@ -470,23 +470,38 @@ def is_transient_api_requeue(
     """True when a requeue was caused by a transient server-side (5xx) API error.
 
     FIELD-FIRST (task 3315, PRD contract C2 / INV-1 "structured field over
-    regex").  Two routes, in precedence order:
+    regex"), but POSITIVE-ONLY: EITHER signal suffices and NEITHER can veto
+    the other.  Two sources of 5xx evidence:
 
     1. *api_error_status* — the STRUCTURED status threaded
        ``TerminalReport -> TaskReport -> Scheduler.record_requeue`` from
        ``AgentResult.api_error_status``.  This is the primary signal and
-       needs no cooperation from the prose of *reason*.
+       needs no cooperation from the prose of *reason*: a 5xx here
+       short-circuits True before *reason* is even looked at.
     2. The ``"agent API error: HTTP <status>"`` marker in *reason* — retained
        ONLY as a LEGACY FALLBACK, for reasons produced by phases that do not
        yet carry the field (the producers land in the sibling PRD tasks γ
        (execute), η (review) and θ (planning/simple_task)).  This is the one
        and only site that still parses that marker.
 
-    Both routes classify through ``shared.cli_invoke.is_server_error_status``,
+    Source 1 is consulted first, but a ``None`` OR NON-5xx status means only
+    "no evidence from the field" — never an authoritative False — so it falls
+    THROUGH to source 2.  Conflicting evidence (e.g. ``api_error_status=400``
+    alongside a ``HTTP 503`` marker in *reason*) therefore resolves
+    TRANSIENT; that disagreement is pinned both ways by
+    ``test_non_5xx_field_does_not_veto_legacy_marker`` and
+    ``test_5xx_field_wins_without_any_marker``.  The asymmetry is deliberate
+    (PRD resolved decision 5): the field defaults ``None`` at every product
+    construction site until tasks γ/η/θ land, so reading its absence as
+    authoritative-False would silently delete the existing planning-phase
+    transient lane.  Producers derive both signals from the same
+    ``AgentResult`` via ``classify_agent_failure``, so in practice they
+    cannot disagree today.
+
+    Both sources classify through ``shared.cli_invoke.is_server_error_status``,
     the single canonical definition of the 5xx band (INV-5) — the band is
     deliberately NOT re-encoded here.  HTTP 4xx (client/auth errors) and
-    non-API reasons return False and still count against ``requeue_cap``; a
-    ``None`` status is not evidence of anything.
+    non-API reasons return False and still count against ``requeue_cap``.
 
     Note: HTTP 429 (rate-limit / too-many-requests) is intentionally
     classified as non-transient.  Unlike a server-side 5xx overload that
@@ -8632,6 +8647,21 @@ class Scheduler:
         # triaging engineer sees which ceiling fired and how many of each kind
         # accumulated (avoids the misleading "10 iterations (cap=10)" when only
         # 8 were transient but total history also includes genuine ones).
+        #
+        # KNOWN DIVERGENCE (task 3315, PRD contract C2) — this breakdown is
+        # REGEX-ONLY and can therefore under-count ``n_transient`` relative to
+        # the routing that actually filled ``_transient_requeue_counts``.
+        # ``record_requeue`` classifies FIELD-FIRST on the structured
+        # ``api_error_status``, but ``RequeueRecord`` does not carry that field
+        # (deliberately: the PRD assigns the cap-exhaust forensics — this
+        # breakdown and the HTTP-status distribution — to sibling task θ), so a
+        # requeue routed transient on the field alone with a MARKER-FREE reason
+        # is recounted here as genuine.  Result: the report/escalation can read
+        # ``cap=<transient_requeue_cap>`` alongside ``n_transient=0``.  Do not
+        # trust this breakdown as the bucket of record; ``cap`` and
+        # ``transient_requeue_count()`` are authoritative.  The fix (stamp
+        # ``api_error_status`` onto ``RequeueRecord`` in ``record_requeue`` and
+        # pass it through here) belongs with task θ's report rework.
         n_transient = sum(
             1 for r in history if is_transient_api_requeue(r.reason)
         )
