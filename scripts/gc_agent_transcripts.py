@@ -78,6 +78,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import shutil
 import sys
 import time
@@ -105,6 +106,27 @@ DEFAULT_ARCHIVE_ROOT = DEFAULT_PROJECT_ROOT / ARCHIVE_ROOT_RELATIVE
 # Mirrors RetentionConfig().max_age_days / .max_task_dirs.
 DEFAULT_MAX_AGE_DAYS = 90
 DEFAULT_MAX_TASK_DIRS = 5000
+
+# Headroom multiplier on the plain (max_age_days x observed peak daily rate)
+# projection, so max_task_dirs is a DERIVED bound and the AGE cap is the only
+# policy that binds in normal operation. Implements the D8 ruling of
+# plans/transcript-preservation-seam-prd.md (Leo, 2026-08-04), which raised the
+# cap because it prunes OLDEST-FIRST and therefore truncates the 90-day window
+# from the forensic end whenever it binds.
+#
+# MEASURED on this host 2026-08-19 via observed_daily_rate(scan_task_dirs(...)):
+# ~1,036 task dirs over a 33-day span, 31 complete interior days, peak ~90/day
+# (a re-measurement the same day read 89/day — the archive is live and the
+# sample moves), mean ~32.9/day. The PRD measured a 71/day peak on 2026-08-04,
+# so the peak rose ~27% in 15 days: the cap has to re-derive, not sit still.
+#
+# At factor 3 the requirement is ceil(90 days x 90/day x 3) = 24,300, which the
+# 50,000 cap clears with ~2.06x margin, and the derived-bound test trips at
+# ~185 dirs/day — roughly double today's peak. Low enough that ordinary
+# burstiness cannot flap the guard, high enough that it is a live tripwire
+# rather than a formality. Must be >= 1: below 1 the cap would be sized UNDER
+# the plain 90-day projection and quietly re-admit the truncation.
+RETENTION_SAFETY_FACTOR = 3
 
 # Smallest number of COMPLETE interior day buckets :func:`observed_daily_rate`
 # will report a rate from. Below it the sample is too sparse to read a peak
@@ -354,6 +376,38 @@ def observed_daily_rate(
         sample_dirs=len(task_dirs),
         span_days=last_day - first_day + 1,
     )
+
+
+def required_max_task_dirs(
+    peak_per_day: float,
+    max_age_days: int,
+    safety_factor: float,
+) -> int:
+    """Smallest ``max_task_dirs`` that keeps the AGE cap the only binding policy.
+
+    *peak_per_day* is the busiest complete day's task-dir count (see
+    :func:`observed_daily_rate`); *max_age_days* is the retention window the
+    count cap must be able to hold in full; *safety_factor* is the headroom
+    multiplier over that plain projection (see
+    :data:`RETENTION_SAFETY_FACTOR`).
+
+    The count cap prunes OLDEST-FIRST, so whenever it binds it truncates the
+    retention window from the forensic end — the sweep would still report a
+    90-day policy while actually holding rather less. Sizing the cap at
+    ``peak x window x factor`` means the count axis stays slack and the age cap
+    remains the only policy that decides what is kept.
+
+    Rounds UP: a fractional requirement must never round down into headroom the
+    archive does not have.
+
+    To RE-DERIVE the cap, measure the live archive and read the answer here::
+
+        rate = observed_daily_rate(scan_task_dirs(default_archive_root()))
+        required_max_task_dirs(
+            rate.peak_per_day, DEFAULT_MAX_AGE_DAYS, RETENTION_SAFETY_FACTOR
+        )
+    """
+    return math.ceil(peak_per_day * max_age_days * safety_factor)
 
 
 @dataclass
