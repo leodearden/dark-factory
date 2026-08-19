@@ -130,15 +130,53 @@ def _result_project(entry: dict) -> tuple[str, str] | None:
     return None
 
 
+def _foreign_tag(entry: dict, target: str) -> tuple[str, str] | None:
+    """The ``(key, value)`` of *entry*'s project tag when it names a FOREIGN project.
+
+    THE single spelling of the drop decision, shared by the top-level result
+    loop in :func:`filter_foreign_project_results` and the nested-child loop in
+    :func:`_filter_grouped_children`. The whole value of the descent is that a
+    nested child is judged by the SAME rule as a top-level result; two
+    independent copies of "read the tag, canonicalise, compare" would be
+    exactly the silent-divergence class this module otherwise works hard to
+    prevent — a later change to the comparison (a project whitelist, an
+    allow-empty-tag rule) applied to only one site would leave the other
+    quietly stricter, and a nested-only divergence surfaces as ``dropped == 0``,
+    indistinguishable from "nothing foreign found".
+
+    ``target`` must ALREADY be canonicalised by :func:`_canonical_project`: it
+    is loop-invariant, so it is normalised once by the caller rather than once
+    per entry.
+
+    Returns ``None`` — i.e. KEEP — both when the entry carries no readable tag
+    (the deliberate keep-untagged policy documented on
+    :func:`filter_foreign_project_results`) and when its tag canonicalises
+    equal to ``target``. The two are not distinguished here because neither
+    caller acts on the difference; each only needs to know whether to drop.
+
+    The firing key rides along with the value so a caller can log WHICH key
+    fired and WHAT it said, and so diagnose a false-positive filter from the
+    logs alone.
+    """
+    match = _result_project(entry)
+    if match is None:
+        return None
+    key, tag = match
+    if _canonical_project(tag) == target:
+        return None
+    return key, tag
+
+
 def _filter_grouped_children(entry: dict, target: str) -> int:
     """Drop cross-project CHILD entries nested inside a KEPT result's block.
 
     Walks :data:`GROUPED_CHILD_KEYS` inside ``entry['grouped']`` and applies
-    the SAME rule the top-level loop applies — :func:`_result_project` for the
-    tag (so the ``src_project`` precedence order is not re-spelled),
-    :func:`_canonical_project` for the comparison, keep-untagged for anything
-    unclassifiable. Returns the number of nested entries dropped; the caller
-    folds that into its own ``dropped`` total.
+    the SAME rule the top-level loop applies — literally the same predicate,
+    :func:`_foreign_tag`, so the ``src_project`` precedence order, the
+    canonicalisation and the keep-untagged policy exist in ONE place and
+    cannot drift apart between the two call sites. Returns the number of
+    nested entries dropped; the caller folds that into its own ``dropped``
+    total.
 
     SURGICAL. Only the child LISTS are rewritten, and only when something was
     actually dropped. ``amendment_count`` / ``sighting_count`` are NEVER
@@ -185,18 +223,18 @@ def _filter_grouped_children(entry: dict, target: str) -> int:
         kept = []
         for child in children:
             # A non-dict nested entry is unclassifiable, not foreign — kept,
-            # exactly as an untagged child is. (``_result_project`` already
-            # tolerates a non-dict ``metadata`` on a well-formed one.)
-            if isinstance(child, dict) and (match := _result_project(child)) is not None:
-                tag_key, tag = match
-                if _canonical_project(tag) != target:
-                    dropped += 1
-                    logger.debug(
-                        f'filter_foreign_project_results: dropped nested '
-                        f'{child.get("id")!r} under {entry.get("id")!r} '
-                        f'({tag_key}={tag!r})'
-                    )
-                    continue
+            # exactly as an untagged child is. (``_result_project``, reached
+            # through ``_foreign_tag``, already tolerates a non-dict
+            # ``metadata`` on a well-formed one.)
+            if isinstance(child, dict) and (foreign := _foreign_tag(child, target)) is not None:
+                tag_key, tag = foreign
+                dropped += 1
+                logger.debug(
+                    f'filter_foreign_project_results: dropped nested '
+                    f'{child.get("id")!r} under {entry.get("id")!r} '
+                    f'({tag_key}={tag!r})'
+                )
+                continue
             kept.append(child)
         if len(kept) != len(children):
             grouped[key] = kept
@@ -290,16 +328,14 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
         if not isinstance(entry, dict):
             kept.append(entry)
             continue
-        match = _result_project(entry)
-        if match is not None:
-            key, tag = match
-            if _canonical_project(tag) != target:
-                dropped += 1
-                logger.debug(
-                    f'filter_foreign_project_results: dropped {entry.get("id")!r} '
-                    f'({key}={tag!r})'
-                )
-                continue
+        if (foreign := _foreign_tag(entry, target)) is not None:
+            key, tag = foreign
+            dropped += 1
+            logger.debug(
+                f'filter_foreign_project_results: dropped {entry.get("id")!r} '
+                f'({key}={tag!r})'
+            )
+            continue
         # Only for a KEPT entry: a dropped parent takes its whole subtree with
         # it, so descending into one would double-count what is already gone.
         dropped += _filter_grouped_children(entry, target)
