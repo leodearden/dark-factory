@@ -60,9 +60,13 @@ if TYPE_CHECKING:
 
 __all__ = [
     'SoftScopeSignal',
+    'SoftScopeFinding',
     'project_name_aliases',
     'find_title_project_prefix',
     'find_absolute_foreign_roots',
+    'find_foreign_project_names',
+    'collect_soft_scope_signals',
+    'soft_scope_enforced',
 ]
 
 
@@ -254,13 +258,23 @@ def find_title_project_prefix(
 # Signal (b1): an ABSOLUTE path under a foreign project root
 # ---------------------------------------------------------------------------
 
-# Characters that continue a path NAME.  A root match is rejected when the
-# very next character is one of these, so ``<root>-old``, ``<root>ish`` and
-# ``<root>.bak`` are near misses rather than hits — the same component
-# boundary ``ProjectPrefixRegistry._owner_for_absolute_path`` already
-# enforces for declared file paths (``root + '/'``), stated here as its
-# right-context complement so the bare-root spelling is admitted too.
-_PATH_NAME_CHARS: re.Pattern[str] = re.compile(r'[A-Za-z0-9_.\-]')
+# Right-hand component boundary for a matched root.  The match is REJECTED
+# when the root is immediately continued by another path-name character —
+# ``<root>-old``, ``<root>ish``, ``<root>.bak`` are different directories,
+# not the root — which is the same boundary
+# ``ProjectPrefixRegistry._owner_for_absolute_path`` enforces for declared
+# file paths (``root + '/'``), stated here as its right-context complement
+# so the BARE-root spelling is admitted too.
+#
+# A trailing ``.`` is the one character that has to be read in context: it
+# begins a real suffix in ``<root>.bak/x.py`` (reject) but is ordinary
+# sentence punctuation in "the work is in <root>." (accept).  Treating every
+# ``.`` as a suffix would lose sentence-final citations, which in prose is
+# the COMMON spelling of exactly the fileless case this signal exists to
+# catch; treating none as a suffix would re-admit the sibling-directory
+# false positive.  So ``.`` blocks only when it is itself followed by a
+# path-name character.
+_ROOT_SUFFIX_RE: re.Pattern[str] = re.compile(r'[A-Za-z0-9_\-]|\.[A-Za-z0-9_\-]')
 
 
 def _foreign_roots_longest_first(
@@ -313,7 +327,9 @@ def find_absolute_foreign_roots(
 
     A bare root with no trailing segment DOES fire, unlike a bare relative
     prefix: nothing but the project spells that project's absolute root, so
-    there is no bare-MENTION ambiguity to defend against.
+    there is no bare-MENTION ambiguity to defend against — including at the
+    end of a sentence, where the trailing ``.`` is punctuation rather than a
+    directory suffix (see :data:`_ROOT_SUFFIX_RE`).
 
     Roots are scanned longest-first so nested roots resolve to the most
     specific owner; at most one signal is emitted per foreign project, in
@@ -329,8 +345,8 @@ def find_absolute_foreign_roots(
         start = text.find(root)
         while start != -1:
             end = start + len(root)
-            tail = text[end : end + 1]
-            if not tail or not _PATH_NAME_CHARS.match(tail):
+            tail = text[end : end + 2]
+            if not tail or not _ROOT_SUFFIX_RE.match(tail):
                 seen.add(owner)
                 signals.append(
                     SoftScopeSignal(
@@ -343,3 +359,162 @@ def find_absolute_foreign_roots(
                 break
             start = text.find(root, start + 1)
     return signals
+
+
+# ---------------------------------------------------------------------------
+# Signal (b2): a bare foreign project NAME in prose — WEAK
+# ---------------------------------------------------------------------------
+
+_NAME_PATTERN_CACHE: dict[tuple[str, ...], re.Pattern[str]] = {}
+
+
+def _build_name_pattern(aliases: tuple[str, ...]) -> re.Pattern[str]:
+    """Build (and cache) a word-boundary alternation over *aliases*."""
+    cached = _NAME_PATTERN_CACHE.get(aliases)
+    if cached is not None:
+        return cached
+    alternation = '|'.join(re.escape(a) for a in aliases)
+    pattern = re.compile(rf'\b({alternation})\b', re.IGNORECASE)
+    _NAME_PATTERN_CACHE[aliases] = pattern
+    return pattern
+
+
+def find_foreign_project_names(
+    text: str | None,
+    project_id: str,
+    registry: ProjectPrefixRegistry | None,
+) -> list[SoftScopeSignal]:
+    """Return one WEAK signal per foreign project NAMED in *text*.
+
+    THE RATE IS THE WHOLE POINT: measured over the corpus, the bare-name
+    rule fires on 20.6% of dark_factory tasks and 3.2% of reify tasks.  At
+    the adjudicator's documented ~$0.105-per-firing floor that is an
+    unaffordable trigger, and it is far too broad to stamp — a task can
+    mention another project because it INTEGRATES with it, because it cites
+    a precedent from it, or simply because the two share an operator.  So
+    these signals are ``strength='weak'``: they ride along as adjudicator
+    context and census detail, and
+    :attr:`SoftScopeFinding.should_adjudicate` deliberately ignores them.
+
+    Word-boundary anchored on both sides, so ``dark-factoryish`` and
+    ``darkfactory`` do not match ``dark-factory``.  At most one signal per
+    implicated project; the filer's own aliases are excluded upstream in
+    :func:`_foreign_aliases`, so self-mention never fires.
+    """
+    if not text or not registry:
+        return []
+    alias_to_project, aliases = _foreign_aliases(project_id, registry)
+    if not aliases:
+        return []
+    signals: list[SoftScopeSignal] = []
+    seen: set[str] = set()
+    for match in _build_name_pattern(aliases).finditer(text):
+        owner = alias_to_project.get(match.group(1).strip().lower())
+        if not owner or owner in seen:
+            continue
+        seen.add(owner)
+        signals.append(
+            SoftScopeSignal(
+                kind='foreign_project_name',
+                project_id=owner,
+                evidence=match.group(1),
+                strength='weak',
+            )
+        )
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SoftScopeFinding:
+    """Every soft signal collected for one candidate, strong ones first."""
+
+    signals: tuple[SoftScopeSignal, ...] = ()
+
+    @property
+    def should_adjudicate(self) -> bool:
+        """True iff a STRONG signal is present.
+
+        The trigger for the paid confirmation step.  Weak signals never
+        reach it on their own — see :func:`find_foreign_project_names` for
+        the measured fire rate that makes that non-negotiable.
+        """
+        return any(s.strength == 'strong' for s in self.signals)
+
+    @property
+    def suggested_project(self) -> str | None:
+        """The single implicated foreign project, or None on disagreement.
+
+        Mirrors ``path_scope_guard._aggregate_owner_mismatches``' rule: when
+        the evidence names more than one project there is no single target
+        to suggest, and silence beats a coin flip.
+        """
+        owners = {s.project_id for s in self.signals}
+        return next(iter(owners)) if len(owners) == 1 else None
+
+
+def collect_soft_scope_signals(
+    title: str | None,
+    description: str | None,
+    details: str | None,
+    project_id: str,
+    registry: ProjectPrefixRegistry | None,
+) -> SoftScopeFinding:
+    """Collect every soft scope signal for one candidate.
+
+    The two PROSE signals scan title/description/details joined into one
+    blob, matching ``check_candidate_for_scope``'s part-joining.  The TITLE
+    convention runs against the TITLE ALONE: its rule is anchored at
+    start-of-string, so against a joined blob it would only ever see the
+    title anyway when the title comes first — and would silently start
+    matching a description's opening words the moment the join order or an
+    empty title changed it.  Anchoring it to the field it was measured on
+    keeps the rule meaning what it was measured to mean.
+
+    Strong signals are returned before weak ones so the census line, the
+    adjudicator prompt and any operator escalation all lead with the best
+    evidence.
+    """
+    strong: list[SoftScopeSignal] = []
+    title_signal = find_title_project_prefix(title, project_id, registry)
+    if title_signal is not None:
+        strong.append(title_signal)
+    blob = '\n'.join(part for part in (title, description, details) if part)
+    strong.extend(find_absolute_foreign_roots(blob, project_id, registry))
+    weak = find_foreign_project_names(blob, project_id, registry)
+    return SoftScopeFinding(signals=tuple(strong) + tuple(weak))
+
+
+# ---------------------------------------------------------------------------
+# Staged rollout
+# ---------------------------------------------------------------------------
+
+# Truthy string values for FUSED_SOFT_SCOPE_ENFORCE (case-insensitive,
+# whitespace-stripped). Unset, empty, or any other value -> warn-only (the
+# default) — see soft_scope_enforced().  A deliberate literal mirror of
+# routing_intent_guard._TRUTHY_ENV_VALUES: `shared/` has no truthy-env
+# helper, and the local-copy shape is this codebase's established
+# convention for staged-rollout flags.
+_TRUTHY_ENV_VALUES: frozenset[str] = frozenset({'1', 'true', 'yes', 'on'})
+
+
+def soft_scope_enforced() -> bool:
+    """Read ``FUSED_SOFT_SCOPE_ENFORCE`` from the environment.
+
+    Returns ``True`` (act on a confirmed misroute: stamp the advisory marker
+    and fire the non-blocking escalation) only when the env var is set to a
+    recognized truthy string.  Unset, empty, or any other value -> ``False``
+    (warn-only, the default: adjudicate and log the census line, act on
+    nothing).  Mirrors
+    :func:`~fused_memory.middleware.routing_intent_guard.routing_intent_enforced`.
+
+    Enforcement NEVER blocks creation in either mode — the measured prose
+    precision this signal family lives beside is 10.7%, so the maximum
+    enforced action is advisory.
+    """
+    raw = os.environ.get('FUSED_SOFT_SCOPE_ENFORCE', '')
+    return raw.strip().lower() in _TRUTHY_ENV_VALUES

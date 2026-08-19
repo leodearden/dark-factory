@@ -581,3 +581,32 @@ class TestSoftScopeEnforced:
     def test_unset_stays_warn_only(self, monkeypatch):
         monkeypatch.delenv('FUSED_SOFT_SCOPE_ENFORCE', raising=False)
         assert soft_scope_enforced() is False
+
+
+class TestAbsoluteForeignRootSentenceBoundary:
+    """The trailing-'.' distinction, pinned in both directions.
+
+    Sentence-final punctuation after a cited root is the COMMON prose
+    spelling of the fileless case this signal exists to catch, so it must
+    fire; a dotted directory suffix names a different directory, so it must
+    not.  Same character, opposite verdicts — hence the two-character
+    lookahead in ``_ROOT_SUFFIX_RE`` rather than a flat path-name class.
+    """
+
+    def test_sentence_final_period_still_fires(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        df_root = registry.root_for_project('dark_factory')
+        signals = find_absolute_foreign_roots(
+            f'ALL of the asked work is in {df_root}. Nothing here.',
+            project_id='reify',
+            registry=registry,
+        )
+        assert [s.project_id for s in signals] == ['dark_factory']
+
+    def test_trailing_comma_and_end_of_text_still_fire(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        df_root = registry.root_for_project('dark_factory')
+        assert find_absolute_foreign_roots(
+            f'see {df_root}, then stop', 'reify', registry
+        )
+        assert find_absolute_foreign_roots(f'see {df_root}', 'reify', registry)
