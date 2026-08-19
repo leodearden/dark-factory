@@ -14,6 +14,7 @@ from shared.transcript_archive import (
     archive_before_delete,
     archive_task_transcripts,
     durable_archive_path,
+    restore_archived_transcript,
 )
 
 # A representative encoded-project directory name (Claude Code encodes the
@@ -1300,3 +1301,102 @@ class TestDurableArchivePathLookup:
         assert durable_archive_path(root, task_id, sid) is not None
 
         assert _snapshot() == before
+
+
+class TestRestoreArchivedTranscript:
+    """The write-back sibling of :func:`durable_archive_path` (task 3578).
+
+    ``restore_archived_transcript`` rehydrates one session's archived main
+    transcript back into a live ``CLAUDE_CONFIG_DIR`` so ``--resume`` works
+    after the original config dir was destroyed — the pooled-warm-lane case
+    where the orchestrator recovers a session id but the lane it re-dispatches
+    into has never seen that session's JSONL.
+
+    Every archive in this class is written by the REAL producer
+    (:func:`archive_task_transcripts`) rather than hand-placed, so the layout
+    under test can never drift from the layout actually shipped.
+    """
+
+    @staticmethod
+    def _seed_archive(tmp_path, sid: str, task_id: str, payload: bytes):
+        """Archive *payload* as *sid*'s transcript via the real producer.
+
+        Returns ``(archive_root, archived_path)``. The source config dir is a
+        throwaway: it stands in for the lane that has since been destroyed,
+        which is precisely the situation the restore exists to repair.
+        """
+        source_config = tmp_path / 'lane-a' / 'claude-config'
+        root = tmp_path / 'archive'
+        _write(source_config / 'projects' / ENC / f'{sid}.jsonl', payload)
+
+        assert archive_task_transcripts(
+            source_config, task_id, sid, archive_root=root
+        ) == 1
+        archived = root / task_id / ENC / f'{sid}.jsonl'
+        assert archived.is_file()
+        return root, archived
+
+    def test_restores_the_transcript_into_the_config_dir(self, tmp_path):
+        """Happy path: an archived session is rehydrated into a fresh lane.
+
+        Pins the four properties the dispatch path leans on: the destination
+        path is RETURNED (not a bool), the archive's own ``<enc>/<name>``
+        relative path is mirrored VERBATIM with no cwd re-encoding, the bytes
+        round-trip, and — the property the CLI actually keys on —
+        :func:`shared.cli_invoke.transcript_exists` now answers True.
+        """
+        from shared.cli_invoke import transcript_exists
+
+        sid = 'sess-restore-happy'
+        task_id = '42'
+        payload = b'{"type":"user"}\n{"type":"assistant"}\n'
+        root, archived = self._seed_archive(tmp_path, sid, task_id, payload)
+
+        # A DIFFERENT lane's config dir, freshly created and empty — the
+        # pooled-warm-lane shape. It knows nothing about ENC.
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        restored = restore_archived_transcript(root, task_id, sid, config_dir)
+
+        # (a) the destination path is returned.
+        assert restored is not None
+        assert isinstance(restored, Path)
+        # (b) the archive's relative path is mirrored VERBATIM: the encoded-cwd
+        # dir name is carried across untouched, NOT re-derived from lane-b's
+        # cwd. Measured on Claude Code CLI 2.1.236: the CLI scans every
+        # ``projects/*/`` subdir by session id and ignores both the directory
+        # name and the ``cwd`` recorded inside the records, so mirroring is
+        # correct AND lane-portable.
+        assert restored == config_dir / 'projects' / ENC / f'{sid}.jsonl'
+        # (c) bytes round-trip exactly.
+        assert restored.read_bytes() == payload
+        # (d) the predicate the CLI keys on.
+        assert transcript_exists(config_dir, sid) is True
+
+    def test_the_restored_copy_carries_the_archived_mtime(self, tmp_path):
+        """The archive's mtime is mirrored onto the restored copy.
+
+        Same reason :func:`_archive_one` mirrors it on the way out: a
+        restored transcript stamped ``now`` would read to the next
+        ``archive_task_transcripts`` pass as newer than its own archive and be
+        pointlessly re-archived over it. int-truncated, dodging FS
+        mtime-granularity mismatch exactly as the producer's own skip test does.
+        """
+        sid = 'sess-restore-mtime'
+        task_id = '42'
+        root, archived = self._seed_archive(tmp_path, sid, task_id, b'payload\n')
+        # Back-date the archive so "mirrored" is distinguishable from "now".
+        os.utime(archived, (1_700_000_000, 1_700_000_000))
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        restored = restore_archived_transcript(root, task_id, sid, config_dir)
+
+        assert restored is not None
+        assert int(restored.stat().st_mtime) == int(archived.stat().st_mtime)
+        # And therefore the next archival pass treats it as already-current.
+        assert archive_task_transcripts(
+            config_dir, task_id, sid, archive_root=root
+        ) == 0
