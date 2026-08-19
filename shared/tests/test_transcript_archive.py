@@ -1534,3 +1534,88 @@ class TestRestoreArchivedTranscript:
             assert restore_archived_transcript(root, '42', 'sess-nope', config_dir) is None
 
         assert caplog.records == []
+
+    def test_an_interrupted_restore_publishes_nothing_at_all(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A torn restore must be indistinguishable from NO restore.
+
+        Not defensive decoration. The gate measurement proved the CLI PARSES
+        the transcript rather than stat-ing it — on CLI 2.1.236 a zero-byte
+        file and a preamble-only file BOTH yield ``No conversation found with
+        session ID`` — so a truncated restore would arm ``--resume`` against a
+        file the CLI then rejects, converting a cheap fresh dispatch into a
+        wasted invocation plus a spurious cap-net candidate. Exactly the
+        argument :func:`_archive_one` already records for the write side.
+
+        The fake writes bytes and THEN raises, which is the real shape of an
+        interrupted copy: a mock that raised before writing anything would pass
+        against an in-place write too, and prove nothing about where the
+        partial bytes went.
+        """
+        sid = 'sess-torn'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        _write(root / task_id / ENC / f'{sid}.jsonl', b'{"a":1}\n{"b":2}\n')
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        def _dies_part_way(src, dst, **kwargs):
+            Path(dst).write_bytes(b'{"a":1}\n{"b')
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr(
+            transcript_archive_module.shutil, 'copyfile', _dies_part_way
+        )
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            assert restore_archived_transcript(root, task_id, sid, config_dir) is None
+
+        # No transcript published at the canonical name...
+        assert not (config_dir / 'projects' / ENC / f'{sid}.jsonl').exists()
+        # ...and no staging residue either. Debris that survived would be inert
+        # (it matches no reader's *.jsonl glob) but is still a leak.
+        assert list((config_dir / 'projects' / ENC).glob('*')) == []
+        # The predicate the dispatch path corroborates on still says "absent",
+        # so the arm-site veto fires and the invocation starts fresh — cheap —
+        # instead of resuming into a file the CLI will reject.
+        from shared.cli_invoke import transcript_exists
+
+        assert transcript_exists(config_dir, sid) is False
+
+    def test_an_interrupted_gz_restore_publishes_nothing_either(
+        self, tmp_path, monkeypatch
+    ):
+        """The staging discipline spans the decompressing branch too.
+
+        A gunzip stream is the likelier place to tear (a corrupt member raises
+        part-way through, after bytes have already landed), so pinning only the
+        plain-copy branch would leave the riskier path unguarded.
+        """
+        import gzip
+
+        from shared.cli_invoke import transcript_exists
+
+        sid = 'sess-torn-gz'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        _write(
+            root / task_id / ENC / f'{sid}.jsonl.gz',
+            gzip.compress(b'{"a":1}\n{"b":2}\n'),
+        )
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        def _dies_part_way(src_fh, dest_fh, *args, **kwargs):
+            dest_fh.write(b'{"a":1}\n{"b')
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr(
+            transcript_archive_module.shutil, 'copyfileobj', _dies_part_way
+        )
+
+        assert restore_archived_transcript(root, task_id, sid, config_dir) is None
+        assert list((config_dir / 'projects' / ENC).glob('*')) == []
+        assert transcript_exists(config_dir, sid) is False
