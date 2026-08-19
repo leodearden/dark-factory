@@ -958,6 +958,95 @@ class TestDeriveTruthLiveClaimant:
 
 
 # ---------------------------------------------------------------------------
+# task 4028 — the plan.lock read is addressed at the `.task-meta` root
+# ---------------------------------------------------------------------------
+
+
+def _plan_lock_artifacts(worktree: Path) -> TaskArtifacts:
+    """``TaskArtifacts`` addressed where the resolver actually READS plan.lock.
+
+    ``<worktree_base>/.task-meta/<worktree_name>`` — a SIBLING of the worktree,
+    derived through ``TaskArtifacts.meta_root_for`` (the single owner of that
+    path shape) rather than hand-joined, exactly as the sole production writer
+    does (``TaskWorkflow``, workflow.py) and as
+    ``TaskGroundTruth._resolve_live_claimant`` does on the read side (task
+    4028).  Every fixture in this module that manufactures a lock for the
+    resolver to find must go through here; a bare ``TaskArtifacts(worktree)``
+    writes the LEGACY ``<worktree>/.task`` path, which the resolver
+    deliberately never consults.
+    """
+    return TaskArtifacts(worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name))
+
+
+@pytest.mark.asyncio
+class TestPlanLockIsReadFromTheMetaRoot:
+    """The plan.lock leg reads the `.task-meta` sibling, never the legacy path.
+
+    The lock's sole writer is ``TaskWorkflow``, which constructs its
+    ``TaskArtifacts`` with ``_meta_root_for_worktree(self.worktree)``
+    (workflow.py) — so it writes ``<base>/.task-meta/<name>/plan.lock``.  Until
+    task 4028 the reader constructed ``TaskArtifacts(worktree_path)`` with no
+    ``meta_root`` and therefore looked under ``<worktree>/.task``: a live lock
+    was invisible and the whole leg (with it ``ClaimantSource.PLAN_LOCK`` and
+    task 3563's composed identity) was inert in production.
+
+    The negative case is as load-bearing as the positive one: the repoint is
+    deliberately SINGLE-PATH, with no new-then-old fallback.  Nothing has
+    written ``<worktree>/.task/plan.lock`` since the meta-root migration, so a
+    legacy fallback would be dead code on arrival — the exact confusion this
+    task removes.  Pinning "legacy is ignored" keeps a future reader from
+    mistaking the omission for an oversight.
+    """
+
+    @staticmethod
+    def _unclaimed_task() -> dict:
+        # The ONLY task shape that reaches the plan.lock leg: no in-memory
+        # hold and no db claimant to take precedence over it.
+        return {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+
+    async def _resolve(self, worktree: Path, tid: str = '40') -> Claimant | None:
+        scheduler = _fake_scheduler(is_actively_held=False, task=self._unclaimed_task())
+        resolver = _make_ground_truth(
+            scheduler=scheduler, worktree_resolver=lambda _tid: worktree,
+        )
+        return (await resolver.derive_truth(tid)).live_claimant
+
+    async def test_lock_at_the_meta_root_resolves_to_a_plan_lock_claimant(
+        self, tmp_path: Path,
+    ) -> None:
+        # Driven through a REAL lock_plan acquisition rather than a
+        # hand-written payload, so this proves the production WRITER and the
+        # repointed READER agree on one path (lock_plan stamps
+        # owner_pid=os.getpid() — alive — and locked_at=now — fresh).
+        worktree = tmp_path / 'wt-4028'
+        worktree.mkdir()
+        artifacts = _plan_lock_artifacts(worktree)
+        artifacts.root.mkdir(parents=True)
+        assert artifacts.lock_plan('sess-4028-abc123', run_id='run-4028-abc123')
+
+        claimant = await self._resolve(worktree)
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        assert claimant.session_id == 'sess-4028-abc123'
+        assert claimant.run_id == compose_claimant_run_id(
+            'run-4028-abc123', 'sess-4028-abc123', os.getpid(),
+        )
+
+    async def test_lock_at_the_legacy_root_is_ignored(self, tmp_path: Path) -> None:
+        # Equally fresh, equally well-formed, equally alive — and still None,
+        # because it is at the address nothing writes any more.
+        worktree = tmp_path / 'wt-4028'
+        worktree.mkdir()
+        legacy = TaskArtifacts(worktree)  # no meta_root -> <worktree>/.task
+        legacy.root.mkdir(parents=True)
+        assert legacy.lock_plan('sess-legacy-abc123', run_id='run-legacy-abc123')
+        assert not _plan_lock_artifacts(worktree).root.exists()
+
+        assert await self._resolve(worktree) is None
+
+
+# ---------------------------------------------------------------------------
 # task 3563 — Claimant.run_id is homogeneous across all three sources
 # ---------------------------------------------------------------------------
 
