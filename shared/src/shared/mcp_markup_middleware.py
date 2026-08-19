@@ -183,6 +183,70 @@ _UNREPAIRABLE_HINT = (
     + _OVERRIDE_SENTENCE
 )
 
+#: A decoded Python value -> the JSON-Schema type name that admits it. ``bool``
+#: is checked BEFORE ``int`` deliberately: ``bool`` is a subclass of ``int`` in
+#: Python, so the reverse order would type ``True`` as ``'integer'``.
+_JSON_TYPE_NAMES: tuple[tuple[type | None, str], ...] = (
+    (bool, 'boolean'),
+    (str, 'string'),
+    (int, 'integer'),
+    (float, 'number'),
+    (list, 'array'),
+    (dict, 'object'),
+    (None, 'null'),
+)
+
+
+def _accepted_types(declared: Any) -> frozenset[str]:
+    """The JSON-Schema type names one parameter's declaration admits.
+
+    Reads the top-level ``'type'`` — which JSON Schema permits to be a single
+    name OR a list of them — else the union of the branch types under
+    ``'anyOf'`` / ``'oneOf'``. Anything unresolvable yields the EMPTY set,
+    which :func:`_coerce_recovered` reads as "do not touch this value".
+
+    The union branch is not a nicety: ``evidence: list[dict[str, Any]] | None``
+    is the parameter this whole mechanism exists for, and pydantic emits it as
+    ``{'anyOf': [{'type': 'array', ...}, {'type': 'null'}]}`` with no
+    top-level ``'type'`` key at all.
+    """
+    if not isinstance(declared, dict):
+        return frozenset()
+
+    def _names(node: Any) -> frozenset[str]:
+        if not isinstance(node, dict):
+            return frozenset()
+        declared_type = node.get('type')
+        if isinstance(declared_type, str):
+            return frozenset({declared_type})
+        if isinstance(declared_type, list):
+            return frozenset(t for t in declared_type if isinstance(t, str))
+        return frozenset()
+
+    direct = _names(declared)
+    if direct:
+        return direct
+
+    branches: frozenset[str] = frozenset()
+    for key in ('anyOf', 'oneOf'):
+        union = declared.get(key)
+        if isinstance(union, list):
+            for branch in union:
+                branches |= _names(branch)
+    return branches
+
+
+def _json_type_name(value: Any) -> str | None:
+    """The JSON-Schema type name of a decoded Python value."""
+    for python_type, name in _JSON_TYPE_NAMES:
+        if python_type is None:
+            if value is None:
+                return name
+        elif isinstance(value, python_type):
+            return name
+    return None
+
+
 def _coerce_recovered(
     recovered: Mapping[str, str], properties: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -191,20 +255,57 @@ def _coerce_recovered(
     ``Repair.recovered`` is ``dict[str, str]`` and every value in it is a
     VERBATIM slice of the absorbed tail (``shared.toolcall_markup`` invariant
     D5). That is correct for the parsing layer and stays true — but it means a
-    parameter the tool declares as ``list[dict]`` receives a ``str``, and
-    pydantic then rejects the whole call before the tool body runs.
+    parameter the tool declares as ``list[dict]`` receives a ``str``.
+
+    THE MEASUREMENT THAT MOTIVATES THIS FUNCTION, so a later reader does not
+    "simplify" it back out: with the recovered map applied verbatim, a repaired
+    ``escalate_info`` carrying a recovered ``evidence`` logs
+    ``repaired recovered_params=['evidence', 'suggested_action']`` and then dies
+    with ``1 validation error … / evidence / Input should be a valid list
+    [type=list_type, input_type=str]``. The tool body NEVER RUNS. For a tier
+    whose entire purpose is that the call gets through (C2 / INV-6: a lost
+    ``escalate_info`` strands a task), that is worse than no guard at all —
+    ``evidence`` is optional, so an unguarded leak at least files the
+    escalation, lossily.
 
     Parsing belongs to ``shared.toolcall_markup``; typing a recovered value
     against the tool that is about to receive it is a BOUNDARY concern and
     belongs here.
+
+    UNCHANGED-ON-DOUBT IS THE DELIBERATE REFUSAL (C2 L187: nothing is
+    guessed). Every branch below that declines to decode leaves the verbatim
+    slice in place, so a value this function cannot confidently type reaches
+    pydantic and produces a legible declared-type error naming the parameter —
+    never a fabricated ``[]``, ``None`` or silently retyped value. A decode
+    failure is a failure to recover, not a licence to invent.
+
+    NEVER RAISES. It runs on a path whose outcome is already decided, and an
+    exception here would convert a repair into a crash.
     """
     coerced: dict[str, Any] = dict(recovered)
     for name, value in recovered.items():
-        declared = properties.get(name)
-        if not isinstance(declared, dict):
+        accepted = _accepted_types(properties.get(name))
+
+        # No resolvable declaration, or one that admits a string: leave it. A
+        # string-typed parameter's verbatim slice is ALREADY the correct value
+        # (D5), and a union admitting a string is ambiguous — decoding text
+        # that merely happens to parse would silently retype the caller's data.
+        if not accepted or 'string' in accepted:
             continue
-        if declared.get('type') in ('array', 'object'):
-            coerced[name] = json.loads(value)
+
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+
+        decoded_name = _json_type_name(decoded)
+        if decoded_name is None:
+            continue
+        # 'integer' is acceptable where 'number' is declared; not the reverse.
+        if decoded_name in accepted or (
+            decoded_name == 'integer' and 'number' in accepted
+        ):
+            coerced[name] = decoded
     return coerced
 
 
