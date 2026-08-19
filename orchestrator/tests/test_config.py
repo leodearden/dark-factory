@@ -3278,11 +3278,39 @@ class TestSessionResumeConfig:
             'session_resume.max_resumes_per_task',
             'session_resume.fallback_storm_threshold',
             'session_resume.storm_window_secs',
+            'session_resume.restore_from_archive',
         ):
             assert leaf in RELOADABLE_FIELDS, (
                 f'{leaf} must be a member of RELOADABLE_FIELDS '
                 '(green-tier hot-reloadable via _submodel_leaf_paths)'
             )
+
+    def test_restore_from_archive_defaults_on(self):
+        """task 3578: the arm-site rehydration ships ON, with its own switch.
+
+        Distinct from `enabled`, which kills the whole feature at the harness
+        guard: an operator can disable ARCHIVE RESTORATION specifically while
+        keeping the eligibility instrumentation, so a suspected restore
+        regression is reversible without going blind on the resume population.
+        """
+        from orchestrator.config import SessionResumeConfig
+
+        assert SessionResumeConfig().restore_from_archive is True
+        assert OrchestratorConfig().session_resume.restore_from_archive is True
+
+    def test_restore_from_archive_round_trips_from_yaml(self, tmp_path):
+        """The switch is settable from dark-factory-orchestrator.yaml."""
+        cfg_path = tmp_path / 'orch.yaml'
+        cfg_path.write_text(
+            'session_resume:\n  restore_from_archive: false\n'
+        )
+        config = load_config(cfg_path)
+
+        assert config.session_resume.restore_from_archive is False
+        # The sibling leaves keep their defaults — a partial block must not
+        # reset the rest of the submodel.
+        assert config.session_resume.enabled is True
+        assert config.session_resume.max_resumes_per_task == 3
 
 
 # ---------------------------------------------------------------------------
