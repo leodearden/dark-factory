@@ -3241,6 +3241,50 @@ class ReconciliationHarness:
                     current_stage_name = stage_key
                     _active.stage(current_stage_name)
 
+                    # Task 4186 — pre-Stage-3 cycle_summary flush.
+                    #
+                    # (1) WHY BEFORE STAGE 3, not in the finally: Stage 3's
+                    #     presence check is ledger-PRIMARY
+                    #     (get_cycle_summary_presence -> get_by_identity) and its
+                    #     prompt rules `ledger_available:true, present:false`
+                    #     GENUINELY ABSENT -> missing_knowledge / actionable /
+                    #     reconstruct, which _maybe_remediate below turns into a
+                    #     real Stage 1 + Stage 2 LLM pass. A CURRENT-cycle in-stage
+                    #     write failure must therefore be re-attempted before Stage
+                    #     3 is dispatched; the finally's re-attempt lands after both
+                    #     Stage 3 and remediation, too late to be seen.
+                    # (2) WHY AT THE TOP OF THE STAGE-3 ITERATION, not right after
+                    #     Stage 2 returns: `current_stage_name` is already
+                    #     'integrity_check' here, so _ensure_stage1_cycle_summary's
+                    #     arm 1 (fabricate-on-raise, gated
+                    #     `current_stage_name == memory_consolidator and no report`)
+                    #     is structurally unreachable and ONLY the write-recovered
+                    #     arms can fire. Anchoring the flush to the READER's
+                    #     dispatch also keeps it correct if the stage list is ever
+                    #     reordered, and it naturally no-ops on a resumed run whose
+                    #     Stage 3 is skipped above.
+                    # (3) WHY THIS IS SAFE: both methods are already never-raise
+                    #     (each swallows BaseException), shield their writes, and
+                    #     are idempotent on the ledger's 5-part identity
+                    #     (ON CONFLICT) — so this is a pure REORDER of arms that
+                    #     would have fired anyway, and can never manufacture a row
+                    #     the cycle would not otherwise have ended with.
+                    #
+                    # The finally-block calls STAY: they remain the terminal
+                    # backstop for paths this flush cannot reach (a stage that
+                    # raised before Stage 3, an interrupted/resumed run) and the
+                    # last chance after a flush attempt that did not CONFIRM (the
+                    # write-missing predicate excludes only a marker that is True).
+                    # _run_remediation_pass carries the identical flush — keep the
+                    # two spellings in sync.
+                    if stage_key == StageId.integrity_check.value:
+                        await self._ensure_stage1_cycle_summary(
+                            run, run_id, project_id, current_stage_name, cycle_start_time,
+                        )
+                        await self._ensure_stage2_cycle_summary(
+                            run, run_id, project_id, cycle_start_time,
+                        )
+
                     # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
                     if isinstance(stage, MemoryConsolidator):
                         self._configure_consolidator(
@@ -3438,6 +3482,14 @@ class ReconciliationHarness:
                 )
                 raise
             finally:
+                # TERMINAL backstop. Task 4186 hoisted a copy of these two calls
+                # to the top of the Stage-3 iteration above (the pre-Stage-3
+                # flush); these stay as the last resort for the paths that flush
+                # cannot reach — a stage that raised before Stage 3, an
+                # interrupted/resumed run — and as the second attempt after a
+                # flush attempt that did not CONFIRM. A flush that DID confirm
+                # makes these no-op via _cycle_summary_ledger_write_missing's
+                # write-recovered exclusion, so one recovery logs one WARNING.
                 await self._ensure_stage1_cycle_summary(
                     run, run_id, project_id, current_stage_name, cycle_start_time,
                 )
