@@ -9532,6 +9532,13 @@ class Harness:
                 # the retry-cap escalation; the pool-level structural-
                 # exhaustion L2 is the loud signal instead.
                 counts_against_cap=report.counts_against_requeue_cap,
+                # Task 3315 (PRD contract C2): the structured 5xx evidence is
+                # the PRIMARY transient-routing signal (INV-1).  A report
+                # without it (None) falls back to the legacy marker regex
+                # over block_reason inside is_transient_api_requeue.  This
+                # closes the TerminalReport -> TaskReport -> record_requeue
+                # -> _transient_requeue_counts chain.
+                api_error_status=report.api_error_status,
             )
             genuine_exhausted = count >= self.config.requeue_cap
             transient_exhausted = (
