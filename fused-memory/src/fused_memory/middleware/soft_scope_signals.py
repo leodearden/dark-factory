@@ -62,6 +62,7 @@ __all__ = [
     'SoftScopeSignal',
     'project_name_aliases',
     'find_title_project_prefix',
+    'find_absolute_foreign_roots',
 ]
 
 
@@ -247,3 +248,98 @@ def find_title_project_prefix(
         evidence=match.group(0).strip(),
         strength='strong',
     )
+
+
+# ---------------------------------------------------------------------------
+# Signal (b1): an ABSOLUTE path under a foreign project root
+# ---------------------------------------------------------------------------
+
+# Characters that continue a path NAME.  A root match is rejected when the
+# very next character is one of these, so ``<root>-old``, ``<root>ish`` and
+# ``<root>.bak`` are near misses rather than hits — the same component
+# boundary ``ProjectPrefixRegistry._owner_for_absolute_path`` already
+# enforces for declared file paths (``root + '/'``), stated here as its
+# right-context complement so the bare-root spelling is admitted too.
+_PATH_NAME_CHARS: re.Pattern[str] = re.compile(r'[A-Za-z0-9_.\-]')
+
+
+def _foreign_roots_longest_first(
+    project_id: str, registry: ProjectPrefixRegistry
+) -> tuple[tuple[str, str], ...]:
+    """Return FOREIGN ``(root, project_id)`` pairs, longest root first.
+
+    Mirrors :attr:`ProjectPrefixRegistry._roots_longest_first`: nested roots
+    must resolve to the MOST SPECIFIC owner deterministically, independent of
+    dict insertion order.  Degenerate roots (empty, relative, or normalising
+    to ``/``) are dropped for the same reason they are there — ``''`` would
+    make every text a match.  Ties break alphabetically so the emitted signal
+    order is stable across runs.
+    """
+    filer = (project_id or '').strip().lower()
+    pairs: list[tuple[str, str]] = []
+    for pid, raw in registry.project_to_root.items():
+        if (pid or '').strip().lower() == filer:
+            continue
+        root = os.path.normpath(raw).rstrip('/') if raw else ''
+        if not root or not root.startswith('/'):
+            continue
+        pairs.append((root, pid))
+    pairs.sort(key=lambda pair: (-len(pair[0]), pair[0]))
+    return tuple(pairs)
+
+
+def find_absolute_foreign_roots(
+    text: str | None,
+    project_id: str,
+    registry: ProjectPrefixRegistry | None,
+) -> list[SoftScopeSignal]:
+    """Return one STRONG signal per foreign project root cited in *text*.
+
+    WHY THIS CANNOT BE FOLDED INTO ``path_scope_guard.find_paths``: that
+    matcher's LEFT boundary class ``[^A-Za-z0-9_\\-/.]`` excludes ``/`` and
+    ``.`` ON PURPOSE, so that ``vendor/corpus/expr.txt`` does not match the
+    bare prefix ``corpus/``; and its ``_RIGHT_CONTEXT`` assertion (task
+    3120) further requires the match be followed by ``<seg>/`` or a file
+    extension, so an English slash-construction does not lex as a path.
+    Both constraints are load-bearing, and both make an absolute path
+    structurally invisible: the prefix in
+    ``/home/leo/src/dark-factory/orchestrator/x.py`` is always preceded by
+    ``/``.  Widening that class to admit absolute paths would re-admit
+    precisely the mid-path false positives it exists to remove — so the MORE
+    certain evidence form is the one the prose matcher cannot see, and it
+    gets its own scan keyed on ``registry.project_to_root`` (a field
+    consumed today only for absolute FILE lookup, never matched against
+    prose).
+
+    A bare root with no trailing segment DOES fire, unlike a bare relative
+    prefix: nothing but the project spells that project's absolute root, so
+    there is no bare-MENTION ambiguity to defend against.
+
+    Roots are scanned longest-first so nested roots resolve to the most
+    specific owner; at most one signal is emitted per foreign project, in
+    that same stable order.  Pure string work — no filesystem access.
+    """
+    if not text or not registry:
+        return []
+    signals: list[SoftScopeSignal] = []
+    seen: set[str] = set()
+    for root, owner in _foreign_roots_longest_first(project_id, registry):
+        if owner in seen:
+            continue
+        start = text.find(root)
+        while start != -1:
+            end = start + len(root)
+            tail = text[end : end + 1]
+            if not tail or not _PATH_NAME_CHARS.match(tail):
+                seen.add(owner)
+                signals.append(
+                    SoftScopeSignal(
+                        kind='absolute_foreign_root',
+                        project_id=owner,
+                        evidence=root,
+                        strength='strong',
+                    )
+                )
+                break
+            start = text.find(root, start + 1)
+    return signals
