@@ -3712,11 +3712,12 @@ async def _run_subprocess(
     # (proc.communicate() returned), so the child has exited and been reaped —
     # there is no process group left to orphan.  The only loss is the
     # transcript_turns / ended_awaiting_background enrichment on a run that is
-    # being torn down anyway.  Note the deliberate contrast with
-    # workflow.py:12405-12410, which now treats its to_thread as a liability:
-    # that one is a WRITE whose in-flight transcripts a cancel would lose.
-    # These four are READS with no side effects, so that argument does not
-    # transfer and the offload remains correct here.
+    # being torn down anyway.  Note the deliberate contrast with the
+    # archive_task_transcripts hook in workflow.py's `_invoke` finally
+    # (:12475-12488), which now treats its to_thread as a liability: that one
+    # is a WRITE whose in-flight transcripts a cancel would lose.  These four
+    # are READS with no side effects, so that argument does not transfer and
+    # the offload remains correct here.
     transcript_records = (
         await asyncio.to_thread(read_transcript_records, config_dir, session_id)
         if (config_dir and session_id)
