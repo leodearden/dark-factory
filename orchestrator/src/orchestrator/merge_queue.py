@@ -13132,6 +13132,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Everything below this block — the streak bump and the whole
         # escalation predicate — runs on EVERY violating poll, exactly as
         # before. The gate coalesces the LOG LINE ONLY. Do not hoist it.
+        #
+        # ROUTING CONTRACT (pinned by TestResourceAuditLogLevels):
+        #   WARNING  first violating poll of an episode, and EVERY change to
+        #            the violation set (a leak appearing, growing, shrinking,
+        #            or crossing the reaper's destruction floor). Never
+        #            suppressed, so `journalctl -p warning` shows each real
+        #            event exactly once instead of once per 30s poll.
+        #   INFO     a scheduled steady-state repeat (polls 1, 2, 4, 8, ...
+        #            capped at RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS).
+        #   DEBUG    a suppressed poll — demoted, NEVER dropped, carrying the
+        #            same coalescing context, so a debug-level operator still
+        #            sees every poll.
+        #   INFO     the clear line, on the violating -> clean transition.
+        #
+        # The INFO/DEBUG split is one logger.log(level_expr, fmt, ...) call
+        # with a single format string — the idiom _reprobe_quarantined_hosts
+        # (above, task 3043 amend) already uses for the same problem.
         self._resource_audit_log_gate.cap_polls = self.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS
         decision = self._resource_audit_log_gate.observe(
             _resource_audit_fingerprint(violations), now,
