@@ -224,6 +224,95 @@ def select_prunable(
     return GcDecision(keep=keep, prune=prune)
 
 
+# The two prune reasons the COUNT axis produces. The distinction is the whole
+# point of :func:`summarize_count_cap`: 'count' means the AGE policy would have
+# kept that dir, while 'age+count' means the age policy was discarding it
+# anyway. Enumerated once, here, beside the :func:`select_prunable` that emits
+# them, so the alarm and the classifier can never drift apart.
+_COUNT_ONLY_REASON = 'count'
+_COUNT_REASONS = frozenset({'count', 'age+count'})
+
+
+def summarize_count_cap(
+    task_dirs: list[tuple[Path, float]],
+    decision: GcDecision,
+    now: float,
+    max_task_dirs: int,
+) -> dict:
+    """Summarise what the COUNT axis actually cost, as a structured fact (pure).
+
+    The count cap prunes OLDEST-FIRST, so whenever it binds it truncates the
+    ``max_age_days`` retention window from the FORENSIC end while the sweep
+    still reports the full age policy. Age prunes and count prunes are
+    otherwise indistinguishable in the output — this block is what separates
+    them, for an operator reading the log AND for a cron/watchdog reading the
+    JSON report (INV-2: a consumer must never have to re-parse the log to
+    recover a fact the emitter already held in a variable).
+
+    Joins ``decision.prune`` reasons against the scanned ``(path, mtime)``
+    pairs to age each dropped dir in days. Returns a STABLE six-key block:
+
+    * ``bound`` — the alarm. True iff at least one dir carries the reason
+      EXACTLY ``count``.
+    * ``max_task_dirs`` — the cap actually applied (echoed so the block stands
+      alone in a log or an alert).
+    * ``pruned`` — every dir the count axis dropped (``count`` +
+      ``age+count``).
+    * ``truncated`` — the subset tagged exactly ``count``, i.e. the dirs that
+      cost real retention window.
+    * ``oldest_dropped_age_days`` — age of the oldest dir the count axis
+      dropped, over the whole count-reason set.
+    * ``effective_window_days`` — age of the NEWEST count-ONLY drop. Everything
+      younger survived, so this is the depth the retention window has ACTUALLY
+      been truncated to, against the ``max_age_days`` the sweep advertises.
+
+    ``bound`` is deliberately NARROW: an ``age+count`` dir fails the age cap
+    INDEPENDENTLY, so the count cap cost nothing by dropping it and warning
+    there would be a false positive. INV-4 asks for loud-over-silent, not
+    noisy-over-useful — an alarm that fires on routine age prunes is one
+    operators learn to ignore, which is how the real signal gets missed.
+
+    A non-positive ``max_task_dirs`` disables the axis upstream in
+    :func:`select_prunable`, which then emits no count reason at all, so a
+    disabled cap reports unbound with no special case here.
+
+    The age fields are ``None`` — never ``0`` — when the corresponding set is
+    empty, so absence of a measurement can never be read as a measured zero.
+    The key set does not change with ``bound``: machine readers branch on the
+    ``bound`` VALUE, never on key presence.
+    """
+    mtimes = dict(task_dirs)
+
+    pruned = 0
+    truncated = 0
+    count_ages: list[float] = []
+    truncated_ages: list[float] = []
+    for path, reason in decision.prune:
+        if reason not in _COUNT_REASONS:
+            continue
+        truncating = reason == _COUNT_ONLY_REASON
+        # Count from the REASON, not from a successful mtime join, so a path
+        # missing from *task_dirs* can never silently understate the drop.
+        pruned += 1
+        truncated += int(truncating)
+        mtime = mtimes.get(path)
+        if mtime is None:
+            continue
+        age_days = (now - mtime) / SECONDS_PER_DAY
+        count_ages.append(age_days)
+        if truncating:
+            truncated_ages.append(age_days)
+
+    return {
+        'bound': truncated > 0,
+        'max_task_dirs': max_task_dirs,
+        'pruned': pruned,
+        'truncated': truncated,
+        'oldest_dropped_age_days': max(count_ages) if count_ages else None,
+        'effective_window_days': min(truncated_ages) if truncated_ages else None,
+    }
+
+
 def _warn_stat_skip(kind: str, path: Path, err: OSError) -> None:
     """LOUD, greppable WARNING for a ``stat`` that failed mid-scan (best-effort).
 
@@ -539,6 +628,12 @@ def build_gc_report(
     carries the best-effort per-dir ``rmtree`` failures — the machine-readable
     failure signal (INV-4 loud-over-silent) that a cron/watchdog wrapper reads
     without alarming on the always-0 exit code.
+
+    ``count_cap`` (see :func:`summarize_count_cap`) is the second such signal:
+    ``reason_counts`` says how many dirs each reason dropped, but not whether
+    the count axis TRUNCATED the advertised retention window. The block is
+    always present under a stable schema, so a reader keys on
+    ``count_cap['bound']`` rather than on key presence.
     """
     max_age_days, max_task_dirs = caps
     reason_counts: dict[str, int] = {}
@@ -553,6 +648,7 @@ def build_gc_report(
         'kept': len(decision.keep),
         'pruned': len(decision.prune),
         'reason_counts': reason_counts,
+        'count_cap': summarize_count_cap(scanned, decision, now, max_task_dirs),
         'removed': len(outcome.removed),
         'removed_paths': [str(p) for p in outcome.removed],
         'failed': len(outcome.failed),
