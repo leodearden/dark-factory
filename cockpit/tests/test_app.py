@@ -444,7 +444,7 @@ class TestWriteDiscipline:
 
 class TestSelectedSlugRestore:
     @pytest.mark.timeout(10)
-    async def test_selection_survives_unmount_and_is_rehighlighted_on_a_fresh_mount(self, tmp_path):
+    async def test_selection_round_trips_into_a_fresh_mount(self, tmp_path):
         """on_mount restores the operator's place via
         load_ui_config(...).selected_slug -> SessionTable.select_slug --
         ui_config's whole reason to exist. Both halves were unit-tested;
@@ -496,12 +496,20 @@ class TestSelectedSlugRestore:
         from cockpit.ui_config import CockpitUIConfig, save_ui_config
 
         save_ui_config(CockpitUIConfig(selected_slug='gone-1'), tmp_path)
-        sr.write_record(_make_record(session_slug='live-1'), root=tmp_path)
+        # Two live records, ranked by order_sessions (AWAITING_INPUT above
+        # RUNNING), so "landed on row 0" is actually observable below -- with
+        # only one record, row 0 is the only row and the assertion would pass
+        # no matter where the cursor really landed.
+        live = _make_record(session_slug='live-1', status=sr.Status.AWAITING_INPUT)
+        other = _make_record(session_slug='live-2', status=sr.Status.RUNNING)
+        for r in (live, other):
+            sr.write_record(r, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
         async with app.run_test() as pilot:
             await pilot.pause()
             table = app.query_one(SessionTable)
+            assert table.get_row_index('live-2') != 0
             assert table.highlighted_slug() == 'live-1'
 
 
