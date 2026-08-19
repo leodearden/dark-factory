@@ -72,6 +72,7 @@ from fused_memory.middleware.scope_violation_escalator import ScopeViolationEsca
 from fused_memory.middleware.soft_scope_signals import (
     SoftScopeFinding,
     collect_soft_scope_signals,
+    soft_scope_enforced,
 )
 from fused_memory.middleware.task_curator import (
     CandidateTask,
@@ -2111,7 +2112,7 @@ class TaskInterceptor:
         if not finding.should_adjudicate or adjudicator is None:
             return None
         try:
-            await adjudicator.adjudicate(
+            adjudication = await adjudicator.adjudicate(
                 title=str(kwargs.get('title') or ''),
                 description=str(
                     kwargs.get('description') or kwargs.get('prompt') or ''
@@ -2133,6 +2134,29 @@ class TaskInterceptor:
                 project_id,
                 exc_info=True,
             )
+            return None
+
+        # CENSUS — the line the enforce flip is meant to be based on,
+        # following FUSED_ROUTING_INTENT_ENFORCE's precedent exactly (ship
+        # warn-only, measure from a greppable WARNING, then flip).
+        #
+        # UNCONDITIONAL ON THE VERDICT, deliberately.  Precision is
+        # confirmations over firings; the firing rate is already known from
+        # corpus measurement, but the CONFIRMATION rate only exists once the
+        # adjudicator actually runs.  Logging only confirmations would give
+        # the flip decision a numerator and no denominator.  It keeps firing
+        # in enforce mode too, so the census does not go dark exactly when
+        # the change starts acting.
+        enforced = soft_scope_enforced()
+        logger.warning(
+            'soft_scope_lint.flagged kinds=%s suggested_project=%s '
+            'verdict=%s failed=%s enforced=%s',
+            ','.join(sig.kind for sig in finding.signals),
+            finding.suggested_project,
+            getattr(adjudication, 'verdict', None),
+            getattr(adjudication, 'failed', None),
+            enforced,
+        )
         return None
 
     def _emit_scope_violation_escalation(
