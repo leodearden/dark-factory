@@ -2447,3 +2447,176 @@ class TestResourceAuditClearLine:
 
         assert _clear_lines(caplog) == [], 'one leak remains — the set is not empty'
         assert len(_audit_lines(caplog)) == 1, 'but the shrinkage is still reported at once'
+
+
+# ---------------------------------------------------------------------------
+# task 3203 step-9 RED / step-10 GREEN: log-level routing
+# ---------------------------------------------------------------------------
+
+
+def _at_level(records: list[logging.LogRecord], level: int) -> list[logging.LogRecord]:
+    return [r for r in records if r.levelno == level]
+
+
+class TestResourceAuditLogLevels:
+    """The routing contract that keeps ``journalctl -p warning`` meaningful
+    (task 3203).
+
+      WARNING — the first violating poll, and EVERY change to the violation set
+      INFO    — a scheduled steady-state repeat
+      DEBUG   — a suppressed poll (demoted, never dropped)
+      INFO    — the clear line
+
+    RED until step-10 GREEN pins the routing in _check_resource_audit.
+    """
+
+    _NOW = 1_000_000.0
+    _POLL_S = 30.0
+    _DETECT = 100.0
+    _FAR_REAP_AGE = 10_000_000.0
+    _IN_BAND_AGE = 150.0
+
+    def _worker(self, git_ops: GitOps, *, reap_age: float | None = None):
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(),
+            escalation_queue=_FakeEscalationQueue(open_l1=True),  # never pages
+            speculation_depth=2,
+        )
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._DETECT
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._FAR_REAP_AGE if reap_age is None else reap_age
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        return worker
+
+    def _drive(self, worker, polls: int, *, start_poll: int = 0) -> None:
+        for i in range(start_poll, start_poll + polls):
+            worker._check_resource_audit(self._NOW + i * self._POLL_S)
+
+    def test_first_violating_poll_is_warning_at_full_detail(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(a)"""
+        worker = self._worker(git_ops)
+        wt = _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, 1)
+
+        records = _audit_records(caplog)
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert str(wt.resolve()) in records[0].getMessage()
+
+    def test_every_set_change_is_a_warning(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(b) A change is never demoted, however deep the backoff."""
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-one', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, 100)  # next scheduled report is poll 128
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            added = _mkdir_worktree(
+                git_ops, '_merge-two', mtime=self._NOW - self._IN_BAND_AGE,
+            )
+            caplog.clear()
+            self._drive(worker, 1, start_poll=100)
+            assert [r.levelno for r in _audit_records(caplog)] == [logging.WARNING], (
+                'a leak APPEARING mid-backoff must warn'
+            )
+
+            added.rmdir()
+            caplog.clear()
+            self._drive(worker, 1, start_poll=101)
+            assert [r.levelno for r in _audit_records(caplog)] == [logging.WARNING], (
+                'a leak DISAPPEARING mid-backoff must warn'
+            )
+
+    def test_steady_state_repeats_are_info_and_suppressed_polls_are_debug(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(c) + (d): exactly one WARNING, 9 INFO repeats, 502 DEBUG — and
+        every DEBUG carries the same coalescing context, so a debug-level
+        operator loses nothing (mirrors the _reprobe_last_info precedent's
+        'Never DROPPED' contract)."""
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, 512)
+
+        records = _audit_records(caplog)
+        warnings = _at_level(records, logging.WARNING)
+        infos = _at_level(records, logging.INFO)
+        debugs = _at_level(records, logging.DEBUG)
+
+        assert len(warnings) == 1, 'only the first violating poll warns'
+        assert len(infos) == 9, f'9 scheduled repeats, got {len(infos)}'
+        assert len(debugs) == 502
+        assert len(records) == 512, 'one record per poll — nothing is dropped'
+
+        for record in debugs:
+            message = record.getMessage()
+            assert 'unchanged for ' in message
+            assert 'next report in ' in message
+
+    def test_the_clear_line_is_info(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(e)"""
+        worker = self._worker(git_ops)
+        wt = _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, 50)
+
+        wt.rmdir()
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            caplog.clear()
+            self._drive(worker, 1, start_poll=50)
+
+        assert [r.levelno for r in _clear_lines(caplog)] == [logging.INFO]
+
+    def test_warning_volume_for_the_measured_incident_shape(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(f) The user-visible property this task exists to deliver: one
+        unchanged violation set held for 246 polls (two hours at the 30s
+        heartbeat — the measured reify incident) is 1 WARNING, not 246."""
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, 246)
+
+        assert len(_at_level(_audit_records(caplog), logging.WARNING)) == 1, (
+            'journalctl -p warning must show this leak once, not 246 times'
+        )
+        assert len(_audit_records(caplog)) == 246, 'every poll is still recorded'
+
+    def test_a_reclaim_disposition_flip_mid_backoff_is_a_warning(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(g) 'scheduled for automatic reclaim' -> 'reclaim overdue' means
+        the reaper was supposed to destroy this tree and did not. That is a
+        real transition, which is exactly why the step-4 normaliser keeps the
+        disposition in the fingerprint."""
+        # Tree ages 150s at poll 1 and 30s per poll thereafter, so it crosses
+        # the destruction floor on poll 51 — a poll the backoff would
+        # otherwise suppress (due polls are 1, 2, 4, ..., 32, 64).
+        flip_poll = 51
+        worker = self._worker(
+            git_ops, reap_age=self._IN_BAND_AGE + (flip_poll - 1) * self._POLL_S,
+        )
+        _mkdir_worktree(git_ops, '_merge-crossing', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, flip_poll - 1)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            caplog.clear()
+            self._drive(worker, 1, start_poll=flip_poll - 1)
+
+        records = _audit_records(caplog)
+        assert [r.levelno for r in records] == [logging.WARNING], (
+            f'the disposition flip must warn on the very poll it happens, got '
+            f'{[(r.levelname, r.getMessage()) for r in records]}'
+        )
+        assert 'reclaim overdue' in records[0].getMessage()
