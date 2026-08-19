@@ -40,6 +40,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from fused_memory.maintenance.cross_graph_move import (
+    CreateResult,
+    SubgraphEdgeResult,
+)
+
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'cgl_eta_auto_apply_impl.py'
 )
@@ -233,8 +238,10 @@ class TestInheritedStoreMutationPreflight:
         manifest = _manifest_path(migrate, tmp_path)
         shim, _ = _shim()
 
-        create = AsyncMock(return_value=None)
-        recreate = AsyncMock(return_value=None)
+        create = AsyncMock(return_value=CreateResult(
+            uuid='u-move', source_graph='reify', target_graph='dark_factory',
+        ))
+        recreate = AsyncMock(return_value=SubgraphEdgeResult())
         delete = AsyncMock(return_value=None)
         monkeypatch.setattr(migrate, 'create_moved_node', create)
         monkeypatch.setattr(migrate, 'recreate_subgraph_relationships', recreate)
@@ -267,9 +274,12 @@ class TestInheritedStoreMutationPreflight:
         manifest = _manifest_path(migrate, tmp_path)
         shim, _ = _shim()
 
-        monkeypatch.setattr(migrate, 'create_moved_node', AsyncMock(return_value=None))
+        monkeypatch.setattr(migrate, 'create_moved_node', AsyncMock(return_value=CreateResult(
+            uuid='u-move', source_graph='reify', target_graph='dark_factory',
+        )))
         monkeypatch.setattr(
-            migrate, 'recreate_subgraph_relationships', AsyncMock(return_value=None),
+            migrate, 'recreate_subgraph_relationships',
+            AsyncMock(return_value=SubgraphEdgeResult()),
         )
         monkeypatch.setattr(migrate, 'delete_source_node', AsyncMock(return_value=None))
 

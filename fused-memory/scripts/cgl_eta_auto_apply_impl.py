@@ -212,6 +212,28 @@ async def main() -> int:
             return 3
 
         # 5. apply
+        #
+        # This call is this script's ENTIRE mutation surface, and it is
+        # deliberately NOT separately guarded by
+        # assert_store_mutation_allowed (task 4293). It inherits
+        # migrate_cross_graph_leak's fail-closed store preflight: _load_migrate
+        # above EXECUTES that file via importlib.spec_from_file_location, so
+        # the probe in its run() runs for this call exactly as it does for the
+        # CLI. A second probe here would only double-probe every run.
+        #
+        # That inheritance is load-bearing and fragile, so two things must stay
+        # true (both pinned by tests/test_cgl_eta_auto_apply_impl.py):
+        #   * the guard must live in migrate's run(). This script has no
+        #     argparse at all -- it builds SimpleNamespace(apply=True)
+        #     unconditionally, right here -- so a guard moved to migrate's
+        #     main()/build_arg_parser() would be bypassed entirely, leaving the
+        #     one bulk-apply in the tree that applies with no flag as the only
+        #     unguarded one;
+        #   * reaching migrate any other way does not inherit it:
+        #     _load_migrate never registers the module in sys.modules, so a
+        #     sys.modules-based lookup or interception finds nothing.
+        # The dry-run census at step 2 above is correctly NOT probed -- it
+        # mutates nothing and returns before migrate's guard site.
         apply_args = types.SimpleNamespace(apply=True, manifest=str(man_path), page_size=1000, config=None)
         report = await migrate.run(apply_args, shim)
         rep_path = OUTDIR / f'apply-report-{STAMP}.json'
