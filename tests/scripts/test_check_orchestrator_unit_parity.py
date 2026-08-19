@@ -68,7 +68,13 @@ from setup_host_parsing import (
 from setup_host_parsing import (
     declared_orchestrator_units as _units_installed_by_setup_host,
 )
-from setup_host_sections import enabled_units, run_section, slice_section, systemctl_calls
+from setup_host_sections import (
+    enabled_units,
+    run_section,
+    slice_section,
+    systemctl_calls,
+    write_checker,
+)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_orchestrator_unit_parity.py"
@@ -1431,7 +1437,7 @@ def _anchor_index(text: str, anchor: str, what: str) -> int:
     return text.index(anchor)
 
 
-def _orchestrator_gate_block(text: str) -> str:
+def _orchestrator_gate_block(text: str | None = None) -> str:
     """Slice the gate's actual `if ... fi` construct out of setup-host.sh.
 
     Both endpoints are DERIVED, never byte counts. An earlier version of these
@@ -1443,16 +1449,16 @@ def _orchestrator_gate_block(text: str) -> str:
     capitalise the word. A test that claims a semantic property must not be
     pinned to incidental file layout.
 
-    Start: the beginning of the line carrying the first mention of the checker
-    script. End: the first column-0 `fi` after it — the gate's own `if` closes
-    there, and every `fi` nested inside it is indented.
+    Start: the `_orch_parity_script=` assignment. End: the first column-0 `fi`
+    after it — the gate's own `if` closes there, and every `fi` nested inside
+    it is indented.
+
+    *text* is accepted and IGNORED, so the module's many `_setup_host_text()`
+    callers keep reading. The shared slicer reads the file itself, which is
+    also what lets it skip comment lines.
     """
-    mention = _anchor_index(
-        text, "check_orchestrator_unit_parity.py", "the parity gate's invocation"
-    )
-    start = text.rfind("\n", 0, mention) + 1
-    end = text.index("\nfi\n", mention) + len("\nfi\n")
-    return text[start:end]
+    del text
+    return slice_section(_ORCH_GATE_START, _ORCH_GATE_END)
 
 
 def _orchestrator_install_block(text: str) -> str:
@@ -1717,23 +1723,19 @@ def test_enabled_units_is_token_matched_not_substring_matched(
 def _installer_section() -> str:
     """The gate + unit-install section of setup-host.sh, verbatim.
 
-    From the line carrying the first mention of the checker through the `fi`
-    that closes the install construct — endpoints derived, so this follows a
-    reflow of the block instead of pinning one.
+    From the `_orch_parity_script=` assignment through the `fi` that closes the
+    INSTALL construct — which is why `end_after` is needed: the first column-0
+    `fi` after the start is the gate's own, and this slice must run past it.
 
-    Both anchors go through _anchor_index: every behavioural test below runs
-    this slice, so a bare `str.index` losing one of them would error out the
-    whole set with `ValueError: substring not found` instead of failing once,
-    legibly, on the literal that moved.
+    Every anchor is self-naming inside slice_section, for the same reason
+    _anchor_index exists here: every behavioural test below runs this slice, so
+    a bare `str.index` losing one would error out the whole set with
+    `ValueError: substring not found` instead of failing once, legibly, on the
+    literal that moved.
     """
-    text = _setup_host_text()
-    mention = _anchor_index(
-        text, "check_orchestrator_unit_parity.py", "the parity gate's invocation"
+    return slice_section(
+        _ORCH_GATE_START, _ORCH_GATE_END, end_after=_INSTALL_LOOP_CP
     )
-    start = text.rfind("\n", 0, mention) + 1
-    first_cp = _anchor_index(text, _INSTALL_LOOP_CP, "the install loop's copy")
-    end = text.index("\nfi\n", first_cp) + len("\nfi\n")
-    return text[start:end]
 
 
 def _fake_repo(
@@ -1752,19 +1754,13 @@ def _fake_repo(
             (REPO_ROOT / relpath).read_text(encoding="utf-8"), encoding="utf-8"
         )
     if with_checker:
-        target = repo / "scripts" / "check_orchestrator_unit_parity.py"
-        if checker_body is None:
-            for name in ("check_orchestrator_unit_parity.py", "systemd_unit_parity.py"):
-                (repo / "scripts" / name).write_text(
-                    (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8"),
-                    encoding="utf-8",
-                )
-        else:
-            target.write_text(checker_body, encoding="utf-8")
+        write_checker(
+            repo,
+            "check_orchestrator_unit_parity.py",
+            body=checker_body,
+            siblings=("systemd_unit_parity.py",),
+        )
     return repo
-
-
-_SYSTEMCTL_LOG = "systemctl-calls.log"
 
 
 def _run_installer_section(
@@ -1774,67 +1770,21 @@ def _run_installer_section(
     *,
     env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """Execute the sliced section under bash with setup-host.sh's own preamble."""
-    stub_bin = tmp_path / "stub-bin"
-    stub_bin.mkdir(exist_ok=True)
-    systemctl = stub_bin / "systemctl"
-    # The stub RECORDS its argv (one call per line) before exiting 0, so the
-    # enable half of the install is observable and not merely assumed. Half of
-    # what this section does is `systemctl --user enable`, and a per-unit gate
-    # that copied the right files while enabling the wrong set would pass every
-    # file-content assertion in this module. Purely additive: tests that do not
-    # read the log are unaffected.
-    systemctl.write_text(
-        "#!/usr/bin/env bash\n"
-        f"printf '%s\\n' \"$*\" >> {tmp_path / _SYSTEMCTL_LOG}\n"
-        "exit 0\n",
-        encoding="utf-8",
-    )
-    systemctl.chmod(0o755)
+    """Execute the sliced section through the shared harness.
 
-    script = tmp_path / "section.sh"
-    script.write_text(
-        "set -euo pipefail\n"
-        f'REPO_ROOT="{repo}"\n'
-        f'UNIT_DIR="{unit_dir}"\n'
-        'mkdir -p "$UNIT_DIR"\n'
-        "info()  { printf '==> %s\\n' \"$*\"; }\n"
-        "ok()    { printf 'OK %s\\n' \"$*\"; }\n"
-        "warn()  { printf 'WARN %s\\n' \"$*\"; }\n"
-        "fail()  { printf 'FAIL %s\\n' \"$*\"; }\n"
-        + _installer_section(),
-        encoding="utf-8",
-    )
-
-    env = dict(os.environ)
-    env["PATH"] = f"{stub_bin}:{env.get('PATH', '')}"
-    env.update(env_extra or {})
-    return subprocess.run(
-        ["bash", str(script)], capture_output=True, text=True, env=env
-    )
-
-
-def _systemctl_calls(tmp_path: pathlib.Path) -> list[list[str]]:
-    """Every `systemctl` invocation the run made, as argv token lists."""
-    log = tmp_path / _SYSTEMCTL_LOG
-    if not log.is_file():
-        return []
-    return [
-        line.split() for line in log.read_text(encoding="utf-8").splitlines() if line
-    ]
-
-
-def _enabled_units(tmp_path: pathlib.Path) -> list[str]:
-    """The units passed to `systemctl ... enable <unit>` during the run.
-
-    Token-matched rather than substring-matched: `enable` naming one unit must
-    never be satisfied by a line naming a different one.
+    A thin wrapper: `run_section` supplies setup-host.sh's own preamble, the
+    plain-text log shims, and the recording `systemctl` stub. This module used
+    to carry private copies of all three; one preamble serves all five sliced
+    blocks, which is what lets setup-host.sh define a helper once above every
+    call site and still have each slice run.
     """
-    enabled: list[str] = []
-    for argv in _systemctl_calls(tmp_path):
-        if "enable" in argv:
-            enabled.extend(argv[argv.index("enable") + 1 :])
-    return enabled
+    return run_section(
+        tmp_path,
+        _installer_section(),
+        repo_root=repo,
+        unit_dir=unit_dir,
+        env_extra=env_extra,
+    )
 
 
 def _install_all_units(repo: pathlib.Path, unit_dir: pathlib.Path) -> None:
@@ -2170,16 +2120,16 @@ def test_the_live_reify_dropin_blocks_only_reify_and_the_watchdog_is_re_enabled(
             repo / "scripts" / name
         ).read_text(encoding="utf-8")
 
-    enabled = _enabled_units(tmp_path)
+    enabled = enabled_units(tmp_path)
     assert "orchestrator-watchdog.timer" in enabled, (
         "orchestrator-watchdog.timer was copied but never enabled. A timer "
         "unit file on disk supervises nothing; enabling it is the repair the "
-        f"31.8h-stale fleet needed.\ncalls: {_systemctl_calls(tmp_path)}"
+        f"31.8h-stale fleet needed.\ncalls: {systemctl_calls(tmp_path)}"
     )
     assert "orchestrator-watchdog.service" not in enabled, (
         "orchestrator-watchdog.service is STATIC (no [Install]) — `systemctl "
         "enable` on it is an error, not a no-op, so under `set -e` this would "
-        f"abort the installer.\ncalls: {_systemctl_calls(tmp_path)}"
+        f"abort the installer.\ncalls: {systemctl_calls(tmp_path)}"
     )
     assert "orchestrator-reify.service" not in enabled, (
         "A unit the gate declined to install was still enabled. The skip must "
@@ -2187,11 +2137,11 @@ def test_the_live_reify_dropin_blocks_only_reify_and_the_watchdog_is_re_enabled(
         f"exactly the unverified state the skip refused.\nenabled: {enabled}"
     )
 
-    reload_calls = [argv for argv in _systemctl_calls(tmp_path) if "daemon-reload" in argv]
+    reload_calls = [argv for argv in systemctl_calls(tmp_path) if "daemon-reload" in argv]
     assert len(reload_calls) == 1, (
         "daemon-reload must run exactly once, AFTER the copies and BEFORE the "
         "enables — systemd must not be asked to enable a unit it has not "
-        f"re-read.\ncalls: {_systemctl_calls(tmp_path)}"
+        f"re-read.\ncalls: {systemctl_calls(tmp_path)}"
     )
 
     assert reify.read_text(encoding="utf-8") == reify_before, (
@@ -2265,9 +2215,9 @@ def test_a_report_with_no_verdict_lines_installs_nothing(tmp_path: pathlib.Path)
         "finding because it measured nothing, not because there was nothing "
         f"to find.\n{result.stdout}"
     )
-    assert _enabled_units(tmp_path) == [], (
+    assert enabled_units(tmp_path) == [], (
         "Units were enabled on a run where nothing cleared the gate.\n"
-        f"{_systemctl_calls(tmp_path)}"
+        f"{systemctl_calls(tmp_path)}"
     )
     assert "SKIPPING" in result.stdout, result.stdout
 
@@ -2311,9 +2261,9 @@ def test_a_vanished_committed_unit_is_skipped_not_fatal(tmp_path: pathlib.Path):
     assert "orchestrator-know-live.service" in _warnings_naming(
         result.stdout, "orchestrator-know-live.service"
     ), f"The vanished unit was skipped silently.\n{result.stdout}"
-    assert "orchestrator-know-live.service" not in _enabled_units(tmp_path), (
+    assert "orchestrator-know-live.service" not in enabled_units(tmp_path), (
         "A unit with no committed copy was enabled.\n"
-        f"{_systemctl_calls(tmp_path)}"
+        f"{systemctl_calls(tmp_path)}"
     )
 
 
@@ -2363,9 +2313,9 @@ def test_force_all_installs_even_drifted_and_unverified_units(
         f"force-ALL; the per-unit gate narrows the default, not the escape "
         f"hatch.\n{result.stdout}"
     )
-    assert unverified in _enabled_units(tmp_path), (
+    assert unverified in enabled_units(tmp_path), (
         f"{unverified} was force-installed but not enabled.\n"
-        f"{_systemctl_calls(tmp_path)}"
+        f"{systemctl_calls(tmp_path)}"
     )
 
 
@@ -2462,9 +2412,9 @@ def test_a_unit_that_cannot_be_copied_does_not_abort_the_installer(
         "The uncopyable unit stopped its siblings from being installed.\n"
         + result.stdout
     )
-    assert "orchestrator-watchdog.timer" in _enabled_units(tmp_path), (
+    assert "orchestrator-watchdog.timer" in enabled_units(tmp_path), (
         "The run survived the failure but never reached the enable loop.\n"
-        f"{_systemctl_calls(tmp_path)}"
+        f"{systemctl_calls(tmp_path)}"
     )
     assert "FAILED" in _warnings_naming(
         result.stdout, "orchestrator-know-live.service"
@@ -2472,9 +2422,9 @@ def test_a_unit_that_cannot_be_copied_does_not_abort_the_installer(
         "The failed copy was not reported. A unit silently not installed is "
         f"the state this whole section exists to make observable.\n{result.stdout}"
     )
-    assert "orchestrator-know-live.service" not in _enabled_units(tmp_path), (
+    assert "orchestrator-know-live.service" not in enabled_units(tmp_path), (
         "A unit whose copy FAILED was enabled anyway — that acts on bytes "
-        f"nobody managed to write.\n{_systemctl_calls(tmp_path)}"
+        f"nobody managed to write.\n{systemctl_calls(tmp_path)}"
     )
 
 

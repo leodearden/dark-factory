@@ -141,10 +141,6 @@ fi
 # is never overwritten without DF_INSTALL_ORCH_UNITS=1, because a difference
 # does not tell you which side is stale — only the blast radius shrinks.
 #
-# HARNESS CONSTRAINT: do NOT name the parity checker's file in the prose below
-# — call it "the parity gate" up here. It bites silently, and the whole rule is
-# stated at the `_orch_parity_script=` assignment that anchors it.
-#
 # Installs and enables (kept in step with scripts/orchestrator-*.service by
 # test_setup_host_installs_every_orchestrator_unit — every template must be
 # copied here, and every template with an [Install] section must be enabled):
@@ -240,15 +236,22 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 #
 # HARNESS CONSTRAINT, stated once, HERE, because this next line is what anchors
 # it. tests/scripts/test_check_orchestrator_unit_parity.py slices this file
-# from the FIRST mention of the parity checker's file name through the install
-# construct's closing `fi`, and EXECUTES that slice under bash. Two consequences,
-# both silent:
-#   - naming that file ABOVE this line moves the slice's start upward, so the
-#     suite runs this section's `install -m 0755 ... "$HOME/bin/..."` against
-#     the developer's REAL home directory;
-#   - anything the sliced code needs (the unit array, the skip-reason helper)
-#     must be declared BELOW this line, or it is unbound at run time and kills
-#     the run under `set -u`.
+# from the `_orch_parity_script=` ASSIGNMENT below through the install
+# construct's closing `fi`, and EXECUTES that slice under bash.
+#
+# The anchor is CODE and unique to this site — the same line the structural
+# sweep in test_check_dashboard_unit_parity.py discovers, and the shared slicer
+# (tests/scripts/setup_host_sections.py) skips comment lines, so prose that
+# merely QUOTES the anchor cannot move the slice. That retires the rule this
+# comment used to state: naming the checker's file up in the section header no
+# longer drags the slice's start upward over the `install -m 0755 ...
+# "$HOME/bin/..."` above, and two tests now hold that shut rather than a
+# request to remember it.
+#
+# The other consequence still holds and is NOT enforced by a test: anything the
+# sliced code needs (the unit array, the skip-reason helper) must be declared
+# BELOW this line, or it is unbound at run time and kills the run under
+# `set -u`.
 _orch_parity_script="$REPO_ROOT/scripts/check_orchestrator_unit_parity.py"
 
 # The units this section installs, declared ONCE. Both loops below iterate this

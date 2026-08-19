@@ -36,11 +36,10 @@ merely assumed. Always, with no opt-in flag: a caller that never reads the log
 is unaffected, and a flag would give the harness two behaviours to reason about
 while letting a future caller silently lose the observability.
 
-Generalized from the reference implementation at
-tests/scripts/test_check_orchestrator_unit_parity.py:1044-1119 (task 3424).
-That file deliberately still carries its own copy: migrating it needs an edit
-to a file this task holds no lock on. See the amendment note in the commit that
-introduced this paragraph.
+Generalized from the reference implementation in
+tests/scripts/test_check_orchestrator_unit_parity.py (task 3424) and migrated
+onto this module by task 3909, so all four parity suites now share one slicer,
+one preamble and one stub.
 """
 
 from __future__ import annotations
