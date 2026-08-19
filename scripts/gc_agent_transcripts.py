@@ -49,7 +49,7 @@ Usage
 
   # Override root / caps.
   python3 scripts/gc_agent_transcripts.py --root /path/to/archive \
-      --max-age-days 90 --max-task-dirs 5000
+      --max-age-days 90 --max-task-dirs 50000
 
   # Deterministic age reference clock (tests / reproducible runs).
   python3 scripts/gc_agent_transcripts.py --now 1000000000
@@ -105,7 +105,7 @@ ARCHIVE_ROOT_RELATIVE = 'data/orchestrator/agent-transcripts'
 DEFAULT_ARCHIVE_ROOT = DEFAULT_PROJECT_ROOT / ARCHIVE_ROOT_RELATIVE
 # Mirrors RetentionConfig().max_age_days / .max_task_dirs.
 DEFAULT_MAX_AGE_DAYS = 90
-DEFAULT_MAX_TASK_DIRS = 5000
+DEFAULT_MAX_TASK_DIRS = 50000
 
 # Headroom multiplier on the plain (max_age_days x observed peak daily rate)
 # projection, so max_task_dirs is a DERIVED bound and the AGE cap is the only

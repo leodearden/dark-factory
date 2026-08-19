@@ -1088,10 +1088,22 @@ class RetentionConfig(BaseModel):
         ),
     )
     max_task_dirs: int = Field(
-        default=5000,
+        default=50000,
         description=(
             'Soft cap on the number of per-task archive dirs kept; the GC '
-            'sweep (δ/task 2731) prunes oldest-first beyond this.'
+            'sweep (δ/task 2731) prunes oldest-first beyond this. A DERIVED '
+            'bound, not a chosen number: max_age_days x the archive\'s '
+            'observed peak daily arrival rate x a safety factor, re-derived '
+            'against the live archive every run by '
+            'scripts/tests/test_gc_agent_transcripts.py (see '
+            'gc_agent_transcripts.required_max_task_dirs). Sized so the AGE '
+            'cap is the only policy that binds in normal operation, because '
+            'this axis prunes OLDEST-FIRST — when it binds it truncates the '
+            'max_age_days window from the forensic end while the sweep still '
+            'reports the full window. Such a bind is now LOUD: the sweep '
+            'emits a WARNING and a count_cap block in its JSON report. '
+            'Raised 5,000 -> 50,000 by plans/transcript-preservation-seam-prd.md '
+            'D8 (task 3621).'
         ),
     )
 
