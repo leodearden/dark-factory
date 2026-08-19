@@ -195,6 +195,69 @@ class TestArmOverlap:
         assert _B in err['error']
 
 
+class TestIntraArmDuplicates:
+    """A repeated id is refused BY NAME, naming both slots.
+
+    Refused rather than de-duplicated for the same reason the overlap check
+    above refuses rather than picking an arm: silently rewriting the caller's
+    set would make the op's own report describe a request nobody made.
+
+    The load-bearing consequence of tolerating one is not the double delete
+    call — it is that `tombstones_written` and `tombstones_expected` would
+    BOTH count the repeat while the recon ledger's five-part identity
+    (project, kind, memory_id, '', '') collapses it to a single row. The pair
+    the envelope advertises as its audit-trail proof would then overstate the
+    ledger: an INFERRED count, in the op whose whole deliverable is
+    corroborated ones.
+    """
+
+    def test_a_repeated_supersede_is_refused_naming_both_slots(self):
+        """The VALUE alone is not actionable — both renders are identical, so
+        a caller editing the list needs to know which slot to delete."""
+        err, _, _ = _call(supersedes=[_A, _B, _A])
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'supersedes[2]' in err['error']
+        assert 'supersedes[0]' in err['error']
+        assert err['hint']
+
+    def test_a_repeated_retain_id_is_refused_naming_both_slots(self):
+        """Both arms, symmetrically: a repeat in `retain` would tag one peer
+        twice and count it twice in `retained`."""
+        err, _, _ = _call(supersedes=None, retain=[_A, _A], run_id=None)
+
+        assert err is not None
+        assert 'retain[1]' in err['error']
+        assert 'retain[0]' in err['error']
+
+    def test_every_repeat_is_named_not_just_the_first(self):
+        """The no-short-circuit bar this module opens with. The op is
+        irreversible, so a caller must never have to re-run a destructive
+        call to learn the offender the first call already knew about."""
+        err, _, _ = _call(supersedes=[_A, _A, _B, _B])
+        assert err is not None
+
+        assert 'supersedes[1]' in err['error']
+        assert 'supersedes[3]' in err['error']
+
+    def test_a_repeat_in_each_arm_reports_together(self):
+        err, _, _ = _call(supersedes=[_A, _A], retain=[_B, _B])
+        assert err is not None
+
+        assert 'supersedes[1]' in err['error']
+        assert 'retain[1]' in err['error']
+
+    def test_distinct_ids_are_untouched_by_the_check(self):
+        """The discriminator: a clean call must not acquire a duplicate
+        problem, and its arms must come back exactly as supplied."""
+        err, supersedes, retain = _call(supersedes=[_A, _B], retain=[_C])
+
+        assert err is None
+        assert supersedes == [_A, _B]
+        assert retain == [_C]
+
+
 class TestDeleteArmRequiresRunId:
     """Task Details item 6 — the tombstone precondition.
 

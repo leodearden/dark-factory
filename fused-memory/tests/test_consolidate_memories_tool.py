@@ -449,6 +449,25 @@ class TestValidationIsRefusedBeforeAnyWrite:
         svc.delete_memory.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_a_repeated_supersede_is_refused_before_any_write(self):
+        """The duplicate contract, pinned at the wire rather than only in the
+        validator's unit tests.
+
+        This is the exact call an abandoned scratch probe used to run without
+        asserting anything (removed in this change). Tolerating the repeat
+        deletes S1 TWICE and leaves `tombstones_written` claiming a row the
+        ledger's five-part identity collapses away.
+        """
+        svc = make_service(gone=[S1, S2])
+
+        result = await call_consolidate(svc, supersedes=[S1, S1, S2])
+
+        assert result['error_type'] == 'ValidationError'
+        assert 'supersedes[1]' in result['error']
+        svc.add_memory.assert_not_awaited()
+        svc.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_the_hint_survives_the_tool_boundary(self):
         """Returned, never raised.
 
@@ -1485,6 +1504,18 @@ class TestAnIncompleteReparentRefusesTheDelete:
         assert failure['id'] == S1
         assert failure['error_type'] == 'ReparentIncomplete'
         assert result['survivors'] == [S1]
+
+        # AND IT COSTS ZERO MUTATIONS. The refusal is knowable the instant the
+        # listing returns, so re-pointing the children the scan COULD see buys
+        # nothing: each patch would move a child onto the canonical while S1 —
+        # its real parent — stays alive and un-deleted, splitting that subtree
+        # across two live parents, and `reparented` would report the move
+        # exactly like one that earned a delete.
+        assert not any(
+            'parent_id' in (c.kwargs.get('metadata_patch') or {})
+            for c in svc.update_memory.await_args_list
+        )
+        assert result['reparented'] == []
 
     @pytest.mark.asyncio
     async def test_a_patch_that_reported_success_is_still_corroborated(self):

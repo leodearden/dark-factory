@@ -5178,6 +5178,37 @@ def create_mcp_server(
                     'error_type': 'ChildScanFailed',
                 })
                 continue
+
+            # (5c-i) A REFUSAL ALREADY DETERMINED COSTS ZERO MUTATIONS.
+            # `scan.truncated` is known the instant the listing returns, and it
+            # refuses this id's delete unconditionally — so re-pointing the
+            # children we CAN see first buys nothing and costs a real write per
+            # child: each patch moves a child onto the canonical while its
+            # actual parent stays alive and un-deleted, splitting that subtree
+            # across two live parents. Nothing in the envelope would let a
+            # caller tell those moves were pointless, because they are reported
+            # in `reparented` exactly like the ones that earned a delete.
+            # `MemoryService.list_child_ids`' own docstring argues against
+            # precisely this — "reparenting records whose own parent is still
+            # alive — a pointer rewrite nothing asked for".
+            #
+            # Same refusal, same `error_type`, same wording as the blocker it
+            # replaces below: only the COST changed, never the report. "at
+            # least" stays load-bearing — the scan was capped, so the count is
+            # a FLOOR, and reporting it bare would read as exhaustive.
+            if scan.truncated:
+                failed_deletes.append({
+                    'id': supersede_id,
+                    'error': (
+                        f'refused to delete {supersede_id}: deleting it would '
+                        'orphan its children — the child listing was truncated '
+                        f'at least {len(scan.ids)} child(ren) in, so the full '
+                        'set could not be seen'
+                    ),
+                    'error_type': 'ReparentIncomplete',
+                })
+                continue
+
             moved_children: list[str] = []
             stranded_children: list[str] = []
             for child_id in scan.ids:
@@ -5247,15 +5278,12 @@ def create_mcp_server(
                     'these children could not be re-homed: '
                     + ', '.join(stranded_children)
                 )
-            if scan.truncated:
-                # "at least" is load-bearing: the scan was capped, so the
-                # count is a FLOOR. Reporting it bare would read as
-                # exhaustive — the overclaim this op exists to eliminate.
-                blockers.append(
-                    f'the child listing was truncated at least {len(scan.ids)} '
-                    'child(ren) in, so the full set could not be seen'
-                )
-            elif moved_children:
+            # NOTE: the truncated-listing refusal is NOT here. It is raised at
+            # (5c-i) above, before the reparent loop, because it is knowable
+            # the instant the listing returns and refusing late would have
+            # already paid for mutations it then discards. Its message and
+            # `error_type` are unchanged by that move.
+            if moved_children:
                 # FAILS CLOSED for the same reason, and it is the same
                 # refusal: a corroboration that could not be READ is not a
                 # corroboration. The message says the CHECK failed rather than

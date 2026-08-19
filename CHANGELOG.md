@@ -41,6 +41,20 @@ retained peers tagged, then per supersede read → re-home children → corrobor
   `add_memory` path. Refused rather than demoted, because a prior canonical in the
   retain list is usually what the caller should have put in `supersedes`; an unreadable
   peer fails closed the same way (`RetainCheckFailed`).
+- **An id repeated within one arm is refused by name, naming both slots.** Not
+  de-duplicated: silently rewriting the caller's set would make the op's own report
+  describe a request nobody made — the reason the cross-arm overlap check refuses rather
+  than picking an arm, and the reason `normalize_supersedes` never drops a member.
+  Tolerating a repeat has three durable consequences, all avoidable for free at
+  validation time: the delete arm awaits `delete_memory` TWICE for one record (a second
+  `memory_deleted` event and a second WriteJournal row for a record already gone); the
+  canonical's durable `metadata.supersedes` KEEPS the repeat, because the step (7)
+  narrowing compares SETS and so never fires on a list differing only by duplication;
+  and `tombstones_written`/`tombstones_expected` BOTH count it while the recon ledger's
+  five-part identity collapses the two rows into one, so the pair the envelope advertises
+  as its audit-trail proof would overstate the ledger by one. That last one is why this
+  is refused rather than tolerated — an INFERRED count, in the op whose whole deliverable
+  is corroborated ones.
 - **`survivors` is the deliverable.** Computed only from a post-delete `get_memory_by_id`
   per id, so an id whose delete reported success but which still resolves is reported as
   a survivor, and an id whose delete raised but which is genuinely gone is not. Partial
@@ -52,6 +66,13 @@ retained peers tagged, then per supersede read → re-home children → corrobor
   patch, on a truncated child listing (its count reads as a floor, "at least N"), or on a
   live post-reparent re-count that is still non-zero. The delete is never forced with
   `cascade=True`, which would destroy the children the re-homing exists to preserve.
+  A truncated listing is decided BEFORE the re-homing loop runs, not after: truncation is
+  known the instant the listing returns and refuses the delete unconditionally, so
+  re-pointing the children that ARE visible first would buy nothing and cost a real write
+  each — moving them onto the canonical while their actual parent stays alive and
+  un-deleted, splitting that subtree across two live parents, with `reparented` reporting
+  the moves exactly like ones that earned a delete. A refusal already determined costs
+  zero mutations.
 - **The delete arm stamps a task-3041 tombstone** per reaped supersede, carrying the new
   `absorbed_by` reverse pointer and the caller-supplied `run_id` as `deleting_run_id`
   (required whenever `supersedes` is non-empty; a delete that cannot be attributed is

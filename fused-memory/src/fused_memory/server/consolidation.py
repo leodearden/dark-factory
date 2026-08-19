@@ -119,6 +119,32 @@ def _bad_id_members(values: list[Any], field: str) -> list[str]:
     ]
 
 
+def _repeated_id_members(values: list[Any], field: str) -> list[str]:
+    """Name every member of *values* that repeats an earlier member.
+
+    Reports BOTH slots by index, for the reason :func:`_bad_id_members`
+    reports one: the two members render identically under ``_safe_repr``, so
+    naming the value alone would not tell a caller which slot to delete.
+
+    Hashable members only. An unhashable malformed member is already named by
+    :func:`_bad_id_members`, and comparing it here would raise inside the one
+    step whose entire job is to refuse without raising.
+    """
+    first_seen: dict[Any, int] = {}
+    problems: list[str] = []
+    for i, value in enumerate(values):
+        if not isinstance(value, (str, bytes, int, float)):
+            continue
+        if value in first_seen:
+            problems.append(
+                f'{field}[{i}] repeats {field}[{first_seen[value]}]: '
+                f'{_safe_repr(value)}'
+            )
+        else:
+            first_seen[value] = i
+    return problems
+
+
 def validate_consolidate_args(
     *,
     canonical_content: Any,
@@ -214,6 +240,41 @@ def validate_consolidate_args(
         _add_hint(
             'An id can be folded-and-deleted or retained-and-tagged, not both. '
             'Drop it from whichever arm you did not mean.'
+        )
+
+    # A repeated id is an ordinary authoring slip — a caller assembling one
+    # cluster from two pages of search results is exactly who trips it — with
+    # three durable consequences, and this is the only point at which all
+    # three still cost nothing to avoid:
+    #
+    #   the delete arm awaits `delete_memory` TWICE for one record, emitting a
+    #       second `memory_deleted` event and a second WriteJournal row for a
+    #       record that is already gone;
+    #   the canonical's durable `metadata.supersedes` KEEPS the repeat, because
+    #       the step (7b) narrowing compares SETS and so never fires on a list
+    #       that differs from the confirmed-gone set only by duplication;
+    #   `tombstones_written` and `tombstones_expected` BOTH count the repeat
+    #       while `ReconLedgerStore.upsert_many` collapses the two identical
+    #       five-part identities to ONE row (last-write-wins, per its own
+    #       docstring), so the pair the envelope advertises as its audit-trail
+    #       proof overstates the ledger by one.
+    #
+    # That third one is why this is refused rather than tolerated: it is an
+    # INFERRED count, in the op whose whole deliverable is corroborated ones
+    # (INV-2 structured-facts, INV-3 corroborate-before-acting).
+    #
+    # REFUSED, not silently de-duplicated, for the reason the overlap check
+    # above refuses rather than picking an arm, and the reason
+    # `normalize_supersedes` never drops a member: rewriting the caller's set
+    # would make the op's own report describe a request nobody made.
+    repeats = _repeated_id_members(supersedes_ids, 'supersedes')
+    repeats += _repeated_id_members(retain_ids, 'retain')
+    if repeats:
+        problems.extend(repeats)
+        _add_hint(
+            'List each id ONCE per arm. A repeat would be deleted twice, '
+            'claimed twice by the canonical, and counted twice against a '
+            'ledger that stores it once.'
         )
 
     # See the module docstring: refused HERE so an unattributable delete
