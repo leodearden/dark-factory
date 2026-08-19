@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from orchestrator.agents.briefing import (
+    FOREIGN_PROJECT_TAG_KEYS,
     MEMORY_CONTEXT_CAVEAT,
     BriefingAssembler,
     filter_foreign_project_results,
@@ -74,7 +75,7 @@ class TestFilterForeignProjectResults:
             'results': [_result('1', 'Foreign fact about reify.', metadata={'project_id': 'reify'})],
         })
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert 'Foreign fact about reify.' not in text
         assert dropped == 1
@@ -84,7 +85,7 @@ class TestFilterForeignProjectResults:
             'results': [_result('1', 'Own project fact.', metadata={'project_id': 'dark_factory'})],
         })
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert 'Own project fact.' in text
         assert dropped == 0
@@ -94,7 +95,7 @@ class TestFilterForeignProjectResults:
             'results': [_result('1', 'Untagged fact.', metadata={})],
         })
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert 'Untagged fact.' in text
         assert dropped == 0
@@ -107,7 +108,7 @@ class TestFilterForeignProjectResults:
             ],
         })
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert text == ''
         assert dropped == 2
@@ -119,7 +120,7 @@ class TestFilterForeignProjectResults:
             'failed_stores': ['mem0'],
         })
 
-        text, _dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, _dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
         parsed = json.loads(text)
 
         assert parsed['degraded'] is True
@@ -134,7 +135,7 @@ class TestFilterForeignProjectResults:
             ],
         })
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
         parsed = json.loads(text)
 
         assert [r['id'] for r in parsed['results']] == ['1', '3']
@@ -151,7 +152,7 @@ class TestFilterForeignProjectResults:
             'results': [_result('1', 'Own — café fact.', metadata={'project_id': 'dark_factory'})],
         })
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert dropped == 0
         assert text is payload
@@ -170,7 +171,7 @@ class TestFilterForeignProjectResults:
             ],
         })
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert dropped == 1
         assert 'Own — café fact.' in text
@@ -205,7 +206,7 @@ class TestFilterFailsOpen:
         text_in = 'not json at all'
 
         with caplog.at_level(logging.WARNING):
-            text, dropped = filter_foreign_project_results(text_in, 'dark_factory')
+            text, dropped, _nested = filter_foreign_project_results(text_in, 'dark_factory')
 
         assert (text, dropped) == (text_in, 0)
         assert any(r.levelno == logging.WARNING for r in caplog.records)
@@ -214,7 +215,7 @@ class TestFilterFailsOpen:
         text_in = '[1, 2, 3]'
 
         with caplog.at_level(logging.WARNING):
-            text, dropped = filter_foreign_project_results(text_in, 'dark_factory')
+            text, dropped, _nested = filter_foreign_project_results(text_in, 'dark_factory')
 
         assert (text, dropped) == (text_in, 0)
         assert any(r.levelno == logging.WARNING for r in caplog.records)
@@ -223,7 +224,7 @@ class TestFilterFailsOpen:
         text_in = json.dumps({'degraded': True})
 
         with caplog.at_level(logging.WARNING):
-            text, dropped = filter_foreign_project_results(text_in, 'dark_factory')
+            text, dropped, _nested = filter_foreign_project_results(text_in, 'dark_factory')
 
         assert (text, dropped) == (text_in, 0)
         assert any(r.levelno == logging.WARNING for r in caplog.records)
@@ -232,7 +233,7 @@ class TestFilterFailsOpen:
         text_in = json.dumps({'results': 'oops'})
 
         with caplog.at_level(logging.WARNING):
-            text, dropped = filter_foreign_project_results(text_in, 'dark_factory')
+            text, dropped, _nested = filter_foreign_project_results(text_in, 'dark_factory')
 
         assert (text, dropped) == (text_in, 0)
         assert any(r.levelno == logging.WARNING for r in caplog.records)
@@ -242,7 +243,7 @@ class TestFilterFailsOpen:
             'results': ['stray', _result('1', 'Own fact.', metadata={'project_id': 'dark_factory'})],
         })
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
         parsed = json.loads(text)
 
         assert 'stray' in parsed['results']
@@ -255,7 +256,7 @@ class TestFilterFailsOpen:
         entry_list_meta['metadata'] = ['oops']
         payload = json.dumps({'results': [entry_none_meta, entry_list_meta]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert 'Fact with null metadata.' in text
         assert 'Fact with list metadata.' in text
@@ -272,7 +273,7 @@ class TestForeignTagKeysAndSpelling:
     def test_group_id_tag_is_dropped(self):
         payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'group_id': 'reify'})]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert 'Fact.' not in text
         assert dropped == 1
@@ -280,7 +281,7 @@ class TestForeignTagKeysAndSpelling:
     def test_project_tag_is_dropped(self):
         payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'project': 'reify'})]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert 'Fact.' not in text
         assert dropped == 1
@@ -303,7 +304,7 @@ class TestForeignTagKeysAndSpelling:
             },
         )]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert 'crates/reify-compiler' not in text
         assert dropped == 1
@@ -313,7 +314,7 @@ class TestForeignTagKeysAndSpelling:
             '1', 'Fact.', metadata={'src_project': 'reify', 'project_id': 'dark_factory'},
         )]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert 'Fact.' not in text
         assert dropped == 1
@@ -323,7 +324,7 @@ class TestForeignTagKeysAndSpelling:
             '1', 'Fact.', metadata={'dst_project': 'dark_factory'},
         )]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert 'Fact.' in text
         assert dropped == 0
@@ -333,7 +334,7 @@ class TestForeignTagKeysAndSpelling:
             '1', 'Fact.', metadata={'project_id': 'dark_factory', 'group_id': 'reify'},
         )]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert 'Fact.' in text
         assert dropped == 0
@@ -342,23 +343,61 @@ class TestForeignTagKeysAndSpelling:
         for spelling in ('dark-factory', 'Dark_Factory', '  dark_factory  '):
             payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'project_id': spelling})]})
 
-            text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+            text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
             assert 'Fact.' in text, f'spelling {spelling!r} should be treated as own-project'
             assert dropped == 0
 
         payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'project_id': 'reify'})]})
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
         assert 'Fact.' not in text
         assert dropped == 1
 
     def test_non_string_tag_is_treated_as_untagged(self):
         payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'project_id': 123})]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         assert 'Fact.' in text
         assert dropped == 0
+
+
+class TestOriginTagKeyDriftGuard:
+    """The two hand-copied tag tuples must stay identical, key for key.
+
+    ``fused_memory.server.grouped_read.ORIGIN_PROJECT_TAG_KEYS`` is what
+    STAMPS an origin tag onto a nested child; :data:`FOREIGN_PROJECT_TAG_KEYS`
+    is what READS it back here. Neither side can import the other — the
+    orchestrator declares no runtime dependency on fused-memory (it appears
+    only in ``orchestrator/pyproject.toml``'s ``[tool.pyright] extraPaths``, a
+    type-checking-only reference) — so the coupling is by COPY, and until this
+    test existed it rested entirely on two prose comments.
+
+    Drift is SILENT and one-directional: a key added to the reader alone is
+    harmless, but a key added to the reader that grouped_read never stamps (or
+    a key dropped from the stamper) makes the nested safeguard stop firing on
+    it, and a safeguard that never fires returns ``nested_dropped == 0`` —
+    indistinguishable from "nothing foreign was found". That is exactly the
+    failure this file otherwise cannot detect.
+    """
+
+    def test_grouped_read_mirrors_the_briefing_tag_keys(self):
+        # Skip-if-unimportable: fused-memory is a sibling package, not a
+        # declared dependency, so an orchestrator-only environment is a
+        # legitimate gap rather than a failure (same pattern as
+        # ``tests/test_reopen_sticks_e2e.py``).
+        grouped_read = pytest.importorskip('fused_memory.server.grouped_read')
+
+        assert grouped_read.ORIGIN_PROJECT_TAG_KEYS == FOREIGN_PROJECT_TAG_KEYS, (
+            'grouped_read.ORIGIN_PROJECT_TAG_KEYS (the STAMPER) and '
+            'briefing.FOREIGN_PROJECT_TAG_KEYS (the READER) are hand-copies of '
+            'one another and have drifted. Tuple equality is asserted, not set '
+            'equality, so PRECEDENCE order is pinned too: src_project must stay '
+            'first, or a CGL-eta rehomed record whose co-present project_id '
+            'names the local project would be certified as native. Add the new '
+            f'key to BOTH sides. stamper={grouped_read.ORIGIN_PROJECT_TAG_KEYS!r} '
+            f'reader={FOREIGN_PROJECT_TAG_KEYS!r}'
+        )
 
 
 def _mcp_search_envelope(results: list[dict]) -> dict:
@@ -458,6 +497,67 @@ class TestGetMemoryContextFiltersForeignFacts:
         assert any(r.levelno == logging.INFO for r in caplog.records)
         assert 'filtered' in caplog.text.lower()
 
+    async def test_a_nested_only_drop_is_reported_as_nested_records(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """The rendered note must not call a dropped CHILD a dropped result slot.
+
+        Task 4008 amendment. Here every top-level result survives and only
+        children inside them are removed, so a note reading "N memory result
+        slot(s) ... filtered out" would tell an operator that N recalled facts
+        vanished when in fact none did. The note is the ONLY signal a human
+        gets that a leak was blocked, so it names the two quantities apart.
+        """
+        envelope = _mcp_search_envelope([_grouped_parent()])
+        # One foreign amendment + one foreign pinned body per query, and the
+        # stub answers all four queries identically.
+        expected_nested = 2 * 4
+
+        with caplog.at_level(logging.INFO), patch(
+            'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
+        ):
+            context = await briefing._get_memory_context('3609')
+
+        assert 'FOREIGN AMENDMENT BODY' not in context
+        assert 'FOREIGN SIGHTING BODY' not in context
+        assert 'Native canonical.' in context, (
+            'The parent itself was never foreign and must still be recalled'
+        )
+        assert (
+            f'{expected_nested} nested memory record(s) across 4 queries were '
+            'tagged to another project and filtered out'
+        ) in context, (
+            f'a nested-only drop must be reported as nested records, got {context!r}'
+        )
+        assert 'memory result slot(s)' not in context, (
+            'No top-level result was dropped, so the note must not claim a '
+            f'result slot was vacated, got {context!r}'
+        )
+        assert any(r.levelno == logging.INFO for r in caplog.records)
+
+    async def test_mixed_drops_name_both_quantities_separately(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """A foreign result AND a foreign child are reported as distinct counts."""
+        envelope = _mcp_search_envelope([
+            _result('f1', 'Foreign fact.', metadata={'project_id': 'reify'}),
+            _grouped_parent(),
+        ])
+
+        with caplog.at_level(logging.INFO), patch(
+            'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
+        ):
+            context = await briefing._get_memory_context('3609')
+
+        assert 'Foreign fact.' not in context
+        assert 'FOREIGN AMENDMENT BODY' not in context
+        assert (
+            '4 memory result slot(s) and 8 nested memory record(s) across 4 '
+            'queries were tagged to another project and filtered out'
+        ) in context, (
+            f'both quantities must be named, and named apart, got {context!r}'
+        )
+
 
 @pytest.mark.asyncio
 class TestMemoryContextProvenanceCaveat:
@@ -553,7 +653,7 @@ class TestMemoryContextProvenanceCaveat:
         async def scoped_search_side_effect(query):
             if 'decisions' in query:
                 raise TimeoutError('memory service unreachable')
-            return f'## recalled for: {query}', 0
+            return f'## recalled for: {query}', 0, 0
 
         with patch.object(
             briefing, '_scoped_search', new=AsyncMock(side_effect=scoped_search_side_effect),
@@ -579,7 +679,7 @@ class TestScopedSearch:
         with patch.object(briefing, '_mcp_search', new=AsyncMock(return_value=None)):
             result = await briefing._scoped_search('anything')
 
-        assert result == (None, 0)
+        assert result == (None, 0, 0)
 
     async def test_multi_text_block_response_fails_open_known_limitation(
         self, briefing: BriefingAssembler, caplog,
@@ -611,7 +711,7 @@ class TestScopedSearch:
         with caplog.at_level(logging.WARNING), patch(
             'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
         ):
-            text, dropped = await briefing._scoped_search('anything')
+            text, dropped, _nested = await briefing._scoped_search('anything')
 
         # Known limitation: the joined multi-block text isn't valid JSON, so
         # the filter fails open rather than filtering each block — the
@@ -679,7 +779,7 @@ class TestGroupedChildrenAreFiltered:
     def test_foreign_nested_children_are_dropped_from_a_kept_parent(self):
         payload = json.dumps({'results': [_grouped_parent()]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
 
         # (a) THE SUBSTANTIVE PIN: neither foreign body reaches the prompt.
         assert 'FOREIGN AMENDMENT BODY' not in text, (
@@ -703,10 +803,15 @@ class TestGroupedChildrenAreFiltered:
         grouped = json.loads(text)['results'][0]['grouped']
         assert [c['id'] for c in grouped['amendments']] == ['a2', 'a3']
         assert grouped['matched_children'] == []
-        # (f) Nested drops are COUNTED, so they reach foreign_dropped/drop_note.
-        assert dropped == 2, (
-            'Nested drops must be counted into the SAME return counter that '
-            f'feeds the drop note, so a blocked leak is reported, got {dropped}'
+        # (f) Nested drops are COUNTED — in their own counter, so they reach
+        # the drop note as nested records rather than as vacated result slots.
+        assert nested == 2, (
+            'Nested drops must be counted and returned, so a blocked leak is '
+            f'reported rather than silently swallowed, got {nested}'
+        )
+        assert dropped == 0, (
+            'No TOP-LEVEL result was foreign here — the parent survived — so '
+            f'the result-slot counter must stay at 0, got {dropped}'
         )
 
     def test_a_nested_only_drop_defeats_the_no_op_fast_path(self):
@@ -722,9 +827,9 @@ class TestGroupedChildrenAreFiltered:
             ],
         })
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
 
-        assert dropped == 2
+        assert (dropped, nested) == (0, 2)
         assert 'FOREIGN AMENDMENT BODY' not in text
         assert 'FOREIGN SIGHTING BODY' not in text
         assert text != payload, (
@@ -747,11 +852,106 @@ class TestGroupedChildrenAreFiltered:
             })],
         })
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
 
-        assert dropped == 1
+        assert (dropped, nested) == (0, 1)
         assert 'FOREIGN AMENDMENT BODY' not in text
         assert json.loads(text)['results'][0]['grouped']['amendments'] == []
+
+
+    def test_nested_children_canonicalise_divergent_spellings(self):
+        """The descent must use ``_canonical_project``, not a raw string compare.
+
+        fused-memory explicitly PERMITS divergent project-id spellings (see
+        ``plans/cross-graph-entity-leak-prd.md`` decision 1 / S1), and the
+        top-level loop already canonicalises before comparing
+        (``TestForeignTagKeysAndSpelling``). If the nested loop compared raw
+        tags instead, a native child tagged ``dark-factory`` would be
+        FALSE-POSITIVE DROPPED — silent context loss on real corpus data,
+        which is strictly worse than the leak this task set out to close, and
+        every other test in this file would still pass.
+        """
+        for spelling in ('dark-factory', 'Dark_Factory', '  dark_factory  '):
+            payload = json.dumps({'results': [_grouped_parent(grouped={
+                'amendments': [
+                    {'id': 'a1', 'digest': 'NATIVE AMENDMENT BODY', 'created_at': None,
+                     'kind': 'amendment', 'metadata': {'project_id': spelling}},
+                ],
+                'amendment_count': 1,
+                'sighting_count': 0,
+            })]})
+
+            text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
+
+            assert (dropped, nested) == (0, 0), (
+                f'nested spelling {spelling!r} must be treated as own-project, '
+                f'got dropped={dropped} nested={nested}'
+            )
+            assert 'NATIVE AMENDMENT BODY' in text, (
+                f'A native child spelled {spelling!r} must survive, got {text!r}'
+            )
+
+    def test_a_foreign_nested_child_is_dropped_whatever_its_casing(self):
+        """The same canonicalisation must not let a FOREIGN child through either."""
+        payload = json.dumps({'results': [_grouped_parent(grouped={
+            'amendments': [
+                {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'created_at': None,
+                 'kind': 'amendment', 'metadata': {'src_project': '  REIFY  '}},
+            ],
+            'amendment_count': 1,
+            'sighting_count': 0,
+        })]})
+
+        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert (dropped, nested) == (0, 1)
+        assert 'FOREIGN AMENDMENT BODY' not in text, (
+            'Canonicalisation must normalise the FOREIGN side too — a tag of '
+            f"'  REIFY  ' still names another project, got {text!r}"
+        )
+
+    def test_a_dropped_parent_is_counted_once_not_once_per_child(self):
+        """A foreign parent takes its whole subtree with it — for exactly 1 drop.
+
+        The descent runs only for a KEPT entry. If the
+        ``_filter_grouped_children`` call were ever moved above the
+        ``continue`` that drops a foreign parent, this parent would score
+        1 + 3 = 4 instead of 1 — and ``dropped`` is not internal bookkeeping,
+        it renders into the operator-visible drop note, so an over-count is a
+        wrong number shown to a human.
+        """
+        entry = _result('f1', 'FOREIGN CANONICAL.', metadata={'src_project': 'reify'},
+                        source_store='mem0')
+        entry['grouped'] = {
+            'amendments': [
+                {'id': 'a1', 'digest': 'FOREIGN CHILD ONE', 'kind': 'amendment',
+                 'metadata': {'src_project': 'reify'}},
+                {'id': 'a2', 'digest': 'FOREIGN CHILD TWO', 'kind': 'amendment',
+                 'metadata': {'src_project': 'reify'}},
+            ],
+            'matched_children': [
+                {'id': 's1', 'content': 'FOREIGN CHILD THREE', 'kind': 'sighting',
+                 'matched': True, 'metadata': {'src_project': 'reify'}},
+            ],
+            'amendment_count': 2,
+            'sighting_count': 1,
+        }
+        payload = json.dumps({'results': [entry, _result('n1', 'Native fact.')]})
+
+        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
+
+        assert dropped == 1, (
+            'A dropped parent is ONE drop however many children hung off it, '
+            f'got {dropped}'
+        )
+        assert nested == 0, (
+            'A dropped parent must not be descended into: its children are '
+            f'already gone, so counting them would double-count, got {nested}'
+        )
+        assert [r['id'] for r in json.loads(text)['results']] == ['n1']
+        for body in ('FOREIGN CANONICAL.', 'FOREIGN CHILD ONE',
+                     'FOREIGN CHILD TWO', 'FOREIGN CHILD THREE'):
+            assert body not in text, f'{body!r} must go with its parent'
 
 
 class TestGroupedDescentIsSurgicalAndFailsOpen:
@@ -772,10 +972,10 @@ class TestGroupedDescentIsSurgicalAndFailsOpen:
         """(a) A shortened list keeps the count API's EXACT value."""
         payload = json.dumps({'results': [_grouped_parent()]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
 
         grouped = json.loads(text)['results'][0]['grouped']
-        assert dropped == 2
+        assert nested == 2
         assert len(grouped['amendments']) == 2, 'PRECONDITION: the list really did shrink'
         assert grouped['amendment_count'] == 3, (
             'amendment_count is the count API\'s exact value; recomputing it here '
@@ -793,10 +993,10 @@ class TestGroupedDescentIsSurgicalAndFailsOpen:
         block['error_type'] = 'TimeoutError'
         payload = json.dumps({'results': [_grouped_parent(grouped=block)]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
 
         grouped = json.loads(text)['results'][0]['grouped']
-        assert dropped == 2
+        assert nested == 2
         assert grouped['truncated'] is True
         assert grouped['children_unavailable'] is True
         assert grouped['error_type'] == 'TimeoutError'
@@ -805,7 +1005,7 @@ class TestGroupedDescentIsSurgicalAndFailsOpen:
         """(c) The descent edits the subtree, never the entry that carries it."""
         payload = json.dumps({'results': [_grouped_parent()]})
 
-        text, _ = filter_foreign_project_results(payload, 'dark_factory')
+        text, _dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
         parent = json.loads(text)['results'][0]
         assert parent['id'] == 'p1'
@@ -823,9 +1023,9 @@ class TestGroupedDescentIsSurgicalAndFailsOpen:
             'results': [_result('n1', 'Native fact.', metadata={'project_id': 'dark_factory'})],
         })
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
 
-        assert dropped == 0
+        assert (dropped, nested) == (0, 0)
         assert 'Native fact.' in text
 
     def test_a_non_dict_grouped_value_fails_open(self):
@@ -834,9 +1034,11 @@ class TestGroupedDescentIsSurgicalAndFailsOpen:
         entry['grouped'] = 'not a dict at all'
         payload = json.dumps({'results': [entry]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
 
-        assert dropped == 0, f'A shape surprise must not be counted as a drop, got {dropped}'
+        assert (dropped, nested) == (0, 0), (
+            f'A shape surprise must not be counted as a drop, got {dropped}/{nested}'
+        )
         assert [r['id'] for r in json.loads(text)['results']] == ['p1'], (
             f'The entry must SURVIVE a malformed grouped block, got {text!r}'
         )
@@ -847,9 +1049,9 @@ class TestGroupedDescentIsSurgicalAndFailsOpen:
         entry['grouped'] = {'amendments': 'not a list', 'amendment_count': 1}
         payload = json.dumps({'results': [entry]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
 
-        assert dropped == 0
+        assert (dropped, nested) == (0, 0)
         assert json.loads(text)['results'][0]['grouped']['amendments'] == 'not a list', (
             'A child collection of the wrong type is left EXACTLY as received — '
             'never coerced, never emptied'
@@ -870,10 +1072,10 @@ class TestGroupedDescentIsSurgicalAndFailsOpen:
         }
         payload = json.dumps({'results': [entry]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
 
-        assert dropped == 1, (
-            f'Only the classifiably-foreign child may be dropped, got {dropped}'
+        assert (dropped, nested) == (0, 1), (
+            f'Only the classifiably-foreign child may be dropped, got {dropped}/{nested}'
         )
         amendments = json.loads(text)['results'][0]['grouped']['amendments']
         assert amendments[:2] == [None, 'a bare string'], (
@@ -894,9 +1096,9 @@ class TestGroupedDescentIsSurgicalAndFailsOpen:
         }
         payload = json.dumps({'results': [entry]})
 
-        text, dropped = filter_foreign_project_results(payload, 'dark_factory')
+        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
 
-        assert dropped == 0
+        assert (dropped, nested) == (0, 0)
         assert 'ODDLY SHAPED BODY' in text, (
             'A nested entry whose metadata is unreadable is untagged, and '
             f'untagged means KEPT, got {text!r}'
