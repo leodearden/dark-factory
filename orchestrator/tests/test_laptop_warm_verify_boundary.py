@@ -2013,6 +2013,43 @@ def test_kill_holder_tree_never_signals_the_callers_own_process_group():
             leader.wait(timeout=5)
 
 
+def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
+    """kill_holder_tree must never raise, even against an already-reaped leader.
+
+    Teardown code that raises MASKS the real test failure it was cleaning
+    up after, converting a legible AssertionError into a confusing
+    error-in-finally.  Two cases, both against a leader that has ALREADY
+    exited and been reaped:
+
+    (a) the real ``os.getpgid``/``read_ppid_map`` path against a pid that no
+        longer refers to a live process -- ``getpgid`` raises
+        ``ProcessLookupError`` and the pid is simply absent from the ppid
+        map ``collect_descendants`` walks.
+
+    (b) an injected ``_ppid_map_provider`` that raises ``OSError``, modeling
+        a ``/proc`` read losing a race with process exit.
+
+    No ``pytest.raises`` here on purpose: if either call raises, pytest
+    reports this test as failed/errored, which is exactly the "no
+    exception escapes" assertion the plan calls for.
+    """
+    leader = subprocess.Popen([sys.executable, '-c', 'pass'])
+    leader.wait(timeout=10)
+
+    # (a) real getpgid / real ppid map against an already-reaped leader.
+    kill_holder_tree(leader, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
+
+    # (b) an injected ppid-map provider that raises OSError must not escape.
+    def raising_ppid_map_provider():
+        raise OSError('simulated /proc read racing process exit')
+
+    kill_holder_tree(
+        leader,
+        timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS,
+        _ppid_map_provider=raising_ppid_map_provider,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task 3369 -- in-child stopwatch for the flock GATE, replacing task 2921/2941's
 # outer wall-clock subtraction in test_flock_wait_env_override_speeds_up_
