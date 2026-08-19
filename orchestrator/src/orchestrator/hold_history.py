@@ -660,6 +660,29 @@ class HoldHistory:
         wanted = str(task_id)
         return [module for (tid, module) in self._open if tid == wanted]
 
+    def _sweep_stale_open(self, task_id: str, now: float) -> list[str]:
+        """Drop *task_id*'s open holds whose OWN start is older than the ceiling.
+
+        Returns the module names dropped, OLDEST FIRST.  Per-KEY, deliberately
+        not per-task: the ceiling asks "is THIS hold bookkeeping residue?",
+        which is a fact about one hold, and generalising it to the whole task
+        took live sibling holds down with the phantom.  :meth:`forget` answers
+        the different question ("drop everything this task holds") for its one
+        caller, ``Scheduler.release``, and stays all-or-nothing.
+
+        Staleness is monotone in ``start``, so the swept set is always exactly
+        the oldest prefix of the task's holds — the sweep cannot strand a
+        newer-but-stale entry.  Sorted rather than left in dict order so the
+        operator-facing log names them in a meaningful order.
+        """
+        stale = sorted(
+            (start, key) for key, start in self._open.items()
+            if key[0] == task_id and (now - start) > self._stale_open_secs
+        )
+        for _start, key in stale:
+            del self._open[key]
+        return [module for _start, (_tid, module) in stale]
+
     def predicted_remaining(self, task_id: str, *, now: float) -> float | None:
         """Seconds *task_id* is predicted to keep holding its locks, or None.
 
@@ -680,28 +703,43 @@ class HoldHistory:
 
         STALENESS BACKSTOP.  An open hold older than ``stale_open_secs`` (24h by
         default, far beyond any real hold) is residue from a release that never
-        reached the live feed, not a running hold.  It is dropped and the answer
-        is None — because the alternative is the permanent 0.0 described above,
-        an actionable claim about a task that is not holding anything.  The
-        deterministic fix is :meth:`forget` on release; this catches the case
-        where that call never happens either.  Deliberately an ABSOLUTE ceiling
-        and not a multiple of the prediction: a hold running 10x its module's
-        median is exactly the overdue holder this method exists to surface, and
-        a relative ceiling would silence it.
+        reached the live feed, not a running hold.  Such holds are dropped —
+        because the alternative is the permanent 0.0 described above, an
+        actionable claim about a task that is not holding anything.
+
+        The sweep is PER-HOLD (:meth:`_sweep_stale_open`): only the entries past
+        the ceiling go, a live sibling hold SURVIVES and is still answered for,
+        and the answer is None only when nothing survives.  Dropping the whole
+        task instead cost twice over — no prediction for a task that really was
+        holding, and, with the live hold's open span gone, its real
+        ``lock_released`` reached ``_apply_release`` as an orphan and recorded
+        nothing, so a hold the feed observed end to end never became a sample.
+
+        The deterministic fix is :meth:`forget` on release; this catches the
+        case where that call never happens either.  Deliberately an ABSOLUTE
+        ceiling and not a multiple of the prediction: a hold running 10x its
+        module's median is exactly the overdue holder this method exists to
+        surface, and a relative ceiling would silence it.
         """
         wanted = str(task_id)
+        now_f = float(now)
+        # Pre-sweep, so the age reported below is the OLDEST DROPPED hold's — the
+        # value this message has always carried.  (Step 4 rewrites the message.)
+        oldest = min(
+            (start for (tid, _module), start in self._open.items() if tid == wanted),
+            default=now_f,
+        )
+        dropped = self._sweep_stale_open(wanted, now_f)
         starts = [start for (tid, _module), start in self._open.items() if tid == wanted]
-        if not starts:
-            return None
-        elapsed = float(now) - min(starts)
-        if elapsed > self._stale_open_secs:
+        if dropped:
             logger.warning(
                 'hold_history: task %s has open hold(s) %.0fs old (> %.0fs) — '
                 'treating as a missed release and dropping them; no prediction',
-                wanted, elapsed, self._stale_open_secs,
+                wanted, now_f - oldest, self._stale_open_secs,
             )
-            self.forget(wanted)
+        if not starts:
             return None
+        elapsed = now_f - min(starts)
         predicted = self.predicted_hold(self.open_modules(wanted))
         if predicted is None:
             return None
