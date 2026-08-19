@@ -1847,6 +1847,75 @@ def _install_all_units(repo: pathlib.Path, unit_dir: pathlib.Path) -> None:
         )
 
 
+def test_the_module_slices_come_off_the_CODE_anchor():
+    """Both slice accessors start at the assignment, not at prose about it.
+
+    RED before the migration: both anchored on the first occurrence of the
+    string "check_orchestrator_unit_parity.py", which lands inside the comment
+    at setup-host.sh:242 naming
+    `tests/scripts/test_check_orchestrator_unit_parity.py` — a SUPERSTRING of
+    the anchor. That coupling is exactly what forced setup-host.sh's standing
+    "do NOT name the parity checker's file in the prose above" constraint, a
+    rule enforced only by a comment asking people to remember it.
+
+    Asserted of the accessors themselves, whatever their implementation, so the
+    property survives however they are rewritten.
+    """
+    for name, section in (
+        ("_orchestrator_gate_block", _orchestrator_gate_block(_setup_host_text())),
+        ("_installer_section", _installer_section()),
+    ):
+        first = section.splitlines()[0]
+        assert not first.lstrip().startswith("#"), (
+            f"{name} starts on a COMMENT line:\n  {first}"
+        )
+        assert first.startswith(_ORCH_GATE_START), (
+            f"{name} must start at the {_ORCH_GATE_START!r} assignment. "
+            f"Got:\n  {first}"
+        )
+
+
+def test_the_module_slices_cannot_reach_the_real_home_directory():
+    """Neither EXECUTED slice contains a write outside the tmp tree.
+
+    setup-host.sh:246-248 names this failure — a slice whose start drifted
+    upward runs this section's `install -m 0755 ... "$HOME/bin/..."` against
+    the developer's REAL home directory — and today only prose prevents it.
+    This makes it a test.
+    """
+    for name, section in (
+        ("_orchestrator_gate_block", _orchestrator_gate_block(_setup_host_text())),
+        ("_installer_section", _installer_section()),
+    ):
+        assert "install -m 0755" not in section, (
+            f"{name} reaches back over installer code that writes outside the "
+            f"tmp tree, and this module EXECUTES it."
+        )
+        assert '"$HOME/' not in section, (
+            f"{name} can reach the developer's real home directory."
+        )
+
+
+def test_the_two_module_slices_stay_distinguishable():
+    """The gate slice stops at the gate; the installer slice runs past it.
+
+    Without this, a change that collapsed one accessor onto the other would go
+    unnoticed: every gate-only assertion would still pass against the longer
+    slice, and the tests that mean to exercise ONLY the read-only gate would
+    silently start executing the install.
+    """
+    gate = _orchestrator_gate_block(_setup_host_text())
+    installer = _installer_section()
+
+    assert _INSTALL_LOOP_CP in installer, (
+        "The installer slice must contain the install loop's copy."
+    )
+    assert _INSTALL_LOOP_CP not in gate, (
+        "The gate slice must stop at the gate's own `fi`, before the install."
+    )
+    assert len(installer) > len(gate)
+
+
 def test_installer_copies_the_units_when_the_gate_reports_parity(
     tmp_path: pathlib.Path,
 ):
