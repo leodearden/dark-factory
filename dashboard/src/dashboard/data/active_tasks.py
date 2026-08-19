@@ -577,7 +577,13 @@ async def _shape_one_project(
     )
 
     # The window is POSITIONED by n_terminal (see below), which only the
-    # compact map can supply. Without it the offset collapses to 0, and since
+    # compact map can supply. That count now rides fetch_statuses' 5 s TTL, so
+    # a task completing inside that window can leave the offset one row short
+    # and hold the newest done row out of the list for up to 5 s — bounded,
+    # self-correcting on the next miss, and far inside the 20 s staleness the
+    # terminal rows already carry from fetch_tasks' own cache. It cuts the
+    # other way too: a stable n_terminal means a stable offset, so the
+    # terminal fetch's cache key stops churning on every completion. Without it the offset collapses to 0, and since
     # page_size/offset slice an ASCENDING-id list, offset 0 selects the OLDEST
     # terminal rows — which are then sorted by updated_at desc and emitted as
     # the tab's "most recent" done list. Showing months-old rows as the newest
