@@ -920,11 +920,29 @@ class Mem0Backend:
         semantics at all — notably when establishing the TRUE incidence rate,
         so that claim rests on nothing but the shared detector.
 
-        Both modes PAGINATE, looping on the ``next_page_offset`` that
-        :meth:`scroll_by_metadata` discards. That method's single-shot
-        ``limit=1000`` cap is deliberately not reused: a silently-capped scan
-        would report a plausible-looking undercount, which is the same
-        silent-wrong-value class this scan exists to measure.
+        (e) BOTH MODES PAGINATE, and the walk is DELEGATED to
+        :meth:`scroll_collection_pages` rather than re-implemented here — one
+        home for the offset/next_offset loop, the per-page read bound and the
+        page budget. The caller-supplied *limit* rides on that pager's
+        ``max_points``, so the cap is pushed down into each page request
+        instead of being layered on top with a ``break``: a capped scan
+        therefore costs no look-ahead round-trip to discover there is more.
+        :meth:`scroll_by_metadata`'s single-shot ``limit=1000`` cap is
+        deliberately not reused: a silently-capped scan would report a
+        plausible-looking undercount, which is the same silent-wrong-value
+        class this scan exists to measure.
+
+        The two exhaustion postures below are DELIBERATE and caller-chosen,
+        not an inconsistency to be tidied away. The pager RAISES on both
+        budgets so the primitive can never truncate silently (INV-2); this
+        method then catches :class:`ScrollPointBudgetExhausted` and reports it
+        as ``truncated=True`` + a WARNING, while
+        :class:`ScrollPageBudgetExhausted` propagates. Being stopped by a
+        *limit* the caller passed is an expected outcome; being stopped by the
+        safety backstop is not, and reporting the latter as if the caller had
+        asked for it would hand a sweep a plausible-looking undercount. That
+        asymmetry is exactly what invites a well-meaning "unify these two
+        paths" fix, which is why it is written down at both sites.
 
         Args:
             scope: Project/agent/session scope (selects the collection).
@@ -1073,12 +1091,30 @@ class Mem0Backend:
     ) -> AsyncIterator[Any]:
         """Yield every Qdrant point in *collection_name*, paging on ``next_offset``.
 
-        THE single home for the offset/next_offset walk (INV-5).  Both
-        full-enumeration callers sit on top of it:
-        :meth:`scroll_all_by_metadata` (Scope+filter-addressed, normalised
-        records — what ``scripts/census_memory_metadata.py`` drives) and
-        ``scripts/consolidate_namespace_families.merge_collection``
-        (raw points, no filter — which enters at THIS layer).
+        THE single home for the offset/next_offset walk (INV-5).  Every
+        paging caller sits on top of it: :meth:`scroll_all_by_metadata`
+        (Scope+filter-addressed, normalised records — what
+        ``scripts/census_memory_metadata.py`` drives),
+        ``scripts/consolidate_namespace_families.merge_collection`` (raw
+        points, no filter — which enters at THIS layer) and
+        :meth:`scan_payload_text` (a bounded substring scan).
+
+        *max_points* exists precisely so that last one does not need a second
+        copy of the walk.  It stops after N POINTS rather than N pages, and
+        expressing that as a caller-side ``break`` would both duplicate the
+        loop and cost a look-ahead round-trip; owning the cap here makes it
+        free.
+
+        The two budgets are DELIBERATELY distinct events with distinct
+        exceptions, so the CALLER chooses the posture rather than this
+        primitive imposing one.  Both raise here — the pager never truncates
+        silently (INV-2) — but :meth:`scan_payload_text` catches only
+        :class:`ScrollPointBudgetExhausted`, converting the cap it asked for
+        into a ``truncated`` flag while letting the backstop propagate.  Do
+        not "unify" the two exceptions or make one inherit from the other:
+        that asymmetry is the whole mechanism, and collapsing it would also
+        change what ``census_memory_metadata``'s ``except CensusScanIncomplete``
+        (an alias of the page-budget class) catches.
 
         Deliberately collection-name-addressed rather than
         :class:`~fused_memory.models.scope.Scope`-addressed, and
