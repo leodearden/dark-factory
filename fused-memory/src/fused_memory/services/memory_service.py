@@ -83,7 +83,7 @@ from fused_memory.services.topic_anchor import (
     select_canonical_payload,
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
-from fused_memory.utils.canonical_labels import Referent, parse_node_name
+from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
 from fused_memory.utils.referent_resolution import (
     REFERENT_SOURCES,
     ReferentResolution,
@@ -2872,6 +2872,17 @@ class MemoryService:
         dominant measured live shape, whose defining signature is that the
         landed-on number is never named by the fact at all.
 
+        PER-EDGE PAIRING: if the edge's own FACT cites at least one task
+        referent and the endpoint's referent is not among them, the fact talks
+        about ``Task M`` while the edge landed on ``Task N``. This is what
+        catches mode (iii), where BOTH numbers are legitimately declared and
+        membership therefore cannot fire — the live case being an episode that
+        minted 'Task 3074' and 'Task 3075' 60us apart. Resolved decision 7:
+        neither check alone is sufficient, so both run.
+
+        The two are ORDERED, not additive. Membership is evaluated first and
+        wins the label, so an endpoint failing both is reported exactly ONCE.
+
         An EMPTY *referents* makes the whole pass a no-op, honouring the contract
         ``resolve_referents`` publishes in its own docstring ("an EMPTY
         ``.referents`` carries nothing to test membership against, so a downstream
@@ -2919,6 +2930,26 @@ class MemoryService:
         for edge in edges:
             stats.edges_scanned += 1
             edge_uuid = getattr(edge, 'uuid', '') or ''
+            # Scanned ONCE per edge, not once per endpoint. The FACT is what
+            # pairing reads — not the episode content — because the fact is the
+            # per-edge assertion whose subject must match the endpoint it landed
+            # on; the episode body is about the write as a whole and cannot
+            # discriminate between two edges of the same episode.
+            #
+            # PERMISSIVE mode (no `known_project_ids`), matching the choice
+            # gamma made and documented in `resolve_referents`. Threading
+            # `self._known_projects` here would fork that decision mid-PRD, and
+            # would DROP a foreign reference the fact genuinely makes — turning
+            # a true negative into a false pairing finding.
+            #
+            # `scan.refs` already excludes `scan.ambiguous`, so nothing further
+            # is filtered out here: an ambiguous reference is deliberately
+            # invisible to this check rather than evidence for it.
+            cited = frozenset(
+                scan_content(
+                    getattr(edge, 'fact', '') or '', group_id=group_id,
+                ).refs
+            )
             for which_end, attr in (
                 ('source', 'source_node_uuid'), ('target', 'target_node_uuid'),
             ):
@@ -2948,7 +2979,33 @@ class MemoryService:
                         endpoint_referent=endpoint_referent,
                         referent_set=referent_names,
                     ))
+                    # ORDERED, NOT ADDITIVE. Membership is evaluated first and
+                    # continues, so an endpoint failing BOTH checks reports the
+                    # stronger, more specific signal exactly once. Two findings
+                    # naming the same (edge_uuid, which_end) would hand eta two
+                    # repair instructions for one edge end that it would have to
+                    # reconcile before acting, and would double-count in iota's
+                    # rate. "Both checks run" is a coverage claim, not a licence
+                    # to emit two findings for one wrong endpoint.
                     continue
+
+                # `if cited` is LOAD-BEARING, not a micro-optimization: a fact
+                # citing no task number is UNINFORMATIVE about which node its
+                # edge belongs on, never contradictory (resolved decision 8;
+                # gamma's `_conflicting_referents` choice 4, one level down). A
+                # scanner blind spot — bare digits, a reference by title, a
+                # hard-wrapped qualified ref — must never manufacture evidence
+                # for destructive edge surgery.
+                if cited and endpoint_referent not in cited:
+                    stats.findings.append(ReferentFinding(
+                        edge_uuid=edge_uuid,
+                        which_end=which_end,
+                        check='per-edge-pairing',
+                        old_endpoint_uuid=endpoint_uuid,
+                        old_endpoint_name=endpoint_name,
+                        endpoint_referent=endpoint_referent,
+                        referent_set=referent_names,
+                    ))
 
         return stats
     async def _reconcile_episode_identity(
