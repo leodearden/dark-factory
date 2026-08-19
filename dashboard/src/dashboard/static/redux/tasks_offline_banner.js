@@ -27,11 +27,14 @@
 // emphatically available.
 //
 // The honest distinction is now made SERVER-SIDE, in `app.api_tasks`, which
-// emits three separate facts (TASKS_OFFLINE = every configured root failed;
-// TASKS_OFFLINE_PROJECTS = roots whose fetch demonstrably failed;
-// TASKS_DEGRADED_PROJECTS = roots the handler ran out of budget for, whose
-// state is UNKNOWN). This module only RENDERS that distinction — it must not
-// re-derive it, or the two would drift.
+// emits four separate facts (TASKS_OFFLINE = no root produced rows AND at
+// least one demonstrably failed; TASKS_OFFLINE_PROJECTS = roots whose fetch
+// demonstrably failed; TASKS_DEGRADED_PROJECTS = roots the handler ran out of
+// budget for, whose state is UNKNOWN; TASKS_COUNT_UNKNOWN_PROJECTS = roots
+// whose rows are current but whose done count was never measured), plus
+// TASKS_PROJECT_COUNT as the denominator the "k of N" copy below needs. Each
+// of the four gets its own notice kind here. This module only RENDERS that
+// distinction — it must not re-derive it, or the two would drift.
 //
 // Nothing here reads `window` or `document`: a module that reached for browser
 // globals would behave differently under `node --test` than in the browser.
@@ -71,10 +74,14 @@ function countPhrase(k, total) {
  *
  * Returns an array of `{kind, text}` — empty when nothing failed. Kinds:
  *
- *   'global'   — every configured root failed: fused-memory itself is
- *                unreachable. Carries the verbatim outage copy, and SUBSUMES
- *                the other three (its "task data unavailable" already covers
- *                everything they could add).
+ *   'global'   — no root produced rows and at least one demonstrably failed:
+ *                fused-memory itself is unreachable. Carries the verbatim
+ *                outage copy, and SUBSUMES the other three (its "task data
+ *                unavailable" already covers everything they could add).
+ *                The parenthetical names the roots that demonstrably failed,
+ *                which in a hang is a SUBSET of the roots without rows (the
+ *                rest timed out) — a partial attribution, never a false one,
+ *                since the sentence's claim is about the fetch as a whole.
  *   'partial'  — some roots failed, not all. Deliberately avoids the words
  *                "fused-memory offline": fused-memory is demonstrably
  *                reachable in this state.

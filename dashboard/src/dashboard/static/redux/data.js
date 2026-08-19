@@ -59,12 +59,15 @@ window.DF_DATA = {
   // offline. Defaulted here (not just on the wire) because the first render
   // happens before any fetch completes.
   TASKS_DEGRADED_PROJECTS: [],
+  // Projects whose rows are current but whose compact status map failed, so
+  // the done count was never measured — neither offline nor degraded. Without
+  // this list they would render as healthy with a confident "0 done".
+  TASKS_COUNT_UNKNOWN_PROJECTS: [],
   // N for the banner's "k of N": how many task project roots the tasks handler
   // fanned out over. Comes from the server so it denominates the same
   // population TASKS_OFFLINE_PROJECTS is drawn from — PROJECTS (orchestrator-
   // derived) is a different one. 0 pre-fetch, which the banner reads as "no
   // count yet" rather than dividing by it.
-  TASKS_COUNT_UNKNOWN_PROJECTS: [],
   TASKS_PROJECT_COUNT: 0,
   DONE_COUNTS: {},
   PERFORMANCE: {},
