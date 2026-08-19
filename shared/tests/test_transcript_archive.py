@@ -1438,3 +1438,99 @@ class TestRestoreArchivedTranscript:
         assert restored == config_dir / 'projects' / ENC / f'{sid}.jsonl'
         assert restored.read_bytes() == payload
         assert transcript_exists(config_dir, sid) is True
+
+    def test_a_miss_returns_none_and_leaves_no_trace(self, tmp_path):
+        """(a) No archive for this (task_id, session_id) -> None, nothing made.
+
+        A MISS is the common case (the PRD §2 reference measurement puts ~36%
+        of sessions there), so it must be free: no ``projects/`` skeleton
+        created, no log noise. Creating the directory eagerly would leave every
+        missed lookup with a half-built config dir a later reader could mistake
+        for a partially-restored one.
+        """
+        root = tmp_path / 'archive'
+        task_id = '42'
+        _write(root / task_id / ENC / 'sess-other.jsonl', b'other\n')
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        assert restore_archived_transcript(root, task_id, 'sess-missing', config_dir) is None
+        assert not (config_dir / 'projects').exists()
+
+    def test_a_live_transcript_is_never_clobbered(self, tmp_path):
+        """(b) A transcript already live in the config dir wins, always.
+
+        A resumed session's transcript only ever GROWS — the same premise
+        durable_archive_path's I-F newest-mtime rule rests on — so a live copy
+        is by construction at least as complete as any archive. Overwriting it
+        would destroy context on the exact path meant to preserve it.
+
+        Seeded here under a DIFFERENT encoded-cwd dir than the archive's, which
+        is the realistic shape (the live copy was written by this lane, the
+        archive by another) and also proves the guard keys on the session id
+        via transcript_exists rather than on the destination path.
+        """
+        sid = 'sess-live-wins'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        _write(root / task_id / ENC / f'{sid}.jsonl', b'ARCHIVED-older\n')
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        live = _write(
+            config_dir / 'projects' / ENC_B / f'{sid}.jsonl', b'LIVE-newer-and-longer\n'
+        )
+
+        restored = restore_archived_transcript(root, task_id, sid, config_dir)
+
+        assert restored == live
+        assert live.read_bytes() == b'LIVE-newer-and-longer\n'
+        # And the archive's own encoded-cwd dir was never even created.
+        assert not (config_dir / 'projects' / ENC).exists()
+
+    def test_a_genuine_fault_returns_none_loudly_and_never_raises(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """(c) Totality: a real I/O fault yields None + a structured WARNING.
+
+        Mirrors durable_archive_path's I-A: this runs on the production
+        dispatch path, so nothing may escape onto it. But silence would be the
+        silent degradation design-invariants INV-2/INV-4 forbid, so a genuine
+        fault (as distinct from a plain miss, which stays quiet) is logged at
+        WARNING with the same structured ``extra`` shape _record_failure and
+        durable_archive_path already emit — path/task_id/errno — so all three
+        archive-side failure signals stay greppable the same way.
+        """
+        sid = 'sess-fault'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        _write(root / task_id / ENC / f'{sid}.jsonl', b'payload\n')
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        def _boom(src, dst, **kwargs):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr(transcript_archive_module.shutil, 'copyfile', _boom)
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            assert restore_archived_transcript(root, task_id, sid, config_dir) is None
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        rec = warnings[0]
+        assert rec.task_id == task_id
+        assert rec.errno == errno.ENOSPC
+        assert sid in rec.getMessage()
+
+    def test_a_plain_miss_logs_nothing(self, tmp_path, caplog):
+        """(a, cont.) The ~36% miss population must never become log noise."""
+        root = tmp_path / 'archive'
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        with caplog.at_level(logging.DEBUG, logger='shared.transcript_archive'):
+            assert restore_archived_transcript(root, '42', 'sess-nope', config_dir) is None
+
+        assert caplog.records == []
