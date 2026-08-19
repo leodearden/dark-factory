@@ -2620,3 +2620,130 @@ class TestResourceAuditLogLevels:
             f'{[(r.levelname, r.getMessage()) for r in records]}'
         )
         assert 'reclaim overdue' in records[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
+# task 3203 step-11 RED / step-12 GREEN: coalescence on the real heartbeat path
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatPathCoalescence:
+    """The journal-drowning scenario reproduced through the EXACT call path
+    the measured reify incident used: only ``_maybe_log_queue_heartbeat`` is
+    driven here, never ``_check_resource_audit`` directly.
+
+    Mirrors TestHeartbeatWiringRunsResourceAuditUnconditionally's convention
+    (task 1994 step-11) — the audit runs before the depth==0 short-circuit,
+    inside its own try/except.
+    """
+
+    _NOW = 1_000_000.0
+    _POLL_S = 30.0
+    _DETECT = 100.0
+    _FAR_REAP_AGE = 10_000_000.0
+    _IN_BAND_AGE = 150.0
+
+    def _worker(self, git_ops: GitOps):
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(),
+            escalation_queue=_FakeEscalationQueue(open_l1=True),  # never pages
+            speculation_depth=2,
+        )
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._DETECT
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._FAR_REAP_AGE
+        worker.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS = 10_000
+        return worker
+
+    def test_idle_worker_with_a_persisting_leak_is_coalesced_end_to_end(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(a) 512 heartbeats over a leak that never changes: 1 WARNING + 9
+        INFO report lines + 502 DEBUG, on a depth-0 idle pipeline — the shape
+        that used to emit 512 WARNINGs."""
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+        assert worker.snapshot()['depth'] == 0, 'the incident shape is an IDLE pipeline'
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            for i in range(512):
+                assert worker._maybe_log_queue_heartbeat(self._NOW + i * self._POLL_S) is False
+
+        records = _audit_records(caplog)
+        assert len(_at_level(records, logging.WARNING)) == 1
+        assert len(_at_level(records, logging.INFO)) == 9
+        assert len(_at_level(records, logging.DEBUG)) == 502
+        assert _streaks(caplog) == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+    def test_the_depth_heartbeat_keeps_its_own_rate_limiting(
+        self, git_ops: GitOps, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(b) Coalescing the audit must not perturb the depth heartbeat's own
+        _heartbeat_interval_s schedule."""
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        worker._queue.put_nowait(_make_request('hb-task', 'hb-task', wt))
+        assert worker.snapshot()['depth'] > 0
+
+        interval = worker._heartbeat_interval_s  # 300s == 10 polls
+        fired: list[int] = []
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            for i in range(100):
+                if worker._maybe_log_queue_heartbeat(self._NOW + i * self._POLL_S):
+                    fired.append(i)
+
+        beats = [
+            r for r in caplog.records
+            if r.getMessage().startswith('merge queue heartbeat: ')
+        ]
+        assert len(beats) == len(fired), 'one heartbeat line per firing poll'
+        assert all(r.levelno == logging.INFO for r in beats)
+        # Its cadence is its OWN interval, untouched by the audit's schedule.
+        assert fired[0] == 0
+        for previous, current in zip(fired, fired[1:], strict=False):
+            assert (current - previous) * self._POLL_S >= interval
+        assert len(fired) == 100 * self._POLL_S // interval, (
+            f'expected one beat per {interval}s over 3000s, got {fired}'
+        )
+
+    def test_the_audit_methods_still_run_on_every_single_heartbeat(
+        self, git_ops: GitOps, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """(c) Suppression is of the LOG, never of the CHECK.
+
+        test_merge_queue_concurrent_verify.py relies on this property, and
+        snapshot()['resource_audit'] would go stale without it.
+        """
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-leak', mtime=self._NOW - self._IN_BAND_AGE)
+
+        spec_calls = 0
+        wt_calls = 0
+        real_spec = worker.speculation_accounting_violations
+        real_wt = worker.worktree_ledger_violations
+
+        def _counting_spec() -> list[str]:
+            nonlocal spec_calls
+            spec_calls += 1
+            return real_spec()
+
+        def _counting_wt(**kwargs) -> list[str]:
+            nonlocal wt_calls
+            wt_calls += 1
+            return real_wt(**kwargs)
+
+        monkeypatch.setattr(worker, 'speculation_accounting_violations', _counting_spec)
+        monkeypatch.setattr(worker, 'worktree_ledger_violations', _counting_wt)
+
+        for i in range(512):
+            worker._maybe_log_queue_heartbeat(self._NOW + i * self._POLL_S)
+
+        assert spec_calls >= 512, (
+            f'the permit audit must run on every heartbeat, ran {spec_calls}'
+        )
+        assert wt_calls >= 512, (
+            f'the worktree audit must run on every heartbeat, ran {wt_calls}'
+        )
