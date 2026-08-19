@@ -6815,34 +6815,19 @@ class TestRunCancellationReapsChild:
 
     async def test_timeout_kills_and_reaps_hung_child(self, tmp_path: Path) -> None:
         pid_file = tmp_path / 'child.pid'
-        # A child that records its own pid then sleeps far longer than the
-        # wait_for timeout below — simulates a persistently-hung script.
-        # The pid is written to a sibling .tmp file and atomically renamed
-        # into place so `pid_file` only ever appears fully written (task
-        # 3851) — see _wait_for_child_pid.
-        script = (
-            'import os, time, sys\n'
-            f"tmp = {str(pid_file)!r} + '.tmp'\n"
-            "open(tmp, 'w').write(str(os.getpid()))\n"
-            f"os.replace(tmp, {str(pid_file)!r})\n"
-            'time.sleep(60)\n'
-        )
-        # The deadline must outlast the child's interpreter startup, or the
-        # child is cancelled before it ever publishes its pid and the poll
-        # below fails as 'child never started'. Measured on a loaded box:
-        # 1.0s missed the pid in 39/40 trials, 3.0s in 12/40, 5.0s in 0/40.
-        # The child sleeps 60s, so a 5.0s deadline still cancels _run with the
-        # child very much alive — which is what this test is about.
+        task, child_pid = await _start_hung_child(pid_file)
+
+        # The wait_for-shaped caller this test exists to model
+        # (delivered_checks._run_script_check) — but driven against an
+        # ALREADY-STARTED future. The child is confirmed alive before the clock
+        # starts, so _CANCEL_TIMEOUT never has to outlast interpreter startup;
+        # it only has to be shorter than the child's 60s sleep. That removed a
+        # fixed 5.0s from every run and the load-sensitive miss with it (task 4109).
         with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(
-                _run(['python3', '-c', script]), timeout=5.0
-            )
+            await asyncio.wait_for(task, timeout=_CANCEL_TIMEOUT)
 
-        # Wait for the child to have written its pid (should be near-instant).
-        child_pid = await _wait_for_child_pid(pid_file)
-
-        # The cancelled _run must have killed + reaped the child by now — no
-        # zombie, no orphan still sleeping.
+        # The cancelled _run must have killed + reaped the child — no zombie,
+        # no orphan still sleeping.
         await _assert_child_reaped(child_pid)
 
     async def test_cancelled_error_kills_and_reaps_child(self, tmp_path: Path) -> None:
