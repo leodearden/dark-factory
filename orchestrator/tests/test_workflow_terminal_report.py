@@ -132,6 +132,36 @@ class TestTerminalReportValueType:
         )
         assert report_omitted.blocked_from_phase is None
 
+    def test_api_error_status_round_trips_and_defaults_to_none(self):
+        """Task 3315 / PRD contract C2: ``api_error_status`` carries the
+        STRUCTURED 5xx evidence (from ``AgentResult.api_error_status`` via
+        ``classify_agent_failure``) as the primary transient-routing signal,
+        replacing regex-over-prose (INV-1).  It round-trips, defaults to None
+        when omitted (additive — every pre-existing construction site is
+        unchanged), and is frozen like every other field on this value type.
+        """
+        report = TerminalReport(
+            outcome=WorkflowOutcome.REQUEUED,
+            reason='implementer produced zero output',
+            phase=WorkflowState.EXECUTE,
+            detail='d',
+            category=None,
+            api_error_status=529,
+        )
+        assert report.api_error_status == 529
+
+        report_omitted = TerminalReport(
+            outcome=WorkflowOutcome.DONE,
+            reason='',
+            phase=WorkflowState.DONE,
+            detail='',
+            category=None,
+        )
+        assert report_omitted.api_error_status is None
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            report.api_error_status = 500  # type: ignore[misc]
+
 
 # ---------------------------------------------------------------------------
 # Fixtures for the e2e-style block paths (mirrors test_workflow_e2e.py /
