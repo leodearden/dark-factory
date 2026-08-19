@@ -455,12 +455,27 @@ def _cycle_summary_ledger_write_missing(report: object, stage_prefix: str) -> bo
 
     *stage_prefix* is ``'stage1'`` or ``'stage2'``, selecting the
     ``<prefix>_cycle_summary_ledger_written`` /
-    ``<prefix>_cycle_summary_degraded_backstop`` stat names.
+    ``<prefix>_cycle_summary_degraded_backstop`` /
+    ``<prefix>_cycle_summary_write_recovered_backstop`` stat names.
     """
     stats = getattr(report, 'stats', None)
     if not isinstance(stats, dict):
         return False
     if stats.get(f'{stage_prefix}_cycle_summary_degraded_backstop') is True:
+        return False
+    if stats.get(f'{stage_prefix}_cycle_summary_write_recovered_backstop') is True:
+        # Task 4186: the write-recovered arm has already re-attempted AND
+        # CONFIRMED a landed row for this identity — it leaves
+        # ``<prefix>_cycle_summary_ledger_written`` at its in-stage 0 by
+        # design, so without this clause the driver's ``finally`` would
+        # re-fire the arm after the pre-Stage-3 flush (the caller that makes
+        # a pre-``finally`` marker reachable at all) already recovered it:
+        # duplicating the best-effort Mem0 mirror write and the pool-cap
+        # trim, and logging a second, misleading
+        # ``..._cycle_summary_write_recovered`` WARNING for one recovery.
+        # ``is True`` ONLY — a ``False``/absent marker means the attempt did
+        # not confirm (writer returned falsy or raised), so the ``finally``
+        # must still get its last chance.
         return False
     return stats.get(f'{stage_prefix}_cycle_summary_ledger_written') == 0
 
@@ -488,6 +503,13 @@ def _stage1_ledger_write_missing(report: object) -> bool:
     ``stats['stage1_cycle_summary_degraded_backstop'] = True``), so the two
     arms of ``_ensure_stage1_cycle_summary`` can never double-process the
     same run.
+
+    Likewise excludes a report whose write-recovery already CONFIRMED a
+    landed row (``stats['stage1_cycle_summary_write_recovered_backstop'] is
+    True``, task 4186), so the driver's ``finally`` does not re-fire the arm
+    after the pre-Stage-3 flush recovered it. ``is True`` only: a ``False``
+    marker means that attempt did not confirm, and the ``finally`` keeps its
+    last chance.
 
     Returns False for anything whose ``.stats`` isn't a dict — including a
     non-``StageReport`` object (e.g. a plain dict, the shape
@@ -527,6 +549,13 @@ def _stage2_ledger_write_missing(report: object) -> bool:
     (stamped ``stats['stage2_cycle_summary_degraded_backstop'] = True``), so
     the two arms of ``_ensure_stage2_cycle_summary`` can never double-process
     the same run.
+
+    Likewise excludes a report whose write-recovery already CONFIRMED a
+    landed row (``stats['stage2_cycle_summary_write_recovered_backstop'] is
+    True``, task 4186), so the driver's ``finally`` does not re-fire the arm
+    after the pre-Stage-3 flush recovered it. ``is True`` only: a ``False``
+    marker means that attempt did not confirm, and the ``finally`` keeps its
+    last chance.
 
     Returns False for anything whose ``.stats`` isn't a dict — including a
     non-``StageReport`` object (e.g. a plain dict, the shape
@@ -3502,6 +3531,14 @@ class ReconciliationHarness:
         ``get_cycle_summary_presence`` reads — neither marker, and not
         ``<prefix>_cycle_summary_ledger_written``, which is left at its
         in-stage value of 0 either way.
+
+        Task 4186 gave the live report's marker a second reader: it is now
+        READ BACK by :func:`_cycle_summary_ledger_write_missing` as the
+        "already recovered, do not re-fire" gate, so the driver's ``finally``
+        no-ops after the pre-Stage-3 flush confirmed a row. That is precisely
+        why the live report must keep being stamped with only the CONFIRMED
+        outcome: an over-claiming ``True`` would suppress the ``finally``'s
+        last-chance re-attempt for a row that never landed.
         """
         marker = f'{stage_prefix}_cycle_summary_write_recovered_backstop'
         stamped = report.model_copy(
