@@ -2147,40 +2147,160 @@ def test_kill_holder_tree_never_signals_the_callers_own_process_group():
 
 
 def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
-    """kill_holder_tree must never raise, even against an already-reaped leader.
+    """An already-reaped leader means proc.pid is a FREE pid -- signal NOTHING.
 
-    Teardown code that raises MASKS the real test failure it was cleaning
-    up after, converting a legible AssertionError into a confusing
-    error-in-finally.  Two cases, both against a leader that has ALREADY
-    exited and been reaped:
+    Four converted call sites reap the leader with ``wait()`` inside their
+    ``try`` block BEFORE the ``finally`` runs ``kill_holder_tree`` (:2478,
+    :2668, :2826, :2905) -- so on their GREEN path ``proc.pid`` no longer
+    refers to the holder at all by the time this helper runs.
+    ``os.getpgid(proc.pid)`` and ``collect_descendants(proc.pid, ...)``
+    would then describe whatever process happens to OWN that pid now, and
+    every descendant of that stranger would be SIGKILLed (and killpg'd by
+    the backstop, if it happened to be its own group leader).  This is not
+    theoretical: pid recycling is observed on this fleet
+    (verify_cancel.py:313-315 -- pid_max=4194304, and the laptop's own pid
+    counter demonstrably wrapped on 2026-08-11).
 
-    (a) the real ``os.getpgid``/``read_ppid_map`` path against a pid that no
-        longer refers to a live process -- ``getpgid`` raises
-        ``ProcessLookupError`` and the pid is simply absent from the ppid
-        map ``collect_descendants`` walks.
+    Three cases; (a) and (b) share ONE already-reaped leader:
 
-    (b) an injected ``_ppid_map_provider`` that raises ``OSError``, modeling
-        a ``/proc`` read losing a race with process exit.
+    (a) REAL-PATH no-signal contract: every seam is spied rather than
+        faked, and NONE may fire -- in particular the ppid-map provider
+        must never be CALLED AT ALL, which is what proves the short
+        circuit lands before the snapshot phase rather than merely seeing
+        a map with no descendants in it.  Also pins that the early-return
+        path still closes stdin, since the lane-lock site (:3157)
+        delegates its stdin cleanup to this helper.
 
-    No ``pytest.raises`` here on purpose: if either call raises, pytest
-    reports this test as failed/errored, which is exactly the "no
-    exception escapes" assertion the plan calls for.
+    (b) PID-REUSE MODEL -- the case that makes this RED non-vacuous.
+        Against a reaped leader the REAL ``/proc`` map almost always has
+        no descendants, so asserting against it would pass by luck even
+        without the short circuit.  A SYNTHETIC ppid map gives the reaped
+        (free) pid fabricated children, modeling a stranger process
+        reusing that pid -- ``collect_descendants`` accepts any dict and
+        is cycle-safe (verify_cancel.py:197), and every pid is fake with
+        ``_kill`` spied, so this can never signal a real process even if
+        the guard under test is missing.
+
+    (c) the OSError-degradation coverage (a)/(b) can no longer reach once
+        the short circuit exists, since it never gets far enough to call
+        the ppid-map provider -- moved onto a LIVE leader so the
+        ``except OSError: ppid_map = {}`` branch stays under test.
     """
-    leader = subprocess.Popen([sys.executable, '-c', 'pass'])
+    # (a) + (b): one already-reaped leader, shared.
+    leader = subprocess.Popen([sys.executable, '-c', 'pass'], stdin=subprocess.PIPE)
     leader.wait(timeout=10)
 
-    # (a) real getpgid / real ppid map against an already-reaped leader.
-    kill_holder_tree(leader, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
+    # (a) REAL-PATH: every seam spied; none may fire for an already-reaped
+    # leader, and the ppid-map provider must not even be CALLED.
+    kill_calls_a: list[tuple[int, int]] = []
+    killpg_calls_a: list[tuple[int, int]] = []
+    ppid_map_call_count = [0]
 
-    # (b) an injected ppid-map provider that raises OSError must not escape.
-    def raising_ppid_map_provider():
-        raise OSError('simulated /proc read racing process exit')
+    def kill_spy_a(pid, sig):
+        kill_calls_a.append((pid, sig))
+
+    def killpg_spy_a(pgid, sig):
+        killpg_calls_a.append((pgid, sig))
+
+    def ppid_map_spy_a():
+        ppid_map_call_count[0] += 1
+        return {}
 
     kill_holder_tree(
         leader,
         timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS,
-        _ppid_map_provider=raising_ppid_map_provider,
+        _ppid_map_provider=ppid_map_spy_a,
+        _kill=kill_spy_a,
+        _killpg=killpg_spy_a,
     )
+
+    assert kill_calls_a == [], (
+        f'kill_holder_tree signalled pid(s) {kill_calls_a} for an '
+        f'already-reaped leader -- proc.pid is FREE, so this can only '
+        f'reach an unrelated stranger process'
+    )
+    assert killpg_calls_a == [], (
+        f'kill_holder_tree called killpg{killpg_calls_a} for an '
+        f'already-reaped leader'
+    )
+    assert ppid_map_call_count[0] == 0, (
+        'kill_holder_tree consulted the ppid-map provider for an '
+        'already-reaped leader -- the short circuit must land BEFORE the '
+        'snapshot phase, not merely happen to see a map with no '
+        'descendants in it'
+    )
+    assert leader.stdin is not None and leader.stdin.closed, (
+        'kill_holder_tree must still close stdin on the already-reaped '
+        'early-return path -- the lane-lock site (:3157) delegates its '
+        'stdin cleanup to this helper'
+    )
+
+    # (b) PID-REUSE MODEL: a synthetic ppid map gives the reaped (free)
+    # leader pid fabricated children, modeling a stranger process reusing
+    # that pid.  Every pid below is fake and _kill/_killpg stay spied, so
+    # this can never signal a real process.
+    synthetic_ppid_map = {
+        leader.pid: 1,
+        99990001: leader.pid,
+        99990002: 99990001,
+    }
+    kill_calls_b: list[tuple[int, int]] = []
+    killpg_calls_b: list[tuple[int, int]] = []
+
+    def kill_spy_b(pid, sig):
+        kill_calls_b.append((pid, sig))
+
+    def killpg_spy_b(pgid, sig):
+        killpg_calls_b.append((pgid, sig))
+
+    kill_holder_tree(
+        leader,
+        timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS,
+        _ppid_map_provider=lambda: synthetic_ppid_map,
+        _kill=kill_spy_b,
+        _killpg=killpg_spy_b,
+    )
+
+    assert kill_calls_b == [], (
+        f'kill_holder_tree signalled fabricated pid(s) {kill_calls_b}, '
+        f"reachable only through a stranger's reuse of the reaped "
+        f"leader's pid {leader.pid} -- an already-reaped leader must "
+        f'signal NOTHING'
+    )
+    assert killpg_calls_b == [], (
+        f'kill_holder_tree called killpg{killpg_calls_b} against a '
+        f"stranger's fabricated process group for an already-reaped "
+        f'leader'
+    )
+
+    # (c) OSError-degradation coverage, moved onto a LIVE leader: once (a)
+    # short-circuits before ever calling the ppid-map provider, a reaped
+    # leader can no longer exercise the `except OSError: ppid_map = {}`
+    # guard.  _kill is deliberately left as the REAL os.kill here so the
+    # leader is genuinely SIGKILLed and reaped fast, well inside the 5.0s
+    # ceiling -- spying it would leave the process alive for the whole
+    # timeout and emit the "did not exit" warning instead.
+    def raising_ppid_map_provider():
+        raise OSError('simulated /proc read racing process exit')
+
+    live_leader = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(300)'],
+    )
+    try:
+        kill_holder_tree(
+            live_leader,
+            timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS,
+            _ppid_map_provider=raising_ppid_map_provider,
+        )
+        assert live_leader.poll() is not None, (
+            'kill_holder_tree must still reap a LIVE leader when the '
+            'ppid-map provider raises OSError (a /proc read racing '
+            'process exit)'
+        )
+    finally:
+        if live_leader.poll() is None:
+            live_leader.kill()
+            live_leader.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------
