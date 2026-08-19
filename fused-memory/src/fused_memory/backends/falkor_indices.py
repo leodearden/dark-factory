@@ -120,7 +120,7 @@ and a ``RELATES_TO(uuid)`` range index already present):
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
 from graphiti_core.driver.driver import GraphProvider
@@ -421,39 +421,34 @@ class IndexRecordShapeError(ValueError):
     """
 
 
-def normalize_index_record(record) -> list[IndexSpec]:
-    """Project one ``list_indices()`` record onto the normal form.
+def _iter_record_properties(record) -> Iterator[tuple[str, str, str, list[str]]]:
+    """Validate ONE ``list_indices()`` record's shape and walk its properties.
 
-    Fan-out is driven by the record's ``field`` list (the authoritative property
-    membership), with each property's index types read from the ``type`` mapping.
-    Driving it off ``type.keys()`` instead would silently under-report if the two
-    ever disagreed — the same class of silent-omission bug this module exists to
-    catch.  Measured live 2026-08-06, the two are keyed identically today; the
-    raise below makes any future divergence loud.
+    The single home of the record SHAPE contract, shared by both public readers
+    (:func:`normalize_index_record` and :func:`vector_index_properties`).  They
+    differ only in the per-property PREDICATE they apply to ``raw_types``; every
+    guard below is identical for both, and duplicating them let the two copies
+    drift — a tightened guard or a corrected message applied to one would silently
+    leave the other on the old contract.  That is the same re-forking failure mode
+    :func:`resolve_header_positions` exists to end for the header read.
 
-    Because FalkorDB merges every index on a label into ONE record, emission is
-    one spec per (property, index_type) pair: an ``Entity`` record carrying
-    ``name: ['RANGE', 'FULLTEXT']`` correctly yields both tuples.
+    Guards, in order: ``label`` is a non-empty string, ``entity_type`` is a valid
+    one, ``field`` is a non-empty sequence (a bare string degrades to one
+    property), and every property in ``field`` has an entry in ``type``.  Each
+    refuses rather than projecting to nothing, because a record that reports no
+    properties reads as "nothing indexed here" — which under-reports the drift
+    diff and leaves vector indices undropped.
 
-    Args:
-        record: A mapping with ``label``, ``entity_type``, ``field`` and ``type``
-            keys, as returned by ``GraphitiBackend.list_indices()``.
-
-    Returns:
-        One spec per (property, representable index type) pair.  May legitimately
-        be empty — e.g. a VECTOR-only record.
+    Yields:
+        ``(label, entity_type, prop, raw_types)`` per property in ``field`` order,
+        with ``raw_types`` always a list (a scalar ``type`` value is wrapped).
 
     Raises:
-        IndexRecordShapeError: ``label`` is not a non-empty string,
-            ``entity_type`` is not ``'NODE'``/``'RELATIONSHIP'``, ``field`` is
-            neither a string nor a non-empty list, or a property in ``field``
-            has no entry in ``type``.
+        IndexRecordShapeError: on any of the shape violations above.
     """
     label = record.get('label')
     entity_type = record.get('entity_type')
 
-    # Symmetric with the entity_type check below, and for the same reason: a
-    # column mis-binding is the failure class this module exists to catch, and
     # `label` is just as bindable to the wrong column as `entity_type` was.
     # Without this, a dict label sails through and the emitted tuple is only
     # rejected later by `normalize_index_records`' set comprehension, as
@@ -473,7 +468,10 @@ def normalize_index_record(record) -> list[IndexSpec]:
     # The isinstance check is load-bearing, not defensive noise -- the value this
     # is most likely to receive IS a dict (the options column), and a bare
     # `not in frozenset` would raise TypeError: unhashable type instead of the
-    # IndexRecordShapeError that names what actually went wrong.
+    # IndexRecordShapeError that names what actually went wrong.  It is also
+    # load-bearing DOWNSTREAM: entity_type selects the DROP statement shape, and
+    # measured 2026-08-16 the node form against a RELATIONSHIP vector index fails
+    # with `no such index` -- a drop that reports success while dropping nothing.
     if not isinstance(entity_type, str) or entity_type not in _VALID_ENTITY_TYPES:
         raise IndexRecordShapeError(
             f'index record for label {label!r} has entity_type {entity_type!r}, '
@@ -485,45 +483,128 @@ def normalize_index_record(record) -> list[IndexSpec]:
 
     fields = record.get('field')
     # A bare str is accepted as a single-element list so a future FalkorDB scalar
-    # shape degrades to "one property" rather than silently to zero tuples.
+    # shape degrades to "one property" rather than silently to zero properties.
     if isinstance(fields, str):
         fields = [fields]
     # Anything else RAISES, including a missing/None field list.  Projecting it
-    # to zero tuples would be strictly worse than the divergence the next block
+    # to nothing would be strictly worse than the divergence the next block
     # already refuses to tolerate: that one drops ONE property, this drops ALL of
-    # them, and the consequence flows straight into β -- a fully-provisioned
+    # them.  The consequence flows straight into both readers -- a fully-provisioned
     # label comes back as entirely missing and β re-creates indices that already
-    # exist.  MEASURED 2026-08-06: the live `properties` column is always a list,
-    # even on a graph with zero indices, so tolerating None buys nothing real.
+    # exist, and every vector index on the label is left undropped while the
+    # caller reports a clean drop.  MEASURED 2026-08-06: the live `properties`
+    # column is always a list, even on a graph with zero indices, so tolerating
+    # None buys nothing real.
     elif not isinstance(fields, Sequence) or not fields:
         raise IndexRecordShapeError(
             f'index record for label {label!r} has field {fields!r}, expected a '
             'non-empty list of property names (or a single property string). '
-            'Refusing to project it to zero tuples: that silently reports every '
-            'index on this label as missing. '
+            'Refusing to project it to zero properties: that silently reports '
+            'every index on this label as missing, and leaves every vector index '
+            'on it undropped. '
             f'Record: {record!r}'
         )
 
     types = record.get('type') or {}
 
-    specs: list[IndexSpec] = []
     for prop in fields:
         if prop not in types:
             raise IndexRecordShapeError(
                 f'property {prop!r} is listed in the field list of the {label!r} '
                 f'index record but has no entry in its type mapping '
-                f'({sorted(types)}). Refusing to drop it: a dropped property '
-                'silently under-reports what is actually indexed. '
+                f'({sorted(types)}). Refusing to skip it: a skipped property '
+                'silently under-reports what is actually indexed, and can leave a '
+                'vector index in place while the caller reports a clean drop. '
                 f'Record: {record!r}'
             )
         raw_types = types[prop]
         if isinstance(raw_types, str):
             raw_types = [raw_types]
+        yield label, entity_type, prop, raw_types
+
+
+def normalize_index_record(record) -> list[IndexSpec]:
+    """Project one ``list_indices()`` record onto the normal form.
+
+    Fan-out is driven by the record's ``field`` list (the authoritative property
+    membership), with each property's index types read from the ``type`` mapping.
+    Driving it off ``type.keys()`` instead would silently under-report if the two
+    ever disagreed — the same class of silent-omission bug this module exists to
+    catch.  Measured live 2026-08-06, the two are keyed identically today;
+    :func:`_iter_record_properties` — which owns the shape guards shared with
+    :func:`vector_index_properties` — makes any future divergence loud.
+
+    Because FalkorDB merges every index on a label into ONE record, emission is
+    one spec per (property, index_type) pair: an ``Entity`` record carrying
+    ``name: ['RANGE', 'FULLTEXT']`` correctly yields both tuples.
+
+    Args:
+        record: A mapping with ``label``, ``entity_type``, ``field`` and ``type``
+            keys, as returned by ``GraphitiBackend.list_indices()``.
+
+    Returns:
+        One spec per (property, representable index type) pair.  May legitimately
+        be empty — e.g. a VECTOR-only record.
+
+    Raises:
+        IndexRecordShapeError: ``label`` is not a non-empty string,
+            ``entity_type`` is not ``'NODE'``/``'RELATIONSHIP'``, ``field`` is
+            neither a string nor a non-empty list, or a property in ``field``
+            has no entry in ``type``.
+    """
+    specs: list[IndexSpec] = []
+    for label, entity_type, prop, raw_types in _iter_record_properties(record):
         for index_type in raw_types:
             # Unrepresentable types (VECTOR) are projected away, NOT raised on.
             if index_type in _REPRESENTABLE_INDEX_TYPES:
                 specs.append((label, entity_type, prop, index_type))
     return specs
+
+
+def vector_index_properties(record) -> list[str]:
+    """Return the properties of ONE ``list_indices()`` record carrying a VECTOR index.
+
+    The structural twin of :func:`normalize_index_record`, and deliberately a
+    SEPARATE function rather than a flag on it.  That one PROJECTS VECTOR AWAY by
+    design — ``_REPRESENTABLE_INDEX_TYPES = {'RANGE', 'FULLTEXT'}`` — because
+    VECTOR is unrepresentable in the PRD normal form and raising on it would make
+    the drift detector a false-alarm generator on every real graph.  A function
+    whose defining behaviour is discarding VECTOR can never be the VECTOR
+    detector, so the detector lives here.
+
+    Selection is ``'VECTOR' in raw_types`` — MEMBERSHIP, never ``== 'VECTOR'``
+    and never list equality.  MEASURED 2026-08-16 on throwaway graph
+    ``_impl3769_probe``: one property can carry BOTH types (``{name: ['RANGE',
+    'VECTOR']}``), and ``DROP VECTOR INDEX`` surgically removes only the VECTOR
+    half, leaving ``{name: ['RANGE']}``.  An ``== ['VECTOR']`` predicate would
+    silently skip exactly those mixed properties.
+
+    Shape validation and the ``field``-driven fan-out are shared with
+    :func:`normalize_index_record` via :func:`_iter_record_properties`; only the
+    per-property predicate differs.  See
+    :meth:`GraphitiBackend.drop_vector_indices` for the defect this replaced.
+
+    Args:
+        record: A mapping with ``label``, ``entity_type``, ``field`` and ``type``
+            keys, as returned by ``GraphitiBackend.list_indices()``.  Note that
+            FalkorDB MERGES every index on a label into ONE record, so a single
+            record routinely carries a mix of VECTOR and RANGE properties.
+
+    Returns:
+        The subset of ``field``, in ``field`` order, whose ``type`` entry contains
+        ``'VECTOR'``.  Legitimately empty for a RANGE/FULLTEXT-only record.
+
+    Raises:
+        IndexRecordShapeError: ``label`` is not a non-empty string,
+            ``entity_type`` is not ``'NODE'``/``'RELATIONSHIP'``, ``field`` is
+            neither a string nor a non-empty list, or a property in ``field`` has
+            no entry in ``type``.
+    """
+    return [
+        prop
+        for _label, _entity_type, prop, raw_types in _iter_record_properties(record)
+        if 'VECTOR' in raw_types
+    ]
 
 
 def normalize_index_records(records) -> set[IndexSpec]:
@@ -652,6 +733,65 @@ def range_create_statement(spec: IndexSpec) -> str:
         f'expected one of {sorted(_VALID_ENTITY_TYPES)}. Refusing to guess the '
         'statement shape: a wrong guess creates an index on the wrong thing, '
         'which the diff then reports as permanently missing.'
+    )
+
+
+def vector_drop_statement(label: str, prop: str, *, entity_type: str) -> str:
+    """Build the per-property VECTOR DROP statement for one indexed property.
+
+    MEASURED 2026-08-16 on throwaway graph ``_impl3769_probe`` (seeded, probed,
+    then ``GRAPH.DELETE``'d):
+
+    * ``DROP VECTOR INDEX FOR (n:Entity) ON (n.emb)`` returns
+      ``Indices deleted: 1``.
+    * ``DROP VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding)`` also
+      returns ``Indices deleted: 1``, while the NODE form against that same
+      relationship index fails with ``no such index``.  Graphiti indexes
+      ``fact_embedding`` on RELATES_TO edges and ``name_embedding`` on Entity
+      nodes, so both branches are live in production.
+    * ``DROP INDEX ON :Entity(emb)`` — the old-style form
+      ``GraphitiBackend.drop_index()`` issues — FAILS against a live VECTOR index
+      with ``ERR Unable to drop index on :Entity(emb): no such index.``  That form
+      targets RANGE only, which is why VECTOR needs its own builder rather than
+      reusing ``drop_index``.  See :meth:`GraphitiBackend.drop_vector_indices`
+      for the full defect history (task 3769).
+
+    ``falkordb``'s own client builds the identical statements
+    (``falkordb/asyncio/graph.py``, ``drop_node_vector_index`` /
+    ``drop_edge_vector_index``), independently corroborating the form — but it
+    speaks ``NODE``/``EDGE`` where this module's normal form speaks
+    ``NODE``/``RELATIONSHIP``, which is why the statement is synthesized here
+    rather than delegated: routing through the client would leave the emitted
+    statement unpinnable and leak the vocabulary mismatch into the backend.
+
+    Args:
+        label: The node label or relationship type carrying the index.
+        prop: A SINGLE property name.  Single-property by construction, matching
+            :func:`range_create_statement` and the per-property fan-out
+            :func:`vector_index_properties` produces.
+        entity_type: ``'NODE'`` or ``'RELATIONSHIP'``.  KEYWORD-ONLY, and
+            deliberately so: it and *prop* are both plain ``str``, so a positional
+            swap would type-check and only ONE direction of it raises.  The same
+            ordering holds on :meth:`GraphitiBackend.drop_vector_index`, which
+            wraps this — ``(label, field)`` positional, ``entity_type`` by keyword
+            — so no call site has to re-order arguments to reach the other.
+
+    Returns:
+        The measured-working DROP statement.
+
+    Raises:
+        ValueError: *entity_type* is not ``'NODE'``/``'RELATIONSHIP'``.
+    """
+    if entity_type == 'NODE':
+        return f'DROP VECTOR INDEX FOR (n:{label}) ON (n.{prop})'
+    if entity_type == 'RELATIONSHIP':
+        return f'DROP VECTOR INDEX FOR ()-[e:{label}]-() ON (e.{prop})'
+    raise ValueError(
+        f'vector_drop_statement() got entity_type {entity_type!r} for '
+        f'{label!r}.{prop!r}, expected one of {sorted(_VALID_ENTITY_TYPES)}. '
+        'Refusing to guess the statement shape: a wrong guess drops NOTHING '
+        '(measured: the node form against a relationship vector index fails with '
+        '"no such index") while the caller reports a successful drop.'
     )
 
 

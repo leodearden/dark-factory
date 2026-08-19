@@ -396,6 +396,13 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
     output, rather than propagating ``TimeoutExpired`` (whose stdout/stderr hang
     off the exception object), so the hang path produces the same
     failure-with-captured-tail shape the module docstring and README promise.
+
+    The other half of that contract is that the pgid is FROZEN at spawn rather
+    than re-derived at kill time — see ``shared/src/shared/proc_group.py``'s
+    module docstring for why ``os.getpgid(proc.pid)`` in a kill path is the
+    task-845 footgun — and that the frozen number is only dispatched while the
+    leader is still unreaped, since a reaped pid may be recycled onto an
+    unrelated group.
     """
     with subprocess.Popen(
         ['bash', str(BASH_TEST_DIR / name)],
@@ -406,13 +413,42 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
         env=_sanitized_env(),
         start_new_session=True,
     ) as proc:
+        # Frozen at spawn: start_new_session=True makes proc its own group
+        # leader, so pgid == proc.pid by POSIX guarantee.  Re-reading it at kill
+        # time with os.getpgid would be the task-845 footgun — a reaped pid can
+        # be recycled onto an unrelated group (in the original incidents, the
+        # user's `systemd --user` group, killing the whole login session).
+        pgid = proc.pid
         try:
             stdout, stderr = proc.communicate(timeout=SUBPROC_TIMEOUT)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):  # pragma: no cover
-                proc.kill()
+            # The other half of the frozen-pgid contract: a frozen pgid is only
+            # safe while its leader is UNREAPED, because the number itself goes
+            # stale the moment the kernel may recycle that pid.  So dispatch no
+            # signal at all once the process has been reaped, mirroring
+            # `shared.proc_group.terminate_process_group` step 1 and
+            # `deterministic_runner._terminate_process_tree`.
+            #
+            # `Popen.communicate(timeout=...)` deliberately does NOT reap on
+            # timeout, so `returncode` is normally None here and the kill still
+            # dispatches.  Read `returncode` (a plain attribute) and NOT
+            # `poll()`: `poll()` is not a read of existing state, it calls
+            # `waitpid(WNOHANG)` and REAPS an exited leader — which would then
+            # suppress the very killpg this path exists for.  That matters
+            # concretely: a suite whose bash leader exits while a backgrounded
+            # helper (`( flock -x 9 && ... sleep 300 ) &`) still holds the stdout
+            # pipe open times out with the leader an unreaped zombie whose pid
+            # the kernel cannot recycle — so the frozen pgid is still valid and
+            # the group must be killed, or the helper holds a lane flock for
+            # minutes and turns one timeout into a cascade.  This spelling is a
+            # literal mirror of `deterministic_runner._terminate_process_tree`,
+            # so both sites this task closed enforce the same two-part rule the
+            # killpg guard's failure message states.
+            if proc.returncode is None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):  # pragma: no cover
+                    proc.kill()
             # ``Popen.communicate``'s ``TimeoutExpired`` carries no output (only
             # ``subprocess.run`` repopulates it), so the resumed call is what
             # recovers the captured tail.  Bounded: a pipe held open by a
