@@ -3767,7 +3767,10 @@ class TestConflictingTaskStatusFraming:
         claim is contingent, and it was already falsified once: the task 3403
         review found services/completion_claim_gate.py importing the same
         constant while durably tagging episodes and filing operator
-        escalations. That consumer now keeps its own _CLAUSE_BOUNDARY_RE.
+        escalations. That consumer now takes STRICT_CLAUSE_BOUNDARY_RE, the
+        narrow variant task_filter exports for exactly this case, and the
+        consumer set is enforced rather than merely asserted here — see
+        TestClauseSplitRe.test_clause_split_re_has_no_out_of_module_consumers.
 
         Suppressing the over-fire here instead would require nearest-ref
         proximity binding, a redesign of the association algorithm and a far
