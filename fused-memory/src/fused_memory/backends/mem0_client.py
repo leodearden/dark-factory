@@ -958,7 +958,7 @@ class Mem0Backend:
         full-enumeration callers sit on top of it:
         :meth:`scroll_all_by_metadata` (Scope+filter-addressed, normalised
         records — what ``scripts/census_memory_metadata.py`` drives) and
-        ``scripts/consolidate_namespace_families.scroll_collection_points``
+        ``scripts/consolidate_namespace_families.merge_collection``
         (raw points, no filter — which enters at THIS layer).
 
         Deliberately collection-name-addressed rather than

@@ -1184,202 +1184,216 @@ class TestCliParser:
 
 
 # ===========================================================================
-# Tests: scroll_collection_points
+# Tests: preflight_collection_points
 # ===========================================================================
 
-class TestScrollCollectionPoints:
-    """async scroll_collection_points(backend, collection, *, page_size, max_pages)
-    -> (point_count, capped).
+class TestPreflightCollectionPoints:
+    """async preflight_collection_points(qdrant_client, collection, *,
+    page_size, max_pages) -> (point_count | None, capped).
 
     This is the read-only PREFLIGHT: it establishes ``point_count`` for the
-    report and ``capped`` for run()'s ``if args.apply and not capped`` guard,
-    and it holds NO point list -- peak memory is O(1) regardless of
-    collection size.  merge_collection performs the sole with-vectors drain.
+    report and ``capped`` for run()'s ``if args.apply and not capped`` guard.
+    It is O(1) -- ONE count round-trip through the module's own
+    ``count_collection_points`` -- not a paged scroll.  It used to drain
+    ``Mem0Backend.scroll_collection_pages`` page by page purely to fold the
+    points into a counter, which cost a round-trip per page and, under
+    --apply, enumerated every collection TWICE (here and again in
+    merge_collection).  merge_collection performs the pass's sole drain.
 
-    Task 3225: this used to issue exactly ONE scroll and discard
-    ``next_offset``, so a collection larger than --limit was permanently
-    reported UNRESOLVED and never migrated.  It now drains
-    ``Mem0Backend.scroll_collection_pages``, which pages properly -- a real
-    bug fix, not a refactor.
-
-    ``capped`` can no longer be inferred from the count (a fully-drained
-    multi-page scroll returns any count), so it is RETURNED explicitly.
+    ``capped`` is still returned explicitly rather than inferred by the
+    caller, because it is a verdict about a BUDGET (--limit x --max-pages),
+    not about the count alone.
     """
 
-    @pytest.mark.asyncio
-    async def test_counts_every_point_across_multiple_pages(self):
-        """THE 3225 bug fix, preserved: page 2+ is still counted instead of
-        being silently dropped."""
-        p1, p2, p3 = _make_point('p1'), _make_point('p2'), _make_point('p3')
-        backend = _make_backend_pager([[p1, p2], [p3]])
-
-        point_count, capped = await _mod.scroll_collection_points(
-            backend, 'reify_reify', page_size=2,
-        )
-
-        assert point_count == 3, 'a 2-page stream must count all 3 points'
-        assert capped is False
+    @staticmethod
+    def _client(count=0, exc=None):
+        """AsyncQdrantClient stand-in exposing count() only -- the preflight
+        must not touch scroll() at all."""
+        client = AsyncMock()
+        if exc is not None:
+            client.count = AsyncMock(side_effect=exc)
+        else:
+            client.count = AsyncMock(return_value=_make_count_result(count))
+        client.scroll = AsyncMock(return_value=([], None))
+        return client
 
     @pytest.mark.asyncio
-    async def test_does_not_request_vectors(self):
-        """POLARITY FLIP: the preflight must NOT fetch embeddings.
+    async def test_counts_via_the_count_api_not_a_paged_scroll(self):
+        """ONE round-trip, no scroll.
 
-        with_vectors=True used to be essential here because the returned
-        points were handed straight to merge_collection to upsert, and
-        omitting the vectors would have silently destroyed them.  Nothing
-        downstream reads the preflight's points any more -- merge_collection
-        drives its own with-vectors drain -- so fetching embeddings here
-        would cost multi-GB of transfer and resident memory to produce a
-        number that a counter already gives.
+        The module already owns count_collection_points; re-deriving the same
+        number by draining every page cost ~200 round-trips on a 200k-point
+        collection and bought nothing the count API does not give.
         """
-        calls: list = []
-        backend = _make_backend_pager([[_make_point('p1')]], calls=calls)
+        client = self._client(count=3)
 
-        await _mod.scroll_collection_points(
-            backend, 'reify_reify', page_size=500, max_pages=7,
+        point_count, capped = await _mod.preflight_collection_points(
+            client, 'reify_reify', page_size=2,
         )
 
-        _collection, kwargs = calls[0]
-        assert kwargs['with_vectors'] is False, (
-            'the preflight counts; it does not carry payloads anywhere'
+        assert (point_count, capped) == (3, False)
+        client.count.assert_awaited_once_with(collection_name='reify_reify')
+        assert client.scroll.call_args_list == [], (
+            'the preflight counts; it does not page -- merge_collection runs '
+            "the pass's sole drain"
         )
-        assert kwargs['page_size'] == 500
-        assert kwargs['max_pages'] == 7
 
     @pytest.mark.asyncio
     async def test_passes_the_collection_name_verbatim_unprefixed(self):
         """COLLECTION_MERGES holds LEGACY mis-named collections
         ('reify_reify', 'fused_dark-factory') that a Scope structurally cannot
-        produce -- prefixing or re-deriving would address a collection that
-        does not exist."""
-        calls: list = []
-        backend = _make_backend_pager([[]], calls=calls)
+        produce -- which is why this addresses the collection-name-keyed count
+        API rather than Mem0Backend.count, which is Scope-addressed.
+        Prefixing or re-deriving would address a collection that does not
+        exist."""
+        client = self._client(count=0)
 
-        await _mod.scroll_collection_points(backend, 'fused_dark-factory')
+        await _mod.preflight_collection_points(client, 'fused_dark-factory')
 
-        assert calls[0][0] == 'fused_dark-factory'
-
-    @pytest.mark.asyncio
-    async def test_counts_without_accumulating_points(self):
-        """The preflight returns a COUNT, not a list.
-
-        The return type is the contract: an int cannot hold the points, so a
-        1000-page collection costs the same resident memory as a 1-page one.
-        Asserted through the public return value alone -- the function's
-        internals are deliberately not introspected.
-        """
-        pages = [[_make_point(f'p{i}') for i in range(50)] for _ in range(4)]
-        backend = _make_backend_pager(pages)
-
-        point_count, capped = await _mod.scroll_collection_points(
-            backend, 'reify_reify', page_size=50,
-        )
-
-        assert point_count == 200
-        assert isinstance(point_count, int) and not isinstance(point_count, bool)
-        assert capped is False
+        client.count.assert_awaited_once_with(collection_name='fused_dark-factory')
 
     @pytest.mark.asyncio
-    async def test_budget_exhaustion_is_caught_and_reported_as_capped(self, caplog):
-        """A ScrollPageBudgetExhausted must NOT propagate out of this call.
+    async def test_a_collection_larger_than_the_page_budget_is_capped(self, caplog):
+        """capped == point_count > page_size * max_pages.
 
-        run_consolidation states that a raising sub-operation must never abort
-        the whole run: earlier keys/sections of the same --apply pass may
-        already hold committed mutations.  Budget exhaustion is instead mapped
-        onto the EXISTING capped contract -- the count reached so far, capped
-        True -- which the caller turns into UNRESOLVED (no upsert, no source
-        delete, non-zero exit).
+        This is the one bit the old drain yielded over a count, and it is
+        exactly derivable: merge_collection's drain would raise
+        ScrollPageBudgetExhausted part-way through such a collection, so it
+        must never be authorised to start (no upsert, no source delete,
+        UNRESOLVED, non-zero exit).
         """
-        backend = _make_backend_pager(
-            [[_make_point('p1'), _make_point('p2')], [_make_point('p3')]],
-            raise_budget_after=2,
-        )
+        client = self._client(count=5)
 
         with caplog.at_level('WARNING'):
-            point_count, capped = await _mod.scroll_collection_points(
-                backend, 'reify_reify', page_size=2, max_pages=1,
+            point_count, capped = await _mod.preflight_collection_points(
+                client, 'reify_reify', page_size=2, max_pages=2,
             )
 
-        assert capped is True
-        assert point_count == 2, 'the count reached before the budget ran out'
+        assert (point_count, capped) == (5, True), '5 points > 2 x 2 budget'
         assert any('reify_reify' in rec.message for rec in caplog.records), (
             'no-silent-caps: the WARNING must name the collection; got '
             f'{[r.message for r in caplog.records]}'
         )
 
     @pytest.mark.asyncio
-    async def test_a_timeout_mid_drain_is_caught_and_reported_as_capped(self, caplog):
-        """A TimeoutError must be caught too, not just a budget cap.
+    async def test_a_collection_exactly_at_the_page_budget_is_not_capped(self):
+        """THE boundary, matched to the pager rather than guessed.
 
-        The backend deliberately PROPAGATES the TimeoutError from its
-        per-page ``asyncio.wait_for``, so a slow Qdrant aborts this drain.
-        The docstring's stated rationale -- a raising sub-operation must not
-        abort the whole consolidation run, because earlier keys/sections of
-        the same --apply pass may already hold committed mutations -- applies
-        to ANY drain failure, not only the one subclass named in the except.
-        This is the file's established idiom: delete_empty_collection catches
-        bare Exception, logs a WARNING, and returns UNRESOLVED.
+        scroll_collection_pages raises only when max_pages pages are consumed
+        with next_offset STILL live, so a collection of exactly
+        page_size x max_pages points drains cleanly.  A > (not >=) comparison
+        is what keeps the derived verdict identical to the drain's.
         """
-        backend = _make_backend_pager(
-            [[_make_point('p1'), _make_point('p2')], [_make_point('p3')]],
-            raise_budget_after=2,
-            raise_exc=TimeoutError('too slow'),
+        client = self._client(count=4)
+
+        point_count, capped = await _mod.preflight_collection_points(
+            client, 'reify_reify', page_size=2, max_pages=2,
         )
+
+        assert (point_count, capped) == (4, False)
+
+    @pytest.mark.asyncio
+    async def test_a_collection_larger_than_page_size_alone_is_not_capped(self):
+        """THE 3225 bug fix, preserved: --limit is a PAGE SIZE, not a ceiling.
+
+        Before 3225 a collection larger than --limit was permanently
+        UNRESOLVED and never migrated.  What disqualifies a collection now is
+        exceeding the whole budget, not a single page.
+        """
+        client = self._client(count=5000)
+
+        point_count, capped = await _mod.preflight_collection_points(
+            client, 'reify_reify', page_size=1000,
+        )
+
+        assert (point_count, capped) == (5000, False)
+
+    @pytest.mark.asyncio
+    async def test_a_failing_count_is_caught_and_reported_as_capped(self, caplog):
+        """A raising count must NOT propagate out of this call.
+
+        run_consolidation states that a raising sub-operation must never abort
+        the whole run: earlier keys/sections of the same --apply pass may
+        already hold committed mutations.  A transport failure (or the
+        TimeoutError the backend deliberately propagates) is instead mapped
+        onto the EXISTING capped contract -- which the caller turns into
+        UNRESOLVED (no upsert, no source delete, non-zero exit).  This is the
+        file's established idiom: delete_empty_collection catches bare
+        Exception, logs a WARNING, and returns UNRESOLVED.
+        """
+        client = self._client(exc=RuntimeError('connection reset'))
 
         with caplog.at_level('WARNING'):
-            point_count, capped = await _mod.scroll_collection_points(
-                backend, 'reify_reify', page_size=2,
+            point_count, capped = await _mod.preflight_collection_points(
+                client, 'fused_dark-factory',
             )
 
-        assert capped is True, 'a failed enumeration is incomplete, i.e. capped'
-        assert point_count == 2, 'the count reached before the drain died'
-        messages = [rec.message for rec in caplog.records]
-        assert any('reify_reify' in m for m in messages), (
-            f'the WARNING must name the collection; got {messages}'
+        assert capped is True, 'an unreadable count is not a clean read'
+        assert point_count is None, (
+            'an unreadable count must not be rendered as a plausible-looking '
+            "0 -- run()'s junk-key loop reports the same None for a count it "
+            'could not read'
         )
-        assert any('too slow' in m for m in messages), (
+        messages = [rec.message for rec in caplog.records]
+        assert any('fused_dark-factory' in m for m in messages), messages
+        assert any('connection reset' in m for m in messages), (
             f'the WARNING must name the exception; got {messages}'
         )
 
     @pytest.mark.asyncio
-    async def test_a_transport_error_mid_drain_is_caught_and_reported_as_capped(self, caplog):
-        """Same for a generic transport-shaped failure -- the guard is not
-        special-cased to TimeoutError either."""
-        backend = _make_backend_pager(
-            [[_make_point('p1')], [_make_point('p2')]],
-            raise_budget_after=1,
-            raise_exc=RuntimeError('connection reset'),
-        )
+    async def test_a_timeout_is_caught_too(self, caplog):
+        """The guard is not special-cased to transport errors: the backend
+        deliberately PROPAGATES the TimeoutError from its per-page
+        asyncio.wait_for, and Qdrant's count can time out the same way."""
+        client = self._client(exc=TimeoutError('too slow'))
 
         with caplog.at_level('WARNING'):
-            point_count, capped = await _mod.scroll_collection_points(
-                backend, 'fused_dark-factory', page_size=1,
+            point_count, capped = await _mod.preflight_collection_points(
+                client, 'reify_reify',
             )
 
-        assert (point_count, capped) == (1, True)
-        assert any('connection reset' in rec.message for rec in caplog.records)
+        assert (point_count, capped) == (None, True)
+        assert any('too slow' in rec.message for rec in caplog.records)
 
     @pytest.mark.asyncio
-    async def test_budget_exhaustion_keeps_its_own_remediation_message(self, caplog):
+    async def test_an_indeterminate_count_is_caught_and_reported_as_capped(self, caplog):
+        """count_collection_points fails CLOSED on an indeterminate .count
+        (raises ValueError rather than defaulting to 0).  The preflight must
+        honour that rather than letting it abort the run -- a collection
+        whose size is unknown is exactly a collection that must not be
+        migrated."""
+        client = AsyncMock()
+        client.count = AsyncMock(return_value=_make_count_result(None))
+
+        with caplog.at_level('WARNING'):
+            point_count, capped = await _mod.preflight_collection_points(
+                client, 'reify_reify',
+            )
+
+        assert (point_count, capped) == (None, True)
+        assert caplog.records, 'an unreadable count must still warn'
+
+    @pytest.mark.asyncio
+    async def test_the_over_budget_branch_keeps_its_own_remediation_message(self, caplog):
         """The two failures must not share one message.
 
         Telling an operator to raise the page budget after a network timeout
         is WRONG advice -- it sends them to re-run a bigger scroll against a
-        transport that is failing. Only the budget branch carries the
+        transport that is failing. Only the over-budget branch carries the
         --max-pages/--limit remediation.
         """
-        budget_backend = _make_backend_pager([[_make_point('p1')]], raise_budget_after=1)
         with caplog.at_level('WARNING'):
-            await _mod.scroll_collection_points(budget_backend, 'reify_reify')
+            await _mod.preflight_collection_points(
+                self._client(count=5), 'reify_reify', page_size=2, max_pages=2,
+            )
         budget_msgs = ' '.join(rec.message for rec in caplog.records)
         assert '--max-pages' in budget_msgs and '--limit' in budget_msgs
 
         caplog.clear()
-        timeout_backend = _make_backend_pager(
-            [[_make_point('p1')]], raise_budget_after=1, raise_exc=TimeoutError('too slow'),
-        )
         with caplog.at_level('WARNING'):
-            await _mod.scroll_collection_points(timeout_backend, 'reify_reify')
+            await _mod.preflight_collection_points(
+                self._client(exc=TimeoutError('too slow')), 'reify_reify',
+            )
         generic_msgs = ' '.join(rec.message for rec in caplog.records)
         assert generic_msgs, 'the generic failure must still warn'
         assert '--max-pages' not in generic_msgs, (
@@ -1388,22 +1402,22 @@ class TestScrollCollectionPoints:
         )
 
     @pytest.mark.asyncio
-    async def test_no_warning_on_a_clean_drain(self):
-        """A fully-drained scroll is not a cap and must not warn."""
+    async def test_no_warning_on_a_clean_count(self):
+        """A within-budget count is not a cap and must not warn."""
         import logging as _logging
 
-        backend = _make_backend_pager([[_make_point('p1')]])
         records: list = []
         handler = _logging.Handler()
         handler.emit = records.append  # type: ignore[method-assign]
         _mod.logger.addHandler(handler)
         try:
-            point_count, capped = await _mod.scroll_collection_points(backend, 'reify_reify')
+            point_count, capped = await _mod.preflight_collection_points(
+                self._client(count=1), 'reify_reify',
+            )
         finally:
             _mod.logger.removeHandler(handler)
 
-        assert capped is False
-        assert point_count == 1
+        assert (point_count, capped) == (1, False)
         assert [r for r in records if r.levelno >= _logging.WARNING] == []
 
 
@@ -1891,7 +1905,14 @@ def _make_run_qdrant_mock(
     """AsyncMock qdrant client whose scroll()/count() dispatch on
     collection_name; unlisted collections scroll as empty and count as 0 --
     the same 'clean by default' convention as _make_run_graphiti_mock's
-    per-key graphs."""
+    per-key graphs.
+
+    A collection listed in *points_by_collection* counts as len(its points)
+    unless *counts_by_collection* overrides it, so the two views of a
+    collection agree by default: the collection-merge preflight now reads
+    point_count from count() while merge_collection drains the same fixture
+    through the backend pager, and a fixture where those disagreed would be
+    modelling a collection that cannot exist."""
     points_by_collection = points_by_collection or {}
     counts_by_collection = counts_by_collection or {}
 
@@ -1899,7 +1920,9 @@ def _make_run_qdrant_mock(
         return (points_by_collection.get(collection_name, []), None)
 
     async def _count(*, collection_name: str, **_kwargs):
-        return _make_count_result(counts_by_collection.get(collection_name, 0))
+        if collection_name in counts_by_collection:
+            return _make_count_result(counts_by_collection[collection_name])
+        return _make_count_result(len(points_by_collection.get(collection_name, [])))
 
     client = AsyncMock()
     client.scroll = AsyncMock(side_effect=_scroll)
@@ -1918,37 +1941,30 @@ def _make_run_memory_service(
     qdrant_client: AsyncMock,
     *,
     budget_exhausted: set[str] | None = None,
-    budget_exhausted_on_call: dict[str, int] | None = None,
 ) -> MagicMock:
     """MagicMock memory_service wired the way run() consumes it.
 
     ``.graphiti`` directly; ``.mem0`` is the Mem0Backend, which run() uses
-    two ways: ``scroll_collection_pages`` to ENUMERATE a collection (task
-    3225 -- the paging lives in the backend now) and ``_get_async_qdrant()``
-    for the raw transport the upsert/delete/count paths still need.
+    two ways: ``scroll_collection_pages``, which ``merge_collection`` drains
+    to migrate a collection (task 3225 -- the paging lives in the backend
+    now), and ``_get_async_qdrant()`` for the raw transport the
+    upsert/delete/count paths still need.  The collection-merge PREFLIGHT is
+    no longer a drain at all: it reads the raw client's count(), so a
+    collection is drained exactly ONCE per --apply pass.
 
     *budget_exhausted* names collections whose paging generator raises
     ``ScrollPageBudgetExhausted`` after yielding everything it has, modelling
-    a collection larger than the page budget.
-
-    *budget_exhausted_on_call* maps a collection to the 1-based drain index
-    that must raise, leaving the others clean.  run() now drains a collection
-    TWICE under --apply -- a vectorless counting PREFLIGHT, then
-    merge_collection's own with-vectors drain -- so ``{'c': 2}`` models the
-    case the single-knob set cannot: an uncapped preflight followed by a
-    phase-2 drain that dies mid-merge.
+    a merge drain that dies mid-stream -- the preflight can pass (the count
+    fits the budget) and the drain still fail, e.g. on a transport hiccup or
+    the heavier vector-bearing pages.
     """
     exhausted = budget_exhausted or set()
-    on_call = dict(budget_exhausted_on_call or {})
-    drain_counts: dict[str, int] = {}
     points_by_collection = getattr(qdrant_client, '_points_by_collection', {}) or {}
 
     async def _scroll_collection_pages(collection, **_kwargs):
-        nth = drain_counts.get(collection, 0) + 1
-        drain_counts[collection] = nth
         for point in points_by_collection.get(collection, []):
             yield point
-        if collection in exhausted or on_call.get(collection) == nth:
+        if collection in exhausted:
             raise _mod.ScrollPageBudgetExhausted(
                 f'collection={collection!r} exhausted its page budget',
             )
@@ -2101,25 +2117,26 @@ class TestRunDryRun:
         assert junk_by_key['know-live']['disposition'] == 'UNRESOLVED'
 
     @pytest.mark.asyncio
-    async def test_dry_run_collection_unresolved_when_scroll_capped(self):
-        """A collection whose scroll exhausts the page budget is UNRESOLVED,
-        not MERGE: no-silent-caps -- a capped scroll may be incomplete, so it
-        must not be reported as a clean merge.
+    async def test_dry_run_collection_unresolved_when_over_the_page_budget(self):
+        """A collection too large for the merge drain's page budget is
+        UNRESOLVED, not MERGE: no-silent-caps -- migrating it would be
+        incomplete, so it must not be reported as a clean merge.
 
-        Task 3225: capped now comes from the flag scroll_collection_points
-        returns, NOT from len(points) >= limit -- with real paging, a
-        fully-drained multi-page scroll can return any count.
+        Task 3225: capped comes from the flag preflight_collection_points
+        returns, NOT from len(points) >= limit -- with real paging, --limit is
+        a PAGE SIZE and what disqualifies a collection is exceeding the whole
+        --limit x --max-pages budget.
         """
-        points = [_make_point(f'p{i}') for i in range(2)]
+        points = [_make_point(f'p{i}') for i in range(5)]
         graphiti = _make_run_graphiti_mock()
         qdrant_client = _make_run_qdrant_mock(
             points_by_collection={'fused_dark-factory': points},
         )
-        memory_service = _make_run_memory_service(
-            graphiti, qdrant_client, budget_exhausted={'fused_dark-factory'},
-        )
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
 
-        report = await _mod.run(_run_args(apply=False), memory_service, limit=2)
+        report = await _mod.run(
+            _run_args(apply=False), memory_service, limit=2, max_pages=2,
+        )
 
         collection_by_source = {item['source']: item for item in report['collection_merges']}
         assert collection_by_source['fused_dark-factory']['disposition'] == 'UNRESOLVED'
@@ -2130,7 +2147,9 @@ class TestRunDryRun:
         MERGEs instead of being permanently UNRESOLVED.
 
         Before task 3225 this scroll stopped at the first page and
-        `len(points) >= limit` marked it capped forever.
+        `len(points) >= limit` marked it capped forever.  --limit is a PAGE
+        SIZE now, so only the full --limit x --max-pages budget caps a
+        collection -- 5 points at limit=2 sits far inside the default budget.
         """
         points = [_make_point(f'p{i}') for i in range(5)]
         graphiti = _make_run_graphiti_mock()
@@ -2548,27 +2567,34 @@ class TestRunApply:
         assert item['disposition'] == 'MERGE'
 
     @pytest.mark.asyncio
-    async def test_apply_passes_the_backend_not_the_raw_client_to_the_scroll(self, monkeypatch):
-        """The enumeration is addressed at memory_service.mem0, and --limit
-        becomes the collection scroll's PAGE SIZE."""
+    async def test_apply_passes_the_raw_client_and_the_budget_to_the_preflight(self, monkeypatch):
+        """The preflight is addressed at the RAW client (it reads count(),
+        which is collection-name-keyed), and both budget knobs reach it.
+
+        The mirror-image oracle -- that the DRAIN is addressed at
+        memory_service.mem0, not the raw client, which is the task-3225 bug
+        -- lives on merge_collection now, in
+        test_apply_merges_every_page_and_keeps_using_the_raw_client_to_upsert.
+        """
         seen: list = []
-        real_scroll = _mod.scroll_collection_points
+        real_preflight = _mod.preflight_collection_points
 
-        async def _spy_scroll(backend, collection, **kwargs):
-            seen.append((backend, collection, dict(kwargs)))
-            return await real_scroll(backend, collection, **kwargs)
+        async def _spy_preflight(qdrant_client, collection, **kwargs):
+            seen.append((qdrant_client, collection, dict(kwargs)))
+            return await real_preflight(qdrant_client, collection, **kwargs)
 
-        monkeypatch.setattr(_mod, 'scroll_collection_points', _spy_scroll)
+        monkeypatch.setattr(_mod, 'preflight_collection_points', _spy_preflight)
         _patch_merge_primitives(monkeypatch)
         memory_service, _, qdrant_client = self._scenario()
 
         await _mod.run(_run_args(apply=True), memory_service, limit=250, max_pages=7)
 
-        assert seen, 'the collection-merge section must scroll at least one collection'
-        for backend, _collection, kwargs in seen:
-            assert backend is memory_service.mem0, (
-                'scroll_collection_points takes the BACKEND, not '
-                'memory_service.mem0._get_async_qdrant()\'s raw client'
+        assert seen, 'the collection-merge section must preflight at least one collection'
+        for client, _collection, kwargs in seen:
+            assert client is qdrant_client, (
+                'preflight_collection_points counts through the RAW client -- '
+                'Mem0Backend.count is Scope-addressed and structurally cannot '
+                'name a legacy collection like fused_dark-factory'
             )
             assert kwargs['page_size'] == 250
             assert kwargs['max_pages'] == 7, (
@@ -2582,13 +2608,13 @@ class TestRunApply:
         pre-existing call sites (and every run() test that predates the flag)
         keep working unchanged."""
         seen: list = []
-        real_scroll = _mod.scroll_collection_points
+        real_preflight = _mod.preflight_collection_points
 
-        async def _spy_scroll(backend, collection, **kwargs):
+        async def _spy_preflight(qdrant_client, collection, **kwargs):
             seen.append(dict(kwargs))
-            return await real_scroll(backend, collection, **kwargs)
+            return await real_preflight(qdrant_client, collection, **kwargs)
 
-        monkeypatch.setattr(_mod, 'scroll_collection_points', _spy_scroll)
+        monkeypatch.setattr(_mod, 'preflight_collection_points', _spy_preflight)
         _patch_merge_primitives(monkeypatch)
         memory_service, _, _ = self._scenario()
 
@@ -2630,26 +2656,27 @@ class TestRunApply:
 
     @pytest.mark.asyncio
     async def test_apply_capped_collection_not_deleted_and_stays_unresolved(self, monkeypatch):
-        """A collection whose scroll exhausts the page budget is NOT deleted
-        even with --apply (no data loss on a partial migration), is never
-        upserted at all, and its disposition stays UNRESOLVED -- which makes
-        the run exit non-zero.
+        """A collection too large for the merge drain's page budget is NOT
+        deleted even with --apply (no data loss on a partial migration), is
+        never upserted at all, and its disposition stays UNRESOLVED -- which
+        makes the run exit non-zero.
 
-        The externally visible contract is unchanged from before task 3225;
-        only the SOURCE of `capped` moved (a caught ScrollPageBudgetExhausted
-        rather than len(points) >= limit).
+        THE regression oracle for 'a capped preflight must not even partially
+        upsert'.  The externally visible contract is unchanged from before
+        task 3225; only the SOURCE of `capped` has moved (a count over the
+        --limit x --max-pages budget rather than len(points) >= limit).
         """
         _patch_merge_primitives(monkeypatch)
-        points = [_make_point(f'p{i}') for i in range(2)]
+        points = [_make_point(f'p{i}') for i in range(5)]
         graphiti = _make_run_graphiti_mock()
         qdrant_client = _make_run_qdrant_mock(
             points_by_collection={'fused_dark-factory': points},
         )
-        memory_service = _make_run_memory_service(
-            graphiti, qdrant_client, budget_exhausted={'fused_dark-factory'},
-        )
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
 
-        report = await _mod.run(_run_args(apply=True), memory_service, limit=2)
+        report = await _mod.run(
+            _run_args(apply=True), memory_service, limit=2, max_pages=2,
+        )
 
         capped_deletes = [
             c for c in qdrant_client.delete_collection.call_args_list
@@ -2660,7 +2687,7 @@ class TestRunApply:
             c for c in qdrant_client.upsert.call_args_list
             if c.kwargs.get('collection_name') == 'fused_dark_factory'
         ]
-        assert capped_upserts == [], 'a capped scroll must not even partially upsert'
+        assert capped_upserts == [], 'a capped preflight must not even partially upsert'
 
         collection_by_source = {item['source']: item for item in report['collection_merges']}
         assert collection_by_source['fused_dark-factory']['disposition'] == 'UNRESOLVED'
@@ -2671,14 +2698,14 @@ class TestRunApply:
         """A CLEAN preflight followed by a phase-2 merge drain that exhausts
         must still report UNRESOLVED and leave the source intact.
 
-        Splitting the pass into a counting preflight and a separate
-        with-vectors merge drain opens a window the single-drain design did
-        not have: the preflight can succeed and the merge drain die anyway
-        (a bigger collection by then, a transport hiccup, a tighter budget on
-        the heavier vector-bearing pages).  run() must fold the returned
-        enumeration_incomplete into an UNRESOLVED disposition -- mirroring the
-        graph-family post-merge downgrade -- so the run exits non-zero and no
-        operator reads a partial merge as clean.
+        Splitting the pass into a read-only preflight and a separate
+        with-vectors merge drain opens a window a fused scroll-and-upsert
+        would not have: the preflight can succeed and the merge drain die
+        anyway (a bigger collection by then, a transport hiccup, a tighter
+        budget on the heavier vector-bearing pages).  run() must fold the
+        returned enumeration_incomplete into an UNRESOLVED disposition --
+        mirroring the graph-family post-merge downgrade -- so the run exits
+        non-zero and no operator reads a partial merge as clean.
         """
         _patch_merge_primitives(monkeypatch)
         points = [_make_point(f'p{i}', payload={'user_id': 'dark-factory'}) for i in range(4)]
@@ -2687,13 +2714,13 @@ class TestRunApply:
             points_by_collection={'fused_dark-factory': points},
         )
         memory_service = _make_run_memory_service(
-            graphiti, qdrant_client, budget_exhausted_on_call={'fused_dark-factory': 2},
+            graphiti, qdrant_client, budget_exhausted={'fused_dark-factory'},
         )
 
         report = await _mod.run(_run_args(apply=True), memory_service, limit=2)
 
         item = {i['source']: i for i in report['collection_merges']}['fused_dark-factory']
-        assert item['point_count'] == 4, 'the preflight itself drained cleanly'
+        assert item['point_count'] == 4, 'the preflight itself read a clean count'
         assert item['enumeration_incomplete'] is True
         assert item['source_deleted'] is False
         assert item['disposition'] == 'UNRESOLVED', (
