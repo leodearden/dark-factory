@@ -12,6 +12,56 @@ ok()    { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
 warn()  { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 fail()  { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; }
 
+# Classify what a parity checker just told us. Defined HERE, once, immediately
+# below the log shims and above every parity call site — the five sites share
+# one shell scope, and every sliced block is executed by the test harness under
+# a preamble that provides this helper (tests/scripts/setup_host_sections.py
+# slices it live out of this file, so there is no second copy to drift).
+#
+#   _parity_verdict <captured_output> <exit_status> <bracketed_tag>
+#
+# echoes exactly one of:
+#   unreported — the tag is ABSENT, so the checker did not report. Its status
+#                says NOTHING about this host: exit 2 in particular is also what
+#                python3 returns for a script it cannot open and what argparse
+#                returns for a rejected flag. Checked FIRST and outranking the
+#                status entirely, which is the whole point of the guard.
+#   parity     — it reported, and found what it was looking for (0).
+#   absent     — it reported that the thing is not installed here (2).
+#   finding    — it reported something actionable (1, or any other status: 127
+#                and friends are not benign just because they are undocumented).
+#
+# CLASSIFICATION ONLY. Each call site keeps its own wording, severity and side
+# effects, because those legitimately differ — `absent` is `info` at the
+# orchestrator, dashboard pre-install and lms sites but `warn` at the
+# fused-memory and dashboard post-install ones; the orchestrator gate may
+# `fail` and sets _orch_install_blocked, while the lms gate is forbidden from
+# ever calling `fail` (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
+# A helper that also emitted messages would have to collapse those distinctions
+# or take five message parameters — either way re-creating the coupling the
+# extraction removes.
+#
+# The tag is matched with bash's own `[[ ]]`, never `printf | grep -q`. grep
+# exits the instant it matches and the tag is on line 1, so once the report
+# exceeds the pipe buffer (~64KB) the printf dies of SIGPIPE, `pipefail` makes
+# the pipeline return 141, and that becomes "it did not run" on a report that
+# plainly carries the tag — a verdict manufactured by the mechanism rather than
+# read from the checker, which is the exact class of failure this guard exists
+# to remove. `[[ ]]` forks nothing and cannot be signalled. (Measured: the pipe
+# form flips at ~82KB of tagged output; this does not.)
+_parity_verdict() {
+  local _out="$1" _status="$2" _tag="$3"
+  if [[ "$_out" != *"$_tag"* ]]; then
+    printf '%s\n' unreported
+  elif [ "$_status" -eq 0 ]; then
+    printf '%s\n' parity
+  elif [ "$_status" -eq 2 ]; then
+    printf '%s\n' absent
+  else
+    printf '%s\n' finding
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # 1. Prerequisites
 # ---------------------------------------------------------------------------

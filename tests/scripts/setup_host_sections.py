@@ -70,14 +70,35 @@ _SHIMS = (
 SYSTEMCTL_LOG = "systemctl-calls.log"
 
 
+# setup-host.sh defines `_parity_verdict` once, below the log shims and above
+# every parity call site, so a sliced block that calls it needs it in scope.
+_VERDICT_HELPER_START = "_parity_verdict() {"
+_VERDICT_HELPER_END = "\n}\n"
+
+
 def _preamble(repo_root: pathlib.Path, unit_dir: pathlib.Path) -> str:
-    """setup-host.sh's own `set` flags and variables, plus the plain-text shims."""
+    """setup-host.sh's own `set` flags and variables, the shims, and the verdict helper.
+
+    The helper is SLICED LIVE out of setup-host.sh, never carried here as a
+    hand-written copy — unlike the four log shims above, which are deliberately
+    reduced to plain text. The shims are reduced for a stated reason (stripping
+    ANSI so assertions can match on prefixes) and their bodies are trivial
+    `printf`s with no logic to drift. `_parity_verdict` IS the logic under
+    test: a copied body would let the version the suite exercises and the
+    version setup-host.sh ships diverge silently — which is precisely the
+    "reports green because it never ran" class this whole gate family exists to
+    catch, reproduced one level up in its own harness.
+
+    Slicing also fails LOUDLY (slice_section asserts, naming the marker) if the
+    helper is ever renamed, rather than leaving the suite testing a helper the
+    installer no longer has.
+    """
     return (
         "set -euo pipefail\n"
         f'REPO_ROOT="{repo_root}"\n'
         f'UNIT_DIR="{unit_dir}"\n'
         'mkdir -p "$UNIT_DIR"\n'
-    ) + _SHIMS
+    ) + _SHIMS + slice_section(_VERDICT_HELPER_START, _VERDICT_HELPER_END)
 
 
 def setup_host_text() -> str:
