@@ -252,6 +252,77 @@ class TestRecordRequeueNonCounting:
         assert len(scheduler.requeue_history('t1')) == 1
 
 
+class TestRecordRequeueFieldFirstRouting:
+    """Task 3315 (PRD contract C2): ``record_requeue`` routes to the transient
+    bucket on the STRUCTURED ``api_error_status`` field.
+
+    Every reason string in this class is deliberately MARKER-FREE, so the
+    ``agent API error: HTTP <n>`` regex is deleted from the assertion path
+    entirely — the field alone drives the bucket decision.  That is the PRD's
+    stated signal for this task.
+    """
+
+    _MARKER_FREE = 'implementer produced zero output'
+
+    def _record(self, scheduler: Scheduler, **kwargs) -> int:
+        return scheduler.record_requeue(
+            't1',
+            phase='execute',
+            reason=self._MARKER_FREE,
+            detail='d',
+            run_id='r',
+            cost_usd=1.0,
+            **kwargs,
+        )
+
+    def test_field_alone_lands_in_transient_bucket(self, scheduler: Scheduler):
+        count = self._record(scheduler, api_error_status=529)
+
+        assert count == 0  # genuine count untouched
+        assert 't1' not in scheduler._requeue_counts
+        assert scheduler._transient_requeue_counts['t1'] == 1
+        assert scheduler.transient_requeue_count('t1') == 1
+        assert len(scheduler._requeue_history['t1']) == 1
+
+    @pytest.mark.parametrize('status', [429, 404, 401])
+    def test_non_5xx_field_routes_genuine(self, scheduler: Scheduler, status: int):
+        """A 4xx is not a provider-side failure — it keeps counting against
+        the genuine cap (the 429 carve-out included)."""
+        count = self._record(scheduler, api_error_status=status)
+
+        assert count == 1
+        assert scheduler._requeue_counts['t1'] == 1
+        assert 't1' not in scheduler._transient_requeue_counts
+
+    def test_absent_field_falls_back_to_legacy_marker_regex(self, scheduler: Scheduler):
+        """No kwarg at all: the legacy marker in the reason still routes
+        transient end-to-end at the record_requeue seam."""
+        count = scheduler.record_requeue(
+            't1',
+            phase='plan',
+            reason='Planning failed: agent API error: HTTP 529',
+            detail='d',
+            run_id='r',
+            cost_usd=1.0,
+        )
+
+        assert count == 0
+        assert 't1' not in scheduler._requeue_counts
+        assert scheduler._transient_requeue_counts['t1'] == 1
+
+    def test_non_counting_route_still_wins_over_5xx_field(self, scheduler: Scheduler):
+        """Route 1 (task 2988) is decided FIRST and keeps winning: a
+        non-counting requeue that ALSO carries a 529 is history-only.  Extends
+        ``test_non_counting_overrides_transient_classification`` from the
+        marker regex to the new structured field."""
+        count = self._record(scheduler, counts_against_cap=False, api_error_status=529)
+
+        assert count == 0
+        assert 't1' not in scheduler._requeue_counts
+        assert 't1' not in scheduler._transient_requeue_counts
+        assert len(scheduler._requeue_history['t1']) == 1
+
+
 class TestCounter:
     def test_record_requeue_increments_per_task(self, scheduler: Scheduler):
         assert _record_one(scheduler, 't1') == 1
