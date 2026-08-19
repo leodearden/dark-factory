@@ -1090,13 +1090,17 @@ class TestDecisionIdLock:
 
 class TestDecisionHelpersAdoptLock:
     """Spy tests (mirror TestSubmitResolveAdoptLock, test_queue.py:2913):
-    update_decision_state, set_manual_boost and set_decision_escalations_dir
-    must EACH acquire decision_id_lock for the correct decision id.
+    update_decision_state, set_manual_boost, set_decision_escalations_dir and
+    the write-decision verb must EACH acquire decision_id_lock for the
+    correct decision id.
 
-    One case per public helper, deliberately, even though all three now share
-    _mutate_decision: the lock is a per-helper CONTRACT, and a future setter
-    that grows its own body (or a wrapper that mutates before delegating)
-    would slip past a single shared-implementation test. TestDecisionIdLock
+    One case per public caller, deliberately, even though the three setters
+    now share _mutate_decision: the lock is a per-caller CONTRACT, and a
+    setter that grows its own body (or a wrapper that mutates before
+    delegating) would slip past a single shared-implementation test. The
+    write-decision verb is precisely such a caller -- it does NOT go through
+    _mutate_decision at all (it is an upsert, not a strict RMW), so nothing
+    but this spy would notice its lock disappearing. TestDecisionIdLock
     covers the lock primitive itself; these cover its ADOPTION.
     """
 
@@ -1172,6 +1176,76 @@ class TestDecisionHelpersAdoptLock:
 
         assert 'dec-spy-3' in acquired, f'Expected lock acquisition for dec-spy-3; got {acquired}'
 
+    def test_main_write_decision_acquires_lock_for_decision_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The write-decision verb is the FOURTH writer on a decision id --
+        and the only one that may CREATE the record rather than only mutate
+        an existing one.
+
+        Asserted on the CREATE path deliberately: two watchers can file the
+        same id concurrently with nothing on disk yet, so the span needs the
+        lock even when there is no existing record to merge with. It is also
+        the path a reader is most likely to assume needs no locking.
+        """
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        real_lock = sr.decision_id_lock
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            with real_lock(decision_id, root=root):
+                yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'dec-spy-4',
+                '--project',
+                'df',
+                '--text',
+                'q',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
+
+        assert rc == 0
+        assert 'dec-spy-4' in acquired, f'Expected lock acquisition for dec-spy-4; got {acquired}'
+
+    def test_main_write_decision_refusal_takes_no_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A REFUSED invocation must not take the lock.
+
+        decision_id_lock's own docstring flags ORPHAN SIDECARS: the
+        ``<id>.json.lock`` file is created on acquisition and never cleaned
+        up, so locking before the stamp guards would litter the decisions
+        dir with sidecars for ids that are never written -- one per
+        mis-invocation, forever. The guards therefore run FIRST.
+        """
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        rc = sr.main(
+            ['write-decision', '--id', 'dec-spy-5', '--project', 'df', '--text', 'q',
+             '--escalations-dir', '']
+        )
+
+        assert rc == 0
+        assert acquired == []
+
 
 @pytest.mark.timeout(30)
 def test_concurrent_state_and_boost_updates_do_not_lose_a_field(
@@ -1221,6 +1295,84 @@ def test_concurrent_state_and_boost_updates_do_not_lose_a_field(
     [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == 'dec-race']
     assert reread.state == sr.DecisionState.ANSWERED
     assert reread.manual_boost == 7
+
+
+@pytest.mark.timeout(30)
+def test_main_write_decision_enrichment_span_is_serialized_per_decision_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The write-decision verb's read->merge->write span must serialize too.
+
+    Task 3559 turned _run_write_decision from a blind single write into a
+    read-then-write, which is exactly the hazard decision_id_lock exists for
+    and which update_decision_state / set_manual_boost /
+    set_decision_escalations_dir already name in their Concurrency NOTEs. It
+    is a REAL race, not a theoretical one: the whole point of the enrichment
+    branch is that two watchers on two queues file the same id, and nothing
+    stops them doing so at the same moment.
+
+    Same deterministic in-process idiom as
+    test_concurrent_state_and_boost_updates_do_not_lose_a_field: a fixed
+    delay is injected into the module-level write_decision seam -- AFTER
+    each call's read, BEFORE its write -- so both threads read the same
+    pre-merge snapshot before either writes.
+
+    Without the lock, the later os.replace() clobbers the earlier call's
+    enrichment: each thread's merged record carries only ITS OWN
+    contribution (task_id or session_id, never both), so whichever writes
+    last silently drops the other watcher's information -- the very
+    lost-update this task exists to stop, reintroduced one level up. With
+    the lock, the second span re-reads the first's persisted record and
+    merges on top, so both contributions survive and the severity is the max
+    across all three filings rather than whichever landed last.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    third = tmp_path / 'third'
+    third.mkdir()
+    sr.write_decision(
+        _make_decision(
+            id='esc-race-1',
+            project='df',
+            text='Adopt the reify plan?',
+            state=sr.DecisionState.OPEN,
+            severity='info',
+            task_id=None,
+            session_id=None,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    real_write_decision = sr.write_decision
+
+    def delayed_write_decision(record: sr.DecisionRecord, root: Path | str | None = None) -> bool:
+        time.sleep(0.3)
+        return real_write_decision(record, root=root)
+
+    monkeypatch.setattr(sr, 'write_decision', delayed_write_decision)
+
+    def file_from(queue: Path, **extra: str) -> None:
+        _file_decision(id='esc-race-1', project='df', text='reify?', escalations_dir=str(queue), **extra)
+
+    t1 = threading.Thread(target=file_from, args=(recon,), kwargs={'task_id': '5914', 'severity': 'critical'})
+    t2 = threading.Thread(target=file_from, args=(third,), kwargs={'session_id': 'watcher-3', 'severity': 'urgent'})
+
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert not t1.is_alive(), 'recon-queue write-decision thread did not finish in time'
+    assert not t2.is_alive(), 'third-queue write-decision thread did not finish in time'
+
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == 'esc-race-1']
+    # Neither filer's contribution was dropped...
+    assert reread.task_id == '5914'
+    assert reread.session_id == 'watcher-3'
+    assert reread.severity == 'urgent'
+    # ...and the first filer's fields are still intact.
+    assert reread.text == 'Adopt the reify plan?'
+    assert reread.escalations_dir == sr.normalize_escalations_dir(orch)
 
 
 # ---------------------------------------------------------------------------
@@ -4137,6 +4289,8 @@ def test_main_write_decision_files_open_record(
             'esc-1',
             '--session-id',
             'watcher-df-99',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
         ]
     )
 
@@ -4174,6 +4328,8 @@ def test_main_write_decision_stamps_severity(
             'q',
             '--severity',
             'critical',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
         ]
     )
 
@@ -4192,7 +4348,19 @@ def test_main_write_decision_severity_defaults_empty(
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
-    rc = sr.main(['write-decision', '--id', 'dec-nosev', '--project', 'df', '--text', 'q'])
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-nosev',
+            '--project',
+            'df',
+            '--text',
+            'q',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
+        ]
+    )
 
     assert rc == 0
     listed = sr.list_decisions(root=tmp_path)
@@ -4239,23 +4407,133 @@ def test_main_write_decision_stamps_escalations_dir(
     assert Path(listed[0].escalations_dir).is_absolute()
 
 
-def test_main_write_decision_escalations_dir_defaults_empty(
+def test_main_write_decision_refuses_when_escalations_dir_omitted(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Omitting --escalations-dir yields '' on the filed record: the flag is
-    optional, and a queue-less record keeps today's project-only-scoped
-    reaper behaviour (mirrors --severity's default at
-    test_main_write_decision_severity_defaults_empty).
+    """Omitting --escalations-dir is an INVOCATION error, not a default.
+
+    DecisionRecords are fleet-global (``~/.claude/fleet/decisions/``) but an
+    ``esc-<taskid>-<n>`` id is unique only WITHIN one queue, and a project
+    may run several (task 3528). A record filed without its queue stamp is
+    therefore cross-queue-ambiguous -- exactly the legacy population task
+    3640 had to back-fill out of, and which must not be allowed to regrow
+    through this verb. So the flag is ``required=True``, joining --id /
+    --project / --text on this same subparser (and mirroring the sibling
+    ``reap-decisions``, whose --escalations-dir has always been required):
+    argparse exits 2 and NOTHING is filed.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
-    rc = sr.main(['write-decision', '--id', 'dec-noq', '--project', 'df', '--text', 'q'])
+    with pytest.raises(SystemExit) as excinfo:
+        sr.main(['write-decision', '--id', 'dec-noq', '--project', 'df', '--text', 'q'])
+
+    assert excinfo.value.code == 2
+    assert '--escalations-dir' in capsys.readouterr().err
+    assert sr.list_decisions(root=tmp_path) == []
+
+
+@pytest.mark.parametrize('blank', ['', '   '])
+def test_main_write_decision_refuses_an_explicitly_empty_escalations_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    blank: str,
+) -> None:
+    """argparse's required=True cannot see the loophole this closes.
+
+    ``--escalations-dir ''`` (or whitespace-only) SATISFIES a required flag
+    and would still produce the unstamped, cross-queue-ambiguous record the
+    verb now exists to refuse -- so the legacy population task 3640
+    back-filled would simply regrow through the loophole. The verb
+    therefore guards on the NORMALIZED stamp too, using the same
+    normalize_escalations_dir the reaper compares with (it already collapses
+    empty and whitespace-only to '').
+
+    Shape is this module's loud-but-fail-soft CLI idiom, matching
+    test_main_write_decision_fail_soft_when_fleet_root_under_a_file: rc 0
+    (filing a decision can never crash a watcher's watch loop), an ERROR
+    log, NOTHING written, and the id NOT echoed on stdout -- the absent id
+    is itself the agent-visible failure signal, since both SKILL.md files
+    tell the watcher to cross-link that printed id into its digest line.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'dec-blankq',
+                '--project',
+                'df',
+                '--text',
+                'q',
+                '--escalations-dir',
+                blank,
+            ]
+        )
 
     assert rc == 0
-    listed = sr.list_decisions(root=tmp_path)
-    assert len(listed) == 1
-    assert listed[0].escalations_dir == ''
+    assert sr.list_decisions(root=tmp_path) == []
+    assert 'dec-blankq' not in capsys.readouterr().out
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors
+    assert any('dec-blankq' in r.getMessage() for r in errors)
+
+
+def test_main_write_decision_refuses_the_unknown_queue_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``<unknown>`` is a BACK-FILL-only sentinel and is refused at this verb.
+
+    skills/escalation-watcher/SKILL.md states the contract outright of the
+    sentinel: "You never write it; task 3640's back-fill did". The reason it
+    must be ENFORCED here rather than merely documented is that an
+    UNKNOWN_QUEUE-stamped record is refused by EVERY reaper (the by-name
+    guard in _run_reap_decisions._status), so a watcher filing one creates a
+    record that only a human can ever close -- a regrowth strictly WORSE
+    than the unstamped '' population this task outlaws, which at least still
+    closes under project-only scoping.
+
+    There is no legitimate write-path caller: a watcher always knows its own
+    queue by construction, since it is the same dir it passes to
+    reap-decisions. The sentinel stays fully valid on the BACK-FILL path via
+    set_decision_escalations_dir, which is where task 3640 put it; this
+    refusal is scoped to the CLI verb alone.
+
+    Gets its OWN error message, distinct from the empty-stamp refusal, so
+    the log tells a watcher author which of the two mistakes they made.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'dec-unkq',
+                '--project',
+                'df',
+                '--text',
+                'q',
+                '--escalations-dir',
+                sr.UNKNOWN_QUEUE,
+            ]
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path) == []
+    assert 'dec-unkq' not in capsys.readouterr().out
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors
+    assert any(sr.UNKNOWN_QUEUE in r.getMessage() for r in errors)
+    assert any('dec-unkq' in r.getMessage() for r in errors)
 
 
 def test_main_write_decision_prints_filed_id(
@@ -4268,7 +4546,19 @@ def test_main_write_decision_prints_filed_id(
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
-    rc = sr.main(['write-decision', '--id', 'dec-park-2', '--project', 'df', '--text', 'q'])
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-park-2',
+            '--project',
+            'df',
+            '--text',
+            'q',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
+        ]
+    )
 
     assert rc == 0
     assert 'dec-park-2' in capsys.readouterr().out
@@ -4290,7 +4580,23 @@ def test_main_write_decision_fail_soft_when_fleet_root_under_a_file(
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(blocker / 'fleet'))
 
     with caplog.at_level(logging.ERROR):
-        rc = sr.main(['write-decision', '--id', 'dec-park-3', '--project', 'df', '--text', 'q'])
+        # The queue dir deliberately lives under tmp_path, NOT under the
+        # broken fleet root: normalize_escalations_dir is non-strict and
+        # resolves a non-existent path fine, so supplying the (now
+        # mandatory) stamp does not itself need the unwritable root.
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'dec-park-3',
+                '--project',
+                'df',
+                '--text',
+                'q',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
 
     assert rc == 0
     assert 'dec-park-3' not in capsys.readouterr().out
@@ -4308,8 +4614,33 @@ def test_main_write_decision_refiling_same_id_overwrites_not_duplicates(
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
-    rc1 = sr.main(['write-decision', '--id', 'dec-park-4', '--project', 'df', '--text', 'first?'])
-    rc2 = sr.main(['write-decision', '--id', 'dec-park-4', '--project', 'df', '--text', 'second?'])
+    queue = str(tmp_path / 'escalations')
+    rc1 = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-park-4',
+            '--project',
+            'df',
+            '--text',
+            'first?',
+            '--escalations-dir',
+            queue,
+        ]
+    )
+    rc2 = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'dec-park-4',
+            '--project',
+            'df',
+            '--text',
+            'second?',
+            '--escalations-dir',
+            queue,
+        ]
+    )
 
     assert rc1 == 0
     assert rc2 == 0
@@ -4443,6 +4774,249 @@ def test_normalize_escalations_dir_preserves_the_unknown_sentinel_verbatim(
 
     assert from_a == sr.UNKNOWN_QUEUE
     assert from_b == sr.UNKNOWN_QUEUE
+
+
+@pytest.mark.parametrize(
+    ('a', 'b', 'expected'),
+    [
+        # Both directions of every adjacent pair: the helper is symmetric,
+        # so argument order must never decide the answer.
+        ('', 'info', 'info'),
+        ('info', '', 'info'),
+        ('info', 'blocking', 'blocking'),
+        ('blocking', 'info', 'blocking'),
+        ('blocking', 'critical', 'critical'),
+        ('critical', 'blocking', 'critical'),
+        ('critical', 'urgent', 'urgent'),
+        ('urgent', 'critical', 'urgent'),
+        # ...and the non-adjacent pair that matters most in practice: a
+        # second watcher's 'info' must not pull a 'critical' record down.
+        ('critical', 'info', 'critical'),
+        ('info', 'critical', 'critical'),
+    ],
+)
+def test_max_decision_severity_takes_the_higher_of_the_two(a: str, b: str, expected: str) -> None:
+    """The never-downgrade primitive: '' < info < blocking < critical < urgent.
+
+    This deliberately does NOT reuse escalation/src/escalation/queue.py's
+    ``_SEVERITY_RANK``, which is ``{'info': 0, 'blocking': 1}`` only: there,
+    'critical' and 'urgent' fall to the ``.get(x, 0)`` default and rank
+    INFO-tier. Reusing it would make the never-downgrade helper itself
+    perform the exact downgrade this task exists to prevent -- a second
+    watcher's 'info' would tie-or-beat a first watcher's 'critical'.
+    (Importing it is impossible anyway: this module is stdlib-only.)
+    """
+    assert sr._max_decision_severity(a, b) == expected
+
+
+@pytest.mark.parametrize('value', ['', 'info', 'blocking', 'critical', 'urgent'])
+def test_max_decision_severity_of_an_equal_pair_is_that_value(value: str) -> None:
+    """A tie returns the value itself, so a re-file never churns the field."""
+    assert sr._max_decision_severity(value, value) == value
+
+
+@pytest.mark.parametrize(
+    ('existing', 'incoming'),
+    [
+        ('critical', 'criticl'),  # typo'd incoming must not displace
+        ('critical', 'CRITICAL'),  # case variant is NOT a known severity
+        ('urgent', 'whatever'),
+        ('info', 'nonsense'),
+    ],
+)
+def test_max_decision_severity_unknown_never_displaces_a_recognised_one(
+    existing: str,
+    incoming: str,
+) -> None:
+    """An UNRECOGNISED severity ranks unknown-lowest and never raises.
+
+    A typo'd or case-variant severity from a second watcher (escalation
+    models.KNOWN_SEVERITIES is lowercase-only and rejects case variants
+    outright) must not be able to downgrade a recognised one. It ranks
+    alongside the unset sentinel rather than blowing up, because this helper
+    sits on a watcher's filing path and must never crash the watch loop.
+    """
+    assert sr._max_decision_severity(existing, incoming) == existing
+
+
+def test_max_decision_severity_two_unknowns_returns_existing() -> None:
+    """Ambiguous both-unknown case resolves to ``existing``: never downgrade,
+    never churn the file with an equally-meaningless replacement.
+    """
+    assert sr._max_decision_severity('mystery-a', 'mystery-b') == 'mystery-a'
+
+
+def test_max_decision_severity_unknown_loses_to_a_recognised_incoming() -> None:
+    """The other direction: an unknown EXISTING value does not block a real
+    incoming severity from landing, since unknown ranks at the bottom.
+    """
+    assert sr._max_decision_severity('bogus', 'blocking') == 'blocking'
+
+
+@pytest.mark.parametrize(
+    ('name', 'kept', 'offered'),
+    [
+        ('text', 'Adopt the reify plan?', 'reify?'),
+        ('task_id', '5914', '9999'),
+        ('escalation_id', 'esc-5914-1', 'esc-other-7'),
+        ('session_id', 'watcher-df-1', 'watcher-recon-2'),
+        ('options', ['yes', 'no'], ['maybe']),
+    ],
+)
+def test_merge_decision_enrichment_never_clobbers_a_non_empty_field(
+    name: str,
+    kept: object,
+    offered: object,
+) -> None:
+    """MODE-2 rule: a second watcher ENRICHES, it never overwrites.
+
+    Two watchers can surface the SAME underlying human gate through two
+    different queues (the observed esc-5914-1 shape, task 3528 requirement
+    (b)). The second one to file must not replace what the first wrote --
+    the cockpit row would otherwise flip to whichever watcher happened to
+    write last.
+    """
+    existing = _make_decision(**{name: kept})
+    incoming = _make_decision(**{name: offered})
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert getattr(merged, name) == kept
+
+
+@pytest.mark.parametrize(
+    ('name', 'empty', 'offered'),
+    [
+        ('text', '', 'reify?'),
+        ('task_id', None, '5914'),
+        ('escalation_id', None, 'esc-5914-1'),
+        ('session_id', None, 'watcher-recon-2'),
+        ('options', None, ['yes', 'no']),
+    ],
+)
+def test_merge_decision_enrichment_fills_an_empty_field(
+    name: str,
+    empty: object,
+    offered: object,
+) -> None:
+    """The other half of the rule -- and what makes this ENRICHMENT rather
+    than a no-op: a field the first filer left empty/None IS filled from the
+    second filer, so the collapsed row is strictly better informed than
+    either watcher's view alone.
+    """
+    existing = _make_decision(**{name: empty})
+    incoming = _make_decision(**{name: offered})
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert getattr(merged, name) == offered
+
+
+@pytest.mark.parametrize(
+    ('name', 'kept', 'offered'),
+    [
+        ('filed_at', '2026-07-07T00:00:00+00:00', '2026-08-08T00:00:00+00:00'),
+        ('state', 'open', 'answered'),
+        ('manual_boost', 5, 0),
+    ],
+)
+def test_merge_decision_enrichment_keeps_custody_fields_with_the_first_filer(
+    name: str,
+    kept: object,
+    offered: object,
+) -> None:
+    """CUSTODY fields always stay with the EXISTING record.
+
+    A second watcher must be able to neither reset an operator's cockpit
+    boost (manual_boost is the C5 human's, not a watcher's), nor re-open or
+    close the record (state transitions are update_decision_state's job),
+    nor restamp when the gate was first surfaced (filed_at drives queue
+    age). These are the fields where "last writer wins" would silently
+    destroy work done by someone else.
+    """
+    existing = _make_decision(**{name: kept})
+    incoming = _make_decision(**{name: offered})
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert getattr(merged, name) == kept
+
+
+@pytest.mark.parametrize(
+    ('existing_sev', 'incoming_sev', 'expected'),
+    [
+        ('info', 'urgent', 'urgent'),  # upgrade lands
+        ('critical', 'info', 'critical'),  # downgrade refused
+        ('', 'blocking', 'blocking'),  # unset is enriched
+        ('blocking', 'blocking', 'blocking'),  # tie is stable
+    ],
+)
+def test_merge_decision_enrichment_never_downgrades_severity(
+    existing_sev: str,
+    incoming_sev: str,
+    expected: str,
+) -> None:
+    """severity is _max_decision_severity(existing, incoming), both ways.
+
+    The record must end up carrying the MOST urgent view any watcher has of
+    the gate: an incoming 'urgent' upgrades an existing 'info', and an
+    incoming 'info' leaves an existing 'critical' alone.
+    """
+    existing = _make_decision(severity=existing_sev)
+    incoming = _make_decision(severity=incoming_sev)
+
+    assert sr.merge_decision_enrichment(existing, incoming).severity == expected
+
+
+def test_merge_decision_enrichment_keeps_id_and_project_from_existing() -> None:
+    """``id`` is the JOIN KEY -- the whole reason these two records are being
+    merged at all -- so it, and the project it is scoped to, come from the
+    existing record and are never taken from the incoming one.
+    """
+    existing = _make_decision(id='esc-5914-1', project='df')
+    incoming = _make_decision(id='esc-5914-1', project='other-project')
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged.id == 'esc-5914-1'
+    assert merged.project == 'df'
+
+
+def test_merge_decision_enrichment_is_pure() -> None:
+    """Neither argument may be mutated in place.
+
+    The helper is deliberately side-effect-free so it stays trivially
+    testable in isolation from the CLI verb, and so a caller holding the
+    pre-merge record (e.g. for a log line naming what changed) still sees
+    what it read.
+    """
+    existing = _make_decision(id='esc-5914-1', text='first?', severity='info')
+    incoming = _make_decision(id='esc-5914-1', text='second?', severity='urgent')
+    before_existing = existing.to_dict()
+    before_incoming = incoming.to_dict()
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged is not existing
+    assert merged is not incoming
+    assert existing.to_dict() == before_existing
+    assert incoming.to_dict() == before_incoming
+
+
+def test_merge_decision_enrichment_touches_only_the_documented_fields() -> None:
+    """Whole-record comparison, following the
+    test_set_decision_escalations_dir_preserves_every_other_field idiom: a
+    merge that differs from `existing` ONLY in severity must be expressible
+    as a single dataclasses.replace, so a field silently drifting in is a
+    hard failure rather than an unasserted gap.
+    """
+    existing = _make_decision(id='esc-5914-1', severity='info')
+    # Same in every field EXCEPT severity, which outranks.
+    incoming = dataclasses.replace(existing, severity='urgent')
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged == dataclasses.replace(existing, severity='urgent')
 
 
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
@@ -4700,6 +5274,310 @@ def _two_queues(tmp_path: Path) -> tuple[Path, Path]:
     return orch, recon
 
 
+def test_merge_decision_enrichment_fills_an_empty_queue_stamp(tmp_path: Path) -> None:
+    """The case that matters most right after task 3640's back-fill.
+
+    An existing record with ``escalations_dir=''`` is the legacy/unstamped
+    population 3640 had to back-fill. When a watcher files against that id
+    carrying a REAL queue, the merge takes it: that is precisely the
+    "append/update its own queue's escalations_dir entry" the task asks for,
+    and it turns a project-only-scoped record into a properly queue-scoped
+    one.
+    """
+    orch, _recon = _two_queues(tmp_path)
+    existing = _make_decision(escalations_dir='')
+    incoming = _make_decision(escalations_dir=sr.normalize_escalations_dir(orch))
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged.escalations_dir == sr.normalize_escalations_dir(orch)
+
+
+def test_merge_decision_enrichment_keeps_a_conflicting_queue_stamp_and_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Two DIFFERENT real queues: FIRST-writer-wins, loudly.
+
+    The field is a scalar (task 3640 hard-committed that, adding
+    UNKNOWN_QUEUE as a third scalar state), so a cross-queue MODE-2 collapse
+    genuinely cannot record both queues. Keeping the EXISTING stamp makes
+    the outcome DETERMINISTIC (the first filer's queue) rather than racy
+    (whichever watcher wrote last), which is strictly better -- but it is
+    still information loss, so it must never be silent: a WARNING names the
+    decision id and BOTH queue paths.
+    """
+    orch, recon = _two_queues(tmp_path)
+    existing = _make_decision(id='esc-5914-1', escalations_dir=sr.normalize_escalations_dir(orch))
+    incoming = _make_decision(id='esc-5914-1', escalations_dir=sr.normalize_escalations_dir(recon))
+
+    with caplog.at_level(logging.WARNING):
+        merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged.escalations_dir == sr.normalize_escalations_dir(orch)
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings
+    assert any(
+        'esc-5914-1' in r.getMessage()
+        and str(sr.normalize_escalations_dir(orch)) in r.getMessage()
+        and str(sr.normalize_escalations_dir(recon)) in r.getMessage()
+        for r in warnings
+    )
+
+
+def test_merge_decision_enrichment_does_not_let_the_unknown_sentinel_displace_a_real_queue(
+    tmp_path: Path,
+) -> None:
+    """UNKNOWN_QUEUE loses to a real queue in BOTH directions.
+
+    Existing ``<unknown>`` + incoming real queue -> take the real one: that
+    is a genuine enrichment, since it makes an otherwise permanently
+    unreapable record reapable again.
+
+    Existing real queue + incoming ``<unknown>`` -> keep the real one:
+    the reverse would make a reapable record unreapable, which no reaper
+    could ever undo.
+
+    Belt-and-braces given the CLI verb already refuses the sentinel at its
+    boundary -- but merge_decision_enrichment is a public pure helper and
+    must be correct on its own terms.
+    """
+    orch, _recon = _two_queues(tmp_path)
+    real = sr.normalize_escalations_dir(orch)
+
+    from_unknown = sr.merge_decision_enrichment(
+        _make_decision(escalations_dir=sr.UNKNOWN_QUEUE),
+        _make_decision(escalations_dir=real),
+    )
+    to_unknown = sr.merge_decision_enrichment(
+        _make_decision(escalations_dir=real),
+        _make_decision(escalations_dir=sr.UNKNOWN_QUEUE),
+    )
+
+    assert from_unknown.escalations_dir == real
+    assert to_unknown.escalations_dir == real
+
+
+def test_merge_decision_enrichment_does_not_let_the_unknown_sentinel_displace_the_empty_queue(
+    tmp_path: Path,
+) -> None:
+    """The third direction: '' must not be DOWNGRADED to ``<unknown>`` either.
+
+    The two states are not interchangeable "not a real queue" spellings, and
+    ranking them by truthiness (the obvious `if incoming_queue:` reading) gets
+    it backwards. A record stamped '' is the LEGACY population and still
+    closes, via the reaper's project-only fallback. A record stamped
+    ``<unknown>`` is refused BY NAME by every reaper, so it can only ever be
+    closed by a human. Adopting the sentinel therefore takes a reapable record
+    and makes it permanently unreapable -- the mirror image of the '' -> real
+    enrichment above, run backwards, and no reaper can undo it.
+
+    ``<unknown>`` means "investigated, could not determine" and is legitimate
+    ONLY from the back-fill that did the investigating (task 3640,
+    set_decision_escalations_dir). A merge has investigated nothing, so it
+    never gets to acquire the sentinel from the other filer.
+
+    Unreachable through the CLI verb today, which refuses the sentinel on
+    input -- but merge_decision_enrichment is public and must be correct on
+    its own terms. Note the 144-case exhaustive test does NOT cover this: its
+    predicate asserts the (queue, id) pair is vouched for, and ('', id) ->
+    ('<unknown>', id) can still be perfectly vouched for while losing
+    reapability.
+    """
+    to_unknown = sr.merge_decision_enrichment(
+        _make_decision(escalations_dir='', escalation_id=None),
+        _make_decision(escalations_dir=sr.UNKNOWN_QUEUE, escalation_id='esc-1'),
+    )
+    from_unknown = sr.merge_decision_enrichment(
+        _make_decision(escalations_dir=sr.UNKNOWN_QUEUE, escalation_id=None),
+        _make_decision(escalations_dir='', escalation_id='esc-1'),
+    )
+
+    assert to_unknown.escalations_dir == ''
+    # ...and the id does not travel without its queue, per the pair rule.
+    assert to_unknown.escalation_id is None
+    # The reverse was already right and stays right: '' is not an "upgrade"
+    # over an investigated ``<unknown>``, it is just a different unknown.
+    assert from_unknown.escalations_dir == sr.UNKNOWN_QUEUE
+    assert from_unknown.escalation_id is None
+
+
+def test_merge_decision_enrichment_treats_equivalent_queue_spellings_as_one(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Both sides are NORMALIZED before comparing, never raw-string-compared.
+
+    A dotted / trailing-slash spelling of the SAME queue must not read as a
+    cross-queue conflict -- that is the fail-open mistake
+    normalize_escalations_dir exists to prevent, and the reaper's axis-2
+    guard already normalizes both sides for exactly this reason. No warning
+    is emitted, because nothing conflicts.
+    """
+    orch, _recon = _two_queues(tmp_path)
+    existing = _make_decision(escalations_dir=sr.normalize_escalations_dir(orch))
+    incoming = _make_decision(escalations_dir=f'{orch}/./')
+
+    with caplog.at_level(logging.WARNING):
+        merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged.escalations_dir == sr.normalize_escalations_dir(orch)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_merge_decision_enrichment_never_forges_a_queue_id_pair(tmp_path: Path) -> None:
+    """``escalations_dir`` and ``escalation_id`` must move as ONE PAIR.
+
+    Merging them by INDEPENDENT rules lets the survivor carry a (queue, id)
+    combination that existed on NEITHER filer's record: here the queue would
+    be adopted from *incoming* while the id stays *existing*'s, yielding
+    ``(orch, 'esc-3036-1')`` -- a pair `orch` never vouched for.
+
+    That is fail-CLOSED, the one direction the reaper must never take.
+    ``_run_reap_decisions._status`` JOINS on exactly this pair: axis 2
+    compares the stamp, then ``read_escalation_status(escalations_dir,
+    decision.escalation_id)`` resolves the id INSIDE that queue -- and
+    ``esc-<taskid>-<n>`` ids are unique only WITHIN a queue, so the forged
+    pair resolves against an unrelated escalation that merely shares the id.
+    That is verbatim the incident _run_reap_decisions' own docstring records:
+    an unrelated RESOLVED orchestrator escalation silently closing a still
+    PENDING recon blocking gate, invisible in the cockpit for ~7 days.
+
+    The correct outcome is to keep *existing*'s own pair: the record is left
+    exactly as (un)reapable as it already was -- a visible cockpit row, which
+    is the fail-OPEN direction _run_reap_decisions' asymmetry-of-harm
+    paragraph prescribes.
+    """
+    orch, _recon = _two_queues(tmp_path)
+    existing = _make_decision(escalations_dir='', escalation_id='esc-3036-1')
+    incoming = _make_decision(
+        escalations_dir=sr.normalize_escalations_dir(orch),
+        escalation_id='esc-9999-1',
+    )
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert (merged.escalations_dir, merged.escalation_id) != (
+        sr.normalize_escalations_dir(orch),
+        'esc-3036-1',
+    )
+    assert merged.escalations_dir == ''
+    assert merged.escalation_id == 'esc-3036-1'
+
+
+def test_merge_decision_enrichment_warns_when_it_refuses_an_ambiguous_queue_upgrade(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Refusing the upgrade is right, but it must never be SILENT.
+
+    Same shape as ..._never_forges_a_queue_id_pair: the record keeps its
+    undetermined queue and therefore stays unreapable. That is deliberate,
+    not an oversight, so it is logged for the same never-silent-information
+    -loss reason the conflicting-stamp WARNING already exists -- naming the
+    decision and the incoming queue it declined to adopt, so an operator can
+    see which record is being held and why.
+    """
+    orch, _recon = _two_queues(tmp_path)
+    existing = _make_decision(id='esc-3036-1', escalations_dir='', escalation_id='esc-3036-1')
+    incoming = _make_decision(
+        id='esc-3036-1',
+        escalations_dir=sr.normalize_escalations_dir(orch),
+        escalation_id='esc-9999-1',
+    )
+
+    with caplog.at_level(logging.WARNING):
+        merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged.escalations_dir == ''
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        'esc-3036-1' in r.getMessage()
+        and str(sr.normalize_escalations_dir(orch)) in r.getMessage()
+        for r in warnings
+    )
+
+
+def test_merge_decision_enrichment_does_not_borrow_an_escalation_id_across_a_queue_conflict(
+    tmp_path: Path,
+) -> None:
+    """The OTHER direction of the same defect: the queue stays, the id must not move.
+
+    First-writer-wins keeps `orch`, but filling the empty ``escalation_id``
+    from the recon filer hands `orch`'s stamp an id from RECON's namespace.
+    The damage is worse than a mismatch: today ``reap_answered_decisions``
+    SKIPS a decision with no escalation_id outright (``if not
+    escalation_id: continue``), so this record is inert and safe. Borrowing
+    an id turns a record the reaper never touched into one it will resolve
+    against the wrong namespace -- manufacturing the fail-CLOSED join out of
+    nothing.
+    """
+    orch, recon = _two_queues(tmp_path)
+    existing = _make_decision(
+        escalations_dir=sr.normalize_escalations_dir(orch),
+        escalation_id=None,
+    )
+    incoming = _make_decision(
+        escalations_dir=sr.normalize_escalations_dir(recon),
+        escalation_id='esc-9999-1',
+    )
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    assert merged.escalations_dir == sr.normalize_escalations_dir(orch)
+    assert merged.escalation_id is None
+
+
+@pytest.mark.parametrize('incoming_id', [None, 'esc-a', 'esc-b'])
+@pytest.mark.parametrize('incoming_queue_key', ['empty', 'unknown', 'orch', 'recon'])
+@pytest.mark.parametrize('existing_id', [None, 'esc-a', 'esc-b'])
+@pytest.mark.parametrize('existing_queue_key', ['empty', 'unknown', 'orch', 'recon'])
+def test_merge_decision_enrichment_pair_is_always_vouched_for(
+    tmp_path: Path,
+    existing_queue_key: str,
+    existing_id: str | None,
+    incoming_queue_key: str,
+    incoming_id: str | None,
+) -> None:
+    """THE INVARIANT, over the whole 12x12 input space.
+
+    The two focused cases above are instances; this is the general rule they
+    are instances of, asserted exhaustively so no future merge rule can
+    reintroduce a forged pair through a combination nobody thought to test.
+
+    Predicate: the merged ``(escalations_dir, escalation_id)`` is either
+    id-less (inert -- the reaper skips it) or is a pair some INPUT record
+    actually vouched for. Never a synthesis of one filer's queue with the
+    other filer's id, because ``read_escalation_status`` is a JOIN on that
+    pair and ids are unique only within a queue.
+
+    Cheap to run exhaustively: merge_decision_enrichment is pure, so this is
+    144 in-memory calls.
+    """
+    orch, recon = _two_queues(tmp_path)
+    queues = {
+        'empty': '',
+        'unknown': sr.UNKNOWN_QUEUE,
+        'orch': sr.normalize_escalations_dir(orch),
+        'recon': sr.normalize_escalations_dir(recon),
+    }
+    existing = _make_decision(
+        escalations_dir=queues[existing_queue_key], escalation_id=existing_id
+    )
+    incoming = _make_decision(
+        escalations_dir=queues[incoming_queue_key], escalation_id=incoming_id
+    )
+
+    merged = sr.merge_decision_enrichment(existing, incoming)
+
+    merged_queue = sr.normalize_escalations_dir(merged.escalations_dir)
+    assert merged.escalation_id is None or any(
+        sr.normalize_escalations_dir(side.escalations_dir) == merged_queue
+        and side.escalation_id == merged.escalation_id
+        for side in (existing, incoming)
+    )
+
+
 def test_main_reap_decisions_does_not_close_across_queues(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -4904,10 +5782,13 @@ def test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_its_st
     """Pins the acknowledged MODE-2 tradeoff (task 3528, raised in review).
 
     A MODE-2 same-subject duplicate (esc-5914-1) collapses to ONE record by
-    design -- but ``escalations_dir`` is single-valued and write_decision
-    rewrites the whole file, so the survivor carries only the LAST filer's
-    queue (pinned by ..._same_id_from_two_queues_stays_one_decision). The
-    axis-2 guard then makes the OTHER queue's reaper skip it outright.
+    design -- but ``escalations_dir`` is single-valued, so the survivor can
+    carry only ONE of the two queues: the FIRST filer's, since task 3559
+    made a cross-queue re-file enrich rather than overwrite (pinned by
+    ..._same_id_from_two_queues_stays_one_decision). The axis-2 guard then
+    makes the OTHER queue's reaper skip it outright. Task 3559 changed only
+    WHICH queue survives -- deterministically the first filer's, rather than
+    racily whichever watcher wrote last -- not the gap's existence.
 
     So if the escalation that actually reaches a terminal status is the one
     in the NON-stamped queue -- entirely possible for two independently-filed
@@ -4928,7 +5809,12 @@ def test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_its_st
         json.dumps({'status': 'resolved'})
     )
     (recon / 'esc-5914-1.json').write_text(json.dumps({'status': 'pending'}))
-    for queue in (orch, recon):  # two watchers, one collapsed record; recon files last
+    # Two watchers, one collapsed record. RECON FILES FIRST, so under task
+    # 3559's first-writer-wins its queue is the one stamped -- which keeps
+    # this case non-vacuous: the reaper below scans `orch`, the NON-stamped
+    # queue, and `orch` is precisely where the RESOLVED copy lives, so an
+    # absent axis-2 guard really would close this decision.
+    for queue in (recon, orch):
         assert (
             sr.main(
                 [
@@ -5016,9 +5902,299 @@ def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
     listed = sr.list_decisions(root=tmp_path)
     assert [d.id for d in listed] == ['esc-5914-1']
     # The discriminator is a FIELD holding a normalized queue path, never a
-    # namespace prefix baked into the id.
-    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+    # namespace prefix baked into the id. The field is scalar, so only ONE of
+    # the two queues can survive: the FIRST filer's (task 3559 -- the second
+    # filing enriches rather than overwrites), which makes the outcome
+    # deterministic instead of "whichever watcher happened to write last".
+    assert listed[0].escalations_dir == sr.normalize_escalations_dir(orch)
     assert listed[0].id == 'esc-5914-1'
+
+
+def _file_decision(**kwargs: str) -> int:
+    """Invoke the write-decision verb with kwargs as --flags, skipping Nones.
+
+    Keeps the MODE-2 end-to-end cases below readable: each is two filings
+    that differ in only a few fields, and spelling both argv lists out in
+    full buries the difference under boilerplate.
+    """
+    argv = ['write-decision']
+    for name, value in kwargs.items():
+        if value is not None:
+            argv += [f'--{name.replace("_", "-")}', value]
+    return sr.main(argv)
+
+
+def test_main_write_decision_mode2_second_queue_enriches_and_never_downgrades(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """THE HEADLINE REGRESSION (task 3559), at the CLI boundary.
+
+    The observed esc-5914-1 MODE-2 shape: both dark_factory queues surface
+    the SAME reify gate. The first watcher files a rich record (full text,
+    critical, task + session ids); the second files a poorer view of the
+    same gate through the OTHER queue.
+
+    Before this change _run_write_decision blind-overwrote the whole file,
+    so the second filing won every field: the cockpit row silently lost the
+    first watcher's text and was DOWNGRADED critical -> info. Now the second
+    filing enriches instead -- still exactly ONE row (the collapse-to-one-
+    cockpit-row requirement, task 3528 (b)), but carrying the best
+    information either watcher has, with custody fields untouched.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+
+    rc1 = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        task_id='5914',
+        session_id='watcher-df-1',
+        escalations_dir=str(orch),
+    )
+    filed_at = sr.list_decisions(root=tmp_path)[0].filed_at
+    rc2 = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='reify?',
+        severity='info',
+        escalations_dir=str(recon),
+    )
+
+    assert rc1 == 0
+    assert rc2 == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    survivor = listed[0]
+    assert survivor.text == 'Adopt the reify plan?'  # never clobbered
+    assert survivor.severity == 'critical'  # never downgraded
+    assert survivor.task_id == '5914'  # never clobbered
+    assert survivor.session_id == 'watcher-df-1'  # never clobbered
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(orch)  # first wins
+    assert survivor.state == sr.DecisionState.OPEN
+    assert survivor.filed_at == filed_at  # queue age not restamped
+
+
+def test_main_write_decision_same_queue_refile_still_fully_overwrites(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The enrichment branch must not OVER-trigger on a same-queue re-file.
+
+    Both SKILL.md files promise a watcher can re-file its own stable id
+    across a restart and have its UPDATED view land -- and that includes
+    fields going DOWN or empty, since the watcher is the sole authority on
+    its own escalation. Freezing the first values would strand stale prose
+    and a stale severity in the cockpit queue forever.
+
+    The queue stamp is precisely the axis separating "the same watcher
+    re-filing" from "a second watcher on the same gate", so it is the
+    discriminator, and it needs no new field. Complements
+    test_main_write_decision_refiling_same_id_overwrites_not_duplicates,
+    which pins the no-duplicate half; this pins that even a DOWNGRADE lands
+    when it comes from the same queue.
+
+    ...with the CUSTODY fields excepted, which is the other half of this
+    test. ``filed_at`` and ``manual_boost`` are NOT the watcher's to revise:
+    a restart is not news about when the gate was first surfaced (filed_at
+    drives cockpit ordering), and the boost belongs to the OPERATOR via
+    set_manual_boost. merge_decision_enrichment already holds both back on
+    the cross-queue path; custody cannot depend on which queue re-filed, or
+    an operator who boosts a row to the top of the queue silently loses it
+    on the watcher's next restart -- the very "second write downgrades an
+    open record" shape task 3559 removes.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        task_id='5914',
+        escalations_dir=str(orch),
+    )
+    # An operator triages the cockpit between the two filings: boosts the row
+    # to the top of the queue. The watcher then restarts and re-files.
+    filed_at = sr.list_decisions(root=tmp_path)[0].filed_at
+    assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='reify? (rephrased)',
+        severity='info',
+        escalations_dir=str(orch),
+    )
+
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    assert listed[0].text == 'reify? (rephrased)'
+    assert listed[0].severity == 'info'
+    assert listed[0].task_id is None
+    assert listed[0].manual_boost == 9  # the operator's boost survives
+    assert listed[0].filed_at == filed_at  # queue age not restamped
+
+
+def test_main_write_decision_same_id_different_project_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A cross-PROJECT id collision is not a MODE-2 collapse, and must not merge.
+
+    DecisionRecords are fleet-global, both watcher SKILLs tell a watcher to
+    use the escalation id as the decision id, and ``esc-<taskid>-<n>`` task
+    numbering RESTARTS per project -- so 'esc-42-1' in dark_factory and
+    'esc-42-1' in reify are two unrelated human gates that collide. Two
+    projects also always run different queue dirs, so such a collision lands
+    on exactly the queue-differs axis the enrichment branch keys on: without
+    a project check it would be folded into the other project's record,
+    producing ONE cockpit row that claims to be A's ask (A's project, text
+    and filed_at kept, severity maxed up by B) while B's gate is invisible
+    and unreapable by B's reaper.
+
+    Refused rather than overwritten: overwriting would delete a live row
+    instead, which is the clobber this task exists to stop. Same
+    first-writer-wins policy as a conflicting queue stamp, and loud, so the
+    collision is a log line rather than a silent misfiling.
+
+    Deliberately arranged so the merge is DETECTABLE rather than a no-op:
+    the incumbent is the POORER record (info, no task/session id) and the
+    colliding filing is richer, so enrichment would visibly leak B's
+    severity and ids onto A's row. Asserting only `project`/`text` would be
+    vacuous -- enrichment keeps those from *existing* too.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+
+    rc1 = _file_decision(
+        id='esc-42-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='info',
+        escalation_id='esc-42-1',
+        escalations_dir=str(orch),
+    )
+    with caplog.at_level(logging.ERROR):
+        rc2 = _file_decision(
+            id='esc-42-1',
+            project='reify',
+            text='an unrelated reify gate that merely shares the id',
+            severity='critical',
+            task_id='42',
+            session_id='watcher-reify-1',
+            escalation_id='esc-42-1',
+            escalations_dir=str(recon),
+        )
+
+    assert rc1 == 0
+    assert rc2 == 0  # loud, but fail-soft: never changes spawn-claude.sh's rc
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-42-1']
+    survivor = listed[0]
+    # Untouched in EVERY field -- not merged, not overwritten, not enriched.
+    assert survivor.project == 'df'
+    assert survivor.text == 'Adopt the reify plan?'
+    assert survivor.severity == 'info'  # NOT maxed up by the other project
+    assert survivor.task_id is None  # no empty field filled from reify
+    assert survivor.session_id is None
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(orch)
+    refusals = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and 'esc-42-1' in r.getMessage()
+    ]
+    assert refusals, 'the refusal must be logged, not silent'
+    assert 'reify' in refusals[0].getMessage()  # names the refused project
+    assert 'df' in refusals[0].getMessage()  # ...and the incumbent
+
+
+def test_main_write_decision_non_open_record_is_still_overwritten(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Protection is scoped to an OPEN record, as the task words it.
+
+    An ANSWERED record is a question the human already dealt with; a second
+    watcher filing that id is starting a NEW ask, not enriching a live one,
+    so it gets today's plain overwrite (which re-opens it -- state comes
+    from the incoming record). Enriching instead would silently graft the
+    new question onto a closed row's history.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='esc-5914-1',
+            project='df',
+            text='the old, answered question',
+            state=sr.DecisionState.ANSWERED,
+            escalations_dir=sr.normalize_escalations_dir(orch),
+        ),
+        root=tmp_path,
+    )
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='a brand new question',
+        escalations_dir=str(recon),
+    )
+
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    assert listed[0].text == 'a brand new question'
+    assert listed[0].state == sr.DecisionState.OPEN
+    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+
+
+def test_main_write_decision_enriches_a_legacy_unstamped_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """End-to-end enrichment of the legacy population, through the CLI.
+
+    The unstamped record has to be seeded via write_decision directly,
+    because the verb now makes it impossible to CREATE one -- which is the
+    point of the whole task. A watcher then files that id with its real
+    queue and the record becomes queue-scoped: this is what makes 3640's
+    back-fill terminal rather than a recurring chore, since the residual
+    population can now only shrink.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='esc-5914-1',
+            project='df',
+            text='Adopt the reify plan?',
+            state=sr.DecisionState.OPEN,
+            escalations_dir='',
+        ),
+        root=tmp_path,
+    )
+
+    # --escalation-id is passed because a real watcher passes it by
+    # construction: the stamp names the queue THAT id belongs to (see the
+    # verb's own --escalations-dir help). It matters here because the queue
+    # and the id move as a PAIR -- a filing that supplies the queue but not
+    # the id cannot vouch for the seed's own 'esc-1', so the upgrade would be
+    # (correctly) refused as ambiguous rather than forging a pair.
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='reify?',
+        escalation_id='esc-1',
+        escalations_dir=str(orch),
+    )
+
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    assert listed[0].escalations_dir == sr.normalize_escalations_dir(orch)
+    assert listed[0].text == 'Adopt the reify plan?'  # enriched, not clobbered
 
 
 def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
