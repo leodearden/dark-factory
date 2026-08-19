@@ -6706,6 +6706,59 @@ async def _assert_child_reaped(
 
 
 @pytest.mark.asyncio
+class TestHungChildHelperContract:
+    """Contract for the not-yet-defined ``_start_hung_child`` arrange helper.
+
+    Pins that the helper's arrange phase is deadline-independent: it waits
+    for the observable fact of the child's pid landing on disk, however long
+    interpreter startup takes, rather than racing a fixed clock (task 4109).
+    """
+
+    async def test_returns_only_after_pid_published_and_alive(
+        self, tmp_path: Path
+    ) -> None:
+        pid_file = tmp_path / 'child.pid'
+        # 10x _CANCEL_TIMEOUT (0.05s) — the discriminating leg. A helper that
+        # folded the spawn into any sub-second fixed deadline, or that
+        # returned before the pid was published, fails the assertions below
+        # here. This is the slow-interpreter-startup condition the old fixed
+        # 5.0s deadline could only cover probabilistically, applied
+        # deterministically instead of hoped for.
+        task, child_pid = await _start_hung_child(pid_file, startup_delay=0.5)
+
+        try:
+            assert pid_file.read_text().strip() == str(child_pid), (
+                f'pid_file contents {pid_file.read_text().strip()!r} do not '
+                f'match the pid the helper returned ({child_pid!r}) — the '
+                'returned pid must be the one the child actually published, '
+                'not a guess'
+            )
+
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                pytest.fail(
+                    f'child pid {child_pid} is not alive immediately after '
+                    '_start_hung_child returned — any cancellation the '
+                    'caller drives next would race a child that may already '
+                    'be gone'
+                )
+
+            assert not task.done(), (
+                'task is already done right after _start_hung_child '
+                'returned — the _run future must still be pending inside '
+                'await proc.communicate() so cancelling it exercises the '
+                'kill+reap path under test rather than an already-completed '
+                'no-op'
+            )
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await _assert_child_reaped(child_pid)
+
+
+@pytest.mark.asyncio
 class TestRunCancellationReapsChild:
     """``_run`` kills+reaps the spawned child on cancellation (task 2608).
 
