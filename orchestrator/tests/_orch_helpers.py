@@ -1369,6 +1369,13 @@ def assert_sandboxed_project_root(project_root, tmp_path: Path) -> None:
        anything the steward wrote relative to ``config.project_root`` escaped
        pytest's ``tmp_path`` retention sweep.
 
+    Clauses 3 and 4 compare RESOLVED paths on both sides, which is what makes a
+    symlink escape detectable: a link created *under* ``tmp_path`` that points
+    outside it is lexically contained but physically is not, and everything the
+    steward writes through it lands outside the retention sweep.  Dropping
+    either ``.resolve()`` would leave that case silently accepted, so clause 4's
+    message reports the resolved target alongside the value as given.
+
     ONE sanctioned exception, recorded here so a reader who greps the invariant
     finds it instead of "fixing" the site: ``test_out_of_band_routing.py``'s
     ``_REVIEW_PROJECT_ROOT`` must NOT be sandboxed, because
@@ -1402,7 +1409,9 @@ def assert_sandboxed_project_root(project_root, tmp_path: Path) -> None:
         f"tmp_path.parent — outside the directory pytest's retention sweep reclaims"
     )
     assert resolved.is_relative_to(root), (
-        f'expected project_root under tmp_path={tmp_path}, got {project_root} — the '
+        f'expected project_root under tmp_path={tmp_path} (resolved to {root}), got '
+        f'{project_root} which resolves to {resolved} — both sides are resolved so a '
+        f'symlink created UNDER tmp_path but pointing outside it is caught here; the '
         f"retired '/tmp/project' and '/tmp/fake-project' literals pointed OUTSIDE "
         f'the test sandbox, so anything the steward wrote relative to '
         f"config.project_root escaped pytest's tmp_path retention sweep"

@@ -46,7 +46,12 @@ class TestAssertSandboxedProjectRoot:
 
     Four clauses, each pinned by at least one test below: the value must be a
     real ``Path``, it must be a CREATED directory, it must not be the sandbox
-    root itself, and it must resolve strictly below that root.
+    root itself, and it must resolve strictly below that root.  Clause 2 is
+    pinned BOTH ways ``is_dir()`` can fail (a path that does not exist, and one
+    that exists as a regular file), and clause 4's ``.resolve()`` calls are
+    pinned by the symlink case — without it, a regression that dropped them
+    would leave every other test here green while a link under the sandbox
+    pointing outside it sailed through.
 
     Clauses 2 and 3 are the DRIFT RECONCILIATION.  The copy in
     ``test_conftest_helpers.py`` never carried the ``.is_dir()`` clause, and
@@ -101,6 +106,50 @@ class TestAssertSandboxedProjectRoot:
 
         with pytest.raises(AssertionError, match='never-created'):
             assert_sandboxed_project_root(never_created, tmp_path)
+
+    def test_rejects_a_regular_file(self, tmp_path):
+        """Clause 2, the OTHER way ``is_dir()`` fails: the path exists, but is
+        not a directory.
+
+        Distinct from the never-created case above and just as plausible — a
+        test that has already written ``tmp_path / 'project'`` as a file, then
+        hands it over as a root.  ``exists()`` would accept it; ``is_dir()`` is
+        what rejects it, so this pins the clause's actual spelling rather than
+        the weaker one it could drift to.
+        """
+        regular_file = tmp_path / 'project'
+        regular_file.write_text('not a directory', encoding='utf-8')
+
+        with pytest.raises(AssertionError, match='CREATED directory'):
+            assert_sandboxed_project_root(regular_file, tmp_path)
+
+    def test_rejects_a_symlink_under_the_sandbox_pointing_outside_it(self, tmp_path):
+        """Clause 4's ``.resolve()`` calls, on BOTH sides — the load-bearing part.
+
+        A symlink created under the sandbox but pointing outside it is
+        lexically contained (``link.is_relative_to(sandbox)`` is ``True``) and
+        ``is_dir()`` follows it, so clauses 1-3 all pass.  Only resolving both
+        sides catches it — and everything the steward writes through such a root
+        lands outside the directory pytest's retention sweep reclaims, which is
+        the exact escape this helper exists to stop.
+
+        Without this case a regression that dropped ``.resolve()`` (say
+        ``resolved = project_root``) would leave every other test in this class
+        green.
+        """
+        sandbox = tmp_path / 'sandbox'
+        sandbox.mkdir()
+        outside = tmp_path / 'elsewhere'
+        outside.mkdir()
+        link = sandbox / 'project'
+        link.symlink_to(outside, target_is_directory=True)
+
+        # Clauses 1-3 genuinely pass: this is a real, existing, non-root Path.
+        assert link.is_dir()
+        assert link.is_relative_to(sandbox)
+
+        with pytest.raises(AssertionError, match='elsewhere'):
+            assert_sandboxed_project_root(link, sandbox)
 
     def test_rejects_the_sandbox_root_itself(self, tmp_path):
         """Clause 3 — the strictness clause NEITHER existing copy carried.
