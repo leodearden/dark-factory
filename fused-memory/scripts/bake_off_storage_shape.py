@@ -140,6 +140,40 @@ metrics, report rendering) with zero network, fully exercised in the merge
 lane, plus a thin **live driver** (``seed_arm`` / ``run_arm`` /
 ``run_bake_off`` / ``_run``) that is the only part touching Qdrant or an
 embedder.
+
+WHY THERE IS NO STORE-MUTATION PREFLIGHT HERE (an observation, task 4293)
+------------------------------------------------------------------------
+``fused_memory.utils.store_mutation_preflight.assert_store_mutation_allowed``
+is the fail-closed capability probe the shared-store mutators in
+``fused-memory/scripts/`` call before their first write.  The live driver's
+two mutations — ``drop_collections``' ``delete_collection`` and
+``seed_arm``'s ``backend.add`` — are unprobed, and that is a decision rather
+than an omission.  Measured against this file AS IT STANDS at task 4293; not
+a standing exemption for whatever it becomes:
+
+  * its blast radius is bounded to scratch substrate, statically.
+    ``run_bake_off`` force-sets ``config.mem0.collection_prefix =
+    ephemeral_collection_prefix()`` on its own config copy, and that prefix is
+    ``load_cleanup_script().E2_BAKEOFF_PREFIX`` — the SAME constant the reaper
+    ``scripts/cleanup_test_collections.py`` allowlists, read from the reaper
+    itself.  No CLI flag reaches the prefix (``--project-suffix`` moves the
+    suffix only), so no invocation can point these deletes or writes at a
+    ``fused``-prefixed production collection;
+  * it does not write mem0's shared SQLite history: ``seed_arm`` stubs
+    ``instance.db.add_history`` per instance before the first ``add`` (that
+    writer is process-shared, xdist-contended, and read-only in the sandbox —
+    see ``seed_arm``'s own docstring).  So the capability the preflight probes
+    for is not one the seeding path needs.
+
+THE RESIDUAL, stated rather than papered over: ``run_bake_off`` builds a real
+``MemoryService(config)`` and awaits ``memory.initialize()``, which runs
+Graphiti startup maintenance — index creation plus the W6-ε dup-uuid-edge
+scan-and-REPAIR — against the production FalkorDB, under no prefix bound at
+all.  That is NOT covered by anything above, and it is not specific to this
+script: no ``run()``-level guard in any of the scripts task 4293 guarded
+dominates ``initialize()`` either, because ``initialize()`` runs before
+``run()`` is called.  It is a systemic gap tracked by tasks 4318 and 4350, and
+is deliberately not claimed as handled here.
 """
 from __future__ import annotations
 
