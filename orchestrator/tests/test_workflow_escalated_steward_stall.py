@@ -680,14 +680,15 @@ def _make_steward_config(project_root: Path) -> MagicMock:
     ``resolve_route``, and a ``spec_set`` MagicMock must not be the reason a
     future assertion moves.
 
-    This factory stays SEPARATE from ``make_steward`` for three structural
-    reasons, examined by task 3551 and recorded in full in that fixture's
-    docstring: it feeds a ``TaskSteward`` SUBCLASS (``_CapFiringSteward`` below);
-    that construction passes ``config_dir=``, which the fixture does not accept;
-    and ``_make_real_steward_factory`` is a CALLBACK the workflow invokes later
-    with a worktree the workflow chooses, so it cannot request ``tmp_path`` at
-    construction time.  It does share the fixture's sandboxed ``project_root``
-    recipe (task 3551) — hence the required parameter.
+    This factory stays SEPARATE from ``make_steward``, PERMANENTLY: task 3647
+    ruled the split closed rather than deferred.  The reasons live in exactly
+    one place — ``conftest.py``'s ``make_steward`` docstring, the single owner —
+    and are deliberately not restated here, because the same rationale living in
+    three copies is the drift that task 3647 existed to end.  The ruling is
+    enforced by the census in ``test_steward_scaffolding_guards.py``, which
+    allowlists this module with that reason recorded.  It does share the
+    fixture's sandboxed ``project_root`` recipe (task 3551) — hence the required
+    parameter.
 
     Deliberately SEPARATE from the workflow's own ``OrchestratorConfig``: the
     steward-side cap and the workflow-side ``steward_completion_timeout`` are
