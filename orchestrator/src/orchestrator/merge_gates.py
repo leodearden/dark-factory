@@ -1844,15 +1844,23 @@ async def _resolve_renamed_plan_path(
     *tree_paths*.  Mechanism 1 cannot see a relocation staged as SEPARATE
     delete and add commits (git pairs renames only within one commit),
     which is exactly how the reify harness-consolidation programme staged
-    its moves.  The fallback is deliberately conservative and bounded four
-    ways: it requires EXACTLY ONE candidate; it only runs for a path that
-    exists nowhere in the branch tree; it only runs for a path with actual
-    history under its declared name (see
-    :func:`_path_existed_in_branch_history` — an invented path is a stale
-    declaration, not a rename); and a resolution never passes the gate on
-    its own — the caller additionally requires the resolved path to be in
-    the touched set.  So an ambiguous or coincidental basename cannot
-    silently satisfy the gate.
+    its moves.  The basename searched for is taken from the LAST RESOLVED
+    HOP (``current``), not the originally declared path (``norm``): this
+    mechanism is reached precisely when the chain dead-ended on a path
+    absent from the tree, so the declared name is already known stale,
+    whereas a hop the chain got at least one step past is live evidence of
+    what the file is called now (``current == norm`` when the chain never
+    advanced, so the no-chain case is unaffected).  The fallback is
+    deliberately conservative and bounded four ways: it requires EXACTLY
+    ONE candidate; it only runs for a path that exists nowhere in the
+    branch tree; it only runs for a path with actual history under its
+    ORIGINALLY DECLARED name, checked via
+    :func:`_path_existed_in_branch_history` on ``norm`` (never ``current``,
+    which would be vacuous — a hop only exists because a commit deleted
+    it; an invented path is a stale declaration, not a rename); and a
+    resolution never passes the gate on its own — the caller additionally
+    requires the resolved path to be in the touched set.  So an ambiguous
+    or coincidental basename cannot silently satisfy the gate.
 
     *tree_paths* is an async provider, not a list, so the (single) tree
     listing is shelled out at most ONCE per gate invocation, shared across
@@ -1928,7 +1936,12 @@ async def _resolve_renamed_plan_path(
     # Reached when no commit deleted the path (never created, or the
     # relocation predates any reachable delete), when the deleting commit
     # carried no pairable rename (separate delete+add commits), or when
-    # the chain dead-ended on a path that is absent from the tree.
+    # the chain dead-ended on a path that is absent from the tree.  The
+    # basename searched for is taken from `current` — the LAST RESOLVED
+    # HOP, which equals `norm` when the chain never advanced — because
+    # reaching this mechanism at all means the declared name is the one
+    # name we already know is stale; a hop the chain got at least one
+    # step past is strictly better evidence of the file's current name.
     if not await _path_existed_in_branch_history(
         norm, branch_head, git_ops, task_id=task_id,
     ):
@@ -1944,12 +1957,16 @@ async def _resolve_renamed_plan_path(
     if live is None:
         return None
 
-    basename = posixpath.basename(norm)
+    basename = posixpath.basename(current)
     if not basename:
         return None
     candidates = [p for p in live if posixpath.basename(p) == basename]
     if len(candidates) == 1:
-        return candidates[0], 'unique basename match'
+        mechanism = (
+            'unique basename match' if current == norm
+            else f'unique basename match on {current} (after {len(shas)}-hop rename chain)'
+        )
+        return candidates[0], mechanism
 
     return None
 
