@@ -2015,10 +2015,29 @@ async def _settled_lane_lock_holder_pids(
     For the two acquire-TIMEOUT sites only (:meth:`GitOps.merge_verify_lease`
     and :meth:`GitOps.reset_persistent_merge_worktree`).  Both used to read the
     kernel lock table exactly ONCE there and feed that snapshot to a predicate
-    and a message; this adds the missing read POLICY on top of the unchanged
-    reader, the way
+    and a message; this adds a read POLICY on top of the reader, the way
     :func:`~orchestrator.verify_cancel.lane_lock_holder_pids` is itself a thin
     policy wrapper over ``lane_lock_holder_pids_strict``.
+
+    TWO LAYERS, NOT A DUPLICATE OF ONE (task 4227 — read this before deleting
+    either).  They answer DIFFERENT questions on DIFFERENT time scales:
+
+    * READER layer (``lane_lock_holder_pids``, MICROSECONDS, never sleeps) —
+      recovers a record the CHUNKED READ dropped.  It reads the table K times
+      back-to-back and returns the union, so it heals a lossy read of a SINGLE
+      instant.  It applies to every consumer of the reader, unconditionally
+      and by construction.
+    * SETTLE layer (THIS helper, 0.5s, sleeps) — asks something no re-read of
+      one instant can answer: did the holder genuinely RELEASE between the
+      acquire timeout and the probe?  That is a question about the passage of
+      TIME, which is why its trigger is emptiness and why it stays after the
+      reader is fixed.
+
+    The reader layer strictly shrinks how often this one is reached; it cannot
+    replace it.  Deleting this helper as redundant would restore the "an empty
+    read contradicts the timeout that produced it" gap, and deleting the
+    reader's confirm loop would re-expose every OTHER call site — including the
+    two ``holder_pids is None`` branches below, which never had a settle layer.
 
     WHAT IT ABSORBS.  ``/proc/locks`` is a seq_file the kernel serves one PAGE
     per ``read(2)`` regardless of the caller's buffer (a 13062-byte table took
@@ -2069,12 +2088,22 @@ async def _settled_lane_lock_holder_pids(
     THE BOUND (``_LANE_LOCK_HOLDER_SETTLE_SECS`` / ``..._INTERVAL_SECS``),
     derived from both sides:
 
-    * FLOOR — against the measured 1.54%-per-read loss, 0.5s at 0.02s gives
-      ~25 reads: ~1e-45 under independence, and ~3e-8 even at a deliberately
-      pessimistic 50%-per-read correlated-burst rate.  A re-read either
-      succeeds in microseconds or is structurally broken, so a wider bound
-      only delays a certain answer — the same reasoning that sized the test
-      side's ``_LANE_LOCK_STRICT_READ_SECS``.
+    * FLOOR — 0.5s at 0.02s gives ~25 POLL ITERATIONS, and the bound must
+      survive all of them losing the record.  Stated per ITERATION, because
+      task 4227 changed what one iteration is: each is now a K-read UNION in
+      the reader, so an iteration loses the record with probability p^K rather
+      than the per-READ p.  At the measured p = 1.54% and K = 3 that is ~4e-6
+      per iteration; even at a deliberately pessimistic 50%-per-read
+      correlated-burst rate it is 12.5%.  The old figures (~1e-45 and ~3e-8)
+      applied the per-READ rate directly across those ~25 iterations; they are
+      stale in DETAIL only, and in the SAFE direction — the total-loss
+      probability is now p^(K x 25), strictly smaller than either, so the
+      conclusion that this bound sits amply clear of the floor only gets
+      stronger.  Note the reader's confirm reads are a READ-COUNT bound
+      with no sleep, so they add microseconds and move NO wall-clock figure
+      here.  A re-read either succeeds in microseconds or is structurally
+      broken, so a wider bound only delays a certain answer — the same
+      reasoning that sized the test side's ``_LANE_LOCK_STRICT_READ_SECS``.
     * CEILING — this is what forbids simply copying that 2.0.  Every test that
       drives a contended raise inside a ``with foreign_lane_lock_holder(...)``
       block pays this bound ON TOP of that helper's 34.0s unconditional stack
@@ -2144,6 +2173,17 @@ def _lane_lock_holder_facts(
     rendered clause describes the very holder set the leak predicate evaluated;
     a second independent read could observe a different one and quietly
     misdescribe the decision during exactly the forensics this exists for.
+
+    ``None`` READS HERE, and that read is now CHUNK-TOLERANT (task 4227).  This
+    branch is one of the two task 3783 deliberately did not cover with
+    :func:`_settled_lane_lock_holder_pids`, so before the reader was fixed it
+    depended on a single lucky read: a chunked skip degraded this clause to
+    "the kernel reports no FLOCK holder" precisely when the lane WAS contended,
+    dropping the holder pid+pgid — the one datum DF 3003/3081 had to
+    reconstruct by hand.  Nothing was rewired to fix it; the tolerance lives in
+    the reader every site here binds, so all four consume it BY CONSTRUCTION
+    and per-site divergence is impossible.  That binding is itself pinned by
+    ``test_git_ops_binds_the_fail_safe_wrapper_not_the_strict_core``.
     """
     pids = lane_lock_holder_pids(lock_path) if holder_pids is None else holder_pids
     if not pids:
@@ -3222,6 +3262,32 @@ class GitOps:
         different holder sets, leaving the message describing a set the
         predicate never evaluated.  ``None`` reads the table here instead,
         keeping direct callers (and the tests) two-argument.
+
+        THE ``None`` READ IS CHUNK-TOLERANT (task 4227), and this is the branch
+        where that matters most.  ``/proc/locks`` is served one page per
+        ``read(2)`` with each read restarting the walk from a positional index,
+        so a single read can silently DROP our row (measured: 1.54%, 144/9337,
+        under 24 churners).  The lane lock is ``LOCK_EX``, so the target inode
+        has at most ONE holder row — losing it surfaces as ``[]``, layer (1)
+        evaluates ``self_pid not in []``, and a genuine self-owned B13 leak is
+        returned as ordinary foreign contention, deferring quietly for up to
+        four hours.  That read SUCCEEDS, so no strict/errno-keyed variant can
+        see it.  Task 3783's settle poll covers the two acquire-timeout sites
+        only; this branch and ``_lane_lock_holder_facts``' were left
+        unabsorbed, and the fix therefore went into the READER both bind rather
+        than into either site — all four are tolerant by construction, and no
+        per-site divergence is possible.
+
+        WHY THE UNION IS SAFE FOR A LOUD PREDICATE.  The reader returns the
+        union of the pids seen across its K back-to-back reads, which can only
+        ADD an attribution that was TRUE OF THE KERNEL at some instant during
+        the query — a chunked read drops records, it never invents them.  So
+        layer (1) can only gain a true attribution, while layers (2) and (3)
+        are read AFTERWARDS and can only VETO: the same asymmetry task 3783's
+        poll already relies on.  The union's staleness window is microseconds
+        (no sleep) against that poll's 0.5s, so it is strictly less exposed to
+        the in-process-sibling race documented there and needs no new argument
+        of its own.
 
         *ctx* forwards ``operation``/``protected_path`` to the fault so it keeps
         the parent's full payload contract.
