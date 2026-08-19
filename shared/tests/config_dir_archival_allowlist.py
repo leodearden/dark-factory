@@ -194,16 +194,34 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
         'archives_in': (
             ('orchestrator/src/orchestrator/workflow.py', 'TaskWorkflow._invoke'),
             ('orchestrator/src/orchestrator/git_ops.py', 'GitOps.cleanup_worktree'),
+            (
+                'orchestrator/src/orchestrator/workflow.py',
+                'TaskWorkflow._archive_then_cleanup_config_dir',
+            ),
         ),
         'rationale': (
-            'The main per-task config dir (~:2377). Covered twice: the '
-            'TaskWorkflow._invoke producer hook archives each finished session, '
-            'and GitOps.cleanup_worktree\'s teardown backstop sweeps the whole '
-            'dir for anything the producer missed (e.g. a CancelledError-killed '
-            'invocation). _shutdown_steps orders cleanup_done_worktree BEFORE '
-            'cleanup_config_dir, so the archiving path runs first. This is the '
-            'reference shape the dry_run_unblock hook (entry 5) was modelled '
-            'on.'
+            'The main per-task config dir (~:2390). Covered three ways as of '
+            'task 3619. The TaskWorkflow._invoke producer hook archives each '
+            'finished session; GitOps.cleanup_worktree\'s teardown backstop '
+            'sweeps the whole dir at cold worktree removal; and '
+            'TaskWorkflow._archive_then_cleanup_config_dir archives at the '
+            'config-dir teardown itself. _shutdown_steps orders '
+            'cleanup_done_worktree BEFORE cleanup_config_dir, so the archiving '
+            'path runs first. This is the reference shape the dry_run_unblock '
+            'hook (entry 5) was modelled on.'
+            '\n\n'
+            'The third entry is the one that makes this disposition hold '
+            'unconditionally, and it is a different KIND of coverage from the '
+            'other two. Both older hooks are skippable — the producer hook can '
+            'be lost to a CancelledError at SIGTERM or to an invocation that '
+            'never reached its finally, and the cleanup_worktree backstop is '
+            'reached only on COLD removals (the warm- and spec-lane early '
+            'returns fire above it; see the NOTES below). The rmtree in '
+            '_archive_then_cleanup_config_dir is not skippable, because task '
+            '3619 made archival a PRECONDITION of that delete rather than a '
+            'step scheduled before it. The observed failure it closes: a run '
+            'that preserved the session sidecar and destroyed the transcript '
+            'the sidecar pointed at, leaving --resume with a dangling id.'
         ),
     },
     # -------------------------------------------------------------------- 7
@@ -211,26 +229,58 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
         'path': 'orchestrator/src/orchestrator/workflow.py',
         'qualname': 'TaskWorkflow._recycle_config_dir',
         'destroyed_by': 'self._config_dir.cleanup() one line earlier',
-        'disposition': UNARCHIVED_GAP,
+        'disposition': ARCHIVED,
+        'archives_in': (
+            (
+                'orchestrator/src/orchestrator/workflow.py',
+                'TaskWorkflow._archive_then_cleanup_config_dir',
+            ),
+        ),
         'rationale': (
-            'Wedged-session recycle (~:8220): cleanup() rmtrees the WHOLE dir '
-            'and a fresh TaskConfigDir is reconstructed at the identical path '
-            'on the next line. The intent is to discard the wedged session, but '
-            'the blast radius is the whole dir — any not-yet-flushed sibling '
-            '(e.g. `<sid>/subagents/agent-*.jsonl` from a prior healthy '
-            'invocation) goes with it, and the wedged session\'s own transcript '
-            'is exactly what a legibility miner would want in order to explain '
-            'the wedge. Note this is the same MODULE as entry 6, which does '
-            'archive — the gate checks the enclosing FUNCTION, so a '
-            'module-level import of archive_task_transcripts cannot launder '
-            'this gap into a false ARCHIVED. Not fixed here: workflow.py is a '
-            'hot, heavily-locked file well outside task 3271\'s scope, and the '
-            'right fix is an archival call before the cleanup rather than a '
-            'change to the recycle semantics.'
+            'Wedged-session recycle (~:8311). CLOSED by task 3619; recorded '
+            'UNARCHIVED_GAP by task 3271 for the reasons kept below.'
+            '\n\n'
+            'The gap was: cleanup() rmtree\'d the WHOLE dir and a fresh '
+            'TaskConfigDir was reconstructed at the identical path on the next '
+            'line. Discarding the wedged session is the intent, but the blast '
+            'radius was the whole dir — any not-yet-flushed sibling (e.g. '
+            '`<sid>/subagents/agent-*.jsonl` from a prior healthy invocation) '
+            'went with it, and the wedged session\'s own transcript is exactly '
+            'what a legibility miner would want in order to explain the wedge. '
+            'It was left unfixed because workflow.py is a hot, heavily-locked '
+            'file well outside task 3271\'s scope, and the right fix was an '
+            'archival call before the cleanup rather than a change to the '
+            'recycle semantics.'
+            '\n\n'
+            'That is what landed: the bare cleanup() here became a call to '
+            'TaskWorkflow._archive_then_cleanup_config_dir, the single '
+            'teardown primitive this function and _cleanup_config_dir (entry 6) '
+            'now share — so neither can acquire the archival guard while the '
+            'other quietly keeps deleting. The recycle semantics are unchanged; '
+            'only what is provably durable is unlinked.'
+            '\n\n'
+            'Why archives_in names the HELPER and not this function: the gate '
+            'scans for NAME references, not a call graph, so archival reached '
+            'through a `self._archive_then_cleanup_config_dir()` hop is '
+            'credited where the archiver is actually named. The '
+            'same-module-as-entry-6 caution that used to sit here still holds '
+            'and still matters — the gate checks the enclosing FUNCTION, so a '
+            'module-level import cannot launder a future regression here into a '
+            'false ARCHIVED. What it means in the other direction is that this '
+            'entry\'s green rests on the helper existing and on this function '
+            'routing through it. The gate proves the first; '
+            'orchestrator/tests/test_transcript_archive_producer_hook.py::'
+            'TestCleanupConfigDirArchivesFirst::'
+            'test_recycle_also_archives_before_it_destroys proves the second by '
+            'planting a transcript, calling _recycle_config_dir(), and reading '
+            'it back out of the archive. Neither half is sufficient alone.'
         ),
         'follow_up': (
-            'Filed as a task-3271 follow-up: archive before '
-            'TaskWorkflow._recycle_config_dir cleans up the wedged session dir.'
+            'CLOSED by task 3619 (leaf 2 of '
+            'plans/transcript-preservation-seam-prd.md), which routed this '
+            'site through TaskWorkflow._archive_then_cleanup_config_dir. No '
+            'open follow-up remains; retained as the audit trail for a gap '
+            'that task 3271 filed and 3619 discharged.'
         ),
     },
 )

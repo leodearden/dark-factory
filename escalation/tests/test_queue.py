@@ -4441,3 +4441,172 @@ class TestResolvedAtIsStampedFromTheLiveClock:
             f'resolved_at {resolved.resolved_at!r} precedes timestamp '
             f'{resolved.timestamp!r} for the same record'
         )
+
+
+class TestAddMembersToL2SeverityFloor:
+    """add_members_to_l2 applies an UPWARD-ONLY severity floor (task 3976).
+
+    Invariant: **an L2's severity is monotonically non-decreasing after mint.**
+
+    This closes a regression that promote_to_l2's new inherited default would
+    otherwise introduce.  Before, every L2 was born 'blocking', so this method
+    never touching severity was harmless.  Once an L2 can be born 'info', a
+    genuine blocker folding into it under the same root_cause would sit at
+    'info' forever — under-escalation, the exact mirror of the inflation this
+    task removes.
+    """
+
+    def _make_l2(
+        self,
+        queue: EscalationQueue,
+        severity: str = 'info',
+        task_id: str = 'task-1',
+    ) -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity=severity,
+            category='design_concern',
+            summary='L2 cluster for severity-floor test',
+            level=2,
+            root_cause='Bad merge strategy',
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        return esc
+
+    def _on_disk(self, queue: EscalationQueue, esc_id: str) -> dict[str, Any]:
+        return json.loads((queue.queue_dir / f'{esc_id}.json').read_text())
+
+    def test_floor_promotes_info_l2_to_blocking(self, tmp_path: Path):
+        """(a) A blocking floor raises an info L2 — in the return value AND on disk."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='info')
+
+        result = queue.add_members_to_l2(l2.id, ['esc-new'], severity_floor='blocking')
+
+        assert result is not None
+        assert result.severity == 'blocking', (
+            f'Expected the floor to raise info→blocking, got {result.severity!r}'
+        )
+        assert self._on_disk(queue, l2.id)['severity'] == 'blocking', (
+            'The promoted severity must be persisted, not only returned'
+        )
+
+    def test_floor_never_demotes(self, tmp_path: Path):
+        """(b) A lower floor is a no-op — the floor can only ever add attention."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='blocking')
+
+        result = queue.add_members_to_l2(l2.id, ['esc-new'], severity_floor='info')
+
+        assert result is not None
+        assert result.severity == 'blocking', (
+            f'A floor must never demote; got {result.severity!r}'
+        )
+
+    def test_floor_is_ranked_not_string_compared(self, tmp_path: Path):
+        """(c) critical outranks blocking, and blocking does not outrank critical."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        blocking_l2 = self._make_l2(queue, severity='blocking', task_id='task-1')
+        critical_l2 = self._make_l2(queue, severity='critical', task_id='task-2')
+
+        raised = queue.add_members_to_l2(
+            blocking_l2.id, ['esc-new'], severity_floor='critical',
+        )
+        held = queue.add_members_to_l2(
+            critical_l2.id, ['esc-new'], severity_floor='blocking',
+        )
+
+        assert raised is not None
+        assert raised.severity == 'critical'
+        assert held is not None
+        assert held.severity == 'critical', (
+            f'blocking must not outrank critical; got {held.severity!r}'
+        )
+
+    def test_omitting_the_floor_is_a_no_op(self, tmp_path: Path):
+        """(d) Every existing caller is unaffected — severity is untouched."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='info')
+
+        result = queue.add_members_to_l2(l2.id, ['esc-new'])
+
+        assert result is not None
+        assert result.severity == 'info', (
+            f'Omitting severity_floor must not change severity; got {result.severity!r}'
+        )
+
+    def test_severity_only_change_bumps_updated_at(self, tmp_path: Path):
+        """(e) A severity-only change IS a content change — it must bump updated_at.
+
+        The watcher's re-assess protocol keys off updated_at > triaged_at
+        ('Triage-ack freshness contract'), so a record that silently got more
+        severe without bumping would be stamp-then-skipped forever.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='info')
+        # No NEW member ids — 'esc-l1-0' is already present.
+        assert l2.updated_at is None
+
+        result = queue.add_members_to_l2(
+            l2.id, ['esc-l1-0'], severity_floor='blocking',
+        )
+
+        assert result is not None
+        assert result.severity == 'blocking'
+        assert result.updated_at is not None, (
+            'A severity-only promotion must stamp updated_at'
+        )
+
+        before = result.updated_at
+        raised_again = queue.add_members_to_l2(
+            l2.id, ['esc-l1-0'], severity_floor='critical',
+        )
+        assert raised_again is not None
+        assert raised_again.updated_at is not None
+        assert raised_again.updated_at > before, (
+            f'Expected updated_at to strictly increase, got {before!r} -> '
+            f'{raised_again.updated_at!r}'
+        )
+
+    def test_no_op_stays_a_no_op(self, tmp_path: Path):
+        """(f) No new members AND a floor at/below current severity → no bump.
+
+        Do not manufacture a re-assess trigger for nothing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='blocking')
+
+        result = queue.add_members_to_l2(l2.id, ['esc-l1-0'], severity_floor='info')
+
+        assert result is not None
+        assert result.severity == 'blocking'
+        assert result.updated_at is None, (
+            f'Expected no updated_at bump for a true no-op, got {result.updated_at!r}'
+        )
+
+    def test_unknown_floor_does_not_corrupt_the_record(self, tmp_path: Path, caplog):
+        """(g) An unknown floor fails soft to rank 0 — the record keeps its severity."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, severity='blocking')
+
+        with caplog.at_level(logging.WARNING):
+            result = queue.add_members_to_l2(
+                l2.id, ['esc-new'], severity_floor='warn',
+            )
+
+        assert result is not None
+        assert result.severity == 'blocking', (
+            f'An unknown floor must not corrupt severity; got {result.severity!r}'
+        )
+        assert self._on_disk(queue, l2.id)['severity'] == 'blocking'
+        warned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'warn' in r.getMessage()
+        ]
+        assert warned, (
+            'Expected a WARNING naming the unrecognised severity; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )

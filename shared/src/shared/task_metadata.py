@@ -901,6 +901,35 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         'before_done_verified_at',
         'before_done_verified_pid',
         'files_tagged_at',
+        # Finding-provenance family (esc-3796-1, 2026-08-17). `source_finding_id`
+        # is the CANONICAL key naming the finding a task was spawned from;
+        # `stage1_finding_id` is a distinct canonical key naming a Stage-1
+        # finding specifically (NOT an alias of it); `origin_finding_id` is the
+        # RETIRED alias, kept in the set deliberately.
+        #
+        # Unusually for a Tier-A entry, this family has NO code reader and NO
+        # code writer — it is a pure LLM prose convention, blessed on
+        # corpus-dominance grounds (source=120 tasks, stage1=33, origin=30,
+        # source-x-origin overlap 0; 46 vs 2 writes since 2026-08-01). A future
+        # reader who greps for a writer, finds none, and concludes these
+        # entries are dead would be wrong: the corpus IS the usage. That also
+        # means `origin_finding_id` never met the "already relied on by real
+        # writers" criterion it was originally blessed under.
+        #
+        # Those figures are a point-in-time census (2026-08-17), not an
+        # invariant, so this comment is deliberately their SINGLE in-repo copy:
+        # docs/task-authoring.md §8 and the dedicated test's docstring cite
+        # esc-3796-1 instead of restating them. A re-census updates here and
+        # the ruling — nowhere else.
+        #
+        # The retired alias STAYS because 30 landed tasks carry it, most
+        # terminal and mechanically un-rewritable (task 3796 rejected data
+        # migration). Removing it would manufacture exactly the unknown_key
+        # census noise this change exists to eliminate. Blessing remains
+        # reversible if a later ruling consolidates the family (precedent:
+        # commit 84e3b4cd75).
+        'source_finding_id',
+        'stage1_finding_id',
         'origin_finding_id',
         'spawned_from',
         'program',

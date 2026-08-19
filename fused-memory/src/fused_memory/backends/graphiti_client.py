@@ -11,6 +11,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, NamedTuple, TypedDict, cast
 from urllib.parse import urlparse
@@ -374,6 +375,643 @@ class AmbiguousEntityError(Exception):
     The error message includes all matching UUIDs so the caller can
     disambiguate and call refresh_entity_summary with a specific UUID.
     """
+
+
+class IncompleteEnumerationError(Exception):
+    """Raised when a whole-graph enumeration was STRUCTURALLY incomplete.
+
+    Not "the read failed" — the read was never validly performed.  Either it
+    refused to start (``INCOMPLETE_STRUCTURAL_REFUSAL``: zero queries issued,
+    so the emptiness is fabricated rather than observed) or it ran out of page
+    budget mid-corpus (``INCOMPLETE_PAGE_CAP``: the rows are a PREFIX in
+    ``ORDER BY`` order, not a sample).
+
+    WHY THIS RAISES INSTEAD OF RETURNING THE COLLECTION, which is what made
+    the original defect corrupting rather than merely under-reporting: a
+    caller cannot tell a fabricated empty from a genuinely empty graph, and
+    the consumer downstream is a WRITE.  ``MemoryService.rebuild_entity_summaries``
+    -> ``_rebuild_one`` -> ``all_edges.get(uuid, [])`` -> ``rebuild_entity_from_edges``
+    computes ``'\\n'.join([]) == ''`` and ``update_node_summary`` persists it,
+    blanking a real summary with the *absence of evidence* that the read was
+    never performed.  The ``force=True`` path is the sharpest vector: it does
+    not consult staleness at all, so it writes to every entity returned.
+
+    Deliberately an ``Exception``, never a ``BaseException``: both
+    reconciliation sweeps catch ``Exception`` while re-raising
+    ``CancelledError``/``KeyboardInterrupt``/``SystemExit``, so subclassing
+    ``BaseException`` would escape their handlers and turn a handled per-cycle
+    error into an outage.
+
+    Empirical incompleteness (``INCOMPLETE_CENSUS_UNAVAILABLE``,
+    ``INCOMPLETE_SHORT_READ``) does NOT raise — see the shims for why.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Paginated whole-graph reads (task 4340)
+# ---------------------------------------------------------------------------
+
+_RESULTSET_SIZE = 10000
+"""FalkorDB's server-wide result-set ceiling: every query returns at most this
+many rows, silently truncated — no error, no marker.
+
+This is an ASSUMPTION about server configuration, not a fact this repo
+controls: nothing here sets ``RESULTSET_SIZE``, and a grep finds no override
+anywhere.  Measured 2026-08-17 against localhost:6379::
+
+    GRAPH.CONFIG GET RESULTSET_SIZE  ->  10000
+
+That it is an assumption is exactly why ``_paged_ro_query`` does not trust it
+alone and cross-checks against a server-side census (see the guards there).
+"""
+
+_DEFAULT_READ_PAGE_SIZE = 5000
+"""Rows per page: half the assumed cap, so a short page really is end-of-data.
+
+The page loop breaks on a page shorter than the requested size, reasoning
+"the data is exhausted".  That reasoning is sound only while the server
+cannot be what shortened the page — i.e. only while the page size stays
+strictly below the cap.  Half the cap buys a full page of margin.
+"""
+
+_MAX_READ_PAGES = 1000
+"""Hard bound on pages per enumeration, so a pathological corpus (or a store
+that never returns a short page) cannot spin forever.
+
+At the default page size that is 5,000,000 rows, against a live maximum near
+32,000 — normal use never approaches it.  Hitting it is REPORTED
+(``complete=False`` + a WARNING naming the numbers), never silently swallowed:
+a page cap that truncates in silence would just be the defect this module
+exists to fix, moved one layer up.
+"""
+
+# The four fail-closed paths of ``_paged_ro_query``, as a typed discriminator
+# on ``PagedRead.incomplete_kind``.  PUBLIC (no leading underscore, unlike
+# ``_RESULTSET_SIZE``): a caller reads these off a returned PagedRead to learn
+# WHY a read was incomplete, so they are part of the contract.
+#
+# They exist so nobody has to sniff ``PagedRead.reason``, which is diagnostic
+# prose written for an operator reading a log and is deliberately NOT a stable
+# interface — any wording improvement would silently break a substring match,
+# and the branch it broke is the one that stops a fabricated empty from being
+# written back over real summaries.
+
+INCOMPLETE_STRUCTURAL_REFUSAL = 'structural_refusal'
+"""Guard 1: ``page_size >= resultset_size``. Zero queries issued, zero rows.
+
+The returned emptiness is FABRICATED — no read was attempted — which is why
+it must never be confused with a genuinely empty corpus.
+"""
+
+INCOMPLETE_PAGE_CAP = 'page_cap'
+"""Guard 2: ``max_pages`` exhausted while the last page was still full.
+
+The rows are a PREFIX of the corpus in ``ORDER BY`` order, not a sample.
+"""
+
+INCOMPLETE_CENSUS_UNAVAILABLE = 'census_unavailable'
+"""Guard 3: no usable count. The rows were fetched; only the PROOF is missing."""
+
+INCOMPLETE_SHORT_READ = 'short_read'
+"""Guard 4: ``rows_seen < expected_rows`` — the enumeration is SHORT."""
+
+INCOMPLETE_STRUCTURAL_KINDS = frozenset(
+    {INCOMPLETE_STRUCTURAL_REFUSAL, INCOMPLETE_PAGE_CAP}
+)
+"""The DETERMINISTIC, non-transient incompleteness kinds.
+
+Both are fully determined by configuration and code: they reproduce exactly
+on retry and can never be caused by a concurrent write.  That is what makes
+them safe to RAISE on (see the shims), where the empirical kinds are not — a
+census disagreeing by a handful of rows is the expected signature of a live
+graph being written to mid-read.
+
+Callers should branch on membership in this set rather than on a specific
+kind, so a future fifth structural path is covered by construction.
+"""
+
+# --------------------------------------------------------------------------- #
+# RESULT-SET CAP AUDIT — every read in this file, re-checked 2026-08-17
+# (task 4340).  Recorded so the next person does not have to redo it, and
+# stated as claims with reasons so it can be FALSIFIED rather than trusted.
+#
+# THIS BLOCK IS THE ONE PLACE the measured figures, the open residual, and the
+# ticket cross-references are written down.  Everything else that used to
+# restate them — the two shim docstrings, _paged_ro_query's residual
+# paragraph, the pagination test module's docstring, and the task-4340
+# amendment in reconciliation/stale_status_snapshot_edge_sweep.py — now points
+# HERE, so a re-measurement is a one-block edit.  Keep it that way.  Moving
+# the block out of source entirely, into a reference doc, is tracked as ticket
+# tkt_0RSKFG5RX196H9CJ0RXGJCZF4F; the counts below are date-stamped precisely
+# because they rot (Entity nodes on dark_factory read 16038, then 16083, then
+# 16262 over roughly 24 hours of task 4340).
+#
+# Measured live against localhost:6379, RESULTSET_SIZE=10000:
+#
+#     graph          Entity nodes   valid-edge rows   an unpaginated read saw
+#     dark_factory       16083            25040                10000
+#     reify              23616            31659                10000
+#
+# FIXED HERE — both were measurably truncated, and they COMPOUND:
+# ``detect_stale_with_edges`` calls them on consecutive lines and the two
+# truncations were INDEPENDENT, so an entity surviving the node cut could
+# still lose every edge to the edge cut, yielding a bogus "stale, zero valid
+# facts" verdict that ``rebuild_entity_from_edges`` then WROTE BACK into
+# ``n.summary``.  Corrupting, not merely under-reporting.
+#   - get_all_valid_edges  -> enumerate_all_valid_edges
+#   - list_entity_nodes    -> enumerate_entity_nodes
+# The old names survive as thin shims with UNCHANGED signatures applying a
+# SPLIT incompleteness policy: they RAISE IncompleteEnumerationError on a
+# STRUCTURAL incompleteness (a read that was never validly performed — its
+# emptiness or prefix is fabricated, and returning it is what let '' be
+# written back over real summaries) and WARN-and-return on an EMPIRICAL one
+# (a census disagreement, transient on a continuously-written graph).  The
+# completeness signal itself is a first-class return value on the enumerate_*
+# methods, which never raise.  No consumer ACTS on it yet — the two
+# reconciliation sweeps and cleanup_count_snapshots still call the shims, so
+# they cannot yet distinguish "swept a complete corpus" from "swept what we
+# could fetch".  Filed as ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH.
+#
+# MEASURED COST of paging, and the keyset rewrite it rules out.  Measured
+# 2026-08-18 against localhost:6379, warm, 3 repeats, median reported; the
+# whole enumeration (census + every page), page_size 5000:
+#
+#     graph          read          UNPAGINATED     PAGED       rows
+#     dark_factory   entity nodes     860 ms      862 ms      16262
+#     dark_factory   valid edges      771 ms     3301 ms      25382
+#     reify          entity nodes    3326 ms     1498 ms      23671
+#     reify          valid edges     3126 ms     3685 ms      31783
+#
+# The UNPAGINATED column is the OLD behaviour and returned 10000 truncated
+# rows for its money, so it is a cost floor, not a comparable answer.  One
+# full detect_stale_with_edges (both reads) costs ~4.2 s on dark_factory —
+# about +2.6 s per reconciliation cycle — and ~5.2 s on reify, which is
+# FASTER than the ~6.5 s the two truncated reads used to cost there.  Paging
+# a large result set in 5000-row chunks beats transferring one 10000-row set.
+#
+# KEYSET/SEEK PAGINATION WAS TRIED AND DECLINED, on measurement rather than
+# on taste.  The concern it answers is real in principle: ORDER BY ... SKIP k
+# LIMIT n re-scans and re-sorts the whole matched population per page, so an
+# enumeration is O(P * N log N) where a seek would be O(N log N).  For the
+# node read the seek form is available — `WHERE n.uuid > $last ORDER BY
+# n.uuid LIMIT k` over the RANGE index ensure_indices creates on
+# Entity(uuid).  Measured head to head, running SEEK FIRST each round so any
+# warm-cache advantage favoured it:
+#
+#     graph          node SEEK (keyset)        node SKIP (offset)
+#     dark_factory   [781, 904, 862] ms        [796, 862, 1610] ms
+#     reify          [1414, 1310, 1577] ms     [1814, 1498, 1214] ms
+#
+# Indistinguishable — identical medians on dark_factory, ~6% on reify, well
+# inside the run-to-run spread.  The asymptotic argument does not bite at
+# this N: 4-5 pages over ~16-24k rows, where the sort is not the bottleneck.
+# So a second paging mode in _paged_ro_query would buy no measured latency
+# and cost a second code path to keep correct.  Re-open only WITH a
+# measurement showing the sort dominating — and note the edge read, which is
+# the expensive one, cannot use it anyway: its ORDER BY is the composite
+# (e.uuid, n.uuid) needed for a total order over ROWS.
+#
+# DOWNSTREAM FAN-OUT, the other cost this fix moved.  detect_stale_dry_run
+# issues one get_valid_edges_for_node per non-empty-summary entity, and now
+# runs over the COMPLETE node set instead of a truncated 10000.  Measured
+# 0.70 ms/entity amortised at max_concurrency=10 on dark_factory (0.39 ms on
+# reify), so the full fan-out is ~9.0 s against ~7.0 s before (dark_factory)
+# and ~8.8 s against ~3.9 s (reify).  Seconds, bounded, and it is the price
+# of the answer being right; it is not a liveness risk at these sizes.
+#
+# RESIDUAL LEFT OPEN DELIBERATELY, and not an oversight: a materially-short
+# INCOMPLETE_SHORT_READ still returns a partial collection that the
+# force=True path (memory_service.py:5826-5834, MemoryService.rebuild_entity_summaries)
+# will write back, blanking the summary of any entity whose edges fell in the
+# missing remainder.  That path never consults staleness, so it writes to
+# every entity the node read returned.  Do NOT close it by tightening the shims — guard 4 fires on any
+# shortfall at all, including a single concurrently-invalidated edge, so
+# raising there would take down the live rebuild for exactly the transient
+# the warn-not-raise decision rejected.  The fix belongs at the consumer, as
+# a policy on how short is too short applied where the destructive write is
+# decided, which is the same code the ticket above must touch.
+#
+# STILL UNPAGINATED and assessed AT RISK.  Left out of 4340 only because they
+# are separable — different call chains, no shared verdict, no write-back —
+# and folding them in would have doubled the diff.  Follow-up filed as ticket
+# tkt_0RSJP82N82SNKT2BHRT3HWK3DA (a TICKET id, not a task id — the curator
+# resolves it to a task asynchronously).
+#   - query_stale_node_embeddings: ~16083 rows on dark_factory.  A truncated
+#     read makes an embedding-dimension migration look COMPLETE when it is
+#     not — the worst shape of this bug, because the operator's evidence of
+#     success is the very thing being truncated.
+#   - query_stale_edge_embeddings: ~15242/22392 rows.  No ``invalid_at``
+#     filter, so it includes superseded edges and its row count runs ahead of
+#     the valid-edge census above.
+#   - query_edges_by_time_range: bounded only by the caller's window width;
+#     any window wide enough to span >10000 edges truncates.
+#   - retrieve_episodes: reaches the same server through graphiti-core's
+#     ``get_by_group_ids(limit=None)`` rather than ``ro_query``, so it is not
+#     fixable with ``_paged_ro_query`` as-is.  Its existing comment reasons
+#     about transfer COST and about ``last_n`` being capped in tools.py;
+#     neither protects against server-side truncation.  Truncation is worse
+#     than slowness here: the Python-side ``sorted(...)[:last_n]`` would be
+#     selecting the most-recent of a truncated 10000, i.e. silently returning
+#     the wrong episodes rather than merely fewer of them.
+#
+# ASSESSED SAFE, with the reason (a bare list would not be checkable):
+#   - every uuid-keyed lookup: the key is unique, so the result is 0 or 1 rows.
+#   - every exact-name lookup: bounded by the duplicate-name count, which
+#     ``find_duplicate_entity_nodes`` reports in single digits.
+#   - every single-row aggregate: one row by construction.
+#   - server-side grouped/filtered aggregates that SCAN the whole graph but
+#     whose RESULT set is small — the cap applies to rows RETURNED, not rows
+#     scanned, so a ``count``/``collect`` folding 20k rows into a handful is
+#     safe.
+#   - ``CALL db.indexes()``: one row per index, single digits.
+#   - every per-node neighbourhood read.  ``get_valid_edges_for_node`` is
+#     called out by name because task 4340 asked about it specifically: its
+#     row count is ONE node's valid degree, and a single node would have to
+#     hold >10000 of the graph's ~12506 valid edges to reach the cap.  It is
+#     left unpaginated deliberately, not by oversight.
+# --------------------------------------------------------------------------- #
+
+
+# Page/census pairs for the paginated whole-graph reads. Each pair shares an
+# IDENTICAL MATCH/WHERE so the two numbers describe the same population and
+# are therefore directly comparable.
+#
+# The ORDER BY must be a TOTAL order over ROWS, not merely over the entity or
+# edge: the undirected edge pattern yields two rows per edge, so `e.uuid`
+# alone would leave that pair free to reshuffle across a page boundary — and a
+# reshuffle at a boundary drops rows permanently and silently.
+_ALL_VALID_EDGES_MATCH = (
+    'MATCH (n:Entity)-[e:RELATES_TO]-() '
+    'WHERE e.invalid_at IS NULL '
+)
+_ALL_VALID_EDGES_PAGE_TEMPLATE = (
+    _ALL_VALID_EDGES_MATCH
+    + 'RETURN n.uuid, e.uuid, e.fact, e.name '
+    'ORDER BY e.uuid, n.uuid '
+    'SKIP {skip} LIMIT {limit}'
+)
+_ALL_VALID_EDGES_CENSUS = _ALL_VALID_EDGES_MATCH + 'RETURN count(*)'
+
+# Entity nodes. Here `n.uuid` alone IS a total order — one row per node, and
+# node uuids are unique — unlike the edge case above.
+_ENTITY_NODES_MATCH = 'MATCH (n:Entity) '
+_ENTITY_NODES_PAGE_TEMPLATE = (
+    _ENTITY_NODES_MATCH
+    + 'RETURN n.uuid, n.name, n.summary '
+    'ORDER BY n.uuid '
+    'SKIP {skip} LIMIT {limit}'
+)
+_ENTITY_NODES_CENSUS = _ENTITY_NODES_MATCH + 'RETURN count(*)'
+
+
+@dataclass(frozen=True)
+class PagedRead:
+    """Result of a paginated read: the rows, plus whether they are all of them.
+
+    ``reason`` is None exactly when ``complete`` is True.  ``expected_rows`` is
+    None when the census probe could not produce a usable count — an
+    unavailable proof, which is itself a reason to report incomplete.
+
+    ``incomplete_kind`` is one of the four module-level ``INCOMPLETE_*``
+    constants, and is None exactly when ``complete`` is True.  It exists so a
+    caller can branch on WHY a read was incomplete without parsing ``reason``,
+    whose wording is diagnostic prose aimed at an operator reading a log and
+    is deliberately NOT a stable interface.  The distinction matters most for
+    ``INCOMPLETE_STRUCTURAL_REFUSAL``, where the returned emptiness is
+    fabricated rather than read: without a typed discriminator that is
+    indistinguishable from a genuinely empty graph, and the difference decides
+    whether a caller writes an empty summary back over a real one.
+
+    The field is last and defaulted so the five original fields — none of
+    which have defaults — keep working under positional construction.
+    """
+
+    rows: list[list]
+    complete: bool
+    rows_seen: int
+    expected_rows: int | None
+    reason: str | None
+    incomplete_kind: str | None = None
+
+
+async def _census_count(graph, cypher: str, params: dict | None = None) -> int | None:
+    """Return the single integer a ``count(...)`` probe reports, or None.
+
+    EVERY "the store did not say" shape collapses to None — no rows, a null
+    result set, a row with no columns, a NULL value, a non-integer — because
+    the caller treats None as fail-closed and there is nothing to gain from
+    distinguishing flavours of missing evidence.
+
+    A single-row aggregate can never be truncated by the row cap it is being
+    used to detect, which is what makes this a proof rather than one more
+    heuristic.
+    """
+    result = await graph.ro_query(cypher, params)
+    rows = getattr(result, 'result_set', None) or []
+    if not rows:
+        return None
+    first = rows[0]
+    if first is None or len(first) == 0:
+        return None
+    try:
+        return int(first[0])
+    except (TypeError, ValueError):
+        return None
+
+
+_SKIP_PLACEHOLDER = '{skip}'
+_LIMIT_PLACEHOLDER = '{limit}'
+
+
+def _render_page_bounds(page_template: str, *, skip: int, limit: int) -> str:
+    """Substitute the two SKIP/LIMIT placeholders, leaving every other brace alone.
+
+    Deliberately NOT ``str.format``.  Cypher map patterns carry literal braces
+    — ``MATCH (n:Entity {name: $name})``, a shape several other queries in this
+    file already use — and ``str.format`` raises ``KeyError``/``ValueError`` on
+    one of those BEFORE any query is issued, from a traceback that points at a
+    formatting call rather than at the offending template.  Since more reads
+    are meant to be routed through this primitive, that trap would be one map
+    literal away for the next author, and it would need a brace-doubling
+    convention nobody has to remember here.  Two literal replacements have no
+    such failure mode.
+
+    Both placeholders are REQUIRED.  A template missing ``{skip}`` would
+    re-fetch the same offset every iteration until ``max_pages``, then report
+    a page-cap shortfall — a real authoring bug wearing the costume of a
+    server truncation.  Raising is how it stays legible.
+
+    Bounds are coerced to ``int`` before substitution, so nothing but a
+    validated integer this module computed can reach the Cypher text.
+    """
+    for placeholder in (_SKIP_PLACEHOLDER, _LIMIT_PLACEHOLDER):
+        if placeholder not in page_template:
+            raise ValueError(
+                f'page_template is missing the {placeholder} placeholder, so '
+                f'its pages could never advance: {page_template!r}'
+            )
+    return page_template.replace(_SKIP_PLACEHOLDER, str(int(skip))).replace(
+        _LIMIT_PLACEHOLDER, str(int(limit))
+    )
+
+
+async def _paged_ro_query(
+    graph,
+    page_template: str,
+    census_cypher: str,
+    *,
+    params: dict | None = None,
+    page_size: int = _DEFAULT_READ_PAGE_SIZE,
+    resultset_size: int = _RESULTSET_SIZE,
+    max_pages: int = _MAX_READ_PAGES,
+) -> PagedRead:
+    """Read every row a whole-graph query matches, past the server's row cap.
+
+    ``page_template`` must be a Cypher string with ``{skip}`` and ``{limit}``
+    placeholders and a TOTAL ``ORDER BY``; ``census_cypher`` must be the
+    identical MATCH/WHERE returning ``count(*)``, so the two numbers describe
+    the same population.
+
+    The ``ORDER BY`` is load-bearing, not cosmetic: every page is a SEPARATE
+    query, and SKIP/LIMIT with no total order gives the store no obligation to
+    return rows in the same order twice — so ``SKIP n`` on page 2 can skip rows
+    page 1 never returned (silently dropped, permanently) or re-return rows it
+    did (harmlessly deduped, which is what makes the drop so easy to miss).
+
+    SKIP/LIMIT bounds are substituted as validated ints rather than bound as
+    ``$`` parameters: parameterised SKIP/LIMIT is not portable across Cypher
+    implementations, and these are integers this module computes, never caller
+    data, so there is no injection surface.  Substitution goes through
+    ``_render_page_bounds``, which replaces the two placeholders LITERALLY
+    rather than running ``str.format`` over the whole template — so a template
+    containing a Cypher map pattern (``{name: $name}``) is safe, and no
+    brace-doubling convention has to be remembered.  See that helper.
+
+    The read fails CLOSED on four independent paths, each logging a WARNING
+    that names the numbers as structured facts rather than prose:
+
+      STRUCTURAL (fires on the numbers alone, before any evidence)
+        1. ``page_size >= resultset_size`` — refuse to enumerate at all and
+           return NO rows.  See the guard body for why a partial list is worse
+           than none.
+        2. ``max_pages`` exhausted while the last page was still full.
+
+      EMPIRICAL (compares fetched against what the server says exists)
+        3. The census probe returned no usable count.
+        4. ``rows_seen < expected_rows`` — the enumeration is SHORT.
+
+    BOTH kinds are kept, and neither subsumes the other.  ``resultset_size``
+    is an assumption about server configuration; if the live server is ever
+    configured BELOW it, the structural check passes and the short-page break
+    lies exactly as an unpaginated query does today — the identical silent
+    truncation, undetected — and only the census catches it.  Conversely the
+    structural check fails FAST, before any query, with a specific operator
+    action.  They fail differently and usefully.
+
+    Completeness is ``rows_seen >= expected_rows``, NOT ``==``: a corpus that
+    grew between the census probe and the last page is not a truncation, and
+    on a graph under continuous write, growth is the common case.
+
+    WHY THE TWO KINDS ARE NAMED SEPARATELY on ``PagedRead.incomplete_kind``,
+    and why callers branch on ``INCOMPLETE_STRUCTURAL_KINDS`` rather than on
+    an individual kind: the split is not a taxonomy for its own sake, it is
+    the line between "safe to raise on" and "must not raise on".
+
+      The STRUCTURAL kinds are DETERMINISTIC and non-transient.  They are
+      properties of the configuration and of this code — a page size at or
+      above the cap, a page budget too small for the corpus.  They reproduce
+      exactly on retry, they can never be caused by a concurrent write, and
+      neither is reachable at the shipped defaults.  A caller that treats
+      them as fatal will never be woken by a passing graph.
+
+      The EMPIRICAL kinds are transient-capable.  A census disagreeing by a
+      handful of rows is the *expected* signature of a live graph being
+      written to mid-read, not evidence of a defect, which is precisely why
+      the design warns rather than raises on them: raising would take down
+      the reconciliation rebuild for something that self-heals next cycle.
+
+    KNOWN RESIDUAL, left open deliberately (task 4340): a materially-short
+    ``INCOMPLETE_SHORT_READ`` still returns a partial collection that the
+    ``force=True`` rebuild path writes back.  Tightening guard 4 into a raise
+    is the WRONG fix — it fires on a single concurrently-invalidated edge, so
+    it would take down the live rebuild for exactly the transient described
+    above.  Full statement, the affected call site, and the ticket that closes
+    it are in the RESULT-SET CAP AUDIT block at the top of this module.
+
+    Args:
+        graph: FalkorDB graph handle exposing ``async ro_query(cypher, params)``.
+        page_template: Page query with ``{skip}``/``{limit}`` placeholders,
+            both required. Other braces are left untouched (see
+            ``_render_page_bounds``); no escaping is needed.
+        census_cypher: Single-row ``count(*)`` over the identical MATCH/WHERE.
+        params: Optional bound parameters, passed to every query.
+        page_size: Rows per page. Must stay strictly below ``resultset_size``.
+        resultset_size: Assumed server row cap (see ``_RESULTSET_SIZE``).
+        max_pages: Hard bound on pages fetched.
+
+    Returns:
+        PagedRead. ``reason`` is None exactly when ``complete`` is True.
+    """
+    page_size = int(page_size)
+    resultset_size = int(resultset_size)
+    max_pages = int(max_pages)
+
+    # Guard 1 (structural). At or above the cap there is nothing trustworthy
+    # to return, so return nothing. The short-page break reasons "this page
+    # was not full, therefore the data is exhausted" — sound only while the
+    # server cannot be what shortened it. At or above the cap those two causes
+    # are indistinguishable, and a partial list would simply invite the caller
+    # to use it anyway, recreating the silently-short-collection defect one
+    # layer up. The comparison is >= and not > deliberately: equality is
+    # arithmetically safe on a server configured at exactly _RESULTSET_SIZE,
+    # but that constant is an assumption, so equality leaves zero margin and a
+    # server configured one row lower silently re-opens the truncation.
+    if page_size >= resultset_size:
+        reason = (
+            f'page_size={page_size} is at or above the assumed server '
+            f'resultset_size={resultset_size}, so a short page cannot be '
+            f'distinguished from a server-truncated one; refusing to '
+            f'enumerate. Re-run with a page size well below the cap '
+            f'(default {_DEFAULT_READ_PAGE_SIZE}).'
+        )
+        logger.warning('_paged_ro_query: %s', reason)
+        return PagedRead(
+            rows=[],
+            complete=False,
+            rows_seen=0,
+            expected_rows=None,
+            reason=reason,
+            incomplete_kind=INCOMPLETE_STRUCTURAL_REFUSAL,
+        )
+
+    # Census FIRST, before paging, so the target is fixed up front rather than
+    # inferred from the same pages whose completeness is in question.
+    expected = await _census_count(graph, census_cypher, params)
+    if expected is None:
+        # Guard 3 (empirical). An unavailable proof is not a passing proof —
+        # but keep paging: the rows are still worth returning, only the proof
+        # is missing.
+        logger.warning(
+            '_paged_ro_query: census probe returned no usable count '
+            '(cypher=%r); the enumeration cannot be proven complete and will '
+            'be reported incomplete even if every row was fetched',
+            census_cypher,
+        )
+
+    rows: list[list] = []
+    skip = 0
+    paged_to_the_end = False
+    for _ in range(max_pages):
+        page_cypher = _render_page_bounds(page_template, skip=skip, limit=page_size)
+        result = await graph.ro_query(page_cypher, params)
+        page = list(getattr(result, 'result_set', None) or [])
+        rows.extend(page)
+        if len(page) < page_size:
+            paged_to_the_end = True
+            break
+        skip += len(page)
+
+    rows_seen = len(rows)
+
+    reason: str | None = None
+    kind: str | None = None
+    if not paged_to_the_end:
+        # Guard 2 (structural). Hitting the page cap on a still-full page is
+        # REPORTED, never swallowed: a page cap that truncated in silence
+        # would just be this module's own defect, one layer up.
+        kind = INCOMPLETE_PAGE_CAP
+        reason = (
+            f'max_pages={max_pages} exhausted at page_size={page_size} with '
+            f'rows_seen={rows_seen} and the last page still full, so more '
+            f'rows almost certainly remain unread'
+        )
+        logger.warning('_paged_ro_query: %s', reason)
+    elif expected is None:
+        kind = INCOMPLETE_CENSUS_UNAVAILABLE
+        reason = (
+            f'census probe returned no usable count, so the {rows_seen} rows '
+            f'fetched cannot be proven to be all of them'
+        )
+    elif rows_seen < expected:
+        # Guard 4 (empirical). Name BOTH candidate causes: an operator reading
+        # this log must not be misled into chasing a phantom truncation when
+        # the graph was simply written to mid-read.
+        kind = INCOMPLETE_SHORT_READ
+        reason = (
+            f'enumeration is SHORT: fetched rows_seen={rows_seen} but the '
+            f'census reports expected_rows={expected}. Most likely a server '
+            f'result-set cap below the assumed resultset_size={resultset_size}; '
+            f'the benign alternative is concurrent invalidation of edges '
+            f'between the census probe and the last page'
+        )
+        logger.warning('_paged_ro_query: %s', reason)
+
+    return PagedRead(
+        rows=rows,
+        complete=reason is None,
+        rows_seen=rows_seen,
+        expected_rows=expected,
+        reason=reason,
+        incomplete_kind=kind,
+    )
+
+
+def _apply_incompleteness_policy(
+    paged: PagedRead,
+    *,
+    method: str,
+    group_id: str,
+    returned_count: int,
+    noun: str,
+    consequence: str,
+) -> None:
+    """Apply the SPLIT incompleteness policy to a shim's PagedRead.
+
+    ONE implementation, shared by every back-compat shim over
+    ``_paged_ro_query``, because the policy is a single decision and not a
+    per-method opinion: copies drift, and the drift would be silent in exactly
+    the direction that matters — a shim that forgot to raise returns a
+    fabricated empty and the write-back path blanks summaries with it.  It is
+    also the single seam the follow-up ticket
+    (tkt_0RSJP8CH1M9GAAJTABV8FZB4AH, wire the completeness signal through to
+    consumers) has to move when the policy migrates to the consumer.
+
+      STRUCTURAL (``INCOMPLETE_STRUCTURAL_KINDS``) -> raise
+      ``IncompleteEnumerationError``.  Deterministic, non-transient, and
+      unreachable at the shipped defaults, so a raise here cannot flap.
+
+      EMPIRICAL (census unavailable, or a short read) -> WARN naming the
+      numbers and return what was fetched.  Transient-capable on a graph
+      under continuous write; raising would take the live rebuild down for
+      something that self-heals next cycle.
+
+    Args:
+        paged: The PagedRead the enumeration returned.
+        method: Shim name, for the message an operator reads.
+        group_id: Graph the read targeted.
+        returned_count: Size of the collection the shim would return.
+        noun: What ``returned_count`` counts, e.g. ``'entities'``/``'nodes'``.
+        consequence: Method-specific clause naming what must NOT be done with
+            a structurally incomplete result, appended to the raise message.
+
+    Raises:
+        IncompleteEnumerationError: ``paged`` is structurally incomplete.
+    """
+    if paged.incomplete_kind in INCOMPLETE_STRUCTURAL_KINDS:
+        raise IncompleteEnumerationError(
+            f'{method}(group_id={group_id!r}): the enumeration was '
+            f'structurally incomplete '
+            f'(incomplete_kind={paged.incomplete_kind!r}), so the '
+            f'{returned_count} {noun} it would have returned are not an '
+            f'answer and {consequence}. {paged.reason}'
+        )
+    if not paged.complete:
+        logger.warning(
+            '%s(group_id=%r): enumeration INCOMPLETE — returning %d rows as '
+            '%d %s, but %s. rows_seen=%s expected_rows=%s',
+            method, group_id, paged.rows_seen, returned_count, noun,
+            paged.reason, paged.rows_seen, paged.expected_rows,
+        )
 
 
 def _as_sortable_utc(created_at: datetime | None) -> datetime:
@@ -1555,51 +2193,39 @@ class GraphitiBackend:
         return [row[0] for row in (result.result_set or [])]
 
     @_canonicalize_group_args
-    async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
-        """Return all currently-valid RELATES_TO edges grouped by entity UUID.
+    async def enumerate_all_valid_edges(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE
+    ) -> tuple[dict[str, list[EdgeDict]], PagedRead]:
+        """Paginated variant of get_all_valid_edges that also reports completeness.
 
-        Bulk variant of get_valid_edges_for_node that issues a single Cypher query
-        instead of O(N) per-entity round-trips.  The undirected MATCH pattern causes
-        each directed edge to appear under both its source and target entity: for a
-        directed A→B edge, traversal matches it from A's side (row: A.uuid, e.uuid)
-        and from B's side (row: B.uuid, e.uuid) — two genuinely distinct rows because
-        n.uuid differs.
-
-        Deduplicates in Python, keyed on (n.uuid, e.uuid). RELATES_TO edge uuids
-        are unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
-        redirect_node_edges; task 2210 W6-epsilon repaired legacy dup-uuid edges),
-        so keying on the (entity, edge-uuid) pair is equivalent to the prior
-        element-identity dedup: it preserves the intended double-attribution (each
-        directed edge appears once under each endpoint entity, as distinct
-        (n.uuid, e.uuid) pairs) and still collapses the undirected self-loop
-        double-match (A→A edges, where both traversal directions yield the
-        identical (n.uuid, e.uuid) pair).
-
-        Uses ro_query since no writes are performed.
+        Same grouping and dedup semantics as get_all_valid_edges (which is a
+        thin shim over this method); the difference is that the completeness
+        of the underlying enumeration is returned as a first-class value
+        instead of only reaching a log line.
 
         Args:
             group_id: Project graph to query.
+            page_size: Rows per page. Must stay strictly below the server's
+                result-set cap — see _paged_ro_query.
 
         Returns:
-            Dict mapping entity UUID → list of edge dicts with keys: uuid, fact, name.
-            fact and name default to empty string when the property is NULL.
-            Each directed edge appears under both its source and target entity UUID
-            (double-attribution from the undirected MATCH pattern).
-
-        Note:
-            Using a directed pattern (n:Entity)-[e:RELATES_TO]->() would give
-            single-appearance semantics per edge if ever needed.
+            (grouped, paged) where *grouped* is the same dict
+            get_all_valid_edges returns and *paged* is the PagedRead carrying
+            ``complete``/``rows_seen``/``expected_rows``/``reason``.
         """
         graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH (n:Entity)-[e:RELATES_TO]-() '
-            'WHERE e.invalid_at IS NULL '
-            'RETURN n.uuid, e.uuid, e.fact, e.name'
+        paged = await _paged_ro_query(
+            graph,
+            _ALL_VALID_EDGES_PAGE_TEMPLATE,
+            _ALL_VALID_EDGES_CENSUS,
+            page_size=page_size,
         )
-        result = await graph.ro_query(cypher)
+        # The dedup map is built ONCE across every page, never per page: the
+        # same (n.uuid, e.uuid) pair can straddle a page boundary, and a
+        # per-page map would let the repeat through and double-count the edge.
         seen: dict[tuple[str, str], EdgeDict] = {}
         grouped: dict[str, list[EdgeDict]] = {}
-        for row in (result.result_set or []):
+        for row in paged.rows:
             entity_uuid, edge_uuid = row[0], row[1]
             key = (entity_uuid, edge_uuid)
             if key in seen:
@@ -1619,6 +2245,78 @@ class GraphitiBackend:
             edge = self._edge_dict(row[1], row[2], row[3])
             seen[key] = edge
             grouped.setdefault(entity_uuid, []).append(edge)
+        return grouped, paged
+
+    @_canonicalize_group_args
+    async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
+        """Return all currently-valid RELATES_TO edges grouped by entity UUID.
+
+        Bulk variant of get_valid_edges_for_node that pages through the whole
+        graph instead of O(N) per-entity round-trips.  The undirected MATCH pattern causes
+        each directed edge to appear under both its source and target entity: for a
+        directed A→B edge, traversal matches it from A's side (row: A.uuid, e.uuid)
+        and from B's side (row: B.uuid, e.uuid) — two genuinely distinct rows because
+        n.uuid differs.
+
+        Deduplicates in Python, keyed on (n.uuid, e.uuid). RELATES_TO edge uuids
+        are unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
+        redirect_node_edges; task 2210 W6-epsilon repaired legacy dup-uuid edges),
+        so keying on the (entity, edge-uuid) pair is equivalent to the prior
+        element-identity dedup: it preserves the intended double-attribution (each
+        directed edge appears once under each endpoint entity, as distinct
+        (n.uuid, e.uuid) pairs) and still collapses the undirected self-loop
+        double-match (A→A edges, where both traversal directions yield the
+        identical (n.uuid, e.uuid) pair).
+
+        Uses ro_query since no writes are performed.
+
+        PAGINATED (task 4340).  This read is NOT a single query: FalkorDB
+        truncates every result set at a server-wide RESULTSET_SIZE ceiling,
+        silently, and this query exceeded it by roughly 2x on the live corpus
+        — about HALF the valid-edge population was invisible to every caller,
+        with no error and no marker.  Do not "simplify" it back to one query.
+        The measured row counts, the paging cost, and the per-query audit that
+        found this live in the RESULT-SET CAP AUDIT block at the top of this
+        module (the single place they are recorded, so a re-measurement is a
+        one-block edit); the ORDER BY and completeness rules that make paging
+        safe are in _paged_ro_query.
+
+        Incompleteness is handled by the shared _apply_incompleteness_policy:
+        STRUCTURAL kinds raise IncompleteEnumerationError, EMPIRICAL ones warn
+        and return what was fetched.  See that helper for the policy and
+        IncompleteEnumerationError for why a structural non-read must not be
+        handed back as a collection.  enumerate_all_valid_edges returns the
+        same completeness signal as a value and never raises.
+
+        Args:
+            group_id: Project graph to query.
+
+        Returns:
+            Dict mapping entity UUID → list of edge dicts with keys: uuid, fact, name.
+            fact and name default to empty string when the property is NULL.
+            Each directed edge appears under both its source and target entity UUID
+            (double-attribution from the undirected MATCH pattern).
+
+        Raises:
+            IncompleteEnumerationError: The underlying enumeration was
+                structurally incomplete — see the policy above.
+
+        Note:
+            Using a directed pattern (n:Entity)-[e:RELATES_TO]->() would give
+            single-appearance semantics per edge if ever needed.  It would also
+            roughly halve the row count — but pagination would still be
+            required, because 12506 distinct edges exceeds the cap on its own.
+            Halving buys margin, not correctness.
+        """
+        grouped, paged = await self.enumerate_all_valid_edges(group_id=group_id)
+        _apply_incompleteness_policy(
+            paged,
+            method='get_all_valid_edges',
+            group_id=group_id,
+            returned_count=len(grouped),
+            noun='entities',
+            consequence='must not be written back',
+        )
         return grouped
 
     @_canonicalize_group_args
@@ -2862,6 +3560,74 @@ class GraphitiBackend:
         }
 
     @_canonicalize_group_args
+    async def enumerate_entity_nodes(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE
+    ) -> tuple[list[dict], PagedRead]:
+        """Paginated variant of list_entity_nodes that also reports completeness.
+
+        Same rows and same NULL coercions as list_entity_nodes (which is a thin
+        shim over this method); the difference is that the completeness of the
+        underlying enumeration is returned as a first-class value instead of
+        only reaching a log line.
+
+        Args:
+            group_id: Project graph to query.
+            page_size: Rows per page. Must stay strictly below the server's
+                result-set cap — see _paged_ro_query.
+
+        Rows are deduplicated on ``n.uuid`` across ALL pages — see the loop
+        body for why paging makes that necessary where a single query never
+        did.
+
+        Returns:
+            (nodes, paged) where *nodes* is the same list list_entity_nodes
+            returns and *paged* is the PagedRead carrying
+            ``complete``/``rows_seen``/``expected_rows``/``reason``.  Note that
+            ``paged.rows_seen`` counts ROWS FETCHED, so it can exceed
+            ``len(nodes)`` when a boundary row was re-emitted.
+        """
+        graph = self._graph_for(group_id)
+        paged = await _paged_ro_query(
+            graph,
+            _ENTITY_NODES_PAGE_TEMPLATE,
+            _ENTITY_NODES_CENSUS,
+            page_size=page_size,
+        )
+        # Dedup on n.uuid, built ONCE across every page — mirroring the
+        # (n.uuid, e.uuid) map in enumerate_all_valid_edges, and necessary for
+        # the same reason: this is a hazard PAGING INTRODUCED, not one it
+        # inherited.  Each page is a separate query against a graph under
+        # concurrent write, so an Entity inserted with a uuid sorting BEFORE
+        # the current offset shifts every later row up by one and the next
+        # page's SKIP re-returns the previous page's last row.  A single
+        # unpaginated query could never return a uuid twice, so every consumer
+        # is entitled to assume it cannot happen — and the ones downstream do:
+        # detect_stale_with_edges reports one stale entry per element and uses
+        # len(entities) as its total_count denominator, and
+        # rebuild_entity_summaries would schedule two concurrent writers for
+        # the repeated node.
+        seen: set[str] = set()
+        nodes: list[dict] = []
+        for row in paged.rows:
+            uuid = row[0]
+            if uuid in seen:
+                logger.debug(
+                    'enumerate_entity_nodes: node uuid %r seen on more than '
+                    'one page — most likely a row re-emitted across a '
+                    'SKIP/LIMIT boundary by a concurrent insert; keeping '
+                    'first-seen row',
+                    uuid,
+                )
+                continue
+            seen.add(uuid)
+            nodes.append({
+                'uuid': uuid,
+                'name': row[1] or '',
+                'summary': row[2] or '',
+            })
+        return nodes, paged
+
+    @_canonicalize_group_args
     async def list_entity_nodes(self, *, group_id: str) -> list[dict]:
         """Return all Entity nodes (uuid, name, summary) for a given group_id.
 
@@ -2869,24 +3635,45 @@ class GraphitiBackend:
         group_id filter is needed in the Cypher itself.  Uses ro_query since
         no writes are performed.
 
+        PAGINATED (task 4340).  This read was truncated at the same server-wide
+        RESULTSET_SIZE ceiling as get_all_valid_edges — measured counts in the
+        RESULT-SET CAP AUDIT block at the top of this module.
+
+        THE COMPOUNDING HAZARD, and the reason this method is in scope for a
+        task nominally about edges: ``detect_stale_with_edges`` calls this
+        method and ``get_all_valid_edges`` on consecutive lines, and the two
+        truncations were INDEPENDENT.  An entity that survived the node cut
+        could still lose every one of its edges to the edge cut, yielding a
+        bogus "stale, zero valid facts" verdict that ``rebuild_entity_from_edges``
+        then WROTE BACK into ``n.summary``.  That makes the defect corrupting
+        rather than merely under-reporting, which is why it was fixed rather
+        than deferred.
+
+        Incompleteness is handled by the same shared
+        _apply_incompleteness_policy get_all_valid_edges uses; see that helper.
+        enumerate_entity_nodes returns the signal as a value and never raises.
+
         Args:
             group_id: Project graph to query.
 
         Returns:
             List of dicts with keys: uuid, name, summary (summary defaults to
             empty string when the node property is NULL).
+
+        Raises:
+            IncompleteEnumerationError: The underlying enumeration was
+                structurally incomplete.
         """
-        graph = self._graph_for(group_id)
-        cypher = 'MATCH (n:Entity) RETURN n.uuid, n.name, n.summary'
-        result = await graph.ro_query(cypher)
-        return [
-            {
-                'uuid': row[0],
-                'name': row[1] or '',
-                'summary': row[2] or '',
-            }
-            for row in (result.result_set or [])
-        ]
+        nodes, paged = await self.enumerate_entity_nodes(group_id=group_id)
+        _apply_incompleteness_policy(
+            paged,
+            method='list_entity_nodes',
+            group_id=group_id,
+            returned_count=len(nodes),
+            noun='nodes',
+            consequence='must not drive a staleness verdict or a summary rewrite',
+        )
+        return nodes
 
     @_canonicalize_group_args
     async def detect_stale_with_edges(
@@ -2896,6 +3683,30 @@ class GraphitiBackend:
 
         Shared by detect_stale_summaries (public API) and MemoryService.rebuild_entity_summaries
         to avoid a duplicate bulk edge fetch when both are needed.
+
+        Both reads below are paginated (task 4340).  Before that they were
+        INDEPENDENTLY truncated at the server's 10000-row result-set cap, and
+        the compounding is what made the defect corrupting: an entity that
+        survived the node cut could still lose every edge to the edge cut,
+        yielding a bogus "stale, zero valid facts" verdict that
+        rebuild_entity_from_edges then wrote back into n.summary.
+
+        ``total_count`` is fixed by construction as a side effect: it is
+        ``len(entities)``, and so was a silently-capped denominator (10000 on
+        any graph above the cap) that made every rate computed against it
+        wrong.  With pagination it is the true node count.
+
+        PROTECTED AT THE SOURCE.  Both calls below are the back-compat shims,
+        which RAISE ``IncompleteEnumerationError`` on a structurally
+        incomplete read.  So this method can no longer manufacture a stale
+        verdict from a non-enumeration: were the edge read to return a
+        fabricated ``{}`` (or a uuid-ordered PREFIX), ``_build_stale_entry``
+        would compute ``canonical = '\\n'.join([]) == ''`` for every affected
+        entity, find ``summary != canonical`` for every non-empty summary, and
+        report the whole graph stale — which ``rebuild_entity_from_edges``
+        would then write back as ``''``.  The raise stops that before a single
+        verdict is formed.  An empirically short read still reaches here and
+        is only WARNed about; see the residual noted in the module audit.
 
         Args:
             group_id: Project graph to query.

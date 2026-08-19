@@ -1245,12 +1245,16 @@ class TestDeriveTruthRemainingFields:
 
         report = await resolver.derive_truth('20')
 
+        # ``created_at`` travels from the row's ``timestamp`` (task 3535), so
+        # a veto site can age a hold without a second store read.
         assert report.open_escalations == [
             EscalationRef(
                 id='esc-20-1', level=1, category='scope_violation', severity='blocking',
+                created_at=rows[0].timestamp,
             ),
             EscalationRef(
                 id='esc-20-2', level=0, category='cleanup_needed', severity='info',
+                created_at=rows[1].timestamp,
             ),
         ]
         escalation_queue.get_by_task.assert_called_once_with('20', status='pending')
@@ -1287,7 +1291,12 @@ class TestDeriveTruthRemainingFields:
 
         report = await resolver.derive_truth('30')
 
-        assert sorted(report.open_escalations, key=lambda r: r.id) == [
+        # ``created_at`` is stamped by the queue at submit time, so it is
+        # stripped for this identity comparison and asserted on its own below.
+        assert [
+            dataclasses.replace(ref, created_at=None)
+            for ref in sorted(report.open_escalations, key=lambda r: r.id)
+        ] == [
             EscalationRef(
                 id='esc-30-1', level=0, category='infra_issue', severity='blocking',
                 filing_claimant_run_id='run-A/sess-A/pid=1',
@@ -1297,6 +1306,9 @@ class TestDeriveTruthRemainingFields:
                 filing_claimant_run_id=None,
             ),
         ]
+        assert all(ref.created_at for ref in report.open_escalations), (
+            'the filing time must survive the JSON round-trip (task 3535)'
+        )
 
     async def test_legacy_on_disk_record_without_filing_identity_resolves_to_none(
         self, tmp_path: Path,
@@ -1314,7 +1326,9 @@ class TestDeriveTruthRemainingFields:
 
         report = await resolver.derive_truth('31')
 
-        assert report.open_escalations == [
+        assert [
+            dataclasses.replace(ref, created_at=None) for ref in report.open_escalations
+        ] == [
             EscalationRef(
                 id='esc-31-1', level=0, category='infra_issue', severity='blocking',
                 filing_claimant_run_id=None,
@@ -1336,7 +1350,9 @@ class TestDeriveTruthRemainingFields:
 
         report = await resolver.derive_truth('32')
 
-        assert report.open_escalations == [
+        assert [
+            dataclasses.replace(ref, created_at=None) for ref in report.open_escalations
+        ] == [
             EscalationRef(id='esc-32-1', level=0, category='infra_issue', severity=''),
         ]
 
@@ -1534,3 +1550,331 @@ class TestRecoveryFor:
         assert report.branch_state == BranchState(BranchStateKind.GONE_NO_MARKER, None)
         assert report.deploy_phase == DeployPhase.RAN
         assert action == RecoveryAction.RE_FILE_ESCALATION
+
+
+# ---------------------------------------------------------------------------
+# task 3535 (beta) — the store-correctness THIRD state, and the ages source.
+#
+# The canonical WHY for the emission mechanism these fields feed lives in
+# orchestrator/src/orchestrator/recovery_emission.py (module docstring).
+# ---------------------------------------------------------------------------
+
+
+class TestEscalationRefCreatedAt:
+    """``created_at`` is the only ages source available at the veto site."""
+
+    def test_created_at_defaults_to_none_meaning_unknown(self):
+        """Defaulted, so every existing construction site keeps working."""
+        ref = EscalationRef(id='esc-1', level=1)
+        assert ref.created_at is None
+
+    def test_created_at_is_carried_verbatim(self):
+        ref = EscalationRef(id='esc-1', level=1, created_at='2026-08-10T12:00:00+00:00')
+        assert ref.created_at == '2026-08-10T12:00:00+00:00'
+
+
+class TestTruthReportStoreUnavailable:
+    """The third state closes the KNOWN GAP the docstrings hand to this task."""
+
+    def test_escalation_store_unavailable_defaults_to_false(self):
+        report = TruthReport(
+            db_status='in-progress',
+            live_claimant=None,
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'abc'),
+            worktree_present=False,
+            open_escalations=[],
+            deploy_phase=None,
+        )
+        assert report.escalation_store_unavailable is False
+
+
+@pytest.mark.asyncio
+class TestResolveOpenEscalationsThirdState:
+    """"no open records" and "could not read the store" must be distinguishable.
+
+    A false ``[]`` routes a genuinely-pinned strand into the plain revert
+    branch — the esc-3163 collapse ``classify_pins(records=None)`` exists to
+    make impossible.
+    """
+
+    async def test_absent_queue_is_unavailable_not_empty(self):
+        resolver = _make_ground_truth()  # escalation_queue defaults to None
+
+        report = await resolver.derive_truth('3535')
+
+        assert report.open_escalations == []
+        assert report.escalation_store_unavailable is True, (
+            'an absent queue means the read was never PERFORMED — it is not '
+            'evidence that the task carries no open escalation'
+        )
+
+    async def test_a_read_that_succeeds_with_no_rows_is_available(self):
+        resolver = _make_ground_truth(escalation_queue=_fake_escalation_queue(rows=[]))
+
+        report = await resolver.derive_truth('3535')
+
+        assert report.open_escalations == []
+        assert report.escalation_store_unavailable is False
+
+    @pytest.mark.parametrize(
+        'exc', [OSError('disk gone'), RuntimeError('queue wedged')],
+    )
+    async def test_a_raising_read_degrades_loudly_without_propagating(self, exc, caplog):
+        """A store fault must never abort the whole ground-truth sweep.
+
+        Same degradation shape as the plan.lock and deploy-state resolvers in
+        this class, and logged at WARNING so the outage is visible.
+        """
+        import logging
+
+        queue = MagicMock()
+        queue.get_by_task = MagicMock(side_effect=exc)
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.task_ground_truth'):
+            report = await resolver.derive_truth('3535')
+
+        assert report.open_escalations == []
+        assert report.escalation_store_unavailable is True
+        assert any('3535' in r.getMessage() for r in caplog.records), (
+            'the outage must name the task it degraded'
+        )
+
+    async def test_created_at_is_populated_from_the_row_timestamp(self):
+        """So a veto site can age a hold without a second store read."""
+        row = Escalation(
+            id='esc-3535-1', task_id='3535', agent_role='implementer',
+            severity='blocking', category='risk_identified', summary='s', level=1,
+        )
+        resolver = _make_ground_truth(escalation_queue=_fake_escalation_queue(rows=[row]))
+
+        report = await resolver.derive_truth('3535')
+
+        assert report.open_escalations[0].created_at == row.timestamp
+
+
+class TestStoreUnavailableChangesNoDisposition:
+    """ZERO-DISPOSITION-CHANGE regression pin (task 3535's whole contract)."""
+
+    @pytest.mark.asyncio
+    async def test_store_unavailable_off_main_strand_still_reverts_to_pending(self):
+        """The fold that must NOT happen.
+
+        Folding ``escalation_store_unavailable`` into ``_shape``'s table key
+        would flip this shape from REVERT_TO_PENDING to LEAVE — a genuine
+        disposition change during a store outage, and precisely what tasks
+        delta/eta own behind the operator flip.  Emission-before-behavior means
+        the third state becomes VISIBLE now while the decision stays put.
+        """
+        task = {'status': 'in-progress', 'claimant_run_id': None, 'heartbeat_at': None}
+        git_ops = _fake_git_ops(is_ancestor=False, branch_sha='deadbeef', marker_sha=None)
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(  # no escalation_queue => store unavailable
+            git_ops=git_ops, scheduler=scheduler,
+        )
+
+        report, action = await resolver.recovery_for('3535')
+
+        assert report.escalation_store_unavailable is True
+        assert action == RecoveryAction.REVERT_TO_PENDING, (
+            'a store outage must not silently start pinning strands'
+        )
+
+    def test_shape_output_ignores_the_new_flag_entirely(self):
+        """``_shape``'s key must be byte-identical with the flag either way."""
+        from orchestrator.task_ground_truth import _shape
+
+        base = {
+            'db_status': 'in-progress',
+            'live_claimant': None,
+            'branch_state': BranchState(BranchStateKind.ON_MAIN, 'abc'),
+            'worktree_present': False,
+            'open_escalations': [],
+            'deploy_phase': None,
+        }
+        available = TruthReport(**base, escalation_store_unavailable=False)
+        unavailable = TruthReport(**base, escalation_store_unavailable=True)
+
+        assert _shape(available) == _shape(unavailable)
+        assert classify_recovery(available) == classify_recovery(unavailable)
+
+
+def _leave_report(**overrides) -> TruthReport:
+    """A TruthReport that classifies LEAVE unless an override says otherwise."""
+    base = {
+        'db_status': 'in-progress',
+        'live_claimant': None,
+        'branch_state': BranchState(BranchStateKind.ON_MAIN, 'abc'),
+        'worktree_present': False,
+        'open_escalations': [EscalationRef(id='esc-1', level=1, severity='blocking')],
+        'deploy_phase': None,
+        'escalation_store_unavailable': False,
+    }
+    base.update(overrides)
+    return TruthReport(**base)
+
+
+class TestLeaveReason:
+    """The pure description of a LEAVE — never a new decision (task 3535).
+
+    ``leave_reason`` adds a DESCRIPTION of what ``classify_recovery`` already
+    decided.  Its precedence chain is documented at the implementation; these
+    tests pin it as a contract rather than an implementation accident.
+    """
+
+    def test_returns_none_for_every_non_leave_action(self):
+        """A caller must never be able to mislabel an ACTION as a hold."""
+        from orchestrator.task_ground_truth import leave_reason
+
+        acted = [
+            # (a) MARK_DONE_WITH_PROVENANCE
+            _leave_report(open_escalations=[]),
+            # (c) REVERT_TO_PENDING
+            _leave_report(
+                open_escalations=[],
+                branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN, None),
+            ),
+            # (g) RE_FILE_ESCALATION
+            _leave_report(
+                db_status='blocked', open_escalations=[],
+                branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+            ),
+        ]
+        for report in acted:
+            assert classify_recovery(report) != RecoveryAction.LEAVE, 'fixture drift'
+            assert leave_reason(report) is None
+
+    def test_a_live_claimant_leave_is_reported_as_such(self):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            live_claimant=Claimant(run_id='r', heartbeat_at=None, source=ClaimantSource.DB),
+        )
+        assert leave_reason(report) == LeaveReason.live_claimant
+
+    def test_recovery_row_f_is_escalation_pinned(self):
+        """Boundary #9's classification half.
+
+        IN_PROGRESS + no claimant + ON_MAIN + an open record: the MARK_DONE
+        that row (a) would otherwise take is VETOED by the record.
+        """
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report()
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+    def test_any_other_leave_with_open_records_is_escalation_pinned(self):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            db_status='blocked',
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+    def test_store_unavailable_outranks_unmapped_shape(self):
+        """"we could not read the store" is a strictly better explanation."""
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            open_escalations=[],
+            db_status='cancelled',  # a shape the table does not map
+            escalation_store_unavailable=True,
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_store_unavailable
+
+    @pytest.mark.parametrize(
+        'phase',
+        [
+            DeployPhase.VERIFIED, DeployPhase.FAILED, DeployPhase.SCHEDULED,
+            DeployPhase.ESCALATED, DeployPhase.DONE,
+        ],
+    )
+    def test_a_deliberately_unmapped_deploy_phase_is_reported_as_in_flight(self, phase):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            open_escalations=[],
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+            deploy_phase=phase,
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.deploy_phase_in_flight
+
+    def test_every_remaining_leave_is_unmapped_shape(self):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(open_escalations=[], db_status='cancelled')
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.unmapped_shape
+
+    def test_live_claimant_outranks_an_open_escalation(self):
+        """A pinned-AND-held task is HELD: there is nothing to recover yet.
+
+        Load-bearing for emission volume — a live-claimant LEAVE emits nothing,
+        and it is the healthy majority of every sweep.
+        """
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            live_claimant=Claimant(
+                run_id='r', heartbeat_at=None, source=ClaimantSource.IN_MEMORY,
+            ),
+        )
+        assert leave_reason(report) == LeaveReason.live_claimant
+
+    def test_an_open_escalation_outranks_a_deploy_phase(self):
+        """A RAN deploy holding an open record is PINNED, not merely in flight."""
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+            deploy_phase=DeployPhase.RAN,
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+    def test_store_unavailable_outranks_a_deploy_phase(self):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            open_escalations=[],
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+            deploy_phase=DeployPhase.FAILED,
+            escalation_store_unavailable=True,
+        )
+        assert leave_reason(report) == LeaveReason.escalation_store_unavailable
+
+
+class TestRecoveryShapeStr:
+    """The emitted shape and the ``_RECOVERY`` table key must never drift."""
+
+    def test_matches_render_shape_over_the_same_five_elements(self):
+        from orchestrator.recovery_emission import render_shape
+        from orchestrator.task_ground_truth import _shape, recovery_shape_str
+
+        report = _leave_report()
+        key = _shape(report)
+        assert recovery_shape_str(report) == render_shape(*key)
+
+    @pytest.mark.parametrize(
+        'report',
+        [
+            _leave_report(),
+            _leave_report(open_escalations=[]),
+            _leave_report(
+                live_claimant=Claimant(
+                    run_id='r', heartbeat_at=None, source=ClaimantSource.DB,
+                ),
+            ),
+            _leave_report(db_status='blocked', deploy_phase=DeployPhase.RAN),
+        ],
+    )
+    def test_stays_bound_to_the_table_key_across_shapes(self, report):
+        from orchestrator.recovery_emission import render_shape
+        from orchestrator.task_ground_truth import _shape, recovery_shape_str
+
+        assert recovery_shape_str(report) == render_shape(*_shape(report))

@@ -43,7 +43,7 @@ from shared.prompt_artifact import PromptArtifactStore, default_artifacts_root
 from shared.task_claimant import compose_claimant_run_id
 from shared.task_metadata import RetryLedger, RoutingDecisionMirror, RoutingState
 from shared.task_statuses import TaskStatus
-from shared.transcript_archive import archive_task_transcripts
+from shared.transcript_archive import archive_before_delete, archive_task_transcripts
 
 from orchestrator import chronic_flake
 from orchestrator.agents.invoke import AgentResult, invoke_agent
@@ -8218,6 +8218,71 @@ class TaskWorkflow:
 
         return WorkflowOutcome.DONE
 
+    def _archive_then_cleanup_config_dir(self) -> None:
+        """Tear down ``self._config_dir``, archiving its transcripts FIRST.
+
+        The single teardown primitive both destroying call sites go through
+        (``_cleanup_config_dir`` and ``_recycle_config_dir``), so neither can
+        acquire the guard while the other quietly keeps deleting.
+
+        Archival is a PRECONDITION of the delete here, not a step before it
+        (task 3619, leaf 2 of plans/transcript-preservation-seam-prd.md). The
+        producer hook in ``_invoke``'s finally already copies each session's
+        transcript on the way out, but that hook is SKIPPABLE — a
+        CancelledError landing on its await at SIGTERM, or an invocation that
+        never reached it — whereas the ``rmtree`` below is not. The observed
+        consequence was a run that preserved the session sidecar (
+        ``session_preserved = True``) and destroyed the very transcript the
+        sidecar pointed at, leaving ``--resume`` with a dangling id. Doing the
+        archival where the deletion happens closes that by construction: the
+        common case is a cheap already-current corroboration, and only what is
+        provably durable is unlinked.
+
+        SYNCHRONOUS on purpose — see :func:`archive_before_delete`. Wrapping
+        this in ``asyncio.to_thread`` would reintroduce the cancellation point
+        the fix exists to remove.
+
+        The kill switch gates ARCHIVAL, never teardown: with
+        ``transcript_archive.enabled`` False this is exactly the
+        ``TaskConfigDir.cleanup()`` it wraps. An operator who turns archiving
+        off must not silently start leaking credential-bearing config dirs.
+        """
+        if not self._config_dir:
+            return
+        ta = self.config.transcript_archive
+        if not ta.enabled:
+            self._config_dir.cleanup()
+            return
+        try:
+            outcome = archive_before_delete(
+                self._config_dir.path,
+                self.task_id,
+                archive_root=self.config.project_root / ta.root,
+            )
+        except Exception as exc:
+            # Defence in depth, not the contract: archive_before_delete is
+            # total by design. But the failure this guards against is stranding
+            # a directory holding a live per-task OAuth credential on EVERY
+            # task, so the guard is cheap next to the risk. Loud, then proceed
+            # with the teardown that was going to happen anyway.
+            logger.warning(
+                'Task %s: archive-before-delete failed, tearing down anyway: %s',
+                self.task_id, exc,
+            )
+            self._config_dir.cleanup()
+            return
+        if outcome.held:
+            logger.warning(
+                'Task %s: %d transcript(s) could not be archived and are HELD '
+                'in the config dir; the next process start\'s sweeper retries '
+                'them: %s',
+                self.task_id,
+                len(outcome.held),
+                ', '.join(str(p) for p in outcome.held),
+                extra={'task_id': self.task_id,
+                       'held': [str(p) for p in outcome.held]},
+            )
+
     def _recycle_config_dir(self) -> None:
         """Tear down the current TaskConfigDir and create a fresh one in place.
 
@@ -8238,7 +8303,11 @@ class TaskWorkflow:
         if not self._config_dir or not self.worktree:
             return
         old_path = self._config_dir.path
-        self._config_dir.cleanup()
+        # Archive first: turns==0 means the destroyed session did no useful
+        # work, but its transcript IS the forensic record of the wedge that
+        # tripped this recycle — the thing an operator most wants, and the
+        # thing this path used to delete unread.
+        self._archive_then_cleanup_config_dir()
         self._config_dir = TaskConfigDir(
             self.task_id,
             base_dir=self.worktree / '.task',
@@ -8263,7 +8332,10 @@ class TaskWorkflow:
           (``self._preserve_config_dir_reason`` — zero-output hang or
           progress-resume churn, task 1739 / task 2360), so the on-call
           engineer knows the dir is intentional and why.
-        - Otherwise → ``self._config_dir.cleanup()`` (normal path).
+        - Otherwise → ``self._archive_then_cleanup_config_dir()`` — the
+          transcripts are made durable and only then is the dir removed
+          (task 3619; see that helper for why archival is a precondition of
+          the delete rather than a step before it).
         """
         if not self._config_dir:
             return
@@ -8276,7 +8348,11 @@ class TaskWorkflow:
                 self._config_dir.path,
             )
             return
-        self._config_dir.cleanup()
+        # The preserve early return stays AHEAD of this: that breaker tripped
+        # precisely so an engineer could read the dir in place, and archiving
+        # there would be pointless while deleting there would destroy the
+        # evidence it was collected for.
+        self._archive_then_cleanup_config_dir()
 
     def _capture_zero_output_evidence(self, result: AgentResult, iteration: int) -> None:
         """Persist forensic evidence for a zero-output CLI timeout to .task/.
@@ -12396,40 +12472,41 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # propagation.
             ta = self.config.transcript_archive
             if ta.enabled and self._config_dir is not None and self._last_invoke_session_id:
-                # Offload to a worker thread: archive_task_transcripts does
-                # blocking filesystem work (glob + move each transcript). Task
-                # 3618 dropped the compression, so the per-file cost is now an
-                # O(1) same-filesystem rename rather than a CPU-bound
-                # stream-gzip; what remains is the glob and the syscalls.
+                # SYNCHRONOUS, and that is the fix. This was
+                # `await asyncio.to_thread(archive_task_transcripts, ...)`
+                # with an `except asyncio.CancelledError: raise` clause whose
+                # own comment conceded the gap: "the abandoned-in-flight tail
+                # is the explicit job of β/task 2729's idempotent teardown
+                # backstop". That backstop fires at worktree REMOVAL — but on
+                # the preserve-for-resume path the worktree is deliberately
+                # RETAINED, so nothing ever came back for the transcript. The
+                # await was therefore the one part of this finally a shutdown
+                # could skip, and the shutdown that skipped it is the same one
+                # that sets `session_preserved = True` and writes a resume
+                # sidecar naming that session. Removing the await removes the
+                # cancellation point; there is nothing left here to cancel.
                 #
-                # The to_thread is therefore no longer load-bearing for loop
-                # latency, and it is what CancelledError kills at SIGTERM —
-                # losing every in-flight transcript. Collapsing this to a
-                # synchronous, uncancellable call is leaf 2 of
-                # plans/transcript-preservation-seam-prd.md, which 3618 exists
-                # to unblock. Do not re-justify the offload on gzip grounds.
+                # Affordable, measured rather than assumed: over n=7788
+                # archived transcripts on this host, median 381 KB, p95 1.0 MB,
+                # max 2.06 MB. Task 3618 dropped the compression, so this is a
+                # plain copy — single-digit milliseconds, and cheaper than the
+                # transcript it currently loses.
+                #
+                # This site COPIES (archive_task_transcripts), where the
+                # teardown sites MOVE (archive_before_delete): the session may
+                # be resumed and must keep reading and appending to its own
+                # live transcript. Moving it here would turn every resume into
+                # a no_transcript fallback — the opposite of what this exists
+                # to enable.
                 try:
-                    await asyncio.to_thread(
-                        archive_task_transcripts,
+                    archive_task_transcripts(
                         self._config_dir.path,
                         self.task_id,
                         self._last_invoke_session_id,
                         archive_root=self.config.project_root / ta.root,
                     )
-                except asyncio.CancelledError:
-                    # Cancellation (loop teardown / hard-kill) surfaces here from
-                    # the await, NOT an archival error. Cooperative cancellation
-                    # must propagate, so we re-raise — meaning a KILLED
-                    # invocation's transcript is deliberately not archived by this
-                    # producer hook. That is an accepted, documented gap: shielding
-                    # the await to salvage it (asyncio.shield) risks a dangling
-                    # background task during loop close, and the abandoned-in-flight
-                    # tail is the explicit job of β/task 2729's idempotent
-                    # teardown backstop (agent-transcript-archival-prd §3), so it
-                    # is not lost overall.
-                    raise
                 except Exception:
-                    # Defense-in-depth for a finally that awaits cross-module work.
+                    # Defense-in-depth for a finally doing cross-module work.
                     # archive_task_transcripts is total by contract (per-file
                     # OSErrors are swallowed + counted), but its top-level glob /
                     # Path / archive_root construction is not individually guarded.

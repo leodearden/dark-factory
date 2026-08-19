@@ -19,7 +19,13 @@ from shared.timestamps import parse_timestamp_or_warn
 
 from escalation import archive
 from escalation.classify import default_resolution_class_for_resolver
-from escalation.models import RESOLUTION_CLASSES, Escalation
+
+# max_severity lives in models.py beside the KNOWN_SEVERITIES vocabulary it must
+# stay total over (task 3976), so server.py can share it without reaching for a
+# module-private symbol.  Imported under its real, public name: it is a shared
+# cross-module helper, and spelling it `_max_severity` here would signal the
+# opposite at every use site.
+from escalation.models import RESOLUTION_CLASSES, Escalation, max_severity
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +77,6 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
     finally:
         os.close(fd)
 
-# Severity rank map for promotion logic.  Alphabetical comparison is wrong
-# ('blocking' < 'info'), so we use an explicit rank.  Unknown severities
-# default to rank 0 (treated as info-level) so malformed input never causes
-# unexpected promotion.
-_SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1}
-
 # Hard cap on EscalationQueue._archive_negative_cache (see _locate_path /
 # _cache_archive_negative).  A polling client hammering many distinct
 # nonexistent ids (typos, stale references, an adversarial sweep) must not
@@ -84,19 +84,6 @@ _SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1}
 # rather than evicted piecemeal (simple, and negative-cache staleness is
 # already bounded by the next self-archival — see _archive_resolved).
 _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
-
-
-def _max_severity(a: str, b: str) -> str:
-    """Return the higher-urgency severity string between *a* and *b*."""
-    for val in (a, b):
-        if val not in _SEVERITY_RANK:
-            logger.warning(
-                '_max_severity: unrecognised severity %r — treating as info-level '
-                '(rank 0). Known values: %s',
-                val,
-                ', '.join(_SEVERITY_RANK),
-            )
-    return a if _SEVERITY_RANK.get(a, 0) >= _SEVERITY_RANK.get(b, 0) else b
 
 
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
@@ -865,6 +852,7 @@ class EscalationQueue:
 
     def add_members_to_l2(
         self, escalation_id: str, new_member_ids: list[str],
+        *, severity_floor: str | None = None,
     ) -> Escalation | None:
         """Append *new_member_ids* to a pending L2 escalation's ``members`` list.
 
@@ -886,15 +874,32 @@ class EscalationQueue:
         ``dict.fromkeys`` so passing ``['a', 'a', 'b']`` adds 'a' exactly once.
         New ids are appended in the order they first appear in *new_member_ids*.
 
-        Only ``members`` is modified.  ``root_cause``, ``options``, ``summary``,
-        ``detail``, and ``timestamp`` are preserved so the human-facing decision
-        context remains the L2's original framing across repeated auto-watcher
-        triage passes.
+        ``members`` is modified, and — when *severity_floor* is given —
+        ``severity`` is additionally promoted UPWARD via ``max_severity``.
+        The invariant is that **an L2's severity is monotonically
+        non-decreasing after mint**: the floor can raise the record but never
+        lower it, so it can only ever add human attention, never suppress it.
+        Omitting *severity_floor* leaves ``severity`` untouched (task 3976).
+        ``root_cause``, ``options``, ``summary``, ``detail``, and ``timestamp``
+        are preserved so the human-facing decision context remains the L2's
+        original framing across repeated auto-watcher triage passes.
+
+        A severity promotion is a real content change, so it bumps
+        ``updated_at`` even when no new member id was appended — the watcher's
+        stamp-then-skip protocol keys off ``updated_at > triaged_at``, and a
+        record that silently got more severe would otherwise be skipped
+        forever.  A floor at or below the current severity with no new members
+        remains a true no-op and does NOT bump.
+
+        Both the member append and the severity bump happen inside the same
+        ``escalation_id_lock`` and land in a single ``_rewrite``, so they are
+        atomic together — a second write after the fact would be racy against a
+        concurrent append.
 
         Returns the updated ``Escalation`` (or the unchanged escalation when
-        *new_member_ids* is empty or all ids are already present).  Returns
-        ``None`` when *escalation_id* is not found in the queue root (unknown id
-        or archived).
+        there is nothing to append and no floor to apply).  Returns ``None``
+        when *escalation_id* is not found in the queue root (unknown id or
+        archived).
         """
         with escalation_id_lock(self.queue_dir, escalation_id):
             path = self.queue_dir / f'{escalation_id}.json'
@@ -906,21 +911,37 @@ class EscalationQueue:
                 logger.warning(f'Failed to parse L2 escalation {escalation_id}: {e}')
                 return None
 
-            if not new_member_ids:
+            if not new_member_ids and severity_floor is None:
                 return esc  # no-op
 
             existing = set(esc.members)
             appended = [m for m in dict.fromkeys(new_member_ids) if m not in existing]
-            if appended:
+
+            # Upward-only: max_severity can only return the higher-ranked of
+            # the two, so a floor at or below the current severity is inert by
+            # construction.  An unrecognised floor falls to rank 0 there (with
+            # a WARNING) and likewise leaves the record alone.
+            new_severity = (
+                max_severity(esc.severity, severity_floor)
+                if severity_floor is not None
+                else esc.severity
+            )
+            severity_changed = new_severity != esc.severity
+
+            if appended or severity_changed:
                 esc.members.extend(appended)
-                # Bump the "changed since triaged" signal — a member append is
-                # exactly the re-assess trigger the watcher's stamp-then-skip
-                # protocol keys off (updated_at > triaged_at).
+                esc.severity = new_severity
+                # Bump the "changed since triaged" signal — a member append or a
+                # severity promotion is exactly the re-assess trigger the
+                # watcher's stamp-then-skip protocol keys off
+                # (updated_at > triaged_at).
                 esc.updated_at = datetime.now(UTC).isoformat()
                 self._rewrite(escalation_id, esc)
                 logger.info(
-                    'add_members_to_l2: added %d new member(s) to %s (total=%d)',
-                    len(appended), escalation_id, len(esc.members),
+                    'add_members_to_l2: added %d new member(s) to %s '
+                    '(total=%d, severity=%s%s)',
+                    len(appended), escalation_id, len(esc.members), esc.severity,
+                    ' [promoted]' if severity_changed else '',
                 )
             return esc
 
@@ -1007,7 +1028,7 @@ class EscalationQueue:
         - ``parent.dedupe_children`` gains *child_id* (appended).
         - ``parent.dedupe_count`` is incremented by 1.
         - ``parent.severity`` is promoted via
-          ``_max_severity(parent.severity, child_severity)``; never demoted.
+          ``max_severity(parent.severity, child_severity)``; never demoted.
         - The updated parent is written back to disk via ``_rewrite()``.  Only
           this final file-replace step is atomic (``tempfile.mkstemp`` +
           ``os.rename``); the preceding in-memory mutations are not.
@@ -1041,7 +1062,7 @@ class EscalationQueue:
                 return None
             parent.dedupe_children.append(child_id)
             parent.dedupe_count += 1
-            parent.severity = _max_severity(parent.severity, child_severity)
+            parent.severity = max_severity(parent.severity, child_severity)
             self._rewrite(parent_id, parent)
         logger.info(
             f'Dedupe: folded {child_id} into parent {parent_id} '

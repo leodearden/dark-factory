@@ -1090,6 +1090,43 @@ class TranscriptArchiveConfig(BaseModel):
         ),
     )
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    storm_threshold: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Archival-failure burst detector (task 3619, INV-4): how many '
+            'per-file archive failures within storm_window_secs constitute a '
+            'storm worth one L1 escalation. One failure is routine and is '
+            'already counted + logged by shared.transcript_archive; a BURST '
+            'is the systemic condition (archive root full, unmounted, or '
+            'permission-denied) an operator has to act on. Harness reads this '
+            'LIVE on every failure, so a hot reload takes effect without a '
+            'restart.'
+            ' Must be >= 1, matching session_resume.fallback_storm_threshold: '
+            'both leaves are green-tier hot-reloadable and are read LIVE on '
+            'every failure, so an unbounded 0 or negative would take effect '
+            'immediately and fire the L1 on the very first routine failure, '
+            'with no validation error and no log line to say so.'
+        ),
+    )
+    storm_window_secs: float = Field(
+        default=600.0,
+        gt=0,
+        description=(
+            'Rolling window for storm_threshold, and the rate limit between '
+            'archival-storm escalations — at most one L1 per window, on top '
+            'of the has_open_l1 dedup. Also read LIVE on every failure. '
+            'Must be > 0, matching session_resume.storm_window_secs. A value '
+            '<= 0 does not merely shrink the window, it DISABLES the '
+            'detector permanently and silently: StormCounter._prune uses a '
+            'half-open window (events[0] <= cutoff), so a zero window makes '
+            'the cutoff equal now and the event record() just appended is '
+            'popped again — the count is always 0 and no burst can ever '
+            'fire. Exactly the silent-degradation-on-misconfiguration this '
+            'escalation exists to prevent, so it is rejected loudly at '
+            'validation instead.'
+        ),
+    )
 
 
 class FusedMemoryConfig(BaseModel):
@@ -2353,6 +2390,83 @@ class ZeroProgressRequeueConfig(BaseModel):
             'positive. 900s (15 min) of CONTINUOUS zero progress is well '
             'past any contention blip but still hours short of the 46h '
             'origin incident.'
+        ),
+    )
+
+
+class RecoveryEmissionConfig(BaseModel):
+    """Structured recovery-decision emission (task 3535, PRD D5).
+
+    Every veto/LEAVE site in the recovery machinery — the reconcile sweep, the
+    scheduler's stranded-blocked redispatch phase, the deterministic recon
+    pair, the already-landed dispatch gate — emits a structured
+    ``recovery_vetoed`` / ``recovery_left`` event describing the decision it
+    ALREADY made.  This section changes NO disposition; the canonical
+    explanation (including why emission is signature-transition-gated rather
+    than one row per observation) is documented once, canonically, in
+    ``orchestrator.recovery_emission``'s module docstring.  Read that before
+    retuning anything here.
+
+    The streak alarm predicate is two-dimensional like ``zero_progress_requeue``
+    — ``veto_streak_threshold`` consecutive IDENTICAL vetoes AND
+    ``veto_streak_min_span_secs`` of wall clock — for the same reason: a streak
+    count alone would page a human for a hold that is only seconds old.
+
+    Ships ENABLED: emission is the whole deliverable, and shipping it off would
+    leave every strand unexplained.  ``streak_escalation_enabled`` is the
+    separate, narrower kill switch for the only part that WRITES to the
+    escalation queue.  All fields are green-tier hot-tunable via
+    RELOADABLE_FIELDS, so a noisy detector can be retuned or silenced live.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to disable structured recovery-decision emission '
+            '(recovery_vetoed / recovery_left events and the veto streak '
+            'counter). Shipped enabled — without it a stranded task held by '
+            'an open escalation leaves no machine-readable trace of WHAT held '
+            'it. Disabling suppresses new emissions only; it never changes a '
+            'recovery disposition, in either direction.'
+        ),
+    )
+    veto_streak_threshold: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Consecutive IDENTICAL vetoes of the same (site, task) before a '
+            'blocking L1 is filed against the streak sentinel (both this AND '
+            'veto_streak_min_span_secs must be satisfied). Must be >= 1. A '
+            'DIFFERENT veto signature restarts the count, so the alarm only '
+            'ever describes N genuinely identical consecutive holds.'
+        ),
+    )
+    veto_streak_min_span_secs: float = Field(
+        default=1500.0,
+        ge=0.0,
+        description=(
+            'Wall-clock seconds the veto streak must ALSO span before a '
+            'blocking L1 is filed. Set to 0 to alarm on streak count alone. '
+            'The default is derived, not picked: stranded_reconcile_interval_'
+            'secs and deterministic_recon_sweep_interval_secs are both 900.0s, '
+            'so three consecutive sweeps span 1800s at the threshold crossing '
+            'and 1500s clears that with 300s of jitter headroom. It is ALSO '
+            'the backstop that makes it impossible for a per-dispatch-TICK '
+            'veto site to file an L1 within seconds of a strand appearing '
+            'should a future site charge the counter by mistake (only the '
+            'sweep-frequency sites charge it today).'
+        ),
+    )
+    streak_escalation_enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to keep emitting recovery_vetoed / recovery_left '
+            'events while suppressing the blocking L1 the veto streak files. '
+            'The narrower kill switch: this is the only part of the mechanism '
+            'that WRITES to the escalation queue, so an operator can silence '
+            'a noisy alarm without losing the telemetry that explains it. '
+            'Disabling suppresses new filings only; an already-filed L1 still '
+            'auto-resolves when its veto stops.'
         ),
     )
 
@@ -4103,6 +4217,14 @@ class OrchestratorConfig(BaseSettings):
         default_factory=ZeroProgressRequeueConfig
     )
 
+    # Structured recovery-decision emission (task 3535, PRD D5). An absent
+    # stanza in orchestrator.yaml yields the ENABLED-by-default instance —
+    # without it a stranded task held by an open escalation leaves no
+    # machine-readable trace of what held it.
+    recovery_emission: RecoveryEmissionConfig = Field(
+        default_factory=RecoveryEmissionConfig
+    )
+
     # κ: shared sccache backend (the laptop warm multiplier)
     # An absent stanza in orchestrator.yaml yields the disabled default;
     # no defaults.yaml edit is required.
@@ -4996,6 +5118,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # detector you can only silence by restarting is one that gets silenced by
     # ignoring it instead.
     _submodel_leaf_paths('zero_progress_requeue', ZeroProgressRequeueConfig),
+    # Structured recovery-decision emission (task 3535) — same
+    # whole-submodel-group idiom, and green-tier for the same reason: an
+    # operator must be able to retune the streak threshold, or silence a noisy
+    # detector, WITHOUT a fleet restart.  streak_escalation_enabled in
+    # particular is the narrow kill switch for the only part that writes to the
+    # escalation queue, and a kill switch behind a restart is not one.
+    _submodel_leaf_paths('recovery_emission', RecoveryEmissionConfig),
     # Variable-depth speculative verify placement (task 2359) — a new
     # dedicated submodel, same whole-submodel-group idiom: every probe knob
     # (probe_fraction/probe_depths/suppress_flake_rate) is green-tier

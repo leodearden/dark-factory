@@ -57,8 +57,10 @@ Amendment pass (post-review) additionally covers:
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
@@ -67,13 +69,19 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.deploy_state import DeployPhase
-from orchestrator.event_store import EventType
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import (
     Harness,
     _deterministic_deploy_health_verdict,
     _deterministic_deploy_stranded,
     _deterministic_gate_stranded,
     _recon_inspect_unit,
+)
+from orchestrator.recovery_emission import (
+    RECOVERY_VETO_STREAK_SENTINEL_PREFIX,
+    RecoverySite,
+    RecoverySweepTally,
+    RecoveryVetoStreakTracker,
 )
 
 # ---------------------------------------------------------------------------
@@ -812,7 +820,10 @@ class TestRunDeterministicReconSweep:
         await h._run_deterministic_recon_sweep()
 
         h._recover_stranded_deterministic_task.assert_awaited_once_with(
-            'tid-a', task, metadata
+            # tally=: the pass's recovery accumulator, threaded so this site's
+            # holds reach the sweep's streak release (task 3535 S28).  ANY, not
+            # a literal: what is asserted here is the POSITIONAL contract.
+            'tid-a', task, metadata, tally=ANY,
         )
         h._revalidate_open_deterministic_escalation.assert_not_awaited()
 
@@ -917,7 +928,10 @@ class TestRunDeterministicReconSweep:
         await h._run_deterministic_recon_sweep()
 
         h._recover_stranded_deterministic_task.assert_awaited_once_with(
-            'tid-a', task, metadata
+            # tally=: the pass's recovery accumulator, threaded so this site's
+            # holds reach the sweep's streak release (task 3535 S28).  ANY, not
+            # a literal: what is asserted here is the POSITIONAL contract.
+            'tid-a', task, metadata, tally=ANY,
         )
         h._revalidate_open_deterministic_escalation.assert_not_awaited()
 
@@ -959,7 +973,7 @@ class TestRunDeterministicReconSweep:
 
         calls: list[str] = []
 
-        async def _recover(tid, task, meta):
+        async def _recover(tid, task, meta, *, tally=None):
             calls.append(tid)
             if tid == 'tid-bad':
                 raise RuntimeError('boom')
@@ -1302,3 +1316,847 @@ class TestGenericStrandedBlockedReaperSkipsDeterministic:
         esc = h._escalation_queue.submit.call_args[0][0]  # type: ignore[union-attr, attr-defined]
         assert esc.category == 'stranded_blocked'
         assert esc.agent_role == 'harness-stranded-blocked-reaper'
+
+
+# ---------------------------------------------------------------------------
+# Task 3535 (PRD task beta, D5) — STRUCTURED EMISSION at the deterministic
+# recon pair.
+#
+# The same "already has a pending escalation" predicate is implemented TWICE,
+# a few hundred lines apart: once in _run_deterministic_recon_sweep's Source-A
+# deploy branch (a completely SILENT `continue`) and once at the head of
+# _recover_stranded_deterministic_task (info-log-only).  Collapsing the pair
+# is task eta's (3541); this task makes BOTH emit, under DISTINCT site labels,
+# so the duplication becomes a measurable fact in the event store rather than
+# an assumption.  These tests must therefore NOT assert that only one fires.
+# ---------------------------------------------------------------------------
+
+def _pinning_esc(esc_id: str = 'esc-pin-1', *, task_id: str = 'tid-pinned') -> Escalation:
+    """A REAL pending record — the shape ``get_by_task`` actually returns."""
+    return Escalation(
+        id=esc_id,
+        task_id=task_id,
+        agent_role='harness-deterministic-recon-sweep',
+        severity='blocking',
+        category='infra_issue',
+        summary=f'{esc_id} summary',
+        level=1,
+        timestamp='2026-07-01T00:00:00+00:00',
+    )
+
+
+def _emitting_recon_harness(tmp_path: Path) -> Harness:
+    """``_make_recon_harness`` plus a REAL EventStore on tmp_path.
+
+    Real, not a MagicMock, so the payload's JSON round-trip through the store
+    is genuinely exercised — an unserialisable member would drop the whole row
+    in production and a mock would happily accept it.
+    """
+    h = _make_recon_harness()
+    h.event_store = EventStore(tmp_path / 'runs.db', 'run-test')
+    return h
+
+
+def _recon_recovery_rows(h: Harness) -> list[dict]:
+    """Every recovery event row, oldest first, ``data`` JSON-decoded."""
+    conn = sqlite3.connect(str(h.event_store.db_path))  # type: ignore[union-attr]
+    try:
+        return [
+            {'task_id': tid, 'event_type': et, 'data': json.loads(raw or '{}')}
+            for tid, et, raw in conn.execute(
+                'SELECT task_id, event_type, data FROM events '
+                'WHERE event_type IN (?, ?) ORDER BY id',
+                (EventType.recovery_vetoed.value, EventType.recovery_left.value),
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _pinned_deploy_strand(tid: str = 'tid-pinned') -> dict:
+    """A blocked deploy RAN-strand whose recovery is already deduped away."""
+    return {
+        'id': tid, 'status': 'blocked',
+        'description': 'Deploy fused-memory restart',
+        'metadata': _strand_metadata(phase=DeployPhase.RAN),
+    }
+
+
+class TestDeterministicReconSweepSiteEmits:
+    """The sweep's Source-A deploy dedup skip — the SILENT half of the pair."""
+
+    @pytest.mark.asyncio
+    async def test_dedup_skip_emits_recovery_vetoed(self, tmp_path: Path) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        task = _pinned_deploy_strand()
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[_pinning_esc()])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+
+        await h._run_deterministic_recon_sweep()
+
+        rows = _recon_recovery_rows(h)
+        assert len(rows) == 1, f'expected exactly one row, got {rows}'
+        assert rows[0]['event_type'] == EventType.recovery_vetoed.value
+        assert rows[0]['task_id'] == 'tid-pinned'
+        data = rows[0]['data']
+        assert data['site'] == 'deterministic_recon_sweep'
+        assert data['reason'] == 'escalation_pinned'
+        assert data['store_unavailable'] is False
+
+    @pytest.mark.asyncio
+    async def test_payload_names_the_pinning_id_and_its_age(self, tmp_path: Path) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[_pinning_esc()])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+
+        await h._run_deterministic_recon_sweep()
+
+        data = _recon_recovery_rows(h)[0]['data']
+        ids = [i for bucket in data['escalation_ids'].values() for i in bucket]
+        assert ids == ['esc-pin-1']
+        assert set(data['ages_secs']) == {'esc-pin-1'}, (
+            'ages_secs is a MAPPING keyed by id — an id can never silently '
+            'vanish from the payload'
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_names_the_deploy_phase_it_knows(self, tmp_path: Path) -> None:
+        """This site genuinely knows the deploy phase, so it states it; the
+        elements it does not resolve render 'unknown' rather than a guess."""
+        h = _emitting_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[_pinning_esc()])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+
+        await h._run_deterministic_recon_sweep()
+
+        assert _recon_recovery_rows(h)[0]['data']['shape'] == (
+            'blocked|unknown|unknown|true|ran'
+        )
+
+    @pytest.mark.asyncio
+    async def test_dedup_skip_still_files_and_flips_nothing(self, tmp_path: Path) -> None:
+        """The disposition half: RE-FILE-NEVER-FLIP, and the dedup still wins."""
+        h = _emitting_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[_pinning_esc()])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
+        h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_a_recovered_strand_emits_nothing(self, tmp_path: Path) -> None:
+        """An un-deduped strand is ACTED on, not held — no row."""
+        h = _emitting_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'active',
+        })
+
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        assert _recon_recovery_rows(h) == [], 'an ACTION is not a hold'
+
+    @pytest.mark.asyncio
+    async def test_repeat_passes_with_an_identical_hold_stay_bounded(
+        self, tmp_path: Path,
+    ) -> None:
+        """Two passes over the same unchanged hold re-state it once."""
+        h = _emitting_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[_pinning_esc()])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+
+        await h._run_deterministic_recon_sweep()
+        await h._run_deterministic_recon_sweep()
+
+        assert len(_recon_recovery_rows(h)) == 1
+
+
+class TestDeterministicReconDeploySiteEmits:
+    """``_recover_stranded_deterministic_task``'s dedup skip — the
+    INFO-log-only half.  Exercised by calling the method DIRECTLY, since a
+    real sweep pass short-circuits at its twin above."""
+
+    @pytest.mark.asyncio
+    async def test_dedup_skip_emits_recovery_vetoed_under_its_own_site(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        task = _pinned_deploy_strand()
+        h._escalation_queue.get_by_task = MagicMock(return_value=[_pinning_esc()])  # type: ignore[union-attr]
+
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        rows = _recon_recovery_rows(h)
+        assert len(rows) == 1, f'expected exactly one row, got {rows}'
+        assert rows[0]['event_type'] == EventType.recovery_vetoed.value
+        data = rows[0]['data']
+        assert data['site'] == 'deterministic_recon_deploy'
+        assert data['reason'] == 'escalation_pinned'
+        assert [i for b in data['escalation_ids'].values() for i in b] == ['esc-pin-1']
+
+    @pytest.mark.asyncio
+    async def test_the_existing_info_log_line_is_kept(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """The structured event is the MACHINE-readable record; the log line
+        stays the human one.  Replacing it would break existing greps."""
+        h = _emitting_recon_harness(tmp_path)
+        task = _pinned_deploy_strand()
+        h._escalation_queue.get_by_task = MagicMock(return_value=[_pinning_esc()])  # type: ignore[union-attr]
+
+        with caplog.at_level('INFO', logger='orchestrator.harness'):
+            await h._recover_stranded_deterministic_task(
+                'tid-pinned', task, task['metadata'],
+            )
+
+        rendered = [r.getMessage() for r in caplog.records]
+        assert any('already has a pending escalation' in m for m in rendered), (
+            f'the dedup INFO line must survive: {rendered}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_dedup_skip_files_nothing(self, tmp_path: Path) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        task = _pinned_deploy_strand()
+        h._escalation_queue.get_by_task = MagicMock(return_value=[_pinning_esc()])  # type: ignore[union-attr]
+
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
+        h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+
+
+class TestDeterministicReconPairIsMeasurable:
+    """The point of the two labels: the duplication becomes a FACT."""
+
+    @pytest.mark.asyncio
+    async def test_the_pair_speaks_under_two_distinct_site_labels(
+        self, tmp_path: Path,
+    ) -> None:
+        """Deliberately NOT asserting that only one fires — de-duplicating
+        the predicate is task eta's (3541), and a shared label would hide
+        exactly the duplication eta needs to measure."""
+        h = _emitting_recon_harness(tmp_path)
+        task = _pinned_deploy_strand()
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[_pinning_esc()])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+
+        await h._run_deterministic_recon_sweep()
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        sites = [r['data']['site'] for r in _recon_recovery_rows(h)]
+        assert sites == ['deterministic_recon_sweep', 'deterministic_recon_deploy'], (
+            'both halves of the duplicated predicate must be independently '
+            'attributable in the event store'
+        )
+
+
+class TestDeterministicReconQueueAbsent:
+    """A missing queue is a PROCESS-scoped fact, not a per-task one."""
+
+    @pytest.mark.asyncio
+    async def test_sweep_queue_absent_emits_one_recovery_left(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        h._escalation_queue = None
+
+        for _ in range(3):
+            await h._run_deterministic_recon_sweep()
+
+        rows = _recon_recovery_rows(h)
+        assert len(rows) == 1, 'once per PROCESS, not once per pass'
+        assert rows[0]['event_type'] == EventType.recovery_left.value
+        assert rows[0]['task_id'] is None, (
+            'the whole sweep is degraded — no single task is the subject'
+        )
+        data = rows[0]['data']
+        assert data['reason'] == 'escalation_store_unavailable'
+        assert data['store_unavailable'] is True
+        assert data['site'] == 'deterministic_recon_sweep'
+
+    @pytest.mark.asyncio
+    async def test_recover_queue_absent_emits_one_recovery_left(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        task = _pinned_deploy_strand()
+        h._escalation_queue = None
+
+        for _ in range(3):
+            await h._recover_stranded_deterministic_task(
+                'tid-pinned', task, task['metadata'],
+            )
+
+        rows = _recon_recovery_rows(h)
+        assert len(rows) == 1
+        assert rows[0]['task_id'] is None
+        assert rows[0]['data']['site'] == 'deterministic_recon_deploy', (
+            'each half latches its own notice, so silencing one never '
+            'silences the other'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_two_halves_latch_independently(self, tmp_path: Path) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        task = _pinned_deploy_strand()
+        h._escalation_queue = None
+
+        await h._run_deterministic_recon_sweep()
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        assert [r['data']['site'] for r in _recon_recovery_rows(h)] == [
+            'deterministic_recon_sweep', 'deterministic_recon_deploy',
+        ]
+
+
+class TestDeterministicReconGateCheckStaysSilent:
+    """PRD D3 carve-out: the archive-INCLUSIVE, role-scoped gate check is one
+    of the predicates the PRD names as deliberately different and documented
+    as staying separate.  Emitting there would blur a boundary drawn on
+    purpose, so its silence is asserted — a later reader must see the
+    omission as intentional rather than a missed site."""
+
+    @pytest.mark.asyncio
+    async def test_gate_strand_skip_emits_nothing(self, tmp_path: Path) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        task = {
+            'id': 'tid-gate', 'status': 'blocked', 'description': 'gate task',
+            'metadata': _strand_metadata(
+                gate_escalated_at='2026-07-01T01:00:00+00:00',
+                always_escalates=True,
+            ),
+        }
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[_pinning_esc()])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
+        assert _recon_recovery_rows(h) == [], (
+            'the archive-inclusive role-scoped gate check is DELIBERATELY '
+            'untouched by task 3535 (PRD D3)'
+        )
+
+
+class TestDeterministicReconZeroBehaviorChange:
+    """Emission may not move a single disposition."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('pinned', [True, False], ids=['held', 'recovered'])
+    async def test_writes_are_identical_with_emission_on_and_off(
+        self, tmp_path: Path, pinned: bool,
+    ) -> None:
+        outcomes = []
+        for enabled in (True, False):
+            h = _emitting_recon_harness(tmp_path / f'on-{enabled}')
+            h.config.recovery_emission.enabled = enabled
+            h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+            h._escalation_queue.get_by_task = MagicMock(  # type: ignore[union-attr]
+                return_value=[_pinning_esc()] if pinned else [],
+            )
+            h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+            h._recon_unit_inspector = AsyncMock(return_value={
+                'MainPID': 4321, 'ActiveState': 'active',
+            })
+
+            await h._run_deterministic_recon_sweep()
+
+            submitted = [
+                (c[0][0].task_id, c[0][0].category, c[0][0].suggested_action)
+                for c in h._escalation_queue.submit.call_args_list  # type: ignore[union-attr, attr-defined]
+            ]
+            outcomes.append((
+                submitted,
+                h.scheduler.set_task_status.call_args_list,  # type: ignore[attr-defined]
+            ))
+            if not enabled:
+                assert _recon_recovery_rows(h) == []
+
+        assert outcomes[0] == outcomes[1], (
+            'emission changed a disposition — the one thing this task may not do'
+        )
+        assert outcomes[0][1] == [], 'RE-FILE-NEVER-FLIP: no status write, ever'
+
+    @pytest.mark.asyncio
+    async def test_source_b_still_skips_a_tid_source_a_recovered(
+        self, tmp_path: Path,
+    ) -> None:
+        """``recovered_this_pass`` bookkeeping is untouched: a tid Source A
+        recovered is still never handled by Source B in the same pass."""
+        h = _emitting_recon_harness(tmp_path)
+        task = _pinned_deploy_strand()
+        h.scheduler.get_tasks = AsyncMock(return_value=[task])
+        h._escalation_queue.get_by_task = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._escalation_queue.get_pending = MagicMock(  # type: ignore[union-attr]
+            return_value=[_pinning_esc(task_id='tid-pinned')],
+        )
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'active',
+        })
+        h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+
+        await h._run_deterministic_recon_sweep()
+
+        h._revalidate_open_deterministic_escalation.assert_not_called()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_an_emission_failure_never_aborts_the_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """Telemetry sits inside the per-task fail-soft guard, so a sibling
+        sorted after a failing task is still swept."""
+        h = _emitting_recon_harness(tmp_path)
+        h._emit_recovery_disposition = MagicMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('telemetry exploded'),
+        )
+        held = _pinned_deploy_strand('tid-held')
+        free = _pinned_deploy_strand('tid-free')
+        h.scheduler.get_tasks = AsyncMock(return_value=[held, free])
+        h._escalation_queue.get_by_task = MagicMock(  # type: ignore[union-attr]
+            side_effect=lambda tid, **kw: [_pinning_esc()] if tid == 'tid-held' else [],
+        )
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+        h._recon_unit_inspector = AsyncMock(return_value={
+            'MainPID': 4321, 'ActiveState': 'active',
+        })
+
+        await h._run_deterministic_recon_sweep()
+
+        submitted = [
+            c[0][0].task_id
+            for c in h._escalation_queue.submit.call_args_list  # type: ignore[union-attr, attr-defined]
+        ]
+        assert submitted == ['tid-free'], (
+            'a telemetry failure on one task must not collateral-strand its sibling'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 3535 S27 — the deterministic-recon sweep's MISSING RELEASE HALF.
+#
+# Both deterministic sites are in ``STREAK_CHARGING_SITES``, so both can file a
+# blocking L1 against ``__recovery_veto_streak__<tid>``.  The only release path
+# is site-filtered to ``reconcile_sweep`` and driven only from
+# ``_reconcile_stranded_in_progress``, so a deterministic hold that CLEARS
+# leaves (a) an operator holding a blocking alarm for a resolved condition and
+# (b) the detector permanently silenced for that task, because the emitter
+# dedups on ``has_open_l1`` — both failures ``resolve_recovery_veto_streak_
+# escalation``'s own docstring calls "NOT optional polish".  The tracker and the
+# filed_at memo also grow one permanent entry per deterministic task ever held,
+# against ``RecoveryVetoStreakTracker``'s stated "proportional to the tasks
+# CURRENTLY held" footprint contract.
+#
+# The sentinel and the memo are keyed on task_id ALONE while the tracker is
+# keyed on ``(site, task_id)``, so two charging sites SHARE one alarm.  That is
+# why the release must be guarded on no OTHER charging site still holding the
+# tid: an unguarded per-site release would resolve an alarm the other sweep's
+# live hold still justifies, and the next pass would re-file it — an alarm flap
+# on an operator's queue, strictly worse than the stale alarm it fixed.
+# ---------------------------------------------------------------------------
+
+class _FakeClock:
+    """A monotonic clock, so the alarm's SPAN dimension is drivable.
+
+    The predicate is two-dimensional (streak AND elapsed span); a test that
+    could not control time could only ever exercise one half of it.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, secs: float) -> None:
+        self.now += secs
+
+
+#: ``deterministic_recon_sweep_interval_secs`` — the real pass cadence, and
+#: half the published derivation for ``veto_streak_min_span_secs``.
+_RECON_INTERVAL = 900.0
+
+
+def _streak_recon_harness(tmp_path: Path) -> tuple[Harness, _FakeClock]:
+    """A recon harness on a REAL EscalationQueue, with a drivable clock.
+
+    Real queue, not a mock: the sentinel alarm's ``has_open_l1`` dedup, its
+    resolution and the re-file-after-recurrence all live in the queue's own
+    archive handling, and a mock would assert none of it.
+    """
+    h = _make_recon_harness()
+    h.event_store = EventStore(tmp_path / 'runs.db', 'run-test')
+    h._escalation_queue = EscalationQueue(tmp_path / 'queue')
+    clock = _FakeClock()
+    h._recovery_veto_tracker = RecoveryVetoStreakTracker(clock=clock)
+    h._recon_unit_inspector = AsyncMock(return_value={
+        'MainPID': 4321, 'ActiveState': 'active',
+    })
+    # Sources B and C are orthogonal to the release half; keep them inert so a
+    # test failure here can only mean the release misbehaved.
+    h.scheduler.get_task = AsyncMock(return_value=None)
+    h._revalidate_open_l2 = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+    return h, clock
+
+
+def _hold(h: Harness, tid: str = 'tid-pinned', esc_id: str = 'esc-pin-1') -> Escalation:
+    """Put a REAL pending record on *tid*, so the sweep's dedup skips it."""
+    esc = _pinning_esc(esc_id, task_id=tid)
+    h._escalation_queue.submit(esc)  # type: ignore[union-attr]
+    return esc
+
+
+def _sentinel_alarms(h: Harness, tid: str = 'tid-pinned') -> list:
+    """Pending veto-streak alarms filed against *tid*'s SENTINEL id."""
+    return h._escalation_queue.get_by_task(  # type: ignore[union-attr]
+        f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}{tid}', status='pending',
+    )
+
+
+async def _recon_passes(
+    h: Harness, clock: _FakeClock, count: int, *, interval: float = _RECON_INTERVAL,
+) -> None:
+    """Run *count* deterministic passes *interval* apart, as the loop would."""
+    for i in range(count):
+        if i:
+            clock.advance(interval)
+        await h._run_deterministic_recon_sweep()
+
+
+def _tracked_for(h: Harness, tid: str) -> set[str]:
+    """Every SITE currently tracking a veto streak for *tid*."""
+    return {
+        str(site) for site, tracked_tid in h._recovery_veto_tracker.tracked()
+        if tracked_tid == tid
+    }
+
+
+class TestDeterministicReconStreakRelease:
+    """A deterministic hold that ENDS must stand its alarm down."""
+
+    @pytest.mark.asyncio
+    async def test_a_sustained_hold_files_one_alarm(self, tmp_path: Path) -> None:
+        """The charge half — already true, pinned here as this section's premise."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        _hold(h)
+
+        await _recon_passes(h, clock, 3)
+
+        alarms = _sentinel_alarms(h)
+        assert len(alarms) == 1, f'expected one sentinel alarm, got {alarms}'
+        assert alarms[0].level == 1
+
+    @pytest.mark.asyncio
+    async def test_the_next_pass_after_the_hold_clears_resolves_the_alarm(
+        self, tmp_path: Path,
+    ) -> None:
+        """The missing half: today this alarm stays pending forever."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        held = _hold(h)
+        await _recon_passes(h, clock, 3)
+        assert len(_sentinel_alarms(h)) == 1
+
+        h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
+        clock.advance(_RECON_INTERVAL)
+        await h._run_deterministic_recon_sweep()
+
+        assert _sentinel_alarms(h) == [], (
+            'the hold ended, so its alarm must stand down — otherwise an '
+            'operator holds a blocking L1 for a resolved condition'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_release_drops_the_tracker_and_memo_entries(
+        self, tmp_path: Path,
+    ) -> None:
+        """The footprint contract: proportional to CURRENTLY-held tasks.
+
+        This process runs for weeks; one permanent entry per deterministic task
+        ever held is an unbounded leak, not a rounding error.
+        """
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        held = _hold(h)
+        await _recon_passes(h, clock, 3)
+        assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_sweep'}
+
+        h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
+        clock.advance(_RECON_INTERVAL)
+        await h._run_deterministic_recon_sweep()
+
+        assert _tracked_for(h, 'tid-pinned') == set()
+        assert 'tid-pinned' not in getattr(h, '_recovery_streak_filed_at', {})
+
+    @pytest.mark.asyncio
+    async def test_a_later_recurrence_files_a_new_alarm(self, tmp_path: Path) -> None:
+        """Without the release, ``has_open_l1`` silences this detector for the
+        task for the life of the queue — one incident per task, ever."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        held = _hold(h)
+        await _recon_passes(h, clock, 3)
+        first = _sentinel_alarms(h)[0].id
+
+        # The hold clears; the next pass releases and RE-FILES on the real tid
+        # (RE-FILE-NEVER-FLIP), which is what holds the task again below.
+        h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
+        clock.advance(_RECON_INTERVAL)
+        await h._run_deterministic_recon_sweep()
+        assert _sentinel_alarms(h) == []
+
+        await _recon_passes(h, clock, 3)
+
+        alarms = _sentinel_alarms(h)
+        assert len(alarms) == 1, f'the recurrence must alarm again, got {alarms}'
+        assert alarms[0].id != first, 'a NEW alarm, not the resurrected old one'
+
+    @pytest.mark.asyncio
+    async def test_the_release_writes_nothing_to_the_subject_task(
+        self, tmp_path: Path,
+    ) -> None:
+        """Zero behavior change still binds: the release is bookkeeping."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        held = _hold(h)
+        await _recon_passes(h, clock, 3)
+        h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
+        clock.advance(_RECON_INTERVAL)
+
+        await h._run_deterministic_recon_sweep()
+
+        h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        # The pass RE-FILED for the real tid (unchanged behaviour); the release
+        # itself contributed no record of its own to the subject.
+        real = h._escalation_queue.get_by_task('tid-pinned', status='pending')  # type: ignore[union-attr]
+        assert [e.category for e in real] == ['stranded_blocked']
+
+
+class TestDeterministicReconStreakReleaseIsSiteScoped:
+    """The two sweeps have DIFFERENT candidate sets, so neither may stand down
+    the other's live alarm."""
+
+    @pytest.mark.asyncio
+    async def test_a_deterministic_pass_leaves_a_reconcile_streak_alone(
+        self, tmp_path: Path,
+    ) -> None:
+        """``T-other`` is not in the deterministic candidate set at all."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        _hold(h)
+        h._recovery_veto_tracker.observe(
+            RecoverySite.reconcile_sweep, 'T-other', 'sig',
+        )
+
+        await _recon_passes(h, clock, 3)
+
+        assert _tracked_for(h, 'T-other') == {'reconcile_sweep'}, (
+            'a sweep may only release streaks for the sites IT drives'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_deterministic_pass_will_not_resolve_a_still_held_alarm(
+        self, tmp_path: Path,
+    ) -> None:
+        """CROSS-SITE SUPPRESSION — the flap this guard exists to prevent.
+
+        The sentinel and the memo are task-scoped while the tracker is
+        (site, task_id)-scoped, so one alarm covers both sites.  Resolving it
+        while the reconcile sweep still holds the task would simply re-file on
+        the next reconcile pass: an alarm flap, worse than the stale alarm.
+        """
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        held = _hold(h)
+        await _recon_passes(h, clock, 3)
+        assert len(_sentinel_alarms(h)) == 1
+        for _ in range(3):
+            h._recovery_veto_tracker.observe(
+                RecoverySite.reconcile_sweep, 'tid-pinned', 'sig',
+            )
+
+        h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
+        clock.advance(_RECON_INTERVAL)
+        await h._run_deterministic_recon_sweep()
+
+        assert _tracked_for(h, 'tid-pinned') == {'reconcile_sweep'}, (
+            'the deterministic entry pops; the reconcile one is not this '
+            "pass's to touch"
+        )
+        assert len(_sentinel_alarms(h)) == 1, (
+            'still held at another charging site — the alarm stays up'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_reconcile_release_will_not_resolve_a_deterministic_hold(
+        self, tmp_path: Path,
+    ) -> None:
+        """The mirror direction, on the PRE-EXISTING reconcile-only path — the
+        same latent hazard, which the cross-site guard closes for both."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        _hold(h)
+        await _recon_passes(h, clock, 3)
+        assert len(_sentinel_alarms(h)) == 1
+        for _ in range(3):
+            h._recovery_veto_tracker.observe(
+                RecoverySite.reconcile_sweep, 'tid-pinned', 'sig',
+            )
+
+        # A reconcile pass that swept nothing: its own entry is stale.
+        h._release_recovery_veto_streaks(RecoverySweepTally())
+
+        assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_sweep'}
+        assert len(_sentinel_alarms(h)) == 1, (
+            'the deterministic sweep still holds this task — its shared alarm '
+            'must not be stood down by the other sweep'
+        )
+
+
+class TestDeterministicReconQueueAbsentNoticeReArms:
+    """The queue-absent latch RE-ARMS when the queue comes back (cycle 1).
+
+    The Scheduler's twin latch already does this, with the reason spelled out
+    at its re-arm line: the escalation queue is attribute-injected AFTER
+    construction, so queue-absent is a state a process genuinely leaves, and a
+    latch that never re-armed would silently swallow a LATER outage — leaving
+    the second, arguably more alarming, outage completely unannounced.  Both
+    adapters must carry the same latch semantics, so it is pinned for the
+    harness sites too.
+    """
+
+    def _sweep_ready(self, h: Harness) -> None:
+        """Wire the sweep to find nothing, so it reaches its normal end."""
+        h.scheduler.get_tasks = AsyncMock(return_value=[])
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_a_second_sweep_outage_is_announced_again(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        queue = h._escalation_queue
+
+        h._escalation_queue = None
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue = queue
+        self._sweep_ready(h)
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue = None
+        await h._run_deterministic_recon_sweep()
+
+        rows = _recon_recovery_rows(h)
+        assert len(rows) == 2, (
+            f'a LATER outage must not be swallowed by the first latch: {rows}'
+        )
+        assert [r['data']['site'] for r in rows] == [
+            'deterministic_recon_sweep', 'deterministic_recon_sweep',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_second_deploy_outage_is_announced_again(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        queue = h._escalation_queue
+        task = _pinned_deploy_strand()
+
+        h._escalation_queue = None
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        # A pass that CAN read the queue re-arms the notice (this one finds a
+        # pending record and dedups, which is enough to have read the store).
+        h._escalation_queue = queue
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        h._escalation_queue = None
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        notices = [
+            r for r in _recon_recovery_rows(h) if r['task_id'] is None
+        ]
+        assert len(notices) == 2, (
+            f'a LATER outage must not be swallowed by the first latch: {notices}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_re_arming_one_site_never_un_silences_the_other(
+        self, tmp_path: Path,
+    ) -> None:
+        """The latch is per SITE, and so is the re-arm."""
+        h = _emitting_recon_harness(tmp_path)
+        queue = h._escalation_queue
+        task = _pinned_deploy_strand()
+
+        h._escalation_queue = None
+        await h._run_deterministic_recon_sweep()
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        # Only the SWEEP site sees a queue again...
+        h._escalation_queue = queue
+        self._sweep_ready(h)
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue = None
+        await h._run_deterministic_recon_sweep()
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        notices = [
+            r['data']['site'] for r in _recon_recovery_rows(h)
+            if r['task_id'] is None
+        ]
+        # ...so the sweep re-announces and the deploy half stays latched.
+        assert notices == [
+            'deterministic_recon_sweep',
+            'deterministic_recon_deploy',
+            'deterministic_recon_sweep',
+        ]
+
+    def test_the_latch_survives_a_new_built_harness(self) -> None:
+        """``Harness.__init__`` declares the latch alongside the other 3535
+        state, but several narrow-scope suites (this one included) build a
+        Harness via ``__new__`` — so the accessor stays getattr-tolerant and
+        must hand back one STABLE set, not a fresh one per call.  A fresh set
+        each time would re-arm every notice on every read and turn the
+        one-shot latch into one row per pass."""
+        h = _make_recon_harness()
+
+        first = h._recovery_process_latch()
+        first.add('deterministic_recon_sweep')
+
+        assert h._recovery_process_latch() is first
+        assert h._recovery_process_notices == {'deterministic_recon_sweep'}

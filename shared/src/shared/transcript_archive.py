@@ -51,10 +51,14 @@ growing a second glob.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import shutil
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +82,19 @@ _ARCHIVAL_FAILURES: int = 0
 # transcript lookalike, and the next archival of the same session rewrites it.
 _STAGING_SUFFIX = '.archive-tmp'
 
+# The single notification seam onto the counter above. _record_failure is the
+# one funnel BOTH producers (archive_task_transcripts' copy, and
+# archive_before_delete's move) already pass through, so hanging one hook there
+# reaches every archival failure with no second counter and no per-producer
+# callback that could drift out of step with the first.
+#
+# It stays a bare mechanism deliberately. The POLICY that consumes it — a rate
+# threshold, a window, an escalation — needs the live orchestrator config to
+# honour a hot reload, and this module is on the PURE_STDLIB_LEAVES contract
+# (shared/tests/test_pure_stdlib_leaves.py), so the policy lives in the
+# consumer (Harness) and only the notification lives here.
+_ON_ARCHIVAL_FAILURE: Callable[[dict[str, Any]], None] | None = None
+
 
 def _archival_failures() -> int:
     """Return the current module-level archival failure count (test aid)."""
@@ -85,31 +102,96 @@ def _archival_failures() -> int:
 
 
 def _reset_archival_failures() -> None:
-    """Reset the module-level archival failure count (test isolation)."""
-    global _ARCHIVAL_FAILURES
+    """Reset the module-level archival failure count (test isolation).
+
+    Clears the installed failure hook too. Both are process-global state that a
+    test can leave behind, and this is the one call every test in the suite
+    already makes for isolation — resetting only half of it would let one
+    test's callback be fed another test's failures.
+    """
+    global _ARCHIVAL_FAILURES, _ON_ARCHIVAL_FAILURE
     _ARCHIVAL_FAILURES = 0
+    _ON_ARCHIVAL_FAILURE = None
 
 
-def _record_failure(src: Path, task_id: str, exc: OSError) -> None:
+def set_archival_failure_hook(
+    hook: Callable[[dict[str, Any]], None] | None,
+) -> None:
+    """Install (or with ``None``, remove) the archival-failure notification.
+
+    *hook* is invoked once per failed file with the same structured payload the
+    WARNING carries — ``{'task_id': ..., 'path': ..., 'errno': ...}`` — so a
+    consumer sees exactly what an operator greps for, and the log line and the
+    machine-readable signal cannot disagree.
+
+    This is the seam the α task described as owned-but-not-yet-consumed:
+    ``_ARCHIVAL_FAILURES`` is substrate a consumer must poll, which is no use
+    to something that needs to react to a BURST. The consumer arrives in
+    ``Harness``, which applies a live-configured rate threshold and files one
+    deduped escalation per window.
+
+    Contract: a hook that raises is swallowed and logged, never propagated —
+    see :func:`_record_failure`. One hook at a time, last install wins; the
+    seam has exactly one consumer by design, and a list would invite the
+    fan-out this module has no reason to own.
+    """
+    global _ON_ARCHIVAL_FAILURE
+    _ON_ARCHIVAL_FAILURE = hook
+
+
+def _record_failure(
+    src: Path,
+    task_id: str,
+    exc: BaseException,
+    *,
+    detail: str = 'failed to archive',
+) -> None:
     """Count and loudly (but non-fatally) log a single per-file archive failure.
 
     Increments :data:`_ARCHIVAL_FAILURES` and emits one structured WARNING so a
     systemic breakage (e.g. disk full → every file fails) is visible as a
     climbing counter rather than failing silently (design-invariants
     INV-2/INV-4).
+
+    *detail* names WHAT failed. It exists so the one other loud failure this
+    module reports — a credential-isolation regression, where
+    :func:`_purge_config_dir` left ``.credentials.json`` behind — accrues to the
+    SAME counter and the same ``path``/``task_id``/``errno`` shape rather than
+    growing a second, separately-monitored signal. One counter, one greppable
+    shape, one thing a consumer has to watch.
     """
     global _ARCHIVAL_FAILURES
     _ARCHIVAL_FAILURES += 1
+    payload = {
+        'path': str(src),
+        'task_id': task_id,
+        'errno': getattr(exc, 'errno', None),
+    }
     logger.warning(
-        'transcript_archive: failed to archive %s: %s',
+        'transcript_archive: %s %s: %s',
+        detail,
         src,
         exc,
-        extra={
-            'path': str(src),
-            'task_id': task_id,
-            'errno': getattr(exc, 'errno', None),
-        },
+        extra=payload,
     )
+    if _ON_ARCHIVAL_FAILURE is None:
+        return
+    try:
+        _ON_ARCHIVAL_FAILURE(payload)
+    except Exception as hook_exc:
+        # A broken consumer must not become an archival outage. _record_failure
+        # runs inside a function whose contract is totality — called from
+        # ``finally`` blocks and teardown paths that may already be unwinding —
+        # so letting the hook's exception escape would turn "the consumer has a
+        # bug" into "teardown raises", strictly worse than the failure being
+        # reported. Loud, not silent: its own WARNING, and the original failure
+        # is already counted above where the hook cannot suppress it.
+        logger.warning(
+            'transcript_archive: archival-failure hook raised for %s: %s',
+            src,
+            hook_exc,
+            extra=payload,
+        )
 
 
 def _discard_staging(staging: Path) -> None:
@@ -191,6 +273,293 @@ def _archive_one(
     return True
 
 
+@dataclass(frozen=True)
+class ArchiveBeforeDelete:
+    """Structured outcome of one :func:`archive_before_delete` call.
+
+    *held* names the transcripts that could NOT be made durable and were
+    therefore deliberately left on disk. It is the caller's only handle on a
+    partial teardown: an empty ``held`` means every transcript is durable and
+    the config dir is gone, which is the whole point of the operation.
+    """
+
+    archived: int = 0
+    already_current: int = 0
+    held: tuple[Path, ...] = ()
+    config_dir_removed: bool = False
+
+
+def _move_to_archive(
+    src: Path,
+    projects_root: Path,
+    archive_root: Path,
+    task_id: str,
+) -> bool:
+    """MOVE a single transcript *src* to its mirror under *archive_root*.
+
+    The sibling of :func:`_archive_one`, and deliberately the same destination
+    layout (``<archive_root>/<task_id>/<relpath-under-projects>``) so the
+    already-current skip is shared by the copier and the mover — all three
+    producer sites converge on one archive, not two.
+
+    Returns ``True`` when the file was newly moved into the archive, ``False``
+    when the archive was ALREADY current and the source was merely dropped.
+    Either way the source is gone on return; an OSError means it is NOT.
+
+    Why a rename rather than :func:`_archive_one`'s staged copy:
+
+    * **No staging sibling is needed.** ``os.rename`` is itself atomic within
+      one filesystem, so a truncated transcript can never appear at the
+      canonical archive path — the failure mode the staged copy exists to
+      prevent is structurally impossible here.
+    * **The mtime mirror is free.** A rename preserves the inode, so the
+      source's mtime lands on the archive without ``os.utime``. That matters
+      twice over: a ``now``-stamped archive would read to
+      ``gc_agent_transcripts`` as a reset retention age, and it would defeat
+      the already-current skip above.
+    * **It is O(1) metadata, not O(size) I/O** — which is what makes doing it
+      synchronously, inside a teardown path, cheap enough to be
+      unconditional.
+
+    The rename fast path requires source and destination on ONE filesystem.
+    Re-measured on this host 2026-08-18: ``<project_root>/.worktrees`` (where
+    the per-task config dir lives) and ``<project_root>/data/orchestrator``
+    (where the archive root lives) report the SAME ``st_dev``, so the fast
+    path is the live route here. That is a property of the deployment, not a
+    guarantee, and a Linux ``st_dev`` is an ephemeral mount handle rather than
+    a stable id, so the cross-device case is handled rather than assumed (see
+    the EXDEV branch).
+    """
+    rel = src.relative_to(projects_root)
+    dest = archive_root / task_id / rel.parent / rel.name
+    st = src.stat()
+    # Idempotency, shared verbatim with _archive_one: int-truncate to dodge FS
+    # mtime-granularity mismatch. The archive is already current, so the
+    # precondition for deleting the source is already satisfied — corroborate,
+    # then delete, rather than re-archive then delete.
+    if dest.exists() and int(dest.stat().st_mtime) == int(st.st_mtime):
+        src.unlink()
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.rename(src, dest)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        # EXDEV — source and destination are on different filesystems, so a
+        # rename is physically impossible and no retry of it will ever work.
+        # Fall back to the COPY this module already has: _archive_one stages
+        # to a sibling, mirrors the mtime with os.utime (which the rename got
+        # for free) and os.replace's it into place, so the canonical archive
+        # path still only ever holds a complete, correctly-stamped transcript.
+        # Then unlink the source, because deletion-after-archival is the whole
+        # contract and a cross-device host must not silently degrade into an
+        # unbounded hold.
+        #
+        # Unreachable on the measured host: .worktrees and data/orchestrator
+        # report the same st_dev, so every archive takes the rename above.
+        # Retained anyway per PRD §9 Q4 — an st_dev is an ephemeral mount
+        # handle, an operator can mount either path elsewhere tomorrow, and
+        # "assume same-device forever" is exactly the assumption that turns a
+        # remount into silent data loss. Its only exercise is the test suite.
+        _archive_one(src, projects_root, archive_root, task_id)
+        src.unlink()
+    return True
+
+
+def _remove_member(entry: Path) -> None:
+    """Delete one config-dir member. Never raises, and never FOLLOWS a symlink.
+
+    The ``is_symlink()`` test comes first and is load-bearing. A symlink to a
+    directory answers ``is_dir()`` True, and the per-task config dir contains
+    exactly that shape — ``TaskConfigDir._setup_symlinks`` links
+    ``settings.json`` / ``settings.local.json`` into the operator's real
+    ``~/.claude``. Handing such an entry to :func:`shutil.rmtree` raises
+    (rmtree refuses a symlinked root), and any variant that resolved the link
+    first would delete the operator's real settings. Unlinking the LINK is the
+    only correct move, and testing for it first makes following one
+    structurally impossible rather than incidentally avoided.
+    """
+    try:
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(entry, ignore_errors=True)
+    except OSError as exc:  # pragma: no cover - the purge is itself best-effort
+        logger.warning(
+            'transcript_archive: failed to purge config-dir member %s: %s',
+            entry,
+            exc,
+            extra={'path': str(entry), 'errno': getattr(exc, 'errno', None)},
+        )
+
+
+def _warn_on_surviving_credential(config_dir: Path, task_id: str) -> None:
+    """Count + log a ``.credentials.json`` that outlived the purge.
+
+    The purge runs on best-effort primitives (``rmtree(ignore_errors=True)``,
+    a swallowing :func:`_remove_member`), so a credential CAN survive it — and
+    a surviving per-task OAuth credential is a strictly worse outcome than the
+    transcript loss this task set out to fix. It accrues to the existing
+    archival-failure counter, so the same consumer watching for a broken
+    archive root sees this too and there is no second signal to wire up.
+    """
+    creds = config_dir / '.credentials.json'
+    if creds.exists():
+        _record_failure(
+            creds,
+            task_id,
+            RuntimeError('config-dir purge left it in place'),
+            detail='CREDENTIAL ISOLATION REGRESSION — failed to purge',
+        )
+
+
+def _purge_config_dir(config_dir: Path, held: list[Path], task_id: str) -> bool:
+    """Remove *config_dir*, or everything in it except the *held* transcripts.
+
+    Returns ``True`` when the whole directory is gone. Never raises.
+
+    With nothing held this is equivalent to the ``TaskConfigDir.cleanup()``
+    rmtree it replaces. With something held the purge is still UNCONDITIONAL
+    for every member that is neither a held transcript nor a directory on the
+    path to one — the per-task OAuth ``.credentials.json``, the ``~/.claude``
+    settings symlinks, ``sessions/``, ``telemetry/``, all of it.
+
+    That asymmetry is the D1/INV-7 decision, and it is deliberate. Refusing to
+    tear down at all until archival succeeds would convert a bounded transcript
+    loss into an unbounded credential exposure: a permanently-failing archive
+    root (full disk, wrong permissions, unmounted volume) would strand every
+    task's live OAuth credential on disk indefinitely, defeating the per-task
+    isolation the config dir exists to provide. So the hold is SCOPED to the
+    un-archivable ``.jsonl`` alone; it is OWNED by the next process start's
+    ``Harness._sweep_orphaned_transcripts``, which re-archives whatever is
+    still lying in a surviving worktree; and it is therefore BOUNDED by a
+    restart rather than open-ended in time.
+    """
+    if not held:
+        shutil.rmtree(config_dir, ignore_errors=True)
+        # Read the outcome back rather than assuming it: rmtree was asked to
+        # ignore its errors, so "we called it" and "the directory is gone" are
+        # different claims and only the second licenses the True.
+        removed = not config_dir.exists()
+        _warn_on_surviving_credential(config_dir, task_id)
+        return removed
+
+    projects_root = config_dir / 'projects'
+    keep_files = set(held)
+    keep_dirs: set[Path] = {projects_root, config_dir}
+    for f in keep_files:
+        keep_dirs.update(f.parents)
+
+    # Everything outside projects/ goes, whatever happened to the transcripts.
+    for entry in config_dir.iterdir():
+        if entry != projects_root:
+            _remove_member(entry)
+
+    # Inside projects/, keep the held files and only the directories that lead
+    # to them. Deepest-first, so any directory reached here provably contains
+    # no keeper (a directory that did would be in keep_dirs) and no rmtree can
+    # take a held transcript down with it.
+    for entry in sorted(
+        projects_root.rglob('*'), key=lambda q: len(q.parts), reverse=True
+    ):
+        if entry in keep_files or entry in keep_dirs:
+            continue
+        _remove_member(entry)
+
+    _warn_on_surviving_credential(config_dir, task_id)
+    return False
+
+
+def archive_before_delete(
+    config_dir: Path,
+    task_id: str,
+    *,
+    archive_root: Path,
+) -> ArchiveBeforeDelete:
+    """Make *config_dir*'s transcripts durable, THEN delete the directory.
+
+    The fused replacement for "call :func:`archive_task_transcripts`, then
+    call ``TaskConfigDir.cleanup()``" at every teardown site (task 3619, leaf 2
+    of plans/transcript-preservation-seam-prd.md). Those were two steps with a
+    gap between them, and the gap is where transcripts were measurably lost:
+    the archival step is skippable (a cancellation landing on its ``await``, a
+    teardown path that never had one) while the ``rmtree`` is not, so the copy
+    could be dropped and the original destroyed anyway. Here deletion is not a
+    step AFTER archival, it is a step archival LICENSES: a transcript is
+    unlinked only once its durable copy provably exists.
+
+    Every ``projects/**/*.jsonl`` is moved to
+    ``<archive_root>/<task_id>/<relpath-under-projects>`` — the same layout
+    :func:`_archive_one` writes and :func:`durable_archive_path` reads, so
+    producer, mover and reader cannot drift (INV-5). Nothing outside
+    ``projects/`` is ever read, so the per-task OAuth ``.credentials.json`` at
+    the config-dir root is structurally unreachable, exactly as in
+    :func:`archive_task_transcripts`.
+
+    **Synchronous, and that is the fix, not an oversight.** The caller must
+    NOT wrap this in ``asyncio.to_thread`` or otherwise make it awaitable. An
+    ``await`` is a cancellation point, and the SIGTERM that triggers teardown
+    is precisely what delivers the cancellation — the archival step would be
+    the one part of teardown that a shutdown can skip. A rename is O(1)
+    metadata; even the EXDEV copy fallback is a single-digit-millisecond
+    operation on the measured corpus (n=7788 archived transcripts: median
+    381 KB, p95 1.0 MB, max 2.06 MB), i.e. cheaper than the transcript it
+    would otherwise lose.
+
+    **Total by contract** — never raises, mirroring
+    :func:`archive_task_transcripts`, because callers invoke it from teardown
+    paths and ``finally`` blocks that may already be unwinding an exception. A
+    per-file failure is counted through :func:`_record_failure` and the file is
+    HELD: reported in the returned :class:`ArchiveBeforeDelete`, left on disk,
+    never deleted.
+
+    A hold is deliberately NARROW and deliberately TEMPORARY. It covers the
+    un-archivable ``.jsonl`` alone — every other member of the config dir,
+    ``.credentials.json`` included, is purged unconditionally (see
+    :func:`_purge_config_dir` for why holding those instead would be the worse
+    bug). It is owned by the next process start's
+    ``Harness._sweep_orphaned_transcripts``, which re-archives whatever is
+    still lying in a surviving worktree, so the hold is bounded by a restart
+    rather than open-ended in time.
+    """
+    config_dir = Path(config_dir)
+    archive_root = Path(archive_root)
+    projects_root = config_dir / 'projects'
+
+    if not config_dir.exists():
+        # Teardown sites call this blind (a lane that never got a config dir,
+        # a second cleanup pass). A cheap no-op, not a raise — and note no
+        # archive tree is conjured for a task that has no transcripts.
+        return ArchiveBeforeDelete()
+
+    archived = 0
+    already_current = 0
+    held: list[Path] = []
+    # sorted() so the WARNING stream and the reported `held` order are
+    # reproducible across runs rather than filesystem-order-dependent.
+    for src in sorted(projects_root.glob('**/*.jsonl')):
+        try:
+            if _move_to_archive(src, projects_root, archive_root, task_id):
+                archived += 1
+            else:
+                already_current += 1
+        except OSError as exc:
+            # Counted + logged loudly, and the source is HELD. Deleting an
+            # un-archived transcript is the one thing this function exists to
+            # prevent, so a failure costs us the directory, never the data.
+            _record_failure(src, task_id, exc)
+            held.append(src)
+
+    removed = _purge_config_dir(config_dir, held, task_id)
+    return ArchiveBeforeDelete(
+        archived=archived,
+        already_current=already_current,
+        held=tuple(held),
+        config_dir_removed=removed,
+    )
+
+
 def archive_task_transcripts(
     config_dir: Path,
     task_id: str,
@@ -227,6 +596,35 @@ def archive_task_transcripts(
         except OSError as exc:
             _record_failure(src, task_id, exc)
     return count
+
+
+def resolve_archive_root(project_root: Any, root: Any) -> Path:
+    """Compose the durable archive root: ``project_root / transcript_archive.root``.
+
+    The ONE home for that composition (INV-5, the same argument this module
+    already makes for ``_archive_one`` / ``_move_to_archive`` /
+    :func:`durable_archive_path` sharing one destination layout). It was
+    open-coded at five call sites — two teardown sites, the producer hook, the
+    boot-time sweeper and the storm escalation's detail text — in two different
+    spellings (``Path(config.project_root) / ta.root`` at some,
+    ``config.project_root / ta.root`` at others, the latter leaning on
+    project_root already being a Path). A layout with one home in read and
+    write but five in composition can still drift; this closes that.
+
+    Deliberately takes the two operands rather than an OrchestratorConfig:
+    this module is on the PURE_STDLIB_LEAVES contract
+    (shared/tests/test_pure_stdlib_leaves.py) and must not import the
+    orchestrator's config model.
+
+    NOT total, and that is deliberate. ``Path(project_root)`` raises TypeError
+    on a ``None``/non-PathLike project_root, and ``/ root`` raises on a
+    malformed root — a config regression, which callers on the dispatch path
+    already guard and log explicitly rather than paper over here (see
+    ``Harness._archive_available``'s handler). Swallowing it into some
+    fallback path would turn "the config is wrong" into "archives silently go
+    somewhere else".
+    """
+    return Path(project_root) / root
 
 
 def durable_archive_path(

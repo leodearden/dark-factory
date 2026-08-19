@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 from shared import transcript_archive as transcript_archive_module
-from shared.transcript_archive import archive_task_transcripts, durable_archive_path
+from shared.transcript_archive import (
+    archive_before_delete,
+    archive_task_transcripts,
+    durable_archive_path,
+)
 
 # A representative encoded-project directory name (Claude Code encodes the
 # absolute project path into this leaf; the exact encoding is irrelevant here).
@@ -299,6 +303,626 @@ class TestBestEffortLoud:
         assert dest.stat().st_mtime_ns == before_mtime_ns
         assert [p.name for p in root.rglob('*') if p.is_file()] == [dest.name]
         assert transcript_archive_module._archival_failures() == 1
+
+
+class TestArchiveBeforeDelete:
+    """Task 3619 leaf 2 — archival as a PRECONDITION of config-dir deletion.
+
+    :func:`archive_task_transcripts` COPIES and leaves the source alone; the
+    caller then deletes the config dir as a *separate, later* step. That gap is
+    the measured bug: every teardown site (``_cleanup_config_dir``,
+    ``_recycle_config_dir``, ``cleanup_worktree``) can lose the copy step —
+    to a SIGTERM cancellation landing on the archival ``await``, or to a code
+    path that simply never had one — and still run the ``rmtree``, destroying
+    the only copy of the transcript.
+
+    :func:`archive_before_delete` closes it by making the two ONE operation:
+    a transcript is moved out first, and only what is provably durable is
+    deleted. These tests pin the happy path (this class); the credential-purge
+    hard constraint and the EXDEV fallback are pinned separately below.
+    """
+
+    def test_moves_every_transcript_then_removes_the_whole_config_dir(self, tmp_path):
+        """(a)+(b)+(d): archive at the canonical path, sources gone, dir gone."""
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        sid = 'sess-move'
+
+        main_bytes = b'{"type":"main","line":1}\n{"type":"main","line":2}\n'
+        sub_bytes = b'{"type":"subagent","line":1}\n'
+
+        src_main = _write(config_dir / 'projects' / ENC / f'{sid}.jsonl', main_bytes)
+        src_sub = _write(
+            config_dir / 'projects' / ENC / sid / 'subagents' / 'agent-1.jsonl',
+            sub_bytes,
+        )
+
+        outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        # (a) Byte-identical at the SAME layout _archive_one writes, so the
+        # already-current skip is shared across all three producer sites.
+        main_dest = root / task_id / ENC / f'{sid}.jsonl'
+        sub_dest = root / task_id / ENC / sid / 'subagents' / 'agent-1.jsonl'
+        assert main_dest.read_bytes() == main_bytes
+        assert sub_dest.read_bytes() == sub_bytes
+
+        # (b) The sources are gone and the ENTIRE config dir is gone — parity
+        # with today's TaskConfigDir.cleanup() rmtree, which this replaces.
+        assert not src_main.exists()
+        assert not src_sub.exists()
+        assert not config_dir.exists()
+
+        # (d) Structured outcome: two moved, nothing skipped, nothing held.
+        assert outcome.archived == 2
+        assert outcome.already_current == 0
+        assert outcome.held == ()
+        assert outcome.config_dir_removed is True
+
+    def test_a_rename_preserves_the_source_mtime_so_the_next_call_skips(
+        self, tmp_path
+    ):
+        """The move must leave the archive stamped from the SOURCE, not `now`.
+
+        ``_archive_one``'s copy path needs an explicit ``os.utime`` mirror for
+        this; a rename preserves the inode, so it comes free. It is asserted
+        anyway because it is load-bearing in two directions: a ``now``-stamped
+        archive reads to ``gc_agent_transcripts`` as a reset retention age, and
+        it would defeat the already-current skip the sweeper and the producer
+        both depend on.
+        """
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        sid = 'sess-mtime'
+
+        src = _write(config_dir / 'projects' / ENC / f'{sid}.jsonl', b'{"l":1}\n')
+        os.utime(src, (1_600_000_000, 1_600_000_000))
+        src_mtime = src.stat().st_mtime
+
+        archive_before_delete(config_dir, task_id, archive_root=root)
+
+        dest = root / task_id / ENC / f'{sid}.jsonl'
+        assert int(dest.stat().st_mtime) == int(src_mtime)
+
+    def test_an_already_current_archive_is_corroborated_not_rewritten(self, tmp_path):
+        """(c): dest already current → source deleted, archive left untouched.
+
+        Corroborate-then-delete, not re-archive-then-delete. The producer hook
+        already archived this session on its way out (workflow.py's
+        ``_invoke`` finally), so by teardown the common case is that the
+        durable copy is ALREADY there. Rewriting it would be wasted I/O; more
+        importantly, proving the archive is current is exactly the precondition
+        that licenses the delete.
+        """
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        sid = 'sess-current'
+
+        src = _write(config_dir / 'projects' / ENC / f'{sid}.jsonl', b'{"src":1}\n')
+        # Pre-write the archive with a DISTINCTIVE payload and mirror the
+        # source mtime onto it, so the already-current predicate holds. A
+        # genuine skip leaves the marker intact; an unconditional re-archive
+        # replaces it with the source bytes.
+        marker = b'MARKER-already-current-not-rewritten'
+        dest = _write(root / task_id / ENC / f'{sid}.jsonl', marker)
+        st = src.stat()
+        os.utime(dest, (st.st_atime, st.st_mtime))
+
+        outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        assert dest.read_bytes() == marker
+        # ...yet the source is still deleted, and the dir still torn down.
+        assert not src.exists()
+        assert not config_dir.exists()
+        assert outcome.archived == 0
+        assert outcome.already_current == 1
+        assert outcome.held == ()
+        assert outcome.config_dir_removed is True
+
+    def test_a_mixed_dir_reports_both_moved_and_already_current(self, tmp_path):
+        """One transcript already archived, one not — both resolved, both gone."""
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        task_id = '3619'
+
+        stale = _write(config_dir / 'projects' / ENC / 'sess-new.jsonl', b'{"n":1}\n')
+        done = _write(config_dir / 'projects' / ENC / 'sess-old.jsonl', b'{"o":1}\n')
+        done_dest = _write(root / task_id / ENC / 'sess-old.jsonl', b'{"o":1}\n')
+        st = done.stat()
+        os.utime(done_dest, (st.st_atime, st.st_mtime))
+
+        outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        assert outcome.archived == 1
+        assert outcome.already_current == 1
+        assert outcome.held == ()
+        assert (root / task_id / ENC / 'sess-new.jsonl').read_bytes() == b'{"n":1}\n'
+        assert not stale.exists()
+        assert not config_dir.exists()
+
+    def test_a_missing_config_dir_is_an_idempotent_no_op(self, tmp_path):
+        """(e): never raises on an absent dir — teardown sites call it blind.
+
+        ``cleanup_worktree`` fires on lanes that never got a config dir, and
+        ``_cleanup_config_dir`` can run twice; both must be cheap no-ops rather
+        than a raise inside a teardown path.
+        """
+        root = tmp_path / 'archive'
+        outcome = archive_before_delete(
+            tmp_path / 'no-such-config-dir', '3619', archive_root=root
+        )
+        assert outcome.archived == 0
+        assert outcome.already_current == 0
+        assert outcome.held == ()
+        # Nothing to remove, so nothing was removed — and no archive tree was
+        # conjured for a task that has no transcripts.
+        assert outcome.config_dir_removed is False
+        assert not root.exists()
+
+    def test_a_config_dir_with_no_transcripts_is_still_torn_down(self, tmp_path):
+        """No ``projects/`` at all → nothing held, so the dir still goes."""
+        config_dir = tmp_path / 'claude-config-3619'
+        _write(config_dir / '.credentials.json', b'{"claudeAiOauth":{}}')
+
+        outcome = archive_before_delete(
+            config_dir, '3619', archive_root=tmp_path / 'archive'
+        )
+
+        assert outcome.archived == 0
+        assert outcome.held == ()
+        assert outcome.config_dir_removed is True
+        assert not config_dir.exists()
+
+    def test_running_it_twice_is_idempotent(self, tmp_path):
+        """A second call over the already-removed dir is a silent no-op."""
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        _write(config_dir / 'projects' / ENC / 'sess-twice.jsonl', b'{"t":1}\n')
+
+        first = archive_before_delete(config_dir, '3619', archive_root=root)
+        second = archive_before_delete(config_dir, '3619', archive_root=root)
+
+        assert first.archived == 1
+        assert second.archived == 0
+        assert second.already_current == 0
+        assert second.held == ()
+        assert (root / '3619' / ENC / 'sess-twice.jsonl').exists()
+
+
+class TestArchiveBeforeDeleteHoldsOnlyTheTranscript:
+    """D1 / INV-7: a failing archive must not become a hold on credentials.
+
+    The obvious way to honour "never delete an un-archived transcript" is to
+    abort the whole teardown on a failure — and that trades one bounded loss
+    for a worse unbounded one: a permanently-failing archive (a full or
+    read-only archive root) would leave every task's ``.credentials.json``,
+    its ``~/.claude`` settings symlinks, its ``sessions/`` and its
+    ``telemetry/`` on disk forever, defeating the per-task credential
+    isolation the config dir exists to provide.
+
+    So the hold is SCOPED: exactly the un-archivable ``.jsonl`` stays, and
+    every other member of the directory is deleted unconditionally. The held
+    file is owned by the next process start's sweeper, so the hold is bounded
+    by a restart rather than unbounded in time.
+    """
+
+    @staticmethod
+    def _build_realistic_config_dir(tmp_path):
+        """A config dir shaped like TaskConfigDir builds one, plus transcripts."""
+        config_dir = tmp_path / 'claude-config-3619'
+        config_dir.mkdir(parents=True)
+
+        creds = config_dir / '.credentials.json'
+        creds.write_bytes(b'{"claudeAiOauth":{"accessToken":"SECRET"}}')
+        creds.chmod(0o600)
+
+        # Mirrors TaskConfigDir._setup_symlinks: a SYMLINK into ~/.claude.
+        # The purge must unlink the link and never follow it — deleting the
+        # user's real settings.json would be a far worse bug than the one
+        # this task fixes.
+        settings_target = tmp_path / 'home-claude' / 'settings.json'
+        _write(settings_target, b'{"real":"settings"}')
+        (config_dir / 'settings.json').symlink_to(settings_target)
+
+        _write(config_dir / 'sessions' / 'x.json', b'{"session":1}')
+        _write(config_dir / 'telemetry' / 'y.log', b'telemetry line\n')
+
+        good = _write(config_dir / 'projects' / ENC / 'sess-good.jsonl', b'{"g":1}\n')
+        bad = _write(config_dir / 'projects' / ENC / 'sess-bad.jsonl', b'{"b":1}\n')
+        return config_dir, settings_target, good, bad
+
+    @staticmethod
+    def _deny(monkeypatch, predicate):
+        """Make both archive routes raise EACCES for sources matching *predicate*."""
+        real_rename = os.rename
+        real_copyfile = transcript_archive_module.shutil.copyfile
+
+        def fake_rename(src, dst, **kwargs):
+            if predicate(str(src)):
+                raise PermissionError(errno.EACCES, 'Permission denied')
+            return real_rename(src, dst, **kwargs)
+
+        def fake_copyfile(src, dst, **kwargs):
+            if predicate(str(src)):
+                raise PermissionError(errno.EACCES, 'Permission denied')
+            return real_copyfile(src, dst, **kwargs)
+
+        monkeypatch.setattr(transcript_archive_module.os, 'rename', fake_rename)
+        monkeypatch.setattr(
+            transcript_archive_module.shutil, 'copyfile', fake_copyfile
+        )
+
+    def test_a_total_archive_failure_still_purges_every_credential(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        config_dir, settings_target, good, bad = self._build_realistic_config_dir(
+            tmp_path
+        )
+        self._deny(monkeypatch, lambda src: True)
+
+        transcript_archive_module._reset_archival_failures()
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        # (a) Every non-transcript member is gone, unconditionally.
+        assert not (config_dir / '.credentials.json').exists()
+        assert not (config_dir / 'settings.json').is_symlink()
+        assert not (config_dir / 'sessions').exists()
+        assert not (config_dir / 'telemetry').exists()
+        # ...and the symlink was UNLINKED, never followed.
+        assert settings_target.read_bytes() == b'{"real":"settings"}'
+
+        # (b) Only the un-archivable transcripts are held.
+        assert good.exists()
+        assert bad.exists()
+        assert set(outcome.held) == {good, bad}
+        assert outcome.archived == 0
+        assert outcome.already_current == 0
+        assert outcome.config_dir_removed is False
+        assert config_dir.exists()
+
+        # (c) The EXISTING counter advanced once per failed file, and each
+        # carries the structured shape an operator greps for.
+        assert transcript_archive_module._archival_failures() == 2
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2
+        assert {r.errno for r in warnings} == {errno.EACCES}
+        assert {r.task_id for r in warnings} == {task_id}
+        assert {r.path for r in warnings} == {str(good), str(bad)}
+        # (d) Nothing was raised — reaching here at all is the assertion.
+
+    def test_one_failing_transcript_does_not_hold_its_sibling(
+        self, tmp_path, monkeypatch
+    ):
+        """Partial failure: the archivable one still leaves; the purge still runs."""
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        config_dir, settings_target, good, bad = self._build_realistic_config_dir(
+            tmp_path
+        )
+        self._deny(monkeypatch, lambda src: 'sess-bad' in src)
+
+        transcript_archive_module._reset_archival_failures()
+        outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        assert (root / task_id / ENC / 'sess-good.jsonl').read_bytes() == b'{"g":1}\n'
+        assert not good.exists()
+        assert bad.exists()
+        assert outcome.archived == 1
+        assert outcome.held == (bad,)
+        assert outcome.config_dir_removed is False
+        assert transcript_archive_module._archival_failures() == 1
+
+        # The credential purge is NOT contingent on a clean archive run.
+        assert not (config_dir / '.credentials.json').exists()
+        assert not (config_dir / 'settings.json').is_symlink()
+        assert not (config_dir / 'sessions').exists()
+        assert not (config_dir / 'telemetry').exists()
+        assert settings_target.exists()
+
+    def test_the_held_transcript_keeps_its_content_and_its_path(
+        self, tmp_path, monkeypatch
+    ):
+        """A hold means UNTOUCHED — the sweeper must find it where it was.
+
+        The startup sweeper globs ``<worktree>/.task/claude-config-*/projects/
+        **/*.jsonl``, so a held file relocated or emptied by the purge would be
+        unrecoverable. Its ancestor directories under ``projects/`` therefore
+        survive too.
+        """
+        root = tmp_path / 'archive'
+        config_dir, _settings_target, _good, bad = self._build_realistic_config_dir(
+            tmp_path
+        )
+        self._deny(monkeypatch, lambda src: True)
+
+        transcript_archive_module._reset_archival_failures()
+        archive_before_delete(config_dir, '3619', archive_root=root)
+
+        assert bad.read_bytes() == b'{"b":1}\n'
+        assert bad.parent.is_dir()
+        assert (config_dir / 'projects').is_dir()
+
+
+class TestArchiveBeforeDeleteCrossDevice:
+    """PRD §9 Q4: the rename fast path is a deployment property, not a promise.
+
+    ``os.rename`` only works within one filesystem. On this host the config dir
+    (under ``<project_root>/.worktrees``) and the archive root (under
+    ``<project_root>/data/orchestrator``) are measurably on the SAME device, so
+    the fast path is the live route and ``EXDEV`` is unreachable here. But a
+    Linux ``st_dev`` is an ephemeral mount handle, not a stable identifier, and
+    an operator is free to mount either path elsewhere — so the cross-device
+    case is HANDLED rather than assumed. These tests are the only thing that
+    keeps that branch honest, since production never exercises it.
+
+    Deliberately no assertion on any device-id LITERAL: the invariant is that
+    the two paths agree with EACH OTHER, and a recorded number would go stale
+    across the next remount and make a healthy host look broken.
+    """
+
+    @staticmethod
+    def _rename_is_cross_device(monkeypatch):
+        monkeypatch.setattr(
+            transcript_archive_module.os,
+            'rename',
+            lambda *a, **kw: (_ for _ in ()).throw(
+                OSError(errno.EXDEV, 'Invalid cross-device link')
+            ),
+        )
+
+    def test_exdev_falls_back_to_copy_then_unlinks_the_source(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        sid = 'sess-xdev'
+
+        payload = b'{"line":1}\n{"line":2}\n'
+        src = _write(config_dir / 'projects' / ENC / f'{sid}.jsonl', payload)
+        os.utime(src, (1_600_000_000, 1_600_000_000))
+        src_mtime = src.stat().st_mtime
+
+        self._rename_is_cross_device(monkeypatch)
+        transcript_archive_module._reset_archival_failures()
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        dest = root / task_id / ENC / f'{sid}.jsonl'
+        # (a) The transcript is durable, with the SOURCE mtime mirrored onto
+        # it. The copy path needs an explicit os.utime for that where the
+        # rename got it free — and without it the already-current skip would
+        # never fire, so every later pass would re-archive forever and
+        # gc_agent_transcripts would read a permanently reset retention age.
+        assert dest.read_bytes() == payload
+        assert int(dest.stat().st_mtime) == int(src_mtime)
+
+        # (b) A cross-device host still gets deletion-AFTER-archival, not an
+        # unbounded hold: the whole point is that the copy licenses the delete.
+        assert not src.exists()
+
+        # (c) Nothing held, dir gone — outwardly indistinguishable from the
+        # rename path, which is what makes the fallback a real fallback.
+        assert outcome.archived == 1
+        assert outcome.held == ()
+        assert outcome.config_dir_removed is True
+        assert not config_dir.exists()
+
+        # (d) EXDEV is a handled ROUTE, not a failure. A counter that climbed
+        # here would page an operator on every archive on a two-mount host.
+        assert transcript_archive_module._archival_failures() == 0
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+        # (e) No staging debris left in the archive tree.
+        assert [p.name for p in root.rglob('*') if p.is_file()] == [dest.name]
+        assert not any(
+            p.name.endswith('.archive-tmp') for p in root.rglob('*')
+        )
+
+    def test_exdev_then_a_failing_copy_holds_the_transcript(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Both routes fail → hold, count once, publish nothing partial."""
+        config_dir = tmp_path / 'claude-config-3619'
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        sid = 'sess-xdev-dead'
+
+        src = _write(
+            config_dir / 'projects' / ENC / f'{sid}.jsonl',
+            b'{"line":1}\n{"line":2}\n{"line":3}\n',
+        )
+        self._rename_is_cross_device(monkeypatch)
+        # The realistic shape: bytes land, THEN the write fails. A mock that
+        # raised before writing anything would pass against an in-place copy
+        # too and prove nothing about where the partial bytes went.
+        TestBestEffortLoud._copyfile_dies_part_way(monkeypatch, b'{"line":1}\n{"li')
+
+        transcript_archive_module._reset_archival_failures()
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            outcome = archive_before_delete(config_dir, task_id, archive_root=root)
+
+        assert outcome.archived == 0
+        assert outcome.held == (src,)
+        assert outcome.config_dir_removed is False
+        assert src.read_bytes() == b'{"line":1}\n{"line":2}\n{"line":3}\n'
+
+        # Nothing partial published at the canonical path, and no staging
+        # debris — the fallback inherits _archive_one's staged-write property.
+        dest = root / task_id / ENC / f'{sid}.jsonl'
+        assert not dest.exists()
+        assert [p for p in root.rglob('*') if p.is_file()] == []
+
+        # Counted ONCE: the EXDEV retry must not double-count one file.
+        assert transcript_archive_module._archival_failures() == 1
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].errno == errno.ENOSPC
+        assert warnings[0].path == str(src)
+
+
+class TestArchivalFailureHook:
+    """INV-4 substrate: ONE machine-readable seam onto the failure counter.
+
+    The α task left ``_ARCHIVAL_FAILURES`` deliberately owned-but-not-consumed.
+    A consumer needs to be TOLD, not to poll a module global, so this adds a
+    single notification seam beside the counter — one hook, fired by the one
+    ``_record_failure`` both producers already funnel through, rather than a
+    second counter or a per-producer callback that could drift out of step with
+    the first. The policy that consumes it (a rate threshold, an escalation)
+    lives in the orchestrator, where the live config is; this module is on the
+    PURE_STDLIB_LEAVES contract and stays a mechanism.
+    """
+
+    @staticmethod
+    def _teardown_hook():
+        transcript_archive_module.set_archival_failure_hook(None)
+
+    def test_the_hook_fires_once_per_failed_file_from_both_producers(
+        self, tmp_path
+    ):
+        """(a) One seam, both producers — no second notification path."""
+        root = tmp_path / 'archive'
+        task_id = '3619'
+        seen: list[dict] = []
+
+        # Producer 1: the COPY path (archive_task_transcripts).
+        copy_dir = tmp_path / 'claude-config-copy'
+        bad_copy = _write(copy_dir / 'projects' / ENC / 'sess-copy.jsonl', b'{}\n')
+        blocker = root / task_id / ENC / 'sess-copy.jsonl'
+        blocker.mkdir(parents=True)
+        os.utime(blocker, (0, 0))
+
+        # Producer 2: the MOVE path (archive_before_delete).
+        move_dir = tmp_path / 'claude-config-move'
+        bad_move = _write(move_dir / 'projects' / ENC / 'sess-move.jsonl', b'{}\n')
+        blocker2 = root / task_id / ENC / 'sess-move.jsonl'
+        blocker2.mkdir(parents=True)
+        os.utime(blocker2, (0, 0))
+
+        transcript_archive_module._reset_archival_failures()
+        transcript_archive_module.set_archival_failure_hook(seen.append)
+        try:
+            archive_task_transcripts(copy_dir, task_id, None, archive_root=root)
+            archive_before_delete(move_dir, task_id, archive_root=root)
+        finally:
+            self._teardown_hook()
+
+        assert len(seen) == 2
+        assert [p['path'] for p in seen] == [str(bad_copy), str(bad_move)]
+        assert {p['task_id'] for p in seen} == {task_id}
+        assert {p['errno'] for p in seen} == {errno.EISDIR}
+        # The counter is unchanged in meaning: the hook is a notification, not
+        # a replacement for the substrate a digest consumer samples.
+        assert transcript_archive_module._archival_failures() == 2
+
+    def test_the_hook_can_be_uninstalled_and_does_not_leak_between_tests(
+        self, tmp_path
+    ):
+        """(b) None uninstalls, and _reset_archival_failures also clears it.
+
+        The reset accessor is what every test in this module already calls for
+        isolation; if it cleared the counter but left a previous test's hook
+        installed, one test's callback would be fed another's failures.
+        """
+        root = tmp_path / 'archive'
+        seen: list[dict] = []
+
+        def one_failure(config_dir_name):
+            config_dir = tmp_path / config_dir_name
+            src = _write(config_dir / 'projects' / ENC / 'sess.jsonl', b'{}\n')
+            blocker = root / '3619' / ENC / 'sess.jsonl'
+            if not blocker.exists():
+                blocker.mkdir(parents=True)
+                os.utime(blocker, (0, 0))
+            archive_task_transcripts(config_dir, '3619', None, archive_root=root)
+            return src
+
+        transcript_archive_module._reset_archival_failures()
+        transcript_archive_module.set_archival_failure_hook(seen.append)
+        try:
+            one_failure('cfg-a')
+            assert len(seen) == 1
+
+            transcript_archive_module.set_archival_failure_hook(None)
+            one_failure('cfg-b')
+            assert len(seen) == 1
+
+            transcript_archive_module.set_archival_failure_hook(seen.append)
+            transcript_archive_module._reset_archival_failures()
+            one_failure('cfg-c')
+            assert len(seen) == 1
+        finally:
+            self._teardown_hook()
+
+    def test_a_raising_hook_cannot_become_an_archival_outage(
+        self, tmp_path, caplog
+    ):
+        """(c) A broken consumer must not take archival down with it.
+
+        The hook is called from inside the failure path of a function whose
+        whole contract is totality — it runs in ``finally`` blocks and teardown
+        paths. Letting a consumer's exception escape would turn "the digest
+        consumer has a bug" into "teardown raises", which is a strictly worse
+        failure than the one being reported.
+        """
+        root = tmp_path / 'archive'
+        config_dir = tmp_path / 'claude-config-3619'
+        good = _write(config_dir / 'projects' / ENC / 'sess-good.jsonl', b'{"g":1}\n')
+        _write(config_dir / 'projects' / ENC / 'sess-bad.jsonl', b'{"b":1}\n')
+        blocker = root / '3619' / ENC / 'sess-bad.jsonl'
+        blocker.mkdir(parents=True)
+        os.utime(blocker, (0, 0))
+
+        def exploding_hook(_payload):
+            raise RuntimeError('consumer is broken')
+
+        transcript_archive_module._reset_archival_failures()
+        transcript_archive_module.set_archival_failure_hook(exploding_hook)
+        try:
+            with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+                count = archive_task_transcripts(
+                    config_dir, '3619', None, archive_root=root
+                )
+        finally:
+            self._teardown_hook()
+
+        # The surrounding archive still completed...
+        assert count == 1
+        assert (root / '3619' / ENC / 'sess-good.jsonl').read_bytes() == good.read_bytes()
+        # ...and still counted the ORIGINAL failure, which the hook must not
+        # be able to suppress by dying.
+        assert transcript_archive_module._archival_failures() == 1
+
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('consumer is broken' in m for m in messages)
+        assert any('sess-bad.jsonl' in m for m in messages)
+
+    def test_with_no_hook_installed_behaviour_is_unchanged(self, tmp_path, caplog):
+        """(d) The default path is byte-identical to before the seam existed."""
+        root = tmp_path / 'archive'
+        config_dir = tmp_path / 'claude-config-3619'
+        _write(config_dir / 'projects' / ENC / 'sess-bad.jsonl', b'{"b":1}\n')
+        blocker = root / '3619' / ENC / 'sess-bad.jsonl'
+        blocker.mkdir(parents=True)
+        os.utime(blocker, (0, 0))
+
+        transcript_archive_module._reset_archival_failures()
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            archive_task_transcripts(config_dir, '3619', None, archive_root=root)
+
+        assert transcript_archive_module._archival_failures() == 1
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].errno == errno.EISDIR
 
 
 class TestDurableArchivePathLookup:

@@ -70,7 +70,7 @@ from shared.proc_group import (
     scan_process_groups_under_path,
     snapshot_process_group,
 )
-from shared.transcript_archive import archive_task_transcripts
+from shared.transcript_archive import archive_before_delete
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
@@ -12554,53 +12554,52 @@ class GitOps:
             await self.release_spec_lane(worktree, warm=True)
             return
 
-        # ── Teardown-archival backstop (task 2786, agent-transcript-archival-prd
-        # β) ────────────────────────────────────────────────────────────────
-        # Before the worktree (and the per-task Claude config dir INSIDE it) is
-        # destroyed, archive any still-un-archived agent transcript to the
-        # durable root OUTSIDE the worktree. This closes the abandoned-in-flight
-        # tail the producer hook (α/workflow.py _invoke) cannot: a role in-flight
-        # when the orchestrator died, whose task is reaped without a completed
-        # resume. Idempotent with the producer — same archive_root + task_id, so
-        # the helper's size/mtime skip fires (a no-op in the normal case).
-        # Reached only on COLD removals: warm/spec lanes returned above (they are
-        # retained, not removed), and branch == task_id at every cold call site,
-        # so it is the task_id the config-dir path and archive layout key on.
-        # Offloaded to a worker thread so the blocking file-copy I/O never stalls
-        # the shared event loop (mirrors the producer's loop-stall avoidance).
-        # Task 3619 (leaf 2) collapses the copy into a rename, at which point
-        # this offload can go too.
+        # ── Teardown-archival guard (task 2786 β; task 3619 leaf 2)  ────────
+        # Before the worktree — and the per-task Claude config dir INSIDE it —
+        # is destroyed, make every still-un-archived agent transcript durable
+        # in the archive root OUTSIDE the worktree. This closes the
+        # abandoned-in-flight tail the producer hook (workflow.py _invoke)
+        # cannot: a role in flight when the orchestrator died, whose task is
+        # reaped without a completed resume.
+        #
+        # SYNCHRONOUS, and that is the point. This used to be
+        # `await asyncio.to_thread(archive_task_transcripts, ...)` with an
+        # `except asyncio.CancelledError: raise` clause below it, offloaded so
+        # a blocking file copy could not stall the shared event loop. Task 3618
+        # dropped the compression and task 3619 turned the copy into a rename,
+        # so what remains is a glob plus O(1) metadata syscalls — and the
+        # offload had become strictly harmful: an `await` is a cancellation
+        # point, the SIGTERM that triggers teardown is what delivers the
+        # cancellation, and `git worktree remove --force` below is NOT
+        # cancellable. The archival was therefore the one part of teardown a
+        # shutdown could skip, immediately before the step that destroys what
+        # it skipped. There is no longer an await here to cancel.
+        #
+        # Reached only on COLD removals: warm/spec lanes returned above (they
+        # are retained, not removed), and branch == task_id at every cold call
+        # site, so it is the task_id the config-dir path and archive layout
+        # key on. Idempotent with the producer — same archive_root + task_id,
+        # so the already-current skip fires and the normal case is a cheap
+        # corroboration.
         if self.transcript_archive is not None and self.transcript_archive.enabled:
             config_dir = worktree / '.task' / f'claude-config-{branch}'
-            # Fast-skip when the config dir is already gone (external worktrees,
-            # already-cleaned dirs): a cheap no-op that never spins up a worker
-            # thread just to glob an absent projects/ tree. The producer already
-            # archived the normal case; the size/mtime skip inside the helper
-            # (matching archive_root + task_id) makes any overlap idempotent.
+            # Fast-skip when the config dir is already gone (external
+            # worktrees, already-cleaned dirs): a cheap no-op rather than a
+            # glob of an absent projects/ tree.
             if config_dir.exists():
                 archive_root = self.project_root / self.transcript_archive.root
                 try:
-                    await asyncio.to_thread(
-                        archive_task_transcripts,
+                    outcome = archive_before_delete(
                         config_dir,
                         branch,
-                        None,
                         archive_root=archive_root,
                     )
-                except asyncio.CancelledError:
-                    # Cooperative cancellation (loop teardown / hard-kill)
-                    # surfaces here from the await, NOT an archival error — it
-                    # must propagate, never be swallowed (mirrors the producer,
-                    # workflow.py _invoke). CancelledError is a BaseException, so
-                    # the `except Exception` below deliberately does not catch it.
-                    raise
                 except Exception:
-                    # Best-effort: teardown must never be blocked by a broken or
-                    # contract-regressed archiver. archive_task_transcripts is
-                    # total by contract (per-file OSErrors are swallowed +
-                    # counted), but its top-level glob / Path / archive_root
-                    # construction is not individually guarded — swallow any
-                    # escaped non-cancellation error here so `git worktree remove`
+                    # Best-effort: teardown must never be blocked by a broken
+                    # or contract-regressed archiver. archive_before_delete is
+                    # total by contract, but its top-level glob / Path /
+                    # archive_root construction is not individually guarded —
+                    # swallow any escaped error here so `git worktree remove`
                     # still runs. Loud, not silent: logged as a structured fact.
                     logger.warning(
                         'Transcript archival backstop failed for task %s '
@@ -12610,6 +12609,34 @@ class GitOps:
                         exc_info=True,
                         extra={'task_id': branch, 'worktree': str(worktree)},
                     )
+                else:
+                    if outcome.held:
+                        # A hold at THIS site is a genuine loss, and taking it
+                        # is still the right call. Everywhere else a held
+                        # transcript survives until the next boot's sweeper
+                        # re-archives it; here `git worktree remove --force`
+                        # destroys it moments from now. The guard's promise is
+                        # that IT never deletes an un-archived transcript, not
+                        # that it can save one from the removal it is a
+                        # precondition of. Blocking the removal instead would
+                        # trade a bounded, counted, escalated transcript loss
+                        # for an unbounded hold on a worktree and the lane slot
+                        # it occupies — the worse failure. So: name it, then
+                        # proceed.
+                        logger.warning(
+                            'Transcript archival backstop: %d transcript(s) '
+                            'could not be archived for task %s and are about '
+                            'to be destroyed with worktree %s: %s',
+                            len(outcome.held),
+                            branch,
+                            worktree,
+                            ', '.join(str(q) for q in outcome.held),
+                            extra={
+                                'task_id': branch,
+                                'worktree': str(worktree),
+                                'held': [str(q) for q in outcome.held],
+                            },
+                        )
 
         full_branch = f'{self.config.branch_prefix}{branch}'
 

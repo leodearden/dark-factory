@@ -576,6 +576,99 @@ end this turn with verification still pending: this session is one-shot, and
 abandoned work is recorded as a successful run."""
 
 
+# Census-2026-08-16 §1.1 companion to WAIT_PATTERN_GUIDANCE's `Monitor` bullet
+# above (task 4273; plans/confusion-census-2026-08-16.md).  Third sighting of
+# the same shape catalogued as `cand-20260806-12` and `cand-20260812-19` in
+# docs/legibility/confusion-codebook.yaml: a `Read` tool call whose echoed
+# input carried an empty parameter slot between `offset` and `limit`
+# (`"offset": 1240, , "limit": 1`) was rejected by `InputValidationError` as
+# unparseable JSON, and three turns later the agent reissued the IDENTICAL
+# malformed structure with only `limit` edited (1 -> 260) -- rejected
+# identically.  The retry encoded a misdiagnosis: the agent read the
+# rejection as a bad `limit` VALUE rather than a JSON SYNTAX defect.
+#
+# WHAT IS AND IS NOT ADDRESSED.  The stray comma's CAUSE is upstream of this
+# repository -- tool-call generation/serialization for a Claude Code builtin
+# (`Read`) -- and no in-repo code path produces or can intercept it, so this
+# constant does not attempt to detect or repair the malformed JSON.  Only the
+# RETRY facet is in scope: the observed retry edited `limit` while leaving
+# the syntax defect untouched, so the rejection reproduced identically and
+# the turn was wasted.  Retry behaviour of a dispatched agent IS this repo's
+# to fix, through the role system prompts.
+#
+# DISCRIMINATION, NOT DUPLICATION.  WAIT_PATTERN_GUIDANCE's `Monitor` bullet
+# above (roles.py:490-495) already names the OTHER `InputValidationError`
+# shape -- a parameter name the schema does not have, typically a deferred
+# tool called before `ToolSearch` loaded its schema -- which needs the
+# OPPOSITE fix (consult the schema, don't re-emit blindly).  This constant
+# points at that discrimination rather than repeating it; do not delete
+# either bullet as redundant with the other.  Do NOT trim that mention down
+# to a generic "consult the schema" on the theory that a dispatched role
+# cannot reach `ToolSearch` -- it can, regardless of whether `ToolSearch`
+# appears in that role's `allowed_tools`; see the TOOL AVAILABILITY comment
+# above WAIT_PATTERN_GUIDANCE (roles.py:401-413), which verified this from
+# inside a live dispatched session and explicitly forbids the same trim
+# there for the same mistaken reason.
+#
+# JUDGE IS DELIBERATELY INCLUDED, not merely uncovered by an exclusion rule.
+# Task 3607 excluded judge (and reviewer_comprehensive) from
+# BACKGROUND_WAIT_GUIDANCE partly on a cost framing -- neither holds
+# unqualified `Bash`, so "the whole block would be dead weight in every one
+# of their sessions" (test_roles_wait_pattern.py's `_BACKGROUND_CAPABLE_ROLES`
+# comment).  JUDGE runs after EVERY implementer iteration, making it the
+# highest per-invocation multiplier of the eight roles this constant is
+# spliced into, and unlike the wait block, JUDGE genuinely can hit this
+# rejection: it holds `Read` and runs on a tight 30-turn budget, so a
+# rejected paginated `Read` it cannot diagnose costs it a turn with no other
+# way to recover.  The token cost this adds to JUDGE's prompt is real and is
+# accepted for JUDGE specifically -- it is not waved through by reusing the
+# wait block's Bash-capability line, which would have excluded it.  The only
+# exclusion in THIS constant's splice set (`_UNPINNED_PROMPT_ROLES` in
+# test_roles_tool_call_rejection.py) rests on the artifact-pinning mechanism;
+# there is no separate, non-arbitrary cost line to draw beside it.
+#
+# HARD CONSTRAINT -- do NOT add an `mcp__<family>__<name>` example to this
+# constant.  test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names
+# (task 4107) is parametrized over every role and asserts any fully-qualified
+# MCP tool named in a role's system_prompt is in THAT role's allowed_tools.
+# This constant is spliced into 8 roles with differing allowlists, so naming
+# one MCP tool would fail for whichever roles lack the grant.  `Read`,
+# `ToolSearch` and `InputValidationError` are all builtins and do not match
+# that regex.
+#
+# Plain text, NO literal `{`/`}` braces.  Defensive rather than load-bearing,
+# same as WAIT_PATTERN_GUIDANCE: role prompts reach this only by plain `+`
+# concatenation, which is brace-safe by construction -- role prompts are
+# deliberately NOT f-strings (see the MANDATED_STAGING_COMMAND note at
+# roles.py:332) precisely because they contain literal braces.  Staying
+# brace-free costs nothing and keeps this safe if a future splice site does
+# interpolate it.
+#
+# No sighting COUNT is stated in the text below -- the codebook accrues a new
+# sighting every census cycle, and a number baked into a role prompt goes
+# stale silently while "catalogued sightings all show the same shape" stays
+# true.
+TOOL_CALL_REJECTION_GUIDANCE = """
+## Reading a tool-call rejection before you retry
+
+`InputValidationError` reports a defect in the CALL you just made, and it
+echoes back the exact bytes you sent — read that echo before retrying. It
+reports two different shapes, and they need OPPOSITE fixes:
+
+- "could not be parsed as JSON" means the call's SYNTAX is broken and no
+  parameter VALUE is implicated. Re-emit the entire call from scratch; never
+  copy the rejected call and edit one field. Catalogued sightings of this
+  shape all show a `Read` call whose echoed input carries an empty slot
+  between `offset` and `limit` — editing `limit` and resubmitting the same
+  malformed structure reproduces the identical rejection, because editing a
+  value cannot fix a syntax error.
+- A rejection naming a parameter the schema does not have is the opposite
+  problem: the call parsed fine, but a field is wrong — typically a deferred
+  tool called before `ToolSearch` loaded its schema. Consult the schema; do
+  not re-emit blindly.
+"""
+
+
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
 # both STEWARD "Marking tasks done" call sites (kind="merged" and
 # kind="found_on_main"). Being a single shared constant IS the mechanism that
@@ -770,7 +863,7 @@ ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
 You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-""" + BACKGROUND_WAIT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -882,7 +975,7 @@ IMPLEMENTER = AgentRole(
     name='implementer',
     system_prompt="""\
 You are a TDD implementer. You execute a structured plan by writing code, step by step.
-""" + BACKGROUND_WAIT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Session Startup Protocol
 
 1. Read `.task/plan.json` to understand the full plan — it is a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets), so reading either path resolves to the same plan.
@@ -946,7 +1039,7 @@ DEBUGGER = AgentRole(
     name='debugger',
     system_prompt="""\
 You are a debugger. You fix test, lint, and type-check failures.
-""" + BACKGROUND_WAIT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Context
 
 You will be given:
@@ -1144,7 +1237,7 @@ JUDGE = AgentRole(
 You are a completion judge. You decide whether an implementer agent has
 *substantively* completed a task's work, regardless of whether the plan.json
 bookkeeping reflects that.
-
+""" + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Context
 
 You run AFTER each implementer iteration inside the orchestrator's execute
@@ -1210,7 +1303,7 @@ MERGER = AgentRole(
     name='merger',
     system_prompt="""\
 You are a merge conflict resolver. You resolve git merge conflicts precisely and conservatively.
-""" + BACKGROUND_WAIT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Context
 
 You will be given:
@@ -1488,7 +1581,7 @@ STEWARD = AgentRole(
     name='steward',
     system_prompt="""\
 You are a task steward — an autonomous escalation handler with a persistent session.
-""" + BACKGROUND_WAIT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Context
 
 You handle escalations that arise during task execution. Your session persists across
@@ -1775,7 +1868,7 @@ DEEP_REVIEWER = AgentRole(
 You are an integration reviewer. Your job is to find issues that per-task reviews miss: \
 broken wiring between modules, stubbed pipelines, missing integration points, and \
 cross-cutting inconsistencies.
-""" + BACKGROUND_WAIT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## What You Do
 
 You receive:
@@ -1895,7 +1988,7 @@ simple change. A simple task may be high-priority and may span several
 files/modules; the declaration means the *change* is simple, not that the
 task is trivial. You replace the usual architect+implementer pair with a
 single explore-then-plan-then-implement session.
-""" + BACKGROUND_WAIT_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is

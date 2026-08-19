@@ -30,9 +30,12 @@ Filing-identity field (default-None; task 3533):
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import TypedDict
+
+logger = logging.getLogger(__name__)
 
 
 class TrainState(TypedDict):
@@ -102,6 +105,43 @@ BORN_AT_L2_SEVERITIES: frozenset[str] = frozenset({'critical', 'urgent'})
 # escalate_info).  Used to validate caller input and return a clear error
 # rather than silently misrouting escalations.
 KNOWN_SEVERITIES: frozenset[str] = frozenset({'info', 'blocking'}) | BORN_AT_L2_SEVERITIES
+
+# Urgency ordering over KNOWN_SEVERITIES, used by every severity FOLD in the
+# system (dedupe-child promotion, L2 member inheritance, the L2 update-path
+# floor).  Alphabetical comparison is wrong ('blocking' < 'info'), so the rank
+# is explicit.
+#
+# TOTAL over KNOWN_SEVERITIES by contract: adding a severity to the vocabulary
+# without adding it here is a bug, not a silent rank-0 — TestSeverityRank
+# (escalation/tests/test_models.py) fails on the gap.  The BORN_AT_L2
+# severities (critical/urgent) outrank 'blocking', which is what lets a
+# born-at-L2 child promote a lower-severity parent.
+#
+# The ordering mirrors the repo's only other canonical escalation-severity
+# ranking — cockpit/src/cockpit/priority.py's _ESCALATION_SEVERITIES and its
+# severity_weights (urgent 6.0 > critical 5.0 > blocking 2.5 > info 0.25) — so
+# the two are traceably one decision rather than two guesses that can drift.
+SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1, 'critical': 2, 'urgent': 3}
+
+
+def max_severity(a: str, b: str) -> str:
+    """Return the higher-urgency severity string between *a* and *b*.
+
+    Fail-soft on unknown input: an unrecognised severity is WARNed about and
+    treated as rank 0 (info-level) rather than raising, so malformed input can
+    never crash a fold nor cause an unexpected upward promotion.  The ``>=``
+    tie-break on *a* makes equal-rank comparisons — including unknown-vs-unknown
+    — deterministic rather than arbitrary.
+    """
+    for val in (a, b):
+        if val not in SEVERITY_RANK:
+            logger.warning(
+                'max_severity: unrecognised severity %r — treating as info-level '
+                '(rank 0). Known values: %s',
+                val,
+                ', '.join(SEVERITY_RANK),
+            )
+    return a if SEVERITY_RANK.get(a, 0) >= SEVERITY_RANK.get(b, 0) else b
 
 # Ladder levels an AGENT-side MCP filing (escalate_blocker) may be born at.
 # 0 = agent→steward, 1 = steward re-escalation→escalation-watcher-auto.
