@@ -6383,6 +6383,109 @@ def test_main_write_decision_cross_queue_refile_of_a_closed_record_still_overwri
     assert survivor.text == 'a brand new question that merely shares the id'
     assert survivor.escalations_dir == sr.normalize_escalations_dir(recon)
 
+def test_main_write_decision_warns_when_a_same_queue_refile_is_held_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Holding a closed row closed must be LOUD, not silent.
+
+    This is the ONE place the verb deliberately declines to do what the filer
+    asked: the watcher's filing carries ``state=open`` (the verb's own
+    default) and the row stays closed. The repo's loud-over-silent-degradation
+    norm applies, and the watcher SKILLs' own discipline is to ADJUDICATE such
+    a divergence rather than assume the re-file landed -- which it can only do
+    if the divergence is visible.
+
+    The message must name BOTH the decision id and the held state, so an
+    operator or agent reading the log can tell WHICH row and WHAT disposition
+    was preserved; a bare "held back" line would send them to read the file.
+
+    stdout is asserted UNCHANGED on purpose: both SKILLs document "if the id
+    doesn't come back on stdout, your filing did not land" as the
+    did-it-work signal, and this filing DID land (its text and severity were
+    written) -- so repurposing that channel as a failure indicator here would
+    break a contract agents already rely on. The divergence goes to the log.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        escalations_dir=str(orch),
+    )
+    assert (
+        sr.update_decision_state('esc-5914-1', sr.DecisionState.DROPPED, root=tmp_path)
+        is not None
+    )
+    capsys.readouterr()  # discard the first filing's stdout
+
+    with caplog.at_level(logging.WARNING):
+        rc = _file_decision(
+            id='esc-5914-1',
+            project='df',
+            text='reify? (rephrased)',
+            severity='info',
+            escalations_dir=str(orch),
+        )
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == 'esc-5914-1'  # the id still lands
+    held = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and 'esc-5914-1' in r.getMessage()
+    ]
+    assert held, 'holding a closed row closed must be logged, not silent'
+    assert 'dropped' in held[0].getMessage()  # names the PRESERVED disposition
+
+
+def test_main_write_decision_same_queue_refile_of_an_open_record_is_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """THE NOISE GUARD: the ordinary restart re-file must say nothing.
+
+    A same-queue re-file against an OPEN record is by far the common path --
+    every watcher restart, for every still-parked item. Nothing the filer
+    asked for was declined there (it files ``state=open`` and the row IS
+    open), so a warning would be pure noise, and a warning on every restart
+    is how the genuinely-actionable one above gets tuned out.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        escalations_dir=str(orch),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = _file_decision(
+            id='esc-5914-1',
+            project='df',
+            text='reify? (rephrased)',
+            severity='info',
+            escalations_dir=str(orch),
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path)[0].state == sr.DecisionState.OPEN
+    noise = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and 'esc-5914-1' in r.getMessage()
+    ]
+    assert not noise, f'the common restart path must be quiet, got: {noise}'
+
 
 def test_main_write_decision_same_id_different_project_is_refused(
     monkeypatch: pytest.MonkeyPatch,
