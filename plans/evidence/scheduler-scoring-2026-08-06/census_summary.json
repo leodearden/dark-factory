@@ -1,0 +1,869 @@
+{
+  "part_a": {
+    "dark_factory": {
+      "all": {
+        "n": 804,
+        "used_n": 409,
+        "used_frac": 0.5087064676616916,
+        "end_reasons": {
+          "used": 409,
+          "lease_expired": 128,
+          "era_death": 203,
+          "reinstall_anomaly": 2,
+          "silent_owner_dispatch_then_release": 42,
+          "evicted": 12,
+          "gc_deps_unsatisfied": 4,
+          "gc_terminal:done": 2,
+          "live": 2
+        },
+        "duration_h": {
+          "p50": 0.753354269431697,
+          "p90": 3.359069138308366,
+          "max": 30.684557614127794
+        },
+        "idle_reserved_mod_h": {
+          "total": 3973.6392441025046,
+          "p50": 1.3300423323114714,
+          "p90": 9.999662277162079,
+          "max": 171.15805412583882
+        },
+        "assembly_latency_h_used_only": {
+          "p50": 0.4087195847431819,
+          "p90": 2.357884832527902,
+          "max": 8.29614597360293
+        },
+        "next_demand_gap_h": {
+          "p50": 0.8397874544064204,
+          "p90": 18.27157030100293,
+          "frac_lt_1h": 0.5294117647058824
+        },
+        "n_modules": {
+          "p50": 4.0,
+          "max": 22
+        }
+      },
+      "modern": {
+        "n": 560,
+        "used_n": 309,
+        "used_frac": 0.5517857142857143,
+        "end_reasons": {
+          "era_death": 193,
+          "used": 309,
+          "evicted": 12,
+          "silent_owner_dispatch_then_release": 37,
+          "reinstall_anomaly": 1,
+          "gc_deps_unsatisfied": 4,
+          "gc_terminal:done": 2,
+          "live": 2
+        },
+        "duration_h": {
+          "p50": 0.7425262162751622,
+          "p90": 3.870283302287262,
+          "max": 30.684557614127794
+        },
+        "idle_reserved_mod_h": {
+          "total": 3542.3024857558144,
+          "p50": 1.6190548674265544,
+          "p90": 13.365567011694118,
+          "max": 171.15805412583882
+        },
+        "assembly_latency_h_used_only": {
+          "p50": 0.5285059186485078,
+          "p90": 2.6227194927533466,
+          "max": 8.29614597360293
+        },
+        "next_demand_gap_h": {
+          "p50": 0.6741439630587895,
+          "p90": 14.364911981953517,
+          "frac_lt_1h": 0.5837837837837838
+        },
+        "n_modules": {
+          "p50": 4.0,
+          "max": 22
+        }
+      },
+      "modern_critical": {
+        "n": 42,
+        "used_n": 23,
+        "used_frac": 0.5476190476190477,
+        "end_reasons": {
+          "used": 23,
+          "era_death": 17,
+          "silent_owner_dispatch_then_release": 1,
+          "live": 1
+        },
+        "duration_h": {
+          "p50": 1.4318461654252477,
+          "p90": 5.944137208329306,
+          "max": 9.938837750554084
+        },
+        "idle_reserved_mod_h": {
+          "total": 556.7014551830954,
+          "p50": 3.4773631942603322,
+          "p90": 33.04813162659274,
+          "max": 119.40315056509442
+        },
+        "assembly_latency_h_used_only": {
+          "p50": 1.3545409536361694,
+          "p90": 3.1769927856657243,
+          "max": 5.709956666098701
+        },
+        "next_demand_gap_h": {
+          "p50": 2.455848485496309,
+          "p90": 19.438273922575885,
+          "frac_lt_1h": 0.38461538461538464
+        },
+        "n_modules": {
+          "p50": 4.0,
+          "max": 21
+        }
+      },
+      "modern_high": {
+        "n": 376,
+        "used_n": 183,
+        "used_frac": 0.4867021276595745,
+        "end_reasons": {
+          "used": 183,
+          "era_death": 160,
+          "silent_owner_dispatch_then_release": 26,
+          "gc_deps_unsatisfied": 4,
+          "gc_terminal:done": 2,
+          "live": 1
+        },
+        "duration_h": {
+          "p50": 0.8948980615536373,
+          "p90": 4.501476351916789,
+          "max": 30.684557614127794
+        },
+        "idle_reserved_mod_h": {
+          "total": 2613.887276552783,
+          "p50": 1.9134998487432797,
+          "p90": 14.185793851249748,
+          "max": 171.15805412583882
+        },
+        "assembly_latency_h_used_only": {
+          "p50": 0.5648358980814616,
+          "p90": 2.61591202890873,
+          "max": 8.29614597360293
+        },
+        "next_demand_gap_h": {
+          "p50": 0.5284352833694881,
+          "p90": 11.388681525078077,
+          "frac_lt_1h": 0.606951871657754
+        },
+        "n_modules": {
+          "p50": 4.0,
+          "max": 22
+        }
+      },
+      "modern_medium": {
+        "n": 114,
+        "used_n": 82,
+        "used_frac": 0.7192982456140351,
+        "end_reasons": {
+          "era_death": 12,
+          "used": 82,
+          "evicted": 10,
+          "silent_owner_dispatch_then_release": 9,
+          "reinstall_anomaly": 1
+        },
+        "duration_h": {
+          "p50": 0.5072872716850705,
+          "p90": 2.7666483622060887,
+          "max": 14.405189846952757
+        },
+        "idle_reserved_mod_h": {
+          "total": 337.12306037028634,
+          "p50": 0.7006668582227495,
+          "p90": 9.064563928385576,
+          "max": 59.90878176305029
+        },
+        "assembly_latency_h_used_only": {
+          "p50": 0.43637884818845324,
+          "p90": 2.0872175668213107,
+          "max": 3.7664243011342156
+        },
+        "next_demand_gap_h": {
+          "p50": 0.7734000337455008,
+          "p90": 13.93456757056713,
+          "frac_lt_1h": 0.5789473684210527
+        },
+        "n_modules": {
+          "p50": 4.0,
+          "max": 19
+        }
+      },
+      "modern_low": {
+        "n": 28,
+        "used_n": 21,
+        "used_frac": 0.75,
+        "end_reasons": {
+          "evicted": 2,
+          "used": 21,
+          "silent_owner_dispatch_then_release": 1,
+          "era_death": 4
+        },
+        "duration_h": {
+          "p50": 0.41794298142194747,
+          "p90": 1.0621723082727859,
+          "max": 2.0282962294419606
+        },
+        "idle_reserved_mod_h": {
+          "total": 34.59069364964962,
+          "p50": 0.3711034662524859,
+          "p90": 3.8301145184172527,
+          "max": 6.9052430421776245
+        },
+        "assembly_latency_h_used_only": {
+          "p50": 0.41434657136599223,
+          "p90": 0.7344786749945746,
+          "max": 1.7262620392110612
+        },
+        "next_demand_gap_h": {
+          "p50": 0.7974905072318184,
+          "p90": 54.79382828021715,
+          "frac_lt_1h": 0.5714285714285714
+        },
+        "n_modules": {
+          "p50": 3.0,
+          "max": 8
+        }
+      },
+      "top10_idle": [
+        {
+          "task": "3060",
+          "tier": "high",
+          "dur_h": 30.684557614127794,
+          "idle_mod_h": 171.15805412583882,
+          "n_modules": 9,
+          "end": "era_death",
+          "title": "advance_main: tolerate or atomicize docs-direct-commit-on-ma"
+        },
+        {
+          "task": "3072",
+          "tier": "critical",
+          "dur_h": 5.970157268577152,
+          "idle_mod_h": 119.40315056509442,
+          "n_modules": 21,
+          "end": "era_death",
+          "title": "Relocate the seven generic warm-lane scripts into dark-facto"
+        },
+        {
+          "task": "3057",
+          "tier": "high",
+          "dur_h": 5.619569853345553,
+          "idle_mod_h": 112.45654682914416,
+          "n_modules": 22,
+          "end": "used",
+          "title": "Close the live found_on_main misattribution regression (soak"
+        },
+        {
+          "task": "3618",
+          "tier": "critical",
+          "dur_h": 6.490211906962925,
+          "idle_mod_h": 84.37275479051802,
+          "n_modules": 17,
+          "end": "live",
+          "title": "Drop gzip from the transcript archive \u2014 one plain, greppable"
+        },
+        {
+          "task": "3060",
+          "tier": "high",
+          "dur_h": 10.44560042474005,
+          "idle_mod_h": 83.56559418625302,
+          "n_modules": 9,
+          "end": "era_death",
+          "title": "advance_main: tolerate or atomicize docs-direct-commit-on-ma"
+        },
+        {
+          "task": "3076",
+          "tier": "high",
+          "dur_h": 9.952891929149628,
+          "idle_mod_h": 79.62380097707113,
+          "n_modules": 9,
+          "end": "era_death",
+          "title": "Populate LaneState.IN_USE \u2014 close the declared-only writer g"
+        },
+        {
+          "task": "3060",
+          "tier": "high",
+          "dur_h": 9.245280778871642,
+          "idle_mod_h": 73.96311973955896,
+          "n_modules": 9,
+          "end": "era_death",
+          "title": "advance_main: tolerate or atomicize docs-direct-commit-on-ma"
+        },
+        {
+          "task": "3076",
+          "tier": "high",
+          "dur_h": 9.208946421411301,
+          "idle_mod_h": 73.67221561431884,
+          "n_modules": 9,
+          "end": "era_death",
+          "title": "Populate LaneState.IN_USE \u2014 close the declared-only writer g"
+        },
+        {
+          "task": "3076",
+          "tier": "high",
+          "dur_h": 7.886711106631491,
+          "idle_mod_h": 63.094468594988186,
+          "n_modules": 9,
+          "end": "era_death",
+          "title": "Populate LaneState.IN_USE \u2014 close the declared-only writer g"
+        },
+        {
+          "task": "3060",
+          "tier": "high",
+          "dur_h": 10.475417981412676,
+          "idle_mod_h": 62.85251452240679,
+          "n_modules": 9,
+          "end": "era_death",
+          "title": "advance_main: tolerate or atomicize docs-direct-commit-on-ma"
+        }
+      ],
+      "blocked_install_attempts": {
+        "n": 1286,
+        "n_tasks": 7,
+        "top": [
+          [
+            "2208",
+            349
+          ],
+          [
+            "1728",
+            286
+          ],
+          [
+            "1689",
+            183
+          ],
+          [
+            "2154",
+            180
+          ],
+          [
+            "2927",
+            149
+          ],
+          [
+            "2133",
+            94
+          ],
+          [
+            "2553",
+            45
+          ]
+        ]
+      }
+    },
+    "reify": {
+      "all": {
+        "n": 1209,
+        "used_n": 429,
+        "used_frac": 0.3548387096774194,
+        "end_reasons": {
+          "lease_expired": 414,
+          "used": 429,
+          "era_death": 292,
+          "silent_owner_dispatch_then_release": 40,
+          "reinstall_anomaly": 4,
+          "gc_missing": 1,
+          "gc_deps_unsatisfied": 2,
+          "gc_terminal:done": 6,
+          "evicted": 20,
+          "live": 1
+        },
+        "duration_h": {
+          "p50": 1.001975837747256,
+          "p90": 6.323422428541715,
+          "max": 78.48663417610857
+        },
+        "idle_reserved_mod_h": {
+          "total": 10378.817641957998,
+          "p50": 1.916412845849991,
+          "p90": 15.808713193429844,
+          "max": 284.63865683946347
+        },
+        "assembly_latency_h_used_only": {
+          "p50": 0.47636400361855824,
+          "p90": 5.0161497817436835,
+          "max": 20.509824569755132
+        },
+        "next_demand_gap_h": {
+          "p50": 1.3847605344321994,
+          "p90": 16.08646666607592,
+          "frac_lt_1h": 0.45394190871369294
+        },
+        "n_modules": {
+          "p50": 4.0,
+          "max": 111
+        }
+      },
+      "modern": {
+        "n": 635,
+        "used_n": 304,
+        "used_frac": 0.47874015748031495,
+        "end_reasons": {
+          "used": 304,
+          "gc_missing": 1,
+          "era_death": 261,
+          "gc_deps_unsatisfied": 2,
+          "silent_owner_dispatch_then_release": 37,
+          "gc_terminal:done": 6,
+          "evicted": 20,
+          "reinstall_anomaly": 3,
+          "live": 1
+        },
+        "duration_h": {
+          "p50": 1.7304849127928417,
+          "p90": 8.200586385991839,
+          "max": 78.48663417610857
+        },
+        "idle_reserved_mod_h": {
+          "total": 8675.759703566499,
+          "p50": 2.8631517946720124,
+          "p90": 34.802154797567276,
+          "max": 284.63865683946347
+        },
+        "assembly_latency_h_used_only": {
+          "p50": 0.9868687495920393,
+          "p90": 5.931353968739506,
+          "max": 20.509824569755132
+        },
+        "next_demand_gap_h": {
+          "p50": 0.2870705461502075,
+          "p90": 9.170953685310153,
+          "frac_lt_1h": 0.6038034865293186
+        },
+        "n_modules": {
+          "p50": 4.0,
+          "max": 111
+        }
+      },
+      "modern_critical": {
+        "n": 137,
+        "used_n": 80,
+        "used_frac": 0.583941605839416,
+        "end_reasons": {
+          "gc_missing": 1,
+          "used": 80,
+          "era_death": 39,
+          "reinstall_anomaly": 1,
+          "gc_terminal:done": 4,
+          "silent_owner_dispatch_then_release": 10,
+          "gc_deps_unsatisfied": 1,
+          "live": 1
+        },
+        "duration_h": {
+          "p50": 2.0748528263966244,
+          "p90": 8.878213968886271,
+          "max": 23.113759409387907
+        },
+        "idle_reserved_mod_h": {
+          "total": 1730.4485060716338,
+          "p50": 4.288049045337571,
+          "p90": 35.08140237843991,
+          "max": 179.27339371429548
+        },
+        "assembly_latency_h_used_only": {
+          "p50": 1.7240829055507976,
+          "p90": 5.187218374358286,
+          "max": 11.323914863599672
+        },
+        "next_demand_gap_h": {
+          "p50": 0.8394279080629349,
+          "p90": 8.262967917839685,
+          "frac_lt_1h": 0.5263157894736842
+        },
+        "n_modules": {
+          "p50": 4.0,
+          "max": 111
+        }
+      },
+      "modern_high": {
+        "n": 419,
+        "used_n": 184,
+        "used_frac": 0.43914081145584727,
+        "end_reasons": {
+          "used": 184,
+          "gc_deps_unsatisfied": 1,
+          "silent_owner_dispatch_then_release": 22,
+          "era_death": 195,
+          "gc_terminal:done": 2,
+          "evicted": 13,
+          "reinstall_anomaly": 2
+        },
+        "duration_h": {
+          "p50": 1.8878523313999176,
+          "p90": 8.219707072549395,
+          "max": 78.48663417610857
+        },
+        "idle_reserved_mod_h": {
+          "total": 5570.022484043042,
+          "p50": 2.5631862552960714,
+          "p90": 35.849771938708066,
+          "max": 284.63865683946347
+        },
+        "assembly_latency_h_used_only": {
+          "p50": 1.0691923413674038,
+          "p90": 6.404353191647265,
+          "max": 20.509824569755132
+        },
+        "next_demand_gap_h": {
+          "p50": 0.30281546115875246,
+          "p90": 11.922995853437316,
+          "frac_lt_1h": 0.5918854415274463
+        },
+        "n_modules": {
+          "p50": 4.0,
+          "max": 53
+        }
+      },
+      "modern_medium": {
+        "n": 79,
+        "used_n": 40,
+        "used_frac": 0.5063291139240507,
+        "end_reasons": {
+          "used": 40,
+          "era_death": 27,
+          "evicted": 7,
+          "silent_owner_dispatch_then_release": 5
+        },
+        "duration_h": {
+          "p50": 0.4231635219520993,
+          "p90": 5.499141407516275,
+          "max": 33.31974348551697
+        },
+        "idle_reserved_mod_h": {
+          "total": 1375.2887134518226,
+          "p50": 2.1941424218151306,
+          "p90": 26.753350237674184,
+          "max": 276.38859867327744
+        },
+        "assembly_latency_h_used_only": {
+          "p50": 0.22814361290799245,
+          "p90": 2.592329907529887,
+          "max": 13.390273572537634
+        },
+        "next_demand_gap_h": {
+          "p50": 0.061116541955206126,
+          "p90": 3.4392432007127347,
+          "frac_lt_1h": 0.7974683544303798
+        },
+        "n_modules": {
+          "p50": 7.0,
+          "max": 78
+        }
+      },
+      "modern_low": {},
+      "top10_idle": [
+        {
+          "task": "4744",
+          "tier": "high",
+          "dur_h": 23.145834013554786,
+          "idle_mod_h": 284.63865683946347,
+          "n_modules": 18,
+          "end": "silent_owner_dispatch_then_release",
+          "title": "Mesh-morph producer hook + morph-or-remesh arm at VolumeMesh"
+        },
+        {
+          "task": "3465",
+          "tier": "medium",
+          "dur_h": 16.46003419862853,
+          "idle_mod_h": 276.38859867327744,
+          "n_modules": 21,
+          "end": "era_death",
+          "title": "Ship half_space primitive (Bounded=false producer)"
+        },
+        {
+          "task": "4652",
+          "tier": "high",
+          "dur_h": 11.54079027639495,
+          "idle_mod_h": 219.1626868862576,
+          "n_modules": 21,
+          "end": "era_death",
+          "title": "value-eval-geometry-addressing R2a: symbolic geometry descri"
+        },
+        {
+          "task": "3466",
+          "tier": "medium",
+          "dur_h": 13.390273572537634,
+          "idle_mod_h": 216.25352009534836,
+          "n_modules": 17,
+          "end": "used",
+          "title": "Ship extrude_infinite primitive (Bounded=false producer)"
+        },
+        {
+          "task": "3768",
+          "tier": "medium",
+          "dur_h": 7.839484337502055,
+          "idle_mod_h": 212.59591728044882,
+          "n_modules": 32,
+          "end": "silent_owner_dispatch_then_release",
+          "title": "Decompose reify-eval 2421-test monolith into finer crates fo"
+        },
+        {
+          "task": "3205",
+          "tier": "high",
+          "dur_h": 22.526507454978095,
+          "idle_mod_h": 202.73856709480285,
+          "n_modules": 11,
+          "end": "era_death",
+          "title": "geom modify \u03b1: curated edge/face SELECTION SEAM \u2014 fillet(sol"
+        },
+        {
+          "task": "4351",
+          "tier": "high",
+          "dur_h": 6.253192933334245,
+          "idle_mod_h": 200.11043084482353,
+          "n_modules": 36,
+          "end": "era_death",
+          "title": "Engine: re-key TopologyAttributeTable by KernelHandle \u2014 cros"
+        },
+        {
+          "task": "4802",
+          "tier": "critical",
+          "dur_h": 13.936857286956576,
+          "idle_mod_h": 179.27339371429548,
+          "n_modules": 20,
+          "end": "silent_owner_dispatch_then_release",
+          "title": "FEA result-model R3b-1: emit structured FEA diagnostics \u2192 Co"
+        },
+        {
+          "task": "5743",
+          "tier": "critical",
+          "dur_h": 19.462386358579,
+          "idle_mod_h": 175.161477227211,
+          "n_modules": 13,
+          "end": "live",
+          "title": "units-length \u03b2: R7 raw-Value LENGTH chokepoint for primitive"
+        },
+        {
+          "task": "3540",
+          "tier": "high",
+          "dur_h": 6.390331525272793,
+          "idle_mod_h": 159.58090767966377,
+          "n_modules": 27,
+          "end": "used",
+          "title": "SIR-\u03b1: Value::StructureInstance foundation slice (wide-lock "
+        }
+      ],
+      "blocked_install_attempts": {
+        "n": 5498,
+        "n_tasks": 9,
+        "top": [
+          [
+            "3795",
+            1874
+          ],
+          [
+            "4120",
+            1147
+          ],
+          [
+            "4674",
+            600
+          ],
+          [
+            "4478",
+            561
+          ],
+          [
+            "5000",
+            489
+          ],
+          [
+            "4490",
+            353
+          ],
+          [
+            "4491",
+            191
+          ],
+          [
+            "4359",
+            183
+          ],
+          [
+            "4383",
+            100
+          ]
+        ]
+      }
+    }
+  },
+  "part_b": {
+    "dark_factory": {
+      "anomalies": {
+        "DOUBLE-ACQUIRE": 250,
+        "ORPHAN-RELEASE": 3594,
+        "STUCK-AT-ERA-END": 1283,
+        "SAME-OWNER-REACQ": 91,
+        "EMPTY-ACQUIRE": 13875
+      },
+      "n_holds": 16644,
+      "n_clean": 15002,
+      "clean_dur_h": {
+        "p50": 0.8108937658866247,
+        "p90": 7.2634260741869605,
+        "p95": 9.268163398656563,
+        "p99": 14.555644758530448,
+        "max": 35.17407629913754
+      },
+      "top5_30d": [
+        {
+          "module": "fused-memory/src/fused_memory/reconciliation",
+          "occ_h_30d": 492.38451207809976,
+          "occ_frac": 0.6838673778862496,
+          "n_spans": 242,
+          "p90plus_share": 0.33028056306112247
+        },
+        {
+          "module": "orchestrator/src/orchestrator/workflow.py",
+          "occ_h_30d": 491.1958307878839,
+          "occ_frac": 0.6822164316498387,
+          "n_spans": 258,
+          "p90plus_share": 0.27933116430301286
+        },
+        {
+          "module": "orchestrator/src/orchestrator/harness.py",
+          "occ_h_30d": 487.4152166426844,
+          "occ_frac": 0.676965578670395,
+          "n_spans": 229,
+          "p90plus_share": 0.3112217759007652
+        },
+        {
+          "module": "fused-memory/src/fused_memory/server",
+          "occ_h_30d": 411.35602311485343,
+          "occ_frac": 0.5713278098817409,
+          "n_spans": 169,
+          "p90plus_share": 0.4079155085498188
+        },
+        {
+          "module": "orchestrator/src/orchestrator/merge_queue.py",
+          "occ_h_30d": 402.43498735765615,
+          "occ_frac": 0.5589374824411891,
+          "n_spans": 197,
+          "p90plus_share": 0.3216882505306576
+        }
+      ],
+      "predictors": [
+        {
+          "name": "global-median",
+          "log2_r2": -0.22364411683826302,
+          "within_2x": 0.1919398907103825,
+          "within_4x": 0.42896174863387976
+        },
+        {
+          "name": "tier-median",
+          "log2_r2": -0.3623472295730956,
+          "within_2x": 0.20560109289617487,
+          "within_4x": 0.44603825136612024
+        },
+        {
+          "name": "tier+width-median",
+          "log2_r2": -0.31185365009686317,
+          "within_2x": 0.23975409836065573,
+          "within_4x": 0.4494535519125683
+        },
+        {
+          "name": "module-history median (last10)",
+          "log2_r2": 0.2617585716248385,
+          "within_2x": 0.4760928961748634,
+          "within_4x": 0.7056010928961749
+        }
+      ],
+      "safety_multiplier": {
+        "k80": 2.877851115840593,
+        "k90": 4.847605543715551
+      },
+      "n_dispatch_grained": 4878
+    },
+    "reify": {
+      "anomalies": {
+        "DOUBLE-ACQUIRE": 1439,
+        "STUCK-AT-ERA-END": 4776,
+        "ORPHAN-RELEASE": 5780,
+        "SAME-OWNER-REACQ": 634,
+        "EMPTY-ACQUIRE": 555
+      },
+      "n_holds": 42685,
+      "n_clean": 36330,
+      "clean_dur_h": {
+        "p50": 1.1517385674847498,
+        "p90": 8.065058548582925,
+        "p95": 9.383116287522846,
+        "p99": 17.205757854978245,
+        "max": 84.14638003693686
+      },
+      "top5_30d": [
+        {
+          "module": "crates/reify-eval/src/engine_eval.rs",
+          "occ_h_30d": 640.8708983456427,
+          "occ_frac": 0.8900984699245037,
+          "n_spans": 155,
+          "p90plus_share": 0.41103526668373574
+        },
+        {
+          "module": "crates/reify-eval/src/engine_build.rs",
+          "occ_h_30d": 595.9742643399371,
+          "occ_frac": 0.8277420338054682,
+          "n_spans": 152,
+          "p90plus_share": 0.38222640431839555
+        },
+        {
+          "module": "crates/reify-compiler/src/expr.rs",
+          "occ_h_30d": 528.9039882328113,
+          "occ_frac": 0.7345888725455713,
+          "n_spans": 234,
+          "p90plus_share": 0.40930997850094875
+        },
+        {
+          "module": "crates/reify-eval/src/lib.rs",
+          "occ_h_30d": 524.2555447273784,
+          "occ_frac": 0.7281327010102477,
+          "n_spans": 138,
+          "p90plus_share": 0.3176342363913176
+        },
+        {
+          "module": "crates/reify-kernel-occt/src/lib.rs",
+          "occ_h_30d": 500.482011065748,
+          "occ_frac": 0.6951139042579834,
+          "n_spans": 155,
+          "p90plus_share": 0.4472329466355122
+        }
+      ],
+      "predictors": [
+        {
+          "name": "global-median",
+          "log2_r2": -0.669581337059652,
+          "within_2x": 0.0975609756097561,
+          "within_4x": 0.18643117465657416
+        },
+        {
+          "name": "tier-median",
+          "log2_r2": -0.8151818328881366,
+          "within_2x": 0.10204653770675638,
+          "within_4x": 0.1951219512195122
+        },
+        {
+          "name": "tier+width-median",
+          "log2_r2": -0.7590223825183076,
+          "within_2x": 0.09728062797869358,
+          "within_4x": 0.20745724698626297
+        },
+        {
+          "name": "module-history median (last10)",
+          "log2_r2": 0.6797507818518582,
+          "within_2x": 0.6066722736192879,
+          "within_4x": 0.769273899635548
+        }
+      ],
+      "safety_multiplier": {
+        "k80": 2.0216972215992524,
+        "k90": 4.028892178572956
+      },
+      "n_dispatch_grained": 11889
+    }
+  }
+}

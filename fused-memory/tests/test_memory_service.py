@@ -1,6 +1,7 @@
 """Tests for the memory service — unit tests with mocked backends."""
 
 import asyncio
+import json
 import logging
 import types
 from datetime import UTC, datetime, timedelta, timezone
@@ -17,6 +18,27 @@ from fused_memory.services.memory_service import (
     _is_rate_limit_or_quota_error,
     _serialize_temporal,
 )
+
+# A realistic stored Qdrant point payload: the mem0-owned keys mem0's own
+# _update_memory recomputes-or-restores, plus this record's CUSTOM provenance
+# keys (the ones a naive content amend silently destroys).
+#
+# 'category' is deliberately present: EVERY mem0 record carries it (both
+# add_memory and add_system_record stamp it from the resolved MemoryCategory),
+# and Mem0Backend.search pushes it down to Qdrant as a payload filter. A
+# fixture that omitted it would model an unreal record and leave every
+# replace-mode test blind to a delta that drops the key.
+DEFAULT_POINT_PAYLOAD = {
+    'data': 'original content',
+    'hash': 'abc123hash',
+    'created_at': '2026-01-01T00:00:00+00:00',
+    'updated_at': '2026-01-02T00:00:00+00:00',
+    'user_id': 'testproject',
+    'category': 'observations_and_summaries',
+    'kind': 'canonical',
+    'src_project': 'dark_factory',
+    'topic': 'docs-prd-landing',
+}
 
 
 @pytest.fixture
@@ -48,6 +70,38 @@ def service(mock_config):
     svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
     svc.mem0.get_all = AsyncMock(return_value={'results': []})
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    # In-place update surface (task 3088). Without these the service's
+    # update_memory path would reach bare non-awaitable MagicMocks and fail
+    # with a confusing TypeError instead of a clean assertion.
+    svc.mem0.update = AsyncMock(return_value={'message': 'Memory updated successfully!'})
+    svc.mem0.set_payload = AsyncMock(return_value=True)
+    svc.mem0.delete_payload = AsyncMock(return_value=True)
+    svc.mem0.overwrite_payload = AsyncMock(return_value=True)
+    # Default read payload carries BOTH mem0-owned keys and custom provenance
+    # keys, so the preservation assertions have something to preserve.
+    svc.mem0.get_point_by_id = AsyncMock(return_value=dict(DEFAULT_POINT_PAYLOAD))
+    # REQUIRED SETUP, not decoration — do not delete.  TWO independent
+    # consumers need this deterministic read surface, which is why the
+    # defaults are shared:
+    #
+    #  * leaf ε (task 3198) — `svc.mem0` is a bare MagicMock, so the
+    #    canonical-uniqueness re-check at
+    #    `_apply_memory_metadata_validation` would hit
+    #    `await svc.mem0.count_by_metadata(...)` → `TypeError: object
+    #    MagicMock can't be used in 'await' expression`, breaking
+    #    already-green tests that merely write `canonical: True` (e.g.
+    #    TestMemoryMetadataValidationAtSeam::test_valid_metadata_round_trips_to_the_backend).
+    #  * leaf δ (task 3197) — `delete_memory`'s child gate awaits
+    #    `count_by_metadata` on EVERY mem0 delete, so without this every
+    #    pre-existing delete test would fail the same confusing way.
+    #
+    # `0` / `[]` are the correct default for both: "no incumbent" for ε, and
+    # CHILDLESS for δ — which also models the live corpus leaf α measured
+    # (`metadata.parent_id` has zero footprint, so no existing record has
+    # children).  `_mm_set_canonical_incumbent` and the child-gate tests
+    # override them per-test.
+    svc.mem0.count_by_metadata = AsyncMock(return_value=0)
+    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
 
     # Mock durable queue
     svc.durable_queue = MagicMock()
@@ -1256,7 +1310,7 @@ class TestDeleteMemory:
     @pytest.mark.asyncio
     async def test_delete_graphiti(self, service):
         result = await service.delete_memory(
-            memory_id='abc-123', store='graphiti', project_id='test'
+            memory_id='00000000-0000-4000-8000-000000000001', store='graphiti', project_id='test'
         )
         assert result['status'] == 'deleted'
         assert result['store'] == 'graphiti'
@@ -1264,7 +1318,7 @@ class TestDeleteMemory:
     @pytest.mark.asyncio
     async def test_delete_mem0(self, service):
         result = await service.delete_memory(
-            memory_id='xyz-456', store='mem0', project_id='test'
+            memory_id='00000000-0000-4000-8000-000000000002', store='mem0', project_id='test'
         )
         assert result['status'] == 'deleted'
         assert result['store'] == 'mem0'
@@ -1275,9 +1329,11 @@ class TestDeleteMemory:
         because search returns edge UUIDs."""
         service.graphiti.remove_edge = AsyncMock()
         await service.delete_memory(
-            memory_id='edge-uuid-123', store='graphiti', project_id='test'
+            memory_id='00000000-0000-4000-8000-000000000003', store='graphiti', project_id='test'
         )
-        service.graphiti.remove_edge.assert_called_once_with('edge-uuid-123', group_id='test')
+        service.graphiti.remove_edge.assert_called_once_with(
+            '00000000-0000-4000-8000-000000000003', group_id='test'
+        )
         service.graphiti.remove_episode.assert_not_called()
 
 
@@ -1342,6 +1398,1264 @@ class TestUpdateEdge:
             edge_uuid='e-1', fact='new', project_id='test'
         )
         assert result['refreshed_nodes'] == ['n-src', 'n-tgt']
+
+
+# The three arm shapes update_memory accepts, as (label, kwargs). Every
+# assertion about the read leg must hold for ALL THREE: the two metadata-only
+# shapes are the §5(b) fast paths, where Qdrant answers acknowledged/completed
+# for an unknown point id — so they are precisely the arms an existence check
+# omission would turn into a silent false success.
+_UPDATE_MEMORY_ARMS = [
+    ('content_amend', {'content': 'amended text', 'reason': 'test amend'}),
+    ('metadata_patch', {'metadata_patch': {'topic': 'docs-prd-landing'}}),
+    ('metadata_delete_keys', {'metadata_delete_keys': ['topic']}),
+]
+
+
+def _journal_mock():
+    """A write journal double recording both journal layers update_memory writes."""
+    journal = MagicMock()
+    journal.log_write_op = AsyncMock()
+    journal.log_backend_op = AsyncMock()
+    return journal
+
+
+class TestUpdateMemoryExistenceCheck:
+    """MemoryService.update_memory §5(c) read leg — the anti-silent-success guard.
+
+    Task 3088. Qdrant's ``set_payload``/``delete_payload`` return
+    ``acknowledged``/``completed`` for an UNKNOWN point id rather than an error,
+    so without an explicit existence check the metadata-only fast paths would
+    manufacture a success envelope AND a journal row claiming a write that never
+    touched anything.
+    """
+
+    @pytest.mark.asyncio
+    async def test_set_known_projects_setter_exists(self, service):
+        """Follows the set_event_buffer / set_write_journal injection shape.
+
+        The {project_id: project_root} snapshot is built at server startup
+        AFTER MemoryService is constructed, so it must arrive by setter.
+        """
+        assert hasattr(service, 'set_known_projects')
+        mapping = {'dark_factory': '/home/leo/src/dark-factory'}
+        assert service.set_known_projects(mapping) is None
+        assert service._known_projects == mapping
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('arm,kwargs', _UPDATE_MEMORY_ARMS, ids=[a for a, _ in _UPDATE_MEMORY_ARMS])
+    async def test_missing_memory_id_is_structured_rejection(self, service, arm, kwargs):
+        """A confirmed-absent point is MemoryNotFound in EVERY arm, never a success."""
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+
+        result = await service.update_memory(
+            memory_id='missing-point-id', project_id='test', **kwargs,
+        )
+
+        assert result['error_type'] == 'MemoryNotFound', (
+            f'{arm} arm returned {result!r} for an absent memory_id'
+        )
+        assert result.get('status') != 'updated'
+        assert 'missing-point-id' in str(result.get('error', ''))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('arm,kwargs', _UPDATE_MEMORY_ARMS, ids=[a for a, _ in _UPDATE_MEMORY_ARMS])
+    async def test_missing_memory_id_writes_nothing(self, service, arm, kwargs):
+        """No backend write and no journal row for a rejection.
+
+        A journal row claiming a write that never landed is worse than no row:
+        it converts an absent record into durable evidence of an edit.
+        """
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+        journal = _journal_mock()
+        service._write_journal = journal
+
+        await service.update_memory(
+            memory_id='missing-point-id', project_id='test', **kwargs,
+        )
+
+        service.mem0.update.assert_not_called()
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+        journal.log_write_op.assert_not_called()
+        journal.log_backend_op.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('arm,kwargs', _UPDATE_MEMORY_ARMS, ids=[a for a, _ in _UPDATE_MEMORY_ARMS])
+    async def test_read_timeout_is_not_memory_not_found(self, service, arm, kwargs):
+        """A read TIMEOUT is a distinct transient failure, never a confirmed absence.
+
+        ``Mem0Backend.get_point_by_id`` deliberately propagates TimeoutError
+        instead of swallowing it into None (unlike ``get()``); this pins that the
+        service does not erase that distinction by catch-and-flattening the two
+        into one outcome.
+        """
+        service.mem0.get_point_by_id = AsyncMock(side_effect=TimeoutError('qdrant read timed out'))
+        journal = _journal_mock()
+        service._write_journal = journal
+
+        with pytest.raises(TimeoutError):
+            await service.update_memory(
+                memory_id='some-point-id', project_id='test', **kwargs,
+            )
+
+        service.mem0.update.assert_not_called()
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+        journal.log_write_op.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_existence_check_reads_before_any_write(self, service):
+        """The read leg runs first — one read against the right point id and scope."""
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+
+        await service.update_memory(
+            memory_id='point-1', project_id='dark_factory',
+            metadata_patch={'topic': 'x'},
+        )
+
+        service.mem0.get_point_by_id.assert_called_once()
+        call_args = service.mem0.get_point_by_id.call_args
+        assert call_args.args[0] == 'point-1'
+        scope = call_args.args[1]
+        assert isinstance(scope, Scope)
+        assert scope.project_id == 'dark_factory'
+
+
+class TestUpdateMemoryContentArm:
+    """MemoryService.update_memory content-amend arm (§5(b)).
+
+    Routes through Mem0Backend.update — which re-embeds, rewrites updated_at
+    and appends a mem0 history row. All three are correct for a genuine content
+    change and inherent to mem0.update(), not design choices.
+    """
+
+    @staticmethod
+    def _forwarded_metadata(service):
+        """The ``metadata=`` kwarg the service forwarded to Mem0Backend.update."""
+        service.mem0.update.assert_awaited_once()
+        return service.mem0.update.await_args.kwargs['metadata']
+
+    @pytest.mark.asyncio
+    async def test_envelope_echoes_same_point_id(self, service):
+        """Identity stability is assertable from the response, without re-fetching."""
+        result = await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+        )
+
+        assert result['status'] == 'updated'
+        assert result['store'] == 'mem0'
+        assert result['id'] == 'point-1'
+        assert result['content_amended'] is True
+        assert result['metadata_patched'] is False
+
+    @pytest.mark.asyncio
+    async def test_created_at_is_not_forwarded_so_mem0_preserves_it(self, service):
+        """No mem0-owned key is forwarded — mem0 restores them from the stored point.
+
+        ``_update_memory`` re-attaches created_at from the existing payload and
+        regenerates updated_at/hash itself, so forwarding stale copies would at
+        best be inert and at worst fight mem0 for ownership of its own keys.
+        """
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+        )
+
+        forwarded = self._forwarded_metadata(service)
+        from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+        assert not (set(forwarded) & MEM0_MANAGED_METADATA_KEYS), (
+            f'mem0-owned keys must not be forwarded, got {sorted(forwarded)}'
+        )
+        assert 'created_at' not in forwarded
+
+    @pytest.mark.asyncio
+    async def test_custom_payload_keys_survive_a_bare_content_amend(self, service):
+        """THE load-bearing regression test for the §2 payload-overwrite bug.
+
+        mem0's ``_update_memory`` builds a FRESH payload from
+        ``deepcopy(metadata) if metadata is not None else {}`` and re-attaches
+        only its own nine keys — created_at among them. So an implementation
+        that forgot the read-existing-payload-then-reforward-custom-subset dance
+        still passes a created_at assertion while silently destroying every
+        custom provenance key on the record. This test asserts on the keys mem0
+        does NOT restore, and is the only one here that fails against that bug.
+        Do not drop it as redundant.
+        """
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+        )
+
+        forwarded = self._forwarded_metadata(service)
+        assert forwarded is not None, (
+            'metadata=None wipes every custom payload key — the exact bug'
+        )
+        assert forwarded == {
+            'category': 'observations_and_summaries',
+            'kind': 'canonical',
+            'src_project': 'dark_factory',
+            'topic': 'docs-prd-landing',
+        }, f'expected the stripped custom subset verbatim, got {forwarded!r}'
+
+    @pytest.mark.asyncio
+    async def test_exactly_one_backend_write(self, service):
+        """One write per call — the content arm never also touches the payload APIs."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+        )
+
+        service.mem0.update.assert_awaited_once()
+        call_args = service.mem0.update.await_args
+        assert call_args.args[0] == 'point-1'
+        assert call_args.args[1] == 'amended text'
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_one_journal_row_with_truncated_content(self, service):
+        """One log_write_op row; content truncated like update_edge truncates fact."""
+        journal = _journal_mock()
+        service._write_journal = journal
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='x' * 500, reason='test amend',
+            agent_id='recon-stage-1', session_id='sess-1',
+        )
+
+        journal.log_write_op.assert_awaited_once()
+        kwargs = journal.log_write_op.await_args.kwargs
+        assert kwargs['operation'] == 'update_memory'
+        assert kwargs['project_id'] == 'test'
+        assert kwargs['agent_id'] == 'recon-stage-1'
+        assert kwargs['session_id'] == 'sess-1'
+        assert kwargs['success'] is True
+        assert len(kwargs['params']['content']) == 200
+        assert kwargs['params']['memory_id'] == 'point-1'
+        assert kwargs['params']['reason'] == 'test amend'
+
+    @pytest.mark.asyncio
+    async def test_journal_row_carries_the_prior_text(self, service):
+        """The audit row is a before/after, not just an after.
+
+        The storm escalation tells an operator to inspect the affected records
+        via the write journal. An in-place amend leaves NO other trace of what
+        the record used to say — the point id is preserved and the old text is
+        overwritten — so a row carrying only the new text gives the responder
+        nothing to diff against, which is precisely the forensic evidence the
+        alarm exists to make reachable. The read leg already fetched it.
+        """
+        journal = _journal_mock()
+        service._write_journal = journal
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value={**DEFAULT_POINT_PAYLOAD, 'data': 'y' * 500}
+        )
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+        )
+
+        params = journal.log_write_op.await_args.kwargs['params']
+        assert params['content_before'] == 'y' * 200, (
+            'the prior text must be journaled, truncated like `content`'
+        )
+        assert params['content'] == 'amended text'
+
+    @pytest.mark.asyncio
+    async def test_metadata_only_route_journals_no_prior_text(self, service):
+        """A patch does not change the text, so there is no before to record."""
+        journal = _journal_mock()
+        service._write_journal = journal
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        params = journal.log_write_op.await_args.kwargs['params']
+        assert 'content_before' not in params
+        assert 'content' not in params
+
+    @pytest.mark.asyncio
+    async def test_emits_memory_updated_event(self, service):
+        """The amendment is announced — an in-place rewrite is otherwise invisible."""
+        from fused_memory.models.reconciliation import EventType
+
+        buffer = MagicMock()
+        buffer.push = AsyncMock()
+        service._event_buffer = buffer
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+        )
+
+        buffer.push.assert_awaited_once()
+        event = buffer.push.await_args.args[0]
+        assert event.type == EventType.memory_updated
+        assert event.project_id == 'test'
+        assert event.payload['memory_id'] == 'point-1'
+        assert event.payload['store'] == 'mem0'
+
+    @pytest.mark.asyncio
+    async def test_content_only_amend_does_not_revalidate_existing_metadata(
+        self, service, caplog
+    ):
+        """A content amend must never be judged on metadata it did not touch.
+
+        Task 3523. The vocabulary seam now runs on the update path, and the
+        line between "judging this write" and "re-validating the corpus" is
+        the whole reason the seam is delta-scoped. A content amend leaves the
+        record's metadata BYTE-IDENTICAL, so this write is responsible for
+        none of it.
+
+        The pre-image staged here is the real hazard, not a contrived one:
+        `eval_worktree_plan_tools_missing` is the snake_case topic the live
+        `dark_factory` canonical record actually carried, and
+        `sweep_toolcall_xml_leak.py` enumerates the classes of legacy record
+        that are fatal-invalid today. (Cited for that enumeration only — that
+        sweep repairs by delete + re-add through `add_memory` and never
+        reaches this arm.) Validating here would make a legacy record's TEXT
+        uncorrectable under `enforce` because of metadata the amend never
+        touched, and would quietly convert `enforce` from "rejects WRITES"
+        into "re-validates the corpus", the model task 3626's flip
+        measurement (~20 → ~19 false rejections/week) rests on.
+        """
+        service.config.memory_metadata.enforce = True
+        service.mem0.get_point_by_id = AsyncMock(return_value={
+            **DEFAULT_POINT_PAYLOAD,
+            'topic': 'eval_worktree_plan_tools_missing',
+        })
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+
+        result = await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='fix typo',
+        )
+
+        assert result['status'] == 'updated'
+        assert result['content_amended'] is True
+        assert result['metadata_patched'] is False
+        service.mem0.update.assert_awaited_once()
+        # Not merely "did not raise": a censused violation would still be a
+        # re-validation of the corpus, inflating the very census stream the
+        # flip decision is measured from.
+        assert _mm_census_codes(caplog) == []
+
+
+class TestUpdateMemoryMetadataArm:
+    """§5(b)'s routing decision table — which primitive each argument shape maps to.
+
+    The three Qdrant primitives are not interchangeable: set_payload and
+    delete_payload are native partial operations (no read-modify-write needed to
+    COMPUTE the new payload), while overwrite_payload replaces the whole point
+    payload and therefore needs the mem0-owned subset re-attached underneath.
+    Every route is exactly ONE backend write.
+    """
+
+    @staticmethod
+    def _assert_no_reembed(service):
+        """The metadata-only arm must never route through mem0's Memory.update."""
+        service.mem0.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_patch_alone_is_one_set_payload(self, service):
+        """merge mode, no deletes → Qdrant's native partial merge, nothing else."""
+        result = await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        call = service.mem0.set_payload.await_args
+        assert call.args[0] == 'point-1'
+        assert call.args[1] == {'topic': 'cgl-eta'}
+        assert isinstance(call.args[2], Scope)
+        # Unlisted pre-existing custom keys survive because Qdrant merges
+        # server-side — the service must NOT hand-roll a full payload here.
+        assert 'kind' not in call.args[1]
+        assert 'src_project' not in call.args[1]
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+        self._assert_no_reembed(service)
+        assert result['status'] == 'updated'
+        assert result['id'] == 'point-1'
+        assert result['content_amended'] is False
+        assert result['metadata_patched'] is True
+
+    @pytest.mark.asyncio
+    async def test_delete_keys_alone_is_one_delete_payload(self, service):
+        """Exactly the named keys are removed, and nothing else is touched."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_delete_keys=['topic'],
+        )
+
+        service.mem0.delete_payload.assert_awaited_once()
+        call = service.mem0.delete_payload.await_args
+        assert call.args[0] == 'point-1'
+        assert call.args[1] == ['topic']
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+        self._assert_no_reembed(service)
+
+    @pytest.mark.asyncio
+    async def test_patch_and_delete_together_is_one_overwrite_payload(self, service):
+        """NEVER set_payload-then-delete_payload: two round-trips can tear.
+
+        A failed second call would leave the record half-patched while the
+        journal row claims the whole edit landed — the torn-intermediate-state
+        problem the unified tool exists to avoid, reintroduced inside it.
+        """
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'cgl-eta'},
+            metadata_delete_keys=['src_project'],
+        )
+
+        service.mem0.overwrite_payload.assert_awaited_once()
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        self._assert_no_reembed(service)
+
+        payload = service.mem0.overwrite_payload.await_args.args[1]
+        assert payload['topic'] == 'cgl-eta', 'the merge must be applied'
+        assert 'src_project' not in payload, 'the deletion must be applied'
+        assert payload['kind'] == 'canonical', 'untouched custom keys survive'
+        # overwrite_payload replaces the WHOLE point payload, so the mem0-owned
+        # subset must ride along or the point becomes unreadable by mem0's own
+        # get/search.
+        assert payload['data'] == 'original content'
+        assert payload['hash'] == 'abc123hash'
+        assert payload['created_at'] == '2026-01-01T00:00:00+00:00'
+        assert payload['user_id'] == 'testproject'
+
+    @pytest.mark.asyncio
+    async def test_replace_mode_replaces_custom_subset_only(self, service):
+        """replace never means "replace the whole Qdrant payload"."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'cgl-eta'},
+            metadata_mode='replace',
+        )
+
+        service.mem0.overwrite_payload.assert_awaited_once()
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        self._assert_no_reembed(service)
+
+        payload = service.mem0.overwrite_payload.await_args.args[1]
+        assert payload['topic'] == 'cgl-eta'
+        # The rest of the custom subset is GONE — that is what replace means.
+        assert 'kind' not in payload
+        assert 'src_project' not in payload
+        # ...but 'category' is carried through: losing it would make the record
+        # permanently invisible to every category-scoped search, silently.
+        assert payload['category'] == 'observations_and_summaries'
+        # ...and the mem0-owned subset survives underneath.
+        assert payload['data'] == 'original content'
+        assert payload['hash'] == 'abc123hash'
+        assert payload['created_at'] == '2026-01-01T00:00:00+00:00'
+        assert payload['updated_at'] == '2026-01-02T00:00:00+00:00'
+        assert payload['user_id'] == 'testproject'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kwargs', [
+        {'metadata_patch': {'topic': 'x'}},
+        {'metadata_delete_keys': ['topic']},
+        {'metadata_patch': {'topic': 'x'}, 'metadata_delete_keys': ['kind']},
+        {'metadata_patch': {'topic': 'x'}, 'metadata_mode': 'replace'},
+    ], ids=['patch', 'delete', 'patch_delete', 'replace'])
+    async def test_no_reembed_and_updated_at_untouched(self, service, kwargs):
+        """A cosmetic tag must not perturb ranking or rewrite updated_at.
+
+        Routing through mem0's Memory.update would re-embed the content, stamp
+        a fresh updated_at and append a history row — for a metadata edit that
+        changed no text at all.
+        """
+        await service.update_memory(memory_id='point-1', project_id='test', **kwargs)
+
+        self._assert_no_reembed(service)
+        for mock in (service.mem0.overwrite_payload, service.mem0.set_payload):
+            if mock.await_args is not None:
+                payload = mock.await_args.args[1]
+                assert payload.get('updated_at', '2026-01-02T00:00:00+00:00') == (
+                    '2026-01-02T00:00:00+00:00'
+                ), 'updated_at must be byte-identical across a metadata-only edit'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kwargs', [
+        {'metadata_patch': {'topic': 'x'}},
+        {'metadata_delete_keys': ['topic']},
+        {'metadata_patch': {'topic': 'x'}, 'metadata_delete_keys': ['kind']},
+        {'metadata_patch': {'topic': 'x'}, 'metadata_mode': 'replace'},
+    ], ids=['patch', 'delete', 'patch_delete', 'replace'])
+    async def test_no_event_emitted_by_default(self, service, kwargs):
+        """No memory_updated event on a metadata-only route.
+
+        The record still says the same thing, so there is nothing for a
+        downstream consolidator to re-read. The service-layer emit_event flag
+        exists for a future concrete consumer; no MCP argument surfaces it yet.
+        """
+        buffer = MagicMock()
+        buffer.push = AsyncMock()
+        service._event_buffer = buffer
+
+        await service.update_memory(memory_id='point-1', project_id='test', **kwargs)
+
+        buffer.push.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kwargs', [
+        {'metadata_patch': {'topic': 'x'}},
+        {'metadata_delete_keys': ['topic']},
+        {'metadata_patch': {'topic': 'x'}, 'metadata_delete_keys': ['kind']},
+        {'metadata_patch': {'topic': 'x'}, 'metadata_mode': 'replace'},
+    ], ids=['patch', 'delete', 'patch_delete', 'replace'])
+    async def test_journal_row_written_on_every_route(self, service, kwargs):
+        """Attribution is never optional at the journal layer.
+
+        The lighter authorization bar for metadata patches is an
+        argument-validation decision; it buys no exemption from the audit trail.
+        """
+        journal = _journal_mock()
+        service._write_journal = journal
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            agent_id='recon-stage-1', **kwargs,
+        )
+
+        journal.log_write_op.assert_awaited_once()
+        row = journal.log_write_op.await_args.kwargs
+        assert row['operation'] == 'update_memory'
+        assert row['agent_id'] == 'recon-stage-1'
+        assert row['params']['memory_id'] == 'point-1'
+        assert row['success'] is True
+
+    @pytest.mark.asyncio
+    async def test_emit_event_flag_opts_a_metadata_route_in(self, service):
+        """The internal service-layer flag exists, defaulting off (no MCP surface)."""
+        buffer = MagicMock()
+        buffer.push = AsyncMock()
+        service._event_buffer = buffer
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'x'}, emit_event=True,
+        )
+
+        buffer.push.assert_awaited_once()
+
+
+class TestFastPathPersistsSeamNormalizedValues:
+    """The set_payload fast path must write the VALIDATED value, not the raw patch.
+
+    Task 3523. The vocabulary seam's only in-place mutation is ``supersedes``
+    scalar→list (PRD D2), and it lands in ``new_custom`` — which the
+    ``overwrite_payload`` and content arms persist but the ``set_payload``
+    fast path historically did not, handing Qdrant ``dict(metadata_patch)``
+    raw. Left alone, wiring the seam in would persist a list on two routes
+    and the raw scalar on a third: a NEW split in exactly the semantics
+    ``TestMetadataFastPathEquivalence`` (below) exists to keep from drifting.
+    """
+
+    _SUPERSEDED = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
+
+    @pytest.mark.asyncio
+    async def test_scalar_supersedes_is_persisted_normalized(self, service):
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'supersedes': self._SUPERSEDED},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        payload = service.mem0.set_payload.await_args.args[1]
+        assert payload['supersedes'] == [self._SUPERSEDED], (
+            'the fast path must persist what the seam normalized, or the '
+            'legacy scalar shape survives on this route alone'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_overwrite_arm_persists_the_identical_value(self, service):
+        """The agreement this is really about — one shape, three routes."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'supersedes': self._SUPERSEDED},
+            metadata_mode='replace',
+        )
+
+        service.mem0.overwrite_payload.assert_awaited_once()
+        payload = service.mem0.overwrite_payload.await_args.args[1]
+        assert payload['supersedes'] == [self._SUPERSEDED]
+
+    @pytest.mark.asyncio
+    async def test_the_fast_path_still_writes_only_the_patch_keys(self, service):
+        """Reading the delta for VALUES must not turn this into a rebuild.
+
+        Qdrant merges server-side; that is the whole reason this route can
+        skip a read-modify-write. A payload that also carried the pre-image's
+        `kind` / `src_project` / `category` would be reconstructing the
+        record — costing nothing visible in a mock, but silently re-writing
+        keys the caller never named and clobbering any concurrent edit to
+        them.
+        """
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        payload = service.mem0.set_payload.await_args.args[1]
+        assert payload == {'topic': 'cgl-eta'}
+
+    @pytest.mark.asyncio
+    async def test_the_content_arm_persists_the_identical_value(self, service):
+        """The THIRD route, and the one with the widest blast radius.
+
+        A combined content+metadata call forwards the whole `new_custom` to
+        `mem0.update`, whose backend rebuilds the point payload from scratch.
+        Pinning only the two metadata-only routes would leave the agreement
+        two-thirds established while reading as complete.
+        """
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text',
+            metadata_patch={'supersedes': self._SUPERSEDED},
+        )
+
+        service.mem0.update.assert_awaited_once()
+        metadata = service.mem0.update.await_args.kwargs['metadata']
+        assert metadata['supersedes'] == [self._SUPERSEDED]
+
+    @pytest.mark.asyncio
+    async def test_a_patch_key_the_seam_removes_fails_loudly(
+        self, service, monkeypatch
+    ):
+        """Unreachable today, and it must stay unreachable LOUDLY.
+
+        The seam only ever assigns, never pops, so every patch key survives
+        into `new_custom`. Were a future normalizer to drop one, filtering it
+        out here would silently succeed while `set_payload` merged
+        server-side and LEFT THE STALE VALUE in Qdrant — whereas the
+        overwrite and content arms would drop it. That is the three-route
+        split this change closed, reopened without a single failing test.
+        """
+        from fused_memory.services import memory_service as ms
+
+        real = ms.validate_memory_metadata
+
+        def _dropping(meta, **kwargs):
+            meta.pop('x_dropped', None)
+            return real(meta, **kwargs)
+
+        monkeypatch.setattr(ms, 'validate_memory_metadata', _dropping)
+
+        with pytest.raises(RuntimeError, match='x_dropped'):
+            await service.update_memory(
+                memory_id='point-1', project_id='test',
+                metadata_patch={'x_dropped': 'gone'},
+            )
+
+        service.mem0.set_payload.assert_not_called()
+
+
+class TestMetadataFastPathEquivalence:
+    """The two fast paths must agree with ``_apply_metadata_delta``.
+
+    ``update_memory`` computes ``new_custom`` once, but only two of its four
+    write routes consume it (``mem0.update`` and ``overwrite_payload``). The
+    ``set_payload`` / ``delete_payload`` fast paths hand the raw patch / key
+    list to Qdrant and let it apply merge and delete SERVER-side — that is what
+    lets them skip a read-modify-write, and it is also a SECOND implementation
+    of the same semantics.
+
+    So the single-home guarantee is not structural here, it is an agreement
+    between two implementations, and this class is what turns that agreement
+    into a test. A rule added to ``_apply_metadata_delta`` that Qdrant's
+    primitives cannot reproduce (a second entry in
+    ``_FUSED_MEMORY_OWNED_METADATA_KEYS`` needing protection in MERGE mode,
+    say) would otherwise split the fast paths away from the combined path
+    silently — nothing else in the suite compares them.
+
+    Both models below are Qdrant's documented payload semantics, deliberately
+    restated in the test rather than mocked off the backend: mocking the
+    backend would only re-assert what the service passed it, which is what the
+    routing tests already do.
+    """
+
+    @staticmethod
+    def _qdrant_set_payload(payload: dict, patch: dict) -> dict:
+        """Qdrant ``set_payload``: shallow merge of *patch* over the point."""
+        return {**payload, **patch}
+
+    @staticmethod
+    def _qdrant_delete_payload(payload: dict, keys: list[str]) -> dict:
+        """Qdrant ``delete_payload``: drop exactly the named keys."""
+        return {k: v for k, v in payload.items() if k not in keys}
+
+    @staticmethod
+    def _via_delta(payload: dict, **delta) -> dict:
+        """The full payload the read-modify-overwrite route would have written."""
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        managed, custom = split_managed_metadata(dict(payload))
+        return {
+            **managed,
+            **MemoryService._apply_metadata_delta(custom, **delta),
+        }
+
+    @pytest.mark.parametrize('patch', [
+        {'topic': 'cgl-eta'},                       # overwrite an existing key
+        {'parent_id': 'mem-9'},                     # add a new key
+        {'topic': 'cgl-eta', 'parent_id': 'mem-9'}, # both at once
+        {'category': 'procedural_knowledge'},       # a fused-memory-owned key
+    ], ids=['overwrite', 'add', 'both', 'protected_key'])
+    def test_set_payload_agrees_with_the_delta_helper(self, patch):
+        """merge + patch-only: Qdrant's server-side merge == the helper's."""
+        payload = dict(DEFAULT_POINT_PAYLOAD)
+
+        assert self._qdrant_set_payload(payload, patch) == self._via_delta(
+            payload,
+            metadata_patch=patch,
+            metadata_delete_keys=None,
+            metadata_mode='merge',
+        )
+
+    @pytest.mark.parametrize('keys', [
+        ['topic'],
+        ['topic', 'kind'],
+        ['not_present_at_all'],
+    ], ids=['one', 'several', 'absent'])
+    def test_delete_payload_agrees_with_the_delta_helper(self, keys):
+        """merge + delete-only: Qdrant's server-side delete == the helper's."""
+        payload = dict(DEFAULT_POINT_PAYLOAD)
+
+        assert self._qdrant_delete_payload(payload, keys) == self._via_delta(
+            payload,
+            metadata_patch=None,
+            metadata_delete_keys=keys,
+            metadata_mode='merge',
+        )
+
+
+class TestUpdateMemoryCombinedArms:
+    """content + metadata in ONE call — the one-write / one-row / one-event guarantee.
+
+    §3 deliberately allows both arms in one call precisely to avoid the torn
+    intermediate state a two-tool design would have: a record that briefly
+    carries the new content but the stale metadata (or vice versa). That
+    guarantee is only real if the metadata delta is FOLDED into the same
+    Mem0Backend.update call rather than routed through a second write.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kwargs', [
+        {'metadata_patch': {'topic': 'cgl-eta'}},
+        {'metadata_delete_keys': ['src_project']},
+        {'metadata_patch': {'topic': 'cgl-eta'}, 'metadata_delete_keys': ['src_project']},
+        {'metadata_patch': {'topic': 'cgl-eta'}, 'metadata_mode': 'replace'},
+    ], ids=['patch', 'delete', 'patch_delete', 'replace'])
+    async def test_exactly_one_backend_write(self, service, kwargs):
+        """The metadata delta rides along on the content write, never beside it."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend', **kwargs,
+        )
+
+        service.mem0.update.assert_awaited_once()
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_forwarded_metadata_reflects_merge_and_delete(self, service):
+        """Both the new content and the metadata delta land in one update call."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+            metadata_patch={'topic': 'cgl-eta'},
+            metadata_delete_keys=['src_project'],
+        )
+
+        call = service.mem0.update.await_args
+        assert call.args[1] == 'amended text'
+        forwarded = call.kwargs['metadata']
+        assert forwarded['topic'] == 'cgl-eta', 'the merge must be applied'
+        assert 'src_project' not in forwarded, 'the deletion must be applied'
+        assert forwarded['kind'] == 'canonical', 'untouched custom keys survive'
+        # mem0 restores its own keys from the stored point; forwarding them
+        # would be fighting it for ownership of its own payload.
+        from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+        assert not (set(forwarded) & MEM0_MANAGED_METADATA_KEYS)
+
+    @pytest.mark.asyncio
+    async def test_replace_mode_drops_unnamed_custom_keys(self, service):
+        """Combined replace uses the SAME delta semantics as the metadata-only path."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+            metadata_patch={'topic': 'cgl-eta'}, metadata_mode='replace',
+        )
+
+        forwarded = service.mem0.update.await_args.kwargs['metadata']
+        assert forwarded == {
+            'topic': 'cgl-eta',
+            'category': 'observations_and_summaries',
+        }
+
+    @pytest.mark.asyncio
+    async def test_one_journal_row_and_one_event(self, service):
+        """One call, one audit row, one announcement — content's event rule wins."""
+        from fused_memory.models.reconciliation import EventType
+
+        journal = _journal_mock()
+        service._write_journal = journal
+        buffer = MagicMock()
+        buffer.push = AsyncMock()
+        service._event_buffer = buffer
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+            metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        journal.log_write_op.assert_awaited_once()
+        buffer.push.assert_awaited_once()
+        assert buffer.push.await_args.args[0].type == EventType.memory_updated
+
+    @pytest.mark.asyncio
+    async def test_envelope_reports_both_arms(self, service):
+        """A caller can tell from the response that both arms actually ran."""
+        result = await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+            metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        assert result['id'] == 'point-1'
+        assert result['content_amended'] is True
+        assert result['metadata_patched'] is True
+
+
+class TestUpdateMemoryReplacePreservesCategory:
+    """`category` survives a replace that never named it — on BOTH replace routes.
+
+    `metadata_mode='replace'` decides the whole custom subset, so a caller that
+    re-tags a record with ``metadata_patch={'topic': ...}`` drops every custom
+    key it did not restate. For an ordinary provenance key that is exactly the
+    documented contract. For `category` it is silent data loss: every mem0
+    record carries the key (add_memory and add_system_record both stamp it from
+    the resolved MemoryCategory), and ``Mem0Backend.search`` pushes it down to
+    Qdrant as a payload filter — so a record that loses it drops out of every
+    category-scoped search permanently, while ``update_memory`` returns
+    ``{'status': 'updated'}``. No error, no other symptom.
+
+    The key is therefore carried across a replace, in the same posture the
+    boundary already takes for mem0-owned keys and for an empty replace: a
+    caller cannot destroy it by omission. It stays freely PATCHABLE, so a
+    deliberate re-categorization still works — that is the difference between
+    protecting a key and freezing it.
+    """
+
+    CARRIED = 'observations_and_summaries'
+
+    @staticmethod
+    def _metadata_only_replace(service):
+        """The custom subset a metadata-only replace actually wrote."""
+        service.mem0.overwrite_payload.assert_awaited_once()
+        return service.mem0.overwrite_payload.await_args.args[1]
+
+    @staticmethod
+    def _combined_replace(service):
+        """The custom subset a combined content+metadata replace forwarded."""
+        service.mem0.update.assert_awaited_once()
+        return service.mem0.update.await_args.kwargs['metadata']
+
+    async def _run(self, service, route, *, metadata_patch):
+        """Drive one of the two replace routes and return what it wrote."""
+        if route == 'metadata_only':
+            await service.update_memory(
+                memory_id='point-1', project_id='test',
+                metadata_patch=metadata_patch, metadata_mode='replace',
+            )
+            return self._metadata_only_replace(service)
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+            metadata_patch=metadata_patch, metadata_mode='replace',
+        )
+        return self._combined_replace(service)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('route', ['metadata_only', 'combined'])
+    async def test_category_survives_a_replace_that_omits_it(self, service, route):
+        """The bug: a routine tag edit must not evict the record from search."""
+        written = await self._run(
+            service, route, metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        assert written.get('category') == self.CARRIED, (
+            'a replace that never mentioned `category` must not drop it — the '
+            'record would become permanently unreachable by every '
+            f'category-scoped search; got {written!r}'
+        )
+        assert written['topic'] == 'cgl-eta', 'the replace itself must still apply'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('route', ['metadata_only', 'combined'])
+    async def test_ordinary_custom_keys_still_do_not_survive(self, service, route):
+        """Replace still means replace — the fix must not become a merge.
+
+        Carrying `category` through is a narrow exception justified by that one
+        key being a search filter. If the seed were widened to the whole
+        existing subset, `metadata_mode='replace'` would silently degrade into
+        `'merge'` and its own tests would be the only thing left saying so.
+        """
+        written = await self._run(
+            service, route, metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        assert 'kind' not in written, 'replace must still drop unnamed custom keys'
+        assert 'src_project' not in written
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('route', ['metadata_only', 'combined'])
+    async def test_an_explicit_category_in_the_patch_wins(self, service, route):
+        """Protected, not frozen: a deliberate re-categorization still lands."""
+        written = await self._run(
+            service, route,
+            metadata_patch={'topic': 'cgl-eta', 'category': 'procedural_knowledge'},
+        )
+
+        assert written['category'] == 'procedural_knowledge', (
+            'an explicit `category` in `metadata_patch` must override the '
+            f'carried-through value, got {written!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_metadata_only_replace_still_reattaches_mem0_owned_keys(self, service):
+        """The carry-through rides on the CUSTOM subset, not on the mem0-owned one.
+
+        overwrite_payload replaces the entire point payload, so this pins that
+        the new seed did not displace the mem0-owned keys that must ride along
+        underneath.
+        """
+        written = await self._run(
+            service, 'metadata_only', metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        assert written['data'] == 'original content'
+        assert written['hash'] == 'abc123hash'
+        assert written['created_at'] == '2026-01-01T00:00:00+00:00'
+        assert written['user_id'] == 'testproject'
+
+    @pytest.mark.asyncio
+    async def test_combined_replace_forwards_no_mem0_owned_keys(self, service):
+        """The combined route's forwarded dict stays the stripped custom subset."""
+        from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+
+        written = await self._run(
+            service, 'combined', metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        assert not (set(written) & MEM0_MANAGED_METADATA_KEYS), (
+            f'mem0 restores its own keys; forwarding them fights it, got {written!r}'
+        )
+        assert written == {'topic': 'cgl-eta', 'category': self.CARRIED}
+
+    @pytest.mark.asyncio
+    async def test_a_record_without_a_category_is_unaffected(self, service):
+        """Nothing is invented: the carry-through copies, it does not default.
+
+        A legacy point with no `category` key must come out of a replace with
+        no `category` key — manufacturing one here would stamp a guessed value
+        onto a record whose real category nobody knows.
+        """
+        payload = {k: v for k, v in DEFAULT_POINT_PAYLOAD.items() if k != 'category'}
+        service.mem0.get_point_by_id = AsyncMock(return_value=payload)
+
+        written = await self._run(
+            service, 'metadata_only', metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        assert 'category' not in written, (
+            f'a missing category must not be invented, got {written!r}'
+        )
+
+
+class _FakeClock:
+    """Advanceable monotonic-ish clock — the 3600s window without sleeping."""
+
+    def __init__(self, now: float = 1_000_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class TestUpdateMemoryStormCounter:
+    """INV-4 storm-escape for the silent-rewrite primitive (§4).
+
+    An agent stuck in a rewrite loop leaves no new records, no id churn and no
+    failed calls, so this alarm is the ONLY signal it produces. It is a
+    monitoring alarm, not a rate limiter: it never blocks the write.
+    """
+
+    @pytest.fixture
+    def stormy(self, service):
+        """A service with a fake clock and a stubbed escalator."""
+        clock = _FakeClock()
+        service._mem0_update_storm_time_provider = clock
+        service._mem0_update_storm_escalator = MagicMock()
+        service._mem0_update_storm_escalator.report_storm = MagicMock(return_value='esc-1')
+        return service, clock
+
+    async def _amend(self, service, agent_id='recon-stage-1', **kwargs):
+        return await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='consolidation',
+            agent_id=agent_id, **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_burst_reports_exactly_once(self, stormy):
+        """threshold calls in-window → one report, carrying the offending agent."""
+        service, _clock = stormy
+        threshold = service.config.mem0_update.storm_threshold
+
+        for _ in range(threshold):
+            await self._amend(service)
+
+        service._mem0_update_storm_escalator.report_storm.assert_called_once()
+        kwargs = service._mem0_update_storm_escalator.report_storm.call_args.kwargs
+        assert kwargs['agent_id'] == 'recon-stage-1'
+        assert kwargs['project_id'] == 'test'
+        assert kwargs['count'] == threshold
+        assert kwargs['threshold'] == threshold
+        assert kwargs['window_seconds'] == service.config.mem0_update.storm_window_seconds
+
+        # A sustained storm keeps writing but does not keep paging.
+        for _ in range(threshold):
+            await self._amend(service)
+        service._mem0_update_storm_escalator.report_storm.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_metadata_only_calls_never_count(self, stormy):
+        """§4's differential bar, made mechanical.
+
+        A mistagged patch is cheap to notice and cheap to correct; a runaway
+        silent content rewrite is neither. Counting patches would drown the
+        signal the counter exists to raise.
+        """
+        service, _clock = stormy
+        threshold = service.config.mem0_update.storm_threshold
+
+        for _ in range(threshold * 2):
+            await service.update_memory(
+                memory_id='point-1', project_id='test',
+                metadata_patch={'topic': 'x'}, agent_id='recon-stage-1',
+            )
+
+        service._mem0_update_storm_escalator.report_storm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_counter_is_keyed_per_agent(self, stormy):
+        """Two busy-but-innocent agents must not sum into a false alarm."""
+        service, _clock = stormy
+        threshold = service.config.mem0_update.storm_threshold
+
+        # Each agent gets threshold-1 calls: individually innocent, jointly
+        # well past the bar. A shared counter would page here.
+        for i in range((threshold - 1) * 2):
+            await self._amend(service, agent_id=f'recon-stage-{i % 2}')
+
+        service._mem0_update_storm_escalator.report_storm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_breaching_call_still_succeeds_and_is_journaled(self, stormy):
+        """Alarm, not rate limiter.
+
+        Blocking would fail a legitimate large consolidation cycle mid-run over
+        its own success count — and would do it precisely when the run is going
+        well.
+        """
+        service, _clock = stormy
+        journal = _journal_mock()
+        service._write_journal = journal
+        threshold = service.config.mem0_update.storm_threshold
+
+        result = None
+        for _ in range(threshold):
+            result = await self._amend(service)
+
+        assert result is not None
+        assert result['status'] == 'updated'
+        assert result['content_amended'] is True
+        assert service.mem0.update.await_count == threshold
+        assert journal.log_write_op.await_count == threshold
+
+    @pytest.mark.asyncio
+    async def test_calls_outside_the_window_are_evicted(self, stormy):
+        """A slow steady rate never trips it."""
+        service, clock = stormy
+        threshold = service.config.mem0_update.storm_threshold
+        window = service.config.mem0_update.storm_window_seconds
+
+        for _ in range(threshold * 3):
+            await self._amend(service)
+            clock.advance(window)
+
+        service._mem0_update_storm_escalator.report_storm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_threshold_change_takes_effect_on_the_next_call(self, stormy):
+        """The green-tier leaf is only honest if it is read live per call.
+
+        A threshold captured once at construction would leave
+        mem0_update.storm_threshold registered as hot-reloadable while silently
+        ignoring reloads — restart-only in disguise.
+        """
+        service, _clock = stormy
+        service.config.mem0_update.storm_threshold = 3
+
+        await self._amend(service)
+        await self._amend(service)
+        service._mem0_update_storm_escalator.report_storm.assert_not_called()
+
+        service.config.mem0_update.storm_threshold = 2
+        await self._amend(service)
+        service._mem0_update_storm_escalator.report_storm.assert_called_once()
+        assert service._mem0_update_storm_escalator.report_storm.call_args.kwargs[
+            'threshold'
+        ] == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('recon', ['absent', 'disabled'])
+    async def test_alarm_survives_reconciliation_being_off(self, stormy, recon):
+        """The escape hatch must exist unconditionally.
+
+        Reconciliation-disabled is exactly the degraded configuration where an
+        unattended rewrite loop is least likely to be noticed any other way, so
+        an alarm that vanished with it would be missing when it matters most.
+        """
+        service, _clock = stormy
+        if recon == 'absent':
+            service.config.reconciliation = None
+        else:
+            service.config.reconciliation.enabled = False
+        threshold = service.config.mem0_update.storm_threshold
+
+        for _ in range(threshold):
+            await self._amend(service)
+
+        service._mem0_update_storm_escalator.report_storm.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_escalator_failure_never_reaches_the_caller(self, stormy, caplog):
+        """The belt to the escalator's braces.
+
+        The escalator is itself never-raise, but the service must not DEPEND on
+        that: the write has already landed by the time the alarm runs, so a
+        monitoring failure that propagated would turn a completed amendment
+        into a tool exception — telling the caller its write failed when it
+        did not, and inviting a retry that amends the record twice. Losing the
+        signal is strictly the lesser harm, and it is still logged.
+        """
+        service, _clock = stormy
+        service._mem0_update_storm_escalator.report_storm = MagicMock(
+            side_effect=RuntimeError('boom')
+        )
+        threshold = service.config.mem0_update.storm_threshold
+
+        result = None
+        with caplog.at_level(logging.ERROR):
+            for _ in range(threshold):
+                result = await self._amend(service)
+
+        assert result is not None
+        assert result['status'] == 'updated'
+        assert result['id'] == 'point-1'
+        assert result['content_amended'] is True
+        assert service.mem0.update.await_count == threshold
+        service._mem0_update_storm_escalator.report_storm.assert_called_once()
+        assert any(
+            'storm escalation failed' in r.getMessage() for r in caplog.records
+        ), 'the swallowed failure must still be logged, not silently dropped'
+
+    @pytest.mark.asyncio
+    async def test_dormant_agent_counters_are_evicted(self, stormy):
+        """Counters are keyed by an UNBOUNDED, caller-supplied ``agent_id``.
+
+        The gate is a self-reported prefix match, so a widened prefix admits
+        arbitrary suffixes (``recon-stage-1-run-<uuid>`` mints a fresh key
+        every run). Each counter self-prunes its deque, but without an eviction
+        sweep the counter OBJECTS accumulate for the process lifetime — small
+        each, unbounded in total, in a server that runs for weeks between
+        restarts.
+        """
+        service, clock = stormy
+        window = service.config.mem0_update.storm_window_seconds
+
+        for i in range(5):
+            await self._amend(service, agent_id=f'recon-stage-1-run-{i}')
+        assert len(service._mem0_update_storm_counters) == 5
+
+        # Every one of those agents has now gone quiet for a full window.
+        clock.advance(window + 1)
+        await self._amend(service, agent_id='recon-stage-2')
+
+        assert set(service._mem0_update_storm_counters) == {'recon-stage-2'}, (
+            'a counter whose window has emptied carries no state that could '
+            'change a later decision, so it must not survive'
+        )
+
+    @pytest.mark.asyncio
+    async def test_eviction_does_not_disarm_a_live_burst(self, stormy):
+        """The sweep must only ever drop counters that have gone quiet."""
+        service, clock = stormy
+        threshold = service.config.mem0_update.storm_threshold
+        window = service.config.mem0_update.storm_window_seconds
+
+        # A slow burst from one agent, interleaved with chatter from throwaway
+        # agent_ids that each go dormant. The sweep runs on every amend.
+        for i in range(threshold - 1):
+            await self._amend(service, agent_id='recon-stage-1')
+            await self._amend(service, agent_id=f'throwaway-{i}')
+            clock.advance(window / (threshold * 2))
+
+        service._mem0_update_storm_escalator.report_storm.assert_not_called()
+        await self._amend(service, agent_id='recon-stage-1')
+
+        service._mem0_update_storm_escalator.report_storm.assert_called_once()
+        assert service._mem0_update_storm_escalator.report_storm.call_args.kwargs[
+            'agent_id'
+        ] == 'recon-stage-1'
+
+    def test_escalator_is_constructed_unconditionally(self, service):
+        """Owned by MemoryService — never borrowed from a conditional component."""
+        from fused_memory.middleware.mem0_update_storm_escalator import (
+            Mem0UpdateStormEscalator,
+        )
+
+        assert isinstance(service._mem0_update_storm_escalator, Mem0UpdateStormEscalator)
+
+    def test_set_known_projects_reaches_the_escalator(self, service):
+        """The registry snapshot must arrive where project_root resolution happens."""
+        service.set_known_projects({'dark_factory': '/home/leo/src/dark-factory'})
+        assert service._mem0_update_storm_escalator._known_projects == {
+            'dark_factory': '/home/leo/src/dark-factory',
+        }
 
 
 class TestUpdateEdgeVerification:
@@ -1481,7 +2795,7 @@ class TestSearchDeleteRoundtrip:
         """End-to-end contract test: search returns edge UUIDs that work with delete_memory."""
         from _fm_helpers import MockEdge, MockNode
 
-        edge_uuid = 'edge-roundtrip-uuid-42'
+        edge_uuid = '00000000-0000-4000-8000-000000000042'
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Payment gateway depends on billing API',
@@ -4948,6 +6262,42 @@ class TestSearchGraphitiIncludePlanned:
             "Planned edges must have metadata['planned'] = True when include_planned=True"
         )
 
+    # task 3658: the RRF stamping must not clobber the planned marker, and a
+    # planned edge that survives include_planned=True DOES consume a rank.
+    @pytest.mark.asyncio
+    async def test_planned_marker_survives_alongside_rrf_fields(
+        self, service_with_registry
+    ):
+        """metadata['planned'] coexists with store_rank/store_score stamping."""
+        from _fm_helpers import MockEdge
+
+        from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import RRF_K
+
+        ep1 = 'plan-ep-1'
+        service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
+            return_value={ep1}
+        )
+        service_with_registry.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Real fact', uuid='edge-real', episodes=['real-ep']),
+            MockEdge(fact='PRD: planned fact', uuid='edge-planned', episodes=[ep1]),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service_with_registry._search_graphiti(
+            'planned', scope, 10, include_planned=True
+        )
+
+        assert [r.id for r in results] == ['edge-real', 'edge-planned']
+        assert 'planned' not in results[0].metadata
+        assert results[1].metadata['planned'] is True, (
+            'RRF stamping must not clobber the planned marker'
+        )
+        # Both edges survive, so both consume a rank.
+        assert [r.metadata['store_rank'] for r in results] == [1, 2]
+        assert [r.metadata['store_score'] for r in results] == [None, None]
+        assert results[1].relevance_score == pytest.approx(1.0 / (RRF_K + 2))
+
 
 class TestSearchMem0Filtering:
     """step-15: _search_mem0 filtering — exclude planned=True by default, include with flag."""
@@ -5018,6 +6368,143 @@ class TestSearchMem0Filtering:
         results = await service._search_mem0('PostgreSQL', scope, 10)
 
         assert len(results) == 1, 'Non-planned result must NOT be excluded'
+
+
+class TestSearchMem0RrfFields:
+    """Task 3658: _search_mem0 stamps store_rank/store_score and scores via RRF.
+
+    The Mem0 cosine no longer reaches relevance_score at all — it moves to
+    metadata['store_score'], the honest per-store signal the E1 retrieval probe
+    and the task 3212 telemetry read.  relevance_score becomes the ordinal
+    fused value.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rank_is_contiguous_over_survivors_and_score_is_rrf(self, service):
+        """Ranks are 1-based over survivors; a planned skip does not consume one."""
+        from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import RRF_K
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm-1', 'memory': 'Postgres for persistence', 'score': 0.79,
+                    'metadata': {'category': 'decisions_and_rationale'},
+                },
+                {
+                    # Skipped (planned) — must NOT consume rank 2.
+                    'id': 'm-planned', 'memory': 'PRD: maybe GraphQL', 'score': 0.71,
+                    'metadata': {'category': 'decisions_and_rationale', 'planned': True},
+                },
+                {
+                    'id': 'm-3', 'memory': 'Qdrant for vectors', 'score': 0.62,
+                    'metadata': {'category': 'decisions_and_rationale'},
+                },
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('storage', scope, 10)
+
+        assert [r.id for r in results] == ['m-1', 'm-3']
+        assert [r.metadata['store_rank'] for r in results] == [1, 2], (
+            'A result skipped for planned=True must not consume a rank'
+        )
+        assert [r.metadata['store_score'] for r in results] == [0.79, 0.62], (
+            'store_score must carry the raw Mem0 cosine verbatim'
+        )
+        for r in results:
+            assert isinstance(r.metadata['store_score'], float)
+            assert r.relevance_score == pytest.approx(
+                1.0 / (RRF_K + r.metadata['store_rank'])
+            )
+            assert r.relevance_score != pytest.approx(r.metadata['store_score']), (
+                'The cosine must no longer reach relevance_score'
+            )
+
+    @pytest.mark.asyncio
+    async def test_preexisting_metadata_keys_survive_stamping(self, service):
+        """category/planned and other backend keys coexist with the two new keys."""
+        from fused_memory.models.scope import Scope
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm-p', 'memory': 'PRD: planned thing', 'score': 0.88,
+                    'metadata': {
+                        'category': 'procedural_knowledge',
+                        'planned': True,
+                        'topic': 'docs-prd-landing',
+                    },
+                },
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('planned', scope, 10, include_planned=True)
+
+        meta = results[0].metadata
+        assert meta['category'] == 'procedural_knowledge'
+        assert meta['planned'] is True
+        assert meta['topic'] == 'docs-prd-landing'
+        assert meta['store_rank'] == 1
+        assert meta['store_score'] == 0.88
+        assert results[0].category == MemoryCategory.procedural_knowledge
+
+    @pytest.mark.asyncio
+    async def test_stamping_does_not_mutate_the_backend_response_dict(self, service):
+        """_search_mem0 must COPY the backend metadata dict before stamping.
+
+        `meta` is the dict object lifted straight out of the Mem0Backend.search
+        response; stamping into it would mutate the caller's response structure
+        in place — invisible in the common path, and exactly the kind of
+        aliasing bug no other test would catch.
+        """
+        from fused_memory.models.scope import Scope
+
+        meta_1 = {'category': 'observations_and_summaries'}
+        meta_2 = {'category': 'observations_and_summaries'}
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {'id': 'm-a', 'memory': 'A', 'score': 0.9, 'metadata': meta_1},
+                {'id': 'm-b', 'memory': 'B', 'score': 0.8, 'metadata': meta_2},
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('anything', scope, 10)
+
+        for original in (meta_1, meta_2):
+            assert 'store_rank' not in original, (
+                'store_rank leaked into the backend response dict (aliasing bug)'
+            )
+            assert 'store_score' not in original, (
+                'store_score leaked into the backend response dict (aliasing bug)'
+            )
+        # The results carry the stamped copies.
+        assert results[0].metadata is not meta_1
+        assert results[0].metadata['store_rank'] == 1
+        assert results[1].metadata['store_rank'] == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_score_defaults_to_zero_and_still_gets_a_rank(self, service):
+        """A result with no 'score' key keeps the existing 0.0 default."""
+        from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import RRF_K
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {'id': 'm-noscore', 'memory': 'No score field', 'metadata': {}},
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('anything', scope, 10)
+
+        assert len(results) == 1
+        assert results[0].metadata['store_score'] == 0.0
+        assert results[0].metadata['store_rank'] == 1
+        assert results[0].relevance_score == pytest.approx(1.0 / (RRF_K + 1))
 
 
 class TestSearchMem0CreatedAt:
@@ -5346,29 +6833,35 @@ class TestSearchGraphitiInvalidatedFiltering:
             'Results must be truncated to limit=10 when Graphiti returns more valid edges'
         )
 
-    # step-11: scores reflect original rank position from Graphiti, not re-ranked positions
+    # step-11 (task 3658): scores are ORDINAL RRF values over the SURVIVING rank.
+    # Supersedes the pre-RRF contract this test used to pin (synthesized
+    # score = max(0, 1 - i*0.05), keyed on the raw pre-filter index i), which
+    # task 3658 deleted: Graphiti exposes no scores at all, so a synthesized
+    # similarity was never an honest number to merge against Mem0 cosines.
     @pytest.mark.asyncio
-    async def test_scores_reflect_original_rank_position(self, service):
-        """Surviving edges keep scores from their original Graphiti rank positions.
+    async def test_scores_are_rrf_over_surviving_rank(self, service):
+        """Surviving edges are scored 1/(RRF_K + rank), rank contiguous over survivors.
 
-        Graphiti returns 5 edges at positions 0-4. Edges at positions 1 and 3
-        are invalidated (invalid_at set). The surviving edges at positions 0, 2,
-        and 4 must score 1.0, 0.9, 0.8 respectively (score = max(0, 1 - i*0.05)),
-        NOT re-ranked to 1.0, 0.95, 0.9 based on their post-filter positions.
+        Graphiti returns 5 edges at positions 0-4; the edges at positions 1 and
+        3 are invalidated (invalid_at set).  The three survivors must take
+        ranks 1, 2, 3 — NOT 1, 3, 5 — because a filtered edge must not consume
+        a rank: RRF maps rank directly to score, so a gap would silently
+        penalize the store for facts the caller never sees.
         """
         from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import RRF_K
 
         dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
         dt_invalid = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
 
         service.graphiti.search = AsyncMock(return_value=[
-            MockEdge(fact='Fact at pos 0', uuid='pos-0', valid_at=dt_valid, invalid_at=None),        # i=0, score=1.00
+            MockEdge(fact='Fact at pos 0', uuid='pos-0', valid_at=dt_valid, invalid_at=None),        # survivor -> rank 1
             MockEdge(fact='Superseded at pos 1', uuid='pos-1', valid_at=dt_valid, invalid_at=dt_invalid),  # filtered
-            MockEdge(fact='Fact at pos 2', uuid='pos-2', valid_at=dt_valid, invalid_at=None),        # i=2, score=0.90
+            MockEdge(fact='Fact at pos 2', uuid='pos-2', valid_at=dt_valid, invalid_at=None),        # survivor -> rank 2
             MockEdge(fact='Superseded at pos 3', uuid='pos-3', valid_at=dt_valid, invalid_at=dt_invalid),  # filtered
-            MockEdge(fact='Fact at pos 4', uuid='pos-4', valid_at=dt_valid, invalid_at=None),        # i=4, score=0.80
+            MockEdge(fact='Fact at pos 4', uuid='pos-4', valid_at=dt_valid, invalid_at=None),        # survivor -> rank 3
         ])
 
         scope = Scope(project_id='test')
@@ -5376,15 +6869,228 @@ class TestSearchGraphitiInvalidatedFiltering:
 
         assert len(results) == 3, 'Three edges should survive filtering'
 
-        scores_by_id = {r.id: r.relevance_score for r in results}
-        assert scores_by_id['pos-0'] == pytest.approx(1.00), (
-            'Edge at original rank 0 must score 1.0 (1.0 - 0*0.05)'
+        # Ranks are 1-based and contiguous over SURVIVORS, in Graphiti's order.
+        assert [r.id for r in results] == ['pos-0', 'pos-2', 'pos-4']
+        assert [r.metadata['store_rank'] for r in results] == [1, 2, 3], (
+            'store_rank must be contiguous 1..N over surviving edges — a '
+            'filtered edge must not consume a rank'
         )
-        assert scores_by_id['pos-2'] == pytest.approx(0.90), (
-            'Edge at original rank 2 must score 0.9 (1.0 - 2*0.05)'
+
+        # Graphiti has no scores of its own: store_score is honestly absent.
+        for r in results:
+            assert r.metadata['store_score'] is None, (
+                "Graphiti's public search() exposes no scores, so store_score "
+                'must be None rather than a synthesized stand-in'
+            )
+
+        # relevance_score is the ordinal RRF value derived from that rank.
+        for r in results:
+            assert r.relevance_score == pytest.approx(
+                1.0 / (RRF_K + r.metadata['store_rank'])
+            ), f'{r.id}: relevance_score must be 1/(RRF_K + store_rank)'
+
+        # The old synthesized sequence is gone entirely.
+        for r in results:
+            for stale in (1.0, 0.95, 0.90, 0.80):
+                assert r.relevance_score != pytest.approx(stale), (
+                    f'{r.id} still carries the pre-RRF synthesized score {stale}'
+                )
+
+        scores = [r.relevance_score for r in results]
+        assert scores == sorted(scores, reverse=True) and len(set(scores)) == 3, (
+            'RRF scores must be strictly decreasing in rank order'
         )
-        assert scores_by_id['pos-4'] == pytest.approx(0.80), (
-            'Edge at original rank 4 must score 0.8 (1.0 - 4*0.05)'
+
+
+class TestSearchRrfMerge:
+    """Task 3658: MemoryService.search merges the two stores by RRF, not by precedence.
+
+    This is the contract the merge lane actually gates.  The seeded
+    real-embedder probe in tests/test_rrf_cross_store_merge.py is
+    `integration`-marked and therefore deselected by the package's default
+    addopts, so it corroborates the signal but cannot pin it — these unit tests
+    must stand alone.
+
+    Because the two stores never return the same result id (Graphiti edge uuid
+    vs Mem0 memory id, and there is no cross-store dedup), every result's fused
+    score is the single term 1/(RRF_K + its own store rank).  Merged order is
+    therefore a rank INTERLEAVE, which is precisely what ends the Mem0
+    shut-out: on the old (is_primary, -score) sort, five Graphiti results filled
+    limit=5 and truncation dropped Mem0 entirely.
+    """
+
+    @staticmethod
+    def _route(primary):
+        """A deterministic two-store route, bypassing the real classifier."""
+        from fused_memory.models.enums import QueryType
+        from fused_memory.models.memory import ReadRouteResult
+
+        return ReadRouteResult(
+            query_type=QueryType.broad,
+            stores=[SourceStore.graphiti, SourceStore.mem0],
+            primary_store=primary,
+        )
+
+    @staticmethod
+    def _seed_both_stores(service, *, graphiti_edges=5, mem0_results=5):
+        """Seed N Graphiti edges and M Mem0 results with descending cosines."""
+        from _fm_helpers import MockEdge
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact=f'Graphiti fact {n}', uuid=f'g-{n}',
+                valid_at=dt_valid, invalid_at=None,
+            )
+            for n in range(1, graphiti_edges + 1)
+        ])
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': f'm-{n}',
+                    'memory': f'Mem0 memory {n}',
+                    # Descending, and deliberately high for m-1: under RRF its
+                    # placement must come from its RANK, not its cosine.
+                    'score': round(0.79 - 0.05 * (n - 1), 4),
+                    'metadata': {'category': 'observations_and_summaries'},
+                }
+                for n in range(1, mem0_results + 1)
+            ]
+        })
+
+    @pytest.mark.asyncio
+    async def test_mem0_rank1_is_not_shut_out_under_graphiti_primary(self, service):
+        """Boundary test 1: the Mem0 top hit reaches the merged top-5 at index 1.
+
+        FAILS ON MAIN: the (is_primary, -relevance_score) sort put all five
+        Graphiti results first and results[:limit] discarded every Mem0 result.
+        """
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.graphiti))
+        self._seed_both_stores(service)
+
+        merged = await service.search('anything', project_id='test', limit=5)
+
+        assert merged[0].id == 'g-1', 'Graphiti rank-1 still leads under a graphiti-primary route'
+        assert merged[1].id == 'm-1', (
+            'The Mem0 rank-1 result must land at merged index 1 — under RRF it '
+            'ties Graphiti rank-1 and loses only the primary-store tiebreak'
+        )
+        assert 'm-1' in {r.id for r in merged}, 'Mem0 must not be shut out of the top-5'
+        assert [r.source_store for r in merged] == [
+            SourceStore.graphiti, SourceStore.mem0, SourceStore.graphiti,
+            SourceStore.mem0, SourceStore.graphiti,
+        ], 'Merged order must be a rank interleave'
+
+        needle = next(r for r in merged if r.id == 'm-1')
+        assert needle.metadata['store_score'] == pytest.approx(0.79), (
+            'The Mem0 cosine must survive verbatim in metadata.store_score'
+        )
+
+    @pytest.mark.asyncio
+    async def test_graphiti_is_not_shut_out_under_mem0_primary(self, service):
+        """Boundary test 2: the interleave is symmetric — no reverse shut-out."""
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.mem0))
+        self._seed_both_stores(service)
+
+        merged = await service.search('anything', project_id='test', limit=5)
+
+        graphiti_hits = [r for r in merged if r.source_store == SourceStore.graphiti]
+        assert graphiti_hits, 'Graphiti must not be shut out under a mem0-primary route'
+        assert [r.source_store for r in merged] == [
+            SourceStore.mem0, SourceStore.graphiti, SourceStore.mem0,
+            SourceStore.graphiti, SourceStore.mem0,
+        ], 'The interleave must flip with the primary store'
+        assert merged[0].id == 'm-1'
+        assert merged[1].id == 'g-1'
+
+    @pytest.mark.asyncio
+    async def test_primary_store_is_a_tiebreak_not_precedence(self, service):
+        """A higher-ranked secondary result beats a lower-ranked primary one."""
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.graphiti))
+        self._seed_both_stores(service)
+
+        merged = await service.search('anything', project_id='test', limit=10)
+
+        order = [r.id for r in merged]
+        assert order.index('m-1') < order.index('g-2'), (
+            'Mem0 rank-1 (1/61) must outrank Graphiti rank-2 (1/62) even though '
+            'graphiti is the primary store — primary is a tiebreak, not precedence'
+        )
+        # ...and the tie it does win is only against the SAME rank.
+        assert order.index('g-1') < order.index('m-1')
+
+    @pytest.mark.asyncio
+    async def test_relevance_score_is_the_fused_ordinal(self, service):
+        """Every merged result scores 1/(RRF_K + its own store_rank)."""
+        from fused_memory.services.memory_service import RRF_K
+
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.graphiti))
+        self._seed_both_stores(service)
+
+        merged = await service.search('anything', project_id='test', limit=10)
+
+        assert len(merged) == 10
+        for r in merged:
+            assert r.relevance_score == pytest.approx(
+                1.0 / (RRF_K + r.metadata['store_rank'])
+            ), f'{r.id}: relevance_score must be the fused ordinal'
+            # No raw cosine leaks into the fused value.
+            assert r.relevance_score != pytest.approx(0.79)
+            assert r.relevance_score < 0.02, (
+                'A fused RRF value is ordinal and lives in the 1/61..1/70 band'
+            )
+        # The seeded cosine is reachable, but only as per-store truth.
+        assert next(r for r in merged if r.id == 'm-1').metadata['store_score'] == pytest.approx(0.79)
+        # Graphiti has no cosine to report.
+        for r in merged:
+            if r.source_store == SourceStore.graphiti:
+                assert r.metadata['store_score'] is None
+
+    @pytest.mark.asyncio
+    async def test_unequal_store_depths_fill_every_slot(self, service):
+        """A shallow store simply stops contributing; no crash, no gap."""
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.graphiti))
+        self._seed_both_stores(service, graphiti_edges=1, mem0_results=5)
+
+        merged = await service.search('anything', project_id='test', limit=5)
+
+        assert [r.id for r in merged] == ['g-1', 'm-1', 'm-2', 'm-3', 'm-4'], (
+            'Once Graphiti is exhausted, Mem0 fills the remaining slots in rank order'
+        )
+
+    @pytest.mark.asyncio
+    async def test_category_filter_and_inference_still_apply(self, service):
+        """Regression guard: the category block (which runs AFTER the sort) is untouched."""
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.graphiti))
+        self._seed_both_stores(service, graphiti_edges=2, mem0_results=2)
+
+        merged = await service.search(
+            'anything', project_id='test', limit=10,
+            categories=['decisions_and_rationale'],
+        )
+
+        # Mem0 results carry observations_and_summaries and are filtered out;
+        # the category=None Graphiti results survive and are assigned the
+        # unambiguously inferred category.
+        assert [r.id for r in merged] == ['g-1', 'g-2']
+        for r in merged:
+            assert r.category == MemoryCategory.decisions_and_rationale, (
+                'An unambiguous Graphiti category must still be inferred'
+            )
+
+    @pytest.mark.asyncio
+    async def test_degraded_and_failed_stores_still_reported(self, service):
+        """Regression guard: per-store error absorption is unchanged by the new sort."""
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.graphiti))
+        self._seed_both_stores(service)
+        service.graphiti.search = AsyncMock(side_effect=RuntimeError('falkor down'))
+
+        merged = await service.search('anything', project_id='test', limit=5)
+
+        assert merged.degraded is True
+        assert merged.failed_stores == ['graphiti']
+        assert [r.id for r in merged] == ['m-1', 'm-2', 'm-3', 'm-4', 'm-5'], (
+            "A single responding store returns its results in that store's own rank order"
         )
 
 
@@ -7273,7 +8979,18 @@ class TestReconPoolAutoTagMissingStageWarning:
                 project_id='dark_factory',
                 metadata={'kind': 'note'},
             )
-        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        # Scoped to the logger this test names, matching its docstring: the
+        # claim is about THIS warning (the missing-stage one), not about the
+        # write being silent overall. caplog captures propagated records from
+        # every logger, so an unscoped assertion here was really asserting
+        # global silence — and task 3195's metadata census legitimately emits
+        # a memory_metadata.schema_warning for kind='note', which is not in
+        # KIND_REGISTRY. Narrowing preserves this test's actual claim exactly.
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.services.memory_service'
+        ]
         assert warning_records == [], (
             f'Expected no WARNING for a non-cycle_summary kind, got: '
             f'{[r.message for r in warning_records]}'
@@ -7972,6 +9689,159 @@ class TestGraphitiBackendUpdateEdgeClearInvalidAt:
             'explicit clear Cypher must be awaited before summary refresh; '
             f'observed graph.query.await_count at refresh time: {observed_await_counts}'
         )
+
+
+class TestScanMemoryContent:
+    """MemoryService.scan_memory_content delegates to mem0.scan_payload_text.
+
+    Task 3083, WORK (b): a LITERAL substring scan over Qdrant payload text.
+    Neither semantic (`search`) nor metadata equality (`scroll_by_metadata`) —
+    the gap that made the tool-call XML leak corpus unsweepable, since a
+    leaked fragment carries almost no semantic signal.
+
+    Sentinel literals use the \x3c escape for "<" (plan pre-1).
+    """
+
+    _CLOSE_CONTENT = '\x3c/content>'
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_scan_payload_text_with_scope(self, mock_config):
+        from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 3, 'truncated': False}
+        )
+
+        await svc.scan_memory_content(
+            project_id='dark_factory',
+            needles=[self._CLOSE_CONTENT],
+            filters={'category': 'procedural_knowledge'},
+            exhaustive=True,
+            limit=500,
+        )
+
+        svc.mem0.scan_payload_text.assert_awaited_once()
+        call = svc.mem0.scan_payload_text.call_args
+        scope = call.kwargs.get('scope') or call.args[0]
+        assert isinstance(scope, Scope)
+        assert scope.project_id == 'dark_factory'
+        assert call.kwargs['needles'] == [self._CLOSE_CONTENT]
+        assert call.kwargs['filters'] == {'category': 'procedural_knowledge'}
+        assert call.kwargs['exhaustive'] is True
+        assert call.kwargs['limit'] == 500
+
+    @pytest.mark.asyncio
+    async def test_returns_the_backend_result_unchanged(self, mock_config):
+        from fused_memory.services.memory_service import MemoryService
+
+        expected = {
+            'matches': [{'id': 'a', 'created_at': None, 'matched_fragments': [],
+                         'excerpt': 'x', 'metadata': {}}],
+            'scanned': 19321,
+            'truncated': False,
+        }
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(return_value=expected)
+
+        assert await svc.scan_memory_content(project_id='dark_factory') == expected
+
+    @pytest.mark.asyncio
+    async def test_does_not_call_semantic_search(self, mock_config):
+        """This is deterministic detection, not similarity ranking. Falling back
+        to search would silently drop matches off the bottom of a top-N cut."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+        svc.mem0.search = AsyncMock(return_value={'results': []})
+
+        await svc.scan_memory_content(project_id='dark_factory')
+
+        svc.mem0.search.assert_not_called()
+        svc.mem0.scroll_by_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_mutate_the_callers_collections(self, mock_config):
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+        needles = [self._CLOSE_CONTENT]
+        filters = {'category': 'procedural_knowledge'}
+
+        await svc.scan_memory_content(
+            project_id='dark_factory', needles=needles, filters=filters
+        )
+
+        assert needles == [self._CLOSE_CONTENT]
+        assert filters == {'category': 'procedural_knowledge'}
+        assert svc.mem0.scan_payload_text.call_args.kwargs['needles'] is not needles
+        assert svc.mem0.scan_payload_text.call_args.kwargs['filters'] is not filters
+
+    @pytest.mark.asyncio
+    async def test_none_needles_and_filters_pass_through_as_none(self, mock_config):
+        """Defaulting belongs to the backend, which reads the shared sentinels —
+        the service must not invent a second default list."""
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+
+        await svc.scan_memory_content(project_id='dark_factory')
+
+        assert svc.mem0.scan_payload_text.call_args.kwargs['needles'] is None
+        assert svc.mem0.scan_payload_text.call_args.kwargs['filters'] is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates(self, mock_config):
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with pytest.raises(TimeoutError):
+            await svc.scan_memory_content(project_id='dark_factory')
+
+    @pytest.mark.asyncio
+    async def test_an_int_task_id_filter_is_normalized_to_str(self, mock_config):
+        """Matches the sibling metadata-matching read paths
+        (count_memories_by_metadata / get_memories_by_metadata).
+
+        The backend turns each filter entry into a MatchValue equality
+        condition and Qdrant's payload filter is TYPE-SENSITIVE, while the
+        write paths store task_id normalized to str. Without this,
+        `filters={'task_id': 3083}` returns zero matches with no error — a
+        silently-wrong empty result, which is the exact failure class this tool
+        exists to eliminate.
+        """
+        from fused_memory.services.memory_service import MemoryService
+
+        svc = MemoryService(mock_config)
+        svc.mem0 = MagicMock()
+        svc.mem0.scan_payload_text = AsyncMock(
+            return_value={'matches': [], 'scanned': 0, 'truncated': False}
+        )
+        filters = {'task_id': 3083}
+
+        await svc.scan_memory_content(project_id='dark_factory', filters=filters)
+
+        assert svc.mem0.scan_payload_text.call_args.kwargs['filters'] == {'task_id': '3083'}
+        # The normalization happens on the COPY, never the caller's dict.
+        assert filters == {'task_id': 3083}
 
 
 class TestGetMemoriesByMetadata:
@@ -8697,3 +10567,2386 @@ class TestGetMemoryById:
 
         with pytest.raises(TimeoutError):
             await service.get_memory_by_id(project_id='dark_factory', memory_id='u')
+
+
+class _FakePointStore:
+    """A minimal in-memory stand-in for the Qdrant point behind Mem0Backend.
+
+    Real enough for the acceptance signal: payload merge/delete/overwrite with a
+    STABLE point id, plus the deterministic metadata scroll. Deliberately not an
+    AsyncMock — the whole claim under test is that a write on one side becomes
+    visible to a read on the other, which only a fake carrying real state can
+    demonstrate.
+    """
+
+    def __init__(self, memory_id: str, payload: dict):
+        self.memory_id = memory_id
+        self.payload = dict(payload)
+        self.update = AsyncMock(return_value={'message': 'Memory updated successfully!'})
+
+    async def get_point_by_id(self, memory_id, scope):
+        return dict(self.payload) if memory_id == self.memory_id else None
+
+    async def set_payload(self, memory_id, payload, scope):
+        assert memory_id == self.memory_id
+        self.payload.update(payload)
+
+    async def delete_payload(self, memory_id, keys, scope):
+        assert memory_id == self.memory_id
+        for key in keys:
+            self.payload.pop(key, None)
+
+    async def overwrite_payload(self, memory_id, payload, scope):
+        assert memory_id == self.memory_id
+        self.payload = dict(payload)
+
+    async def scroll_by_metadata(self, scope, filters, limit=1000):
+        if all(self.payload.get(k) == v for k, v in filters.items()):
+            return [{
+                'id': self.memory_id,
+                'created_at': self.payload.get('created_at'),
+                'metadata': dict(self.payload),
+            }]
+        return []
+
+
+class TestInPlaceTagAcceptanceSignal:
+    """The signal the whole task exists to produce (task 3088 acceptance).
+
+    Closes the loop from the write side added here to the deterministic read
+    side that already shipped (`get_memories_by_metadata` → Qdrant scroll,
+    `count_memories_by_metadata` → Qdrant count). That read side is what
+    replaces the semantic-search gamble whose top-N cutoff produced four
+    successive false closure claims on the reify docs-prd-landing cluster: a
+    scroll by payload equality either finds the record or does not.
+    """
+
+    CLUSTER = 'reify-docs-prd-landing'
+    MEMORY_ID = '9f2c1d40-0000-0000-0000-0000000000ac'
+
+    @pytest.fixture
+    def tagged_service(self, service):
+        """A real MemoryService whose mem0 backend is a stateful fake, holding
+        one UNTAGGED record (no `topic` key)."""
+        store = _FakePointStore(self.MEMORY_ID, {
+            'data': 'the original observation text',
+            'hash': 'h-abc',
+            'created_at': '2026-01-01T00:00:00+00:00',
+            'updated_at': '2026-01-02T00:00:00+00:00',
+            'user_id': 'dark_factory',
+            'kind': 'observation',
+            'src_project': 'dark_factory',
+        })
+        service.mem0 = store
+        return service
+
+    @pytest.mark.asyncio
+    async def test_one_tag_call_makes_the_record_deterministically_findable(
+        self, tagged_service,
+    ):
+        store = tagged_service.mem0
+
+        # Not findable before — the premise, so a passing assertion below cannot
+        # be an artefact of a fake that matches everything.
+        assert await tagged_service.get_memories_by_metadata(
+            project_id='dark_factory', filters={'topic': self.CLUSTER},
+        ) == []
+
+        result = await tagged_service.update_memory(
+            memory_id=self.MEMORY_ID,
+            project_id='dark_factory',
+            metadata_patch={'topic': self.CLUSTER},
+            agent_id='recon-stage-memory_consolidator',
+        )
+        assert result.get('error_type') is None, result
+        assert result['status'] == 'updated'
+
+        found = await tagged_service.get_memories_by_metadata(
+            project_id='dark_factory', filters={'topic': self.CLUSTER},
+        )
+        assert [row['id'] for row in found] == [self.MEMORY_ID], (
+            'the tagged record must be reachable by a deterministic metadata '
+            'scroll — the read path that replaces the top-N semantic gamble'
+        )
+
+        # Identity, content and siblings all intact: the point was amended in
+        # place, not deleted and re-added under a new id.
+        read_back = await tagged_service.get_memory_by_id(
+            project_id='dark_factory', memory_id=self.MEMORY_ID,
+        )
+        assert read_back is not None
+        assert read_back['id'] == self.MEMORY_ID
+        assert read_back['content'] == 'the original observation text'
+        assert read_back['metadata']['kind'] == 'observation'
+        assert read_back['metadata']['src_project'] == 'dark_factory'
+        assert read_back['metadata']['created_at'] == '2026-01-01T00:00:00+00:00'
+        assert read_back['metadata']['topic'] == self.CLUSTER
+
+        # A metadata-only tag must not re-embed: mem0's Memory.update is the
+        # expensive, history-appending path this arm exists to route around.
+        store.update.assert_not_called()
+
+
+def _tombstone_row(payload_json, created_at='2026-07-20T00:00:00+00:00'):
+    """A ReconLedgerRecord as ReconLedgerStore.get_mem0_tombstone would return it."""
+    from fused_memory.reconciliation.recon_ledger import (
+        RECORD_KIND_MEM0_TOMBSTONE,
+        ReconLedgerRecord,
+    )
+
+    return ReconLedgerRecord(
+        project_id='dark_factory',
+        record_kind=RECORD_KIND_MEM0_TOMBSTONE,
+        task_id='mem-victim',
+        payload_json=payload_json,
+        state='deleted',
+        created_at=created_at,
+        expires_at='2026-08-19T00:00:00+00:00',
+    )
+
+
+class TestGetMem0DeletionTombstone:
+    """MemoryService.get_mem0_deletion_tombstone: why a recon-deleted memory is gone.
+
+    A strictly ADDITIVE sibling of get_memory_by_id (task 3041). It answers the
+    question recon gate 165 dead-ended on: `get_memory_by_id` said
+    {found: false} and there was no reachable path from a memory uuid to "who
+    deleted it and why". get_memory_by_id's own None-on-miss contract is
+    load-bearing for citation_verifier, reconciliation stage1 and recon_report's
+    cite_memory, so it is deliberately NOT widened — see the last test here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_decoded_payload_with_row_timestamps(self, service):
+        """The decoded payload, plus the row's own created_at/expires_at.
+
+        The row's timestamps are exposed under tombstone_-prefixed keys rather
+        than merged bare: the payload's own 'created_at' is the VICTIM's (how
+        old the evicted record was), while the row's created_at is when the
+        tombstone was written. Merging them flat would silently clobber the
+        former with the latter — precisely the deleting-run vs victim-run
+        conflation that made the original finding unreadable.
+        """
+        payload = {
+            'deleter': 'stage1_cycle_summary_trim',
+            'deleting_run_id': 'run-deleter',
+            'deleted_at': '2026-07-20T00:00:00+00:00',
+            'created_at': '2026-07-01T00:00:00+00:00', # the VICTIM's
+            'kind': 'cycle_summary',
+            'record_type': 'ledger_stamp',
+            'source': 'cycle_summary_mirror',
+            'recon_pool': 'stage1_cycle_summary',
+            'run_id': 'run-victim', # the VICTIM's, distinct from deleting_run_id
+        }
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(
+            return_value=_tombstone_row(json.dumps(payload))
+        )
+
+        result = await service.get_mem0_deletion_tombstone('dark_factory', 'mem-victim')
+
+        assert result is not None
+        for key, value in payload.items():
+            assert result[key] == value, f'payload field {key} not surfaced'
+        assert result['tombstone_created_at'] == '2026-07-20T00:00:00+00:00'
+        assert result['tombstone_expires_at'] == '2026-08-19T00:00:00+00:00'
+        # The victim's created_at must survive the merge unclobbered.
+        assert result['created_at'] == '2026-07-01T00:00:00+00:00'
+        service.recon_ledger.get_mem0_tombstone.assert_awaited_once_with(
+            'dark_factory', 'mem-victim'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_row_returns_none(self, service):
+        """No tombstone for this uuid → None (the ordinary never-deleted case)."""
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(return_value=None)
+
+        assert await service.get_mem0_deletion_tombstone('dark_factory', 'm') is None
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_wired_returns_none_without_raising(self, service):
+        """A deployment running recon_ledger_enabled=False degrades to None.
+
+        Same getattr(self, 'recon_ledger', None) optional-store precedent as
+        get_cycle_summary_presence and summary_pool.write_cycle_summary.
+        """
+        assert getattr(service, 'recon_ledger', None) is None
+        assert await service.get_mem0_deletion_tombstone('dark_factory', 'm') is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_payload_returns_none_and_warns(self, service, caplog):
+        """Undecodable payload_json → None plus one WARNING, never a raise.
+
+        A corrupt tombstone must not break the read of the record it documents:
+        the auditor still gets a clean not-found rather than a stack trace.
+        """
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(
+            return_value=_tombstone_row('{not json at all')
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            result = await service.get_mem0_deletion_tombstone('dark_factory', 'mem-victim')
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings!r}'
+        assert 'mem-victim' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_raising_store_returns_none_and_warns(self, service, caplog):
+        """A raising ledger read → None plus one WARNING with exc_info.
+
+        The docstring promises "fail-safe throughout", so the guard belongs
+        HERE and not only at the MCP boundary — otherwise any future
+        in-process caller without its own try/except eats the raise. And it
+        must be LOUD: a broken tombstone store returning a bare None is
+        indistinguishable from "never deliberately deleted", which is exactly
+        the undiscoverability class task 3041 was filed to fix (reviewer
+        finding robustness, amendment pass).
+        """
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(
+            side_effect=RuntimeError('database is locked')
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            result = await service.get_mem0_deletion_tombstone('dark_factory', 'mem-victim')
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings!r}'
+        assert 'mem-victim' in caplog.text
+        assert warnings[0].exc_info is not None, (
+            'the WARNING must carry exc_info — the fault type is the diagnostic'
+        )
+
+    @pytest.mark.asyncio
+    async def test_ordinary_absence_is_silent(self, service, caplog):
+        """No ledger and no row are ordinary STATES, not faults — neither logs.
+
+        The other half of the loud-over-silent split: if every never-deleted
+        lookup warned, the fault WARNING above would drown in noise and stop
+        meaning "the tombstone store is broken".
+        """
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            assert await service.get_mem0_deletion_tombstone('dark_factory', 'm') is None
+
+            service.recon_ledger = MagicMock()
+            service.recon_ledger.get_mem0_tombstone = AsyncMock(return_value=None)
+            assert await service.get_mem0_deletion_tombstone('dark_factory', 'm') is None
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            f'ordinary absence must be silent: {caplog.text!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_object_payload_returns_none_and_warns(self, service, caplog):
+        """Valid JSON that isn't an object (e.g. a list) is treated as malformed."""
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(
+            return_value=_tombstone_row('[1, 2, 3]')
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            result = await service.get_mem0_deletion_tombstone('dark_factory', 'mem-victim')
+
+        assert result is None
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+    @pytest.mark.asyncio
+    async def test_get_memory_by_id_contract_unchanged_by_a_present_tombstone(self, service):
+        """LOAD-BEARING: get_memory_by_id still returns plain None on a miss, and
+        still PROPAGATES a backend TimeoutError, even when a tombstone exists.
+
+        Three in-process callers (reconciliation/citation_verifier.py,
+        reconciliation stage1, server/recon_report.py's cite_memory) branch on
+        `is None`; widening this return to a dict-with-tombstone would silently
+        flip every one of them. The tombstone is surfaced at the MCP tool
+        boundary instead (server/tools.py), not here.
+        """
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(
+            return_value=_tombstone_row('{"deleter": "stage1_cycle_summary_trim"}')
+        )
+
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+        assert await service.get_memory_by_id(project_id='dark_factory', memory_id='mem-victim') is None
+
+        service.mem0.get_point_by_id = AsyncMock(side_effect=TimeoutError('qdrant timed out'))
+        with pytest.raises(TimeoutError):
+            await service.get_memory_by_id(project_id='dark_factory', memory_id='mem-victim')
+
+
+# --- Mem0 metadata vocabulary validation at the write seam (task 3195, leaf β) ---
+
+_MM_UUID = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
+_MM_CENSUS_LOGGER = 'fused_memory.services.memory_metadata_census'
+
+
+def _mm_install_journal(svc):
+    """Install a mock write journal on *svc* and return it.
+
+    REQUIRED SETUP, not redundant boilerplate — do not delete it.
+    ``MemoryService.__init__`` sets ``self._write_journal = None`` and only
+    ``set_write_journal()`` populates it, which the shared ``service``
+    fixture never calls. Without this install the entire
+    ``if self._write_journal:`` write-ahead-intent branch is DEAD under the
+    fixture, so any ``log_mem0_intent.assert_not_called()`` would either
+    raise AttributeError on None or pass for the wrong reason — proving
+    nothing about rejection ordering while looking like it did.
+
+    An ``AsyncMock`` rather than a ``MagicMock`` with hand-picked async
+    attributes, because the success path also awaits ``resolve_mem0_intent``
+    and ``log_write_op``; a bare MagicMock would return non-awaitables there
+    and fail the positive control for an unrelated reason.
+    """
+    journal = AsyncMock()
+    svc.set_write_journal(journal)
+    return journal
+
+
+def _mm_set_canonical_incumbent(svc, incumbent_id, *, topic='some-topic', count=1):
+    """Make *svc* report an existing canonical record and return it.
+
+    REQUIRED SETUP for every canonical-uniqueness case, not decoration — do
+    not delete it.  The shared ``service`` fixture stubs
+    ``mem0.count_by_metadata``/``scroll_by_metadata`` to ``0``/``[]``, i.e.
+    "no incumbent", which is the right default for every OTHER test but makes
+    the uniqueness branch UNREACHABLE.  Without this flip a
+    ``pytest.raises(CanonicalUniquenessViolation)`` case would fail, and an
+    ``assert_not_called()`` case would pass for the wrong reason — proving
+    nothing about the re-check while looking like it did.
+
+    *count* is settable independently of the scroll result so the count/scroll
+    race (count says 1, scroll comes back empty) can be staged explicitly.
+    """
+    record = {'id': incumbent_id, 'created_at': '2026-01-01T00:00:00Z',
+              'metadata': {'topic': topic, 'canonical': True}}
+    svc.mem0.count_by_metadata = AsyncMock(return_value=count)
+    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[record])
+    return record
+
+
+def _mm_configure_project_root(svc, root):
+    """Give *svc* a ``taskmaster.project_root`` and return it.
+
+    REQUIRED SETUP for the storm cases, not decoration — do not delete it.
+    The shared ``mock_config`` fixture (``tests/conftest.py:184``) leaves
+    ``taskmaster=None``, so ``_memory_metadata_project_root()`` returns ``''``
+    and ``_apply_memory_metadata_validation`` takes its documented
+    "no project queue to file into — census only, do not escalate" branch.
+    Without this install the storm escape is UNREACHABLE under the fixture:
+    the crossing case never reaches the filer at all, and the no-crossing
+    case would pass for the wrong reason while looking like it proved the
+    detector gate.
+
+    Nothing is ever written to *root* — both storm tests patch the filer.
+    """
+    from fused_memory.config.schema import TaskmasterConfig
+
+    svc.config.taskmaster = TaskmasterConfig(project_root=str(root))
+    return str(root)
+
+
+#: The pre-image staged for the ``update_memory`` arm of :func:`_mm_write`.
+#:
+#: mem0-OWNED keys only (``MEM0_MANAGED_METADATA_KEYS``), so the record's
+#: CUSTOM subset — the half ``split_managed_metadata`` hands to the seam — is
+#: vocabulary-EMPTY.  That emptiness is load-bearing, not incidental: the
+#: update seam judges a patch against the record's pre-image (task 3523), so
+#: an empty pre-image makes the baseline subtraction a NO-OP and every shared
+#: case below asserts exactly what it asserts on the two add paths.  Staging a
+#: pre-image that carried violations would silently mask half of them and the
+#: suite would still look green.
+_MM_UPDATE_PRE_IMAGE = {
+    'data': 'original content',
+    'hash': 'abc123hash',
+    'created_at': '2026-01-01T00:00:00+00:00',
+    'updated_at': '2026-01-02T00:00:00+00:00',
+    'user_id': 'darkfactory',
+}
+
+_MM_UPDATE_POINT_ID = 'mm-point-1'
+
+
+async def _mm_write(svc, entry_point, *, metadata, category='observations_and_summaries',
+                    project_id='dark_factory', agent_id='claude-task-3195'):
+    """Drive one write through any of the three seams.
+
+    D8/§2 pin enforcement at the SERVICE seam precisely so
+    ``add_system_record`` cannot bypass it, so every case runs against both.
+    Task 3523 adds ``update_memory`` — the THIRD write path — for the same
+    reason: an entry point the shared cases do not reach is an entry point
+    that can drift away from the seam without failing anything.
+
+    ``category`` rides in the PATCH on the update arm.  The two add paths
+    stamp ``meta['category'] = resolved_category.value`` themselves because
+    they are creating the record; an update has no category to resolve (the
+    record already carries one), so the harness supplies it explicitly rather
+    than leaving the shared "caller keys survive alongside category"
+    assertion to pass vacuously on two seams and fail on the third.
+    """
+    if entry_point == 'add_memory':
+        return await svc.add_memory(
+            content='some content',
+            category=category,
+            project_id=project_id,
+            agent_id=agent_id,
+            metadata=metadata,
+            causation_id='c1',
+        )
+    if entry_point == 'update_memory':
+        # The §5(c) existence check and leaf δ's parent-liveness lookup share
+        # ONE backend primitive on this path — both run through
+        # ``get_memory_by_id`` → ``mem0.get_point_by_id``. Route the record's
+        # OWN id to the staged pre-image and delegate every OTHER id (i.e. the
+        # parent) to whatever the case staged, then restore. Without the split
+        # a case staging ``return_value=None`` would fail the existence check
+        # and never reach the seam at all, one staging a ``TimeoutError`` would
+        # die in the read leg, and every ``get_point_by_id.assert_awaited_once``
+        # would be counting the existence check rather than the parent lookup.
+        staged = svc.mem0.get_point_by_id
+
+        async def _routed(point_id, scope, *args, **kwargs):
+            if point_id == _MM_UPDATE_POINT_ID:
+                return dict(_MM_UPDATE_PRE_IMAGE)
+            return await staged(point_id, scope, *args, **kwargs)
+
+        svc.mem0.get_point_by_id = _routed
+        try:
+            return await svc.update_memory(
+                memory_id=_MM_UPDATE_POINT_ID,
+                project_id=project_id,
+                agent_id=agent_id,
+                metadata_patch={'category': category, **metadata},
+                causation_id='c1',
+            )
+        finally:
+            svc.mem0.get_point_by_id = staged
+    svc.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+    return await svc.add_system_record(
+        content='some content',
+        project_id=project_id,
+        agent_id=agent_id,
+        category=category,
+        metadata=metadata,
+        causation_id='c1',
+    )
+
+
+def _mm_backend_mock(svc, entry_point):
+    """The backend write primitive this entry point must reach — or not.
+
+    ``update_memory``'s metadata-only route with a patch and no delete keys
+    lands on ``set_payload`` (the Qdrant server-side-merge fast path), which
+    is what ``_mm_write`` above drives.
+    """
+    return {
+        'add_memory': svc.mem0.add,
+        'update_memory': svc.mem0.set_payload,
+        'add_system_record': svc.mem0.add_system_record,
+    }[entry_point]
+
+
+def _mm_backend_meta(svc, entry_point):
+    """The metadata dict the backend actually received."""
+    call = _mm_backend_mock(svc, entry_point).call_args
+    if entry_point == 'update_memory':
+        # set_payload(memory_id, payload, scope) — positional, no metadata=.
+        return call.args[1]
+    return call.kwargs['metadata']
+
+
+def _mm_census_codes(caplog):
+    codes = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if 'memory_metadata.schema_warning' not in message:
+            continue
+        for token in message.split():
+            if token.startswith('code='):
+                codes.append(token.removeprefix('code='))
+    return codes
+
+
+_MM_ENTRY_POINTS = ['add_memory', 'add_system_record', 'update_memory']
+
+#: The two CREATE paths only.  Used by the single case whose subject is the
+#: ordering of the add path's server-side tagging helpers
+#: (``_apply_cycle_summary_metadata_tagging``), which an in-place amendment
+#: deliberately does not run: those stamps were applied when the record was
+#: created, and re-deriving `recon_pool`/`run_id` on every patch would rewrite
+#: provenance the patch never mentioned.  Scoped explicitly rather than by
+#: shrinking ``_MM_ENTRY_POINTS``, so the default for a new shared case stays
+#: "runs against all three".
+_MM_ADD_ENTRY_POINTS = ['add_memory', 'add_system_record']
+
+
+class TestMemoryMetadataValidationAtSeam:
+    """PRD V1 enforcement at the MemoryService write seam (task 3195, leaf β)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_valid_metadata_round_trips_to_the_backend(self, service, entry_point):
+        """Every caller-supplied key survives alongside the server stamps."""
+        await _mm_write(service, entry_point, metadata={
+            'topic': 'a-good-slug',
+            'canonical': True,
+            'kind': 'cycle_summary',
+            'parent_id': _MM_UUID,
+            'task_id': '3195',
+            'x_experimental': 'ok',
+        })
+        meta = _mm_backend_meta(service, entry_point)
+        assert meta['topic'] == 'a-good-slug'
+        assert meta['canonical'] is True
+        assert meta['kind'] == 'cycle_summary'
+        assert meta['parent_id'] == _MM_UUID
+        assert meta['task_id'] == '3195'
+        assert meta['x_experimental'] == 'ok'
+        assert meta['category'] == 'observations_and_summaries'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_scalar_supersedes_is_normalized_before_the_backend(
+        self, service, entry_point
+    ):
+        """The observable that proves the β-before-γ hazard is closed.
+
+        The recon harness wrote a scalar until γ (task 3196) migrated it to a
+        list, and γ landed AFTER β. If the seam had rejected — or passed
+        through — the scalar form, the window between the two leaves would
+        either have broken the recon harness's own writes or left the list
+        contract unmet.
+
+        Post-3196 this guards the LEGACY CORPUS rather than a live in-repo
+        writer: γ shipped no corpus rewrite, so the 81 pre-migration records
+        still carry scalars (PRD D2 defers retro normalization to leaf θ's
+        stamping sweep), and out-of-repo writers are unbound by it.
+        """
+        await _mm_write(service, entry_point, metadata={'supersedes': _MM_UUID})
+        assert _mm_backend_meta(service, entry_point)['supersedes'] == [_MM_UUID]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_default_config_warns_and_proceeds_on_a_bad_slug(
+        self, service, entry_point, caplog
+    ):
+        """THE census-refuted-premise safety default.
+
+        This is the regression that would otherwise silently take the fleet
+        down when someone flips a default: 98 of 352 distinct live `topic`
+        values are snake_case, so a shipped-on enforce would reject a large
+        slice of real traffic on day one.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False
+
+        await _mm_write(service, entry_point, metadata={'topic': 'bad_slug'})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'invalid_topic_slug' in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_enforce_rejects_before_any_backend_call(self, service, entry_point):
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        with pytest.raises(MemoryMetadataValidationError):
+            await _mm_write(service, entry_point, metadata={'topic': 'bad_slug'})
+        _mm_backend_mock(service, entry_point).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enforce_rejects_before_the_write_ahead_intent(self, service):
+        """A rejected write must leave NO pending intent to reconcile.
+
+        ``recover_mem0_intents`` reconciles pending intents at startup, so a
+        rejection raised after the intent was journalled would convert a
+        clean structured rejection into permanent store-reconciliation debt.
+
+        add_memory only: ``add_system_record`` has no write-ahead intent — it
+        goes straight to ``_journaled_backend_call`` — so its equivalent
+        "no persistence side effect" observable is asserted separately below.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        journal = _mm_install_journal(service)
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError):
+            await _mm_write(service, 'add_memory', metadata={'topic': 'bad_slug'})
+
+        journal.log_mem0_intent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_positive_control_valid_write_does_log_the_intent(self, service):
+        """Without this, `not_called` cannot distinguish "rejected before the
+        intent" from "the branch never runs at all"."""
+        journal = _mm_install_journal(service)
+        await _mm_write(service, 'add_memory', metadata={'topic': 'a-good-slug'})
+        journal.log_mem0_intent.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_enforce_rejects_before_add_system_record_journals_anything(self, service):
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        journal = _mm_install_journal(service)
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError):
+            await _mm_write(service, 'add_system_record', metadata={'topic': 'bad_slug'})
+
+        journal.log_backend_op.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_kind_registry_carve_out_is_real(self, service, entry_point, caplog):
+        """`enforce=True` + `enforce_kind_registry=False`: unknown kind warns
+        and PROCEEDS, while a bad slug in the same call still raises.
+
+        The carve-out has to be checked in one call, not two: a validator
+        that simply downgraded everything under the kind flag would pass two
+        separate tests while silently disabling the shape checks too.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.config.memory_metadata.enforce = True
+        service.config.memory_metadata.enforce_kind_registry = False
+
+        await _mm_write(service, entry_point, metadata={'kind': 'invented_kind_xyz'})
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'unknown_kind' in _mm_census_codes(caplog)
+
+        with pytest.raises(MemoryMetadataValidationError):
+            await _mm_write(service, entry_point, metadata={
+                'kind': 'invented_kind_xyz', 'topic': 'bad_slug',
+            })
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_unknown_key_censuses_but_x_prefixed_key_is_silent(
+        self, service, entry_point, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+
+        await _mm_write(service, entry_point, metadata={'totally_novel_key': 1})
+        assert 'unknown_key' in _mm_census_codes(caplog)
+
+        caplog.clear()
+        await _mm_write(service, entry_point, metadata={'x_novel': 1})
+        assert _mm_census_codes(caplog) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ADD_ENTRY_POINTS)
+    async def test_validation_runs_after_the_existing_tagging_helpers(
+        self, service, entry_point, caplog
+    ):
+        """A cycle_summary write must not census-warn on the SERVER's own stamps.
+
+        ``_apply_cycle_summary_metadata_tagging`` writes recon_pool/run_id
+        into meta. Validating before it would either warn on the server's own
+        fields or force a second copy of the server-stamped key list, so the
+        ordering is a real contract rather than an implementation detail.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+
+        # `stage` is what the helper infers recon_pool FROM, and it must be a
+        # KNOWN stage (CYCLE_SUMMARY_STAGE_TO_RECON_POOL) or the helper no-ops
+        # on recon_pool. Without a real one this test would pass vacuously,
+        # never exercising the server-stamped key it exists to check.
+        await _mm_write(service, entry_point, metadata={
+            'kind': 'cycle_summary', 'run_id': 'r1', 'stage': 'task_knowledge_sync',
+        })
+        meta = _mm_backend_meta(service, entry_point)
+        assert 'recon_pool' in meta, 'the tagging helper must have run'
+        assert 'unknown_key' not in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    async def test_graphiti_primary_writes_are_validated_too(self, service, caplog):
+        """V1 covers the SEAM, not just the Mem0 branch.
+
+        `entities_and_relations` never reaches Mem0, so a validator wired
+        into the Mem0 branch instead of the seam would leave this whole
+        category unvalidated and uncensused.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+
+        await _mm_write(
+            service, 'add_memory',
+            category='entities_and_relations',
+            metadata={'topic': 'bad_slug'},
+        )
+        service.mem0.add.assert_not_called()
+        assert 'invalid_topic_slug' in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_storm_crossing_files_one_escalation_naming_the_writer(
+        self, service, entry_point, tmp_path
+    ):
+        """The INV-4 escape: a drifting writer is heard, not logged into oblivion."""
+        root = _mm_configure_project_root(service, tmp_path)
+        filed = []
+
+        def _fake_filer(project_root, *, project_id, agent_id, keys):
+            filed.append((project_root, project_id, agent_id, list(keys)))
+            return 'esc-memory-metadata-unknown-key-storm-1'
+
+        crossing = MagicMock()
+        crossing.record = MagicMock(return_value=True)
+        service._metadata_storm_detector = crossing
+
+        with patch.object(memory_service, 'file_unknown_key_storm_escalation', _fake_filer):
+            await _mm_write(
+                service, entry_point,
+                metadata={'drifting_key': 1},
+                agent_id='claude-drifter',
+            )
+
+        assert len(filed) == 1
+        project_root, project_id, agent_id, keys = filed[0]
+        # Asserted, not ignored: the filer resolves the escalation QUEUE from
+        # this path, so a seam that passed the wrong root (or '') would file
+        # into the wrong project — or nowhere — while every other assertion
+        # here still passed.
+        assert project_root == root
+        assert project_id == 'dark_factory'
+        assert agent_id == 'claude-drifter'
+        assert keys == ['drifting_key']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_storm_escalation_is_filed_off_the_event_loop(
+        self, service, entry_point, tmp_path
+    ):
+        """The filer does blocking FS I/O; it must not run ON the loop.
+
+        `file_unknown_key_storm_escalation` constructs an EscalationQueue,
+        scans the queue directory and does a durable fsync-flushed write.
+        Called inline from these coroutines that I/O would stall every other
+        concurrent memory write for its duration. Pinned behaviourally by
+        thread identity rather than by a comment, so a later leaf that
+        re-inlines the call fails here instead of silently reintroducing the
+        stall.
+        """
+        import threading
+
+        _mm_configure_project_root(service, tmp_path)
+        loop_thread = threading.get_ident()
+        filer_threads = []
+
+        def _fake_filer(project_root, *, project_id, agent_id, keys):
+            filer_threads.append(threading.get_ident())
+            return 'esc-x-1'
+
+        crossing = MagicMock()
+        crossing.record = MagicMock(return_value=True)
+        service._metadata_storm_detector = crossing
+
+        with patch.object(memory_service, 'file_unknown_key_storm_escalation', _fake_filer):
+            await _mm_write(service, entry_point, metadata={'drifting_key': 1})
+
+        assert filer_threads, 'the filer must still be called'
+        assert filer_threads[0] != loop_thread
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_no_storm_no_escalation(self, service, entry_point, tmp_path):
+        # Configured root, so this pins the DETECTOR gate rather than passing
+        # vacuously on the unconfigured-project_root branch (see the helper).
+        _mm_configure_project_root(service, tmp_path)
+        with patch.object(memory_service, 'file_unknown_key_storm_escalation') as filer:
+            await _mm_write(service, entry_point, metadata={'drifting_key': 1})
+        filer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_detector_is_built_once_per_service(self, service):
+        """Process-lifetime state: counts survive across writes.
+
+        A detector rebuilt per write would reset its window every time and
+        could never reach the threshold — the storm escape would be dead code
+        that still looked wired up.
+        """
+        from fused_memory.services.memory_metadata_census import UnknownKeyStormDetector
+
+        assert isinstance(service._metadata_storm_detector, UnknownKeyStormDetector)
+        before = service._metadata_storm_detector
+        await _mm_write(service, 'add_memory', metadata={'a_novel_key': 1})
+        assert service._metadata_storm_detector is before
+
+    @pytest.mark.asyncio
+    async def test_enforce_flag_is_read_per_call_not_cached(self, service):
+        """A config reload must take effect on the NEXT write.
+
+        Caching the flag at __init__ would make the red-tier restart
+        requirement worse than documented: even a restart-free reload path
+        that did land the value would be ignored.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        await _mm_write(service, 'add_memory', metadata={'topic': 'bad_slug'})
+        service.config.memory_metadata.enforce = True
+        with pytest.raises(MemoryMetadataValidationError):
+            await _mm_write(service, 'add_memory', metadata={'topic': 'bad_slug'})
+
+
+#: A pre-image that is FATAL-invalid under the vocabulary as it sits.
+#:
+#: `eval_worktree_plan_tools_missing` is not invented — it is the snake_case
+#: topic the live `dark_factory` canonical record carried, and
+#: `sweep_toolcall_xml_leak.py` enumerates the classes of legacy record that
+#: are fatal-invalid today (unknown `kind`, malformed `supersedes`, non-bool
+#: `canonical`). Records like this exist; the update seam has to be able to
+#: re-tag them.
+_MM_LEGACY_INVALID_PRE_IMAGE = {
+    **DEFAULT_POINT_PAYLOAD,
+    'topic': 'eval_worktree_plan_tools_missing',
+}
+
+
+class TestUpdateMemoryValidatesTheDeltaNotTheCorpus:
+    """A patch is judged on what it CHANGES, never on the record at rest.
+
+    Task 3523. Wiring the seam into `update_memory` without this rule would
+    make `enforce` start re-validating records at rest on every patch —
+    silently contradicting a model the codebase both states in prose and
+    MEASURES against. `_check_canonical_uniqueness`'s docstring and PRD §9
+    leaf ε's 2026-08-04 amendment both say "`enforce` rejects WRITES and
+    never re-validates the corpus", and quantify the flip's blast radius
+    (~20 → ~19 false rejections/week) on exactly that basis; task 3626's
+    flip decision rests on that number.
+
+    The three cases below draw the line from both sides, which is the point:
+    a pre-existing violation the patch did not cause is not this write's
+    problem, but a violation the patch DOES cause is — including one that
+    emerges from the combination and appears in neither the pre-image nor the
+    patch keys alone.
+    """
+
+    _POINT = 'point-1'
+
+    @staticmethod
+    def _stage(service, payload):
+        service.mem0.get_point_by_id = AsyncMock(return_value=dict(payload))
+
+    @pytest.mark.asyncio
+    async def test_patching_an_unrelated_key_is_not_judged_on_the_pre_image(
+        self, service, caplog
+    ):
+        """The load-bearing case: routine re-tagging of a legacy record.
+
+        Without delta scoping this raises, and `enforce` becomes an outage
+        for exactly the records that most need re-tagging — including for
+        `retro_stamp_topics.py`, the in-repo bulk re-tagger that actually
+        drives this arm (one metadata-only patch per legacy record).
+        """
+        service.config.memory_metadata.enforce = True
+        self._stage(service, _MM_LEGACY_INVALID_PRE_IMAGE)
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'x_note': 'hi'},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        # Empty, not merely "no invalid_topic_slug": re-censusing a
+        # pre-existing violation on every patch would inflate the census
+        # stream the flip is measured from, and would trip false unknown-key
+        # storms on a record whose long-tail keys were already counted once.
+        assert _mm_census_codes(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_a_violation_the_patch_itself_introduces_is_rejected(self, service):
+        """The other side of the line — delta scoping is not a blanket pass."""
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, _MM_LEGACY_INVALID_PRE_IMAGE)
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'topic': 'Not A Slug'},
+            )
+
+        assert 'invalid_topic_slug' in {v.code for v in excinfo.value.violations}
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_violation_that_emerges_from_the_combination_is_rejected(
+        self, service
+    ):
+        """NEW is judged on the effective post-image, not on the patch keys.
+
+        Neither half shows this violation alone: the pre-image is clean
+        (`canonical` with a valid `topic`) and the delta names only `topic`.
+        `canonical_without_topic` exists only in the record the write would
+        leave behind — so a rule that diffed the PATCH against the vocabulary
+        instead of the post-image against the pre-image would admit it.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {
+            **DEFAULT_POINT_PAYLOAD, 'topic': 'a-good-slug', 'canonical': True,
+        })
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_delete_keys=['topic'],
+            )
+
+        assert 'canonical_without_topic' in {v.code for v in excinfo.value.violations}
+        service.mem0.delete_payload.assert_not_called()
+
+    @staticmethod
+    def _stage_with_parent(service, pre_image, lookups):
+        """Route the record's own id to *pre_image*; every other id is DEAD.
+
+        The §5(c) existence check and leaf δ's parent lookup share ONE
+        backend primitive (`get_memory_by_id` → `mem0.get_point_by_id`), so a
+        flat `AsyncMock(return_value=None)` would fail the existence check and
+        never reach the seam. *lookups* records the ids in order, which is how
+        these cases assert the round-trip COUNT and not merely the verdict.
+        """
+        async def _routed(point_id, scope, *args, **kwargs):
+            lookups.append(point_id)
+            return dict(pre_image) if point_id == 'point-1' else None
+
+        service.mem0.get_point_by_id = _routed
+
+    @pytest.mark.asyncio
+    async def test_a_dead_pre_existing_parent_is_not_this_writes_problem(
+        self, service, caplog
+    ):
+        """Liveness is delta-scoped too — at its own gate, not by subtraction.
+
+        The `(key, code)` subtraction cannot reach this rule: its baseline set
+        comes from the PURE `validate_memory_metadata`, which structurally
+        cannot emit `dead_parent_id` / `parent_id_liveness_unavailable`, so
+        both codes would survive EVERY patch of a record carrying a
+        `parent_id` — including one that never mentions it. That would make a
+        record whose parent was since deleted permanently un-patchable under
+        `enforce` (and census a line per patch under the shipped warn mode):
+        corpus re-validation, the exact failure this class exists to prevent,
+        reintroduced through the one rule the subtraction is blind to.
+        """
+        service.config.memory_metadata.enforce = True
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        lookups: list[str] = []
+        self._stage_with_parent(
+            service, {**DEFAULT_POINT_PAYLOAD, 'parent_id': _MM_UUID}, lookups,
+        )
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'x_note': 'hi'},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        assert _mm_census_codes(caplog) == []
+        # Exactly ONE read — the existence check. The parent was never probed,
+        # which is also ε's contracted zero-extra-round-trips property holding
+        # for a patch that asserts no parent.
+        assert lookups == [self._POINT]
+
+    @pytest.mark.asyncio
+    async def test_a_parent_id_this_write_asserts_still_fails_closed(self, service):
+        """Delta scoping is not a liveness exemption.
+
+        The other side of the same line: a write that ASSERTS a parent — a new
+        one, or a different one — is answerable for it, pays the round-trip
+        and still fails closed under `enforce`. INV-3 read literally.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        other_parent = '9c5b94b1-35ad-49bb-b118-8e8fc24abf80'
+        lookups: list[str] = []
+        self._stage_with_parent(
+            service, {**DEFAULT_POINT_PAYLOAD, 'parent_id': _MM_UUID}, lookups,
+        )
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'parent_id': other_parent},
+            )
+
+        assert 'dead_parent_id' in {v.code for v in excinfo.value.violations}
+        assert lookups == [self._POINT, other_parent]
+        service.mem0.set_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_combined_content_and_patch_rejection_writes_nothing(
+        self, service
+    ):
+        """The widest-blast-radius arm, pinned for rejection ORDERING.
+
+        Every other case here drives a metadata-only route, so their
+        `mem0.update.assert_not_called()` passes vacuously — no content was
+        ever supplied. This one supplies it: the content arm rebuilds the
+        point payload from scratch, so a rejection that landed AFTER the
+        write is the one that could leave a record carrying new text with
+        stale metadata. The seam sits before `scope` and every journaled
+        backend call precisely so that cannot happen.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, _MM_LEGACY_INVALID_PRE_IMAGE)
+        journal = _mm_install_journal(service)
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                content='new text',
+                metadata_patch={'topic': 'Not A Slug'},
+            )
+
+        assert 'invalid_topic_slug' in {v.code for v in excinfo.value.violations}
+        service.mem0.update.assert_not_called()
+        journal.log_mem0_intent.assert_not_called()
+        journal.log_write_op.assert_not_called()
+
+
+class TestCanonicalUniquenessAtSeam:
+    """<=1 canonical memory per (project, topic) — the live INV-3 re-check.
+
+    Task 3198 (leaf ε). This is the only half of `canonical` that needs
+    live store state, so it lives at the async seam rather than in the
+    pure validator. Every case runs against BOTH entry points: D8/§2 pin
+    enforcement here precisely so `add_system_record` cannot bypass it.
+    """
+
+    _TOPIC = 'some-topic'
+    _INCUMBENT = 'incumbent-uuid-1'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_second_canonical_is_rejected_and_names_the_incumbent(
+        self, service, entry_point
+    ):
+        """V1: the incumbent is NAMED, not merely counted.
+
+        A bare "a canonical already exists" would leave the operator with
+        nothing to go look at; naming the id is the contract-fixed
+        obligation, and the reason the seam scrolls after counting.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        assert self._INCUMBENT in str(excinfo.value)
+        assert excinfo.value.incumbent_id == self._INCUMBENT
+        assert excinfo.value.topic == self._TOPIC
+        assert excinfo.value.project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_rejection_happens_before_any_persistence(self, service, entry_point):
+        """Nothing may reach the backend once the write is doomed."""
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        _mm_backend_mock(service, entry_point).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejection_leaves_no_pending_mem0_intent(self, service):
+        """A rejected write must leave nothing for `recover_mem0_intents`.
+
+        The write-ahead intent is logged before the backend call, so a
+        check that ran too late would reject the write and STILL leave a
+        pending intent that recovery would later replay — resurrecting
+        precisely the duplicate canonical this rule forbids.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        journal = _mm_install_journal(service)
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, 'add_memory',
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        journal.log_mem0_intent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_uniqueness_is_scoped_to_project_and_topic(self, service, entry_point):
+        """INV-3 scoping is exact: the key is (project, topic), not global.
+
+        A filter missing `canonical` would count every memory in the
+        topic; one missing `topic` would make the rule global and reject
+        the SECOND canonical anywhere. Both would pass a laxer assertion
+        that only checked that a count happened.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+
+        expected_filters = {'topic': self._TOPIC, 'canonical': True}
+
+        service.mem0.count_by_metadata.assert_awaited_once()
+        call = service.mem0.count_by_metadata.await_args
+        filters = call.kwargs.get('filters', call.args[1] if len(call.args) > 1 else None)
+        assert filters == expected_filters
+        scope = call.kwargs.get('scope', call.args[0] if call.args else None)
+        assert 'dark_factory' in str(scope), f'the count must be project-scoped, got {scope!r}'
+
+        # The follow-up scroll must be scoped IDENTICALLY and bounded.
+        # Unasserted, a regression that dropped `canonical` from these
+        # filters would name a non-canonical record as the incumbent, and
+        # one that dropped the limit would scroll the 1000-row default on
+        # the failing path — both stay green against the stub, which
+        # returns the same record no matter what it is asked for.
+        service.mem0.scroll_by_metadata.assert_awaited_once()
+        scroll = service.mem0.scroll_by_metadata.await_args
+        scroll_filters = scroll.kwargs.get(
+            'filters', scroll.args[1] if len(scroll.args) > 1 else None
+        )
+        assert scroll_filters == expected_filters
+        scroll_scope = scroll.kwargs.get('scope', scroll.args[0] if scroll.args else None)
+        assert 'dark_factory' in str(scroll_scope), (
+            f'the scroll must be project-scoped, got {scroll_scope!r}'
+        )
+        scroll_limit = scroll.kwargs.get(
+            'limit', scroll.args[2] if len(scroll.args) > 2 else None
+        )
+        assert scroll_limit == 1, (
+            f'the incumbent lookup needs exactly one row, got limit={scroll_limit!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_first_canonical_for_a_topic_succeeds(self, service, entry_point):
+        """POSITIVE CONTROL — without it the assert_not_called cases above
+        cannot distinguish "correctly rejected" from "this branch is dead".
+
+        The fixture default is count=0, i.e. no incumbent.
+        """
+        service.config.memory_metadata.enforce = True
+        journal = _mm_install_journal(service)
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'topic': self._TOPIC, 'canonical': True},
+        )
+        meta = _mm_backend_meta(service, entry_point)
+        assert meta['canonical'] is True
+        assert meta['topic'] == self._TOPIC
+        if entry_point == 'add_memory':
+            journal.log_mem0_intent.assert_called()
+
+    # -- shipped default: warn, do not reject -----------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_warn_mode_censuses_but_does_not_reject(
+        self, service, entry_point, caplog
+    ):
+        """THE regression that protects the live fleet.
+
+        Uniqueness must honour the same `enforce` flag every sibling fatal
+        check honours. The one real `canonical: true` record in
+        dark_factory carries topic `eval_worktree_plan_tools_missing`
+        (snake_case), so a shipped-on enforce would start rejecting
+        canonical writes against a corpus leaf θ has not normalized yet --
+        exactly the census-refuted-premise outage the warn default exists
+        to prevent.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False, 'warn is the shipped default'
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'topic': self._TOPIC, 'canonical': True},
+        )
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'canonical_uniqueness_violation' in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    async def test_enforce_is_read_per_call_not_captured(self, service):
+        """A config edit must take effect on the NEXT write."""
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+        meta = {'topic': self._TOPIC, 'canonical': True}
+
+        await _mm_write(service, 'add_memory', metadata=dict(meta))
+        service.config.memory_metadata.enforce = True
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(service, 'add_memory', metadata=dict(meta))
+
+    # -- no wasted I/O on the ordinary path --------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    @pytest.mark.parametrize(
+        ('metadata', 'expected_code'),
+        [
+            ({'topic': 'some-topic'}, None),
+            ({'kind': 'cycle_summary'}, None),
+            ({'canonical': False, 'topic': 'some-topic'}, None),
+            ({'canonical': True}, 'canonical_without_topic'),
+            ({'canonical': True, 'topic': 'bad_slug'}, 'invalid_topic_slug'),
+        ],
+    )
+    async def test_no_round_trip_on_the_ordinary_path(
+        self, service, entry_point, metadata, expected_code, caplog
+    ):
+        """The guards must short-circuit BEFORE any await.
+
+        The last two cases also assert their census code, so "no query
+        issued" is proven to be the guard working rather than the whole
+        check being dead — an assertion that would otherwise pass just as
+        happily against a deleted feature.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await _mm_write(service, entry_point, metadata=dict(metadata))
+
+        service.mem0.count_by_metadata.assert_not_awaited()
+        if expected_code is not None:
+            assert expected_code in _mm_census_codes(caplog)
+
+    # -- race resilience ---------------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_count_scroll_race_still_yields_a_structured_rejection(
+        self, service, entry_point
+    ):
+        """Count says 1, scroll comes back empty (concurrent delete).
+
+        The rejection must survive with a sentinel id rather than dying on
+        `records[0]` — an IndexError on the live write path would turn a
+        clean policy rejection into an unhandled crash.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        assert excinfo.value.topic == self._TOPIC
+        assert excinfo.value.incumbent_id  # a sentinel, never empty or absent
+
+    # -- the probe itself failing ------------------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    @pytest.mark.parametrize('failing_probe', ['count', 'scroll'])
+    async def test_probe_outage_does_not_fail_the_write_in_warn_mode(
+        self, service, entry_point, failing_probe, caplog
+    ):
+        """A Qdrant blip must not fail an otherwise-valid canonical write.
+
+        Both probes hit Qdrant and `count_by_metadata` PROPAGATES a read
+        timeout by contract, so without handling, an unrelated Mem0 outage
+        turns a valid write into an error at the MCP boundary — under the
+        SHIPPED default, whose documented contract is "census the
+        violation and let the write proceed". Worse, this seam runs before
+        store routing, so it could fail a Graphiti-primary write that
+        never touches Mem0 at all.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False, 'warn is the shipped default'
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+        getattr(service.mem0, f'{failing_probe}_by_metadata').side_effect = TimeoutError(
+            'qdrant read timed out'
+        )
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'topic': self._TOPIC, 'canonical': True},
+        )
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        codes = _mm_census_codes(caplog)
+        assert 'canonical_uniqueness_check_unavailable' in codes, (
+            'degradation must be LOUD — a swallowed probe failure is '
+            'indistinguishable from a clean uniqueness check'
+        )
+        # It must NOT claim a duplicate it never observed.
+        assert 'canonical_uniqueness_violation' not in codes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    @pytest.mark.parametrize('failing_probe', ['count', 'scroll'])
+    async def test_probe_outage_fails_closed_under_enforce(
+        self, service, entry_point, failing_probe, caplog
+    ):
+        """Under enforce the operator asked for the invariant to HOLD.
+
+        Admitting a canonical whose uniqueness could not be verified would
+        be the silent fail-soft the house norm forbids. The real backend
+        error surfaces as itself rather than as a
+        CanonicalUniquenessViolation — "the store was unreachable" and "a
+        duplicate exists" are different facts.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+        getattr(service.mem0, f'{failing_probe}_by_metadata').side_effect = TimeoutError(
+            'qdrant read timed out'
+        )
+
+        with pytest.raises(TimeoutError) as excinfo:
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+            )
+        assert not isinstance(excinfo.value, CanonicalUniquenessViolation)
+        _mm_backend_mock(service, entry_point).assert_not_called()
+        assert 'canonical_uniqueness_check_unavailable' in _mm_census_codes(caplog)
+
+    # -- scope: the invariant is Mem0-scoped -------------------------------
+
+    @pytest.mark.asyncio
+    async def test_graphiti_primary_canonical_is_only_checked_against_mem0(
+        self, service, caplog
+    ):
+        """PINS the known scope limit so the silence cannot read as coverage.
+
+        Both probes are Qdrant payload filters, but the seam deliberately
+        runs BEFORE the write_graphiti/write_mem0 branching. So for a
+        Graphiti-primary category the probe still runs (dual_write can
+        route any category into Mem0, which is why it is not skipped on
+        category alone) but can only ever see Mem0 rows — a
+        previously-written Graphiti-only canonical is invisible to it and
+        the <=1-per-(project, topic) rule does NOT hold there.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.config.memory_metadata.enforce = True
+        # No Mem0 twin: exactly the state a Graphiti-only canonical leaves.
+        service.mem0.count_by_metadata = AsyncMock(return_value=0)
+
+        await _mm_write(
+            service, 'add_memory',
+            metadata={'topic': self._TOPIC, 'canonical': True},
+            category='decisions_and_rationale',
+        )
+
+        # The probe IS issued even though this write never reaches Mem0...
+        service.mem0.count_by_metadata.assert_awaited_once()
+        # ...and, seeing no Mem0 row, admits the write. Documented residual,
+        # not an oversight: closing it needs a Graphiti-side count the PRD
+        # does not specify. See _check_canonical_uniqueness's SCOPE note.
+        assert 'canonical_uniqueness_violation' not in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    async def test_graphiti_primary_canonical_is_rejected_when_a_mem0_twin_exists(
+        self, service
+    ):
+        """POSITIVE CONTROL for the scope test above.
+
+        Without it, "no rejection for decisions_and_rationale" could not
+        distinguish the documented Mem0 scope from the check simply being
+        dead for Graphiti-primary categories.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, 'add_memory',
+                metadata={'topic': self._TOPIC, 'canonical': True},
+                category='decisions_and_rationale',
+            )
+
+
+class TestCanonicalClaimChangeOnTheUpdatePath:
+    """The probe fires only on a NEW claim — so a record is never its OWN incumbent.
+
+    Task 3523. Wiring leaf ε's uniqueness re-check into `update_memory` raises
+    a question the add paths never face: the record being patched may ALREADY
+    hold the claim, and it is in the store, so a naive probe counts it and
+    rejects the record against itself.
+
+    Gating on the claim CHANGING dissolves that structurally rather than
+    patching around it. A probe is issued only when the write is ACQUIRING a
+    `(canonical, topic)` claim the record does not already hold — and a record
+    that does not yet hold the claim in the store cannot appear in the
+    store-side count. So no `exclude_id` is needed, and none should be added:
+    it would cost an extra round-trip on every canonical patch, need
+    `limit=2` to filter self out of the scroll, and risk over-excluding a real
+    duplicate.
+
+    It also preserves ε's contracted "ordinary writes issue ZERO extra
+    round-trips": re-asserting a claim the record already holds is a no-op,
+    and no-ops must not pay for I/O.
+    """
+
+    _TOPIC = 'some-topic'
+    _INCUMBENT = 'incumbent-uuid-1'
+    _POINT = 'point-1'
+
+    @staticmethod
+    def _stage(service, custom):
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value={**DEFAULT_POINT_PAYLOAD, **custom}
+        )
+
+    @staticmethod
+    def _assert_no_probe(service):
+        """Neither half of the two-round-trip probe may have been spent."""
+        service.mem0.count_by_metadata.assert_not_called()
+        service.mem0.scroll_by_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reasserting_a_held_claim_issues_no_probe(self, service):
+        """THE self-incumbency case, stated as the no-op it is.
+
+        A foreign incumbent is staged, so a probe that ran WOULD find one —
+        without that staging this would pass for the wrong reason.
+        """
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': True})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'canonical': True},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        self._assert_no_probe(service)
+
+    @pytest.mark.asyncio
+    async def test_patching_an_unrelated_key_on_a_canonical_record_issues_no_probe(
+        self, service
+    ):
+        """ε's zero-extra-round-trips property, on the update path.
+
+        Every patch to an already-canonical record would otherwise pay a
+        Qdrant count it can only ever answer with "yes, itself".
+        """
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': True})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'x_note': 'hi'},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        self._assert_no_probe(service)
+
+    @pytest.mark.asyncio
+    async def test_acquiring_the_claim_does_probe_and_names_the_incumbent(
+        self, service
+    ):
+        """POSITIVE CONTROL — without it the two `assert_not_called`s above
+        cannot distinguish "correctly gated" from "the check is dead on this
+        path".
+
+        The pre-image carries the topic but NOT `canonical`, so this write is
+        genuinely acquiring a claim it does not hold.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'canonical': True},
+            )
+
+        assert excinfo.value.incumbent_id == self._INCUMBENT
+        service.mem0.set_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_moving_the_claim_probes_the_new_topic(self, service):
+        """A claim that MOVES is acquired at the destination.
+
+        Asserted on the filters, not merely on "a probe happened": a gate
+        that compared only `canonical` would see no change here and skip the
+        check entirely, letting a canonical record be re-homed onto a topic
+        that already has one.
+        """
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': True})
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'topic': 'other-topic'},
+        )
+
+        service.mem0.count_by_metadata.assert_awaited_once()
+        call = service.mem0.count_by_metadata.await_args
+        filters = call.kwargs.get('filters', call.args[1] if len(call.args) > 1 else None)
+        assert filters == {'topic': 'other-topic', 'canonical': True}
+
+
+class TestParentIdLivenessAtSeam:
+    """Write-time `metadata.parent_id` LIVENESS (task 3197, leaf δ).
+
+    Leaf β pinned `validate_memory_metadata` as pure-by-construction — it
+    takes a dict and structurally cannot reach a store — and reserved
+    liveness for this leaf "at the seam". So the lookup lives in
+    `_apply_memory_metadata_validation`, and every case runs against BOTH
+    entry points: D8/§2 pin enforcement at the SERVICE seam precisely so
+    `add_system_record` cannot bypass it.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_live_parent_resolves_in_the_writes_own_project(
+        self, service, entry_point
+    ):
+        """One lookup, keyed by the WRITE's project_id.
+
+        Same-project scoping is structural, not a filter: `Scope` selects a
+        per-project Qdrant collection, so passing the write's own project_id
+        is what makes "same-project" true. A parent living in another
+        project's collection must not satisfy this check.
+        """
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value=dict(DEFAULT_POINT_PAYLOAD)
+        )
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'parent_id': _MM_UUID},
+            project_id='dark_factory',
+        )
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        service.mem0.get_point_by_id.assert_awaited_once()
+        args, _ = service.mem0.get_point_by_id.call_args
+        assert args[0] == _MM_UUID
+        assert args[1].project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_dead_parent_rejects_under_enforce_before_any_backend_call(
+        self, service, entry_point
+    ):
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        journal = _mm_install_journal(service)
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        assert 'dead_parent_id' in {v.code for v in excinfo.value.violations}
+        _mm_backend_mock(service, entry_point).assert_not_called()
+        # Rejection ordering: no write-ahead intent may be journalled for a
+        # write that never happened.
+        journal.log_mem0_intent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_dead_parent_censuses_and_proceeds_in_warn_mode(
+        self, service, entry_point, caplog
+    ):
+        """Warn mode never blocks a write — it produces the data that makes a
+        later `enforce` flip informed rather than blind."""
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+
+        await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'dead_parent_id' in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_no_parent_id_costs_no_round_trip(self, service, entry_point):
+        """The common write path pays nothing.
+
+        `parent_id` is absent from essentially every live record (leaf α
+        measured it at zero corpus footprint), so a lookup on every write
+        would be pure overhead on the hot path.
+        """
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value=dict(DEFAULT_POINT_PAYLOAD)
+        )
+
+        await _mm_write(service, entry_point, metadata={'topic': 'a-good-slug'})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        service.mem0.get_point_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_shape_invalid_parent_id_never_reaches_the_store(
+        self, service, entry_point, caplog
+    ):
+        """Liveness fires only AFTER the shape check passes.
+
+        No store could resolve 'not-a-uuid', so spending a round-trip on it
+        would be waste — and censusing `dead_parent_id` for it would blame
+        the wrong rule.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value=dict(DEFAULT_POINT_PAYLOAD)
+        )
+
+        await _mm_write(service, entry_point, metadata={'parent_id': 'not-a-uuid'})
+
+        service.mem0.get_point_by_id.assert_not_awaited()
+        codes = _mm_census_codes(caplog)
+        assert 'invalid_parent_id_shape' in codes
+        assert 'dead_parent_id' not in codes
+        assert 'parent_id_liveness_unavailable' not in codes
+
+    # -- lookup FAILURE is not the same fact as a dead parent -------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_lookup_failure_censuses_unavailable_not_dead_in_warn_mode(
+        self, service, entry_point, caplog
+    ):
+        """A timed-out read must never be reported as a dead parent.
+
+        `get_point_by_id` deliberately PROPAGATES a Qdrant read timeout
+        rather than collapsing it into None, precisely so the two facts stay
+        distinguishable; folding both into `dead_parent_id` would discard
+        that at the seam and tell an operator a live parent is dead. Warn
+        mode also keeps its promise: validation never blocks a write.
+        """
+        caplog.set_level(logging.WARNING)
+        assert service.config.memory_metadata.enforce is False
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=TimeoutError('qdrant read timeout')
+        )
+
+        await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        codes = _mm_census_codes(caplog)
+        assert 'parent_id_liveness_unavailable' in codes
+        assert 'dead_parent_id' not in codes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_lookup_failure_logs_the_raw_backend_cause(
+        self, service, entry_point, caplog
+    ):
+        """The backend cause is degraded, not discarded.
+
+        The census code says only "could not be checked"; without the
+        exception type in the log an operator debugging a burst of
+        `parent_id_liveness_unavailable` has nothing to correlate against.
+        """
+        caplog.set_level(logging.WARNING, logger='fused_memory.services.memory_service')
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=TimeoutError('qdrant read timeout')
+        )
+
+        await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        text = '\n'.join(r.getMessage() for r in caplog.records)
+        assert 'TimeoutError' in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_lookup_failure_fails_closed_under_enforce(
+        self, service, entry_point
+    ):
+        """INV-3: an actor that cannot corroborate must not act.
+
+        Blast radius is confined to writes that actually carry `parent_id`
+        — a population leaf α measured at zero live records — and only when
+        `enforce` is on.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=TimeoutError('qdrant read timeout')
+        )
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        codes = {v.code for v in excinfo.value.violations}
+        assert 'parent_id_liveness_unavailable' in codes
+        assert 'dead_parent_id' not in codes
+        _mm_backend_mock(service, entry_point).assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_backend_exception_never_leaks_past_the_seam(
+        self, service, entry_point
+    ):
+        """The MCP boundary must report the metadata contract, not a backend
+        detail: a raw TimeoutError there reads as a transport fault an agent
+        should retry, when the actual state is "this write was rejected"."""
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=TimeoutError('qdrant read timeout')
+        )
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+        assert type(excinfo.value) is MemoryMetadataValidationError
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_non_timeout_backend_failure_takes_the_same_arm(
+        self, service, entry_point, caplog
+    ):
+        """The mapping is "liveness is UNKNOWN", not "the timeout case".
+
+        Special-casing TimeoutError would leave every other transport fault
+        — a connection reset, a serialization error — falling through to
+        whatever the raw exception did.
+        """
+        caplog.set_level(logging.WARNING)
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=RuntimeError('qdrant transport blew up')
+        )
+
+        await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'parent_id_liveness_unavailable' in _mm_census_codes(caplog)
+
+
+# --- delete_memory parent-lifecycle gate (task 3197, leaf δ) ---------------
+#
+# PRD V3: "no operation may silently orphan a child or dangle a pointer it
+# could have seen." The gate is UNCONDITIONAL — deliberately not behind
+# `memory_metadata.enforce`, unlike the V1 shape checks — because it is a
+# lifecycle safety gate, not a vocabulary check, and behind a default-off
+# flag the orphan hole would stay open exactly as long as the flag stayed
+# off.
+
+# Full 36-char UUIDs, not readable handles: `delete_memory` validates id
+# SHAPE (`require_full_uuid`, task 3132) above the store branch, so a short
+# handle is refused before the child gate is ever reached — every id the
+# cascade re-enters with has to be well-formed too.
+def _dm_uuid(suffix: str) -> str:
+    """Build a canonical UUID ending in *suffix* (<=12 hex chars)."""
+    return f'00000000-0000-4000-8000-{suffix.rjust(12, "0")}'
+
+
+_DM_PARENT = _dm_uuid('d001')
+_DM_CHILD_A = _dm_uuid('d00a')
+_DM_CHILD_B = _dm_uuid('d00b')
+
+
+def _dm_children(svc, child_ids, *, count=None):
+    """Report *child_ids* as children of whatever is being deleted.
+
+    *count* defaults to ``len(child_ids)``; pass it explicitly to model a
+    count/scroll DISAGREEMENT (a bounded scroll, or a concurrent write
+    between the two reads).
+    """
+    svc.mem0.count_by_metadata = AsyncMock(
+        return_value=len(child_ids) if count is None else count
+    )
+    svc.mem0.scroll_by_metadata = AsyncMock(
+        return_value=[{'id': cid, 'metadata': {}} for cid in child_ids]
+    )
+
+
+def _dm_event_buffer(svc):
+    buffer = MagicMock()
+    buffer.push = AsyncMock()
+    svc._event_buffer = buffer
+    return buffer
+
+
+def _dm_deleted_ids(svc):
+    """Ids passed to the mem0 backend delete, in call order."""
+    return [call.args[0] for call in svc.mem0.delete.call_args_list]
+
+
+class TestDeleteMemoryChildRefusal:
+    """`delete_memory` refuses to orphan children (task 3197, leaf δ)."""
+
+    @pytest.mark.asyncio
+    async def test_refuses_and_names_every_child(self, service):
+        """The refusal is the task's user-observable signal.
+
+        An agent that trips it at the MCP wire receives only
+        `{'error': str(e), 'error_type': ...}`, so the ids have to be in
+        the message, not merely on the exception object.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        _dm_children(service, [_DM_CHILD_A, _DM_CHILD_B])
+
+        with pytest.raises(ParentHasChildrenError) as excinfo:
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+
+        assert excinfo.value.child_ids == [_DM_CHILD_A, _DM_CHILD_B]
+        text = str(excinfo.value)
+        assert _DM_CHILD_A in text
+        assert _DM_CHILD_B in text
+
+    @pytest.mark.asyncio
+    async def test_refusal_leaves_no_delete_no_journal_row_no_event(self, service):
+        """A refused delete must leave no trace claiming a deletion happened.
+
+        The gate therefore runs BEFORE the backend call, before
+        `log_write_op` and before the `memory_deleted` event — a journal row
+        or a reconciliation event for a delete that never happened would
+        make downstream recon act on a record that is still there.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        _dm_children(service, [_DM_CHILD_A])
+
+        with pytest.raises(ParentHasChildrenError):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+
+        service.mem0.delete.assert_not_awaited()
+        journal.log_write_op.assert_not_awaited()
+        buffer.push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_child_lookup_filter_and_project_scope(self, service):
+        """The gate asks exactly one question, in the delete's own project."""
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        _dm_children(service, [_DM_CHILD_A])
+
+        with pytest.raises(ParentHasChildrenError):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='dark_factory'
+            )
+
+        scope, filters = service.mem0.count_by_metadata.call_args.args[:2]
+        assert filters == {'parent_id': _DM_PARENT}
+        assert scope.project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_childless_delete_is_unchanged_and_costs_one_count(self, service):
+        """The common path pays one exact count and ZERO scrolls.
+
+        `delete_memory` has six in-repo recon callers including bulk pool
+        GC, so paying a full payload scroll per delete would be a real cost
+        for a listing nobody reads when there is nothing to list.
+        """
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        service.mem0.count_by_metadata = AsyncMock(return_value=0)
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        result = await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test'
+        )
+
+        assert result['status'] == 'deleted'
+        assert _dm_deleted_ids(service) == [_DM_PARENT]
+        journal.log_write_op.assert_awaited_once()
+        buffer.push.assert_awaited_once()
+        service.mem0.count_by_metadata.assert_awaited_once()
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_graphiti_delete_pays_no_child_lookup(self, service):
+        """`parent_id` is a Mem0 payload key — a Graphiti edge has none.
+
+        Charging the graphiti arm a Qdrant count for a relationship that
+        cannot exist there would be pure overhead.
+        """
+        service.mem0.count_by_metadata = AsyncMock(return_value=0)
+
+        await service.delete_memory(
+            memory_id=_dm_uuid('ed9e'), store='graphiti', project_id='test'
+        )
+
+        service.mem0.count_by_metadata.assert_not_awaited()
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_count_is_re_read_live_on_every_delete(self, service):
+        """INV-3: corroborate against the store, never against cached state.
+
+        A child can be written between two deletes, so a gate that trusted
+        a remembered "childless" answer would be checking history.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        service.mem0.count_by_metadata = AsyncMock(return_value=0)
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test'
+        )
+        assert service.mem0.count_by_metadata.await_count == 1
+
+        _dm_children(service, [_DM_CHILD_A])
+        with pytest.raises(ParentHasChildrenError):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+        assert service.mem0.count_by_metadata.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_scroll_shortfall_still_refuses_and_marks_truncated(self, service):
+        """A disagreement between the two reads is never downgraded.
+
+        If the scroll returns fewer ids than the live count — a bounded
+        scroll or a concurrent write — reporting "no children" would be the
+        exact silent orphan this gate exists to prevent, and reporting an
+        exhaustive-looking list would understate it.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        _dm_children(service, [_DM_CHILD_A], count=5)
+
+        with pytest.raises(ParentHasChildrenError) as excinfo:
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+
+        assert excinfo.value.truncated is True
+        assert 'at least' in str(excinfo.value)
+        service.mem0.delete.assert_not_awaited()
+
+
+
+
+class _DMGraph:
+    """A minimal parent→children Mem0 double for cascade tests.
+
+    Models the one relationship the gate reads (`metadata.parent_id`) plus
+    the effect a delete has on it, so cascade ORDER and TERMINATION are
+    exercised against state that actually changes — a static mock would let
+    an unbounded loop or a parent-first delete pass.
+    """
+
+    def __init__(self, edges, *, page_size=None):
+        #: parent id -> ids of records whose metadata.parent_id is that id
+        self.edges = {k: list(v) for k, v in edges.items()}
+        self.deleted = []
+        self.page_size = page_size
+
+    async def count(self, scope, filters):
+        return len(self.edges.get(filters['parent_id'], []))
+
+    async def scroll(self, scope, filters, limit):
+        rows = self.edges.get(filters['parent_id'], [])
+        bound = min(limit, self.page_size) if self.page_size else limit
+        return [{'id': r, 'metadata': {}} for r in rows[:bound]]
+
+    async def delete(self, memory_id, scope):
+        self.deleted.append(memory_id)
+        # A deleted record is nobody's child any more.
+        for kids in self.edges.values():
+            if memory_id in kids:
+                kids.remove(memory_id)
+        return {'message': 'deleted'}
+
+    def install(self, svc):
+        svc.mem0.count_by_metadata = AsyncMock(side_effect=self.count)
+        svc.mem0.scroll_by_metadata = AsyncMock(side_effect=self.scroll)
+        svc.mem0.delete = AsyncMock(side_effect=self.delete)
+        return self
+
+
+class TestDeleteMemoryCascade:
+    """`cascade=True` — the explicit opt-in (task 3197, leaf δ)."""
+
+    @pytest.mark.asyncio
+    async def test_cascade_deletes_children_and_parent(self, service):
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert sorted(graph.deleted) == sorted([_DM_CHILD_A, _DM_CHILD_B, _DM_PARENT])
+
+    @pytest.mark.asyncio
+    async def test_children_are_deleted_strictly_before_the_parent(self, service):
+        """THE load-bearing ordering assertion, not decoration.
+
+        Parent-first would re-open precisely the orphan window this task
+        closes: a crash between the parent's delete and the children's
+        leaves live children whose parent_id points at a dead uuid — still
+        recognised as children, still suppressed from grouped search,
+        content unreachable while remaining in Qdrant. Children-first fails
+        safe: the surviving state is "parent alive, some children gone",
+        which the refusal gate still protects and an operator can retry.
+        """
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted[-1] == _DM_PARENT
+        assert graph.deleted.index(_DM_CHILD_A) < graph.deleted.index(_DM_PARENT)
+        assert graph.deleted.index(_DM_CHILD_B) < graph.deleted.index(_DM_PARENT)
+
+    @pytest.mark.asyncio
+    async def test_every_child_gets_its_own_journal_row(self, service):
+        """Re-entering the SAME guarded delete per child is what buys this.
+
+        A second, unguarded `mem0.delete` loop would have deleted the same
+        records while producing one row for the parent only — the PRD's
+        "children deleted too, journalled" signal, silently absent.
+        """
+        journal = _mm_install_journal(service)
+        _DMGraph({_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        rows = {
+            call.kwargs['params']['memory_id']: call.kwargs
+            for call in journal.log_write_op.call_args_list
+        }
+        assert set(rows) == {_DM_CHILD_A, _DM_CHILD_B, _DM_PARENT}
+        for row in rows.values():
+            assert row['operation'] == 'delete_memory'
+            json.dumps(row['params'])  # rows are persisted as JSON
+        for child in (_DM_CHILD_A, _DM_CHILD_B):
+            assert rows[child]['params']['cascade'] is True
+            # The row must say WHOSE cascade took this record; without it a
+            # cascaded delete is indistinguishable from a direct one.
+            assert rows[child]['params']['cascade_parent_id'] == _DM_PARENT
+        parent_row = rows[_DM_PARENT]
+        assert sorted(parent_row['result_summary']['cascaded_child_ids']) == sorted(
+            [_DM_CHILD_A, _DM_CHILD_B]
+        )
+
+    @pytest.mark.asyncio
+    async def test_reported_ids_name_the_whole_destroyed_set(self, service):
+        """A grandchild is destroyed, so it must be NAMED as destroyed.
+
+        `cascaded_child_ids` is the only account of the operation an MCP
+        caller can read — they never see the server's journal. Reporting
+        the DIRECT children only would tell them a three-level cascade
+        A→B→C destroyed just B, leaving them to reconstruct the rest from a
+        log they have no access to.
+        """
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        grandchild = _dm_uuid('9a9a')
+        graph = _DMGraph(
+            {_DM_PARENT: [_DM_CHILD_A], _DM_CHILD_A: [grandchild]}
+        ).install(service)
+
+        result = await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted == [grandchild, _DM_CHILD_A, _DM_PARENT]
+        # Deepest-first, mirroring the order they were destroyed in.
+        assert result['cascaded_child_ids'] == [grandchild, _DM_CHILD_A]
+        parent_row = next(
+            call.kwargs for call in journal.log_write_op.call_args_list
+            if call.kwargs['params']['memory_id'] == _DM_PARENT
+        )
+        assert parent_row['result_summary']['cascaded_child_ids'] == [
+            grandchild, _DM_CHILD_A,
+        ]
+        parent_event = next(
+            call.args[0] for call in buffer.push.call_args_list
+            if call.args[0].payload['memory_id'] == _DM_PARENT
+        )
+        assert parent_event.payload['cascaded_child_ids'] == [
+            grandchild, _DM_CHILD_A,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_self_parent_terminates_and_deletes_once(self, service):
+        """A record whose own parent_id points at itself.
+
+        Without a visited set this recurses until RecursionError; with a
+        naive post-cascade count it would refuse forever, because the record
+        is its own surviving child right up until it is deleted.
+        """
+        graph = _DMGraph({_DM_PARENT: [_DM_PARENT]}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted == [_DM_PARENT]
+
+    @pytest.mark.asyncio
+    async def test_parent_cycle_terminates_and_deletes_each_once(self, service):
+        graph = _DMGraph(
+            {_DM_PARENT: [_DM_CHILD_A], _DM_CHILD_A: [_DM_PARENT]}
+        ).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted == [_DM_CHILD_A, _DM_PARENT]
+
+    @pytest.mark.asyncio
+    async def test_fan_out_beyond_one_scroll_page(self, service):
+        """The listing is bounded; the CASCADE must not be.
+
+        Stopping at one page would delete the parent while later-page
+        children survived — a silent orphan produced by the very operation
+        meant to prevent one.
+        """
+        kids = [_dm_uuid(f'c{i}') for i in range(5)]
+        graph = _DMGraph({_DM_PARENT: kids}, page_size=2).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert sorted(graph.deleted) == sorted([*kids, _DM_PARENT])
+        assert graph.deleted[-1] == _DM_PARENT
+
+    @pytest.mark.asyncio
+    async def test_partial_cascade_refuses_the_parent(self, service):
+        """Corroborate AFTER acting.
+
+        A child delete that DID NOT TAKE — the backend reported success and
+        the record is still there — must stop the parent's deletion.
+        Without this re-read the operation reports success while leaving an
+        orphan, the exact silent partial-failure class INV-3 exists to
+        close.
+
+        Note the survivor is a child this cascade already TRIED to delete.
+        A corroboration that excluded everything the cascade touched would
+        explain this away as "already handled" and find nothing — which is
+        why survivors are measured against the enclosing frames' in-flight
+        set only. (A child that merely raced in AFTER the cascade started
+        needs no refusal: the re-scroll loop picks it up and deletes it.)
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A]}).install(service)
+
+        async def delete_that_silently_does_not_take(memory_id, scope):
+            graph.deleted.append(memory_id)
+            if memory_id == _DM_CHILD_A:
+                return {'message': 'deleted'}  # ...but the record survives
+            return await graph.delete(memory_id, scope)
+
+        service.mem0.delete = AsyncMock(side_effect=delete_that_silently_does_not_take)
+
+        with pytest.raises(ParentHasChildrenError) as excinfo:
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+            )
+
+        assert excinfo.value.child_ids == [_DM_CHILD_A]
+        assert _DM_PARENT not in graph.deleted
+
+    @pytest.mark.asyncio
+    async def test_cascade_on_a_childless_entry_is_a_plain_delete(self, service):
+        graph = _DMGraph({}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted == [_DM_PARENT]
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cascade_on_a_graphiti_delete_is_refused(self, service):
+        """A request no store branch can honour is refused, not dropped.
+
+        `parent_id` is a Mem0 payload key, so the graphiti arm has nothing
+        to recurse on. Tolerating the flag deleted the edge and reported
+        plain success — while `log_write_op` and the `memory_deleted` event
+        still carried `cascade: True` with an empty `cascaded_child_ids`,
+        recording a cascade as requested-and-satisfied when nothing
+        recursive ever ran.
+        """
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+
+        with pytest.raises(ValueError, match='cascade'):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='graphiti', project_id='test',
+                cascade=True,
+            )
+
+        service.graphiti.remove_edge.assert_not_awaited()
+        journal.log_write_op.assert_not_awaited()
+        buffer.push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cascade_defaults_to_false(self, service):
+        """The destructive path is opt-IN. A caller that never heard of this
+        contract gets the refusal, not a silent recursive delete."""
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A]}).install(service)
+
+        with pytest.raises(ParentHasChildrenError):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+        assert graph.deleted == []
+
+
+class TestListDescendantIds:
+    """The read-only enumeration the citation gate pre-flights on.
+
+    The tool layer has to answer "what would this cascade destroy?" BEFORE
+    deciding to destroy it, so this walk must see the same tree the cascade
+    walks, in the same order, while mutating nothing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_level_tree_returns_every_descendant_deepest_first(
+        self, service
+    ):
+        """Same order the cascade destroys in — grandchild before child.
+
+        A gate that visited ids in a different order than the traversal it
+        gates would be reasoning about a different sequence than the one
+        that actually runs.
+        """
+        grandchild = _dm_uuid('9a1')
+        _DMGraph(
+            {
+                _DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B],
+                _DM_CHILD_A: [grandchild],
+            }
+        ).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert sorted(scan.ids) == sorted([_DM_CHILD_A, _DM_CHILD_B, grandchild])
+        assert scan.ids.index(grandchild) < scan.ids.index(_DM_CHILD_A)
+        assert _DM_PARENT not in scan.ids
+
+    @pytest.mark.asyncio
+    async def test_fully_visible_tree_is_not_truncated(self, service):
+        grandchild = _dm_uuid('9a1')
+        _DMGraph(
+            {
+                _DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B],
+                _DM_CHILD_A: [grandchild],
+            }
+        ).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan.truncated is False
+
+    @pytest.mark.asyncio
+    async def test_childless_target_scans_empty(self, service):
+        _DMGraph({}).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan == ([], False)
+
+    @pytest.mark.asyncio
+    async def test_scan_is_read_only(self, service):
+        """It runs BEFORE the caller has decided to delete anything.
+
+        A walk that deleted, journalled or emitted would turn the gate's
+        look-before-you-leap into the leap.
+        """
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A]}).install(service)
+
+        await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        service.mem0.delete.assert_not_awaited()
+        assert graph.deleted == []
+        journal.log_write_op.assert_not_awaited()
+        buffer.push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_self_parent_terminates(self, service):
+        _DMGraph({_DM_PARENT: [_DM_PARENT]}).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan.ids == []
+
+    @pytest.mark.asyncio
+    async def test_cycle_terminates_and_lists_each_id_once(self, service):
+        _DMGraph(
+            {_DM_PARENT: [_DM_CHILD_A], _DM_CHILD_A: [_DM_PARENT]}
+        ).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan.ids == [_DM_CHILD_A]
+
+    @pytest.mark.asyncio
+    async def test_partial_visibility_reports_truncated(self, service):
+        """THE load-bearing case.
+
+        A read-only walk cannot page past `_CHILD_SCAN_LIMIT` the way the
+        cascade can — the cascade only ever sees the next page because
+        deleting the previous one made it visible. So the enumeration has to
+        be able to say "I could not see all of them"; silently returning the
+        visible subset would let the gate read a partial set as complete and
+        clear a cascade over records it never checked.
+        """
+        _DMGraph(
+            {_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}, page_size=1
+        ).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan.truncated is True
+        assert scan.ids == [_DM_CHILD_A]

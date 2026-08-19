@@ -69,10 +69,68 @@ set -euo pipefail
 
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
 VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
+# Grace re-probe window (task 2961): the fleet's slowest-draining unit
+# (long merge-verifies, warm-lane drop-in -- reify in practice) can have its
+# restart job superseded/canceled and re-run by systemd's own supervision
+# AFTER VERIFY_TIMEOUT already expired, which previously made
+# restart_and_verify() declare the unit FAILED (and the caller escalate
+# critical) seconds before the unit actually came up fresh. Give a unit that
+# is still not fresh at the VERIFY_TIMEOUT deadline this many additional
+# seconds to re-probe into before genuinely declaring it failed.
+#
+# Serial-latency tradeoff (amend, task 2961): restart_and_verify() runs once
+# per unit in series, so a genuinely-dead unit now costs VERIFY_TIMEOUT +
+# VERIFY_GRACE (default 30s + 120s) to surface as a failure, and a whole-fleet
+# outage (e.g. a host reboot with every unit down) adds ~VERIFY_GRACE per dead
+# unit before the caller can escalate. Confirmed acceptable against the
+# fleet-deploy cadence, so the 120s default is deliberately kept:
+#   1. The escalating callers (deploy task before_done.script, merge-landed
+#      coordinator, watchdog backstop) fire this script DETACHED via
+#      `systemd-run --user ... --collect` (service_restart.py) -- a Type=simple
+#      transient unit with no runtime timeout -- so the extra grace only DELAYS
+#      a genuine FAILED verdict; it never manufactures a new kill/timeout.
+#   2. This same chokepoint's --drain gate already tolerates
+#      ORCH_RESTART_FORCE_FIRE_AFTER_SECS (default 4500s = 75m) of deferral PER
+#      busy unit, so the caller's runtime budget already dwarfs an added
+#      ~120s/unit for the (rarer) dead-unit case.
+#   3. The fleet redeploy re-fires at most once per
+#      orchestrator_restart_min_interval_secs (default 28800s = 8h), so even a
+#      ~7-unit outage's ~14m of added serial latency is <4% of one interval and
+#      only postpones an escalation that is not time-critical (a dead fleet
+#      stays dead until repaired regardless).
+# A cumulative per-run grace cap was considered and deliberately NOT added: it
+# could starve a legitimately slow-draining unit restarted late in the run of
+# its full grace, reintroducing the exact false-FAILED escalation this fixes.
+VERIFY_GRACE="${RESTART_VERIFY_GRACE_SECS:-120}"
 SELF_UNIT="${SELF_UNIT:-orchestrator-dark-factory.service}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
+# Fleet-common heartbeat directory (read-only here: the sole use is the
+# drain_check.py --fleet-dir gate below, under --drain).
+#
+# Its default is an ABSOLUTE path while the CLOCK_FILE default six lines down
+# is $REPO_DIR-relative. That asymmetry is DELIBERATE, not an oversight, and
+# "fixing" it to match its neighbour would be a fail-SOFT in the drain gate:
+#   - data/fleet/ is a MACHINE-GLOBAL, CROSS-PROJECT rendezvous directory
+#     (task 2395's Open-Q2, decided at decompose) -- measured 2026-08-07 and
+#     again 2026-08-09 holding live heartbeats for SEVEN different projects'
+#     orchestrators. It sits under dark-factory/data/ only because dark-factory
+#     is the fleet HOST, not because it is a dark-factory repo artifact. Made
+#     $REPO_DIR-relative, every .worktrees/<id> checkout would resolve to its
+#     own EMPTY data/fleet, read ZERO heartbeats, and silently conclude the
+#     fleet is absent.
+#   - the deploy CLOCK, by contrast, IS a dark-factory repo artifact, for which
+#     per-checkout is the correct scope. Hence the two differ.
+#
+# Test isolation is achieved by SETTING ORCH_FLEET_DIR
+# (df_pytest_isolation._df_fleet_dir_redirect redirects the whole pytest
+# session), never by changing this default. Pinned across all four mirrors --
+# this line, drain_check.DEFAULT_FLEET_DIR,
+# orchestrator.fleet_heartbeat.DEFAULT_FLEET_DIR and
+# df_pytest_isolation.LIVE_FLEET_DIR -- by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_dir_default_matches_across_tiers
+# (task 3799). Read that test before changing this value.
 FLEET_DIR="${ORCH_FLEET_DIR:-/home/leo/src/dark-factory/data/fleet}"
 # Shared fleet-deploy clock (task 2396, fleet-redeploy β): this script is the
 # SOLE on-disk writer, stamped only once every unit has verified fresh below.
@@ -84,6 +142,10 @@ FORCE_FIRE_AFTER_SECS="${ORCH_RESTART_FORCE_FIRE_AFTER_SECS:-4500}"
 DRAIN_FRESH_WINDOW_SECS="${ORCH_DRAIN_FRESH_WINDOW_SECS:-120}"
 DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"
 DRAIN_UNKNOWN_GRACE_SECS="${ORCH_DRAIN_UNKNOWN_GRACE_SECS:-120}"
+# Return channel for drain_await_fresh -- never declare 'local' anywhere
+# (full contract and incident rationale live in drain_await_fresh's own
+# docstring, task 3852).
+_DRAIN_VERDICT=""
 
 DRAIN_ENABLED=0
 for arg in "$@"; do
@@ -136,6 +198,27 @@ restart_and_verify() {
         fi
         sleep 1
     done
+
+    # Grace re-probe (task 2961): VERIFY_TIMEOUT expired without seeing a
+    # fresh ActiveEnterTimestampMonotonic, but a slow-draining unit's actual
+    # stop/start can still be in flight underneath a superseded/canceled
+    # restart job -- declaring FAILED here, before that in-flight start has
+    # had a chance to land, produces a false failure/escalation for a unit
+    # that verifies fresh moments later. Re-probe on the same cadence for up
+    # to VERIFY_GRACE more seconds before giving up for real.
+    echo -n " not yet fresh after ${VERIFY_TIMEOUT}s, re-probing for up to ${VERIFY_GRACE}s more..."
+    deadline=$((SECONDS + VERIFY_GRACE))
+    while [[ $SECONDS -lt $deadline ]]; do
+        state="$(get_state "$unit")"
+        pid="$(read_field "$state" MainPID)"
+        active="$(read_field "$state" ActiveState)"
+        mono="$(read_field "$state" ActiveEnterTimestampMonotonic)"
+        if [[ "$pid" -gt 0 && "$active" == "active" && "$mono" -gt "$baseline_mono" ]]; then
+            echo " OK (new MainPID=${pid}, verified fresh during grace re-probe)"
+            return 0
+        fi
+        sleep 1
+    done
     echo " FAILED"
     return 1
 }
@@ -173,25 +256,73 @@ drain_check_verdict() {
 drain_await_fresh() {
     # $1 = unit name.  Waits up to DRAIN_UNKNOWN_GRACE_SECS for a stale or
     # absent heartbeat to become fresh (idle or busy), re-polling every
-    # DRAIN_POLL_INTERVAL_SECS.  Prints the resulting verdict to stdout ONLY
-    # -- idle or busy if a fresh reading appeared before the grace elapsed,
-    # or the original stale/absent verdict if the grace elapsed with no
-    # fresh reading (fail-toward-convergence: the caller proceeds with the
-    # restart).  Emits no journal lines itself, so it is safe to call via
-    # command substitution from anywhere in drain_gate.
+    # DRAIN_POLL_INTERVAL_SECS.  Contract: sets the module-global
+    # _DRAIN_VERDICT to the resulting verdict -- idle or busy if a fresh
+    # reading appeared before the grace elapsed, or the original
+    # stale/absent verdict if the grace elapsed with no fresh reading
+    # (fail-toward-convergence: the caller proceeds with the restart) --
+    # returns 0, and prints nothing to stdout.
+    #
+    # MUST be invoked as a plain command, e.g. `drain_await_fresh "$unit"`
+    # then read `$_DRAIN_VERDICT` -- and MUST NEVER be called via command
+    # substitution (`verdict="$(drain_await_fresh "$unit")"`). Command
+    # substitution runs this function's poll loop inside a forked
+    # subshell; a SIGKILL of the top-level script pid does not reach that
+    # subshell, so it survives, reparents to systemd --user, and keeps
+    # forking one `python3 drain_check.py` per DRAIN_POLL_INTERVAL_SECS
+    # for up to DRAIN_UNKNOWN_GRACE_SECS more -- an orphan observed
+    # running for ~27.8h in the wild before being manually reaped (task
+    # 3852).
+    #
+    # The reset below (before anything else, including the BASH_SUBSHELL
+    # check) and that check itself are this function's own two-part guard
+    # of the contract above; drain_gate's _drain_validate_verdict is a
+    # further, independent backstop -- see that function for why it is
+    # still needed even with this guard in place (task 3852).
+    _DRAIN_VERDICT=""
+    if [[ ${BASH_SUBSHELL:-0} -ne 0 ]]; then
+        echo "BUG(task 3852): drain_await_fresh must run in the main shell, not a subshell (BASH_SUBSHELL=$BASH_SUBSHELL); its poll loop would survive a kill of the top-level script pid" >&2
+        return 1
+    fi
     local unit="$1"
-    local verdict grace_start elapsed_grace
-    verdict="$(drain_check_verdict "$unit")"
+    local grace_start elapsed_grace
+    _DRAIN_VERDICT="$(drain_check_verdict "$unit")"
     grace_start=$SECONDS
-    while [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; do
+    while [[ "$_DRAIN_VERDICT" == "stale" || "$_DRAIN_VERDICT" == "absent" ]]; do
         elapsed_grace=$((SECONDS - grace_start))
         if [[ $elapsed_grace -ge $DRAIN_UNKNOWN_GRACE_SECS ]]; then
             break
         fi
         sleep "$DRAIN_POLL_INTERVAL_SECS"
-        verdict="$(drain_check_verdict "$unit")"
+        _DRAIN_VERDICT="$(drain_check_verdict "$unit")"
     done
-    printf '%s\n' "$verdict"
+    return 0
+}
+
+_drain_validate_verdict() {
+    # $1 = unit name (for the error message only), $2 = verdict to check.
+    # Defensive backstop, independent of drain_await_fresh's own guard
+    # (task 3852): drain_gate must never branch on a verdict that is not
+    # one of the four tokens drain_check_verdict can produce -- mirroring
+    # the token-whitelist coercion drain_check_verdict already applies to
+    # its own python3 subprocess output. It earns its keep even with
+    # drain_await_fresh's BASH_SUBSHELL guard in place because that guard
+    # can be silently defeated: combining the declaration with the
+    # command substitution, e.g. `local verdict="$(drain_await_fresh
+    # "$unit")"`, makes bash report the exit status of `local` (always 0)
+    # rather than the subshell's, so `set -e` never sees the failure
+    # (shellcheck SC2155) and the run would otherwise continue on
+    # whatever verdict resulted. Aborting loudly here on any unrecognized
+    # value is the alternative to drain_gate silently falling through
+    # into its busy-defer branch (withholding a restart for up to
+    # FORCE_FIRE_AFTER_SECS) for a unit that was actually stale/absent.
+    case "$2" in
+        idle|busy|stale|absent) ;;
+        *)
+            echo "BUG(task 3852): drain_await_fresh produced verdict '$2' for unit $1" >&2
+            exit 1
+            ;;
+    esac
 }
 
 drain_gate() {
@@ -220,7 +351,9 @@ drain_gate() {
     #   indefinitely.
     local unit="$1"
     local verdict start_secs elapsed
-    verdict="$(drain_await_fresh "$unit")"
+    drain_await_fresh "$unit"
+    verdict="$_DRAIN_VERDICT"
+    _drain_validate_verdict "$unit" "$verdict"
 
     if [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; then
         echo "proceeding with restart of ${unit}: heartbeat ${verdict} after ${DRAIN_UNKNOWN_GRACE_SECS}s grace"
@@ -249,7 +382,9 @@ drain_gate() {
         if [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; then
             # Stopped heartbeating mid-defer -- apply the shorter bounded
             # grace instead of continuing to wait out the full busy grace.
-            verdict="$(drain_await_fresh "$unit")"
+            drain_await_fresh "$unit"
+            verdict="$_DRAIN_VERDICT"
+            _drain_validate_verdict "$unit" "$verdict"
             if [[ "$verdict" == "idle" ]]; then
                 echo "resuming restart of ${unit}: drained"
                 return 0

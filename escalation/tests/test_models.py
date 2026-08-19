@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import json
+import logging
+from typing import Any
+
+import pytest
 
 from escalation.models import (
     BORN_AT_L2_SEVERITIES,
+    KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
+    SEVERITY_RANK,
     Escalation,
     EvidenceEntry,
+    IndexHealthState,
     TrainState,
+    max_severity,
 )
 
 
@@ -325,6 +333,135 @@ class TestEscalationTrainState:
         restored = Escalation.from_json(old_json)
         assert restored.train_state is None, (
             f"Expected train_state=None for legacy JSON, got {restored.train_state!r}"
+        )
+
+
+class TestEscalationIndexHealthField:
+    """Escalation carries a structured index_health payload (task 3709, PRD δ D8+D11).
+
+    A `recon_missing_index` escalation must expose the drifted graph and the
+    missing index specs as FIRST-CLASS FIELDS (INV-2), so no consumer parses
+    `summary`/`detail` prose to recover a fact the emitter had in a variable.
+    These three properties are exactly what the additive zero-migration
+    precedent (`train_state`, `granted_files`) relies on.
+    """
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        # Annotated dict[str, Any]: without it the literal infers as
+        # dict[str, str], and the ** unpack then reports every non-str field
+        # (level, index_health, evidence, ...) as a type error.
+        base: dict[str, Any] = {
+            'id': 'esc-graph:dark_factory-0001',
+            'task_id': 'graph:dark_factory',
+            'agent_role': 'reconciliation-index-drift',
+            'severity': 'blocking',
+            'category': 'recon_missing_index',
+            'summary': 'graph dark_factory is missing 3 expected indices',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    # --- (a) default is None ---
+
+    def test_index_health_default_is_none(self):
+        """Escalation constructed without index_health has index_health=None."""
+        esc = self._make_base_esc()
+        assert esc.index_health is None
+
+    def test_index_health_default_is_none_in_to_dict(self):
+        """to_dict() surfaces the None default rather than dropping the key."""
+        esc = self._make_base_esc()
+        d = esc.to_dict()
+        assert 'index_health' in d
+        assert d['index_health'] is None
+
+    # --- (b) round-trip with nested lists preserved ---
+
+    def test_index_health_round_trip_via_to_dict_from_dict(self):
+        """index_health payload is preserved through to_dict() / from_dict()."""
+        ih: IndexHealthState = {
+            'group_id': 'dark_factory',
+            'missing': [['Entity', 'NODE', 'name', 'RANGE']],
+            'unexpected': [],
+            'expected_total': 38,
+        }
+        esc = self._make_base_esc(level=1, index_health=ih)
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.index_health == ih
+
+    def test_index_health_round_trip_via_to_json_from_json(self):
+        """index_health survives JSON serialisation with nested lists intact.
+
+        Specs are carried as JSON LISTS (not tuples) precisely so the on-disk
+        record round-trips identically — a tuple would come back as a list and
+        break equality for any consumer that compares payloads.
+        """
+        ih: IndexHealthState = {
+            'group_id': 'dark_factory',
+            'missing': [['Entity', 'NODE', 'name', 'RANGE']],
+            'unexpected': [],
+            'expected_total': 38,
+        }
+        esc = self._make_base_esc(level=1, index_health=ih)
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.index_health == ih
+        assert restored.index_health is not None
+        assert restored.index_health['missing'] == [['Entity', 'NODE', 'name', 'RANGE']]
+        assert restored.to_json() == esc.to_json()
+
+    def test_index_health_appears_in_to_json_output(self):
+        """index_health is serialised (not silently dropped) when set."""
+        ih: IndexHealthState = {
+            'group_id': 'dark_factory',
+            'missing': [['Entity', 'NODE', 'name', 'RANGE'], ['Episodic', 'NODE', 'uuid', 'RANGE']],
+            'unexpected': [['Entity', 'NODE', 'custom_field', 'RANGE']],
+            'expected_total': 38,
+        }
+        esc = self._make_base_esc(index_health=ih)
+        d = json.loads(esc.to_json())
+        assert 'index_health' in d
+        assert d['index_health'] == ih
+        assert d['index_health']['group_id'] == 'dark_factory'
+        assert len(d['index_health']['missing']) == 2
+
+    # --- (c) legacy JSON backward compat (zero migration) ---
+
+    def test_from_dict_legacy_json_omits_index_health(self):
+        """from_json() on JSON without index_health returns None (backward compat).
+
+        The `__dataclass_fields__` filter in from_dict is what makes the field
+        additive: pre-3709 records on disk deserialise unchanged, no migration.
+        """
+        old_dict = {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without index_health',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'train_state': None,
+            # NOTE: index_health is intentionally absent
+        }
+        restored = Escalation.from_json(json.dumps(old_dict))
+        assert restored.index_health is None, (
+            f'Expected index_health=None for legacy JSON, got {restored.index_health!r}'
         )
 
 
@@ -967,3 +1104,291 @@ class TestEscalationGrantedFiles:
         assert restored.granted_files == [], (
             f"Expected granted_files=[] for legacy JSON, got {restored.granted_files!r}"
         )
+
+
+class TestFilingClaimantRunId:
+    """Escalation carries the FILING incarnation's claimant identity (task 3533).
+
+    These tests pin the FIELD's storage/round-trip behaviour only.  What the
+    identity MEANS, and the fail-safe rule applied to it, are documented once
+    on ``escalation.pins.classify_pins`` and exercised in tests/test_pins.py.
+    """
+
+    #: Real ``compose_claimant_run_id`` output shape.
+    IDENTITY = 'run-abc/3533-f3af2d2a/pid=1234'
+
+    def _make_base_esc(self) -> Escalation:
+        return Escalation(
+            id='esc-task-3533-0001',
+            task_id='3533',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='s',
+        )
+
+    # --- (a) default is None ---
+
+    def test_filing_claimant_run_id_defaults_to_none(self):
+        """A minimally-constructed Escalation has filing_claimant_run_id=None."""
+        esc = self._make_base_esc()
+        assert esc.filing_claimant_run_id is None
+
+    # --- (b) construction preserves a real identity string ---
+
+    def test_filing_claimant_run_id_preserved_on_construction(self):
+        """filing_claimant_run_id is stored verbatim (no parsing/normalisation)."""
+        esc = Escalation(
+            id='esc-task-3533-0001',
+            task_id='3533',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='s',
+            filing_claimant_run_id=self.IDENTITY,
+        )
+        assert esc.filing_claimant_run_id == self.IDENTITY
+
+    # --- (c) round-trip via to_dict / from_dict ---
+
+    def test_filing_claimant_run_id_appears_in_to_dict(self):
+        """to_dict() carries the key (not silently dropped)."""
+        esc = Escalation(
+            id='esc-task-3533-0001',
+            task_id='3533',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='s',
+            filing_claimant_run_id=self.IDENTITY,
+        )
+        d = esc.to_dict()
+        assert 'filing_claimant_run_id' in d
+        assert d['filing_claimant_run_id'] == self.IDENTITY
+
+    def test_filing_claimant_run_id_round_trip_via_to_dict_from_dict(self):
+        """Escalation.from_dict(esc.to_dict()) round-trips the identity exactly."""
+        esc = Escalation(
+            id='esc-task-3533-0001',
+            task_id='3533',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='s',
+            filing_claimant_run_id=self.IDENTITY,
+        )
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.filing_claimant_run_id == self.IDENTITY
+
+    # --- (d) round-trip via to_json / from_json ---
+
+    def test_filing_claimant_run_id_round_trip_via_to_json_from_json(self):
+        """Escalation.from_json(esc.to_json()) round-trips the identity exactly."""
+        esc = Escalation(
+            id='esc-task-3533-0001',
+            task_id='3533',
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary='s',
+            filing_claimant_run_id=self.IDENTITY,
+        )
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.filing_claimant_run_id == self.IDENTITY
+
+    # --- (e) legacy JSON backward compat (zero-migration) ---
+
+    def _legacy_payload(self) -> dict:
+        """A pre-3533 on-disk payload — every field EXCEPT filing_claimant_run_id."""
+        return {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without filing_claimant_run_id',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'evidence': [],
+            'train_state': None,
+            'resolution_action': None,
+            'resolution_class': None,
+            'triaged_at': None,
+            'triaged_by': None,
+            'triage_note': '',
+            'updated_at': None,
+            'granted_files': [],
+            # NOTE: filing_claimant_run_id is intentionally absent
+        }
+
+    def test_from_dict_legacy_payload_omits_filing_claimant_run_id(self):
+        """Legacy JSON without the key deserialises to None — zero migration."""
+        restored = Escalation.from_dict(self._legacy_payload())
+        assert restored.filing_claimant_run_id is None, (
+            f'Expected None for legacy JSON, got {restored.filing_claimant_run_id!r}'
+        )
+
+    def test_from_json_legacy_payload_does_not_raise(self):
+        """Legacy JSON deserialises through from_json without raising."""
+        restored = Escalation.from_json(json.dumps(self._legacy_payload()))
+        assert restored.id == 'esc-task-1-0001'
+        assert restored.filing_claimant_run_id is None
+
+    # --- (f) the __dataclass_fields__ filter is not weakened ---
+
+    def test_unknown_extra_key_is_still_dropped(self):
+        """An unknown payload key is dropped by from_dict's __dataclass_fields__ filter."""
+        payload = self._legacy_payload()
+        payload['not_a_real_field'] = 'boom'
+        restored = Escalation.from_dict(payload)
+        assert not hasattr(restored, 'not_a_real_field')
+
+
+class TestTimestampIsStampedFromTheLiveClock:
+    """REGRESSION PIN, not a fix — no timestamp defect exists (task 3236).
+
+    ``Escalation.timestamp`` is stamped by a per-instance
+    ``field(default_factory=...)`` off the live clock, so the backdating the
+    task asked about has no cause in the stamping code.  This pins the two
+    falsifiable regression classes: a stamp hoisted to an import-time
+    ``field(default=...)`` (every record in a process would share one value),
+    and a tz-naive stamp (``datetime.now()`` without UTC).
+    """
+
+    def test_two_constructions_get_distinct_non_decreasing_aware_timestamps(self):
+        """Each construction gets its own tz-aware stamp from the live clock."""
+        import time
+        from datetime import datetime
+
+        first = Escalation(
+            id='esc-1-1', task_id='1', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s',
+        )
+        time.sleep(0.01)
+        second = Escalation(
+            id='esc-1-2', task_id='1', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s',
+        )
+
+        assert first.timestamp != second.timestamp, (
+            'Both Escalations share one timestamp — the stamp looks hoisted to '
+            'an import-time constant rather than a per-instance default_factory'
+        )
+        assert datetime.fromisoformat(first.timestamp).tzinfo is not None, (
+            f'Naive timestamp: {first.timestamp!r}'
+        )
+        assert datetime.fromisoformat(second.timestamp) >= datetime.fromisoformat(
+            first.timestamp,
+        ), 'Timestamps must be non-decreasing across constructions'
+
+
+class TestSeverityRank:
+    """`escalation.models` owns a COMPLETE, public severity ordering (task 3976).
+
+    The ordering `info < blocking < critical < urgent` is not invented here: it
+    mirrors the repo's only other canonical escalation-severity ranking,
+    `cockpit/src/cockpit/priority.py:257` `_ESCALATION_SEVERITIES` and its
+    `severity_weights` (`:98-115`, urgent 6.0 > critical 5.0 > blocking 2.5 >
+    info 0.25).  Keeping the two traceably one decision is the point — two
+    independent guesses would drift.
+
+    These tests exist because `queue._SEVERITY_RANK` was `{'info': 0,
+    'blocking': 1}`: `critical`/`urgent` both fell to the rank-0 unknown
+    fail-soft, making the fold ORDER-DEPENDENT for them.
+    """
+
+    def test_rank_is_total_over_known_severities(self):
+        """(a) SEVERITY_RANK covers exactly KNOWN_SEVERITIES — no gaps, no extras.
+
+        A severity added to the vocabulary without a rank must be a loud test
+        failure, not a silent rank-0 that reads as info-level.
+        """
+        assert set(SEVERITY_RANK) == set(KNOWN_SEVERITIES), (
+            f'SEVERITY_RANK keys {sorted(SEVERITY_RANK)} != '
+            f'KNOWN_SEVERITIES {sorted(KNOWN_SEVERITIES)}'
+        )
+
+    def test_ordering_is_info_blocking_critical_urgent(self):
+        """(b) Ranks ascend info < blocking < critical < urgent."""
+        assert (
+            SEVERITY_RANK['info']
+            < SEVERITY_RANK['blocking']
+            < SEVERITY_RANK['critical']
+            < SEVERITY_RANK['urgent']
+        ), f'Unexpected ordering: {SEVERITY_RANK}'
+
+    def test_born_at_l2_severities_all_outrank_blocking(self):
+        """(b) Every born-at-L2 severity outranks 'blocking'."""
+        for sev in BORN_AT_L2_SEVERITIES:
+            assert SEVERITY_RANK[sev] > SEVERITY_RANK['blocking'], (
+                f'{sev!r} (born-at-L2) must outrank blocking; got {SEVERITY_RANK}'
+            )
+
+    @pytest.mark.parametrize(
+        ('a', 'b', 'expected'),
+        [
+            ('info', 'blocking', 'blocking'),
+            ('info', 'critical', 'critical'),
+            ('info', 'urgent', 'urgent'),
+            ('blocking', 'critical', 'critical'),
+            ('blocking', 'urgent', 'urgent'),
+            ('critical', 'urgent', 'urgent'),
+        ],
+    )
+    def test_max_severity_returns_higher_urgency(self, a: str, b: str, expected: str):
+        """(c) max_severity returns the higher-urgency of the two."""
+        assert max_severity(a, b) == expected
+        assert max_severity(b, a) == expected
+
+    @pytest.mark.parametrize('a', sorted(KNOWN_SEVERITIES))
+    @pytest.mark.parametrize('b', sorted(KNOWN_SEVERITIES))
+    def test_max_severity_is_order_independent(self, a: str, b: str):
+        """(c) max_severity(x, y) == max_severity(y, x) over every known pair."""
+        assert max_severity(a, b) == max_severity(b, a), (
+            f'Order-dependent fold: max_severity({a!r}, {b!r}) != '
+            f'max_severity({b!r}, {a!r})'
+        )
+
+    def test_info_vs_critical_regression(self):
+        """(c) Explicit regression for the live bug in queue._SEVERITY_RANK.
+
+        `queue._max_severity('info', 'critical')` returned `'info'` — both
+        arguments fell to rank 0 and the `>=` tie-break handed the win to `a`.
+        """
+        assert max_severity('info', 'critical') == 'critical'
+        assert max_severity('critical', 'info') == 'critical'
+
+    def test_unknown_severity_fails_soft_to_rank_zero(self, caplog):
+        """(d) An unknown severity is treated as rank 0 and WARNs — never raises."""
+        with caplog.at_level(logging.WARNING, logger='escalation.models'):
+            result = max_severity('warn', 'blocking')
+
+        assert result == 'blocking'
+        warned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'warn' in r.getMessage()
+        ]
+        assert warned, (
+            'Expected a WARNING naming the unrecognised severity; '
+            f'got records: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_unknown_vs_unknown_is_deterministic(self):
+        """(e) Unknown-vs-unknown resolves on the first argument, not arbitrarily."""
+        assert max_severity('warn', 'wat') == 'warn'
+        assert max_severity('wat', 'warn') == 'wat'

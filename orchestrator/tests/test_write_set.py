@@ -26,7 +26,11 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.agents.write_set import WriteSet, compute_write_set
+from orchestrator.agents.write_set import (
+    WriteSet,
+    compute_write_set,
+    ensure_claude_fleet_dir,
+)
 from orchestrator.artifacts import TaskArtifacts
 
 
@@ -266,3 +270,118 @@ class TestGitdirParsingRobustness:
 
         assert ws.git_worktree_admin == admin.resolve()
         assert ws.git_objects == (main_git / 'objects').resolve()
+
+
+# ---------------------------------------------------------------------------
+# OS-sandbox β2 (task 2909): WriteSet.digest()
+# ---------------------------------------------------------------------------
+
+
+def _make_write_set(**overrides: Path) -> WriteSet:
+    """Construct a WriteSet from dummy Paths (hermetic — digest() depends
+    ONLY on writable_paths(), which needs no filesystem)."""
+    fields: dict[str, Path] = dict(
+        worktree=Path('/wt'),
+        task_meta=Path('/base/.task-meta/wt'),
+        git_objects=Path('/main/.git/objects'),
+        git_task_refs=Path('/main/.git/refs/heads/task'),
+        git_task_reflogs=Path('/main/.git/logs/refs/heads/task'),
+        git_worktree_admin=Path('/main/.git/worktrees/wt'),
+        uv_cache=Path('/home/.cache/uv'),
+        claude_fleet=Path('/home/.claude/fleet'),
+        tmp=Path('/tmp'),
+        dev=Path('/dev'),
+    )
+    fields.update(overrides)
+    return WriteSet(**fields)
+
+
+class TestWriteSetDigest:
+    """Pins WriteSet.digest() — the single owner (INV-5) of the stable
+    writable-set hash the β2 ``sandbox_applied`` event carries so an operator
+    can diff exactly what a given invocation could touch (INV-2). It is a
+    sha256 over the contract-ordered ``writable_paths()`` strings.
+    """
+
+    def test_digest_is_deterministic_across_calls(self):
+        # (a) Same WriteSet → identical hex string across two calls.
+        ws = _make_write_set()
+        assert ws.digest() == ws.digest()
+
+    def test_equal_writable_paths_produce_equal_digest(self):
+        # (b) Two independently-built WriteSets with identical writable_paths()
+        # produce the same digest.
+        a = _make_write_set()
+        b = _make_write_set()
+        assert a.writable_paths() == b.writable_paths()
+        assert a.digest() == b.digest()
+
+    def test_one_differing_path_changes_digest(self):
+        # (c) A WriteSet differing in exactly one writable path yields a
+        # different digest.
+        base = _make_write_set()
+        changed = _make_write_set(worktree=Path('/other-wt'))
+        assert base.writable_paths() != changed.writable_paths()
+        assert base.digest() != changed.digest()
+
+    def test_digest_is_64_char_lowercase_sha256_hex(self):
+        # (d) Shape: a 64-char lowercase sha256 hex string.
+        digest = _make_write_set().digest()
+        assert isinstance(digest, str)
+        assert len(digest) == 64
+        assert digest == digest.lower()
+        assert all(c in '0123456789abcdef' for c in digest)
+
+
+# ---------------------------------------------------------------------------
+# task 2996: ensure_claude_fleet_dir() — side-effecting pre-creation helper
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureClaudeFleetDir:
+    """Pins ``ensure_claude_fleet_dir(write_set) -> bool`` — the SEPARATE,
+    explicitly side-effecting helper that materializes ~/.claude/fleet OUTSIDE
+    the sandbox before dispatch (task 2996).
+
+    ``compute_write_set`` stays PURE (``test_purity_no_makedirs_side_effect``);
+    this helper is the one place the load-bearing ``claude_fleet`` carve-out is
+    created so BOTH backends can grant it (neither can --bind / add a
+    nonexistent path with parent ~/.claude read-only). Hermetic: ``claude_fleet``
+    always points under ``tmp_path`` — never the real ~/.claude.
+    """
+
+    def test_creates_dir_and_missing_parents_when_absent(self, tmp_path: Path):
+        # (a) parents=True: a claude_fleet whose parent does not yet exist is
+        # created in full, and the call reports success.
+        claude_fleet = tmp_path / 'nonexistent-home' / '.claude' / 'fleet'
+        ws = _make_write_set(claude_fleet=claude_fleet)
+        assert not claude_fleet.exists()
+        assert not claude_fleet.parent.exists()  # missing parent chain
+
+        assert ensure_claude_fleet_dir(ws) is True
+
+        assert claude_fleet.is_dir()
+        assert claude_fleet.parent.is_dir()  # parents=True built the chain
+
+    def test_idempotent_when_dir_already_exists(self, tmp_path: Path):
+        # (b) exist_ok=True: a second call on an already-present dir returns
+        # True and does not raise.
+        claude_fleet = tmp_path / '.claude' / 'fleet'
+        ws = _make_write_set(claude_fleet=claude_fleet)
+        assert ensure_claude_fleet_dir(ws) is True
+        assert claude_fleet.is_dir()
+
+        assert ensure_claude_fleet_dir(ws) is True
+        assert claude_fleet.is_dir()
+
+    def test_returns_false_when_mkdir_raises_oserror(self, tmp_path: Path):
+        # (c) failure path: a regular FILE cannot be a parent dir, so
+        # mkdir(parents=True) raises NotADirectoryError (an OSError subclass),
+        # which the helper catches -> returns False, and nothing is created.
+        blocker = tmp_path / 'blocker'
+        blocker.write_text('i am a regular file, not a directory\n')
+        claude_fleet = blocker / 'fleet'
+        ws = _make_write_set(claude_fleet=claude_fleet)
+
+        assert ensure_claude_fleet_dir(ws) is False
+        assert not claude_fleet.exists()

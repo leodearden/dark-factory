@@ -12,14 +12,20 @@ Covers:
 from __future__ import annotations
 
 import contextlib
-import os
-import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params, make_rebuild_detail
-from falkordb import FalkorDB as _SyncFalkorDB
+from _fm_helpers import (
+    FALKOR_HOST,
+    FALKOR_PORT,
+    assert_ro_query_only,
+    extract_cypher,
+    extract_params,
+    falkor_skipif,
+    make_rebuild_detail,
+    unique_graph_name,
+)
 from falkordb.asyncio import FalkorDB
 
 from fused_memory.backends.graphiti_client import (
@@ -403,9 +409,15 @@ class TestGetAllValidEdges:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        call_args = graph.ro_query.call_args
-        assert call_args is not None, "graph.ro_query was not called"
-        cypher = extract_cypher(call_args)
+        # The read is paginated (task 4340), so `call_args` is only the LAST
+        # call — read the SKIP/LIMIT page query explicitly instead.
+        pages = [
+            extract_cypher(c)
+            for c in graph.ro_query.call_args_list
+            if 'SKIP' in extract_cypher(c)
+        ]
+        assert pages, f'no page query issued: {graph.ro_query.call_args_list}'
+        cypher = pages[0]
         # The whole point of W6-zeta (task 2213): drop the WITH DISTINCT idiom.
         assert 'WITH DISTINCT' not in cypher, (
             f'Cypher must NOT use WITH DISTINCT — dedup is (n.uuid, e.uuid)-keyed in Python: {cypher}'
@@ -429,7 +441,11 @@ class TestGetAllValidEdges:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        graph.ro_query.assert_awaited_once()
+        # Paginated (task 4340): a census probe plus N pages, so "exactly one
+        # query" no longer describes the shape. The load-bearing half of the
+        # original assertion — every query stays on the read-only path — is
+        # what this test is named for and is kept.
+        assert graph.ro_query.await_count >= 1
         graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -471,19 +487,52 @@ class TestGetAllValidEdges:
             await backend.get_all_valid_edges(group_id='test')
 
     @pytest.mark.asyncio
-    async def test_none_result_set_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
-        """result_set=None from the driver is treated as empty — returns {}."""
+    async def test_none_result_set_returns_empty_dict(self, mock_config, make_backend):
+        """result_set=None from the driver is treated as empty — returns {}.
+
+        Defensive-coding pin: the read path uses ``result.result_set or []``
+        (in ``_census_count`` and in the ``_paged_ro_query`` page loop) to
+        tolerate a driver that returns None where an empty list is expected.
+        Without the guard, ``list(None)`` raises ``TypeError``, so this test
+        fails loudly rather than merely returning something different.
+
+        WHY A LOCAL DOUBLE AND NOT ``make_graph_mock`` (task 4340 amendment).
+        This test used to do ``graph.ro_query.return_value.result_set = None``
+        on a ``make_graph_mock`` graph.  That fixture now drives ``ro_query``
+        with a ``side_effect`` callable so it can answer per-cypher, and
+        ``unittest.mock`` IGNORES ``return_value`` entirely once a
+        ``side_effect`` callable returns a non-DEFAULT value — so the override
+        was a silent no-op.  The test kept passing only because
+        ``make_graph_mock([])`` yields empty rows; it would have passed
+        identically with the guard deleted.  Do not "simplify" this back to
+        the shared fixture without giving that fixture an explicit
+        None-result-set knob.
+        """
+        class _NoneResult:
+            result_set = None
+            header: list = []
+
+        class _NoneResultGraph:
+            """Answers EVERY query with result_set=None — census and pages alike."""
+
+            def __init__(self):
+                self.queries: list[str] = []
+
+            async def ro_query(self, cypher, params=None):
+                self.queries.append(cypher)
+                return _NoneResult()
+
+            async def query(self, cypher, params=None):  # pragma: no cover
+                raise AssertionError('read paths must use ro_query, never query')
+
         backend = make_backend(mock_config)
-        graph = make_graph_mock([])
-        # Defensive-coding pin: get_all_valid_edges() uses `result.result_set or []`
-        # to tolerate a driver that returns None instead of an empty list — this
-        # test exercises that guard.
-        # Override the awaited return value to have result_set=None, simulating
-        # a driver that returns None instead of an empty list.
-        graph.ro_query.return_value.result_set = None
+        graph = _NoneResultGraph()
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_all_valid_edges(group_id='test')
         assert result == {}
+        # The guard was really reached: a query was issued and its None
+        # result_set was coerced, rather than the read short-circuiting.
+        assert graph.queries
 
     @pytest.mark.asyncio
     async def test_rows_sharing_uuid_pair_collapse_to_one(self, mock_config, make_backend, make_graph_mock):
@@ -1270,35 +1319,16 @@ class TestMemoryServiceRefreshEntitySummaryJournalFix:
 #       property tuple — as redirect_node_edges produces on the merge path —
 #       are both counted, not collapsed into one.
 # Skipped automatically when FalkorDB is not reachable, following the
-# established pattern in tests/test_list_indices_integration.py.
-
-FALKOR_HOST: str = os.environ.get('FALKOR_HOST', 'localhost')
-FALKOR_PORT: int = int(os.environ.get('FALKOR_PORT', '6379'))
-
-
-def _falkor_available() -> bool:
-    """FalkorDB-native reachability probe (mirrors test_list_indices_integration.py)."""
-    try:
-        client = _SyncFalkorDB(host=FALKOR_HOST, port=FALKOR_PORT, socket_connect_timeout=2)
-        try:
-            client.select_graph('_probe').query('RETURN 1')
-        finally:
-            with contextlib.suppress(Exception):
-                client.close()
-        return True
-    except Exception:
-        return False
-
+# established pattern in tests/test_list_indices_integration.py. The
+# reachability probe, connection constants and per-run graph name come from
+# _fm_helpers (task 3502) — see its module docstring for why it is not
+# conftest.py. Only the fixture body below is per-module; do not re-fork the
+# shared helpers back into this file.
 
 @pytest_asyncio.fixture
 async def edge_dedup_live_graph():
-    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up.
-
-    A fresh graph name is minted on every invocation (rather than a shared
-    module-level constant) so the dedup tests below never share state, even
-    under pytest-xdist or a shared FalkorDB instance.
-    """
-    graph_name = f'_test_2084_edge_dedup_{uuid.uuid4().hex[:8]}'
+    """Provision a throwaway, uniquely-named FalkorDB graph, yield it, then clean up."""
+    graph_name = unique_graph_name('2084_edge_dedup')
     client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
     with contextlib.suppress(Exception):
         stale = client.select_graph(graph_name)
@@ -1313,8 +1343,9 @@ async def edge_dedup_live_graph():
             await client.aclose()
 
 
-@pytest.mark.skipif(not _falkor_available(), reason='FalkorDB not reachable')
+@falkor_skipif()
 @pytest.mark.timeout(15)
+@pytest.mark.integration
 class TestEdgeDedupLiveFalkorDB:
     """Pin WITH DISTINCT e / WITH DISTINCT n, e result semantics against real FalkorDB."""
 

@@ -30,6 +30,7 @@ from shared.cli_invoke import (  # noqa: F401
     build_claude_argv,
     invoke_claude_agent,
     invoke_with_cap_retry,
+    require_non_blank_prompt,
 )
 
 # Process-group termination helper for subprocess tree cleanup
@@ -103,6 +104,7 @@ async def invoke_agent(
     output_schema: dict | None = None,
     permission_mode: str = 'bypassPermissions',
     sandbox_modules: list[str] | None = None,
+    sandbox_extras: list[str] | None = None,
     effort: str | None = None,
     backend: str = 'claude',
     oauth_token: str | None = None,
@@ -150,6 +152,7 @@ async def invoke_agent(
             allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
             mcp_config=mcp_config, output_schema=output_schema,
             permission_mode=permission_mode, sandbox_modules=sandbox_modules,
+            sandbox_extras=sandbox_extras,
             effort=effort, oauth_token=oauth_token,
             resume_session_id=resume_session_id,
             session_id=session_id,
@@ -166,7 +169,8 @@ async def invoke_agent(
         return await _invoke_codex(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_budget_usd=max_budget_usd, mcp_config=mcp_config,
-            sandbox_modules=sandbox_modules, effort=effort,
+            sandbox_modules=sandbox_modules, sandbox_extras=sandbox_extras,
+            effort=effort,
             timeout_seconds=timeout_seconds, prices=prices,
             max_turns=max_turns,
         )
@@ -174,7 +178,8 @@ async def invoke_agent(
         return await _invoke_gemini(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_budget_usd=max_budget_usd, mcp_config=mcp_config,
-            sandbox_modules=sandbox_modules, effort=effort,
+            sandbox_modules=sandbox_modules, sandbox_extras=sandbox_extras,
+            effort=effort,
             timeout_seconds=timeout_seconds, prices=prices,
         )
     elif backend == 'pi':
@@ -182,7 +187,8 @@ async def invoke_agent(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
             max_budget_usd=max_budget_usd, allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools, mcp_config=mcp_config,
-            sandbox_modules=sandbox_modules, effort=effort,
+            sandbox_modules=sandbox_modules, sandbox_extras=sandbox_extras,
+            effort=effort,
             oauth_token=oauth_token, resume_session_id=resume_session_id,
             session_id=session_id, timeout_seconds=timeout_seconds,
             env_overrides=env_overrides, prices=prices,
@@ -209,6 +215,7 @@ async def _invoke_claude_with_sandbox(
     permission_mode: str,
     sandbox_modules: list[str] | None,
     effort: str | None,
+    sandbox_extras: list[str] | None = None,
     oauth_token: str | None = None,
     resume_session_id: str | None = None,
     session_id: str | None = None,
@@ -242,6 +249,15 @@ async def _invoke_claude_with_sandbox(
         from orchestrator.agents.sandbox_dispatch import resolve_active_backend, wrap_command
         active = resolve_active_backend()
         if active != 'none':
+            # Same lockstep obligation as the argv build below, applied to the
+            # precondition (task 3143): this path never calls
+            # shared.cli_invoke._invoke_claude, so that function's guard does
+            # not cover it and a blank prompt would reach the CLI as an opaque
+            # argument error (esc-3118-1).  Placed BEFORE build_claude_argv so
+            # no system-prompt / mcp-config temp file is created for an
+            # invocation that can never produce a useful run.
+            require_non_blank_prompt(prompt, context='_invoke_claude_with_sandbox')
+
             # Build command via the shared single source of truth (task 2465
             # dedup) so this sandboxed path stays in lockstep with the
             # non-sandbox path in shared.cli_invoke._invoke_claude — including
@@ -265,7 +281,7 @@ async def _invoke_claude_with_sandbox(
             # User prompt piped via stdin to avoid ARG_MAX
             stdin_data = prompt.encode()
 
-            cmd = wrap_command(cmd, cwd, sandbox_modules)
+            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
 
             env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
             if env_overrides:
@@ -327,6 +343,7 @@ async def _invoke_codex(
     mcp_config: dict | None,
     sandbox_modules: list[str] | None,
     effort: str | None,
+    sandbox_extras: list[str] | None = None,
     timeout_seconds: float | None = None,
     prices: dict[str, Any] | None = None,
     max_turns: int | None = None,
@@ -384,7 +401,7 @@ async def _invoke_codex(
 
         if sandbox_modules is not None:
             from orchestrator.agents.sandbox_dispatch import wrap_command
-            cmd = wrap_command(cmd, cwd, sandbox_modules)
+            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
 
         # Strip OPENAI_API_KEY if using OAuth
         env = dict(os.environ)
@@ -538,6 +555,7 @@ async def _invoke_gemini(
     mcp_config: dict | None,
     sandbox_modules: list[str] | None,
     effort: str | None,
+    sandbox_extras: list[str] | None = None,
     timeout_seconds: float | None = None,
     prices: dict[str, Any] | None = None,
 ) -> AgentResult:
@@ -560,7 +578,7 @@ async def _invoke_gemini(
 
         if sandbox_modules is not None:
             from orchestrator.agents.sandbox_dispatch import wrap_command
-            cmd = wrap_command(cmd, cwd, sandbox_modules)
+            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
 
         env = dict(os.environ)
 
@@ -909,6 +927,7 @@ async def _invoke_pi(
     mcp_config: dict | None,
     sandbox_modules: list[str] | None,
     effort: str | None,
+    sandbox_extras: list[str] | None = None,
     oauth_token: str | None = None,
     resume_session_id: str | None = None,
     session_id: str | None = None,
@@ -1013,7 +1032,7 @@ async def _invoke_pi(
 
         if sandbox_modules is not None:
             from orchestrator.agents.sandbox_dispatch import wrap_command
-            cmd = wrap_command(cmd, cwd, sandbox_modules)
+            cmd = wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
 
         _warn_if_argv_near_arg_max(cmd)
 
@@ -1147,21 +1166,44 @@ async def _run_subprocess_local(
     # Capture pgid at spawn; start_new_session guarantees pgid == pid.
     pgid = proc.pid
 
+    # Outer try: a cancel landing *inside* the TimeoutError handler's
+    # terminate_process_group await (SIGTERM already sent, SIGKILL escalation
+    # pending) must still be caught here too — an exception raised inside an
+    # except block is not caught by a sibling handler of the same try, so a
+    # CancelledError handler that was only a sibling of `except TimeoutError:`
+    # would let that escalation be abandoned with a SIGTERM-ignoring child
+    # left alive.
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=stdin_data),
-            timeout=timeout_seconds,
-        )
-    except TimeoutError:
-        await terminate_process_group(proc, pgid)
-        duration_ms = int(time.monotonic() * 1000) - start_ms
-        return _SubprocessResult(
-            stdout='',
-            stderr=f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)',
-            returncode=1,
-            duration_ms=duration_ms,
-            timed_out=True,
-        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=stdin_data),
+                timeout=timeout_seconds,
+            )
+        except TimeoutError:
+            await terminate_process_group(proc, pgid)
+            duration_ms = int(time.monotonic() * 1000) - start_ms
+            return _SubprocessResult(
+                stdout='',
+                stderr=f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)',
+                returncode=1,
+                duration_ms=duration_ms,
+                timed_out=True,
+            )
+    except asyncio.CancelledError:
+        # Orchestrator shutdown / steward-stop path: the awaiting task was
+        # cancelled.  Without this, proc.communicate() is cancelled but the
+        # child process GROUP is never signalled and the agent survives as an
+        # orphan still editing/committing in its worktree.  Mirrors the
+        # already-blessed handler in shared/src/shared/cli_invoke.py (:2433)
+        # and orchestrator/src/orchestrator/steward.py (:405).
+        # No comm_task to reap: asyncio.wait_for already cancels and awaits
+        # its inner task before propagating CancelledError.
+        if proc.returncode is None:
+            logger.warning(
+                f'Subprocess cancelled — terminating process group for pid {proc.pid}'
+            )
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
+        raise
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
 

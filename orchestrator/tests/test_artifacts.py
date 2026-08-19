@@ -152,6 +152,120 @@ class TestPlan:
         assert len(completed) == 2  # pre-1 + step-1
 
 
+class TestMarkStepCommitted:
+    """TaskArtifacts.mark_step_committed(step_id, sha) — pre-satisfy a plan
+    step at AUTHORING time (status→'done', commit=full sha, prepend a
+    '[COMMITTED <sha[:12]>]' description tag). Pure persistence, NO git — the
+    git corroborate-before-acting guard lives in plan_tools._sha_exists_on_branch.
+    See task 3030 / PRD plans/architect-already-complete-exits.md Contract A1.
+    """
+
+    SHA = 'a' * 40
+
+    @staticmethod
+    def _plan() -> dict:
+        return {
+            'task_id': 'task-1',
+            'files': ['backend/app.py'],
+            'prerequisites': [
+                {'id': 'pre-1', 'type': 'test', 'description': 'Setup fixture',
+                 'status': 'pending', 'commit': None},
+            ],
+            'steps': [
+                {'id': 'step-1', 'type': 'test', 'description': 'Write test',
+                 'status': 'pending', 'commit': None},
+                {'id': 'step-2', 'type': 'impl', 'description': 'Implement',
+                 'status': 'pending', 'commit': None},
+            ],
+        }
+
+    def test_marks_step_done_full_sha_in_commit_truncated_in_tag(
+        self, artifacts: TaskArtifacts
+    ):
+        artifacts.write_plan(self._plan())
+
+        assert artifacts.mark_step_committed('step-1', self.SHA) is True
+
+        step = artifacts.read_plan()['steps'][0]
+        assert step['id'] == 'step-1'
+        assert step['status'] == 'done'
+        # FULL sha persisted to commit; only sha[:12] appears in the tag.
+        assert step['commit'] == self.SHA
+        assert step['description'].startswith(f'[COMMITTED {self.SHA[:12]}]')
+        assert step['description'].endswith('Write test')
+        # The untruncated 40-char sha must NOT leak into the tag text.
+        assert self.SHA not in step['description']
+
+    def test_marks_prerequisite(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(self._plan())
+
+        assert artifacts.mark_step_committed('pre-1', self.SHA) is True
+
+        prereq = artifacts.read_plan()['prerequisites'][0]
+        assert prereq['status'] == 'done'
+        assert prereq['commit'] == self.SHA
+        assert prereq['description'].startswith(f'[COMMITTED {self.SHA[:12]}]')
+
+    def test_unknown_id_returns_false_and_mutates_nothing(
+        self, artifacts: TaskArtifacts
+    ):
+        artifacts.write_plan(self._plan())
+        # Stabilize any one-time normalization rewrite before capturing bytes.
+        artifacts.read_plan()
+        before = (artifacts.root / 'plan.json').read_text()
+
+        assert artifacts.mark_step_committed('nope', self.SHA) is False
+
+        after = (artifacts.root / 'plan.json').read_text()
+        assert after == before
+
+    def test_idempotent_per_step_and_sha(self, artifacts: TaskArtifacts):
+        artifacts.write_plan(self._plan())
+
+        assert artifacts.mark_step_committed('step-1', self.SHA) is True
+        assert artifacts.mark_step_committed('step-1', self.SHA) is True
+
+        step = artifacts.read_plan()['steps'][0]
+        assert step['status'] == 'done'
+        # No double-prepend on a repeated (step_id, sha) call.
+        assert step['description'].count('[COMMITTED ') == 1
+
+    def test_remark_different_sha_replaces_tag_no_stacking(
+        self, artifacts: TaskArtifacts
+    ):
+        # A re-mark against a DIFFERENT sha (e.g. an amended/squashed commit
+        # during re-planning) must REPLACE the stale [COMMITTED ...] tag, not
+        # stack a second one in front of it.
+        artifacts.write_plan(self._plan())
+        sha_a = 'a' * 40
+        sha_b = 'b' * 40
+
+        assert artifacts.mark_step_committed('step-1', sha_a) is True
+        assert artifacts.mark_step_committed('step-1', sha_b) is True
+
+        step = artifacts.read_plan()['steps'][0]
+        assert step['status'] == 'done'
+        # commit tracks the LATEST sha; description carries exactly the current
+        # tag — the stale sha_a tag is gone, not stacked.
+        assert step['commit'] == sha_b
+        assert step['description'].count('[COMMITTED ') == 1
+        assert step['description'].startswith(f'[COMMITTED {sha_b[:12]}]')
+        assert sha_a[:12] not in step['description']
+        assert step['description'].endswith('Write test')
+
+    def test_affects_pending_and_completed_filters(
+        self, artifacts: TaskArtifacts
+    ):
+        artifacts.write_plan(self._plan())
+
+        artifacts.mark_step_committed('step-1', self.SHA)
+
+        pending_ids = [s['id'] for s in artifacts.get_pending_steps()]
+        completed_ids = [s['id'] for s in artifacts.get_completed_steps()]
+        assert 'step-1' not in pending_ids
+        assert 'step-1' in completed_ids
+
+
 class TestIterationLog:
     def test_append_and_read(self, artifacts: TaskArtifacts):
         artifacts.append_iteration_log({
@@ -554,6 +668,70 @@ class TestPlanLock:
         result = artifacts.lock_plan('session-abc')
         assert result is True
         assert lock_path.exists()
+
+
+class TestPlanLockRunId:
+    """``lock_plan`` persists the process-level run id (task 3563).
+
+    plan.lock historically carried only ``session_id``/``locked_at``/
+    ``owner_pid``, so ``TaskGroundTruth``'s PLAN_LOCK claimant source had no
+    run_id to compose a full ``compose_claimant_run_id`` identity from.
+    Recording it here makes the lock-derived identity byte-identical to the
+    DB claimant stamp that the SAME incarnation writes.
+
+    The key is written ONLY when the run id is known and non-blank, so an
+    ABSENT ``run_id`` unambiguously means "unknown" — covering both legacy
+    locks already on disk and harness-less (test/eval) workflows.  It must
+    never be written as ``''``, which the resolver could not distinguish from
+    a genuinely empty run_id component.
+    """
+
+    def test_lock_plan_persists_run_id_alongside_existing_keys(
+        self, artifacts: TaskArtifacts
+    ):
+        assert artifacts.lock_plan('sess-x', run_id='run-abc') is True
+        lock_data = artifacts.read_plan_lock()
+        assert lock_data is not None
+        assert lock_data['run_id'] == 'run-abc'
+        # The pre-existing keys are untouched.
+        assert lock_data['session_id'] == 'sess-x'
+        assert lock_data['owner_pid'] == os.getpid()
+        assert 'locked_at' in lock_data
+
+    def test_legacy_positional_call_writes_no_run_id_key(self, artifacts: TaskArtifacts):
+        """The un-widened call site must leave the key ABSENT, not empty."""
+        assert artifacts.lock_plan('sess-x') is True
+        lock_data = artifacts.read_plan_lock()
+        assert lock_data is not None
+        assert 'run_id' not in lock_data
+
+    @pytest.mark.parametrize(
+        'run_id',
+        [None, '', '   ', '\t\n'],
+        ids=['none', 'empty', 'spaces', 'whitespace'],
+    )
+    def test_unknown_or_blank_run_id_omits_the_key_entirely(
+        self, artifacts: TaskArtifacts, run_id
+    ):
+        assert artifacts.lock_plan('sess-x', run_id=run_id) is True
+        lock_data = artifacts.read_plan_lock()
+        assert lock_data is not None
+        assert 'run_id' not in lock_data, (
+            'a blank/unknown run_id must be omitted, never written as a '
+            'falsy value the resolver would mistake for a known component'
+        )
+
+    def test_run_id_does_not_change_acquire_semantics(self, artifacts: TaskArtifacts):
+        """The return contract is untouched: True on acquire, False when held."""
+        first = artifacts.lock_plan('sess-x', run_id='run-abc')
+        second = artifacts.lock_plan('sess-other', run_id='run-other')
+        assert first is True
+        assert second is False
+        # The loser must not have clobbered the winner's record.
+        lock_data = artifacts.read_plan_lock()
+        assert lock_data is not None
+        assert lock_data['session_id'] == 'sess-x'
+        assert lock_data['run_id'] == 'run-abc'
 
 
 class TestAgentSession:
@@ -980,6 +1158,52 @@ class TestAlreadyDone:
         artifacts.write_already_done('first-sha', 'first evidence')
         artifacts.write_already_done('second-sha', 'second evidence')
         data = artifacts.read_already_done()
+        assert data is not None
+        assert data['commit'] == 'second-sha'
+        assert data['evidence'] == 'second evidence'
+
+
+class TestReadyToMerge:
+    """Round-trip and edge-case tests for the architect's
+    ``.task/ready_to_merge.json`` artifact."""
+
+    def test_read_returns_none_when_absent(self, artifacts: TaskArtifacts):
+        assert artifacts.read_ready_to_merge() is None
+
+    def test_round_trip(self, artifacts: TaskArtifacts):
+        artifacts.write_ready_to_merge(
+            commit='abc123def456',
+            evidence='branch is a clean FF of main; verify PASSED; review PASS',
+        )
+        data = artifacts.read_ready_to_merge()
+        assert data is not None
+        assert data['commit'] == 'abc123def456'
+        assert data['evidence'] == (
+            'branch is a clean FF of main; verify PASSED; review PASS'
+        )
+        from datetime import datetime
+        datetime.fromisoformat(data['reported_at'])
+
+    def test_artifact_path_is_under_task_dir(self, artifacts: TaskArtifacts):
+        artifacts.write_ready_to_merge('sha', 'e')
+        path = artifacts.root / 'ready_to_merge.json'
+        assert path.exists()
+        json.loads(path.read_text())
+
+    def test_clear_removes_artifact(self, artifacts: TaskArtifacts):
+        artifacts.write_ready_to_merge('sha', 'e')
+        artifacts.clear_ready_to_merge()
+        assert artifacts.read_ready_to_merge() is None
+
+    def test_clear_is_idempotent(self, artifacts: TaskArtifacts):
+        # No raise even when the artifact doesn't exist.
+        artifacts.clear_ready_to_merge()
+        artifacts.clear_ready_to_merge()
+
+    def test_write_overwrites_prior_artifact(self, artifacts: TaskArtifacts):
+        artifacts.write_ready_to_merge('first-sha', 'first evidence')
+        artifacts.write_ready_to_merge('second-sha', 'second evidence')
+        data = artifacts.read_ready_to_merge()
         assert data is not None
         assert data['commit'] == 'second-sha'
         assert data['evidence'] == 'second evidence'

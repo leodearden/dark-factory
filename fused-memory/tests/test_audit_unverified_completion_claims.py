@@ -1,0 +1,1485 @@
+"""Tests for audit_unverified_completion_claims.py.
+
+Loaded via importlib so the script (not on PYTHONPATH) can be tested without
+sys.path pollution — mirrors the pattern in test_audit_found_on_main_provenance.py
+/ test_audit_duplicate_memories.py.
+"""
+from __future__ import annotations
+
+import ast
+import importlib.util
+import json
+import logging
+import re
+import types
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+SCRIPT_PATH = (
+    Path(__file__).parent.parent / 'scripts' / 'audit_unverified_completion_claims.py'
+)
+
+
+def _load_module() -> types.ModuleType:
+    """Load audit_unverified_completion_claims.py from its file path.
+
+    The module is registered in sys.modules under its name so that
+    @dataclass and other reflection-based decorators work correctly
+    (they call sys.modules.get(cls.__module__)).
+    """
+    import sys  # noqa: PLC0415
+
+    mod_name = 'audit_unverified_completion_claims'
+    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {SCRIPT_PATH}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    return module
+
+
+_mod = _load_module()
+parse_category = _mod.parse_category
+IN_SCOPE_CATEGORIES = _mod.IN_SCOPE_CATEGORIES
+CorpusRecord = _mod.CorpusRecord
+ScannedRecord = _mod.ScannedRecord
+scan_records = _mod.scan_records
+adjudicate = _mod.adjudicate
+Finding = _mod.Finding
+UNRESOLVABLE = _mod.UNRESOLVABLE
+build_report = _mod.build_report
+_build_parser = _mod._build_parser
+RO_COMMAND = _mod.RO_COMMAND
+EpisodeReader = _mod.EpisodeReader
+EPISODE_CYPHER = _mod.EPISODE_CYPHER
+PROJECTED_FIELDS = _mod.PROJECTED_FIELDS
+_run = _mod._run
+Probes = _mod.Probes
+_LOGGER_NAME = _mod.logger.name
+
+KNOWN_PROJECTS = frozenset({'dark_factory', 'reify'})
+
+#: esc-3085-1 instance (2), verbatim: a filing/dispatch claim naming a ticket
+#: id that does not exist in the registry.
+ESC_3085_1_INSTANCE_2 = (
+    'reify task 5638 was reported unactionable and re-filed into '
+    "dark_factory's task tree as ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376"
+)
+
+#: esc-3085-1 instance (1): an applied-work claim about a still-open task.
+ESC_3085_1_INSTANCE_1 = "task 5422's de-flake fix has been applied"
+
+
+def _record(
+    uuid: str = 'ep-1',
+    text: str = '',
+    category: str | None = 'temporal_facts',
+    project_id: str = 'reify',
+    created_at: str = '2026-07-26T00:00:00Z',
+    source_description: str = 'add_memory:temporal_facts',
+    name: str = 'episode',
+    graph_name: str | None = None,
+) -> object:
+    """Build a CorpusRecord without touching a store.
+
+    ``graph_name`` defaults to ``project_id`` — the common case where the graph
+    swept and the record's own group_id coincide. Pass it explicitly to build
+    the divergent case.
+    """
+    return CorpusRecord(
+        uuid=uuid,
+        kind='episode',
+        text=text,
+        source_description=source_description,
+        category=category,
+        project_id=project_id,
+        graph_name=project_id if graph_name is None else graph_name,
+        created_at=created_at,
+        name=name,
+    )
+
+
+class TestParseCategory:
+    """The category label survives ONLY as the Episodic source_description.
+
+    Graphiti persists no ``category`` property anywhere — not on Entity nodes,
+    not on RELATES_TO edges. ``MemoryService`` stamps ``add_memory:<category>``
+    (memory_service.py:2804) and ``replay_from_mem0:<category>`` (:3302), and
+    ``graphiti_client`` may prepend ``[temporal:<ctx>] `` (:700) and — new from
+    task 3142 — ``[unverified_claim] `` (:702). Recovering the label from that
+    string is the only way to honour this task's category scope.
+    """
+
+    def test_add_memory_temporal_facts(self) -> None:
+        assert parse_category('add_memory:temporal_facts') == 'temporal_facts'
+
+    def test_add_memory_decisions_and_rationale(self) -> None:
+        assert (
+            parse_category('add_memory:decisions_and_rationale')
+            == 'decisions_and_rationale'
+        )
+
+    def test_replay_from_mem0_prefix(self) -> None:
+        assert parse_category('replay_from_mem0:temporal_facts') == 'temporal_facts'
+
+    def test_temporal_context_prefix_is_stripped(self) -> None:
+        assert (
+            parse_category('[temporal:sprint-4] add_memory:temporal_facts')
+            == 'temporal_facts'
+        )
+
+    def test_unverified_claim_prefix_is_stripped(self) -> None:
+        """THE case that matters most.
+
+        Task 3142 stamps ``[unverified_claim] `` at graphiti_client.py:702.
+        Without stripping it, every episode the new write-time gate ALREADY
+        flagged falls out of this sweep's population — precisely the records
+        most worth reading.
+        """
+        assert (
+            parse_category('[unverified_claim] add_memory:temporal_facts')
+            == 'temporal_facts'
+        )
+
+    def test_both_prefixes_any_order(self) -> None:
+        assert (
+            parse_category(
+                '[unverified_claim] [temporal:x] add_memory:decisions_and_rationale'
+            )
+            == 'decisions_and_rationale'
+        )
+        assert (
+            parse_category(
+                '[temporal:x] [unverified_claim] add_memory:decisions_and_rationale'
+            )
+            == 'decisions_and_rationale'
+        )
+
+    def test_caller_supplied_add_episode_description_is_uncategorized(self) -> None:
+        assert parse_category('reconciliation stage 2 cycle summary') is None
+
+    def test_unknown_category_does_not_mint_a_phantom_bucket(self) -> None:
+        """Validated against models.enums.MemoryCategory, so a typo yields None."""
+        assert parse_category('add_memory:not_a_real_category') is None
+
+    def test_empty_and_none(self) -> None:
+        assert parse_category('') is None
+        assert parse_category(None) is None
+        assert parse_category('   ') is None
+
+    def test_in_scope_categories(self) -> None:
+        assert frozenset(
+            {'temporal_facts', 'decisions_and_rationale'}
+        ) == IN_SCOPE_CATEGORIES
+
+
+class TestScanRecords:
+    """The imported extractor, run over the corpus projection.
+
+    The script contributes NO claim-detection regex of its own — the whole
+    point of reusing completion_claim_gate is that a second, drifting copy of
+    the negation/aspirational strippers is what stops "has not yet landed"
+    from being read as a completion (the gate's own docstring, :20-26).
+    """
+
+    def _scan(self, records: list[object]) -> list[Any]:
+        return scan_records(
+            records,
+            default_project_id='reify',
+            known_project_ids=KNOWN_PROJECTS,
+            categories=IN_SCOPE_CATEGORIES,
+        )
+
+    def test_esc_3085_1_instance_2_yields_the_ticket_claim(self) -> None:
+        """Ticket > commit > task precedence (completion_claim_gate.py:405-411).
+
+        The clause names BOTH task 5638 and the ticket; it is ONE claim about
+        the ticket — the most specific ref is what the writer asserted into
+        existence.
+        """
+        scanned = self._scan([_record(text=ESC_3085_1_INSTANCE_2)])
+        assert len(scanned) == 1
+        claims = scanned[0].claims
+        assert len(claims) == 1
+        assert claims[0].kind == 'filing_dispatch'
+        assert claims[0].subject == 'ticket'
+        assert claims[0].ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+
+    def test_esc_3085_1_instance_1_yields_the_task_claim(self) -> None:
+        scanned = self._scan([_record(text=ESC_3085_1_INSTANCE_1)])
+        assert len(scanned) == 1
+        claims = scanned[0].claims
+        assert len(claims) == 1
+        assert claims[0].kind == 'applied_work'
+        assert claims[0].subject == 'task'
+        assert claims[0].ref == '5422'
+        assert claims[0].project_id == 'reify'
+
+    def test_negated_claim_yields_nothing(self) -> None:
+        """Proves the imported strippers are LIVE, not re-derived."""
+        scanned = self._scan(
+            [_record(text='the fix has not been applied for task 5422')]
+        )
+        assert scanned == []
+
+    def test_out_of_scope_category_is_excluded(self) -> None:
+        scanned = self._scan([
+            _record(uuid='ep-a', text=ESC_3085_1_INSTANCE_1,
+                    category='entities_and_relations'),
+            _record(uuid='ep-b', text=ESC_3085_1_INSTANCE_1, category=None),
+        ])
+        assert scanned == []
+
+    def test_records_without_claims_are_dropped(self) -> None:
+        scanned = self._scan([
+            _record(uuid='ep-a', text='an ordinary observation about the tree'),
+            _record(uuid='ep-b', text=''),
+            _record(uuid='ep-c', text=ESC_3085_1_INSTANCE_1),
+        ])
+        assert [s.record.uuid for s in scanned] == ['ep-c']
+
+    def test_output_order_is_deterministic(self) -> None:
+        """Sorted by (category, created_at, uuid) — never dict iteration order."""
+        records = [
+            _record(uuid='ep-z', text=ESC_3085_1_INSTANCE_1,
+                    category='temporal_facts', created_at='2026-07-27T00:00:00Z'),
+            _record(uuid='ep-a', text=ESC_3085_1_INSTANCE_1,
+                    category='temporal_facts', created_at='2026-07-26T00:00:00Z'),
+            _record(uuid='ep-m', text=ESC_3085_1_INSTANCE_1,
+                    category='decisions_and_rationale',
+                    created_at='2026-07-28T00:00:00Z'),
+            _record(uuid='ep-b', text=ESC_3085_1_INSTANCE_1,
+                    category='temporal_facts', created_at='2026-07-26T00:00:00Z'),
+        ]
+        expected = ['ep-m', 'ep-a', 'ep-b', 'ep-z']
+        assert [s.record.uuid for s in self._scan(records)] == expected
+        assert [s.record.uuid for s in self._scan(list(reversed(records)))] == expected
+
+    def test_record_project_id_overrides_the_default(self) -> None:
+        scanned = self._scan(
+            [_record(text=ESC_3085_1_INSTANCE_1, project_id='dark_factory')]
+        )
+        assert scanned[0].claims[0].project_id == 'dark_factory'
+
+
+class TestAdjudicate:
+    """Verdicts, via the IMPORTED verify_claims with hand-written probes.
+
+    Every probe is injected, so the whole adjudication layer is exercised with
+    no Taskmaster, no ticket DB and no git.
+    """
+
+    def _adjudicate(
+        self,
+        text: str,
+        *,
+        task_status: object = None,
+        ticket: object = None,
+        commit: object = None,
+        category: str = 'temporal_facts',
+        uuid: str = 'ep-1',
+        created_at: str = '2026-07-26T00:00:00Z',
+    ) -> list[Any]:
+        scanned = scan_records(
+            [_record(uuid=uuid, text=text, category=category, created_at=created_at)],
+            default_project_id='reify',
+            known_project_ids=KNOWN_PROJECTS,
+            categories=IN_SCOPE_CATEGORIES,
+        )
+        return adjudicate(
+            scanned,
+            task_status_probe=lambda ref, project_id: task_status,
+            ticket_probe=lambda ref: ticket,
+            commit_probe=lambda ref, project_id: commit,
+        )
+
+    def test_absent_ticket_is_a_mismatch(self) -> None:
+        """esc-3085-1 instance (2), reproduced end-to-end.
+
+        ``None`` from the ticket probe means the registry ANSWERED and said no
+        such ticket — that is evidence the writer was wrong.
+        """
+        findings = self._adjudicate(ESC_3085_1_INSTANCE_2, ticket=None)
+        assert len(findings) == 1
+        assert findings[0].status == 'mismatch'
+        assert findings[0].subject == 'ticket'
+        assert findings[0].ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+
+    def test_unresolvable_ticket_registry_is_unverifiable_not_mismatch(self) -> None:
+        """THE CRITICAL ASSERTION — the deliberate divergence from the live gate.
+
+        ``TaskInterceptor.get_ticket_row`` returns None BOTH for "no such
+        ticket" and for "no ticket store configured" (task_interceptor.py:
+        3006-3012), and ``_verify_ticket`` maps a None row to 'mismatch'
+        (completion_claim_gate.py:575). On the write path that conflation is
+        contained upstream by the _taskmaster_configured guard and costs one
+        spurious tag. In a BATCH sweep it would print a fabrication accusation
+        against every ticket claim in the corpus whenever tickets.db is merely
+        absent. The gate's own module makes this distinction load-bearing at the
+        sentinel level (:123-127, INV-2); honouring it here follows that intent.
+        """
+        findings = self._adjudicate(ESC_3085_1_INSTANCE_2, ticket=UNRESOLVABLE)
+        assert len(findings) == 1
+        assert findings[0].status == 'unverifiable'
+        assert findings[0].status != 'mismatch'
+
+    def test_existing_ticket_verifies_and_is_dropped(self) -> None:
+        findings = self._adjudicate(
+            ESC_3085_1_INSTANCE_2,
+            ticket={'project_id': 'dark_factory', 'status': 'open'},
+        )
+        assert findings == []
+
+    def test_terminal_task_status_verifies_and_is_dropped(self) -> None:
+        """Verified claims never appear — the report is a report of problems."""
+        assert self._adjudicate(ESC_3085_1_INSTANCE_1, task_status='done') == []
+
+    def test_open_task_status_is_a_mismatch(self) -> None:
+        findings = self._adjudicate(ESC_3085_1_INSTANCE_1, task_status='in-progress')
+        assert len(findings) == 1
+        assert findings[0].status == 'mismatch'
+        assert findings[0].observed == 'in-progress'
+
+    def test_unresolvable_task_status_is_unverifiable(self) -> None:
+        findings = self._adjudicate(ESC_3085_1_INSTANCE_1, task_status=None)
+        assert len(findings) == 1
+        assert findings[0].status == 'unverifiable'
+
+    def test_unknown_task_status_is_unverifiable_not_mismatch(self) -> None:
+        """'unknown' is get_statuses' NULL sentinel, not a live status.
+
+        It cannot contradict the claim, but it cannot confirm it either.
+        """
+        findings = self._adjudicate(ESC_3085_1_INSTANCE_1, task_status='unknown')
+        assert len(findings) == 1
+        assert findings[0].status == 'unverifiable'
+
+    def test_absent_commit_is_a_mismatch_unresolvable_is_not(self) -> None:
+        text = 'task 3142 has landed in commit 23f1c27ddf'
+        absent = self._adjudicate(text, commit=False)
+        assert len(absent) == 1
+        assert absent[0].status == 'mismatch'
+        assert absent[0].subject == 'commit'
+
+        unresolvable = self._adjudicate(text, commit=None)
+        assert len(unresolvable) == 1
+        assert unresolvable[0].status == 'unverifiable'
+
+        present = self._adjudicate(text, commit=True)
+        assert present == []
+
+    def test_finding_is_self_contained(self) -> None:
+        """A reader can re-check the verdict without re-running the sweep."""
+        findings = self._adjudicate(
+            ESC_3085_1_INSTANCE_2,
+            ticket=None,
+            category='decisions_and_rationale',
+            uuid='02090224-7bc9-4485-9291-6748e1042ac9',
+            created_at='2026-07-27T05:00:00Z',
+        )
+        finding = findings[0]
+        assert finding.record_uuid == '02090224-7bc9-4485-9291-6748e1042ac9'
+        assert finding.record_kind == 'episode'
+        assert finding.category == 'decisions_and_rationale'
+        assert finding.created_at == '2026-07-27T05:00:00Z'
+        assert finding.project_id == 'reify'
+        assert finding.claim_kind == 'filing_dispatch'
+        assert 'tkt_0RRRC5AASJ9Z630VP4PCN9H376' in finding.claimed_text
+        assert 'no ticket' in finding.observed
+        assert finding.derived_edge_uuids == ()
+        assert finding.to_json()['status'] == 'mismatch'
+
+    def test_mismatches_sort_before_unverifiables(self) -> None:
+        """A mismatch is evidence a writer was wrong; an unverifiable is merely
+        unchecked. The ordering is what makes the head of the report the part
+        worth reading."""
+        scanned = scan_records(
+            [
+                _record(uuid='ep-unver', text=ESC_3085_1_INSTANCE_2,
+                        category='decisions_and_rationale'),
+                _record(uuid='ep-mism', text=ESC_3085_1_INSTANCE_1,
+                        category='temporal_facts'),
+            ],
+            default_project_id='reify',
+            known_project_ids=KNOWN_PROJECTS,
+            categories=IN_SCOPE_CATEGORIES,
+        )
+        findings = adjudicate(
+            scanned,
+            task_status_probe=lambda ref, project_id: 'in-progress',
+            ticket_probe=lambda ref: UNRESOLVABLE,
+            commit_probe=lambda ref, project_id: None,
+        )
+        assert [f.status for f in findings] == ['mismatch', 'unverifiable']
+
+
+def _finding(
+    status: str = 'mismatch',
+    uuid: str = 'ep-1',
+    category: str = 'temporal_facts',
+    project_id: str = 'reify',
+    subject: str = 'ticket',
+    ref: str = 'tkt_X',
+    created_at: str = '2026-07-26T00:00:00Z',
+    graph_name: str | None = None,
+    edges_unqueried: bool = False,
+) -> object:
+    return Finding(
+        record_uuid=uuid,
+        record_kind='episode',
+        category=category,
+        project_id=project_id,
+        graph_name=project_id if graph_name is None else graph_name,
+        created_at=created_at,
+        claim_kind='filing_dispatch',
+        subject=subject,
+        ref=ref,
+        claim_project_id=None,
+        status=status,
+        observed=f'observed for {ref}',
+        claimed_text='some claiming clause',
+        derived_edge_uuids=None if edges_unqueried else (),
+        edges_unqueried=edges_unqueried,
+    )
+
+
+class TestBuildReport:
+    """Volume control WITHOUT a silent cap, and the retrospective bias as data."""
+
+    def _build(self, findings: list[object], include_unverifiable: bool = False):
+        return build_report(
+            findings,
+            swept_at='2026-08-11T12:00:00Z',
+            scanned_count=100,
+            records_with_claims=7,
+            projects=['dark_factory', 'reify'],
+            categories=sorted(IN_SCOPE_CATEGORIES),
+            include_unverifiable=include_unverifiable,
+        )
+
+    def test_summary_counts_both_buckets_even_when_not_listing(self) -> None:
+        """Counting-but-not-listing must never read as a clean corpus."""
+        report = self._build([
+            _finding('mismatch', uuid='ep-a'),
+            _finding('unverifiable', uuid='ep-b'),
+            _finding('unverifiable', uuid='ep-c'),
+        ])
+        assert report['summary']['mismatch'] == 1
+        assert report['summary']['unverifiable'] == 2
+        assert report['summary']['by_category']
+        assert report['summary']['by_project']
+        assert report['summary']['by_subject']
+
+    def test_mismatch_and_unverifiable_are_never_summed(self) -> None:
+        """Different facts — the gate makes the same distinction load-bearing
+        at the sentinel level (completion_claim_gate.py:123-127)."""
+        report = self._build([_finding('mismatch'), _finding('unverifiable')])
+        assert 'total' not in report['summary']
+        assert 'findings_total' not in report['summary']
+
+    def test_default_lists_only_mismatches_and_says_what_it_withheld(self) -> None:
+        report = self._build([
+            _finding('mismatch', uuid='ep-a'),
+            _finding('unverifiable', uuid='ep-b'),
+        ])
+        assert [f['status'] for f in report['findings']] == ['mismatch']
+        assert report['summary']['unverifiable'] == 1
+        truncated = report['truncated_by']
+        assert truncated is not None
+        assert truncated['withheld'] == 1
+        assert truncated['status'] == 'unverifiable'
+        assert '--include-unverifiable' in truncated['flag']
+
+    def test_include_unverifiable_lists_everything(self) -> None:
+        report = self._build(
+            [_finding('mismatch', uuid='ep-a'), _finding('unverifiable', uuid='ep-b')],
+            include_unverifiable=True,
+        )
+        assert [f['status'] for f in report['findings']] == [
+            'mismatch', 'unverifiable',
+        ]
+        assert report['truncated_by'] is None
+
+    def test_denominators_are_present(self) -> None:
+        """A rate can be computed rather than guessed."""
+        report = self._build([_finding('mismatch')])
+        assert report['scanned'] == 100
+        assert report['records_with_claims'] == 7
+        assert report['projects'] == ['dark_factory', 'reify']
+        assert report['categories'] == sorted(IN_SCOPE_CATEGORIES)
+        assert report['swept_at'] == '2026-08-11T12:00:00Z'
+        assert report['caveats']
+
+    def test_edges_unqueried_is_always_counted(self) -> None:
+        """Always present, 0 when none — a key that appears only when nonzero
+        reads as absent rather than as zero."""
+        assert self._build([_finding('mismatch')])['summary']['edges_unqueried'] == 0
+        report = self._build([
+            _finding('mismatch', uuid='ep-a', edges_unqueried=True),
+            _finding('mismatch', uuid='ep-b', edges_unqueried=True),
+            _finding('mismatch', uuid='ep-c'),
+        ])
+        assert report['summary']['edges_unqueried'] == 2
+
+    def test_report_is_json_serializable_and_byte_stable(self) -> None:
+        findings = [
+            _finding('unverifiable', uuid='ep-b', category='decisions_and_rationale'),
+            _finding('mismatch', uuid='ep-a'),
+            _finding('mismatch', uuid='ep-c', edges_unqueried=True),
+        ]
+        first = json.dumps(self._build(findings, True), indent=2, default=str)
+        second = json.dumps(self._build(findings, True), indent=2, default=str)
+        assert first == second
+        loaded = json.loads(first)
+        assert loaded['summary']['mismatch'] == 2
+        unqueried = [f for f in loaded['findings'] if f['edges_unqueried']]
+        assert [f['derived_edge_uuids'] for f in unqueried] == [None]
+
+    def test_empty_corpus_reports_zero_without_truncation(self) -> None:
+        report = self._build([])
+        assert report['findings'] == []
+        assert report['summary']['mismatch'] == 0
+        assert report['summary']['unverifiable'] == 0
+        assert report['truncated_by'] is None
+
+
+class TestReadOnlyByConstruction:
+    """The scope note, turned into a test.
+
+    "read-only report first; do NOT auto-delete or auto-invalidate edges on a
+    regex verdict" — asserted mechanically so it survives a later editor who
+    never reads the task description. audit_duplicate_memories.py and
+    invalidate_fabricated_shipping_edges.py both HAVE an --apply; this script
+    deliberately has none, and the ABSENCE is what must be asserted.
+    """
+
+    #: Any option whose dest or option string contains one of these is a
+    #: mutation affordance this script must never grow.
+    FORBIDDEN = ('apply', 'invalidate', 'delete', 'repair', 'fix', 'write', 'mutate')
+
+    def test_parser_exposes_no_mutation_option(self) -> None:
+        parser = _build_parser()
+        offenders = []
+        for action in parser._actions:
+            names = [str(action.dest or '')] + [str(s) for s in action.option_strings]
+            for name in names:
+                lowered = name.lower()
+                if any(word in lowered for word in self.FORBIDDEN):
+                    offenders.append(name)
+        assert offenders == [], f'mutation affordance(s) present: {offenders}'
+
+    #: Callee names that would mutate a store. ``query`` is FalkorDB's
+    #: writable command (the sweep issues ``ro_query``); the rest are the
+    #: memory-service mutators.
+    FORBIDDEN_CALLS = frozenset({
+        'query',
+        'update_edge',
+        'delete_episode',
+        'bulk_remove_edges',
+        'remove_edge',
+        'delete_entity',
+        'add_memory',
+        'add_episode',
+    })
+
+    def test_ro_command_is_the_only_falkordb_command(self) -> None:
+        assert RO_COMMAND == 'GRAPH.RO_QUERY'
+
+    def test_no_mutation_call_in_the_source_ast(self) -> None:
+        """Asserted over the AST, not as a substring scan.
+
+        A substring test cannot tell a CALL from a docstring that names the
+        hazard to warn against it — the same reason
+        test_reader_constructs_no_graphiti_driver went AST-based. Pinning
+        source text also punished a second legitimate mention of a constant.
+        The behavioural guarantee lives in _FakeGraph (which raises if the
+        writable ``query`` is ever issued) and in assert_read_only_command;
+        this test is the structural backstop for a mutator that never runs
+        under test.
+        """
+        tree = ast.parse(SCRIPT_PATH.read_text())
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, 'id', None) or getattr(node.func, 'attr', None)
+            if name in self.FORBIDDEN_CALLS:
+                offenders.append(f'{name} (line {node.lineno})')
+        assert offenders == [], f'mutation call(s) present: {offenders}'
+
+    def test_no_cypher_write_keyword_in_any_query_constant(self) -> None:
+        cypher_constants = [
+            value
+            for name, value in vars(_mod).items()
+            if name.endswith('_CYPHER') and isinstance(value, str)
+        ]
+        assert cypher_constants, 'expected at least one *_CYPHER constant'
+        # Word-boundary matched, not substring: the projected field
+        # ``e.created_at`` legitimately contains the letters of CREATE, and a
+        # substring test would fail on a read-only query.
+        write_keyword_re = re.compile(
+            r'\b(?:CREATE|MERGE|SET|DELETE|DETACH|REMOVE|DROP)\b', re.IGNORECASE
+        )
+        for query in cypher_constants:
+            hit = write_keyword_re.search(query)
+            assert hit is None, f'write keyword {hit and hit.group()!r} in {query!r}'
+
+    def test_project_is_repeatable(self) -> None:
+        """esc-3085-1's two instances were written by reify agents about work in
+        two different trees, so a single-project sweep would have missed half
+        the incident."""
+        parser = _build_parser()
+        args = parser.parse_args(['--project', 'dark_factory', '--project', 'reify'])
+        assert args.project == ['dark_factory', 'reify']
+
+    def test_volume_and_gate_flags_exist(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(['--include-unverifiable', '--fail-on-mismatch'])
+        assert args.include_unverifiable is True
+        assert args.fail_on_mismatch is True
+        defaults = parser.parse_args([])
+        assert defaults.include_unverifiable is False
+        assert defaults.fail_on_mismatch is False
+
+
+class _FakeGraph:
+    """A graph double recording every command issued against it.
+
+    Hand-written rather than MagicMock so the recorded commands are a plain,
+    readable list — the read-only assertions below are about what was ISSUED,
+    and a mock's call machinery obscures exactly that.
+    """
+
+    def __init__(self, rows: list[list[object]] | None = None,
+                 edge_rows: list[list[object]] | None = None) -> None:
+        self.rows = rows if rows is not None else []
+        self.edge_rows = edge_rows if edge_rows is not None else []
+        self.commands: list[str] = []
+        self.queries: list[tuple[str, object]] = []
+
+    async def ro_query(self, query: str, params: object = None) -> object:
+        self.commands.append(RO_COMMAND)
+        self.queries.append((query, params))
+        rows = self.edge_rows if 'RELATES_TO' in query else self.rows
+        return types.SimpleNamespace(result_set=rows)
+
+    async def query(self, query: str, params: object = None) -> object:  # pragma: no cover
+        self.commands.append('GRAPH.QUERY')
+        raise AssertionError('the sweep must never issue a writable GRAPH.QUERY')
+
+
+def _episode_row(
+    uuid: str = 'ep-1',
+    name: str = 'episode',
+    group_id: str | None = 'reify',
+    source_description: str = 'add_memory:temporal_facts',
+    created_at: str = '2026-07-26T00:00:00Z',
+    content: str = ESC_3085_1_INSTANCE_1,
+) -> list[object]:
+    return [uuid, name, group_id, source_description, created_at, content]
+
+
+@pytest.mark.asyncio
+class TestEpisodeReader:
+    """The read seam: GRAPH.RO_QUERY only, no graphiti_core driver."""
+
+    async def test_episode_cypher_is_derived_from_the_projection(self) -> None:
+        """Built from the constant, so query and record cannot drift apart."""
+        expected = 'MATCH (e:Episodic) RETURN ' + ', '.join(
+            f'e.{field}' for field in PROJECTED_FIELDS
+        )
+        assert expected == EPISODE_CYPHER
+
+    async def test_rows_map_onto_corpus_records(self) -> None:
+        graph = _FakeGraph(rows=[_episode_row()])
+        records = await EpisodeReader(graph=graph).fetch_population()
+        assert len(records) == 1
+        record = records[0]
+        assert record.uuid == 'ep-1'
+        assert record.kind == 'episode'
+        assert record.project_id == 'reify'
+        assert record.category == 'temporal_facts'
+        assert record.text == ESC_3085_1_INSTANCE_1
+        assert record.source_description == 'add_memory:temporal_facts'
+
+    async def test_null_columns_degrade_to_empty_string(self) -> None:
+        """A real corpus has episodes with no source_description."""
+        graph = _FakeGraph(rows=[[None, None, None, None, None, None]])
+        records = await EpisodeReader(graph=graph).fetch_population()
+        assert len(records) == 1
+        assert records[0].uuid == ''
+        assert records[0].source_description == ''
+        assert records[0].category is None
+        assert records[0].text == ''
+
+    async def test_reader_issues_only_ro_query(self) -> None:
+        graph = _FakeGraph(rows=[_episode_row()])
+        reader = EpisodeReader(graph=graph)
+        await reader.fetch_population()
+        await reader.fetch_derived_edges('ep-1')
+        assert set(graph.commands) == {RO_COMMAND}
+        write_re = re.compile(
+            r'\b(?:CREATE|MERGE|SET|DELETE|DETACH|REMOVE|DROP)\b', re.IGNORECASE
+        )
+        for query, _params in graph.queries:
+            assert write_re.search(query) is None
+
+    async def test_fetch_derived_edges_returns_edge_uuids(self) -> None:
+        episode = '02090224-7bc9-4485-9291-6748e1042ac9'
+        graph = _FakeGraph(edge_rows=[
+            ['7dbf12cf-9251-4674-b396-8eefdf651d1c', [episode]],
+            ['edge-2', [episode, 'some-other-episode']],
+        ])
+        uuids = await EpisodeReader(graph=graph).fetch_derived_edges(episode)
+        assert uuids == ('7dbf12cf-9251-4674-b396-8eefdf651d1c', 'edge-2')
+
+    async def test_fetch_derived_edges_empty_result(self) -> None:
+        graph = _FakeGraph(edge_rows=[])
+        assert await EpisodeReader(graph=graph).fetch_derived_edges('ep-x') == ()
+
+    async def test_batch_scans_once_and_fans_out_per_episode(self) -> None:
+        """ONE graph scan for the whole batch, split by each edge's r.episodes.
+
+        The predicate is a full relationship scan however it is written, so
+        issuing it per flagged episode multiplied a whole-population scan by
+        the mismatch count. The fan-out is what makes one scan sufficient.
+        """
+        graph = _FakeGraph(edge_rows=[
+            ['edge-a', ['ep-1']],
+            ['edge-b', ['ep-2', 'ep-1']],
+            ['edge-c', ['ep-unrelated']],
+        ])
+        batch = await EpisodeReader(graph=graph).fetch_derived_edges_batch(
+            ['ep-1', 'ep-2', 'ep-3']
+        )
+        assert len(graph.queries) == 1
+        assert batch == {
+            'ep-1': ('edge-a', 'edge-b'),  # sorted, so the report is byte-stable
+            'ep-2': ('edge-b',),
+            # Total over the request: an absent key would be indistinguishable
+            # from "not enumerated" once it reaches the report.
+            'ep-3': (),
+        }
+
+    async def test_batch_survives_an_odd_episodes_column(self) -> None:
+        """A NULL/scalar r.episodes must not abort a sweep OF odd rows."""
+        graph = _FakeGraph(edge_rows=[
+            ['edge-null', None],
+            ['edge-scalar', 'ep-1'],
+            ['edge-short'],
+        ])
+        batch = await EpisodeReader(graph=graph).fetch_derived_edges_batch(['ep-1'])
+        assert batch == {'ep-1': ('edge-scalar',)}
+
+    async def test_empty_batch_issues_no_query(self) -> None:
+        graph = _FakeGraph()
+        assert await EpisodeReader(graph=graph).fetch_derived_edges_batch([]) == {}
+        assert graph.queries == []
+
+    async def test_limit_is_applied(self) -> None:
+        graph = _FakeGraph(rows=[_episode_row(uuid=f'ep-{i}') for i in range(3)])
+        await EpisodeReader(graph=graph).fetch_population(limit=2)
+        query, _params = graph.queries[0]
+        assert 'LIMIT 2' in query
+
+    async def test_fetch_population_stamps_the_graph_it_queried(self) -> None:
+        """``graph_name`` and ``project_id`` are two DIFFERENT facts.
+
+        ``graph_name`` is WHICH GRAPH WAS QUERIED (the ``--project`` value);
+        ``project_id`` is the record's own Graphiti ``group_id``. They coincide
+        for most rows and diverge for exactly the rows the edge lookup used to
+        lose, so neither may overwrite the other.
+        """
+        graph = _FakeGraph(rows=[_episode_row(group_id='know_live')])
+        reader = EpisodeReader(graph=graph, graph_name='dark_factory')
+        records = await reader.fetch_population()
+        assert len(records) == 1
+        assert records[0].graph_name == 'dark_factory'
+        assert records[0].project_id == 'know_live'
+
+    async def test_null_group_id_still_falls_back_to_graph_name(self) -> None:
+        """The pre-existing fallback survives the new field."""
+        graph = _FakeGraph(rows=[_episode_row(group_id=None)])
+        reader = EpisodeReader(graph=graph, graph_name='dark_factory')
+        records = await reader.fetch_population()
+        assert records[0].project_id == 'dark_factory'
+        assert records[0].graph_name == 'dark_factory'
+
+    async def test_reader_constructs_no_graphiti_driver(self) -> None:
+        """graphiti_core's FalkorDriver.__init__ fire-and-forgets
+        build_indices_and_constraints() — a WRITE. This class must never
+        construct it (build_corpus.py:706-712's explicit warning).
+
+        Asserted STRUCTURALLY over the AST, not as a substring scan: the module
+        deliberately NAMES FalkorDriver in a docstring to warn against it (as
+        build_corpus.py does), and a substring test cannot tell a warning from
+        a construction — it would punish documenting the hazard.
+        """
+        tree = ast.parse(SCRIPT_PATH.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert not alias.name.startswith('graphiti_core'), (
+                        f'imports graphiti_core: {alias.name}'
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                assert not (node.module or '').startswith('graphiti_core'), (
+                    f'imports from graphiti_core: {node.module}'
+                )
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = getattr(func, 'id', None) or getattr(func, 'attr', None)
+                assert name != 'FalkorDriver', 'constructs graphiti FalkorDriver'
+
+        graph = _FakeGraph(rows=[_episode_row()])
+        reader = EpisodeReader(graph=graph)
+        await reader.fetch_population()
+        assert reader._graph is graph
+
+
+class _FakeReader:
+    """A reader double: a fixed corpus plus a fixed episode->edges map.
+
+    ``edge_lookups`` records every uuid the sweep ASKED this reader about — the
+    batched call appends each member of the batch, so an assertion on it reads
+    the same whether the production path issues one query or many.
+    """
+
+    def __init__(
+        self,
+        records: list[object],
+        edges: dict[str, tuple[str, ...]] | None = None,
+    ) -> None:
+        self.records = records
+        self.edges = edges or {}
+        self.edge_lookups: list[str] = []
+        self.batch_calls: int = 0
+
+    async def fetch_population(self, *, limit: int | None = None) -> list[object]:
+        return self.records if limit is None else self.records[:limit]
+
+    async def fetch_derived_edges_batch(
+        self, episode_uuids: object
+    ) -> dict[str, tuple[str, ...]]:
+        wanted = list(episode_uuids)  # type: ignore[call-overload]
+        self.batch_calls += 1
+        self.edge_lookups.extend(wanted)
+        # Total over the request, exactly as EpisodeReader is: a missing key
+        # would be indistinguishable from "not enumerated".
+        return {uuid: self.edges.get(uuid, ()) for uuid in wanted}
+
+
+class _ExplodingEdgeReader(_FakeReader):
+    """Reads its population fine, then fails on the edge query.
+
+    The live shape of a graph that errors mid-run: the population is already in
+    hand, so the sweep proceeds — but the edge enumeration for those episodes
+    produced NO answer and must not be recorded as one.
+    """
+
+    async def fetch_derived_edges_batch(
+        self, episode_uuids: object
+    ) -> dict[str, tuple[str, ...]]:
+        wanted = list(episode_uuids)  # type: ignore[call-overload]
+        self.edge_lookups.extend(wanted)
+        raise RuntimeError(f'edge scan blew up for {wanted}')
+
+
+def _args(**overrides: object) -> object:
+    parser = _build_parser()
+    args = parser.parse_args([])
+    args.project = ['reify']
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _probes(
+    task_status: object = None,
+    ticket: object = None,
+    commit: object = None,
+) -> object:
+    return Probes(
+        task_status_probe=lambda ref, project_id: task_status,
+        ticket_probe=lambda ref: ticket,
+        commit_probe=lambda ref, project_id: commit,
+    )
+
+
+@pytest.mark.asyncio
+class TestRunEndToEnd:
+    """_run wired against fakes — the seams injected as audit_found_on_main
+    injects its GitFacts facade."""
+
+    async def _run_capture(
+        self,
+        capsys,
+        reader: object,
+        probes: object,
+        **arg_overrides: object,
+    ) -> tuple[int, dict[str, Any] | None, str]:
+        code = await _run(
+            _args(**arg_overrides),
+            reader_factory=lambda project: reader,
+            probes=probes,
+        )
+        out = capsys.readouterr().out
+        report = json.loads(out) if out.strip() else None
+        return code, report, out
+
+    async def test_clean_corpus_returns_zero_with_no_findings(self, capsys) -> None:
+        reader = _FakeReader([_record(uuid='ep-1', text='an ordinary observation')])
+        code, report, _ = await self._run_capture(capsys, reader, _probes())
+        assert code == 0
+        assert report is not None
+        assert report['findings'] == []
+        assert report['summary']['mismatch'] == 0
+
+    async def test_mismatch_returns_zero_by_default_and_two_when_gated(
+        self, capsys
+    ) -> None:
+        reader = _FakeReader([_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_2)])
+
+        code, report, _ = await self._run_capture(
+            capsys, reader, _probes(ticket=None)
+        )
+        assert code == 0
+        assert report is not None
+        assert report['summary']['mismatch'] == 1
+
+        code, _report, _ = await self._run_capture(
+            capsys, reader, _probes(ticket=None), fail_on_mismatch=True
+        )
+        assert code == 2
+
+    async def test_stdout_is_exactly_one_json_blob(self, capsys) -> None:
+        """The committed artifact in the sweep directory is byte-for-byte
+        stdout, so any stray print corrupts it."""
+        reader = _FakeReader([_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_2)])
+        _code, report, out = await self._run_capture(
+            capsys, reader, _probes(ticket=None)
+        )
+        assert report is not None
+        assert out == json.dumps(report, indent=2, default=str) + '\n'
+
+    async def test_flagged_episode_carries_its_derived_edge_uuids(
+        self, capsys
+    ) -> None:
+        """The esc-3085-1 episode->edge shape: the operator gets the actual harm
+        artefacts, not only the source episode."""
+        episode = '02090224-7bc9-4485-9291-6748e1042ac9'
+        edge = '7dbf12cf-9251-4674-b396-8eefdf651d1c'
+        reader = _FakeReader(
+            [_record(uuid=episode, text=ESC_3085_1_INSTANCE_2)],
+            edges={episode: (edge,)},
+        )
+        _code, report, _ = await self._run_capture(
+            capsys, reader, _probes(ticket=None)
+        )
+        assert report is not None
+        assert report['findings'][0]['derived_edge_uuids'] == [edge]
+        assert reader.edge_lookups == [episode]
+
+    async def test_unavailable_ticket_store_never_yields_a_mismatch(
+        self, capsys
+    ) -> None:
+        """THE PROBE-AVAILABILITY CONTRACT, at the wiring level.
+
+        When the ticket store is absent, EVERY ticket claim must land on
+        'unverifiable' and ZERO on 'mismatch'. Pinned here as well as at the
+        unit level (TestAdjudicate) because this is the defect most likely to
+        be reintroduced by someone "simplifying" the probe to match the live
+        gate, and the regression would happen in the wiring.
+        """
+        reader = _FakeReader([
+            _record(uuid=f'ep-{i}', text=ESC_3085_1_INSTANCE_2) for i in range(5)
+        ])
+        _code, report, _ = await self._run_capture(
+            capsys, reader, _probes(ticket=UNRESOLVABLE), include_unverifiable=True
+        )
+        assert report is not None
+        assert report['summary']['mismatch'] == 0
+        assert report['summary']['unverifiable'] == 5
+        assert all(f['status'] == 'unverifiable' for f in report['findings'])
+
+    async def test_mistyped_category_is_named_not_silently_empty(
+        self, capsys, caplog
+    ) -> None:
+        """`--categories temporal_fact` scans a corpus and matches nothing.
+
+        Without this, the artifact reads `scanned: 7595, mismatch: 0` — exactly
+        what a genuinely clean corpus looks like — because no record can carry
+        a label that names no MemoryCategory. The scope was empty by
+        MIS-SPELLING, and the report has to say so itself.
+        """
+        reader = _FakeReader([_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_2)])
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            _code, report, _ = await self._run_capture(
+                capsys, reader, _probes(ticket=None),
+                categories='temporal_fact,decisions_and_rationale',
+            )
+        assert report is not None
+        assert report['unrecognized_categories'] == ['temporal_fact']
+        assert report['scanned'] == 1
+        assert report['records_with_claims'] == 0
+        assert report['summary']['mismatch'] == 0
+        assert 'temporal_fact' in caplog.text
+
+    async def test_recognized_categories_leave_the_key_empty(self, capsys) -> None:
+        """Always present, [] when clean — an absent key would read as absent
+        rather than as none."""
+        reader = _FakeReader([_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_2)])
+        _code, report, _ = await self._run_capture(
+            capsys, reader, _probes(ticket=None)
+        )
+        assert report is not None
+        assert report['unrecognized_categories'] == []
+        assert report['summary']['mismatch'] == 1
+
+    async def test_infra_failure_returns_one_and_prints_nothing(self, capsys) -> None:
+        """A truncated report that looks complete is worse than none."""
+
+        def exploding_factory(project: str) -> object:
+            raise RuntimeError('FalkorDB unreachable')
+
+        code = await _run(
+            _args(), reader_factory=exploding_factory, probes=_probes()
+        )
+        assert code == 1
+        assert capsys.readouterr().out == ''
+
+    async def test_unverifiable_is_counted_but_not_listed_by_default(
+        self, capsys
+    ) -> None:
+        reader = _FakeReader([
+            _record(uuid='ep-1', text=ESC_3085_1_INSTANCE_2),
+            _record(uuid='ep-2', text=ESC_3085_1_INSTANCE_1),
+        ])
+        _code, report, _ = await self._run_capture(
+            capsys,
+            reader,
+            Probes(
+                task_status_probe=lambda ref, project_id: None,
+                ticket_probe=lambda ref: None,
+                commit_probe=lambda ref, project_id: None,
+            ),
+        )
+        assert report is not None
+        assert report['summary']['mismatch'] == 1
+        assert report['summary']['unverifiable'] == 1
+        assert [f['status'] for f in report['findings']] == ['mismatch']
+        assert report['truncated_by']['withheld'] == 1
+
+
+@pytest.mark.asyncio
+class TestDerivedEdgeLookupKeying:
+    """The derived-edge reader is looked up by the GRAPH THAT WAS SWEPT.
+
+    A graph legitimately holds episodes whose ``group_id`` differs from the
+    graph name — the committed pre-fix report.json shows 15 such findings under
+    ``know_live`` / ``knowlive`` / ``solar_challenge_platform``, every one of
+    them carrying ``derived_edge_uuids: []``. Those episodes were never queried
+    at all: the lookup was keyed on the record's ``project_id`` against a dict
+    keyed by ``--project`` graph names, so it silently resolved to no reader and
+    the miss serialized as a measured zero.
+    """
+
+    async def _run_capture(
+        self,
+        capsys,
+        reader: object,
+        probes: object,
+        **arg_overrides: object,
+    ) -> tuple[int, dict[str, Any] | None]:
+        code = await _run(
+            _args(project=['dark_factory'], **arg_overrides),
+            reader_factory=lambda project: reader,
+            probes=probes,
+        )
+        out = capsys.readouterr().out
+        return code, (json.loads(out) if out.strip() else None)
+
+    async def test_foreign_group_id_episode_is_still_queried_for_edges(
+        self, capsys
+    ) -> None:
+        """The regression: fetch_derived_edges was not called AT ALL."""
+        episode = '02090224-7bc9-4485-9291-6748e1042ac9'
+        edge = '7dbf12cf-9251-4674-b396-8eefdf651d1c'
+        reader = _FakeReader(
+            [
+                _record(
+                    uuid=episode,
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='know_live',
+                    graph_name='dark_factory',
+                )
+            ],
+            edges={episode: (edge,)},
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert reader.edge_lookups == [episode]
+        assert report is not None
+        assert report['findings'][0]['derived_edge_uuids'] == [edge]
+
+    async def test_report_row_names_both_the_graph_and_the_group(
+        self, capsys
+    ) -> None:
+        """Two distinct facts, both reported; ``by_project`` keeps meaning the
+        record's own claimed project, which investigation.md already uses."""
+        reader = _FakeReader(
+            [
+                _record(
+                    uuid='ep-1',
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='know_live',
+                    graph_name='dark_factory',
+                )
+            ],
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['project_id'] == 'know_live'
+        assert finding['graph_name'] == 'dark_factory'
+        assert report['summary']['by_project'] == {'know_live': 1}
+
+    async def test_unresolved_reader_is_null_not_an_empty_list(
+        self, capsys, caplog
+    ) -> None:
+        """NOT ENUMERATED and NO EDGES FOUND are different facts.
+
+        A --project dropped from the argv leaves a finding whose graph has no
+        reader. Serializing that as ``[]`` makes it indistinguishable in the
+        committed artifact from an episode genuinely free of derived edges —
+        a silent fail-soft, on the report's central harm-artefact column.
+        """
+        reader = _FakeReader(
+            [
+                _record(
+                    uuid='ep-orphan',
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='reify',
+                    graph_name='reify',  # not among --project, so no reader
+                )
+            ],
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            _code, report = await self._run_capture(
+                capsys, reader, _probes(task_status='in-progress')
+            )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['derived_edge_uuids'] is None
+        assert finding['edges_unqueried'] is True
+        assert reader.edge_lookups == []
+        # Every other degradation path in this module warns; this one must too.
+        assert 'ep-orphan' in caplog.text
+        assert 'reify' in caplog.text
+
+    async def test_reader_that_raises_is_null_not_an_empty_list(
+        self, capsys, caplog
+    ) -> None:
+        """A query that blew up is also not a measured zero."""
+        reader = _ExplodingEdgeReader(
+            [_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_1,
+                     project_id='know_live', graph_name='dark_factory')]
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            _code, report = await self._run_capture(
+                capsys, reader, _probes(task_status='in-progress')
+            )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['derived_edge_uuids'] is None
+        assert finding['edges_unqueried'] is True
+        assert 'ep-1' in caplog.text
+
+    async def test_answered_but_edge_free_episode_stays_an_empty_list(
+        self, capsys
+    ) -> None:
+        """The two cases must stay distinguishable in the artifact."""
+        reader = _FakeReader(
+            [_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_1,
+                     project_id='know_live', graph_name='dark_factory')],
+            edges={},  # the reader answers, with nothing
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['derived_edge_uuids'] == []
+        assert finding['edges_unqueried'] is False
+        assert reader.edge_lookups == ['ep-1']
+
+    async def test_each_graph_is_asked_through_its_OWN_reader(
+        self, capsys
+    ) -> None:
+        """The other half of the defect: the WRONG graph's reader answering.
+
+        Every other _run test shares one reader across all graphs, so it cannot
+        tell "queried graph A's reader" from "queried graph B's". Here the
+        record is READ FROM reify while claiming group_id dark_factory — the
+        shape that lost 6-11 edges each on five findings in the first live run.
+        Keying the lookup back on project_id would still pass those tests; it
+        fails this one, because reify's reader would never be asked.
+        """
+        episode = 'ep-cross'
+        reify_reader = _FakeReader(
+            [
+                _record(
+                    uuid=episode,
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='dark_factory',
+                    graph_name='reify',
+                )
+            ],
+            edges={episode: ('edge-in-reify',)},
+        )
+        dark_reader = _FakeReader([], edges={episode: ('edge-in-dark-factory',)})
+        readers = {'reify': reify_reader, 'dark_factory': dark_reader}
+
+        code = await _run(
+            _args(project=['reify', 'dark_factory']),
+            reader_factory=lambda project: readers[project],
+            probes=_probes(task_status='in-progress'),
+        )
+        out = capsys.readouterr().out
+        report = json.loads(out)
+        assert code == 0
+        # Read from reify: reify's OWN reader is the one that must be asked.
+        assert reify_reader.edge_lookups == [episode]
+        # And its group_id graph too, since dark_factory was also swept — those
+        # edges are real and were previously dropped on the floor.
+        assert dark_reader.edge_lookups == [episode]
+        finding = report['findings'][0]
+        assert finding['derived_edge_uuids'] == [
+            'edge-in-dark-factory', 'edge-in-reify',
+        ]
+        assert finding['edges_enumerated_in'] == ['reify', 'dark_factory']
+        assert finding['cross_graph'] is True
+        assert report['summary']['by_graph'] == {'reify': 1}
+        assert report['summary']['by_project'] == {'dark_factory': 1}
+
+    async def test_group_id_graph_not_swept_is_enumerated_where_it_can_be(
+        self, capsys
+    ) -> None:
+        """A group_id naming an UNSWEPT graph is still enumerated where read.
+
+        edges_enumerated_in names the one graph that answered, so an empty
+        result is readable as "asked here, found nothing" rather than as
+        coverage of a graph this run never opened.
+        """
+        reader = _FakeReader(
+            [
+                _record(
+                    uuid='ep-1',
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='know_live',
+                    graph_name='dark_factory',
+                )
+            ],
+            edges={'ep-1': ('edge-1',)},
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['derived_edge_uuids'] == ['edge-1']
+        assert finding['edges_enumerated_in'] == ['dark_factory']
+        assert finding['cross_graph'] is True
+
+    async def test_one_scan_per_graph_not_one_per_episode(self, capsys) -> None:
+        """Batched: the graph is scanned once however many episodes flagged."""
+        reader = _FakeReader(
+            [
+                _record(uuid=f'ep-{i}', text=ESC_3085_1_INSTANCE_1,
+                        project_id='dark_factory', graph_name='dark_factory')
+                for i in range(4)
+            ],
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        assert report['summary']['mismatch'] == 4
+        assert reader.batch_calls == 1
+        assert sorted(reader.edge_lookups) == ['ep-0', 'ep-1', 'ep-2', 'ep-3']
+
+    async def test_summary_counts_unqueried_findings(self, capsys) -> None:
+        """The denominator of un-enumerated findings is visible without
+        diffing the list — the same no-silent-caps discipline as
+        ``truncated_by``."""
+        reader = _FakeReader(
+            [
+                _record(uuid='ep-seen', text=ESC_3085_1_INSTANCE_1,
+                        project_id='know_live', graph_name='dark_factory'),
+                _record(uuid='ep-orphan', text=ESC_3085_1_INSTANCE_1,
+                        project_id='reify', graph_name='reify'),
+            ],
+            edges={'ep-seen': ('edge-1',)},
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        assert report['summary']['edges_unqueried'] == 1
+        assert report['summary']['mismatch'] == 2
+
+
+@pytest.mark.asyncio
+class TestProbeBuilders:
+    """The three probe builders, tested DIRECTLY against real stores.
+
+    Every other test in this file injects a hand-written probe, so the builders
+    themselves were unexercised: someone "simplifying" ``_build_ticket_probe``
+    to return ``None`` when tickets.db is absent — the exact regression its
+    docstring warns about, which would print a fabrication accusation against
+    every ticket-claiming writer in the corpus — would leave the whole suite
+    green. These tests close that gap, and also pin the READ-ONLY contract: a
+    sweep opens other projects' LIVE databases, so it must never create,
+    migrate, or otherwise touch one.
+    """
+
+    async def test_ticket_probe_missing_db_is_unresolvable_and_creates_nothing(
+        self, tmp_path
+    ) -> None:
+        """Absent registry -> UNRESOLVABLE for every ref, never None."""
+        db_path = tmp_path / 'tickets.db'
+        probe = await _mod._build_ticket_probe(db_path, ['tkt_ANY'])
+        assert probe('tkt_ANY') is UNRESOLVABLE
+        assert probe('tkt_OTHER') is UNRESOLVABLE
+        # TicketStore.initialize() would have mkdir'd and CREATE TABLE'd here.
+        assert not db_path.exists()
+
+    async def test_ticket_probe_unopenable_db_is_unresolvable(self, tmp_path) -> None:
+        """A corrupt/foreign file is an unreadable registry, not a fabrication."""
+        db_path = tmp_path / 'tickets.db'
+        db_path.write_bytes(b'this is not a sqlite database')
+        probe = await _mod._build_ticket_probe(db_path, ['tkt_ANY'])
+        assert probe('tkt_ANY') is UNRESOLVABLE
+
+    async def test_ticket_probe_present_row_absent_ref_and_unrequested_ref(
+        self, tmp_path
+    ) -> None:
+        """The three outcomes, against a REAL TicketStore-written database.
+
+        Built by the store itself rather than by hand so the SELECT in
+        ``_read_ticket_rows_readonly`` is pinned to the live schema — the read
+        no longer goes through TicketStore, so schema agreement is exactly what
+        could silently drift.
+        """
+        from fused_memory.middleware.ticket_store import TicketStore  # noqa: PLC0415
+
+        db_path = tmp_path / 'tickets.db'
+        store = TicketStore(db_path)
+        await store.initialize()
+        ticket_id = await store.submit('dark_factory', '{"title": "a candidate"}')
+        await store.close()
+
+        probe = await _mod._build_ticket_probe(
+            db_path, [ticket_id, 'tkt_0RRRC5AASJ9Z630VP4PCN9H376']
+        )
+        row = probe(ticket_id)
+        assert isinstance(row, dict)
+        # The two keys completion_claim_gate._verify_ticket reads (:578-581).
+        assert row['project_id'] == 'dark_factory'
+        assert row['status'] == 'pending'
+        # Asked about, and genuinely not there: the mismatch signal.
+        assert probe('tkt_0RRRC5AASJ9Z630VP4PCN9H376') is None
+        # Never asked about: unresolvable, not an accusation.
+        assert probe('tkt_NEVER_REQUESTED') is UNRESOLVABLE
+
+    async def test_task_status_probe_unregistered_project_is_unresolvable(
+        self, caplog
+    ) -> None:
+        """The path that produced the shipped report's know_live unverifiables."""
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            probe = await _mod._build_task_status_probe({}, {'know_live': {'5422'}})
+        assert probe('5422', 'know_live') is None
+        assert 'know_live' in caplog.text
+
+    async def test_task_status_probe_reads_the_real_schema(self, tmp_path) -> None:
+        """Statuses come back per (project, id), scoped to the master tag.
+
+        The fixture database is created from the BACKEND's own ``_SCHEMA_SQL``,
+        so this test fails if the read's SQL ever drifts from the schema the
+        backend writes — the silent-all-unverifiable regression.
+        """
+        import sqlite3  # noqa: PLC0415
+
+        from fused_memory.backends.sqlite_task_backend import (  # noqa: PLC0415
+            _SCHEMA_SQL,
+        )
+
+        root = tmp_path / 'proj'
+        db_path = root / '.taskmaster' / 'tasks' / 'tasks.db'
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(db_path)
+        conn.executescript(_SCHEMA_SQL)
+        conn.executemany(
+            'INSERT INTO tasks (tag, id, title, status, updated_at) '
+            'VALUES (?, ?, ?, ?, ?)',
+            [
+                ('master', 5422, 'a task', 'in-progress', '2026-07-26T00:00:00Z'),
+                ('master', 5638, 'another', 'done', '2026-07-26T00:00:00Z'),
+                ('other-tag', 5999, 'off-tag', 'done', '2026-07-26T00:00:00Z'),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        probe = await _mod._build_task_status_probe(
+            {'reify': str(root)}, {'reify': {'5422', '5638', '5999', '4040'}}
+        )
+        assert probe('5422', 'reify') == 'in-progress'
+        assert probe('5638', 'reify') == 'done'
+        assert probe('5999', 'reify') is None  # another tag is not this tree
+        assert probe('4040', 'reify') is None  # no such task -> unresolvable
+        assert probe('5422', 'dark_factory') is None  # wrong project's tree
+
+    async def test_task_status_probe_missing_db_creates_nothing(
+        self, tmp_path
+    ) -> None:
+        """SqliteTaskBackend would mkdir the parents and apply the schema here.
+
+        A sweep must never bring a .taskmaster tree into existence in a
+        checkout that has none, so the absence of the directory afterwards is
+        the assertion that matters.
+        """
+        root = tmp_path / 'empty-checkout'
+        root.mkdir()
+        probe = await _mod._build_task_status_probe(
+            {'reify': str(root)}, {'reify': {'5422'}}
+        )
+        assert probe('5422', 'reify') is None
+        assert not (root / '.taskmaster').exists()
+
+    async def test_commit_probe_unregistered_project_is_unresolvable(self) -> None:
+        """Searching the WRONG repo would be a false 'no such commit'."""
+        probe = _mod._build_commit_probe({})
+        assert probe('deadbeef', 'know_live') is None
+        assert probe('deadbeef', None) is None
+
+    async def test_commit_probe_answers_against_a_real_repo(self) -> None:
+        """Wired to a real git tree: a bogus sha is a MISS (False), not None.
+
+        False and None are different verdicts downstream — mismatch versus
+        unverifiable — so a probe that answered None for everything would look
+        harmless while quietly emptying the mismatch bucket.
+        """
+        repo_root = SCRIPT_PATH.parents[2]
+        probe = _mod._build_commit_probe({'dark_factory': str(repo_root)})
+        assert probe('0' * 40, 'dark_factory') is False

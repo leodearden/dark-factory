@@ -1,0 +1,87 @@
+{
+  "corpus": {
+    "counts": {
+      "decisions_and_rationale": 812,
+      "entities_and_relations": 1204,
+      "observations_and_summaries": 946,
+      "preferences_and_norms": 233,
+      "procedural_knowledge": 407,
+      "temporal_facts": 588
+    },
+    "project_id": "dark_factory"
+  },
+  "eval_id": "e1-retrieval-health",
+  "metrics": [
+    {
+      "denominator": 30,
+      "direction": "lower_is_worse",
+      "kind": "proportion",
+      "metric_id": "canonical-in-top-5",
+      "n": 30,
+      "value": 0.8
+    },
+    {
+      "direction": "higher_is_worse",
+      "kind": "count",
+      "metric_id": "dangling-pointers",
+      "n": 30,
+      "value": 6.0
+    },
+    {
+      "direction": "higher_is_worse",
+      "kind": "count",
+      "metric_id": "superseded-above-successor",
+      "n": 30,
+      "value": 2.0
+    },
+    {
+      "details_path": "report-20260703T031500Z.txt",
+      "items": [
+        {
+          "item_key": "t-briefing-assembler-queries",
+          "passed": true
+        },
+        {
+          "item_key": "t-canonical-consolidation",
+          "passed": true
+        },
+        {
+          "item_key": "t-escalation-severity",
+          "passed": true
+        },
+        {
+          "item_key": "t-merge-lane-invariants",
+          "passed": true
+        },
+        {
+          "item_key": "t-recon-watcher-triage",
+          "passed": false
+        },
+        {
+          "item_key": "t-routing-ladder",
+          "passed": false
+        },
+        {
+          "item_key": "t-supersedes-chain",
+          "passed": true
+        },
+        {
+          "item_key": "t-worktree-lifecycle",
+          "passed": true
+        }
+      ],
+      "kind": "tripwire",
+      "metric_id": "topic-canonical-present",
+      "n": 8,
+      "value": 2.0
+    },
+    {
+      "kind": "scalar",
+      "metric_id": "search-latency-p50-ms",
+      "n": 30,
+      "value": 43.25
+    }
+  ],
+  "run_stamp": "20260703T031500Z",
+  "schema_version": 1
+}

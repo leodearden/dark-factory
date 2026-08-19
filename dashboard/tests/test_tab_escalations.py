@@ -37,6 +37,22 @@ def tab_escalations_jsx_body(_client):
 
 
 @pytest.fixture(scope='module')
+def tab_escalations_jsx_code(tab_escalations_jsx_body):
+    """`tab_escalations.jsx` with every comment stripped.
+
+    Same rationale as the `tab_memory_evals_jsx_code` fixture in
+    test_tab_memory_evals.py: this file carries explanatory prose naming most
+    of the identifiers the render code also names, so a whole-file substring
+    grep is satisfied by a MENTION — delete the render site, leave the comment,
+    and the assertion stays green.
+
+    Safe to strip naively: the source contains no `//` inside a string literal
+    (no URLs) and no regex literals, so no `/`-bearing code is eaten.
+    """
+    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', tab_escalations_jsx_body)
+
+
+@pytest.fixture(scope='module')
 def app_jsx_body(_client):
     return _client.get('/static/redux/app.jsx').text
 
@@ -229,7 +245,8 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
 
     The entry must be present in the static (unwindowed) section of endpointsFor,
     and the empty-defaults block must initialise ESCALATIONS with the shape
-    expected by redux_api.shape_escalations: {subsections, summary:{by_level,by_status}}.
+    expected by redux_api.shape_escalations:
+    {subsections, summary:{by_level, by_status, skipped_count}}.
     """
     assert '/api/v2/dashboard/escalations' in data_js_body, (
         "data.js does not contain the literal URL '/api/v2/dashboard/escalations' — "
@@ -267,6 +284,13 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
     assert re.search(r'\bby_status\s*:', summary_block), (
         "ESCALATIONS.summary seed missing key 'by_status:' — "
         'add it nested under summary in the ESCALATIONS seed block.'
+    )
+    assert re.search(r'\bskipped_count\s*:', summary_block), (
+        "ESCALATIONS.summary seed missing key 'skipped_count:' — "
+        'add it nested under summary in the ESCALATIONS seed block.  The seed '
+        "declares the server's true payload shape before the first poll resolves; "
+        'omitting the key leaves the global "N unreadable" pill reading `undefined` '
+        'rather than a real zero.'
     )
 
 
@@ -485,16 +509,21 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
         'tab_escalations.jsx must load before app.jsx so EscalationsTab is set on window.DF_TABS.',
     )
 
-    # (g) All /static/redux/ v= cache-busters share one version >= 10
-    import re as _re
-    versions = set(_re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
-    assert len(versions) == 1, (
-        f'index.html has mixed /static/redux/?v= cache-buster versions: {sorted(versions)} — '
-        'bump all of them uniformly to the same value.'
+    # (g) every /static/redux/ cache-buster is at or past this tab's floor.
+    #     FLOOR only: whether the versions are UNIFORM is asserted once,
+    #     canonically, in test_index_html.py. It was replicated byte-identically
+    #     across five test modules, each with its own stale monotonic floor, so a
+    #     partial bump failed five tests with five different floors in the
+    #     message. `min(...)` is the strictly stronger floor claim under mixed
+    #     versions anyway — the OLDEST asset is the one that serves stale code.
+    versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
+    assert versions, (
+        'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
+        'cache-buster convention has been dropped or the URLs were rewritten.'
     )
-    v = int(next(iter(versions)))
-    assert v >= 10, (
-        f'index.html cache-buster version is {v}, expected >= 10.'
+    assert min(versions) >= 10, (
+        f'the oldest index.html cache-buster version is {min(versions)}, '
+        'expected >= 10 (the floor tab_escalations.jsx landed at).'
     )
 
 
@@ -653,6 +682,179 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
         'tab_escalations.jsx sidebar does not have a `task_unresolved` fallback branch — '
         'add `{row.task_unresolved ? <unresolved note> : <task card>}` to handle '
         'escalations whose linked task could not be resolved.'
+    )
+
+
+def test_tab_escalations_renders_skipped_queue_files(tab_escalations_jsx_body: str) -> None:
+    """tab_escalations.jsx must surface the queue files the reader could not parse.
+
+    The ESCALATIONS payload carries per-subsection ``skipped``
+    (``[{path, error}, ...]``) and ``summary.skipped_count``.  A tab that
+    renders one escalation short with nothing saying so is the exact silent
+    degradation INV-2 (``structured-facts-at-failure``) forbids.
+
+    Asserts:
+    (a) a ``data-testid="escalation-skipped"`` notice element exists.
+    (b) the notice names BOTH ``.path`` and ``.error`` — the operator must be
+        told WHICH file and WHY, not just a count.
+    (c) the notice is driven by ``sec.skipped`` and gated on a non-zero length.
+    (d) the notice sits OUTSIDE the ``filteredRows.length === 0`` ternary, so a
+        group whose every row is filtered out still shows it.
+    (e) the notice is NOT gated on the level/status filter chips — a file that
+        could not be parsed has neither field to filter on.
+    (f) the per-subsection group summary carries a skipped badge, beside the
+        existing L1/L2 pips, so it is visible while the group is collapsed.
+    (g) the global controls header renders a ``skipped_count`` pill, gated on > 0.
+    (h) the notice caps how many rows it lists while still counting the true
+        total, so a whole-directory fault does not bury the escalation table.
+    """
+    body = tab_escalations_jsx_body
+
+    # (a) The notice element exists.
+    assert 'data-testid="escalation-skipped"' in body, (
+        'tab_escalations.jsx has no `data-testid="escalation-skipped"` notice — '
+        'add a SkippedNotice component (modelled on tab_memory_evals.jsx::IssuesNotice) '
+        'that renders the subsection\'s unreadable queue files.'
+    )
+
+    # (b) The notice names each file and its cause, not just a count.
+    #
+    # The window is the SkippedNotice component body — sliced from its `function`
+    # declaration to the next top-level one — not a fixed character count.  A
+    # char-count window makes the negative assertions in (e) below depend on how
+    # much unrelated source happens to sit within N characters, so an edit
+    # nowhere near this notice could fail them.
+    comp_m = re.search(r'^function SkippedNotice\(', body, re.MULTILINE)
+    assert comp_m is not None, (
+        'tab_escalations.jsx declares no top-level `function SkippedNotice(` — the '
+        'notice must be a named component, not inlined into the subsection map.'
+    )
+    next_fn = re.search(r'^function ', body[comp_m.end():], re.MULTILINE)
+    notice = body[comp_m.start():comp_m.end() + next_fn.start()] if next_fn else body[comp_m.start():]
+    assert 'data-testid="escalation-skipped"' in notice, (
+        'the `escalation-skipped` testid is not rendered by SkippedNotice — keep the '
+        'notice and its testid in one component so this test window covers it.'
+    )
+    for field in ('.path', '.error'):
+        assert field in notice, (
+            f'the escalation-skipped notice does not reference `{field}` — a bare count '
+            'tells the operator something is wrong but not what; render one line per '
+            'entry naming the path and the parse error.'
+        )
+
+    # (c) Driven by the subsection field, gated on a non-zero length.
+    assert 'sec.skipped' in body, (
+        'tab_escalations.jsx never reads `sec.skipped` — the notice must be driven by '
+        'the per-subsection payload field, not re-derived or hardcoded.'
+    )
+    assert re.search(r'skipped\.length|skipped\s*\.\s*length', body), (
+        'the escalation-skipped notice is not gated on the skipped list length — '
+        'render nothing when the queue read cleanly.'
+    )
+
+    # (d) The notice sits OUTSIDE the all-rows-filtered empty-state branch.
+    map_m = re.search(r'subsections\.map\(sec\s*=>', body)
+    assert map_m is not None, (
+        'could not locate the `subsections.map(sec =>` body in tab_escalations.jsx'
+    )
+    map_body = body[map_m.start():]
+    skipped_at = map_body.find('sec.skipped')
+    mount_at = map_body.find('<SkippedNotice')
+    empty_at = map_body.find('filteredRows.length === 0')
+    assert skipped_at != -1 and empty_at != -1
+    # Anchor on the MOUNT site, not the `const skipped = sec.skipped` read: an
+    # implementation that hoisted the read but moved the mount into the
+    # empty-state branch would satisfy a read-position check while silently
+    # reintroducing the exact looks-empty-but-isn't case this asserts against.
+    assert mount_at != -1, (
+        'the subsection map never mounts `<SkippedNotice …>` — the component must be '
+        'rendered inside the group, not merely declared.'
+    )
+    assert mount_at < empty_at, (
+        'the skipped notice is mounted inside or after the '
+        '`filteredRows.length === 0` ternary — hoist it above that branch so a group '
+        'rendering "No escalations match current filters" while holding an unreadable '
+        'file still says so.'
+    )
+
+    # (e) Not routed through the level/status filter chips.
+    for gate in ('matchesFilter', 'filter.levels', 'filter.statuses'):
+        assert gate not in notice, (
+            f'the escalation-skipped notice references `{gate}` — a file that could not '
+            'be parsed has no level or status, so routing it through the chips would let '
+            'an arbitrary default decide whether the operator is told about corruption.'
+        )
+    skipped_stmt = map_body[skipped_at:map_body.find('\n', skipped_at)]
+    for gate in ('matchesFilter', 'filter.levels', 'filter.statuses'):
+        assert gate not in skipped_stmt, (
+            f'`sec.skipped` is filtered through `{gate}` before reaching the notice — '
+            'pass the list through unfiltered.'
+        )
+
+    # (f) Per-subsection badge beside the existing L1/L2 pips.
+    #
+    # Bounded structurally — from the `const summary = (` fragment to the group's
+    # own `return (` — rather than by a character count, and anchored on the
+    # `secByLevel[2]` identifier rather than the rendered `L2 ·` label, so a
+    # reformat or a label tweak does not fail this test with a misdirecting
+    # "widen the window" message.
+    frag_start = map_body.find('const summary = (')
+    assert frag_start != -1, (
+        'could not locate the per-subsection `const summary = (` fragment'
+    )
+    frag_end = map_body.find('return (', frag_start)
+    frag = map_body[frag_start:frag_end if frag_end != -1 else len(map_body)]
+    assert 'secByLevel[2]' in frag, (
+        'the per-subsection summary fragment no longer renders the L2 pip from '
+        '`secByLevel[2]` — this test anchors the skipped badge beside it.'
+    )
+    assert re.search(r'skipped\.length\s*>\s*0', frag), (
+        'the per-subsection group summary carries no skipped badge — add a '
+        '`{skipped.length > 0 && <span className="pip">…</span>}` badge after the L2 pip '
+        'so the count is visible while the group is collapsed.'
+    )
+    assert 'badge' in frag, (
+        'the skipped badge does not use the `badge` span idiom the L1/L2 pips use'
+    )
+
+    # (g) Global controls-header pill from the top-level summary.
+    assert 'skipped_count' in body, (
+        'tab_escalations.jsx never reads `skipped_count` — add a global pill beside the '
+        'existing `N pending · N L1 · N L2` summary pills.'
+    )
+    # Anchored on the `byLevel[2]` identifier (the global pills; the subsection
+    # pips read `secByLevel[2]`, which does not match) and bounded at the next
+    # structural landmark — the subsection map — rather than by a character
+    # count.  The stated contract is "in the controls header, after the
+    # pending/L1/L2 pills and before the subsection groups", which survives a
+    # reformat or a label change; `'L1 · {byLevel[2]'` pinned exact whitespace
+    # and an interpunct.
+    pills_at = body.find('byLevel[2]')
+    assert pills_at != -1, 'could not locate the global summary-pill span'
+    pills_end = body.find('subsections.map(', pills_at)
+    pills_window = body[pills_at:pills_end if pills_end != -1 else len(body)]
+    assert 'skipped_count' in pills_window, (
+        'the `skipped_count` pill is not rendered beside the existing pending/L1/L2 '
+        'pills — append it to that same summary span.'
+    )
+    assert re.search(r'skipped_count[^\n]*>\s*0', pills_window), (
+        'the global `skipped_count` pill is not gated on `> 0` — a clean fleet must not '
+        'render a permanent "0 unreadable" pill.'
+    )
+
+    # (h) The notice bounds how many rows it renders, without understating the
+    # loss.  A whole-directory fault (truncated write, permission fault, a
+    # half-synced mount) yields hundreds of records; rendering them all,
+    # always-expanded, pushes the escalation table below the fold and degrades
+    # the same operator view the notice exists to serve.
+    assert '.slice(' in notice, (
+        'SkippedNotice renders every entry unbounded — slice the list to a cap and add '
+        'an overflow line, so a whole-directory fault does not bury the escalation table.'
+    )
+    assert 'rows.length' in notice, (
+        'the SkippedNotice headline no longer counts from the full `rows.length` — the '
+        'headline must state the TRUE total even when the listing is capped, or the '
+        'notice understates the loss it exists to report.'
     )
 
 
@@ -907,4 +1109,224 @@ def test_tab_escalations_strip_sparklines_and_churn_retained(tab_escalations_jsx
         'No `spark=` prop found within ~200 chars of a churn tile label / '
         'churn_daily reference — churn-24h must be RETAINED with its own '
         'sparkline per the open-question-4 decision (keep all four tiles).'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 3470: cross-tab focus must retry until the payload lands, then report
+# ---------------------------------------------------------------------------
+
+
+def test_focus_handoff_retries_then_reports_a_miss(
+    tab_escalations_jsx_code: str,
+) -> None:
+    """A cross-tab focus that finds no row must retry, then SAY it missed.
+
+    Two halves of one defect in the focus effect:
+
+    (1) It consumes `focusId` UNCONDITIONALLY.  On a miss the operator — who
+        just clicked an escalation link over in the memory-evals section —
+        lands on the Escalations tab with nothing selected and no explanation.
+        A dead click with zero feedback is exactly the silent degradation this
+        repo's loud-over-silent norm exists to prevent.
+
+    (2) It is keyed only on `[focusId]`, so the lookup runs ONCE.  `DF.ESCALATIONS`
+        starts as data.js's seed (`subsections: []`) and `applyKey` replaces the
+        reference wholesale on the first successful poll — ESCALATIONS is
+        deliberately not in STABLE_ARRAY_KEYS (data.js:96-105).  So on a cold
+        load, or with the escalations endpoint sitting in data.js's exponential
+        backoff, the single mount-time pass searches an EMPTY payload, drops the
+        focus, and never retries when the rows arrive.
+
+    Asserted structurally and on `data-testid` values, never on copy.
+    """
+    code = tab_escalations_jsx_code
+
+    # (a) module-scope helpers exist AND are called. Naming a helper and then
+    #     never calling it is the dead-code failure the `trendGaps` precedent
+    #     in test_tab_memory_evals.py:1311-1318 guards against.
+    for helper in ('findEscalationRow', 'escalationsLoaded'):
+        assert re.search(rf'\bfunction\s+{helper}\s*\(', code), (
+            f'tab_escalations.jsx must define `function {helper}(`. Lifting the '
+            'row search and the payload-arrival check to module scope is what '
+            'keeps the focus effect small enough to stay under the 900-char cap '
+            'the cross-tab contract test (test_tab_memory_evals.py) matches on.'
+        )
+        assert len(re.findall(rf'\b{helper}\s*\(', code)) >= 2, (
+            f'`{helper}` is defined but never called.'
+        )
+
+    # Extract the focus effect the same way the cross-tab contract test does,
+    # so the two cannot drift apart on what "the focus effect" means.
+    effect = re.search(
+        r'uE\(\(\)\s*=>\s*\{([\s\S]{0,900}?)\n\s*\},\s*\[([^\]]*focusId[^\]]*)\]\)',
+        code,
+    )
+    assert effect is not None, (
+        'no `uE` effect keyed on `focusId` found within the 900-char body cap. '
+        'If the effect body outgrew the cap, the cross-tab handoff contract '
+        'test in test_tab_memory_evals.py has silently stopped matching too.'
+    )
+    eff, deps = effect.group(1), effect.group(2)
+
+    # (b) the effect DECLINES to decide before the payload arrives.
+    assert re.search(r'if\s*\(\s*!\s*escalationsLoaded\s*\([^)]*\)\s*\)\s*\{?\s*return', eff), (
+        'the focus effect must bail out early while the escalations payload is '
+        'still data.js\'s seed. Searching an empty payload and calling it a '
+        'miss asserts "no longer in the queue" on evidence that cannot support '
+        'it — the endpoint may simply be in backoff.'
+    )
+
+    # (c) the dep array names the escalations payload local, so the lookup
+    #     RETRIES on each 3s poll instead of firing once at mount.
+    #     Derived from inside the COMPONENT body, not the whole file: the
+    #     module-scope seed capture reads `DF.ESCALATIONS` too, and it is a
+    #     different thing — the frozen pre-fetch reference, which correctly
+    #     must NOT appear in the deps.
+    tab_body = _extract_function_body(code, 'EscalationsTab')
+    assert tab_body, 'could not extract the EscalationsTab body.'
+    esc_local = re.search(r'const\s+(\w+)\s*=\s*DF\.ESCALATIONS', tab_body)
+    assert esc_local is not None, (
+        'EscalationsTab must read `DF.ESCALATIONS` into a local.'
+    )
+    assert re.search(r'\b' + re.escape(esc_local.group(1)) + r'\b', deps), (
+        f'the focus effect\'s dep array is `[{deps.strip()}]` — it does not '
+        f'name `{esc_local.group(1)}`, so the lookup never re-runs when the '
+        'payload lands. A cold load drops the focus permanently.'
+    )
+
+    # (d) a miss is RECORDED BY THE NO-ROW BRANCH into the state the miss
+    #     NOTICE renders — not merely stored somewhere.
+    #
+    #     Both anchors are load-bearing.  A loop over every `uS` declaration
+    #     asking only "is this setter called anywhere in the effect, and does
+    #     this state reach any JSX position?" is VACUOUS here: `setSelected` is
+    #     also called in this effect and `selected` also reaches render, it is
+    #     declared first, so such a loop binds to `selected` and passes — as it
+    #     did on the pre-fix code, which recorded no miss at all.
+    no_row_branch = re.search(r'\belse\b([\s\S]*)$', eff)
+    assert no_row_branch is not None, (
+        'the focus effect has no `else` branch: a lookup that found NO row must '
+        'take a distinct path, not fall through to the one a hit takes.'
+    )
+    branch = no_row_branch.group(1)
+    miss_state = None
+    for decl in re.finditer(r'const\s*\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*=\s*uS\(', code):
+        state, setter = decl.group(1), decl.group(2)
+        if not re.search(r'\b' + re.escape(setter) + r'\s*\(', branch):
+            continue
+        # ...and that same state must GATE the miss notice's subtree. Derived
+        # from the testid, not from the state's spelling, so a rename is free.
+        if not re.search(
+            r'\{\s*' + re.escape(state) + r'\s*&&[\s\S]{0,400}?data-testid="esc-focus-miss"',
+            code,
+        ):
+            continue
+        miss_state = state
+        break
+    assert miss_state is not None, (
+        'no `uS` state is both written by the focus effect\'s no-row branch and '
+        'the gate on the `data-testid="esc-focus-miss"` subtree. A miss must be '
+        'recorded by the branch that observed it AND displayed — the operator '
+        'clicked a link and is owed an answer either way.'
+    )
+
+    # (e) both no-selection outcomes are visible, pinned by testid not by copy.
+    #     `pending` needs its own state because with the endpoint in backoff the
+    #     payload never leaves the seed: a miss-only fix leaves precisely the
+    #     cold-load case silent, which is half the defect.
+    for testid in ('esc-focus-miss', 'esc-focus-pending'):
+        assert f'data-testid="{testid}"' in code, (
+            f'the tab must render a `data-testid="{testid}"` notice.'
+        )
+
+    # (f) the stale-drawer invariant survives: the focus is still consumed.
+    assert 'onFocusConsumed' in eff, (
+        'the focus effect must still call onFocusConsumed() once a decision is '
+        'reachable — leaving the focus set would reopen a stale drawer on every '
+        'later visit to this tab.'
+    )
+
+
+def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
+    data_js_body: str,
+    tab_escalations_jsx_code: str,
+) -> None:
+    """"Has the payload arrived?" must come from data.js, not from a captured ref.
+
+    The seed-identity form — capture `DF.ESCALATIONS` at module-eval time, then
+    test `payload !== SEED` — races Babel and can WEDGE.  data.js is a classic
+    script whose `startPolling()` fires its first fetch at load time
+    (`refreshDFData` before the interval); tab_escalations.jsx is
+    `type="text/babel"`, transpiled and evaluated after DOMContentLoaded.  So
+    the first escalations response can land BEFORE the capture runs, making the
+    captured "seed" a REAL payload.  Nothing then clears it while either
+    (a) `tw.pauseLive` was already on at load — `startPolling` bypasses
+    `__DF_PAUSE` for that first fetch, but every later `pollTick` is skipped —
+    or (b) the endpoint enters backoff (up to 60s) right after that first
+    success.  In those windows the tab renders a "still loading" notice directly
+    above a fully-populated escalation table and never consumes the cross-tab
+    focus: the same dead-link outcome the focus fix exists to remove, in a new
+    form.
+
+    The sound signal is a per-key FIRST-SUCCESS marker recorded where the apply
+    actually happens.  Asserted structurally, deriving the registry expression
+    and the key from the source rather than pinning either spelling.
+    """
+    code = tab_escalations_jsx_code
+
+    # (a) data.js records the marker inside applyKey — the one place that knows
+    #     a real server value was applied.
+    apply_body = _extract_function_body(data_js_body, 'applyKey')
+    assert apply_body, 'could not extract data.js\'s applyKey body.'
+    marker = re.search(r'([\w.$]+)\[\s*key\s*\]\s*=\s*true', apply_body)
+    assert marker is not None, (
+        'data.js\'s applyKey records no per-key first-success marker '
+        '(`<registry>[key] = true`). Without one, a consumer cannot tell a '
+        'pre-fetch seed from a loaded-but-empty payload: the two are '
+        'structurally identical by design, so nothing about a payload\'s '
+        'contents can distinguish them.'
+    )
+    registry = marker.group(1)
+    leaf = registry.split('.')[-1]
+
+    # (b) the marker means "a real value LANDED", so the null/undefined guard
+    #     must come first — a response that omits the key must not mark it.
+    guard = re.search(
+        r'if\s*\([^)]*value\s*===\s*(?:undefined|null)[\s\S]{0,120}?return', apply_body
+    )
+    assert guard is not None and guard.end() <= marker.start(), (
+        f'applyKey marks `{registry}[key]` before (or without) its '
+        'null/undefined early return, so the marker would claim arrival for a '
+        'response that omitted the key entirely.'
+    )
+
+    # (c) the registry is initialised at module scope, so the first applyKey
+    #     call has a target — the same reason every DF_DATA key is seeded.
+    assert re.search(rf'\b{re.escape(leaf)}\s*[:=]\s*\{{\s*\}}', data_js_body), (
+        f'data.js never initialises the `{leaf}` marker registry to an empty '
+        'object, so the first applyKey call would throw on a missing target.'
+    )
+
+    # (d) tab_escalations.jsx reads THAT marker, keyed on its own payload key.
+    loaded_body = _extract_function_body(code, 'escalationsLoaded')
+    assert loaded_body, 'could not extract the escalationsLoaded body.'
+    assert leaf in loaded_body, (
+        f'escalationsLoaded does not read data.js\'s `{leaf}` marker registry: '
+        f'{loaded_body.strip()!r}'
+    )
+    assert 'ESCALATIONS' in loaded_body, (
+        'escalationsLoaded must key the marker lookup on its own payload key, '
+        f'not on whatever landed last: {loaded_body.strip()!r}'
+    )
+
+    # (e) and the racy form is GONE: no module-scope (column-0) capture of
+    #     `DF.ESCALATIONS`. The component's own per-render read is indented and
+    #     is a different thing entirely.
+    seed_capture = re.search(r'^const\s+\w+\s*=\s*DF\.ESCALATIONS', code, re.M)
+    assert seed_capture is None, (
+        f'tab_escalations.jsx still captures `DF.ESCALATIONS` at module scope: '
+        f'{seed_capture.group(0)!r}. A first poll that resolves before this '
+        'module is evaluated freezes a real payload as the "seed", and paused '
+        'polling or endpoint backoff makes that wedge permanent.'
     )

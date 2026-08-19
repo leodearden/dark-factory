@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import itertools
 import json
 import logging
 import os
@@ -12,12 +13,19 @@ import tempfile
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from shared.timestamps import parse_timestamp_or_warn
 
 from escalation import archive
 from escalation.classify import default_resolution_class_for_resolver
-from escalation.models import RESOLUTION_CLASSES, Escalation
+
+# max_severity lives in models.py beside the KNOWN_SEVERITIES vocabulary it must
+# stay total over (task 3976), so server.py can share it without reaching for a
+# module-private symbol.  Imported under its real, public name: it is a shared
+# cross-module helper, and spelling it `_max_severity` here would signal the
+# opposite at every use site.
+from escalation.models import RESOLUTION_CLASSES, Escalation, max_severity
 
 logger = logging.getLogger(__name__)
 
@@ -69,12 +77,6 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
     finally:
         os.close(fd)
 
-# Severity rank map for promotion logic.  Alphabetical comparison is wrong
-# ('blocking' < 'info'), so we use an explicit rank.  Unknown severities
-# default to rank 0 (treated as info-level) so malformed input never causes
-# unexpected promotion.
-_SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1}
-
 # Hard cap on EscalationQueue._archive_negative_cache (see _locate_path /
 # _cache_archive_negative).  A polling client hammering many distinct
 # nonexistent ids (typos, stale references, an adversarial sweep) must not
@@ -82,19 +84,6 @@ _SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1}
 # rather than evicted piecemeal (simple, and negative-cache staleness is
 # already bounded by the next self-archival — see _archive_resolved).
 _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
-
-
-def _max_severity(a: str, b: str) -> str:
-    """Return the higher-urgency severity string between *a* and *b*."""
-    for val in (a, b):
-        if val not in _SEVERITY_RANK:
-            logger.warning(
-                '_max_severity: unrecognised severity %r — treating as info-level '
-                '(rank 0). Known values: %s',
-                val,
-                ', '.join(_SEVERITY_RANK),
-            )
-    return a if _SEVERITY_RANK.get(a, 0) >= _SEVERITY_RANK.get(b, 0) else b
 
 
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
@@ -197,8 +186,10 @@ class EscalationQueue:
         a spurious ``rglob`` call on a missing directory.  Centralising the
         existence-check + rglob here means get() and get_by_task() both
         benefit from any future caching or indexing added in one place.
-        Note: make_id() does NOT use this — its counter is authoritative and
-        never scans the archive.
+        Note: make_id() uses this only via ``_recover_seq_from_disk`` — i.e.
+        when its counter file is absent or unparseable, which includes a
+        brand-new task_id's first mint — never while the counter is intact;
+        the counter remains authoritative in steady state.
         """
         archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
         if archive_root.exists():
@@ -861,6 +852,7 @@ class EscalationQueue:
 
     def add_members_to_l2(
         self, escalation_id: str, new_member_ids: list[str],
+        *, severity_floor: str | None = None,
     ) -> Escalation | None:
         """Append *new_member_ids* to a pending L2 escalation's ``members`` list.
 
@@ -882,15 +874,32 @@ class EscalationQueue:
         ``dict.fromkeys`` so passing ``['a', 'a', 'b']`` adds 'a' exactly once.
         New ids are appended in the order they first appear in *new_member_ids*.
 
-        Only ``members`` is modified.  ``root_cause``, ``options``, ``summary``,
-        ``detail``, and ``timestamp`` are preserved so the human-facing decision
-        context remains the L2's original framing across repeated auto-watcher
-        triage passes.
+        ``members`` is modified, and — when *severity_floor* is given —
+        ``severity`` is additionally promoted UPWARD via ``max_severity``.
+        The invariant is that **an L2's severity is monotonically
+        non-decreasing after mint**: the floor can raise the record but never
+        lower it, so it can only ever add human attention, never suppress it.
+        Omitting *severity_floor* leaves ``severity`` untouched (task 3976).
+        ``root_cause``, ``options``, ``summary``, ``detail``, and ``timestamp``
+        are preserved so the human-facing decision context remains the L2's
+        original framing across repeated auto-watcher triage passes.
+
+        A severity promotion is a real content change, so it bumps
+        ``updated_at`` even when no new member id was appended — the watcher's
+        stamp-then-skip protocol keys off ``updated_at > triaged_at``, and a
+        record that silently got more severe would otherwise be skipped
+        forever.  A floor at or below the current severity with no new members
+        remains a true no-op and does NOT bump.
+
+        Both the member append and the severity bump happen inside the same
+        ``escalation_id_lock`` and land in a single ``_rewrite``, so they are
+        atomic together — a second write after the fact would be racy against a
+        concurrent append.
 
         Returns the updated ``Escalation`` (or the unchanged escalation when
-        *new_member_ids* is empty or all ids are already present).  Returns
-        ``None`` when *escalation_id* is not found in the queue root (unknown id
-        or archived).
+        there is nothing to append and no floor to apply).  Returns ``None``
+        when *escalation_id* is not found in the queue root (unknown id or
+        archived).
         """
         with escalation_id_lock(self.queue_dir, escalation_id):
             path = self.queue_dir / f'{escalation_id}.json'
@@ -902,21 +911,37 @@ class EscalationQueue:
                 logger.warning(f'Failed to parse L2 escalation {escalation_id}: {e}')
                 return None
 
-            if not new_member_ids:
+            if not new_member_ids and severity_floor is None:
                 return esc  # no-op
 
             existing = set(esc.members)
             appended = [m for m in dict.fromkeys(new_member_ids) if m not in existing]
-            if appended:
+
+            # Upward-only: max_severity can only return the higher-ranked of
+            # the two, so a floor at or below the current severity is inert by
+            # construction.  An unrecognised floor falls to rank 0 there (with
+            # a WARNING) and likewise leaves the record alone.
+            new_severity = (
+                max_severity(esc.severity, severity_floor)
+                if severity_floor is not None
+                else esc.severity
+            )
+            severity_changed = new_severity != esc.severity
+
+            if appended or severity_changed:
                 esc.members.extend(appended)
-                # Bump the "changed since triaged" signal — a member append is
-                # exactly the re-assess trigger the watcher's stamp-then-skip
-                # protocol keys off (updated_at > triaged_at).
+                esc.severity = new_severity
+                # Bump the "changed since triaged" signal — a member append or a
+                # severity promotion is exactly the re-assess trigger the
+                # watcher's stamp-then-skip protocol keys off
+                # (updated_at > triaged_at).
                 esc.updated_at = datetime.now(UTC).isoformat()
                 self._rewrite(escalation_id, esc)
                 logger.info(
-                    'add_members_to_l2: added %d new member(s) to %s (total=%d)',
-                    len(appended), escalation_id, len(esc.members),
+                    'add_members_to_l2: added %d new member(s) to %s '
+                    '(total=%d, severity=%s%s)',
+                    len(appended), escalation_id, len(esc.members), esc.severity,
+                    ' [promoted]' if severity_changed else '',
                 )
             return esc
 
@@ -1003,7 +1028,7 @@ class EscalationQueue:
         - ``parent.dedupe_children`` gains *child_id* (appended).
         - ``parent.dedupe_count`` is incremented by 1.
         - ``parent.severity`` is promoted via
-          ``_max_severity(parent.severity, child_severity)``; never demoted.
+          ``max_severity(parent.severity, child_severity)``; never demoted.
         - The updated parent is written back to disk via ``_rewrite()``.  Only
           this final file-replace step is atomic (``tempfile.mkstemp`` +
           ``os.rename``); the preceding in-memory mutations are not.
@@ -1037,7 +1062,7 @@ class EscalationQueue:
                 return None
             parent.dedupe_children.append(child_id)
             parent.dedupe_count += 1
-            parent.severity = _max_severity(parent.severity, child_severity)
+            parent.severity = max_severity(parent.severity, child_severity)
             self._rewrite(parent_id, parent)
         logger.info(
             f'Dedupe: folded {child_id} into parent {parent_id} '
@@ -1230,52 +1255,131 @@ class EscalationQueue:
         """
         self._atomic_write_path(path, str(value), durable=True)
 
-    def _root_has_existing_escalations(self, task_id: str) -> bool:
-        """Best-effort signal: does the queue ROOT already hold files for task_id?
+    def _recover_seq_from_disk(self, task_id: str) -> int:
+        """Highest sequence observed on disk for *task_id*, or 0 if none.
 
-        Used only to make an absent counter file observable: an absent file
-        is otherwise silently treated as 0, which is indistinguishable from a
-        legitimately-new task_id even though it may actually mean the counter
-        was lost (aggressive cleanup, fresh checkout, disk restore, accidental
-        rm of the non-.json sidecar) despite escalations already existing for
-        this task_id.
+        Consulted ONLY when the counter file is ABSENT or UNPARSEABLE, never
+        while it is present and parseable, so PRD C9's contract — the
+        counter, not a directory scan, is the sole source of the next
+        sequence — holds in steady state, and task 1879's retired per-mint
+        archive glob + ``_archive_max_seq_cache`` stays retired.  ``make_id``
+        immediately makes the result durable via ``_write_seq_counter``, so
+        this runs at most once per task_id per counter lifetime and never
+        gates a steady-state mint.
 
-        Deliberately root-only — never the archive subtree. make_id() must
-        never scan the archive (PRD C9 / finding 10.4, pinned by
-        ``test_make_id_does_not_scan_archive``), so a task_id whose only
-        surviving evidence is archived (e.g. all its escalations were already
-        resolved) is NOT caught here. This is a cheap, best-effort diagnostic
-        — not a substitute for the counter, and it never changes the returned
-        id.
+        Not *purely* a repair path, despite the framing above: the FIRST
+        mint for every brand-new task_id also lands on the absent-counter
+        branch and pays one scan.  See "Cost" below.
+
+        Scans both halves of the id namespace, because a task_id whose
+        escalations were all resolved has evidence ONLY in the archive — and
+        that is precisely the case ``get()``'s archive fallback would
+        otherwise resolve a re-minted id to (task 3238):
+
+        - queue root: ``esc-{task_id}-*.json``
+        - archive subtree: ``_iter_archive_paths('esc-{task_id}-*.json')``
+
+        The ``.json`` suffix in the pattern is load-bearing: it excludes the
+        ``esc-{task_id}.seq`` counter itself, the ``{id}.json.lock``
+        sidecars, and submit's ``{id}.tmp`` staging files.
+
+        Sequence extraction is PREFIX-ANCHORED: the literal
+        ``esc-{task_id}-`` is stripped from the stem and the remainder must
+        parse as an int.  The task_id is known, never parsed back out of a
+        filename, so this is hyphen-safe by construction — recovering task
+        ``'1-2'`` correctly ignores ``esc-1-2-3-9.json`` (task ``'1-2-3'``),
+        which the glob over-matches.  Reintroducing the retired
+        parse-after-last-hyphen derivation here would resurrect that bug.
+        The comparison is NUMERIC (``max`` over parsed ints, not over stem
+        suffixes as strings): lexicographically ``'9' > '10'``, which would
+        under-report the max and mint a colliding id.
+
+        Cost, and why the archive half is a FRESH targeted rglob rather than
+        the memoised ``_get_archive_listing()``: that memo is built once per
+        instance and can predate another ``EscalationQueue`` instance's
+        archival of records for this task_id.  ``_locate_path`` tolerates
+        that staleness because it is an EXISTENCE lookup — it verifies a
+        memo hit with ``.exists()`` and re-probes on a memo miss — but a
+        MAXIMUM derived from a merely-incomplete memo is wrong in the
+        collision-producing direction: it under-reports and mints an id an
+        archived record already holds, the exact defect this scan exists to
+        prevent.  The freshness is therefore deliberate, and the price is
+        one archive rglob per task_id per counter lifetime (so, in a
+        long-lived instance, once per new task_id) rather than one per
+        instance — paid off the steady-state mint path, under the per-counter
+        lock, and bounded by ``prune_archive`` retention.
+
+        Recovery observes SUBMITTED records only.  An id that was minted but
+        not yet submitted when the counter was lost is invisible here and
+        can therefore still be re-minted — a residual hole inherent to any
+        disk-derived recovery, and far narrower than the pre-3238 behaviour
+        of restarting from 1.  It is also why ``make_id``'s ``OSError``
+        branch is NOT routed here: there the counter still exists and
+        remains authoritative over disk.
         """
-        return any(self.queue_dir.glob(f'esc-{task_id}-*.json'))
+        prefix = f'esc-{task_id}-'
+        pattern = f'{prefix}*.json'
+        highest = 0
+        for path in itertools.chain(
+            self.queue_dir.glob(pattern), self._iter_archive_paths(pattern),
+        ):
+            stem = path.stem
+            if not stem.startswith(prefix):
+                continue
+            try:
+                seq = int(stem[len(prefix):])
+            except ValueError:
+                # A sibling task_id the glob over-matched (e.g. esc-1-2-3-9
+                # while recovering '1-2'), or a non-numeric suffix.
+                continue
+            highest = max(highest, seq)
+        return highest
 
     def make_id(self, task_id: str) -> str:
         """Generate a unique escalation ID from a durable per-task_id counter.
 
         The counter file ``queue_dir/esc-{task_id}.seq`` holds the
-        last-issued sequence number as plain integer text. This file is the
-        SOLE source of the next sequence: unlike the retired
-        directory/archive-scan derivation, make_id() never globs the archive
-        to "catch up" — the counter is authoritative (PRD
+        last-issued sequence number as plain integer text. In steady state
+        this file is the SOLE source of the next sequence: unlike the
+        retired directory/archive-scan derivation, make_id() never globs the
+        archive to "catch up" — the counter is authoritative (PRD
         task-status-authority-prd.md contract C9 / finding 10.4).
 
-        Two distinct failure modes on read are handled differently:
+        The four read outcomes, in full:
 
-        - Unparseable contents (``ValueError``) are treated as 0 and logged
-          as an ERROR — loudly observable-but-unrecoverable data loss.
-        - An absent file is treated as 0 (the common case: a legitimately-new
-          task_id). Because the counter has no archive-scan fallback, a LOST
-          counter looks identical to a new task_id on its own; when
-          ``_root_has_existing_escalations`` finds pre-existing files for
-          this task_id in the queue root, that suspicious case is also
-          logged as an ERROR (still starting from 0 — this is observability
-          only, not a scan-derived fallback).
+        - Present and parseable (the steady state): authoritative, taken
+          verbatim, with ZERO disk scans of any kind.
+        - Unparseable contents (``ValueError``): reconciled from a one-shot
+          bounded ``_recover_seq_from_disk`` scan and logged as an ERROR.
+          Still ERROR, not WARNING — a corrupt counter is unrecoverable data
+          loss an operator must see — but it is now self-healing rather than
+          collision-producing.
+        - An absent file: reconciled the same way.  0 recovered is the
+          common, legitimate case (a brand-new task_id) and stays SILENT;
+          a non-zero recovery means the counter was LOST (aggressive
+          cleanup, fresh checkout, disk restore, accidental rm of the
+          non-.json sidecar) while escalations for this task_id already
+          exist, and is logged as an ERROR.  Note this branch is not only a
+          repair path — every brand-new task_id's FIRST mint takes it and
+          pays one reconciliation scan (see ``_recover_seq_from_disk``
+          "Cost"); every mint after that is counter-derived and scan-free.
         - An ``OSError`` while reading an EXISTING file (transient I/O error,
-          EINTR, fd exhaustion, permission flap) is NOT treated as 0 — it is
-          allowed to propagate so the mint fails loudly rather than silently
-          overwriting a still-valid on-disk counter with a colliding
-          restart-from-1.
+          EINTR, fd exhaustion, permission flap) is NOT reconciled — it is
+          allowed to propagate so the mint fails loudly.  A present-but-
+          momentarily-unreadable counter is not evidence of loss, and
+          reconciling there would derive a maximum from SUBMITTED records
+          only, silently rewinding the counter below any id that was minted
+          but never submitted.
+
+        Reconciliation returns ``max(observed sequence on disk) + 1``, so a
+        recovered id is strictly greater than every root and archived record
+        for this task_id — it can never be one that ``get()``'s archive
+        fallback resolves to a pre-existing, already-resolved record (task
+        3238).  The reconciled value is written durably BEFORE the id is
+        returned, which is what bounds the repair scan to once per task_id
+        per counter lifetime.  The residual hole: recovery observes
+        SUBMITTED records only, so an id minted but not yet submitted when
+        the counter was lost is invisible to it and can still be re-minted.
 
         The read -> increment -> durable write (tmp+fsync+rename+dir-fsync,
         see ``_write_seq_counter``) all happen inside
@@ -1292,20 +1396,123 @@ class EscalationQueue:
                 try:
                     current = int(counter_path.read_text().strip())
                 except ValueError as e:
+                    current = self._recover_seq_from_disk(task_id)
                     logger.error(
                         f'make_id: could not parse counter file {counter_path}: {e}; '
-                        'treating as 0 — counter is authoritative with no archive-scan '
-                        'fallback, so this WILL mint ids that collide with any already '
-                        f'issued for task_id {task_id!r}'
+                        f'reconciled it from a one-shot bounded root+archive scan for '
+                        f'task_id {task_id!r} (highest observed sequence {current}) and '
+                        f'resuming at {current + 1}, so no already-recorded id is '
+                        'reused (an id minted but never submitted is not observable '
+                        'on disk and is not covered)'
                     )
-                    current = 0
-            elif self._root_has_existing_escalations(task_id):
-                logger.error(
-                    f'make_id: counter file {counter_path} is absent but escalations '
-                    f'for task_id {task_id!r} already exist in the queue root; '
-                    'starting from 0 — counter is authoritative with no archive-scan '
-                    'fallback, so this WILL mint ids that collide with already-issued ones'
-                )
+            else:
+                current = self._recover_seq_from_disk(task_id)
+                if current > 0:
+                    logger.error(
+                        f'make_id: counter file {counter_path} is absent but '
+                        f'escalations for task_id {task_id!r} already exist on disk '
+                        f'(highest observed sequence {current}); reconciled the '
+                        f'counter from a one-shot bounded root+archive scan and '
+                        f'resuming at {current + 1} rather than re-minting from 1, '
+                        'so no already-recorded id is reused (an id minted but '
+                        'never submitted is not observable on disk and is not '
+                        'covered)'
+                    )
             nxt = current + 1
             self._write_seq_counter(counter_path, nxt)
             return f'esc-{task_id}-{nxt}'
+
+
+def observed_submit_response(
+    queue: EscalationQueue,
+    esc_id: str,
+    *,
+    fallback_level: int | None = None,
+) -> dict[str, Any]:
+    """Shape a post-write response from OBSERVED state, never from write intent.
+
+    Task 3236.  The submit paths used to return a hardcoded
+    ``{'id': ..., 'status': 'queued'}`` with no re-read, so a filing that a
+    concurrent resolver/sweep had already dismissed in the same instant was
+    still reported to its filer as 'queued'.  The filer then had no way to
+    learn its escalation had been swallowed.
+
+    Re-reads the persisted record and returns:
+    - still pending → ``{'id', 'status': 'queued', 'level'}`` (as before, plus
+      the persisted level so a caller that asked for ``level=1`` can confirm
+      it landed);
+    - anything else → the auto-resolved shape ``escalate_blocker``'s docstring
+      already promises, ``{'id', 'status', 'resolution', 'resolved_by',
+      'level'}``, carrying the record's REAL values.  No new status vocabulary
+      is invented, so no consumer needs updating.
+
+    FAIL-OPEN by construction: a re-read that returns ``None`` or raises falls
+    back to the historical ``'queued'`` response and logs a WARNING rather than
+    raising.  A filing must never be lost to a bookkeeping read — that is the
+    very failure mode being fixed here.
+
+    ``fallback_level`` is the level the CALLER wrote (i.e. ``esc.level``).  It
+    is echoed on the two fail-open branches so ``level`` is present on EVERY
+    response this function can return: the ``level`` echo is documented as the
+    way a caller confirms its requested level landed, and a caller written to
+    that contract must not hit a ``KeyError`` in exactly the degraded case the
+    fail-open exists to survive.  It is a fallback, never an override — when
+    the re-read succeeds, the PERSISTED level is reported even if it differs
+    from what the caller asked for (born-at-L2 severity legitimately overrides
+    a requested level=1).
+
+    Lives in ``queue`` rather than ``dedupe`` because it re-reads a persisted
+    record and shapes a response — it has nothing to do with fold logic, and
+    ``server._submit_or_dedupe``'s born-at-L2 branch needs it precisely because
+    that branch does NOT route through dedupe.
+
+    COST NOTE: this adds one ``queue.get()`` per successful submit.  For a
+    just-written record that is a cheap queue-root hit, but ``get()`` falls
+    through to ``_locate_path``'s archive listing when the record is absent
+    from the root — i.e. an O(archive) scan is possible on the submit path in
+    exactly the resolve+archive race this targets.  Acceptable at current
+    volumes; if it ever shows up in a storm profile (e.g. a 30-task infra
+    fan-out), read ``queue_dir/{id}.json`` directly and treat an absent record
+    as the fail-open 'queued' case — that is already this function's documented
+    behaviour for an unreadable record, though it would forfeit the honest
+    observed-state report for a record archived between submit and re-read.
+    """
+    try:
+        persisted = queue.get(esc_id)
+    except Exception as exc:
+        logger.warning(
+            'Post-submit re-read of %s failed (%s); reporting queued (fail-open)',
+            esc_id, exc,
+        )
+        return _fail_open_queued(esc_id, fallback_level)
+    if persisted is None:
+        logger.warning(
+            'Post-submit re-read of %s returned nothing; reporting queued (fail-open)',
+            esc_id,
+        )
+        return _fail_open_queued(esc_id, fallback_level)
+    if persisted.status == 'pending':
+        return {'id': esc_id, 'status': 'queued', 'level': persisted.level}
+    logger.warning(
+        'Escalation %s was already %s at filing time (resolved_by=%r); '
+        'reporting observed state instead of queued',
+        esc_id, persisted.status, persisted.resolved_by,
+    )
+    return {
+        'id': esc_id,
+        'status': persisted.status,
+        'resolution': persisted.resolution,
+        'resolved_by': persisted.resolved_by,
+        'level': persisted.level,
+    }
+
+
+def _fail_open_queued(esc_id: str, fallback_level: int | None) -> dict[str, Any]:
+    """The fail-open 'queued' response, carrying *fallback_level* when known.
+
+    ``level`` is omitted only when the caller supplied no fallback — legacy
+    callers that predate the echo contract — so the key is never fabricated.
+    """
+    if fallback_level is None:
+        return {'id': esc_id, 'status': 'queued'}
+    return {'id': esc_id, 'status': 'queued', 'level': fallback_level}

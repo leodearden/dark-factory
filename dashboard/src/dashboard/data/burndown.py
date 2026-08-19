@@ -3,6 +3,19 @@
 Periodically snapshots task status counts per project into a SQLite table.
 The background collector (in app.py lifespan) writes via a dedicated writable
 connection; route handlers read via DbPool (read-only).
+
+Each snapshot row carries three things beyond the six display zones
+(task 3543 / PRD ι, spec S8/E12):
+
+* ``in_progress_live`` / ``in_progress_stranded`` — a partition of the
+  ``in_progress`` zone, so a window full of strands is legible as such
+  instead of reading as healthy throughput.
+* ``concurrency_cap`` — ``max_concurrent_tasks`` as it stood AT SNAPSHOT
+  TIME, ``NULL`` when unknown.
+
+The collector's single source is ``fetch_tasks`` (MCP ``get_tasks``): the
+compact ``fetch_statuses`` map carries no claimant columns, so the split
+cannot be derived from it at all.
 """
 
 from __future__ import annotations
@@ -10,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -22,8 +35,9 @@ from dashboard.data.orchestrator import (
     _read_project_root_from_config,
     _resolve_project_root,
     find_running_orchestrators,
+    read_max_concurrent_tasks,
 )
-from dashboard.data.tasks import fetch_statuses
+from dashboard.data.tasks import fetch_tasks, task_is_stranded
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
@@ -38,10 +52,31 @@ CREATE TABLE IF NOT EXISTS snapshots (
     blocked     INTEGER NOT NULL DEFAULT 0,
     deferred    INTEGER NOT NULL DEFAULT 0,
     cancelled   INTEGER NOT NULL DEFAULT 0,
-    done        INTEGER NOT NULL DEFAULT 0
+    done        INTEGER NOT NULL DEFAULT 0,
+    -- The in_progress zone's live/stranded split (task 3543). Partitions
+    -- in_progress; it does not add to the six zones.
+    in_progress_live     INTEGER NOT NULL DEFAULT 0,
+    in_progress_stranded INTEGER NOT NULL DEFAULT 0,
+    -- max_concurrent_tasks in force AT SNAPSHOT TIME. Nullable on purpose:
+    -- NULL means "cap unknown", which is not a breach. Storing 0 instead would
+    -- read as a cap of zero and alarm on every snapshot. The cap is restart-
+    -- only (red-tier), but a burndown window spans restarts and the cap also
+    -- varies BETWEEN projects, so the only honest denominator for a historical
+    -- row is the cap that was in force at that instant.
+    concurrency_cap      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_project_ts ON snapshots(project_id, ts);
 """
+
+# Columns added after the original 6-zone schema shipped, in the order
+# ensure_snapshot_columns adds them. ``CREATE TABLE IF NOT EXISTS`` is a no-op
+# against an existing DB, so these reach a live burndown.db only via the
+# migration.
+_ADDED_SNAPSHOT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ('in_progress_live', 'INTEGER NOT NULL DEFAULT 0'),
+    ('in_progress_stranded', 'INTEGER NOT NULL DEFAULT 0'),
+    ('concurrency_cap', 'INTEGER'),
+)
 
 # Maps raw task statuses to the 6 display zones.
 _STATUS_MAP: dict[str, str] = {
@@ -56,18 +91,99 @@ _STATUS_MAP: dict[str, str] = {
 
 _ZONE_KEYS = ('pending', 'in_progress', 'blocked', 'deferred', 'cancelled', 'done')
 
+# The in_progress zone's live/stranded split (task 3543 / PRD ι, spec S8).
+# First-class snapshot columns, but NOT display zones: they partition
+# ``in_progress`` rather than sitting alongside it, so summing _ZONE_KEYS still
+# yields the task total.
+_SPLIT_KEYS = ('in_progress_live', 'in_progress_stranded')
+
 _INSERT_SNAPSHOT_SQL = (
-    'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done) '
-    'VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done, '
+    'in_progress_live, in_progress_stranded, concurrency_cap) '
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
 )
 
 
+async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
+    """Bring an existing ``snapshots`` table up to the current column set.
+
+    Additive only: probes ``PRAGMA table_info`` and issues one
+    ``ALTER TABLE ... ADD COLUMN`` per missing column.  Idempotent, never drops
+    or rewrites anything, so pre-existing rows keep their data and take the
+    column defaults (``0`` for the split, ``NULL`` for the cap — an honest
+    "unknown", since no cap was recorded at the time).
+
+    Mandatory, not cosmetic: :data:`BURNDOWN_SCHEMA` is applied with
+    ``CREATE TABLE IF NOT EXISTS``, which is a no-op against every already
+    deployed burndown.db.  Without this, the widened
+    :data:`_INSERT_SNAPSHOT_SQL` would fail on the first collection cycle after
+    deploy.  Call it at store open, before the collector runs.
+
+    Mirrors fused-memory's ``_migrate_v1_to_v2`` probe-then-add idiom.  The
+    caller commits.
+    """
+    cursor = await conn.execute('PRAGMA table_info(snapshots)')
+    existing = {row[1] for row in await cursor.fetchall()}
+    await cursor.close()
+    for column, ddl in _ADDED_SNAPSHOT_COLUMNS:
+        if column in existing:
+            continue
+        await conn.execute(f'ALTER TABLE snapshots ADD COLUMN {column} {ddl}')
+        logger.info('burndown: added snapshots.%s (%s)', column, ddl)
+
+
 def _count_statuses(statuses: dict[int, str | None]) -> dict[str, int]:
-    """Count statuses (id → status) by mapped display zone."""
+    """Count statuses (id → status) by mapped display zone.
+
+    Superseded by :func:`_count_zones` for the collector, which needs the
+    claimant columns that the ``{id: status}`` map does not carry.  Retained
+    for callers that only have statuses to hand.
+    """
     counts: dict[str, int] = {k: 0 for k in _ZONE_KEYS}
     for raw in statuses.values():
         zone = _STATUS_MAP.get(raw or 'pending', 'pending')
         counts[zone] += 1
+    return counts
+
+
+def _count_zones(tasks: Sequence[Mapping[str, Any]], now: datetime) -> dict[str, int]:
+    """Count shaped task rows by display zone, splitting ``in_progress``.
+
+    Returns the six :data:`_ZONE_KEYS` counts plus :data:`_SPLIT_KEYS`
+    (``in_progress_live`` / ``in_progress_stranded``), which partition the
+    ``in_progress`` zone rather than adding to it.
+
+    Takes shaped task rows (as ``dashboard.data.tasks._shape_task`` emits) and
+    NOT the ``{id: status}`` map, because the split needs the claimant columns
+    that only ``get_tasks`` carries.
+
+    *now* is the reference instant for the strand verdict, supplied by the
+    caller (the collector captures one instant per cycle) — this function never
+    reads the clock.
+
+    **The split is a subtraction, deliberately.** ``in_progress_stranded`` is
+    counted directly via :func:`dashboard.data.tasks.task_is_stranded`, and
+    ``in_progress_live`` is then ``zone_total - stranded``.  Never derive
+    ``live`` independently (e.g. via ``has_live_claimant``, which carries
+    neither the status gate nor the ``metadata.infra_hold`` carve-out): only
+    the subtraction makes the conservation invariant
+    ``live + stranded == in_progress`` true by construction, and that invariant
+    is what makes the stacked chart and the parity alarm auditable.
+
+    A consequence worth naming: ``_STATUS_MAP`` folds BOTH 'in-progress' and
+    'review' into the ``in_progress`` zone, but ``is_stranded`` hard-gates on
+    ``status == 'in-progress'`` and can never fire for a 'review' row.  A
+    claimant-less review row therefore lands in ``live``.  That under-reports
+    strands and never over-reports them, which is the correct direction to err
+    for a surface that raises alarms.
+    """
+    counts: dict[str, int] = {k: 0 for k in (*_ZONE_KEYS, *_SPLIT_KEYS)}
+    for task in tasks:
+        zone = _STATUS_MAP.get(task.get('status') or 'pending', 'pending')
+        counts[zone] += 1
+        if task_is_stranded(task, now=now):
+            counts['in_progress_stranded'] += 1
+    counts['in_progress_live'] = counts['in_progress'] - counts['in_progress_stranded']
     return counts
 
 
@@ -106,7 +222,12 @@ async def collect_snapshot(
       regressions.
     """
     try:
-        now = datetime.now(UTC).isoformat()  # clock-exempt: single-capture writer
+        now_dt = datetime.now(UTC)  # clock-exempt: single-capture writer
+        # One instant for the whole cycle: the ``ts`` written to every row and
+        # the reference the strand verdicts are judged against must be the SAME
+        # capture, or a row could claim a strand count that its own timestamp
+        # contradicts.
+        now = now_dt.isoformat()
         # config.project_root is already resolved by DashboardConfig.__post_init__
         resolved_root = str(config.project_root)
 
@@ -165,11 +286,19 @@ async def collect_snapshot(
             roots_to_snapshot.append(root_str)
 
         # Phase 2 — Parallel read:
-        # Each fetch_statuses call hits fused-memory MCP independently;
+        # Each fetch_tasks call hits fused-memory MCP independently;
         # return_exceptions=True isolates per-project network failures so a
         # single offline server can't sink the whole cycle.
+        #
+        # SOURCE: fetch_tasks (MCP get_tasks), NOT the ~95%-smaller
+        # fetch_statuses (get_statuses).  get_statuses returns a bare
+        # {id: status} map with no claimant columns, so the live/stranded
+        # split is physically underivable from it.  The collector runs once
+        # per _SAMPLE_INTERVAL_SECONDS (600s), so the larger payload is a
+        # ten-minute cost, not a per-render one — and it collapses the
+        # collector onto ONE source instead of two that can disagree.
         all_results = await asyncio.gather(
-            *(fetch_statuses(client, config, root) for root in roots_to_snapshot),
+            *(fetch_tasks(client, config, root) for root in roots_to_snapshot),
             return_exceptions=True,
         )
 
@@ -179,19 +308,35 @@ async def collect_snapshot(
         # cannot roll back rows that were already committed for earlier projects.
         for root_str, result in zip(roots_to_snapshot, all_results, strict=True):
             if isinstance(result, BaseException):
-                logger.warning('Failed to fetch statuses for %s', root_str, exc_info=result)
+                logger.warning('Failed to fetch tasks for %s', root_str, exc_info=result)
                 continue
-            if not isinstance(result, dict):
-                logger.warning('Unexpected fetch_statuses result for %s: %r', root_str, type(result))
+            # The offline marker is a dict, a healthy result is a list — check
+            # the marker FIRST so a known outage is reported as an outage
+            # rather than as a malformed result.
+            if isinstance(result, dict) and result.get('offline'):
+                logger.debug('fetch_tasks offline for %s: %s', root_str, result.get('error'))
                 continue
-            if result.get('offline'):
-                logger.debug('fetch_statuses offline for %s: %s', root_str, result.get('error'))
+            if not isinstance(result, list):
+                logger.warning('Unexpected fetch_tasks result for %s: %r', root_str, type(result))
                 continue
-            statuses: dict[int, str | None] = {
-                k: v for k, v in result.items() if isinstance(k, int)
-            }
+            tasks = [t for t in result if isinstance(t, Mapping)]
             try:
-                counts = _count_statuses(statuses)
+                counts = _count_zones(tasks, now_dt)
+                # One cap read per ROOT (not per task): it touches the
+                # filesystem, and the value is a per-project scalar.  Stored on
+                # the row because max_concurrent_tasks varies across restarts
+                # and across projects — see BURNDOWN_SCHEMA's concurrency_cap
+                # comment.
+                cap = read_max_concurrent_tasks(root_str)
+                if cap is not None and counts['in_progress'] > cap:
+                    logger.warning(
+                        'Concurrency cap breached for %s: %d in-progress vs cap %d '
+                        '(%d stranded)',
+                        root_str,
+                        counts['in_progress'],
+                        cap,
+                        counts['in_progress_stranded'],
+                    )
                 await conn.execute(
                     _INSERT_SNAPSHOT_SQL,
                     (
@@ -203,6 +348,11 @@ async def collect_snapshot(
                         counts['deferred'],
                         counts['cancelled'],
                         counts['done'],
+                        counts['in_progress_live'],
+                        counts['in_progress_stranded'],
+                        # NULL, never 0, when the cap is unknown: a stored 0
+                        # would read as a cap of zero and alarm on every row.
+                        cap,
                     ),
                 )
                 await conn.commit()
@@ -296,7 +446,13 @@ async def aggregate_burndown_series(
     Returns the empty-series default ``{labels: [], done: [], ...}`` when no
     rows are found across any DB.
     """
-    _keys = ('done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending')
+    _keys = (
+        'done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending',
+        # The split partitions in_progress; concurrency_cap is a per-snapshot
+        # scalar (nullable).  Both merge last-writer-wins with the zones — a
+        # snapshot is one consistent observation, so its columns travel together.
+        'in_progress_live', 'in_progress_stranded', 'concurrency_cap',
+    )
     empty: dict = {'labels': [], **{k: [] for k in _keys}}
 
     if not dbs:
@@ -434,6 +590,94 @@ def distinct_iso_days(labels: list[Any]) -> int:
     return max(1, len(seen))
 
 
+def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
+    """Return ``{parity_alarm, parity_cap, parity_peak, parity_breach_count}``.
+
+    Answers one question about a burndown series: did in-progress work ever
+    exceed the orchestrator's own concurrency cap?  That is the E12 defect —
+    the cap was breached and every surface reported ordinary throughput.
+
+    **Each snapshot is judged against the cap stored on THAT snapshot**, never
+    against one "current" cap applied across history.  ``max_concurrent_tasks``
+    is restart-only (red-tier), but a burndown window spans restarts, so it is
+    still TIME-VARYING across the window: re-deriving a single cap would forgive
+    a real past breach after a cap raise, and invent a fictional one after a cut.
+
+    Semantics:
+
+    * ``parity_breach_count`` — snapshots where ``in_progress > cap``.  The cap
+      is INCLUSIVE, so running exactly at capacity is healthy, not an alarm.
+    * ``parity_alarm`` — ``breach_count > 0``.
+    * ``parity_peak`` / ``parity_cap`` — a MATCHED PAIR read off ONE snapshot,
+      never assembled from two.  The cap can change mid-window (a restart), so
+      a peak from one snapshot beside a cap from another misstates the severity
+      of the very breach it is describing (50-over-40 rendered as 50-over-24),
+      and in a healthy window it manufactures a breach that never happened
+      (peak 33 / cap 24 printed next to ``parity_alarm: False``).
+
+      The snapshot chosen is:
+
+      - when the series breaches — the breaching snapshot with the WIDEST
+        margin ``count - cap`` (ties broken toward the larger count), i.e. the
+        worst moment and the cap that was actually in force at it;
+      - otherwise — the snapshot with the highest ``in_progress`` (ties broken
+        toward the tighter cap), i.e. the literal peak of a healthy window and
+        the cap it was actually measured against.
+
+      Capless snapshots are excluded from both: a peak means nothing without
+      the cap it is compared to, and mixing them in would show a number the
+      displayed cap cannot explain.
+
+    A series with no cap anywhere is UNKNOWN, not "not breaching": the alarm
+    stays False but ``parity_cap``/``parity_peak`` are ``None`` so a caller can
+    tell the two apart, and the collapse is logged rather than left silent.
+
+    Pure: no clock, no I/O, no mutation of *series*.  Ragged or non-numeric
+    input degrades to the quiet result rather than raising inside a route.
+    """
+    in_progress = list(series.get('in_progress') or [])
+    caps = list(series.get('concurrency_cap') or [])
+
+    breaches = 0
+    comparable = 0
+    # Both candidates are (count, cap) pairs read off a SINGLE snapshot, so
+    # whichever one is published cannot misdescribe the other half.
+    worst_breach: tuple[int, int] | None = None   # widest margin among breaches
+    highest: tuple[int, int] | None = None        # highest count overall
+    for count, cap in zip(in_progress, caps, strict=False):
+        if not isinstance(count, int) or isinstance(count, bool):
+            continue
+        if not isinstance(cap, int) or isinstance(cap, bool):
+            continue
+        comparable += 1
+        if highest is None or (count, -cap) > (highest[0], -highest[1]):
+            highest = (count, cap)
+        if count > cap:
+            breaches += 1
+            margin = count - cap
+            if worst_breach is None or (margin, count) > (
+                worst_breach[0] - worst_breach[1], worst_breach[0]
+            ):
+                worst_breach = (count, cap)
+
+    chosen = worst_breach if worst_breach is not None else highest
+    peak, cap_at_peak = chosen if chosen is not None else (None, None)
+
+    if not comparable:
+        logger.debug(
+            'compute_parity_alarm: no snapshot carries a concurrency cap over '
+            '%d label(s); reporting unknown rather than "not breaching"',
+            len(in_progress),
+        )
+
+    return {
+        'parity_alarm': breaches > 0,
+        'parity_cap': cap_at_peak,
+        'parity_peak': peak,
+        'parity_breach_count': breaches,
+    }
+
+
 def compute_window_completion(series: Mapping[str, Any]) -> dict[str, Any]:
     """Return ``{completed, velocity, window_days}`` from a burndown series.
 
@@ -514,13 +758,31 @@ async def get_burndown_series(
         'deferred': [],
         'in_progress': [],
         'pending': [],
+        'in_progress_live': [],
+        'in_progress_stranded': [],
+        'concurrency_cap': [],
     }
     if db is None:
         return empty
     since = (resolve_now(now) - timedelta(days=days)).isoformat()
     try:
+        # Which of the post-3543 columns this DB actually has.  ``_burndown_dbs``
+        # opens OTHER projects' burndown.db files read-only and nothing migrates
+        # those, so a hardcoded widened SELECT would raise 'no such column'
+        # there, hit the guard below, and silently blank that project's entire
+        # chart — losing the six zones it DOES have to report three it does not.
+        async with db.execute('PRAGMA table_info(snapshots)') as cur:
+            available = {row[1] for row in await cur.fetchall()}
+        has_split = {'in_progress_live', 'in_progress_stranded'} <= available
+        has_cap = 'concurrency_cap' in available
+
+        columns = ['ts', 'done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending']
+        if has_split:
+            columns += ['in_progress_live', 'in_progress_stranded']
+        if has_cap:
+            columns.append('concurrency_cap')
         async with db.execute(
-            'SELECT ts, done, cancelled, blocked, deferred, in_progress, pending '
+            f'SELECT {", ".join(columns)} '
             'FROM snapshots WHERE project_id = ? AND ts >= ? ORDER BY ts',
             (project_id, since),
         ) as cur:
@@ -529,28 +791,26 @@ async def get_burndown_series(
         logger.warning('Error fetching burndown series', exc_info=True)
         return empty
 
-    labels = []
-    done = []
-    cancelled = []
-    blocked = []
-    deferred = []
-    in_progress = []
-    pending = []
+    result: dict = {key: [] for key in empty}
     for row in rows:
-        labels.append(row[0])
-        done.append(row[1])
-        cancelled.append(row[2])
-        blocked.append(row[3])
-        deferred.append(row[4])
-        in_progress.append(row[5])
-        pending.append(row[6])
+        result['labels'].append(row[0])
+        result['done'].append(row[1])
+        result['cancelled'].append(row[2])
+        result['blocked'].append(row[3])
+        result['deferred'].append(row[4])
+        result['in_progress'].append(row[5])
+        result['pending'].append(row[6])
+        if has_split:
+            result['in_progress_live'].append(row[7])
+            result['in_progress_stranded'].append(row[8])
+        else:
+            # Un-migrated DB: the split is unknown.  All-live keeps the
+            # conservation invariant (live + stranded == in_progress) true and
+            # errs toward under-reporting strands, never over-reporting.
+            result['in_progress_live'].append(row[5])
+            result['in_progress_stranded'].append(0)
+        # A missing cap column is UNKNOWN, i.e. NULL — never 0, which would
+        # read as a cap of zero and alarm on every row.
+        result['concurrency_cap'].append(row[-1] if has_cap else None)
 
-    return {
-        'labels': labels,
-        'done': done,
-        'cancelled': cancelled,
-        'blocked': blocked,
-        'deferred': deferred,
-        'in_progress': in_progress,
-        'pending': pending,
-    }
+    return result

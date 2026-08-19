@@ -411,6 +411,21 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
                 <td className="num mono">
                   {fmtUptime(item.age_secs)}
                   {item.breach_6h && <span className="badge bad" style={{ marginLeft: 6, fontSize: 9 }}>6h+</span>}
+                  {/* Truthiness, deliberately: the backend OMITS pins_recovery
+                      when the annotation is unknown (that project's escalation
+                      MCP was unreadable, or the record carried none), so this
+                      draws nothing for both false and undefined. There is no
+                      negated arm — "does not pin" over an unclassified record
+                      would be a claim nobody made. */}
+                  {item.pins_recovery && (
+                    <span
+                      className="badge bad"
+                      style={{ marginLeft: 6, fontSize: 9 }}
+                      title={`PINNING recovery of task ${(item.pins_recovery_task_ids || []).join(', ')} — this escalation is what stops it being redispatched`}
+                    >
+                      PINNING
+                    </span>
+                  )}
                 </td>
               </tr>
             ))}
@@ -475,11 +490,13 @@ function WorkflowPanel({ workflow, win, generatedAt, regimeMarkers }) {
   const churnDates = Object.keys(churnDaily).sort();
 
   const escPerDoneDaily = sliceRowsByWindow(workflow.esc_per_done_daily || [], generatedAt, win, row => row.date);
-  // charts.jsx's LineChart has no null/gap support (not modified — see design
-  // decisions), so a null ratio (done == 0 that day) is OMITTED rather than
-  // plotted as a misleading zero.
-  const epdRows = escPerDoneDaily.filter(row => row.ratio != null);
-  const epdDates = epdRows.map(row => row.date);
+  // A null ratio means done == 0 that day: no task completed, so escalations
+  // per done is undefined rather than zero. It is passed straight through as a
+  // hole, and LineChart breaks the line across it (task 3489). These rows used
+  // to be FILTERED OUT, which dropped the day from this label row too — that
+  // compacted the x-axis and silently redated every surviving sample, the exact
+  // hazard spark_path.js's header calls out.
+  const epdDates = escPerDoneDaily.map(row => row.date);
 
   const flowDaily = sliceRowsByWindow(workflow.flow_daily || [], generatedAt, win, row => row.date);
 
@@ -516,7 +533,7 @@ function WorkflowPanel({ workflow, win, generatedAt, regimeMarkers }) {
           <div style={{ fontSize: 10, color: 'var(--fg-3)', margin: '10px 0 4px' }}>Escalations filed per task done</div>
           <TimeChart labels={epdDates} markers={regimeMarkers}>
             <C.LineChart
-              series={[{ key: 'ratio', color: C.PALETTE.accent, values: epdRows.map(row => row.ratio) }]}
+              series={[{ key: 'ratio', color: C.PALETTE.accent, values: escPerDoneDaily.map(row => row.ratio) }]}
               labels={epdDates}
               formatX={fmtDateTime}
             />

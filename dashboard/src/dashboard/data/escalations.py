@@ -1,26 +1,43 @@
 """Backend data layer for the Escalations dashboard section.
 
-Provides three public functions:
+Provides four public functions:
 
 - ``load_queue_escalations`` — root-only *.json reader for a single escalation
-  queue directory (no archive traversal).
+  queue directory (no archive traversal), with an opt-in ``skipped``
+  accumulator so a caller can learn which files it dropped and why.
 - ``resolve_owning_project`` — maps a reconciliation escalation back to its
   owning project via worktree-prefix matching or task-map probe.
 - ``build_escalation_queues`` — enumerates per-project escalation dirs plus the
   fused-memory reconciliation queue, returning a structured ``{subsections, summary}``
   dict for the API layer to serve.
+- ``fetch_pins_recovery`` — the one ASYNC function here: fans
+  ``get_pending_escalations`` out across every configured escalation MCP and
+  returns each project's per-record ``pins_recovery`` annotation.
+
+The first three are pure filesystem readers; only ``fetch_pins_recovery``
+touches the network.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
+from typing import Any
+
+import httpx
+
+from dashboard.data.memory import mcp_tool_call
 
 logger = logging.getLogger(__name__)
 
 
-def load_queue_escalations(esc_dir: Path) -> list[dict]:
+def load_queue_escalations(
+    esc_dir: Path,
+    *,
+    skipped: list[dict[str, Any]] | None = None,
+) -> list[dict]:
     """Load all escalation JSON files from *esc_dir* (root only, no archive).
 
     Only ``*.json`` files directly inside *esc_dir* are read — subdirectories
@@ -36,13 +53,45 @@ def load_queue_escalations(esc_dir: Path) -> list[dict]:
     unchanged — an acceptable trade-off given the controlled write environment.
 
     A missing or non-directory *esc_dir* returns ``[]`` without raising.
-    A file that cannot be parsed as JSON is skipped with a ``WARNING`` log.
+    A file that cannot be read or parsed as JSON is skipped with a ``WARNING``
+    log — and, if the caller opted in, recorded in *skipped*.
+
+    Skipping is the right behaviour (one corrupt file must not fail a whole
+    queue scan), but a skip with no return channel is a silent discard: the
+    caller cannot tell "this queue holds nothing" from "this queue holds
+    something I could not read".  *skipped* is that channel, and it is what
+    lets a consumer report the loss as structured payload rather than leaving
+    it in a log line only a human tailing stderr will ever see (INV-2,
+    ``structured-facts-at-failure``).
+
+    An out-parameter is a deliberate divergence from the sibling readers in
+    this subsystem (``_index_escalations``, ``_read_limits``), which return a
+    tuple when they have a second result to report.  Tuple-return was the first
+    choice and was rejected because this function is not private to one caller:
+    ``build_escalation_queues`` calls it twice and wants none of this, and
+    widening the return type would have forced an unpacking edit at every site
+    to serve one.  A sibling ``load_queue_escalations_reporting`` wrapper would
+    keep the idiom uniform, but it buys that uniformity with a second public
+    name for one function and one opted-in caller — worse than one documented
+    exception.  Revisit if a second consumer ever needs the skips: at two, the
+    tuple-returning sibling starts paying for itself.
 
     Args:
         esc_dir: Path to the escalation queue root directory.
+        skipped: Optional accumulator for the files this call dropped.  When a
+            list is passed, one record per skipped file is **appended** to it
+            as ``{'path': Path, 'error': str}`` — appended, not assigned, so a
+            single list can span several queue dirs across several calls.
+            ``path`` stays a ``Path`` (the caller may want ``.name`` or a retry
+            read); stringify at the payload boundary, not here.  The default
+            ``None`` leaves behaviour verbatim as it was before this parameter
+            existed, which is what every non-opted-in caller relies on.  The
+            ``WARNING`` log is emitted either way, so it remains the signal for
+            callers that do not opt in (``build_escalation_queues`` today).
 
     Returns:
-        List of escalation dicts (fields passed through unchanged).
+        List of escalation dicts (fields passed through unchanged).  Unaffected
+        by *skipped*: opting in adds a report, it never changes what is read.
     """
     if not esc_dir.is_dir():
         return []
@@ -53,6 +102,8 @@ def load_queue_escalations(esc_dir: Path) -> list[dict]:
             results.append(json.loads(path.read_text()))
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning('Failed to load escalation %s: %s', path, exc)
+            if skipped is not None:
+                skipped.append({'path': path, 'error': str(exc)})
             continue
     return results
 
@@ -122,7 +173,35 @@ _LEVEL_KEYS = (0, 1, 2)
 _STATUS_KEYS = ('pending', 'resolved', 'dismissed')
 
 
-def _bucket(escalations: list[dict]) -> dict:
+def _load_queue_with_skips(esc_dir: Path) -> tuple[list[dict], list[dict[str, str]]]:
+    """Read one escalation queue dir, returning ``(escalations, skipped)``.
+
+    A FRESH accumulator per call is load-bearing: :func:`load_queue_escalations`
+    **appends** to the list it is handed, so one list shared across
+    :func:`build_escalation_queues`' two call sites would attribute every
+    queue's skips to every subsection — a single corrupt file in one
+    orchestrator's queue would then render as N badges across N unrelated
+    projects, a worse lie than silence.  Owning the allocation here makes that
+    failure mode unwritable by construction instead of comment-enforced at each
+    call site.
+
+    ``path`` is stringified here because this is the boundary between the reader
+    — which deliberately keeps a ``Path`` so callers can take ``.name`` or retry
+    the read — and the payload :func:`build_escalation_queues` hands the API
+    layer, where a ``Path`` reaching ``JSONResponse`` would 500 the endpoint.
+
+    Args:
+        esc_dir: Path to the escalation queue root directory.
+
+    Returns:
+        ``(escalations, [{"path": str, "error": str}, ...])``.
+    """
+    skips: list[dict[str, Any]] = []
+    escs = load_queue_escalations(esc_dir, skipped=skips)
+    return escs, [{'path': str(s['path']), 'error': s['error']} for s in skips]
+
+
+def _bucket(escalations: list[dict], *, skipped_count: int) -> dict:
     """Compute per-subsection summary counts from a list of escalation dicts.
 
     Only ``level`` values in ``{0, 1, 2}`` and ``status`` values in
@@ -130,9 +209,22 @@ def _bucket(escalations: list[dict]) -> dict:
     silently ignored (the escalation is still present in the subsection's
     ``escalations`` list).
 
+    Args:
+        escalations: The escalations this subsection actually loaded.
+        skipped_count: How many ``*.json`` files in this queue could **not** be
+            read, and therefore how short the ``by_level``/``by_status`` counts
+            beside it may be.  Passed through verbatim so the annotation lives
+            in the same dict as the counts it qualifies, read by the same
+            consumers at the same nesting.  Required, deliberately: a default of
+            ``0`` would let a future call site that forgot the kwarg report a
+            clean queue it never checked, which is the silent degradation this
+            whole field exists to prevent.  A call site that genuinely has no
+            skips says ``skipped_count=0`` and means it.
+
     Returns:
         ``{"by_level": {0: int, 1: int, 2: int},
-           "by_status": {"pending": int, "resolved": int, "dismissed": int}}``
+           "by_status": {"pending": int, "resolved": int, "dismissed": int},
+           "skipped_count": int}``
     """
     by_level: dict = {k: 0 for k in _LEVEL_KEYS}
     by_status: dict = {k: 0 for k in _STATUS_KEYS}
@@ -143,19 +235,35 @@ def _bucket(escalations: list[dict]) -> dict:
         st = esc.get('status')
         if st in by_status:
             by_status[st] += 1
-    return {'by_level': by_level, 'by_status': by_status}
+    return {'by_level': by_level, 'by_status': by_status, 'skipped_count': skipped_count}
 
 
 def _merge_summaries(summaries: list[dict]) -> dict:
-    """Merge a list of per-subsection summary dicts into one aggregate."""
+    """Merge a list of per-subsection summary dicts into one aggregate.
+
+    ``skipped_count`` aggregates here alongside the level/status counts, so the
+    top-level rollup comes free from the one call this function already has —
+    there is no second aggregation path to keep in sync (INV-5).  It reports how
+    many ``*.json`` files across **all** queues could not be read, and therefore
+    how short the merged ``by_level``/``by_status`` counts beside it may be.
+
+    ``skipped_count`` is indexed, not ``.get(..., 0)``-ed, to match the adjacent
+    ``by_level``/``by_status`` handling: a summary dict missing the key is
+    malformed, and defaulting it would turn "this summary was built by a path
+    that forgot to count skips" into a confident "0 unreadable" — precisely the
+    silent-zero the key exists to eliminate.  Fail loud on a ``KeyError``
+    instead (INV-2, ``no-silent-fail-soft``).
+    """
     by_level: dict = {k: 0 for k in _LEVEL_KEYS}
     by_status: dict = {k: 0 for k in _STATUS_KEYS}
+    skipped_count = 0
     for s in summaries:
         for k in _LEVEL_KEYS:
             by_level[k] += s['by_level'].get(k, 0)
         for k in _STATUS_KEYS:
             by_status[k] += s['by_status'].get(k, 0)
-    return {'by_level': by_level, 'by_status': by_status}
+        skipped_count += s['skipped_count']
+    return {'by_level': by_level, 'by_status': by_status, 'skipped_count': skipped_count}
 
 
 def build_escalation_queues(config) -> dict:
@@ -173,8 +281,26 @@ def build_escalation_queues(config) -> dict:
             "label":      str,        # root.name for orchestrators; "fused-memory"
             "kind":       str,        # "orchestrator" | "reconciliation"
             "escalations": list[dict],
-            "summary":    {"by_level": {0,1,2}, "by_status": {pending,resolved,dismissed}},
+            "skipped":    [{"path": str, "error": str}, ...],
+            "summary":    {"by_level": {0,1,2}, "by_status": {pending,resolved,dismissed},
+                           "skipped_count": int},
         }
+
+    ``summary.skipped_count`` is ``len(skipped)`` — how many ``*.json`` files in
+    this queue could not be read, and therefore how short the ``by_level`` /
+    ``by_status`` counts beside it may be.  It is always present (an absent key
+    would read as "unknown" and force every consumer into a ``.get(..., 0)``
+    guess).
+
+    ``skipped`` names the ``*.json`` files in this subsection's queue directory
+    that :func:`load_queue_escalations` could not read or parse — one record per
+    file, ``path`` stringified by :func:`_load_queue_with_skips` because this
+    function's return value is the payload the API layer serves (the reader
+    deliberately leaves ``path`` a ``Path`` and defers the coercion to its
+    caller; a ``Path`` reaching ``JSONResponse`` would 500 the endpoint).  It exists because a queue that
+    reports fewer escalations than it holds must say so in the payload, not only
+    in a WARNING line a human tailing stderr may never see (INV-2,
+    ``structured-facts-at-failure``).
 
     The top-level return value also carries an aggregated ``summary`` block.
 
@@ -194,25 +320,199 @@ def build_escalation_queues(config) -> dict:
             seen.add(root)
             roots_to_visit.append(root)
 
+    # `_load_queue_with_skips` owns the per-call accumulator so no call site can
+    # share one list across queues and cross-attribute another queue's skips.
     for root in roots_to_visit:
-        escs = load_queue_escalations(root / 'data' / 'escalations')
+        escs, skipped = _load_queue_with_skips(root / 'data' / 'escalations')
         subsections.append({
             'id': str(root),
             'label': root.name,
             'kind': 'orchestrator',
             'escalations': escs,
-            'summary': _bucket(escs),
+            'skipped': skipped,
+            'summary': _bucket(escs, skipped_count=len(skipped)),
         })
 
     # Reconciliation subsection (fused-memory queue)
-    recon_escs = load_queue_escalations(config.reconciliation_escalations_dir)
+    recon_escs, recon_skipped = _load_queue_with_skips(config.reconciliation_escalations_dir)
     subsections.append({
         'id': 'reconciliation',
         'label': 'fused-memory',
         'kind': 'reconciliation',
         'escalations': recon_escs,
-        'summary': _bucket(recon_escs),
+        'skipped': recon_skipped,
+        'summary': _bucket(recon_escs, skipped_count=len(recon_skipped)),
     })
 
     top_summary = _merge_summaries([s['summary'] for s in subsections])
     return {'subsections': subsections, 'summary': top_summary}
+
+
+# ---------------------------------------------------------------------------
+# pins_recovery fan-out (task 3543, spec S8)
+# ---------------------------------------------------------------------------
+
+_PINS_DEFAULT_PER_CALL_TIMEOUT = 2.0
+
+
+def _pins_map_from_records(records: list, base_url: str) -> dict[str, list[str]]:
+    """Project a ``get_pending_escalations`` list into ``{esc_id: pins_recovery}``.
+
+    A record is included ONLY when it carries a usable ``pins_recovery`` list.
+    Three kinds of record are dropped, all for the same reason:
+
+    * no ``pins_recovery`` key — a pre-3543 escalation server that never
+      computed the annotation, or a server that computed it and deliberately
+      OMITTED it because the task-status read was unavailable (the omission
+      contract in ``get_pending_escalations``' docstring);
+    * a non-list ``pins_recovery`` (including ``None``) — malformed;
+    * a non-dict record, or a record with no ``id`` — ragged input.
+
+    Dropping is not the same as defaulting to ``[]``.  An id absent from the
+    returned map is UNKNOWN, and every consumer must render it as nothing.
+    Defaulting would manufacture a confident "this record pins nothing" out of
+    a server that never said so — the exact false negative (esc-3163) the
+    escalation side refuses to emit.
+    """
+    pins: dict[str, list[str]] = {}
+    dropped = 0
+    for rec in records:
+        if not isinstance(rec, dict):
+            dropped += 1
+            continue
+        esc_id = rec.get('id')
+        if not isinstance(esc_id, str) or not esc_id:
+            dropped += 1
+            continue
+        if 'pins_recovery' not in rec:
+            # Deliberately absent (unknown) — not an error, not a zero.
+            continue
+        value = rec['pins_recovery']
+        if not isinstance(value, list):
+            dropped += 1
+            continue
+        pins[esc_id] = [str(t) for t in value]
+    if dropped:
+        logger.debug(
+            'get_pending_escalations from %s: dropped %d malformed record(s)',
+            base_url, dropped,
+        )
+    return pins
+
+
+async def _fetch_pins_one(
+    client: httpx.AsyncClient,
+    base_url: str,
+    timeout: float,
+) -> dict[str, list[str]] | None:
+    """Read one escalation server's pins_recovery annotations.
+
+    Returns ``None`` for UNKNOWN (transport failure, timeout, or a result that
+    is not the tool's declared ``list`` shape) and a dict — possibly empty —
+    for a successful read.
+    """
+    try:
+        result = await asyncio.wait_for(
+            mcp_tool_call(
+                client, base_url, 'get_pending_escalations', {'compact': True},
+            ),
+            timeout=timeout,
+        )
+    except (TimeoutError, httpx.HTTPError, OSError, ValueError) as exc:
+        logger.debug('get_pending_escalations failed for %s: %s', base_url, exc)
+        return None
+
+    if isinstance(result, list):
+        return _pins_map_from_records(result, base_url)
+
+    # Not a list.  The one benign case is an EMPTY dict: fastmcp encodes an
+    # empty list return as an empty ``content`` array (tools/base.py
+    # ``_convert_to_content`` — the ``all(isinstance(...))`` guard is vacuously
+    # true for ``[]``), and the shared ``_extract_tool_result`` collapses empty
+    # content to ``{}``.  So a project with zero pending escalations arrives
+    # here as ``{}`` and is an authoritative empty read, not an unknown one.
+    #
+    # Caveat, recorded rather than papered over: ``_extract_tool_result`` also
+    # returns ``{}`` when the inner text fails to parse.  That path logs its own
+    # WARNING from dashboard.data.memory, so the loss is visible; disambiguating
+    # it would mean widening that shared helper's return contract, which is out
+    # of scope here.
+    if isinstance(result, dict) and not result:
+        return {}
+    logger.debug(
+        'get_pending_escalations from %s returned %s, not a list — treating as '
+        'unknown', base_url, type(result).__name__,
+    )
+    return None
+
+
+async def fetch_pins_recovery(
+    client: httpx.AsyncClient,
+    escalation_urls: dict[str, str],
+    *,
+    per_call_timeout: float = _PINS_DEFAULT_PER_CALL_TIMEOUT,
+) -> dict[str, dict[str, list[str]] | None]:
+    """Fan ``get_pending_escalations`` out to every escalation URL concurrently.
+
+    Returns ``{project_label: {escalation_id: [task_ids]} | None}``, with the
+    labels taken verbatim from *escalation_urls* (project basenames, matching
+    ``shape_merge_queue`` and ``get_merge_halt_status``).  Every configured
+    label is always present in the result: one project's failure never sinks
+    another's, because each probe is isolated.
+
+    The value is THREE-state, mirroring
+    :attr:`escalation.pins.PinReport.store_unavailable`:
+
+    * ``None`` — this project could not be read (transport error, timeout, a
+      non-list result such as an error envelope, or an unanticipated exception
+      escaping the probe).  UNKNOWN.
+    * ``{}`` — the read succeeded and no record carried an annotation (zero
+      pending escalations, or a pre-3543 server).
+    * ``{id: [task_ids]}`` — the read succeeded and these records are annotated.
+
+    Callers must not collapse the first into the second.  An empty map reads as
+    "nothing pins this", which is precisely the failure (esc-3163) that routes
+    a genuinely-pinned strand down the wrong branch.  The same discipline holds
+    per RECORD: an id absent from a non-``None`` map is unknown, never "does
+    not pin" — see :func:`_pins_map_from_records`.
+
+    ``compact=True`` is requested because ``_COMPACT_PENDING_FIELDS`` on the
+    escalation side exists for this caller: it re-adds ``pins_recovery`` on top
+    of the shared compact projection so the heavy free-text fields this
+    function never reads stay off the wire on every poll.
+
+    The default ``mcp_tool_call`` timeout is 10s — too slow for a polling loop —
+    so each call is wrapped in ``asyncio.wait_for`` and worst-case latency stays
+    close to *per_call_timeout* even when every orchestrator is down.
+    """
+    if not escalation_urls:
+        return {}
+    labels = list(escalation_urls.keys())
+    urls = [escalation_urls[lbl] for lbl in labels]
+    base_urls = [u.removesuffix('/mcp').rstrip('/') for u in urls]
+    # return_exceptions=True is what makes the per-project isolation promised
+    # above actually hold.  `_fetch_pins_one` catches the transport family it
+    # can anticipate ((TimeoutError, httpx.HTTPError, OSError, ValueError)), but
+    # `mcp_tool_call` reaches `McpSession.call_tool`, whose failure modes are
+    # not contractually narrowed to those — a RuntimeError from session-state
+    # handling, say, or a TypeError while unwrapping an envelope.  With
+    # return_exceptions=False such an escape propagates out of the gather and
+    # app.py's outer `except Exception` blanks the annotation for EVERY
+    # project at once, which is precisely the sinking-the-whole-fleet failure
+    # this fan-out exists to prevent.  Mapped to None, it degrades exactly one
+    # project to UNKNOWN instead.
+    settled = await asyncio.gather(
+        *(_fetch_pins_one(client, base, per_call_timeout) for base in base_urls),
+        return_exceptions=True,
+    )
+    results: list[dict[str, list[str]] | None] = []
+    for label, outcome in zip(labels, settled, strict=True):
+        if isinstance(outcome, BaseException):
+            logger.debug(
+                'pins_recovery probe for %s raised %s: %s — treating that '
+                'project as unknown', label, type(outcome).__name__, outcome,
+            )
+            results.append(None)
+        else:
+            results.append(outcome)
+    return dict(zip(labels, results, strict=True))

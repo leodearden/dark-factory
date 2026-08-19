@@ -22,6 +22,7 @@ from shared.invocation_outcome import (
     Failure,
     InvocationOutcome,
     NearCap,
+    ServerError,
     ZeroOutputWedge,
     _extract_cap_message,
     _parse_resets_at,
@@ -64,6 +65,11 @@ class TestInvocationOutcomeSumType:
     def test_zero_output_wedge_is_invocation_outcome(self):
         assert isinstance(ZeroOutputWedge(), InvocationOutcome)
 
+    def test_server_error_round_trips_status(self):
+        outcome = ServerError(status=529)
+        assert isinstance(outcome, InvocationOutcome)
+        assert outcome.status == 529
+
     def test_failure_round_trips_kind(self):
         outcome = Failure(kind='unknown')
         assert isinstance(outcome, InvocationOutcome)
@@ -77,10 +83,20 @@ class TestInvocationOutcomeSumType:
             NearCap(reason='r'),
             AuthFailed(status=401),
             CliLocalError(marker='m'),
+            ServerError(status=529),
             ZeroOutputWedge(),
             Failure(kind='k'),
         ],
-        ids=['OK', 'CapHit', 'NearCap', 'AuthFailed', 'CliLocalError', 'ZeroOutputWedge', 'Failure'],
+        ids=[
+            'OK',
+            'CapHit',
+            'NearCap',
+            'AuthFailed',
+            'CliLocalError',
+            'ServerError',
+            'ZeroOutputWedge',
+            'Failure',
+        ],
     )
     def test_frozen(self, instance):
         with pytest.raises(dataclasses.FrozenInstanceError):
@@ -611,6 +627,7 @@ _VARIANT_CLASSES: dict[str, type[InvocationOutcome]] = {
     'NearCap': NearCap,
     'AuthFailed': AuthFailed,
     'CliLocalError': CliLocalError,
+    'ServerError': ServerError,
     'ZeroOutputWedge': ZeroOutputWedge,
     'Failure': Failure,
 }

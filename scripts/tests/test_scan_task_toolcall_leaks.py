@@ -9,8 +9,10 @@ task 2865). This module — and its tests — never mutate task text; they only
 detect and report.
 
 Mirrors test_recon_busy_check.py: pure functions (detect_leak, scan_db,
-discover_db_paths, format_report, format_json) get direct pytest coverage;
-main() gets subprocess coverage (added alongside the CLI in a later step).
+format_report, format_json) get direct pytest coverage; main() gets
+subprocess coverage (added alongside the CLI in a later step). Discovery
+helpers (discover_db_paths et al.) are covered in
+scripts/tests/test_task_db_scan.py (task 3336).
 
 Fixture shapes below are modeled on the real live-DB leak shapes confirmed
 while planning this task (tasks 992, 1068, 1067, 2691) and the real
@@ -19,36 +21,22 @@ false-positive prose mentions (tasks 2938/2939) — not invented shapes.
 from __future__ import annotations
 
 import json
-import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 from scan_task_toolcall_leaks import (
     LeakMatch,
     detect_leak,
-    discover_db_paths,
     format_json,
     format_report,
     scan_db,
 )
 
-# Minimal reproduction of the live tasks table schema (columns + NOT NULL
-# constraints only — see fused-memory's sqlite_task_backend.py _SCHEMA_SQL).
-# Only the columns scan_db actually reads/needs are included.
-_TASKS_SCHEMA = """
-CREATE TABLE tasks (
-    tag           TEXT NOT NULL DEFAULT 'master',
-    id            INTEGER NOT NULL,
-    title         TEXT NOT NULL,
-    description   TEXT,
-    details       TEXT,
-    test_strategy TEXT,
-    status        TEXT NOT NULL,
-    metadata      TEXT,
-    updated_at    TEXT NOT NULL,
-    PRIMARY KEY (tag, id)
-);
-"""
+# The tasks-table schema and the fake-db builder live in scripts/tests/
+# conftest.py, behind the `make_tasks_db` fixture (task
+# 3336) — they were previously copied near-identically into all three
+# sweep-script test files.
 
 # ---------------------------------------------------------------------------
 # Genuine-leak fixtures: a stray closing tag, a REAL newline, then one or more
@@ -186,40 +174,7 @@ def test_detect_leak_returns_none_for_zero_whitespace_adjacent_tag():
 # scan_db(db_path) -> list[LeakMatch]
 # ---------------------------------------------------------------------------
 
-def _make_db(tmp_path, rows):
-    """Build a temp sqlite tasks.db at tmp_path/'tasks.db' seeded with *rows*.
-
-    Each row is a dict of column -> value; title/status/updated_at (the
-    NOT NULL columns) default to per-id placeholders when omitted.
-    """
-    db_path = tmp_path / "tasks.db"
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.executescript(_TASKS_SCHEMA)
-        for row in rows:
-            conn.execute(
-                "INSERT INTO tasks (tag, id, title, description, details, "
-                "test_strategy, status, metadata, updated_at) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    row.get("tag", "master"),
-                    row["id"],
-                    row.get("title", f"Task {row['id']}"),
-                    row.get("description"),
-                    row.get("details"),
-                    row.get("test_strategy"),
-                    row.get("status", "pending"),
-                    row.get("metadata"),
-                    row.get("updated_at", "2026-07-22T00:00:00+00:00"),
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return db_path
-
-
-def test_scan_db_finds_only_genuine_leaks_and_is_read_only(tmp_path):
+def test_scan_db_finds_only_genuine_leaks_and_is_read_only(make_tasks_db):
     rows = [
         {"id": 1, "description": "Clean task, nothing wrong here."},
         {"id": 2, "description": GENUINE_DESCRIPTION_LEAK},
@@ -241,7 +196,7 @@ def test_scan_db_finds_only_genuine_leaks_and_is_read_only(tmp_path):
             ),
         },
     ]
-    db_path = _make_db(tmp_path, rows)
+    db_path = make_tasks_db(rows)
     before = db_path.read_bytes()
 
     matches = scan_db(str(db_path))
@@ -266,76 +221,9 @@ def test_scan_db_finds_only_genuine_leaks_and_is_read_only(tmp_path):
     assert by_task_id[4].fragment == SWALLOWED_DETAILS_FRAGMENT
 
 
-def test_scan_db_returns_empty_list_for_clean_db(tmp_path):
-    db_path = _make_db(tmp_path, [{"id": 1, "description": "All clean here."}])
+def test_scan_db_returns_empty_list_for_clean_db(make_tasks_db):
+    db_path = make_tasks_db([{"id": 1, "description": "All clean here."}])
     assert scan_db(str(db_path)) == []
-
-
-# ---------------------------------------------------------------------------
-# discover_db_paths(explicit_dbs, project_roots, env) -> list[str]
-# ---------------------------------------------------------------------------
-
-def _touch_tasks_db(project_root):
-    """Create an (empty-content) tasks.db under project_root/.taskmaster/tasks/."""
-    db_dir = project_root / ".taskmaster" / "tasks"
-    db_dir.mkdir(parents=True)
-    db_file = db_dir / "tasks.db"
-    db_file.write_text("")
-    return db_file
-
-
-def test_discover_db_paths_explicit_dbs_passed_through_existing_only(tmp_path):
-    existing = tmp_path / "a.db"
-    existing.write_text("")
-    missing = tmp_path / "missing.db"
-
-    result = discover_db_paths(explicit_dbs=[str(existing), str(missing)])
-
-    assert result == [str(existing)]
-
-
-def test_discover_db_paths_project_root_maps_to_taskmaster_tasks_db(tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    db_file = _touch_tasks_db(root)
-
-    result = discover_db_paths(project_roots=[str(root)])
-
-    assert result == [str(db_file)]
-
-
-def test_discover_db_paths_parses_dashboard_known_project_roots_env(tmp_path):
-    root_a = tmp_path / "a"
-    root_b = tmp_path / "b"
-    root_a.mkdir()
-    root_b.mkdir()
-    db_a = _touch_tasks_db(root_a)
-    db_b = _touch_tasks_db(root_b)
-
-    # Comma-separated, whitespace padded, with an empty entry (",,") that
-    # must be dropped rather than mapped to a bogus db path.
-    env = {"DASHBOARD_KNOWN_PROJECT_ROOTS": f" {root_a} , {root_b} ,, "}
-
-    result = discover_db_paths(env=env)
-
-    assert result == [str(db_a), str(db_b)]
-
-
-def test_discover_db_paths_falls_back_to_dark_factory_default(monkeypatch):
-    monkeypatch.delenv("DASHBOARD_KNOWN_PROJECT_ROOTS", raising=False)
-
-    result = discover_db_paths()
-
-    assert result == ["/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db"]
-
-
-def test_discover_db_paths_skips_project_root_without_tasks_db(tmp_path):
-    root = tmp_path / "empty_proj"
-    root.mkdir()
-
-    result = discover_db_paths(project_roots=[str(root)])
-
-    assert result == []
 
 
 # ---------------------------------------------------------------------------
@@ -420,15 +308,15 @@ SCRIPT = Path(__file__).parent.parent / "scan_task_toolcall_leaks.py"
 
 def _run_cli(*args, timeout=10):
     return subprocess.run(
-        ["python3", str(SCRIPT), *args],
+        [sys.executable, str(SCRIPT), *args],
         capture_output=True,
         text=True,
         timeout=timeout,
     )
 
 
-def test_cli_leaky_db_exits_1_with_task_id_in_stdout_and_does_not_mutate(tmp_path):
-    db_path = _make_db(tmp_path, [{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
+def test_cli_leaky_db_exits_1_with_task_id_in_stdout_and_does_not_mutate(make_tasks_db):
+    db_path = make_tasks_db([{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
     before = db_path.read_bytes()
 
     result = _run_cli("--db", str(db_path))
@@ -439,8 +327,8 @@ def test_cli_leaky_db_exits_1_with_task_id_in_stdout_and_does_not_mutate(tmp_pat
     assert "992" in result.stdout
 
 
-def test_cli_clean_db_exits_0_with_no_leaks_message(tmp_path):
-    db_path = _make_db(tmp_path, [{"id": 1, "description": "Nothing wrong here."}])
+def test_cli_clean_db_exits_0_with_no_leaks_message(make_tasks_db):
+    db_path = make_tasks_db([{"id": 1, "description": "Nothing wrong here."}])
 
     result = _run_cli("--db", str(db_path))
 
@@ -448,8 +336,8 @@ def test_cli_clean_db_exits_0_with_no_leaks_message(tmp_path):
     assert "no leaked tool-call fragments found" in result.stdout
 
 
-def test_cli_json_flag_exits_1_and_emits_parseable_json(tmp_path):
-    db_path = _make_db(tmp_path, [{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
+def test_cli_json_flag_exits_1_and_emits_parseable_json(make_tasks_db):
+    db_path = make_tasks_db([{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
 
     result = _run_cli("--db", str(db_path), "--json")
 
@@ -466,17 +354,163 @@ def test_cli_no_resolvable_db_exits_2():
     assert result.returncode == 2, f"stdout={result.stdout!r} stderr={result.stderr!r}"
 
 
-def test_cli_continues_past_unreadable_db_and_warns_on_stderr(tmp_path):
+def test_cli_continues_past_unreadable_db_and_warns_on_stderr(tmp_path, make_tasks_db):
     """A corrupt/unreadable tasks.db (e.g. a stale WAL-less file, or a
     genuinely non-sqlite file at that path) must not abort the whole sweep:
     the CLI logs a warning naming the bad db to stderr and continues, still
     reporting leaks found in the other, readable database(s)."""
     corrupt_db = tmp_path / "corrupt.db"
     corrupt_db.write_bytes(b"not a sqlite database, just garbage bytes")
-    leaky_db = _make_db(tmp_path, [{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
+    leaky_db = make_tasks_db([{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
 
     result = _run_cli("--db", str(corrupt_db), "--db", str(leaky_db))
 
     assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert "992" in result.stdout
     assert str(corrupt_db) in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Single-detector promotion (task 3083)
+#
+# This script's detector was promoted into fused_memory.utils.toolcall_xml_leak
+# so that the task-DB scanner, the live MCP write-boundary guard, and the Mem0
+# corpus sweep all share ONE definition of a leak. Everything above this line
+# is the pre-existing behavioural contract and must stay green UNMODIFIED —
+# that is the regression proof that the promotion changed nothing here.
+#
+# The assertions below are IDENTITY assertions on purpose. Equality would pass
+# against a second, independently-maintained copy of the regex, which is
+# exactly the drift the promotion exists to prevent.
+#
+# Sentinel literals use the \x3c escape for "<" (task 3083 plan pre-1): writing
+# one verbatim would force the authoring agent to emit that literal inside its
+# own tool-call XML, reproducing the bug under repair.
+# ---------------------------------------------------------------------------
+
+_CLOSE_CONTENT = "\x3c/content>"
+_CLOSE_INVOKE = "\x3c/invoke>"
+
+
+class TestDetectorIsTheSharedDefinition:
+    """The script must re-export the shared detector, not redefine it."""
+
+    def test_leak_tail_is_the_shared_pattern_object(self):
+        import scan_task_toolcall_leaks
+        from fused_memory.utils import toolcall_xml_leak
+
+        assert scan_task_toolcall_leaks.LEAK_TAIL is toolcall_xml_leak.LEAK_TAIL
+
+    def test_detect_leak_is_the_shared_function_object(self):
+        import scan_task_toolcall_leaks
+        from fused_memory.utils import toolcall_xml_leak
+
+        assert scan_task_toolcall_leaks.detect_leak is toolcall_xml_leak.detect_leak
+
+    def test_patching_the_shared_detector_changes_the_script_behaviour(self, monkeypatch, make_tasks_db):
+        """Delegation is real, not a same-valued copy captured at import."""
+        import scan_task_toolcall_leaks
+
+        monkeypatch.setattr(
+            scan_task_toolcall_leaks, "detect_leak", lambda text: "SENTINEL" if text else None
+        )
+        db_path = make_tasks_db([{"id": 7, "description": "totally clean prose"}])
+
+        matches = scan_db(str(db_path))
+
+        assert matches, "scan_db must call through the patched shared detector"
+        assert all(m.fragment == "SENTINEL" for m in matches)
+
+
+class TestGeneralizedShapesAreReportedByScanDb:
+    """The task DB is subject to the identical harness bug, so the two Mem0
+    generalizations must be visible through this script too."""
+
+    def test_closing_content_tag_leak_is_reported(self, make_tasks_db):
+        fragment = _CLOSE_CONTENT + '\n<parameter name="priority">high'
+        db_path = make_tasks_db([{"id": 3083, "description": "Body prose." + fragment}])
+
+        matches = scan_db(str(db_path))
+
+        assert [(m.task_id, m.column, m.fragment) for m in matches] == [
+            (3083, "description", fragment)
+        ]
+
+    def test_bare_closing_invoke_tail_leak_is_reported(self, make_tasks_db):
+        fragment = _CLOSE_CONTENT + "\n" + _CLOSE_INVOKE
+        db_path = make_tasks_db([{"id": 3084, "details": "Body prose." + fragment}])
+
+        matches = scan_db(str(db_path))
+
+        assert [(m.task_id, m.column, m.fragment) for m in matches] == [
+            (3084, "details", fragment)
+        ]
+
+    def test_generalization_does_not_weaken_the_whitespace_discriminator(self, make_tasks_db):
+        """Prose quoting the new shapes with an ESCAPED backslash-n stays clean."""
+        rows = [
+            {"id": 1, "description": "Quoted: `" + _CLOSE_CONTENT + "\\n" + _CLOSE_INVOKE + "` here."},
+            {"id": 2, "description": "Adjacent:" + _CLOSE_CONTENT + _CLOSE_INVOKE},
+        ]
+        db_path = make_tasks_db(rows)
+
+        assert scan_db(str(db_path)) == []
+
+
+# ---------------------------------------------------------------------------
+# All-unreadable exit-code contract (task 3474)
+#
+# Appended BELOW the task 3083 banner deliberately: that banner's "everything
+# above this line is the pre-existing behavioural contract and must stay green
+# UNMODIFIED" claim is the regression proof for the single-detector promotion,
+# so these later CLI tests are added after it rather than grouped with the
+# other _run_cli tests above.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_every_db_unreadable_exits_3_not_0(tmp_path):
+    """EVERY resolved database failing to open is not a clean sweep.
+
+    Covered here at the layer a cron job actually observes — a process exit
+    status — because that is where the false green did its damage: stdout
+    still reads "no leaked tool-call fragments found" while nothing at all
+    was scanned, so only the exit code can contradict it.
+    """
+    bad1 = tmp_path / "bad1.db"
+    bad2 = tmp_path / "bad2.db"
+    bad1.write_bytes(b"not a sqlite database, just garbage bytes")
+    bad2.write_bytes(b"not a sqlite database, just garbage bytes")
+
+    result = _run_cli("--db", str(bad1), "--db", str(bad2))
+
+    assert result.returncode == 3, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert str(bad1) in result.stderr
+    assert str(bad2) in result.stderr
+    assert "NOTHING was scanned" in result.stderr
+    # The clean-looking report is still printed — that is the false-green
+    # shape the exit code now disagrees with.
+    assert "no leaked tool-call fragments found" in result.stdout
+
+    # Same under --json, and pinned deliberately: stdout is a WELL-FORMED
+    # EMPTY payload, indistinguishable from a genuinely clean sweep. So a
+    # `... --json | jq -e 'length == 0'` pipeline that ignores $? still reads
+    # a total failure as clean. That residual gap is documented on
+    # run_scan_cli (and matches audit_wiped_metadata_files.py); this asserts
+    # it rather than leaving it to be rediscovered as a surprise.
+    json_result = _run_cli("--db", str(bad1), "--db", str(bad2), "--json")
+    assert json_result.returncode == 3, json_result.stderr
+    assert json.loads(json_result.stdout) == []
+
+
+def test_cli_one_unreadable_db_beside_a_clean_one_still_exits_0(tmp_path, make_tasks_db):
+    """Partial failure is NOT exit 3: a database was genuinely scanned."""
+    corrupt_db = tmp_path / "corrupt.db"
+    corrupt_db.write_bytes(b"not a sqlite database, just garbage bytes")
+    clean_db = make_tasks_db([{"id": 1, "description": "Nothing wrong here."}])
+
+    result = _run_cli("--db", str(corrupt_db), "--db", str(clean_db))
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "no leaked tool-call fragments found" in result.stdout
+    assert str(corrupt_db) in result.stderr
+    assert "NOTHING was scanned" not in result.stderr

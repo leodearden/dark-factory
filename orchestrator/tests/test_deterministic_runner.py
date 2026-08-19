@@ -6,12 +6,54 @@ Step-7: RED — idempotent resume + quiescence (I2/B3/B4/B11)
 
 from __future__ import annotations
 
+import asyncio
+import functools
+import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+
+# ---------------------------------------------------------------------------
+# Task 3286 — the real task-2902 specimen shape.
+#
+# `_default_run_script` merges stderr into stdout and returns `[-2000:]`, so a
+# chatty predicate script's server-log noise reached `done_provenance.note`
+# verbatim — and from there fused-memory's `_format_outcome_echo` wrote it into
+# a Mem0 completion summary.  The live note on task 2902 is exactly 1999 chars:
+# it starts MID-TOKEN (the 2000-char tail cut), carries FalkorDB identity-scan
+# WARNINGs naming the unrelated project `my_solar_challenge` plus `httpx` HTTP
+# request lines, and ends with the script's own pretty-printed dry-run JSON
+# verdict — the ONE part actually worth keeping.
+#
+# Shape-faithful, not byte-identical: reproduced from the plan's analysis (the
+# live task is a preserved forensic specimen and is never re-read or mutated
+# by this suite).  An abridged copy lives in
+# scripts/tests/test_scan_provenance_note_log_leaks.py — the two suites cannot
+# share imports across orchestrator/tests/ and scripts/tests/.
+# ---------------------------------------------------------------------------
+
+POLLUTED_PREDICATE_OUTPUT = """\
+_tariff_pence_per_kwh' in group 'my_solar_challenge' (exact-name identity gate should prevent this — investigate)
+2026-07-30 16:39:00,523 fused_memory.backends.graphiti_client WARNING identity scan found 3 candidate nodes for 'import_tariff_pence_per_kwh' in group 'my_solar_challenge'
+2026-07-30 16:39:00,584 fused_memory.backends.graphiti_client WARNING identity scan found 2 candidate nodes for 'export_tariff_pence_per_kwh' in group 'my_solar_challenge'
+2026-07-30 16:39:00,625 httpx INFO HTTP Request: GET http://localhost:6333 "HTTP/1.1 200 OK"
+2026-07-30 16:39:00,701 httpx INFO HTTP Request: POST http://localhost:6333/collections/mem0/points/scroll "HTTP/1.1 200 OK"
+2026-07-30 16:39:00,742 fused_memory.backends.graphiti_client WARNING identity scan found 4 candidate nodes for 'battery_state_of_charge' in group 'my_solar_challenge'
+{
+  "dry_run": true,
+  "before": {
+    "total_source": 0,
+    "total_with_kind": 0
+  },
+  "orphan_count": 0,
+  "orphan_ids": [],
+  "verdict": "clean"
+}"""
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -92,6 +134,25 @@ def _mock_scheduler(task: dict):
     scheduler.update_task = AsyncMock(return_value=True)
     scheduler.get_task = AsyncMock(return_value=task)
     return scheduler
+
+
+def _seed_resolved_gate(queue: EscalationQueue, task_id: str) -> Escalation:
+    """Seed a RESOLVED+ARCHIVED deterministic gate escalation for *task_id*.
+
+    This is the true state after a human ``resume``: the L2 gate is archived
+    (resolved) BEFORE the task is re-pended (task 2954).  It makes the pure-gate
+    resume's archive-inclusive ``own_escalation_resolved`` proof pass, so the
+    legitimate drive-to-done stays green — as distinct from a truly-empty queue
+    (a LOST escalation), which the hardened resume treats as a strand.
+    """
+    esc = Escalation(
+        id=queue.make_id(task_id), task_id=task_id,
+        agent_role='orchestrator-deterministic', severity='critical',
+        category='milestone_gate', summary='Ship feature gate', level=2,
+    )
+    queue.submit(esc)
+    queue.resolve(esc.id, 'human resolved the gate', resolved_by='human')
+    return esc
 
 
 def _deploy_task(
@@ -272,6 +333,215 @@ def _seed_escalation(
     if resolved:
         queue.resolve(esc.id, 'resolved for test setup')
     return esc
+
+
+# Repo root of this worktree, derived exactly as orchestrator/tests/conftest.py
+# derives _SRC / _SHARED_SRC / _ESCALATION_SRC (conftest.py:20-27) — same source
+# of truth, same idiom, no new constant to drift.
+_REPO_ROOT = Path(__file__).parent.parent.parent
+_CHILD_SRC_ROOTS = (
+    _REPO_ROOT / 'escalation' / 'src',
+    _REPO_ROOT / 'shared' / 'src',
+    _REPO_ROOT / 'orchestrator' / 'src',
+)
+
+
+# Every child this module spawns is bounded.  30s, NOT the 60s a reviewer
+# suggested, because orchestrator/pyproject.toml sets a 60s per-test
+# pytest-timeout with `timeout_method = "thread"` — at parity the two would
+# race, and pytest-timeout's thread method resolves a hit by `os._exit()`-ing
+# the xdist worker, which produces no diagnosis at all.  Firing strictly inside
+# that budget guarantees the named AssertionError below wins the race.
+_CHILD_TIMEOUT_SECS = 30
+
+
+def _child_env() -> dict[str, str]:
+    """os.environ plus the repo src roots prepended to PYTHONPATH.
+
+    One definition, shared by `_run_wrapper_payload` and `_probe_submit_cli`,
+    so the preflight probes a child environment identical to the one the
+    wrapper actually runs in.  The injected roots take precedence; any
+    inherited PYTHONPATH is appended rather than dropped.  See
+    `_run_wrapper_payload` for why the injection is needed at all.
+    """
+    env = {**os.environ}
+    inherited = env.get('PYTHONPATH')
+    env['PYTHONPATH'] = os.pathsep.join(
+        [*(str(p) for p in _CHILD_SRC_ROOTS), *([inherited] if inherited else [])]
+    )
+    return env
+
+
+@functools.cache
+def _probe_submit_cli(python_exe: str) -> tuple[int, str]:
+    """Run ``<python_exe> -m escalation submit --help``; return (rc, output).
+
+    Memoized per interpreter path: spawning a fresh CPython costs ~0.3-0.7s and
+    the answer is deterministic for the life of a suite run, while
+    `_assert_submit_cli_invokable` runs on every wrapper-exec test.  The cache
+    key omits the ambient PYTHONPATH deliberately — `_child_env` *prepends* the
+    repo src roots, so an inherited value (appended, lower precedence) cannot
+    change whether the import resolves.  Failures are cached as VALUES, not
+    raised in here, so a broken interpreter still re-reports its full diagnosis
+    at every call site.
+    """
+    from orchestrator.proc_supervision import EscalationSpec
+
+    argv = EscalationSpec(
+        queue_dir='', task_id='0', summary='preflight',
+    ).to_submit_argv(python_exe)
+    # The slice below is the ONLY thing keeping this probe honest, so pin the
+    # shape it assumes.  If `to_submit_argv` ever grows a leading interpreter
+    # flag (`-X faulthandler`, `-P`) or an option before the subcommand,
+    # argv[:4] would drop the `submit` token and `--help` would then be handled
+    # by escalation/submit.py's TOP-LEVEL parser — which also exits 0 (its
+    # subparsers are declared with dest='command' and are not required).  The
+    # probe would pass vacuously: exactly the silent-pass class it exists to
+    # eliminate.  Re-derive the prefix rather than widening the slice.
+    expected_prefix = [python_exe, '-m', 'escalation', 'submit']
+    assert argv[:4] == expected_prefix, (
+        f'submit argv prefix drifted from {expected_prefix!r}: got {argv[:5]!r}. '
+        f'The preflight probe slices argv[:4] and appends --help; with `submit` '
+        f'no longer 4th the probe degrades into a top-level --help that exits 0 '
+        f'unconditionally, i.e. it would pass vacuously.'
+    )
+    # The option list is dropped so the probe stays side-effect-free (it parses
+    # `--help` and exits; it files nothing and touches no queue dir).
+    probe = [*argv[:4], '--help']
+
+    try:
+        result = subprocess.run(
+            probe,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=_child_env(),
+            timeout=_CHILD_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = (exc.output or b'').decode(errors='replace')
+        # Reported as a non-zero rc so the caller handles it on its single
+        # failure path; the text carries the distinction.  A wedged probe (a
+        # stuck queue lock, an interpreter waiting on stdin) must name itself,
+        # not hang the whole run.
+        return -1, (
+            f'probe timed out after {_CHILD_TIMEOUT_SECS}s and was killed; '
+            f'partial output: {partial!r}'
+        )
+    return result.returncode, result.stdout.decode(errors='replace')
+
+
+def _assert_submit_cli_invokable(python_exe: str) -> None:
+    """Fail loudly, and specifically, if *python_exe* cannot run the submit CLI.
+
+    The probe argv is taken from ``EscalationSpec.to_submit_argv``
+    (proc_supervision.py:117-133) — the very function the RP-4 wrapper's
+    on-failure branch uses — truncated to its interpreter/module prefix and
+    given ``--help``, with that prefix shape asserted in `_probe_submit_cli`
+    so the preflight cannot silently drift from the real invocation.
+
+    Raises ``AssertionError`` naming the interpreter and quoting the child's
+    output.  Without this preflight a non-invokable CLI surfaces only as
+    "exactly one L2 must be filed on failure, got 0" — a message that
+    misdirects the reader at production filing logic (task 3404).
+    """
+    rc, out = _probe_submit_cli(python_exe)
+    if rc != 0:
+        from orchestrator.proc_supervision import RP4_ESCALATION_SUBMIT_FAILED_RC
+
+        raise AssertionError(
+            f'the escalation submit CLI is not invokable by {python_exe!r} '
+            f'(exit {rc}): {out.strip()!r}. '
+            f'The RP-4 wrapper files its on-failure L2 by exec-ing '
+            f'{" ".join([python_exe, "-m", "escalation", "submit"])!r}, so this '
+            f'environment would file NOTHING. '
+            f'Remedy: this venv most likely lacks the `escalation` editable '
+            f'install — run `uv sync` at the repo root. '
+            f'In PRODUCTION, an interpreter that cannot run this makes a fired '
+            f'RP-4 transient unit exit {RP4_ESCALATION_SUBMIT_FAILED_RC} '
+            f'(RP4_ESCALATION_SUBMIT_FAILED_RC) with '
+            f'"RP-4: on-failure escalation submit failed rc=<N> '
+            f'(payload rc=<M>)" on stderr, instead of the payload\'s own exit '
+            f'code — that line and that code are the journald signature to '
+            f'grep for (task 3404).'
+        )
+
+
+async def _run_wrapper_payload(wrapped: str) -> tuple[int, str]:
+    """Execute a deferred RP-4 ``/bin/sh -c`` wrapper the way systemd would.
+
+    *wrapped* is the payload `systemd-run` was asked to defer — i.e. the
+    four-part `{payload}; __rc=$?; if [ "$__rc" -ne 0 ]; then {on_failure};
+    __esc=$?; if [ "$__esc" -ne 0 ]; then echo "RP-4: ..." >&2; exit 97; fi;
+    fi; exit "$__rc"` shell built by
+    ``RestartPlan``/``EscalationSpec.to_submit_argv``.  Running it for real is
+    what makes the wrapper-exec tests higher-fidelity than argv assertions.
+
+    Returns ``(returncode, combined_output)``.  The output half is returned
+    **specifically so assertion failures can quote it**: on the
+    submit-succeeded path the wrapper still exits the PAYLOAD's own code, so
+    the exit status alone never says which of the two commands produced it,
+    and the text the child printed is the only evidence.  The pre-3404 inline
+    pattern called ``await proc.communicate()`` and discarded that result,
+    leaving a failure to report itself as a bare "got 0" with the real
+    diagnosis unread.  (Pre-3404 the wrapper also swallowed a FAILED submit
+    entirely; it now exits ``RP4_ESCALATION_SUBMIT_FAILED_RC`` with an `RP-4:`
+    line on stderr, which this helper likewise surfaces.)
+
+    The child is given the repo's src roots on ``PYTHONPATH``.  WHY (measured,
+    task 3404): the wrapper's on-failure branch is
+    ``EscalationSpec.to_submit_argv(sys.executable)`` =>
+    ``[sys.executable, '-m', 'escalation', 'submit', ...]``, and that is a
+    FRESH interpreter — it inherits none of root conftest.py's in-process
+    ``sys.path`` injection, only site-packages plus cwd.  In a venv whose
+    site-packages lacks the `escalation` editable install (`.worktrees/3352`
+    had ONLY `_editable_impl_dark_factory_shared.pth`), the child resolves the
+    repo's `escalation/` directory as an implicit NAMESPACE package with no
+    `__main__`, exits non-zero, and files nothing — while the wrapper's
+    trailing `exit "$__rc"` still returns the payload script's own code.  So
+    the test saw rc==7 and zero escalations and blamed production filing logic.
+    Injecting the roots fixes it for real:
+    ``PYTHONPATH=<roots> <that stripped venv>/bin/python3 -m escalation submit
+    --help`` exits 0.  This supplements the venv, it does not replace it —
+    escalation's third-party deps still resolve from site-packages (a bare
+    /usr/bin/python3 + PYTHONPATH still fails), so a genuinely unsynced
+    environment still fails, just loudly and specifically.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        '/bin/sh', '-c', wrapped,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=_child_env(),
+    )
+    # Bounded: the wrapper's on-failure branch really invokes the submit CLI,
+    # which writes into a queue dir under an EscalationQueue lock.  A child that
+    # blocks — stuck lock, an interpreter waiting on stdin, a payload that never
+    # exits — would otherwise wedge the run with no diagnosis, the exact
+    # opposite of this harness's purpose.
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_CHILD_TIMEOUT_SECS)
+    except TimeoutError:
+        proc.kill()
+        try:
+            # Reap so the killed child cannot leak as a zombie / unawaited pipe.
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except TimeoutError:
+            out = b''
+        raise AssertionError(
+            f'the wrapper payload did not exit within {_CHILD_TIMEOUT_SECS}s and '
+            f'was killed. Payload: {wrapped!r}. Output captured before the kill: '
+            f'{out.decode(errors="replace")!r}'
+        ) from None
+    output = out.decode(errors='replace')
+    # `communicate()` has reaped the child, so returncode is always set — but it
+    # is typed `int | None`, so narrow it explicitly.  NOT `proc.returncode or
+    # 0`: that would silently report an unexited child as a clean exit 0, which
+    # is the exact value the success-path caller asserts on.  Same idiom as
+    # shared/tests/test_proc_group.py:524.
+    rc = proc.returncode
+    assert rc is not None, (
+        f'communicate() returned but the child has no exit status; output: {output!r}'
+    )
+    return rc, output
 
 
 # ---------------------------------------------------------------------------
@@ -516,10 +786,13 @@ class TestIdempotentResumeAndQuiescence:
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
 
-        # gate already escalated; escalation already resolved (no pending)
+        # gate already escalated; escalation resolved+archived (task 2954: the
+        # true post-`resume` state — an empty archive would be a LOST-escalation
+        # strand, which the hardened resume re-files rather than driving to done).
         task = _gate_task(task_id='100', gate_escalated_at='2026-06-23T12:00:00+00:00')
         assignment = _make_assignment(task)
-        queue = EscalationQueue(tmp_path)  # empty queue — no pending escalation
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '100')
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -544,6 +817,7 @@ class TestIdempotentResumeAndQuiescence:
         task = _gate_task(task_id='100', gate_escalated_at='2026-06-23T12:00:00+00:00')
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '100')  # resolved+archived — the true post-resume state
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -679,7 +953,8 @@ class TestIdempotentResumeAndQuiescence:
 
         task = _gate_task(task_id='99', gate_escalated_at='2026-06-23T12:00:00+00:00')
         assignment = _make_assignment(task)
-        queue = EscalationQueue(tmp_path)  # empty — gate escalation resolved
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '99')  # resolved+archived — the true post-resume state
         scheduler = _mock_scheduler(task)
 
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
@@ -693,6 +968,722 @@ class TestIdempotentResumeAndQuiescence:
                 'kind': 'deterministic-gate',
                 'note': 'pure gate resolved',
             },
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 2954 step-7/step-8: pure-gate resume-proof hardening.
+#
+# Today the pure-gate section-1 resume drives a stamped gate to `done` whenever
+# the PENDING queue is empty — which, if the born-at-L2 escalation was LOST
+# (the reported strand), silently BYPASSES the human gate the moment an operator
+# re-pends the stuck task.  Hardening requires the SAME archive-inclusive
+# positive proof the deploy path already demands: drive to done only when a
+# resolved/archived deterministic escalation actually exists; otherwise re-file
+# the gate and stay BLOCKED.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPureGateResumeHardening:
+    """DeterministicRunner — pure-gate resume requires archive-inclusive proof."""
+
+    async def test_pure_gate_resume_no_record_refiles_and_blocks(self, tmp_path: Path):
+        """gate_escalated_at set + ZERO records anywhere (no pending, no archived)
+        → must NOT drive to done; re-files the born-at-L2 gate and returns BLOCKED."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='100', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # ZERO records — no pending, no archived
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # Must NOT silently drive to done — the human gate was never proven resolved.
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert not done_calls, 'pure-gate resume must not drive to done without proof'
+        # Instead it re-files the born-at-L2 milestone_gate to re-establish the gate.
+        pending = queue.get_by_task(
+            '100', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1
+        assert pending[0].category == 'milestone_gate'
+        assert pending[0].level == 2
+
+    async def test_pure_gate_resume_with_resolved_record_drives_to_done(self, tmp_path: Path):
+        """GREEN-preserving: a RESOLVED+ARCHIVED deterministic escalation (the true
+        post-`resume` state) IS positive proof a human acted → drive to done with
+        deterministic-gate provenance, exactly as before the hardening."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='99', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        # A human `resume` archives the escalation before the task is re-pended.
+        existing = Escalation(
+            id=queue.make_id('99'), task_id='99',
+            agent_role='orchestrator-deterministic', severity='critical',
+            category='milestone_gate', summary='Ship feature gate', level=2,
+        )
+        queue.submit(existing)
+        queue.resolve(existing.id, 'human approved the gate', resolved_by='human')
+        # Sanity: resolved record is archived (not pending) but archive-visible.
+        assert queue.get_by_task('99', status='pending') == []
+        assert len(queue.get_by_task('99', agent_role='orchestrator-deterministic')) == 1
+
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_awaited_once_with(
+            '99',
+            'done',
+            done_provenance={
+                'kind': 'deterministic-gate',
+                'note': 'pure gate resolved',
+            },
+        )
+
+    async def test_always_escalates_gate_stamp_implies_queryable_escalation(self, tmp_path: Path):
+        """Regression guard (task 2954, the explicitly-requested end-to-end
+        deliverable): a fresh always_escalates pure-gate dispatch must yield a
+        DURABLY queryable L2 escalation AND stamp gate_escalated_at — pinning the
+        'stamp ⟹ queryable escalation' invariant whose violation (stamp present,
+        record absent) is the reported bug, and guarding the file-before-stamp
+        durability contract against regression."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='2954', gate_options=['approve', 'reject'])
+        assert 'gate_escalated_at' not in task['metadata']  # fresh dispatch
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        # (d) a fresh gate blocks awaiting a human decision
+        assert outcome == WorkflowOutcome.BLOCKED
+        # (a) exactly one queryable born-at-L2 escalation, scoped to the runner role
+        pending = queue.get_by_task(
+            '2954', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.category == 'milestone_gate'
+        # (b) the record round-trips from DISK — durable persistence, not just an
+        # in-memory list — proving the invariant end-to-end.
+        on_disk = queue.get(esc.id)
+        assert on_disk is not None
+        assert on_disk.id == esc.id
+        assert on_disk.task_id == '2954'
+        # (c) gate_escalated_at is stamped via a metadata merge
+        stamp_calls = [
+            c for c in scheduler.update_task.await_args_list
+            if len(c.args) >= 2 and isinstance(c.args[1], dict)
+            and 'gate_escalated_at' in c.args[1]
+        ]
+        assert stamp_calls, 'gate_escalated_at must be stamped on first dispatch'
+        assert stamp_calls[0].kwargs.get('metadata_mode') == 'merge'
+
+
+# ---------------------------------------------------------------------------
+# task 3341: human-curator-gate content-adjudication guard.
+#
+# Task 2954's hardening (above) proves a gate RECORD exists and is no longer
+# pending.  For a `human_curator_gate` task that is NOT the same proposition as
+# "the human actually did the content review" — and task 3181 is the incident
+# where the two diverged.  See the class docstring below.
+# ---------------------------------------------------------------------------
+
+def _curator_gate_task(
+    task_id: str = '3181',
+    title: str = 'Adjudicate the Mem0 corpus entries',
+    description: str = 'Human curator must review each entry before this closes',
+    deps: list | None = None,
+    gate_options: list | None = None,
+    gate_escalated_at: str | None = None,
+    human_curator_adjudicated_at: object = None,
+    marker: object = True,
+) -> dict:
+    """Build a deterministic pure-gate task dict carrying the curator marker.
+
+    Composes ``_gate_task`` the way ``_llm_gate_task`` does (delegate, then
+    stamp the marker key) rather than duplicating the task-dict literal.
+    Byte-matches task 3181's real shape: ``before_done`` None,
+    ``always_escalates=True``, ``task_kind='deterministic'``, plus
+    ``metadata['human_curator_gate']``.
+
+    *marker* is deliberately parameterisable (and not typed ``bool``) so the
+    fail-closed tests can pass a truthy-but-not-``True`` value such as the
+    string ``'true'``.  *human_curator_adjudicated_at* is stamped only when not
+    ``None``, so the default task is an UNADJUDICATED curator gate.
+    """
+    task = _gate_task(
+        task_id=task_id,
+        title=title,
+        description=description,
+        deps=deps,
+        gate_options=gate_options,
+        gate_escalated_at=gate_escalated_at,
+    )
+    task['metadata']['human_curator_gate'] = marker
+    if human_curator_adjudicated_at is not None:
+        task['metadata']['human_curator_adjudicated_at'] = human_curator_adjudicated_at
+    return task
+
+
+@pytest.mark.asyncio
+class TestHumanCuratorGateAdjudicationGuard:
+    """DeterministicRunner — a curator gate needs CONTENT proof, not just a closed record.
+
+    Incident (task 3181): a ``human_curator_gate=true`` pure deterministic gate.
+    Its born-at-L2 gate escalation ``esc-3181-1`` was resolved by the automated
+    ``escalation-watcher`` with ``action='resume'`` on 2026-07-30T19:41Z — and
+    that resolution's OWN text says the curator content work was deliberately
+    skipped: *"RECOMMENDED REMEDIATION (curator action, deliberately NOT
+    executed here)"* and *"I did not touch the ~13 Mem0 entries: a 13-entry
+    corpus edit is curator disposition with irreversible flavour, and this gate
+    asked the FACT question."*
+
+    The harness then flipped 3181 blocked -> pending, the pure-gate resume's
+    archive-inclusive proof check (task 2954) passed on the archived record, and
+    the runner drove the task to ``done`` with the generic
+    ``note='pure gate resolved'`` — contradicting the task's own
+    ``consolidation_note``, which said the status must remain pending.
+
+    The gap: "a record of my own gate escalation exists and is no longer
+    pending" is being equated with "the human curator reviewed the content".
+    For a curator gate those are different propositions.
+    """
+
+    async def test_curator_gate_resume_without_adjudication_stamp_does_not_drive_to_done(
+        self, tmp_path: Path,
+    ):
+        """The task-3181 incident, reproduced: curator gate + resolved-and-archived
+        record + NO ``human_curator_adjudicated_at`` stamp must NOT drive to done.
+
+        It files a born-at-L2 ``curator_adjudication_missing`` escalation naming
+        the remediation and stays BLOCKED.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        assert 'human_curator_adjudicated_at' not in task['metadata']  # unadjudicated
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')  # the exact esc-3181-1 shape
+
+        # Sanity: the task-2954 archive-inclusive proof check DOES pass here —
+        # which is precisely WHY the bug fires.  The record is archived (not
+        # pending) but archive-visible, so record-closure alone looks like proof.
+        assert queue.get_by_task('3181', status='pending') == []
+        assert len(queue.get_by_task('3181', agent_role='orchestrator-deterministic')) == 1
+
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert not done_calls, (
+            'curator gate must not drive to done without a content-adjudication stamp'
+        )
+
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1
+        assert pending[0].category == 'curator_adjudication_missing'
+        assert pending[0].level == 2
+        assert pending[0].agent_role == 'orchestrator-deterministic'
+        # The detail must name the remediation the human has to perform.
+        assert 'human_curator_adjudicated_at' in pending[0].detail
+
+        scheduler.set_task_status.assert_any_await('3181', 'blocked')
+
+    async def test_curator_gate_with_zero_records_still_refiles_milestone_gate(
+        self, tmp_path: Path,
+    ):
+        """ORDERING PIN: the task-2954 strand check must run BEFORE the curator guard.
+
+        A curator gate with a TOTALLY EMPTY queue (no pending, no archived) has
+        no established gate at all — nobody has ever been asked. Re-establishing
+        the ORIGINAL ``milestone_gate`` is the correct recovery; demanding an
+        adjudication stamp for a gate nobody has yet seen would be incoherent
+        (and would present the human with a remediation for a review they were
+        never asked to perform).
+
+        This pins the ordering against a future refactor innocently swapping the
+        two branches, which a comment alone cannot prevent.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # ZERO records anywhere
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert not done_calls
+
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1
+        assert pending[0].category == 'milestone_gate', (
+            'zero records ⇒ the gate was never established ⇒ re-file the ORIGINAL '
+            'milestone_gate; the curator-adjudication guard must not pre-empt it'
+        )
+        assert pending[0].level == 2
+
+    async def test_plain_pure_gate_resume_provenance_is_byte_unchanged(
+        self, tmp_path: Path,
+    ):
+        """REGRESSION PIN: a pure gate WITHOUT the curator marker is untouched.
+
+        Deliberately redundant with
+        ``TestPureGateResumeHardening.test_pure_gate_resume_with_resolved_record_drives_to_done``.
+        It lives HERE, in the curator-guard class, so that a future edit widening
+        the curator provenance branch cannot silently leak new keys or a changed
+        note onto every plain deterministic gate in the fleet — the reviewer of
+        such an edit sees this fence in the same file region they are editing.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='99', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        assert 'human_curator_gate' not in task['metadata']
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '99')
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_awaited_once_with(
+            '99',
+            'done',
+            done_provenance={
+                'kind': 'deterministic-gate',
+                'note': 'pure gate resolved',
+            },
+        )
+
+    async def test_curator_gate_with_adjudication_stamp_drives_to_done_with_specific_provenance(
+        self, tmp_path: Path,
+    ):
+        """The POSITIVE path: a confirmed stamp closes the gate — with SPECIFIC
+        provenance, never the generic string.
+
+        The generic ``note='pure gate resolved'`` is what made task 3181's
+        phantom closure indistinguishable from a genuine one in the audit trail.
+        A curator gate that closes legitimately must say so, and must name the
+        evidence: the adjudication stamp, plus the escalation record that proved
+        rung one.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        stamp = '2026-07-31T09:00:00+00:00'
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+            human_curator_adjudicated_at=stamp,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        esc = _seed_resolved_gate(queue, '3181')
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert len(done_calls) == 1
+        provenance = done_calls[0].kwargs['done_provenance']
+
+        assert provenance['kind'] == 'deterministic-gate'
+        assert provenance['note'] != 'pure gate resolved', (
+            'a curator gate must not close under the generic note — that is '
+            'exactly what made task 3181 unauditable'
+        )
+        assert 'curator' in provenance['note']
+        assert stamp in provenance['note'], 'the note must name the actual evidence'
+        # Rung-one evidence: the resolved gate record that proved a human acted.
+        assert provenance['escalation_id'] == esc.id
+
+        # And no re-ask was filed.
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert not [e for e in pending if e.category == 'curator_adjudication_missing']
+
+    @pytest.mark.parametrize('stamp', ['', '   ', True, 0, None])
+    async def test_blank_adjudication_stamp_is_not_proof(self, tmp_path: Path, stamp):
+        """FAIL-CLOSED PIN: only a non-empty, non-whitespace ``str`` counts as proof.
+
+        Pins ``_curator_adjudication_confirmed`` against a future "just use
+        truthiness" simplification. ``True`` is the most dangerous value in this
+        table: it reads as "yes, adjudicated" while recording nothing about when
+        the review happened, so a hand edit that writes it must NOT close the gate.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        # Stamp the value directly: _curator_gate_task skips a None value, and
+        # here we want the key PRESENT-but-invalid for every non-None case.
+        task['metadata']['human_curator_adjudicated_at'] = stamp
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert not done_calls, f'{stamp!r} must not count as adjudication proof'
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert [e for e in pending if e.category == 'curator_adjudication_missing']
+
+    async def test_string_truthy_curator_gate_marker_still_trips_the_guard(
+        self, tmp_path: Path,
+    ):
+        """FAIL-CLOSED PIN for the MARKER: ``'true'`` (a string) is still a curator gate.
+
+        Companion to the stamp pin above. Pins
+        ``_is_human_curator_gate``'s deliberate divergence from the neighbouring
+        ``_is_operational_llm_gate``'s strict ``is True``: a hand edit or a JSON
+        round-trip that yields the string ``'true'`` must not silently disarm the
+        safety guard and re-open the phantom-done.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+            marker='true',  # a STRING, not a bool
+        )
+        assert task['metadata']['human_curator_gate'] is not True
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert not done_calls
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert [e for e in pending if e.category == 'curator_adjudication_missing']
+
+    async def test_oversized_adjudication_stamp_is_truncated_in_the_note(
+        self, tmp_path: Path,
+    ):
+        """The note is BOUNDED, because it is memory-ingested downstream (task 3286).
+
+        ``done_provenance.note`` is not a private field: fused-memory
+        reconciliation's ``_format_outcome_echo`` appends it to the
+        "Task '<title>' completed." Mem0 write under a 500-char
+        ``max_note_chars`` cap. The curator note is the only note in the module
+        that interpolates an externally-supplied task-metadata value, and
+        ``_curator_adjudication_confirmed`` deliberately validates TYPE only —
+        never length — so an oversized stamp must be bounded at the note, not
+        rejected at the gate.
+
+        An oversized stamp is NOT a safety failure: it is still a stamp, so the
+        task still closes. It just gets truncated in the audit string.
+
+        The plan's optional log-leak assertion is deliberately NOT here
+        (reviewer amendment). Both available forms were vacuous: the detector in
+        ``scripts/scan_provenance_note_log_leaks.py`` cannot be imported (no
+        ``__init__.py``; the header comment of this file records that), and the
+        inlined ``' INFO '``-style level-token check could never fail — the note
+        is a fixed template plus a stamp hard-truncated at construction, so no
+        log-line shape can appear regardless of input. What replaced it pins the
+        thing that CAN regress: that truncation, not merely some bound, is what
+        keeps the note small.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        oversized = '2026-07-31T09:00:00+00:00 ' + 'x' * 5000
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+            human_curator_adjudicated_at=oversized,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        # Still closes — an oversized stamp is a formatting problem, not a
+        # safety one, and rejecting it would re-open the phantom-done.
+        assert outcome == WorkflowOutcome.DONE
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert len(done_calls) == 1
+        note = done_calls[0].kwargs['done_provenance']['note']
+
+        # Guard against a VACUOUS pass: the length bound below is trivially
+        # satisfied by the short generic note, so first pin that this really is
+        # the curator note carrying the interpolated stamp.
+        assert note != 'pure gate resolved'
+        assert 'curator' in note
+        assert len(note) < 500, (
+            'the note must stay inside _format_outcome_echo max_note_chars so a '
+            'multi-KB stamp cannot be pushed into the Mem0 completion summary'
+        )
+        # Pin that TRUNCATION is what bounded it (reviewer amendment). The
+        # `< 500` bound alone is satisfied by any cap at or below ~440, so a
+        # regression widening _CURATOR_STAMP_NOTE_MAX_CHARS to 400 would sail
+        # past it while shipping a note four times the intended size.
+        from orchestrator.deterministic_runner import _CURATOR_STAMP_NOTE_MAX_CHARS
+
+        assert note.endswith('…'), 'an oversized stamp must be visibly elided'
+        assert 'x' * 100 not in note, 'the 5000-char tail must not survive'
+        stamp_segment = note.split('confirmed at ', 1)[1]
+        assert len(stamp_segment) == _CURATOR_STAMP_NOTE_MAX_CHARS + 1, (
+            'the interpolated stamp must be exactly the cap plus the ellipsis'
+        )
+
+    async def test_curator_gate_remediation_round_trip_cites_the_gate_record(
+        self, tmp_path: Path,
+    ):
+        """END-TO-END: the exact remediation the escalation detail instructs.
+
+        Runs the runner TWICE against ONE queue, walking the full loop the
+        ``curator_adjudication_missing`` detail asks a human to perform:
+
+          1. gate resolved, no stamp        -> BLOCKED, re-ask filed
+          2. human reviews, stamps, resolves the re-ask
+          3. re-dispatch                    -> DONE
+
+        Two things only this path can pin:
+
+        * ``done_provenance.escalation_id`` must name the **milestone_gate**
+          record (rung-one evidence), NOT the ``curator_adjudication_missing``
+          re-ask. By step 3 there are two own-role records and the re-ask is
+          the NEWER one, so a "newest own record" selection cites the record
+          that proves nothing about the gate — silently mis-aiming the very
+          audit trail this change exists to sharpen. Every single-record test
+          above is blind to this.
+        * ``_file_curator_adjudication_missing_and_block`` must not re-stamp
+          ``gate_escalated_at`` — its docstring claims this and nothing else
+          checks it. A re-stamp would be harmless today but would quietly make
+          the re-ask indistinguishable from a freshly established gate.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        queue = EscalationQueue(tmp_path)
+        gate_esc = _seed_resolved_gate(queue, '3181')  # (A) the original gate
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        # ── 1. resume with no stamp: BLOCKED, re-ask filed ──────────────────
+        assert await runner.run(_make_assignment(task)) == WorkflowOutcome.BLOCKED
+        re_asks = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(re_asks) == 1
+        re_ask = re_asks[0]
+        assert re_ask.category == 'curator_adjudication_missing'
+        assert re_ask.id != gate_esc.id
+
+        # ── 2. the human does the work, stamps, and resolves the re-ask ─────
+        stamp = '2026-07-31T11:15:00+00:00'
+        task['metadata']['human_curator_adjudicated_at'] = stamp
+        queue.resolve(re_ask.id, 'reviewed all 13 entries', resolved_by='human')
+
+        # ── 3. re-dispatch: closes, citing the GATE record ──────────────────
+        assert await runner.run(_make_assignment(task)) == WorkflowOutcome.DONE
+
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert len(done_calls) == 1
+        provenance = done_calls[0].kwargs['done_provenance']
+        assert stamp in provenance['note']
+        assert provenance['escalation_id'] == gate_esc.id, (
+            'escalation_id is rung-ONE evidence and must name the milestone_gate '
+            'record; citing the curator_adjudication_missing re-ask (the NEWER '
+            'own-role record here) points the audit trail at the one record that '
+            'proves nothing about the gate'
+        )
+
+        # Sanity: the re-ask really was the newer record, so this test would
+        # fail against a plain "newest own record" selection rather than
+        # passing by accident on a tie.
+        own = sorted(
+            queue.get_by_task('3181', agent_role='orchestrator-deterministic'),
+            key=lambda e: e.timestamp,
+        )
+        assert len(own) == 2
+        assert own[-1].id == re_ask.id
+
+        # The re-ask never re-stamped gate_escalated_at (docstring claim).
+        assert not [
+            c for c in scheduler.update_task.await_args_list
+            if 'gate_escalated_at' in str(c.args) + str(c.kwargs)
+        ]
+
+    async def test_blocked_writeback_failure_still_returns_blocked(
+        self, tmp_path: Path,
+    ):
+        """A severed scheduler connection must not turn a BLOCK into an exception.
+
+        ``_file_curator_adjudication_missing_and_block`` files the escalation to
+        local disk FIRST, then writes ``blocked`` best-effort. If that writeback
+        raises (fused-memory connection severed mid-dispatch), the escalation is
+        already durable, so the correct outcome is still BLOCKED — never a
+        propagated exception, and above all never a fall-through to ``done``.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')
+        scheduler = _mock_scheduler(task)
+        scheduler.set_task_status = AsyncMock(
+            side_effect=RuntimeError('fused-memory connection severed'),
+        )
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(_make_assignment(task))
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # And the escalation survived the failed writeback — it is on disk, so
+        # the human still sees the re-ask even though the task row says pending.
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert [e for e in pending if e.category == 'curator_adjudication_missing']
+
+    async def test_curator_marker_on_a_non_pure_gate_is_loud(
+        self, tmp_path: Path, caplog,
+    ):
+        """A curator marker on an act-then-ask task must WARN, not vanish.
+
+        The rung-two guard lives only on the pure-gate resume path, because
+        ``human_curator_gate`` and a ``before_done`` action are contradictory:
+        one says only a human's content judgement closes this task, the other is
+        a machine step that closes it. But the marker is LLM-authored
+        (reconciliation Stage 2) and ``shared.task_metadata`` blesses the key
+        with no co-occurrence validation, so a misauthored task CAN carry both —
+        and would then be driven to done with the marker never read.
+
+        That is a silent fail-OPEN of exactly the failure class task 3341
+        exists to close, so the runner says so loudly on every dispatch. It
+        stays a WARNING rather than a block on purpose: the defect is in task
+        authoring, and hard-failing would strand deploys with no curator
+        semantics at all. Write-time rejection belongs in
+        ``shared.task_metadata`` and is tracked separately.
+        """
+        import logging
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='200')
+        task['metadata']['human_curator_gate'] = True
+        assert task['metadata']['before_done'] is not None  # NOT a pure gate
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(
+                side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE],
+            ),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        with caplog.at_level(
+            logging.WARNING, logger='orchestrator.deterministic_runner',
+        ):
+            outcome = await runner.run(_make_assignment(task))
+
+        warned = '\n'.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'human_curator_gate' in warned
+        assert 'before_done' in warned, (
+            'the warning must name the contradiction, not just the marker'
+        )
+
+        # Behaviour is deliberately unchanged: the deploy still completes.
+        assert outcome == WorkflowOutcome.DONE
+        assert not queue.get_by_task(
+            '200', status='pending', agent_role='orchestrator-deterministic',
         )
 
 
@@ -1321,6 +2312,201 @@ class TestBeforeDoneTargetUnitlessDeploy:
         scheduler.set_task_status.assert_awaited_once()
         assert scheduler.set_task_status.call_args.args[1] == 'done'
         assert queue.get_by_task('2634', status='pending') == []
+
+
+# ---------------------------------------------------------------------------
+# Task 4065 — DEPLOY-path parity pin for the default runner's INNER timeout.
+#
+# `_default_run_script`'s own per-subprocess `asyncio.wait_for` fires strictly
+# BEFORE the outer wall-clock guard (`timeout_secs + run_timeout_grace_secs`),
+# so on the production path (script_runner=None) the inner timeout is what the
+# deploy classifier actually sees.  Task 4065 changes how the PREDICATE path
+# classifies that event; the deploy path's handling must not move.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDefaultRunnerInnerTimeoutDeployParity:
+    """DeterministicRunner — the REAL default runner's inner timeout on the
+    deploy path stays classified exactly as it is today (task 4065).
+
+    Deliberate CHARACTERIZATION PIN, not a RED test: it is GREEN on arrival
+    and must stay green across task 4065's refactor.  Unlike the predicate
+    path — where a non-zero rc is a milestone VERDICT and the inner timeout
+    was therefore misclassified — the deploy classifiers have no verdict
+    semantics at all: every non-zero rc there already routes to
+    ``_file_infra_issue_and_block``.  So the legacy ``(1, '<script timed out
+    after Ns>')`` pair must still reach the deploy classifier byte-for-byte
+    after the fix, and this test is what proves the refactor did not disturb
+    it.
+
+    Drives the REAL ``_default_run_script`` (``script_runner=None``) — the
+    existing hung-seam coverage all injects a custom ``script_runner`` and so
+    only ever exercises the OUTER guard.
+
+    BOTH deploy branches are pinned — target_unit-less
+    (``_run_deploy_script_guarded``) and named-target (``_RunFnProcShim`` ->
+    ``RestartPlan.execute()``).  They share ONE
+    ``_invoke_run_fn_translating_timeout``, so a drift that pushed the
+    ``ScriptTimeout`` restore down into either call site would degrade only
+    the other one — a single-branch pin would not catch it.
+    """
+
+    async def test_targetless_deploy_default_runner_inner_timeout_files_infra_issue(
+        self, tmp_path: Path,
+    ):
+        """A real deploy script that overruns ``before_done['timeout_secs']``
+        under the default runner must file exactly one born-at-L2
+        ``infra_issue`` whose detail still carries the legacy ``rc=1`` +
+        ``<script timed out after 1s>`` pair.
+
+        ``timeout_secs=1`` against a 30s sleep leaves the outer guard at
+        ``1 + 30 = 31s``, so the INNER timeout provably wins (the 20s
+        tripwire below would fire first if it did not).
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'slow-deploy.sh'
+        script.write_text('#!/bin/sh\nsleep 30\n')
+        script.chmod(0o755)
+
+        task = _deploy_task(
+            task_id='4065',
+            target_unit=None,
+            script=str(script),
+            cwd=str(tmp_path),
+            timeout_secs=1,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=None,
+        )
+
+        # Hang tripwire: also proves the INNER timeout (1s) beat the outer
+        # guard (31s) rather than the other way round.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4065', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue', (
+            f'the deploy path classifies a timed-out script as an infra fault; '
+            f'task 4065 must not change that: {esc.category!r}'
+        )
+        assert 'rc=1' in esc.detail, (
+            f'the legacy rc=1 must still reach the deploy classifier: {esc.detail!r}'
+        )
+        assert '<script timed out after 1s>' in esc.detail, (
+            f'the legacy timed-out tail marker must still reach the deploy '
+            f'classifier verbatim: {esc.detail!r}'
+        )
+
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
+        unit_inspector.assert_not_awaited()
+
+    async def test_named_target_deploy_default_runner_inner_timeout_is_restart_failed(
+        self, tmp_path: Path,
+    ):
+        """Same parity pin for the OTHER deploy branch: a named ``target_unit``
+        routes the ``(rc, tail)`` pair through ``_RunFnProcShim`` into
+        ``RestartPlan.execute()``, which must classify it as
+        ``RESTART_FAILED`` -> the ``Deploy failed: <unit>`` infra_issue.
+
+        This is the half of ``_invoke_run_fn_translating_timeout``'s anti-drift
+        claim the target_unit-less case cannot cover.  Both deploy branches go
+        through that ONE shared wrapper; if the ``ScriptTimeout`` catch were
+        ever moved down into ``_run_deploy_script_guarded``, THIS branch would
+        silently degrade — ``ScriptTimeout`` would escape ``plan.execute()``
+        into ``run()``'s catch-all and be reported as 'Deploy run_fn raised an
+        unexpected error', i.e. the same category with materially worse
+        diagnostics.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'slow-named-deploy.sh'
+        script.write_text('#!/bin/sh\nsleep 30\n')
+        script.chmod(0o755)
+
+        target_unit = 'orchestrator-reify.service'
+        task = _deploy_task(
+            task_id='4065b',
+            target_unit=target_unit,
+            script=str(script),
+            cwd=str(tmp_path),
+            timeout_secs=1,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        # Baseline inspect only: the script "fails" (rc=1), so execute() skips
+        # the post-deploy verify re-inspect entirely.
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=None,
+        )
+
+        # Hang tripwire: also proves the INNER timeout (1s) beat the outer
+        # guard (31s) rather than the other way round.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4065b', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+        assert esc.summary == f'Deploy failed: {target_unit}', (
+            f'the restored (rc, tail) pair must reach RestartPlan.execute() and '
+            f'come back as RESTART_FAILED — NOT escape as a raw ScriptTimeout '
+            f"into run()'s catch-all ('Deploy run_fn failed (unexpected error): "
+            f"{target_unit}'): {esc.summary!r}"
+        )
+        assert 'rc=1' in esc.detail, (
+            f'the legacy rc=1 must still reach the named-target classifier: '
+            f'{esc.detail!r}'
+        )
+        assert '<script timed out after 1s>' in esc.detail, (
+            f'the legacy timed-out tail marker must survive the _RunFnProcShim '
+            f'round-trip verbatim: {esc.detail!r}'
+        )
+
+        assert unit_inspector.await_count == 1, (
+            f'baseline inspect only — a failed script skips the verify '
+            f're-inspect: {unit_inspector.await_count}'
+        )
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
 
 
 # ---------------------------------------------------------------------------
@@ -2374,6 +3560,24 @@ class TestDefaultRunScriptEnv:
 # Task 2090 — Layer A: whole-process-group kill on subprocess timeout
 # ---------------------------------------------------------------------------
 
+def _fake_pgid() -> int:
+    """A stand-in pgid that ``_unsafe_pgid_reason`` will never refuse.
+
+    ``_terminate_process_tree`` sanity-checks the pgid against this process's
+    own identifiers (task 3884 amendment), so a hard-coded literal can collide
+    with ``os.getpid()``/``os.getppid()``/``os.getpgrp()`` and make the helper
+    refuse-and-fall-back instead of dispatching the killpg these tests assert
+    on. That is ~1-in-1.4M with this box's ``pid_max=4194304``, but ~1-in-10k
+    on the older 32768 default — a real flake, and a baffling one to debug.
+    Deriving a provably-distinct value removes the class outright.
+    """
+    live = {os.getpid(), os.getppid(), os.getpgrp()}
+    candidate = 12345
+    while candidate in live:
+        candidate += 1
+    return candidate
+
+
 @pytest.mark.asyncio
 class TestBeforeDoneSubprocessTimeoutHardening:
     """DeterministicRunner — Layer A: kill the WHOLE process tree on timeout.
@@ -2383,21 +3587,27 @@ class TestBeforeDoneSubprocessTimeoutHardening:
     curl, journalctl, sleep, the restarted daemon) that inherit the write end
     of the merged stdout pipe.  Killing only the direct child (pre-2090
     behavior) leaves the tree alive and the pipe open forever.
+
+    Task 4065 amendment: the timeout branch now RAISES ``ScriptTimeout``
+    instead of returning ``(1, '<script timed out after Ns>')`` — see that
+    class's docstring for why.  The Layer-A teardown below is unchanged and
+    must still happen BEFORE the raise, so the grandchild-is-dead assertion
+    stays exactly as it was.
     """
 
     async def test_timeout_kills_whole_process_group(self, tmp_path: Path):
         """On timeout, a backgrounded grandchild must be killed too, not just
-        the direct child.
+        the direct child — and the timeout must surface as ``ScriptTimeout``.
 
-        RED today: current code calls ``proc.kill()`` on the direct child only
-        (no ``start_new_session``, no process-group kill) — the orphaned
-        grandchild survives the timeout branch.
+        The raise carries the legacy ``rc``/``tail`` pair as structured data
+        so ``_invoke_run_fn_translating_timeout`` can hand the deploy
+        classifiers exactly what they saw before (task 4065).
         """
         import asyncio
         import os
         import time
 
-        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.deterministic_runner import DeterministicRunner, ScriptTimeout
 
         script = tmp_path / 'hang.sh'
         pidfile = tmp_path / 'grandchild.pid'
@@ -2422,12 +3632,19 @@ class TestBeforeDoneSubprocessTimeoutHardening:
 
         # Hang tripwire: if the fix regresses into a real hang, fail loudly
         # instead of stalling the suite.
-        rc, tail = await asyncio.wait_for(
-            runner._default_run_script(before_done), timeout=10,
-        )
+        with pytest.raises(ScriptTimeout) as excinfo:
+            await asyncio.wait_for(
+                runner._default_run_script(before_done), timeout=10,
+            )
 
-        assert rc == 1, f'expected rc=1 on timeout, got {rc}'
-        assert 'timed out' in tail, f'expected a timed-out marker in tail, got {tail!r}'
+        exc = excinfo.value
+        assert exc.timeout_secs == 1, (
+            f'ScriptTimeout must carry the budget it overran, got {exc.timeout_secs!r}'
+        )
+        assert exc.rc == 1, f'expected the legacy rc=1 on the exception, got {exc.rc}'
+        assert '<script timed out after 1s>' in exc.tail, (
+            f'expected the legacy timed-out marker on the exception, got {exc.tail!r}'
+        )
 
         grandchild_pid = int(pidfile.read_text().strip())
         deadline = time.monotonic() + 3.0
@@ -2451,9 +3668,13 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         BOTH the killpg path and the proc.kill() fallback — an already-exited
         process must never propagate out of the timeout-cleanup helper.
 
-        RED today: ``_terminate_process_tree`` does not exist yet
-        (AttributeError).
+        Task 3884: the killpg now targets the pgid FROZEN at spawn (passed in
+        by the caller) rather than one re-derived via ``os.getpgid(proc.pid)``
+        at kill time, so the dispatch is actually reached here — the swallow
+        being asserted is the killpg's own ProcessLookupError, then the
+        proc.kill() fallback's.
         """
+        import signal
         from unittest.mock import patch
 
         from orchestrator.deterministic_runner import DeterministicRunner
@@ -2465,18 +3686,24 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             reap_grace_secs=0.05,
         )
 
+        pgid = _fake_pgid()
         mock_proc = MagicMock()
-        mock_proc.pid = 12345
+        # pid must equal the pgid: _unsafe_pgid_reason refuses a mismatch as a
+        # corrupted capture, which would short-circuit before the killpg.
+        mock_proc.pid = pgid
+        # A bare MagicMock's `.returncode` is a truthy Mock (i.e. `is not None`),
+        # which the task-3884 reaped-proc short-circuit would read as "already
+        # reaped" and skip the signal entirely.  This proc is still running.
+        mock_proc.returncode = None
         mock_proc.kill = MagicMock(side_effect=ProcessLookupError('already exited'))
         mock_proc.wait = AsyncMock(return_value=None)
 
-        with (
-            patch('os.getpgid', side_effect=ProcessLookupError('no such process')),
-            patch('os.killpg', side_effect=ProcessLookupError('no such process')) as mock_killpg,
-        ):
-            await runner._terminate_process_tree(mock_proc)
+        with patch(
+            'os.killpg', side_effect=ProcessLookupError('no such process'),
+        ) as mock_killpg:
+            await runner._terminate_process_tree(mock_proc, pgid)
 
-        mock_killpg.assert_not_called()
+        mock_killpg.assert_called_once_with(pgid, signal.SIGKILL)
         mock_proc.kill.assert_called_once()
 
     async def test_terminate_process_tree_bounds_reap_when_proc_never_exits(
@@ -2505,24 +3732,116 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             reap_grace_secs=0.05,
         )
 
+        pgid = _fake_pgid()
         mock_proc = MagicMock()
-        mock_proc.pid = 12345
+        # pid must equal the pgid — see the sibling test.
+        mock_proc.pid = pgid
+        # Still running (see the sibling test): a bare MagicMock's `.returncode`
+        # is truthy, which the task-3884 reaped-proc short-circuit would treat
+        # as already-reaped and skip the killpg this test asserts on.
+        mock_proc.returncode = None
         # proc.wait() never resolves — simulates an unkillable/D-state process
         # that ignores SIGKILL.
         never_resolves = asyncio.Event()
         mock_proc.wait = AsyncMock(side_effect=never_resolves.wait)
 
-        with (
-            patch('os.getpgid', return_value=12345),
-            patch('os.killpg') as mock_killpg,
-        ):
+        with patch('os.killpg') as mock_killpg:
             # Hang tripwire: if reap_grace_secs stops bounding the wait, fail
             # loudly instead of stalling the suite.
             await asyncio.wait_for(
-                runner._terminate_process_tree(mock_proc), timeout=5,
+                runner._terminate_process_tree(mock_proc, pgid), timeout=5,
             )
 
         mock_killpg.assert_called_once()
+
+    async def test_no_killpg_after_proc_reaped(self, tmp_path: Path):
+        """A reaped proc must receive NO killpg — its pid may already be recycled.
+
+        Task 3884 / task 845: freezing the pgid at spawn removes the
+        ``os.getpgid`` lookup, but the frozen NUMBER is itself stale once the
+        leader has been reaped — the kernel may have recycled that pid onto an
+        unrelated group (in the original incidents, the user's ``systemd --user``
+        group, which killed the whole login session).  So the helper must
+        dispatch no signal at all once ``proc.returncode is not None``, mirroring
+        ``shared.proc_group.terminate_process_group``'s step 1.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        runner = DeterministicRunner(
+            scheduler=MagicMock(),
+            escalation_queue=EscalationQueue(tmp_path),
+            reap_grace_secs=0.05,
+        )
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.returncode = 0          # already reaped by asyncio's child watcher
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=0)
+        killpg_calls: list[tuple[int, int]] = []
+        getpgid_calls: list[int] = []
+        with (
+            patch('os.killpg', side_effect=lambda pgid, sig: killpg_calls.append((pgid, sig))),
+            patch('os.getpgid', side_effect=lambda pid: getpgid_calls.append(pid) or 999),
+        ):
+            await runner._terminate_process_tree(mock_proc, 12345)
+        assert killpg_calls == [], f'must not killpg a reaped proc (task 845); got {killpg_calls}'
+        assert getpgid_calls == [], f'must never re-derive the pgid at kill time; got {getpgid_calls}'
+        mock_proc.kill.assert_not_called()
+
+    @pytest.mark.parametrize('scenario', ['own_process_group', 'pid_mismatch'])
+    async def test_refuses_to_killpg_an_unsafe_pgid(
+        self, tmp_path: Path, scenario: str,
+    ):
+        """An unsafe pgid must be refused and degraded to a direct kill().
+
+        The residual defence behind the frozen capture and the reaped-proc
+        short-circuit: this helper reuses
+        ``shared.proc_group._unsafe_pgid_reason`` rather than growing a third
+        divergent copy of the same sanity checks (the shared helper and
+        ``df_pytest_isolation._kill_process_group`` are the other two).
+
+        ``own_process_group`` is the consequential case, not a synthetic one —
+        it is precisely the task-845 outcome. A pgid that resolves to our OWN
+        group means the killpg would SIGKILL this test session, the
+        orchestrator, and everything else sharing it. ``pid_mismatch`` covers a
+        corrupted capture, where the frozen int no longer describes ``proc``.
+
+        Degrading to ``proc.kill()`` rather than doing nothing matches
+        ``df_pytest_isolation``'s handling of the same refusal: the timed-out
+        child still dies, and only the (unreachable) grandchildren are forgone.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        runner = DeterministicRunner(
+            scheduler=MagicMock(),
+            escalation_queue=EscalationQueue(tmp_path),
+            reap_grace_secs=0.05,
+        )
+        mock_proc = MagicMock()
+        mock_proc.returncode = None          # still running: not the reaped path
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=None)
+
+        if scenario == 'own_process_group':
+            pgid = os.getpgrp()
+            mock_proc.pid = pgid
+        else:
+            pgid = _fake_pgid()
+            mock_proc.pid = pgid + 1         # capture no longer describes proc
+
+        killpg_calls: list[tuple[int, int]] = []
+        with patch('os.killpg', side_effect=lambda p, s: killpg_calls.append((p, s))):
+            await runner._terminate_process_tree(mock_proc, pgid)
+
+        assert killpg_calls == [], (
+            f'{scenario}: refused pgid must never be signalled -- killpg on our '
+            f'own group is the task-845 login-session kill; got {killpg_calls}'
+        )
+        mock_proc.kill.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -3997,6 +5316,220 @@ class TestBeforeDoneCrashWindow:
         assert pending[0].category == 'infra_issue'
         blocked_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'blocked']
         assert blocked_calls, 'crash-window must leave the task blocked'
+
+
+@pytest.mark.asyncio
+class TestCrashWindowScheduledDoubleDispatch:
+    """Task 2983 fix (a): a double-dispatched, already-completed scheduled
+    self-deploy must NOT trip the crash-window false positive.
+
+    The reported incident (task 2912 / γ3 self-unit restart deploy): the
+    scheduler re-selected a deterministic self-deploy off a STALE eligibility
+    snapshot that carried ONLY before_done_ran_at — the before_done_scheduled_at
+    stamp and the done-writeback had not yet landed when the snapshot was read.
+    By execution time the first dispatch had completed (task 'done' with
+    done_provenance.kind='deterministic-deploy-scheduled'), but run() holds the
+    stale snapshot, so the b-self (before_done_scheduled_at) branch is skipped
+    and the second run falls through to the crash-window detector, filing a
+    born-at-L2 infra_issue false positive.
+
+    Fix (a): before re-escalating, re-read the CURRENT task via
+    scheduler.get_task and, if it is an already-completed scheduled self-deploy
+    (_is_scheduled_self_deploy_complete), treat it as deploy-complete — return
+    DONE with NO escalation and NO status write.  A fresh read that is NOT
+    scheduled-complete still re-escalates exactly as today.
+    """
+
+    def _stale_snapshot(self, task_id: str = '2912') -> dict:
+        """The stale eligibility snapshot: before_done_ran_at only (no
+        before_done_scheduled_at, no before_done_verified_at, no done_provenance).
+        """
+        return _deploy_task(
+            task_id=task_id,
+            target_unit='orchestrator.service',
+            before_done_ran_at='2026-07-23T10:00:00+00:00',
+        )
+
+    async def test_double_dispatch_via_done_provenance_returns_done_no_side_effects(
+        self, tmp_path: Path,
+    ):
+        """Fresh get_task shows status='done' + done_provenance.kind=
+        'deterministic-deploy-scheduled' → DONE, no escalation, no status write."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        snapshot = self._stale_snapshot('2912')
+        assignment = _make_assignment(snapshot)
+        queue = EscalationQueue(tmp_path)  # empty — no escalation ever filed
+        scheduler = _mock_scheduler(snapshot)
+        # Fresh read at execution time: the first dispatch already completed.
+        current_task = {
+            'id': '2912',
+            'status': 'done',
+            'metadata': {
+                'before_done_ran_at': '2026-07-23T10:00:00+00:00',
+                'done_provenance': {
+                    'kind': 'deterministic-deploy-scheduled',
+                    'unit': 'orchestrator.service',
+                },
+            },
+        }
+        scheduler.get_task = AsyncMock(return_value=current_task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        assert queue.get_by_task('2912') == [], (
+            'a double-dispatched completed scheduled self-deploy must NOT re-escalate'
+        )
+        scheduler.set_task_status.assert_not_awaited()
+
+    async def test_double_dispatch_via_scheduled_stamp_returns_done_no_side_effects(
+        self, tmp_path: Path,
+    ):
+        """Fresh get_task carries before_done_scheduled_at → DONE, no escalation,
+        no status write (recognized via the stamp even without done_provenance)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        snapshot = self._stale_snapshot('2912')
+        assignment = _make_assignment(snapshot)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(snapshot)
+        # Fresh read carries the scheduled stamp the snapshot lacked.
+        current_task = _deploy_task(
+            task_id='2912',
+            target_unit='orchestrator.service',
+            before_done_ran_at='2026-07-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-07-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-2912.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        scheduler.get_task = AsyncMock(return_value=current_task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        assert queue.get_by_task('2912') == []
+        scheduler.set_task_status.assert_not_awaited()
+
+    async def test_genuine_crash_window_still_reescalates_and_blocks(
+        self, tmp_path: Path,
+    ):
+        """Negative / no-over-match: fresh get_task is NOT scheduled-complete
+        (the stale snapshot itself) → the genuine crash-window still re-escalates
+        exactly once and blocks (existing behavior preserved)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        snapshot = self._stale_snapshot('2912')
+        assignment = _make_assignment(snapshot)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(snapshot)
+        # Fresh read shows NO scheduled shape (still just the stale snapshot):
+        # a genuine crash mid-deploy before any terminal decision.
+        scheduler.get_task = AsyncMock(return_value=snapshot)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2912', status='pending')
+        assert len(pending) == 1, (
+            f'genuine crash-window must re-escalate exactly once, got {len(pending)}'
+        )
+        assert pending[0].category == 'infra_issue'
+        blocked_calls = [
+            c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'blocked'
+        ]
+        assert blocked_calls, 'genuine crash-window must leave the task blocked'
+
+    async def test_stale_redispatch_always_escalates_true_refiles_gate_not_done(
+        self, tmp_path: Path,
+    ):
+        """Amendment (reviewer_comprehensive): a STALE re-dispatch of an
+        always_escalates=True scheduled self-deploy must NOT be short-circuited
+        to DONE by the fresh-read backstop.
+
+        The before_done_scheduled_at stamp is written on BOTH the
+        always_escalates=False path (which sets the task 'done') AND the
+        act-then-ask always_escalates=True path (b-self, which re-files the
+        milestone gate and BLOCKS — the gate must not be bypassed).  When the
+        in-hand snapshot lacks the stamp (so b-self is skipped) but the fresh
+        get_task now carries before_done_scheduled_at, the DONE short-circuit
+        must apply ONLY to always_escalates=False; the act-then-ask gate must be
+        re-filed (mirroring b-self), never silently bypassed with a done write.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        # Stale snapshot: before_done_ran_at only, always_escalates=True.
+        snapshot = self._stale_snapshot('2913')
+        snapshot['metadata']['always_escalates'] = True
+        assignment = _make_assignment(snapshot)
+        queue = EscalationQueue(tmp_path)  # empty — gate not yet re-observed
+        scheduler = _mock_scheduler(snapshot)
+        # Fresh read carries the scheduled stamp the snapshot lacked, still
+        # always_escalates=True (act-then-ask; the gate is NOT resolved).
+        current_task = _deploy_task(
+            task_id='2913',
+            target_unit='orchestrator.service',
+            before_done_ran_at='2026-07-23T10:00:00+00:00',
+            before_done_scheduled_at={
+                'at': '2026-07-23T10:00:01+00:00',
+                'transient_unit': 'orch-redeploy-restart-2913.service',
+                'fire_delay_secs': 60,
+            },
+        )
+        current_task['metadata']['always_escalates'] = True
+        scheduler.get_task = AsyncMock(return_value=current_task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(return_value=_BASELINE_UNIT_STATE),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+            restart_scheduler=AsyncMock(return_value=(0, 'scheduled')),
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            'a stale re-dispatch of an always_escalates=True scheduled self-deploy '
+            'must re-file the gate and BLOCK, not return DONE'
+        )
+        pending = queue.get_by_task('2913', status='pending')
+        assert len(pending) == 1, (
+            f'the act-then-ask milestone gate must be re-filed exactly once, '
+            f'got {len(pending)}'
+        )
+        assert pending[0].category == 'milestone_gate', (
+            f'the gate re-file must be a milestone_gate, not {pending[0].category!r}'
+        )
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done'
+        ]
+        assert not done_calls, (
+            'the still-open act-then-ask gate must never be bypassed with a done write'
+        )
 
 
 @pytest.mark.asyncio
@@ -5626,7 +7159,6 @@ class TestDefaultScheduleDetachedRestart:
         it for real with a SUCCEEDING restart script.  No escalation must be
         filed (the bug was that registration itself filed one eagerly).
         """
-        import asyncio as _asyncio
         from unittest.mock import patch
 
         from orchestrator.deterministic_runner import DeterministicRunner
@@ -5644,7 +7176,6 @@ class TestDefaultScheduleDetachedRestart:
         }
 
         captured: dict = {}
-        real_exec = _asyncio.create_subprocess_exec
 
         async def fake_exec(*argv, **kwargs):
             captured['argv'] = argv
@@ -5666,15 +7197,14 @@ class TestDefaultScheduleDetachedRestart:
         wrapped = argv[-1]
 
         # Fire the wrapped payload as systemd would (real shell, real CLI path).
-        proc = await real_exec(
-            '/bin/sh', '-c', wrapped,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.STDOUT,
-        )
-        await proc.communicate()
-        assert proc.returncode == 0, 'success-script wrapper must exit 0'
+        wrapper_rc, out = await _run_wrapper_payload(wrapped)
+        assert wrapper_rc == 0, f'success-script wrapper must exit 0; wrapper output: {out!r}'
+        # Preflight: a CLI the interpreter cannot invoke would make the
+        # queue assertion below pass for the WRONG reason (nothing filed
+        # because nothing could run).  Name that failure instead.
+        _assert_submit_cli_invokable(sys.executable)
         assert queue.get_by_task('900') == [], (
-            'no escalation may be filed on the success path'
+            f'no escalation may be filed on the success path; wrapper output: {out!r}'
         )
 
     async def test_handler_executes_on_failure_path(self, tmp_path: Path):
@@ -5683,7 +7213,6 @@ class TestDefaultScheduleDetachedRestart:
         Confirms the failure branch still reaches δ's escalation-submit CLI and
         preserves the non-zero exit code.
         """
-        import asyncio as _asyncio
         from unittest.mock import patch
 
         from orchestrator.deterministic_runner import DeterministicRunner
@@ -5701,7 +7230,6 @@ class TestDefaultScheduleDetachedRestart:
         }
 
         captured: dict = {}
-        real_exec = _asyncio.create_subprocess_exec
 
         async def fake_exec(*argv, **kwargs):
             captured['argv'] = argv
@@ -5716,18 +7244,105 @@ class TestDefaultScheduleDetachedRestart:
             )
 
         wrapped = captured['argv'][-1]
-        proc = await real_exec(
-            '/bin/sh', '-c', wrapped,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.STDOUT,
+        wrapper_rc, out = await _run_wrapper_payload(wrapped)
+        assert wrapper_rc == 7, (
+            f'failure-script wrapper must preserve the exit code; '
+            f'wrapper output: {out!r}'
         )
-        await proc.communicate()
-        assert proc.returncode == 7, 'failure-script wrapper must preserve the exit code'
+
+        # Preflight: a non-invokable interpreter would make the assertions
+        # below report "got 0" while the real cause went unnamed.  Fail on the
+        # actual cause instead.  (Since 3404 such a wrapper exits the reserved
+        # RP4_ESCALATION_SUBMIT_FAILED_RC, so the `wrapper_rc == 7` assert
+        # above would now catch it too — but with a bare number, not a name.)
+        _assert_submit_cli_invokable(sys.executable)
 
         filed = queue.get_by_task('901')
-        assert len(filed) == 1, f'exactly one L2 must be filed on failure, got {len(filed)}'
-        assert filed[0].category == 'infra_issue'
-        assert filed[0].level == 2
+        assert len(filed) == 1, (
+            f'exactly one L2 must be filed on failure, got {len(filed)}; '
+            f'wrapper output: {out!r}'
+        )
+        assert filed[0].category == 'infra_issue', (
+            f'wrapper output: {out!r}'
+        )
+        assert filed[0].level == 2, f'wrapper output: {out!r}'
+
+    async def test_fired_wrapper_reports_a_failed_escalation_submit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A submit that DIES must be loud end-to-end, through the real caller.
+
+        The sibling pins in test_proc_supervision.py exercise ``RestartPlan``
+        directly; this one drives ``_default_schedule_detached_restart``, so the
+        DELEGATION seam is covered too — if deterministic_runner ever stops
+        delegating to RestartPlan and reintroduces a wrapper of its own, this
+        catches it and those cannot.
+
+        ``sys.executable`` is patched to a stub exiting 9 before the wrapper is
+        built, so the on-failure ``to_submit_argv(sys.executable)`` branch
+        genuinely fails when the wrapper is later fired for real.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.proc_supervision import RP4_ESCALATION_SUBMIT_FAILED_RC
+
+        queue = EscalationQueue(tmp_path / 'q')
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        fail_script = tmp_path / 'deploy-fail.sh'
+        fail_script.write_text('#!/bin/sh\nexit 7\n')
+        fail_script.chmod(0o755)
+        before_done = {
+            'script': str(fail_script),
+            'args': [],
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        # A stub interpreter that ignores argv and dies — stands in for a
+        # service that is down, a bad argv, or an interpreter that cannot
+        # import `escalation`.  Patched BEFORE the call, because the wrapper
+        # string is built (and reads sys.executable) at scheduling time.
+        stub_python = tmp_path / 'stub-python'
+        stub_python.write_text('#!/bin/sh\nexit 9\n')
+        stub_python.chmod(0o755)
+        monkeypatch.setattr(sys, 'executable', str(stub_python))
+
+        captured: dict = {}
+
+        async def fake_exec(*argv, **kwargs):
+            captured['argv'] = argv
+            return self._make_mock_proc()
+
+        with patch('asyncio.create_subprocess_exec', side_effect=fake_exec):
+            await runner._default_schedule_detached_restart(
+                before_done,
+                transient_unit='orch-redeploy-restart-902.service',
+                on_active_secs=1,
+                task_id='902',
+            )
+
+        wrapped = captured['argv'][-1]
+        wrapper_rc, out = await _run_wrapper_payload(wrapped)
+
+        assert wrapper_rc == RP4_ESCALATION_SUBMIT_FAILED_RC, (
+            f'a failed on-failure submit must exit the reserved '
+            f"{RP4_ESCALATION_SUBMIT_FAILED_RC}, not the payload's own code; "
+            f'got {wrapper_rc}. Wrapper output: {out!r}'
+        )
+        assert 'RP-4' in out, (
+            f'missing the RP-4 diagnostic marker; wrapper output: {out!r}'
+        )
+        assert 'rc=9' in out, (
+            f"missing the failed submit's own rc; wrapper output: {out!r}"
+        )
+        assert 'payload rc=7' in out, (
+            f"missing the payload's rc; wrapper output: {out!r}"
+        )
+        assert queue.get_by_task('902') == [], (
+            f'the submit died, so nothing can have been filed — the point is '
+            f'that this is now VISIBLE; wrapper output: {out!r}'
+        )
 
     async def test_argv_contains_escalation_submit_cli(self, tmp_path: Path):
         """escalation submit CLI must appear in the spawn argv for OnFailure handling."""
@@ -5863,6 +7478,107 @@ class TestDefaultScheduleDetachedRestart:
         assert 'orch-redeploy-restart-900.service' in all_argv, (
             f'transient unit name must appear in --detail context: {all_argv!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3404: the wrapper-payload exec harness.
+#
+# `TestDefaultScheduleDetachedRestart`'s two higher-fidelity tests capture the
+# deferred `/bin/sh -c` wrapper and then execute it for REAL.  That exec left
+# the in-process world: the child interpreter inherits none of conftest.py's
+# sys.path surgery, and the child's output was discarded outright.  These tests
+# pin the harness that fixes both — it must return the child's exit code AND
+# its combined output, and it must hand the child the repo's src roots.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestWrapperPayloadHarness:
+    """The shared `_run_wrapper_payload` harness used by the wrapper-exec tests."""
+
+    async def test_run_wrapper_payload_returns_rc_and_captured_output(self):
+        """The harness must surface the child's rc AND its combined output.
+
+        The pre-3404 inline pattern threw `await proc.communicate()`'s result
+        away, so a wrapper whose on-failure branch died printed its own precise
+        diagnosis into a pipe nobody read.  Both halves are returned now.
+        """
+        rc, out = await _run_wrapper_payload(
+            "printf 'MARKER-3404\\n' >&2; exit 7"
+        )
+        assert rc == 7, f'harness must return the child exit code, got {rc!r} (output: {out!r})'
+        assert 'MARKER-3404' in out, (
+            f'harness must return the child combined stdout/stderr, got {out!r}'
+        )
+
+    async def test_run_wrapper_payload_injects_repo_src_roots_into_child_pythonpath(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The child must get the same import roots conftest.py grants in-process.
+
+        The wrapper's on-failure branch is `sys.executable -m escalation
+        submit` — a FRESH interpreter that inherits none of root conftest.py's
+        sys.path surgery, only site-packages plus cwd.  In a venv whose
+        site-packages lacks the `escalation` editable install that branch
+        cannot import the package at all, so the harness hands the child the
+        three repo src roots explicitly.
+        """
+        repo_root = Path(__file__).parent.parent.parent
+        roots = [
+            str(repo_root / 'escalation' / 'src'),
+            str(repo_root / 'shared' / 'src'),
+            str(repo_root / 'orchestrator' / 'src'),
+        ]
+        payload = 'printf \'%s\' "$PYTHONPATH"'
+
+        # Clear any ambient value so this is a real RED, not a coincidence.
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        rc, out = await _run_wrapper_payload(payload)
+        assert rc == 0, f'probe payload must exit 0, got {rc!r} (output: {out!r})'
+        for root in roots:
+            assert root in out, (
+                f'child PYTHONPATH must carry the repo src root {root!r}; got {out!r}'
+            )
+
+        # An inherited PYTHONPATH must be preserved, never clobbered.
+        monkeypatch.setenv('PYTHONPATH', '/tmp/df-3404-sentinel')
+        rc, out = await _run_wrapper_payload(payload)
+        assert rc == 0, f'probe payload must exit 0, got {rc!r} (output: {out!r})'
+        assert '/tmp/df-3404-sentinel' in out, (
+            f'an inherited PYTHONPATH must be preserved, not dropped; got {out!r}'
+        )
+        for root in roots:
+            assert root in out, (
+                f'injected root {root!r} must survive alongside an inherited '
+                f'PYTHONPATH; got {out!r}'
+            )
+
+    async def test_assert_submit_cli_invokable_rejects_a_broken_interpreter(
+        self, tmp_path: Path,
+    ):
+        """The preflight must actually fail for an interpreter that cannot run the CLI.
+
+        This pins only that the helper is not a no-op: an interpreter which
+        cannot run `-m escalation submit` must raise, so a broken environment
+        stops at the preflight instead of degrading into "exactly one L2 must
+        be filed on failure, got 0" (task 3404).  The *wording* of the raised
+        message is deliberately NOT asserted — it is test scaffolding, not
+        production behaviour, and the real journald signature is covered
+        against the real wrapper by
+        `test_fired_wrapper_reports_a_failed_escalation_submit` (above) and
+        test_proc_supervision.py::test_wrapper_surfaces_failed_on_failure_submit.
+        """
+        stub = tmp_path / 'broken-python'
+        stub.write_text(
+            "#!/bin/sh\nprintf 'NO-ESCALATION-MODULE-3404\\n' >&2\nexit 1\n"
+        )
+        stub.chmod(0o755)
+
+        with pytest.raises(AssertionError):
+            _assert_submit_cli_invokable(str(stub))
+
+    async def test_assert_submit_cli_invokable_passes_for_the_real_interpreter(self):
+        """The interpreter running this suite must be able to reach the CLI."""
+        _assert_submit_cli_invokable(sys.executable)
 
 
 # ---------------------------------------------------------------------------
@@ -6881,6 +8597,251 @@ class TestSharedDoneProvenance:
 
 
 # ---------------------------------------------------------------------------
+# Task 3286: `_summarize_predicate_output` — the ALLOWLIST sanitizer standing
+# between a predicate script's raw stdout tail and `done_provenance.note`.
+#
+# The note is not a private field: fused-memory's `_format_outcome_echo` reads
+# it and appends it to a Mem0 completion-summary write, so anything that lands
+# here is ingested into the knowledge graph.  Task 2902 is the specimen that
+# proved raw forwarding corrupts it.
+# ---------------------------------------------------------------------------
+
+class TestSummarizePredicateOutput:
+    """The sanitizer keeps the structured verdict and drops the log noise."""
+
+    def test_specimen_starts_with_deterministic_verdict_prefix(self):
+        """The verdict prefix is unconditional — a note is never empty."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+
+        assert result.startswith('predicate check passed (rc=0)'), result
+
+    @pytest.mark.parametrize(
+        'marker',
+        [
+            'fused_memory.backends.graphiti_client',
+            'httpx',
+            'my_solar_challenge',
+            'HTTP/1.1 200 OK',
+            'WARNING',
+        ],
+    )
+    def test_specimen_server_log_markers_are_dropped(self, marker: str):
+        """No server-log noise survives into the note (the task-2902 leak)."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+
+        assert marker not in result, (
+            f'{marker!r} leaked into the provenance note: {result!r}'
+        )
+
+    def test_specimen_trailing_json_verdict_survives_compacted(self):
+        """The script's OWN structured verdict is the part worth keeping."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+
+        # Compact json.dumps separators — no space after ':' or ','.
+        assert '"orphan_count":0' in result, result
+        assert '"verdict":"clean"' in result, result
+
+    def test_specimen_result_is_single_line(self):
+        """A note flowing into a Mem0 summary must not carry newlines."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+
+        assert '\n' not in result, result
+
+    def test_specimen_mid_token_first_line_is_dropped(self):
+        """The 2000-char tail cut starts mid-word — that fragment is noise."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+
+        assert '_tariff_pence_per_kwh' not in result, result
+
+    # -- Tier 2: one clean final line survives -----------------------------
+    #
+    # Each shape below is a REAL in-repo predicate script's output, and each
+    # is load-bearing for a pre-existing green test.  A sanitizer that dropped
+    # them would be throwing away the verdict it exists to preserve.
+
+    @pytest.mark.parametrize(
+        ('out', 'expected'),
+        [
+            # test_deterministic_runner.py's own predicate-mode fixtures.
+            ('check ok: 0 flakes', 'check ok: 0 flakes'),
+            # scripts/check_merge_flakiness.sh — drives the REAL-subprocess
+            # test at test_milestone_integration_gate.py's exemplar-pass case.
+            (
+                'check_merge_flakiness: value=1 threshold=5 window_days=7 '
+                '-- invariant holds',
+                'invariant holds',
+            ),
+            # scripts/check_esc_analytics_perf.sh.
+            (
+                'measured_median_ms=12 attempts=5 threshold_ms=2000 '
+                'url=http://127.0.0.1:8080/api/escalations/analytics',
+                'measured_median_ms=12 attempts=5',
+            ),
+        ],
+    )
+    def test_clean_final_line_is_preserved(self, out: str, expected: str):
+        """A single clean verdict line is the payload — kept verbatim."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(out, rc=0)
+
+        assert result.startswith('predicate check passed (rc=0)'), result
+        assert expected in result, result
+
+    def test_trailing_blank_lines_do_not_defeat_extraction(self):
+        """A script ending with a newline still yields its verdict line."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output('check ok: 0 flakes\n\n', rc=0)
+
+        assert 'check ok: 0 flakes' in result, result
+
+    # -- Log-shaped lines are rejected -------------------------------------
+
+    def test_pure_log_output_yields_bare_verdict(self):
+        """Nothing but logger lines -> no payload at all, not a log line."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        out = (
+            '2026-07-30 16:39:00,523 fused_memory.backends.graphiti_client '
+            'WARNING identity scan found 3 candidate nodes\n'
+            '2026-07-30 16:39:00,625 httpx INFO HTTP Request: GET '
+            'http://localhost:6333 "HTTP/1.1 200 OK"'
+        )
+
+        result = _summarize_predicate_output(out, rc=0)
+
+        assert result == 'predicate check passed (rc=0)', result
+
+    @pytest.mark.parametrize(
+        'out',
+        [
+            '2026-07-30 16:39:00,523 fused_memory.x INFO done',
+            # No timestamp — the standalone level token alone is enough.
+            'INFO: all checks passed',
+        ],
+    )
+    def test_level_token_final_line_is_rejected(self, out: str):
+        """Deliberately conservative: a level token forfeits the payload.
+
+        Losing a payload is the safe failure direction — the verdict prefix
+        always survives and the raw text is logged (step-6).
+        """
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(out, rc=0)
+
+        assert result == 'predicate check passed (rc=0)', result
+
+    def test_formatter_less_log_line_survives_as_documented_limitation(self):
+        """Tier 2 is a DENYLIST, and this pins the gap it leaves open.
+
+        A ``%(name)s %(message)s`` formatter emits no timestamp and no level
+        token, so ``_LOG_LINE_RE`` does not reject it and the line is kept as
+        the payload.  Tier 2 cannot be tightened into a grammar-based
+        allowlist without also dropping ``check ok: 0 flakes`` and
+        ``-- invariant holds`` (see the parametrized cases above), which are
+        structurally identical prose.
+
+        The exposure is bounded rather than closed — ONE line, capped — and
+        this test exists so the boundary is asserted rather than assumed.  If
+        a future change narrows tier 2, this expectation should flip
+        deliberately, not silently.
+        """
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        out = 'httpx HTTP Request: GET http://localhost:6333 secret=abc'
+
+        result = _summarize_predicate_output(out, rc=0)
+
+        assert result == f'predicate check passed (rc=0): {out}', result
+        # Still bounded: a single line, never the multi-KB 2902 blob.
+        assert '\n' not in result, result
+
+    # -- The verdict word is derived from rc, never hardcoded ---------------
+
+    def test_nonzero_rc_verdict_does_not_claim_passed(self):
+        """The prefix cannot contradict the code it renders.
+
+        Only the ``rc == 0`` branch calls this today, but a hardcoded
+        ``passed`` would let a future caller stamp
+        ``predicate check passed (rc=2)`` into a provenance note that flows
+        into a Mem0 completion summary.
+        """
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output('check failed: 3 flakes', rc=2)
+
+        assert result.startswith('predicate check failed (rc=2)'), result
+        assert 'passed' not in result, result
+        assert 'check failed: 3 flakes' in result, result
+
+    # -- Size bound: elide wholesale, never slice mid-structure -------------
+
+    def test_oversized_payload_is_elided_not_sliced(self):
+        """Task 2054's lesson: a mid-structure cut is worse than no payload.
+
+        A raw ``note[:N]`` slice there garbled ``8679,8680`` into
+        ``8679,868``.  A sliced JSON object is worse still — unparseable, yet
+        still structured-looking to a reader.
+        """
+        import json as _json
+
+        from orchestrator.deterministic_runner import (
+            _PREDICATE_NOTE_MAX_PAYLOAD_CHARS,
+            _summarize_predicate_output,
+        )
+
+        obj = {'ids': list(range(2000))}
+        compact = _json.dumps(obj, separators=(',', ':'))
+        assert len(compact) > _PREDICATE_NOTE_MAX_PAYLOAD_CHARS, 'fixture too small'
+
+        result = _summarize_predicate_output(_json.dumps(obj, indent=2), rc=0)
+
+        # Bounded: the cap plus the verdict prefix and the marker's own text.
+        assert len(result) <= _PREDICATE_NOTE_MAX_PAYLOAD_CHARS + 200, len(result)
+        # The marker names the dropped size and where the full text lives.
+        assert str(len(compact)) in result, result
+        assert 'elided' in result, result
+        # Critically: NOT a prefix-slice of the compact dump.
+        assert compact[:100] not in result, result
+
+    def test_payload_at_the_cap_is_kept(self):
+        """The bound elides only what exceeds it — it is not a blanket drop."""
+        from orchestrator.deterministic_runner import (
+            _PREDICATE_NOTE_MAX_PAYLOAD_CHARS,
+            _summarize_predicate_output,
+        )
+
+        out = 'ok ' + 'x' * (_PREDICATE_NOTE_MAX_PAYLOAD_CHARS - 10)
+        result = _summarize_predicate_output(out, rc=0)
+
+        assert out in result, result
+        assert 'elided' not in result, result
+
+    # -- Degenerate inputs -------------------------------------------------
+
+    @pytest.mark.parametrize('out', ['', None, 42, b'check ok', ['check ok']])
+    def test_degenerate_output_yields_bare_verdict(self, out: object):
+        """A falsy/non-str seam return never raises and never leaks a repr."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(out, rc=0)
+
+        assert result == 'predicate check passed (rc=0)', result
+
+
+# ---------------------------------------------------------------------------
 # Task 2336 (γ-predicate): predicate deterministic mode — a read-only
 # exit-code verdict check (before_done.kind == 'predicate'), NOT a systemd
 # deploy.  Boundary tests B7 (pass), B8 (fail), B9 (timeout/infra), B10
@@ -6942,8 +8903,12 @@ class TestPredicateModePassPath:
         assert provenance is not None, 'done_provenance must be passed as a kwarg'
         assert provenance['kind'] == 'deterministic-milestone'
 
-    async def test_predicate_pass_provenance_note_contains_stdout_tail(self, tmp_path: Path):
-        """done_provenance.note contains the check's stdout tail (B7)."""
+    async def test_predicate_pass_provenance_note_contains_check_verdict(self, tmp_path: Path):
+        """done_provenance.note carries the check's own verdict line (B7).
+
+        Task 3286 narrowed this from the raw stdout tail to a bounded
+        structured summary; a single clean verdict line still survives intact.
+        """
         from orchestrator.deterministic_runner import DeterministicRunner
 
         task = _predicate_task(task_id='700')
@@ -6965,7 +8930,82 @@ class TestPredicateModePassPath:
         call = scheduler.set_task_status.call_args
         provenance = call.kwargs.get('done_provenance')
         assert 'check ok' in provenance.get('note', ''), (
-            f'stdout tail must appear in provenance note: {provenance!r}'
+            f"the check's verdict line must survive into the provenance "
+            f'note: {provenance!r}'
+        )
+
+    async def test_predicate_pass_provenance_note_is_sanitized(self, tmp_path: Path):
+        """A chatty script's log noise never reaches done_provenance.note.
+
+        Task 3286 / specimen 2902: the note is read by fused-memory's
+        `_format_outcome_echo` and appended to a Mem0 completion summary, so
+        raw subprocess output landing here is ingested into memory.
+        """
+        from orchestrator.deterministic_runner import (
+            DeterministicRunner,
+            _summarize_predicate_output,
+        )
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, POLLUTED_PREDICATE_OUTPUT))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        note = scheduler.set_task_status.call_args.kwargs['done_provenance']['note']
+
+        assert note == _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+        for marker in (
+            'fused_memory.backends.graphiti_client',
+            'httpx',
+            'my_solar_challenge',
+        ):
+            assert marker not in note, f'{marker!r} leaked into the note: {note!r}'
+        # The live specimen was 1999 chars; the note is now bounded.
+        assert len(note) <= 500, f'note must stay bounded, got {len(note)}: {note!r}'
+
+    async def test_predicate_pass_logs_raw_output_before_summarizing(
+        self, tmp_path: Path, caplog,
+    ):
+        """The summarizer discards content — the raw text must stay recoverable.
+
+        The orchestrator log is the right home for it: durable and
+        operator-accessible, and (unlike the note) never memory-ingested.
+        """
+        import logging
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, POLLUTED_PREDICATE_OUTPUT))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        with caplog.at_level(logging.INFO, logger='orchestrator.deterministic_runner'):
+            await runner.run(assignment)
+
+        logged = '\n'.join(record.getMessage() for record in caplog.records)
+        assert 'my_solar_challenge' in logged, (
+            f'raw predicate output must be logged, not silently dropped: {logged!r}'
         )
 
     async def test_predicate_pass_script_runner_called_once_with_before_done(self, tmp_path: Path):
@@ -7471,6 +9511,172 @@ class TestPredicateModeTimeout:
 
 
 # ---------------------------------------------------------------------------
+# Task 4065 — RED: the REAL default runner's INNER per-script timeout on the
+# predicate path.
+#
+# The classes above all inject a hanging/erroring `script_runner`, so they
+# only ever exercise the OUTER wall-clock guard.  On the production path
+# (script_runner=None) `_default_run_script`'s OWN per-subprocess timeout
+# fires strictly first — it used to return an ordinary (1, tail), landing in
+# the `rc != 0` milestone-VERDICT branch and stamping gate_escalated_at for
+# what is actually an infra fault with no verdict at all.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPredicateDefaultRunnerInnerTimeout:
+    """DeterministicRunner — a predicate script that overruns its own
+    ``timeout_secs`` under the REAL default runner is an INFRA fault, never a
+    milestone verdict (task 4065).
+
+    The harm being pinned: ``milestone_check_failed`` additionally stamps
+    ``gate_escalated_at``, which latches the task into section-1's
+    resolve-to-done path — so a human resolving the escalation drives a task
+    to done whose invariant was never actually evaluated.  ``infra_issue``
+    leaves the stamp unset and the read-only check is simply re-attempted.
+    """
+
+    async def test_default_runner_inner_timeout_files_infra_issue_not_milestone_check_failed(
+        self, tmp_path: Path,
+    ):
+        """A real predicate script that overruns ``before_done['timeout_secs']``
+        must file ``infra_issue`` (no ``gate_escalated_at`` stamp), with a
+        message naming the INNER per-script timeout.
+
+        ``timeout_secs=1`` against a 30s sleep leaves the outer guard at the
+        default ``1 + 30 = 31s``, so the INNER timeout provably wins.
+
+        RED today: the inner timeout returns ``(1, tail)``, so this lands in
+        the ``rc != 0`` VERDICT branch -> ``milestone_check_failed`` +
+        ``gate_escalated_at``.
+        """
+        import asyncio
+        import time
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'slow-predicate.sh'
+        script.write_text('#!/bin/sh\nsleep 30\n')
+        script.chmod(0o755)
+
+        task = _predicate_task(
+            task_id='704',
+            script=str(script),
+            cwd=str(tmp_path),
+            timeout_secs=1,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        # run_timeout_grace_secs left at its default so the outer guard
+        # (1 + 30 = 31s) provably CANNOT be what fires.
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=None,
+        )
+
+        started = time.monotonic()
+        # Hang tripwire: fail loudly instead of stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 15, (
+            f'the INNER 1s timeout must be what fires, not the 31s outer '
+            f'guard — run took {elapsed:.1f}s'
+        )
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('704', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue', (
+            f'a timed-out script produced NO exit code, so there is no verdict '
+            f'— must not be milestone_check_failed: {esc.category!r}'
+        )
+
+        # The message must identify WHICH guard fired: all three predicate
+        # infra_issue arms share one category, so the text is the only
+        # discriminator a human gets.  Each arm has a unique, STABLE summary,
+        # so pin that exactly rather than sniffing the detail — detail
+        # substrings do not actually discriminate (the outer-guard detail also
+        # cites before_done['timeout_secs'], and its '31s' contains '1s'), and
+        # negative substring pins would fail on a purely additive wording
+        # improvement.
+        assert esc.summary == 'Predicate check script timed out (no verdict produced)', (
+            f'must be the INNER per-script timeout arm — not the outer-guard '
+            f"arm ('Predicate check timed out (subprocess hung)') nor the "
+            f"generic arm ('Predicate check run_fn failed (unexpected "
+            f"error)'): {esc.summary!r}"
+        )
+
+        scheduler.update_task.assert_not_awaited()  # no gate_escalated_at stamp
+        scheduler.set_task_status.assert_awaited_once_with('704', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+    async def test_custom_script_runner_nonzero_rc_is_still_a_verdict(self, tmp_path: Path):
+        """PIN: an INJECTED ``script_runner`` returning the literal legacy
+        ``(1, '<script timed out after 1s>')`` tuple must STILL file
+        ``milestone_check_failed`` and stamp ``gate_escalated_at``.
+
+        Green before and after task 4065.  It forbids implementing the fix by
+        substring-sniffing ``'timed out'`` out of the tail — which would
+        silently reclassify any predicate script that merely PRINTS that
+        phrase from an honest verdict into a re-attempted infra fault.
+        Classification must key on the exception TYPE, and only the default
+        runner raises it.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='705', timeout_secs=1)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        script_runner = AsyncMock(return_value=(1, '<script timed out after 1s>'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('705', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed', (
+            f'an injected runner keeps the plain (rc, tail) contract — a '
+            f'non-zero rc is a VERDICT no matter what the tail says: '
+            f'{esc.category!r}'
+        )
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('gate_escalated_at')
+        ]
+        assert stamp_calls, (
+            'a verdict must still stamp gate_escalated_at (resolve-to-done path)'
+        )
+        scheduler.set_task_status.assert_awaited_once_with('705', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # Step-7: RED — B10 predicate resume: gate_escalated_at set + escalation
 # resolved -> done with deterministic-milestone provenance (NOT
 # deterministic-deploy). (RED until step-8 adds the predicate-aware resume
@@ -7534,7 +9740,8 @@ class TestPredicateModeResume:
             'predicate resume must not claim a systemd deploy happened'
         )
         assert 'check ok' in provenance.get('note', ''), (
-            f"the re-run's stdout tail must appear in provenance note: {provenance!r}"
+            f"the re-run's verdict line must survive into the provenance "
+            f'note: {provenance!r}'
         )
 
     async def test_predicate_resume_recheck_still_failing_refiles_and_stays_blocked(

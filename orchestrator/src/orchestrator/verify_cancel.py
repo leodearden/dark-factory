@@ -300,16 +300,40 @@ def cancel_request(
         remove_pgid_file(path)
         return 0
 
-    # NOTE — stale-file / PID-reuse window:
-    # If verify-merge dies without running its finally-block (hard crash, OOM,
-    # host reset) the pgid file is left on disk.  After the original process is
-    # gone the OS may recycle that pid/pgid for an unrelated process; a later
-    # cancel_request call would then SIGKILL the wrong process.
-    # The window is bounded: modern kernels recycle pids slowly (default
-    # pid_max = 32768), and the stale file is cleaned up by the next successful
-    # cancel-verify or on host reboot.  A future β hardening: stamp a boot-id
-    # alongside the pgid (e.g. /proc/sys/kernel/random/boot_id) and validate
-    # it here before killing.
+    # NOTE — stale-file / PID-reuse window.  Both of this note's original
+    # "the window is bounded" premises were MEASURED FALSE on 2026-08-12; the
+    # corrected picture is below.
+    #
+    # If verify-merge dies without running its finally-block the pgid file is
+    # left on disk.  The dominant cause is not a crash: it is
+    # ``fire_watchdog_kill``'s ``os._exit(1)`` (below), which by design skips
+    # every finally — 64 leftover files accumulated on the reify laptop in the
+    # 21 days after that host first ran the watchdog, ~54% of its dispatches.
+    #
+    # (a) pid recycling is NOT slow.  pid_max is 4194304 — not the 32768
+    #     default this note assumed — on BOTH the workstation and the laptop,
+    #     and the laptop's counter demonstrably wrapped on 2026-08-11.
+    # (b) Stale files are NOT cleaned on host reboot.  PGID_DIR_NAME lives
+    #     under worktree_base, a persistent repo path deliberately outside any
+    #     registered worktree (see the module docstring) — nothing prunes it.
+    #     Nine files dated 2026-07-22/23 survived the laptop's 2026-07-25 boot.
+    #
+    # What that does NOT mean: the per-request files are near-harmless for
+    # cancel_request specifically, for a reason the original note missed —
+    # request_ids are ``uuid4().hex`` (verify_runner.py), so a stale file's id
+    # is never revisited and this function never re-reads one.
+    #
+    # The real exposure is the FIXED-key holder file (LOCK_HOLDER_PGID_KEY),
+    # which every run overwrites and which ``_merge_verify_lease_active``
+    # (git_ops.py) probes with ``os.killpg(pgid, 0)``.  A recycled pid there
+    # reads as a LIVE holder and fails CLOSED: reset_persistent_merge_worktree
+    # raises MergeVerifyLeaseHeld and remove_merge_worktree_guarded skips
+    # removal — i.e. a wedged warm lane, not a mis-aimed SIGKILL.  Bounded only
+    # by the next run that acquires the build lane lock and overwrites it.
+    #
+    # Hardening (unchanged, now better motivated): stamp a boot-id alongside
+    # the pgid (e.g. /proc/sys/kernel/random/boot_id) and validate it before
+    # trusting the value, plus a GC for the leaked per-request files.
 
     # Step 2: snapshot PPID map BEFORE any kills (invariant: snapshot precedes kill).
     # Killing the root reparents its survivors to init, severing the /proc parent
@@ -406,6 +430,18 @@ def acquire_merge_verify_flock(
     :func:`release_merge_verify_flock`.  Returns ``None`` on timeout (the fd
     is closed before returning).
 
+    Raises ``OSError`` if the lock file cannot be prepared at all: the
+    ``path.parent.mkdir(...)`` and ``os.open(path, O_RDWR | O_CREAT)``
+    below run BEFORE the bounded-wait loop's own ``try``, so ENOSPC,
+    EACCES, EMFILE or EROFS propagate to the caller rather than returning
+    the ``None`` that means "contended".  That distinction is deliberate
+    and must not be collapsed here — :meth:`GitOps.merge_verify_lease`
+    converts ``None`` into ``MergeVerifyLeaseContended``, so swallowing
+    the ``OSError`` would misreport a disk-full as another process holding
+    the lane.  Callers on never-raise teardown paths must guard the call
+    themselves (see :meth:`GitOps.remove_merge_worktree_guarded`, which
+    degrades it to ``'skipped_lock_error'``).
+
     *monotonic* / *sleep* are injectable (default ``time.monotonic`` /
     ``time.sleep``) so tests can run the bounded wait fast and deterministically.
     """
@@ -436,6 +472,136 @@ def release_merge_verify_flock(fd: int) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
     with contextlib.suppress(OSError):
         os.close(fd)
+
+
+#: Default kernel lock table.  Injectable at the call site purely so tests can
+#: drive the parser from a fixture file.
+PROC_LOCKS_PATH: Path = Path('/proc/locks')
+
+
+def lane_lock_holder_pids_strict(
+    path: Path,
+    *,
+    locks_path: Path = PROC_LOCKS_PATH,
+) -> list[int]:
+    """Return the pids currently holding an ``flock(2)`` on *path*, per the kernel.
+
+    Reads the kernel lock table (``/proc/locks``) and returns every pid holding
+    a ``FLOCK`` record whose device+inode match ``os.stat(path)``.  Matching on
+    (dev, inode) rather than on a pathname is what makes this correct: the lock
+    table records inodes, and ``flock(2)``/``flock(1)`` interoperate on the same
+    inode regardless of which path string each caller opened.
+
+    Row shape, verified empirically on this host::
+
+        82: FLOCK  ADVISORY  WRITE 1553455 103:08:14958524 0 EOF
+        <id>: <TYPE> <MODE> <RW> <PID> <MAJ:MIN:INO> <START> <END>
+
+    with three properties that the parse depends on:
+
+    * **MAJ and MIN are HEX; the inode is DECIMAL.** (259, 8 renders ``103:08``.)
+    * A process *blocked waiting* on the lock appears as a separate row whose
+      first token after the id is ``->``::
+
+          82: -> FLOCK  ADVISORY  WRITE 1555037 103:08:14958524 0 EOF
+
+      A waiter is not a holder and is skipped — counting one would libel every
+      process merely contending for the lane.
+    * A flock taken on a worker **thread** is reported against the process
+      **tgid**, not the thread's ``native_id``.  This is the decisive property
+      for the caller: the D8/B13 leak this probe exists to detect is acquired
+      inside ``asyncio.to_thread``, so were the thread id reported instead the
+      leak would be invisible here.
+
+    ``POSIX``/``OFDLCK`` records on the same inode are ignored: they are a
+    different lock class and do not conflict with ``flock(2)``.
+
+    Why kernel truth rather than the holder-pgid rendezvous below: an orphaned
+    acquire never reaches :func:`write_lock_holder_pgid` (callers record the
+    pgid only *after* the acquire returns), so the rendezvous is empty in
+    exactly the leak case.  ``/proc/locks`` is also what the incident anchor
+    itself used — reify ``esc-5548-5`` inode-matched
+    ``FLOCK ADVISORY WRITE 588232 07:1d:4300647613`` against
+    ``_merge-verify.lock`` by hand.
+
+    STRICT about "I could not tell" (task 3604).  A missing lock file and a
+    missing or unreadable lock table both raise their ``OSError`` (errno and
+    filename intact) rather than yielding ``[]``: in both, NO rows were
+    examined at all, so an empty result carries no information whatsoever
+    about the target inode and must not be rendered as "nobody holds it".
+    Use this variant wherever confusing those two would be unsafe — canonically
+    when asserting a NEGATIVE ("the lane is free"), where a fail-safe ``[]`` is
+    the very answer that silently satisfies the caller.  Callers that would
+    rather degrade than raise want :func:`lane_lock_holder_pids` instead.
+
+    Per-ROW tolerance is deliberately UNCHANGED: ``/proc/locks`` is a
+    system-wide table, so a row this parser cannot understand belonging to some
+    unrelated process does not make THIS caller's answer about THIS inode
+    unknown.  Raising on it would couple every lane-lock check to arbitrary
+    system state.  The line drawn here is between "this ROW is odd" (skip) and
+    "the whole ANSWER is unknown" (raise).
+
+    Returns the matching pids de-duplicated, in first-seen order.
+    """
+    st = os.stat(path)
+    target = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+
+    raw = locks_path.read_text()
+
+    pids: list[int] = []
+    seen: set[int] = set()
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        fields = fields[1:]  # drop the leading '<id>:' token
+        if fields[0] == '->':
+            continue  # a blocked waiter, not a holder
+        if len(fields) < 5 or fields[0] != 'FLOCK':
+            continue
+        try:
+            pid = int(fields[3])
+            maj, minor, ino = fields[4].split(':')
+            record = (int(maj, 16), int(minor, 16), int(ino, 10))
+        except (ValueError, IndexError):
+            continue  # tolerate an unexpected row shape rather than raise
+        if record == target and pid not in seen:
+            seen.add(pid)
+            pids.append(pid)
+    return pids
+
+
+def lane_lock_holder_pids(
+    path: Path,
+    *,
+    locks_path: Path = PROC_LOCKS_PATH,
+) -> list[int]:
+    """Fail-safe :func:`lane_lock_holder_pids_strict`: an unreadable answer is ``[]``.
+
+    Identical parse — this is a thin wrapper, deliberately not a second copy,
+    so the two can never drift.  What it adds is one named FAIL-SAFE POLICY,
+    mirroring :func:`read_lock_holder_pgid`: a missing lock file and a missing
+    or unreadable lock table (a non-Linux host has no ``/proc/locks``) yield
+    "no known holders" rather than raising.  Per-row parse tolerance lives in
+    the core and applies to both variants.
+
+    Why swallow: the production callers in :mod:`orchestrator.git_ops` invoke
+    this from inside acquire-timeout paths, where an exception would convert a
+    diagnosable stall into a broken merge.  Degrading to "no known holders"
+    costs at most a less specific diagnostic message.
+
+    The cost of that policy, and when NOT to pay it (task 3604): ``[]`` here
+    means "nobody holds it" OR "the lock file is gone" OR "I could not read the
+    lock table", indistinguishably.  A caller asserting a NEGATIVE — that a
+    lane is FREE — is satisfied by all three, so for it a bad read produces a
+    silent pass rather than a diagnosable failure.  Such a caller must use
+    :func:`lane_lock_holder_pids_strict` and decide for itself what an unknown
+    answer means.
+    """
+    try:
+        return lane_lock_holder_pids_strict(path, locks_path=locks_path)
+    except OSError:
+        return []
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,13 @@ plans/confusion-reduction-prd.md (PRD task epsilon, decision 7: quiet
 nights commit nothing, so liveness must probe systemd UNIT STATE, never
 git history).
 
+SCOPE: this probe answers "did the unit run" only. Whether the pipeline
+actually PRODUCED anything is a separate question answered by
+check_trickle_progress.py (see scripts/tests/test_check_trickle_progress.py,
+task 3340). This file is deliberately unchanged in substance: its passing
+unchanged is the proof that task 3340 altered no liveness semantics, which
+tasks 2587/2615 already depend on.
+
 Drives the script via subprocess with a FAKE `systemctl` shimmed onto PATH
 (answers `show -p ...` property lines from a JSON state file — mirrors
 scripts/tests/test_deploy_w5_recon_reliability.py /
@@ -20,7 +27,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 SCRIPT = Path(__file__).parent.parent / "legibility" / "check_trickle_liveness.sh"
@@ -170,7 +177,7 @@ def test_script_is_executable():
 
 
 def test_alive_within_window_exits_zero(tmp_path):
-    recent = datetime.now(timezone.utc) - timedelta(hours=2)
+    recent = datetime.now(UTC) - timedelta(hours=2)
     result, git_marker = _run_script(
         tmp_path, "proj_a", 24,
         fields={
@@ -193,7 +200,7 @@ def test_alive_within_window_exits_zero(tmp_path):
 
 
 def test_older_than_window_exits_nonzero(tmp_path):
-    stale = datetime.now(timezone.utc) - timedelta(hours=48)
+    stale = datetime.now(UTC) - timedelta(hours=48)
     result, git_marker = _run_script(
         tmp_path, "proj_a", 24,
         fields={
@@ -211,7 +218,7 @@ def test_older_than_window_exits_nonzero(tmp_path):
 
 
 def test_failed_run_exits_nonzero(tmp_path):
-    recent = datetime.now(timezone.utc) - timedelta(hours=1)
+    recent = datetime.now(UTC) - timedelta(hours=1)
     result, git_marker = _run_script(
         tmp_path, "proj_a", 24,
         fields={

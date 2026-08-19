@@ -18,6 +18,7 @@ from shared.prompt_artifact import (
     PromptSpec,
     compose_prompt,
 )
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import TaskmasterError, TaskNotFoundError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
@@ -42,6 +43,7 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     _trim_pool,
     flatten_task_tree,
+    is_combine_eligible_status,
     normalize_title,
 )
 
@@ -88,7 +90,13 @@ class TestTaskDependencies:
 
 
 class TestToPoolEntry:
-    def test_pending_is_combine_eligible(self):
+    def test_maps_task_fields(self):
+        """Field mapping only — combine_eligible is covered by the class below.
+
+        (The per-status eligibility assertions that used to live here are
+        subsumed by ``TestCombineEligibilityNoDivergence``, which parametrizes
+        the same call over the full status vocabulary.)
+        """
         task = {
             'id': '42',
             'title': 'Fix parser',
@@ -101,15 +109,8 @@ class TestToPoolEntry:
         entry = _to_pool_entry(task, source='module', lock_depth=2)
         assert entry is not None
         assert entry.task_id == '42'
-        assert entry.combine_eligible is True
         assert entry.source == 'module'
         assert entry.module_keys == ['src/parser.py']
-
-    def test_done_is_not_combine_eligible(self):
-        task = {'id': '1', 'title': 'x', 'status': 'done'}
-        entry = _to_pool_entry(task, source='module', lock_depth=2)
-        assert entry is not None
-        assert entry.combine_eligible is False
 
     def test_missing_id_returns_none(self):
         entry = _to_pool_entry({'title': 'x'}, source='module', lock_depth=2)
@@ -117,6 +118,79 @@ class TestToPoolEntry:
 
     def test_none_returns_none(self):
         assert _to_pool_entry(None, source='module', lock_depth=2) is None
+
+
+class TestIsCombineEligibleStatus:
+    """The ONE shared combine STATUS predicate (task 4035).
+
+    Selection (``_to_pool_entry.combine_eligible``) and execution
+    (``task_interceptor._execute_combine``) previously hand-copied
+    ``status == 'pending'`` and silently diverged, letting combines land on
+    non-pending targets mid-planning. These tests pin the single definition;
+    the SELECTION call site is pinned to it by
+    ``TestCombineEligibilityNoDivergence`` below, and the EXECUTION call site
+    by ``test_curator_combine_execution_matches_shared_predicate`` in
+    ``test_task_interceptor.py``.
+    """
+
+    @pytest.mark.parametrize('status', list(TaskStatus))
+    def test_pending_only_over_full_vocabulary(self, status: TaskStatus):
+        expected = status is TaskStatus.PENDING
+        assert is_combine_eligible_status(status.value) is expected
+
+    def test_in_progress_is_not_eligible(self):
+        """THE BUG, kept as a named regression case though the sweep above covers it.
+
+        An in-progress target sailed through the old execution guard; naming
+        the incident status explicitly is what makes a future deletion of this
+        behaviour read as deliberate rather than as parametrize-list churn.
+        """
+        assert is_combine_eligible_status('in-progress') is False
+
+    @pytest.mark.parametrize(
+        'status',
+        [
+            'unknown',
+            '',
+            'PENDING',  # wrong case is not the canonical spelling
+            'Pending',
+            ' pending ',
+            'pending-review',
+        ],
+    )
+    def test_unrecognised_status_fails_closed(self, status: str):
+        assert is_combine_eligible_status(status) is False
+
+
+class TestCombineEligibilityNoDivergence:
+    """INV-5 anti-divergence pin for the SELECTION site only.
+
+    Scope is deliberately narrow: these assertions drive
+    ``_to_pool_entry`` and say nothing about the interceptor. Because
+    ``_to_pool_entry`` calls ``is_combine_eligible_status`` directly, they
+    fail only if that call is deleted or re-forked into a second literal —
+    which is exactly the selection-side half of the 20.2% race.
+
+    The EXECUTION site (``task_interceptor._execute_combine``, the half that
+    actually diverged and caused the incident) cannot be covered from here;
+    it is pinned by ``test_curator_combine_execution_matches_shared_predicate``
+    in ``test_task_interceptor.py``, which drives the real combine path over
+    the same full vocabulary.
+    """
+
+    @pytest.mark.parametrize('status', list(TaskStatus))
+    def test_pool_entry_agrees_with_shared_predicate(self, status: TaskStatus):
+        task = {'id': '42', 'title': 'Fix parser', 'status': status.value}
+        entry = _to_pool_entry(task, source='module', lock_depth=2)
+        assert entry is not None
+        assert entry.combine_eligible is is_combine_eligible_status(status.value)
+
+    def test_pool_entry_agrees_on_unknown_status(self):
+        """A task dict with no status reads as 'unknown' — both sides refuse it."""
+        entry = _to_pool_entry({'id': '42', 'title': 'x'}, source='module', lock_depth=2)
+        assert entry is not None
+        assert entry.combine_eligible is is_combine_eligible_status('unknown')
+        assert entry.combine_eligible is False
 
 
 class TestFlattenTaskTree:
@@ -343,7 +417,7 @@ def _pool_with_ids(*pairs: tuple[str, str]) -> list[_PoolEntry]:
             status=status,
             priority='medium',
             source='module',
-            combine_eligible=(status == 'pending'),
+            combine_eligible=is_combine_eligible_status(status),
         )
         for tid, status in pairs
     ]
@@ -2934,8 +3008,16 @@ class TestCurateBatchPreDedupCachePollution:
     the first sibling's real LLM decision.  Caching them would overwrite the
     real decision with a degenerate ``action='drop', target_id=None`` entry,
     and a later single-item ``curate()`` hit on that hash would then return
-    the synthetic drop — which ``_process_add_ticket`` cannot safely dispatch
-    and would interpret as "create a duplicate task".
+    the synthetic drop.
+
+    That degenerate shape is still create-degraded on the single path — a
+    targetless ``drop`` is an LLM dedupe that lost its target, so failing OPEN
+    into "create it anyway" is the deliberate behaviour (pinned by
+    ``test_dispatch_targetless_llm_drop_still_fails_open_to_create``).  It is
+    NOT a refusal: a genuine deterministic refusal uses ``action='refuse'``,
+    which creates nothing.  Keeping the two distinct is exactly why the cache
+    must not be polluted here — a create-degraded stale drop silently files a
+    duplicate, which is the harm this test guards.
     """
 
     @pytest.mark.asyncio
@@ -3909,10 +3991,10 @@ def _make_config_with_blocklist(blocklist_path_str: str) -> FusedMemoryConfig:
 
 @pytest.mark.asyncio
 class TestCuratorBlocklistShortCircuit:
-    """Tests that a blocklist match returns drop BEFORE corpus/LLM calls."""
+    """Tests that a blocklist match returns a refusal BEFORE corpus/LLM calls."""
 
     async def test_blocklist_match_returns_drop_without_llm(self, tmp_path):
-        """(a) curate() returns drop with blocklist justification prefix."""
+        """(a) curate() returns action='refuse' with the blocklist justification prefix."""
         blocklist = _make_blocklist_yaml(
             tmp_path,
             title_subs=["search-then-delete", "fix c"],
@@ -3931,7 +4013,7 @@ class TestCuratorBlocklistShortCircuit:
              patch.object(curator, "_pre_llm_exact_match", new=AsyncMock(side_effect=AssertionError("_pre_llm_exact_match must not be called"))) as mock_exact:
             decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
-        assert decision.action == "drop"
+        assert decision.action == "refuse"
         assert decision.justification.startswith("cancelled-premise-blocklist:")
         mock_corpus.assert_not_called()
         mock_llm.assert_not_called()
@@ -3957,7 +4039,7 @@ class TestCuratorBlocklistShortCircuit:
         payload_hash = candidate.payload_hash()
         assert payload_hash in curator._decision_cache
         cached_dec, _ = curator._decision_cache[payload_hash]
-        assert cached_dec.action == "drop"
+        assert cached_dec.action == "refuse"
         assert cached_dec.justification == decision.justification
 
     async def test_blocklist_non_matching_candidate_falls_through(self, tmp_path):
@@ -4057,11 +4139,11 @@ class TestCuratorBatchBlocklistShortCircuit:
         # (a) Three decisions returned, one per prepared candidate
         assert len(decisions) == 3
 
-        # (b) decisions[0] is a blocklist drop — NOT a batch_target_index drop
-        assert decisions[0].action == "drop"
+        # (b) decisions[0] is a blocklist REFUSAL — NOT a batch_target_index drop
+        assert decisions[0].action == "refuse"
         assert decisions[0].justification.startswith("cancelled-premise-blocklist:")
         assert decisions[0].batch_target_index is None, (
-            "blocklist drops are real drops, not sibling-substitution drops"
+            "blocklist refusals create nothing; they are not sibling-substitution drops"
         )
 
         # (c) LLM was called with only candidates[1] and [2], not [0]
@@ -4638,12 +4720,12 @@ def _make_config_with_premise_registry(registry_path_str: str) -> FusedMemoryCon
 
 @pytest.mark.asyncio
 class TestCuratorPremiseRefutedDrop:
-    """Tests that a recon code-fix premise refuted by live source returns drop
+    """Tests that a recon code-fix premise refuted by live source returns a refusal
     BEFORE corpus/LLM calls. Mirrors TestCuratorBlocklistShortCircuit.
     """
 
     async def test_premise_refuted_returns_drop_without_llm(self, tmp_path):
-        """(a)+(b) curate() returns drop with recon-premise-refuted justification;
+        """(a)+(b) curate() returns action='refuse' with the recon-premise-refuted justification;
         taskmaster/LLM path is NOT invoked (pre-LLM drop)."""
         source_root = tmp_path / "source_root"
         source_root.mkdir()
@@ -4672,7 +4754,7 @@ class TestCuratorPremiseRefutedDrop:
              patch.object(curator, "_pre_llm_exact_match", new=AsyncMock(side_effect=AssertionError("_pre_llm_exact_match must not be called"))) as mock_exact:
             decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
-        assert decision.action == "drop"
+        assert decision.action == "refuse"
         assert decision.justification.startswith("recon-premise-refuted:")
         assert "test_premise_entry" in decision.justification
         mock_corpus.assert_not_called()
@@ -4680,8 +4762,8 @@ class TestCuratorPremiseRefutedDrop:
         mock_exact.assert_not_called()
 
     async def test_premise_refuted_drop_not_stored_in_cache(self, tmp_path):
-        """The recon-premise-refuted drop is deliberately NOT stored in
-        _decision_cache — unlike the blocklist's unconditional forever-drop,
+        """The recon-premise-refuted refusal is deliberately NOT stored in
+        _decision_cache — unlike the blocklist's unconditional forever-refusal,
         this guard must re-verify live source on every call so it self-corrects
         the moment the source stops refuting the premise. Caching the drop would
         let a stale decision suppress a genuinely-fixed premise for up to
@@ -4708,7 +4790,7 @@ class TestCuratorPremiseRefutedDrop:
 
         decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
-        assert decision.action == "drop"
+        assert decision.action == "refuse"
         assert decision.justification.startswith("recon-premise-refuted:")
         assert candidate.payload_hash() not in curator._decision_cache
 
@@ -4749,7 +4831,7 @@ class TestCuratorPremiseRefutedDrop:
                    new=AsyncMock(return_value=create_result)):
             decision1 = await curator.curate(candidate, project_id="p", project_root="/x")
 
-            assert decision1.action == "drop"
+            assert decision1.action == "refuse"
             assert decision1.justification.startswith("recon-premise-refuted:")
             assert candidate.payload_hash() not in curator._decision_cache
 
@@ -4917,11 +4999,11 @@ class TestCuratorBatchPremiseRefutedDrop:
         # (a) Two decisions returned, one per prepared candidate
         assert len(decisions) == 2
 
-        # (b) decisions[0] is a recon-premise-refuted drop — NOT a batch_target_index drop
-        assert decisions[0].action == "drop"
+        # (b) decisions[0] is a recon-premise-refuted REFUSAL — NOT a batch_target_index drop
+        assert decisions[0].action == "refuse"
         assert decisions[0].justification.startswith("recon-premise-refuted:")
         assert decisions[0].batch_target_index is None, (
-            "premise-refuted drops are real drops, not sibling-substitution drops"
+            "premise-refuted refusals create nothing; they are not sibling-substitution drops"
         )
 
         # (c) LLM was called with only candidates[1], not [0]
@@ -5046,8 +5128,8 @@ class TestCuratorBatchPremiseRefutedDrop:
                 prepared, project_id="p", project_root="/x"
             )
 
-            # c0 is dropped pre-LLM; only the ordinary c1 reaches the mocked LLM.
-            assert decisions1[0].action == "drop"
+            # c0 is refused pre-LLM; only the ordinary c1 reaches the mocked LLM.
+            assert decisions1[0].action == "refuse"
             assert decisions1[0].justification.startswith("recon-premise-refuted:")
             assert decisions1[1].action == "create"
             assert len(llm_candidates_received) == 1
@@ -5069,6 +5151,177 @@ class TestCuratorBatchPremiseRefutedDrop:
         assert any(c is c0 for c in llm_candidates_received)
         assert decisions2[0].action == "create"
         assert not decisions2[0].justification.startswith("recon-premise-refuted:")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-3126 step-10 RED: TestBatchDuplicateInheritsRefusal
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestBatchDuplicateInheritsRefusal:
+    """A deterministic refusal must not be bypassable by submitting the SAME
+    candidate twice in one batch.
+
+    The pre-batch payload_hash dedup in ``curate_batch_prepared`` runs BEFORE
+    the blocklist and premise guards, so a byte-identical duplicate is assigned
+    a synthetic ``CuratorDecision(action='drop', batch_target_index=<first>)``
+    and is excluded from ``unique_indices`` — the guards never see it. At
+    dispatch that drop resolves against a sibling whose ``task_id`` is None (a
+    refusal creates nothing), takes the 'sibling failed' branch, degrades to
+    ``create`` and files the very dead-premise task the guard just refused.
+
+    Identical ``payload_hash`` means an identical guard verdict by construction,
+    so the duplicate must inherit the refusal.
+    """
+
+    async def test_identical_blocklisted_duplicates_both_refused(self, tmp_path):
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        def _blocklisted():
+            return CandidateTask(
+                title="Convert FIX C relay-flag deletion: search-then-delete",
+                description="Metric fixc_flags_deleted_not_found is not tracked.",
+            )
+
+        c0, c1 = _blocklisted(), _blocklisted()
+        # Self-documenting: this test exists to exercise the pre-batch dedup path.
+        assert c0.payload_hash() == c1.payload_hash()
+
+        empty_sizes = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        prepared = [
+            PreparedCandidate(candidate=c0, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+        ]
+
+        with patch.object(
+            curator, "_call_llm",
+            new=AsyncMock(side_effect=AssertionError("_call_llm must not be called")),
+        ), patch.object(
+            curator, "_call_llm_batch_with_fallback",
+            new=AsyncMock(side_effect=AssertionError("batch LLM must not be called")),
+        ):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root="/x"
+            )
+
+        assert len(decisions) == 2
+        for i, dec in enumerate(decisions):
+            assert dec.action == "refuse", (i, dec.action, dec.justification)
+            # Downstream readers (ticket reason, eval corpus, operators grepping
+            # production logs) key on this prefix — it must survive inheritance.
+            assert dec.justification.startswith("cancelled-premise-blocklist:"), (i, dec)
+            assert dec.batch_target_index is None, (
+                "a refusal creates nothing and must carry no sibling target"
+            )
+            assert dec.target_id is None, (i, dec)
+
+    async def test_identical_premise_refuted_duplicates_both_refused(self, tmp_path):
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        def _refuted():
+            return CandidateTask(
+                title="Fix entity-summary rebuild missing invalid_at filter",
+                description="Rebuild does not check missing invalid_at filter before writing.",
+            )
+
+        c0, c1 = _refuted(), _refuted()
+        assert c0.payload_hash() == c1.payload_hash()
+
+        empty_sizes = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        prepared = [
+            PreparedCandidate(candidate=c0, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+        ]
+
+        with patch.object(
+            curator, "_call_llm",
+            new=AsyncMock(side_effect=AssertionError("_call_llm must not be called")),
+        ), patch.object(
+            curator, "_call_llm_batch_with_fallback",
+            new=AsyncMock(side_effect=AssertionError("batch LLM must not be called")),
+        ):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root="/x"
+            )
+
+        assert len(decisions) == 2
+        for i, dec in enumerate(decisions):
+            assert dec.action == "refuse", (i, dec.action, dec.justification)
+            assert dec.justification.startswith("recon-premise-refuted:"), (i, dec)
+            assert dec.batch_target_index is None, (
+                "a refusal creates nothing and must carry no sibling target"
+            )
+            assert dec.target_id is None, (i, dec)
+
+    async def test_ordinary_duplicate_still_uses_sibling_substitution(self, tmp_path):
+        """The propagation must be narrow: a duplicate of a NON-refused candidate
+        keeps its synthetic pre-batch-dedup drop, so the worker's topo-sort can
+        still substitute the first candidate's task_id."""
+        from fused_memory.middleware.task_curator import PreparedCandidate
+
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        def _ordinary():
+            return CandidateTask(title="Improve worker logging", description="Normal task")
+
+        c0, c1 = _ordinary(), _ordinary()
+        assert c0.payload_hash() == c1.payload_hash()
+
+        empty_sizes = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
+        prepared = [
+            PreparedCandidate(candidate=c0, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+            PreparedCandidate(candidate=c1, pool=[], pool_sizes=empty_sizes, prompt_tokens=10),
+        ]
+
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+            return [
+                CuratorDecision(action="create", justification="new-1",
+                                pool_sizes=empty_sizes, latency_ms=0),
+            ]
+
+        with patch.object(
+            curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch
+        ):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id="p", project_root="/x"
+            )
+
+        assert decisions[0].action == "create"
+        assert decisions[1].action == "drop"
+        assert decisions[1].batch_target_index == 0
+        assert decisions[1].justification == "pre-batch-dedup: identical payload_hash"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -5396,7 +5649,7 @@ class TestCuratorCurateRouteDeterministicIntegration:
              patch.object(curator, "_call_llm", new=AsyncMock(side_effect=AssertionError("_call_llm must not be called"))):
             decision = await curator.curate(candidate, project_id="p", project_root="/x")
 
-        assert decision.action == "drop"
+        assert decision.action == "refuse"
         assert decision.justification.startswith("cancelled-premise-blocklist:")
 
     async def test_exact_match_dedup_takes_precedence_over_route(self, tmp_path):
@@ -5526,7 +5779,7 @@ class TestCuratorBatchRouteDeterministic:
 
     async def test_batch_blocklist_precedence_over_route(self, tmp_path):
         """(b) Within a batch, a candidate matching BOTH the blocklist and the
-        operational registry resolves to the blocklist drop, not route."""
+        operational registry resolves to the blocklist refusal, not route."""
         from fused_memory.middleware.task_curator import PreparedCandidate
 
         blocklist = _make_blocklist_yaml(
@@ -5576,7 +5829,7 @@ class TestCuratorBatchRouteDeterministic:
                 prepared, project_id="p", project_root="/x"
             )
 
-        assert decisions[0].action == "drop"
+        assert decisions[0].action == "refuse"
         assert decisions[0].justification.startswith("cancelled-premise-blocklist:")
         assert len(llm_candidates_received) == 1
         assert llm_candidates_received[0] is c1
@@ -5990,6 +6243,65 @@ class TestCuratorPromptLoaderWiringSingle:
         )
 
 
+class TestCuratorPromptResolveFailSafe:
+    """``_resolve_curator_prompt``'s docstring leans on "PromptArtifactStore.
+    resolve never raises ... so the curator's best-effort contract is
+    preserved", and it runs on every live reconciliation cycle. Pin that
+    dependency at the consumer boundary so a future refactor reintroducing the
+    raise fails where it actually hurts.
+    """
+
+    def test_resolve_curator_prompt_degrades_when_provenance_sidecar_becomes_unreadable(
+        self, tmp_path
+    ):
+        """A *good* pin must degrade to the in-code baseline, not raise.
+
+        Deliberately starts from a working pin and asserts the curator serves
+        the composed pinned text, so breaking the sidecar afterwards proves a
+        degradation. Asserting only the post-break state would hold just as
+        well for a key that was never pinned at all, which is a weaker claim
+        than the docstring this test exists to pin.
+
+        Synchronous — the guard under test is reached before any LLM call, so
+        no ``invoke_with_cap_retry`` patch and no event loop are needed.
+        """
+        config = _make_config()
+        store = PromptArtifactStore(tmp_path)
+        curator = TaskCurator(config=config, taskmaster=None, prompt_store=store)
+
+        heuristics = 'PINNED: prefer combining aggressively when in doubt.'
+        provenance = ArtifactProvenance(
+            **_prompt_artifact_provenance_kwargs(harness_version=_CURATOR_PROMPT_HARNESS_VERSION)
+        )
+        store.pin(
+            CURATOR_SINGLE_SPEC.prompt_id,
+            config.curator.model,
+            _CURATOR_PROMPT_HARNESS_VERSION,
+            heuristics=heuristics,
+            provenance=provenance,
+        )
+
+        # Premise: the curator genuinely serves this pin before the break.
+        assert curator._resolve_curator_prompt(CURATOR_SINGLE_SPEC) == compose_prompt(
+            CURATOR_SINGLE_SPEC.contract, heuristics,
+        )
+
+        # Now make the sidecar unreadable in place — directory-in-place-of-file,
+        # the uid-independent trigger (chmod 0o000 is a no-op under root).
+        provenance_path = store._key_dir(
+            CURATOR_SINGLE_SPEC.prompt_id,
+            config.curator.model,
+            _CURATOR_PROMPT_HARNESS_VERSION,
+        ) / 'provenance.json'
+        provenance_path.unlink()
+        provenance_path.mkdir()
+
+        assert (
+            curator._resolve_curator_prompt(CURATOR_SINGLE_SPEC)
+            == CURATOR_SINGLE_SPEC.in_code_constant
+        )
+
+
 # ----------------------------------------------------------------------
 # Prompt-loader wiring — batch-call path (task 2494 step-5/step-6)
 # ----------------------------------------------------------------------
@@ -6049,3 +6361,135 @@ class TestCuratorPromptLoaderWiringBatch:
             CURATOR_BATCH_SPEC.contract, heuristics,
         )
 
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-3126 step-1 RED: TestCuratorDeterministicRefusal
+#
+# Both deterministic guards previously emitted `action='drop', target_id=None`.
+# That shape is INERT at the dispatch chokepoint — the interceptor's drop
+# handler requires a target, so a targetless drop fell through and CREATED the
+# very candidate its own justification said to refuse. These tests pin the new
+# explicit `action='refuse'` verdict, which creates nothing.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestCuratorDeterministicRefusal:
+    """Both deterministic guards emit action='refuse', not a targetless 'drop'."""
+
+    async def test_blocklist_guard_emits_refuse_not_targetless_drop(self, tmp_path):
+        """_maybe_blocklist_drop returns action='refuse' with no target."""
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+
+        decision = await curator._maybe_blocklist_drop(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is not None
+        assert decision.action == "refuse", (
+            "a blocklisted candidate must be REFUSED (creates nothing), not "
+            "emitted as a targetless 'drop' that the dispatcher fails open on"
+        )
+        assert decision.target_id is None
+        assert decision.justification.startswith("cancelled-premise-blocklist: ")
+        assert "test_entry" in decision.justification
+
+    async def test_premise_refuted_guard_emits_refuse_not_targetless_drop(self, tmp_path):
+        """_maybe_premise_refuted_drop returns action='refuse' with no target."""
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text(
+            "def rebuild():\n    filter_by(invalid_at=None)\n", encoding="utf-8",
+        )
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+
+        decision = await curator._maybe_premise_refuted_drop(
+            candidate, candidate.payload_hash(),
+        )
+
+        assert decision is not None
+        assert decision.action == "refuse", (
+            "a premise-refuted candidate must be REFUSED (creates nothing), not "
+            "emitted as a targetless 'drop' that the dispatcher fails open on"
+        )
+        assert decision.target_id is None
+        assert decision.justification.startswith("recon-premise-refuted: ")
+        assert "test_premise_entry" in decision.justification
+
+    async def test_refuse_preserves_blocklist_caching_contract(self, tmp_path):
+        """Switching drop→refuse must not regress the blocklist's idempotency cache write."""
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+        payload_hash = candidate.payload_hash()
+
+        decision = await curator._maybe_blocklist_drop(candidate, payload_hash)
+
+        assert decision is not None and decision.action == "refuse"
+        assert payload_hash in curator._decision_cache
+        assert curator._decision_cache[payload_hash][0].action == "refuse"
+
+    async def test_refuse_preserves_premise_non_caching_contract(self, tmp_path):
+        """The premise guard must STILL skip the cache — it re-verifies live source
+        on every call, so a cached refusal could suppress a genuinely-fixed bug."""
+        source_root = tmp_path / "source_root"
+        source_root.mkdir()
+        (source_root / "memory_service.py").write_text("invalid_at\n", encoding="utf-8")
+
+        registry = _make_premise_registry_yaml(
+            tmp_path,
+            title_subs=["entity-summary rebuild"],
+            desc_subs=["invalid_at filter"],
+            source_assertions=[
+                {"file": "memory_service.py", "must_contain": ["invalid_at"]},
+            ],
+        )
+        config = _make_config_with_premise_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=source_root)
+
+        candidate = CandidateTask(
+            title="Fix entity-summary rebuild missing invalid_at filter",
+            description="Rebuild does not check missing invalid_at filter before writing.",
+        )
+        payload_hash = candidate.payload_hash()
+
+        decision = await curator._maybe_premise_refuted_drop(candidate, payload_hash)
+
+        assert decision is not None and decision.action == "refuse"
+        assert payload_hash not in curator._decision_cache

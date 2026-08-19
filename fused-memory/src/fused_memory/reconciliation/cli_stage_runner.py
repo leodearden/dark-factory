@@ -45,17 +45,34 @@ DISALLOW_TASK_WRITES = [
 ]
 
 # Memory write tools (disallowed in Stage 3 — read-only integrity check)
+#
+# update_memory (task 3088, esc-3623-3) is an in-place SILENT-REWRITE primitive
+# — it changes what a Mem0 record says while preserving its point id and
+# created_at — and shipped unclassified: it was in NO disallow list at all, so
+# Stage 3 (the read-only integrity check) was neither denied it here nor
+# turned away by the mem0_update authz gate, whose shipped default
+# content_amend_allowed_agent_prefixes=['recon-stage-', 'curator-'] admits
+# every recon stage's f'recon-stage-{stage_id}' agent_id via its recon-stage-
+# entry (curator-, added for the interactive consolidation sitting per
+# esc-3524-1, matches no recon stage and does not move this reasoning).
+# Stage 1 and Stage 2 KEEP the
+# tool because neither STAGE1_DISALLOWED nor STAGE2_DISALLOWED (below) folds
+# DISALLOW_MEMORY_WRITES — the very asymmetry the AMEND_AND_EPISODE_TOOLS_BLOCK
+# prompt addition (prompts/__init__.py) now advertises.
 DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__add_episode',
     'mcp__fused-memory__add_memory',
     'mcp__fused-memory__delete_memory',
+    'mcp__fused-memory__update_memory',
     'mcp__fused-memory__delete_episode',
+    'mcp__fused-memory__redact_episode_content',
     'mcp__fused-memory__replay_to_graphiti',
     'mcp__fused-memory__replay_dead_letters',
     'mcp__fused-memory__refresh_entity_summary',
     'mcp__fused-memory__set_entity_summary',
     'mcp__fused-memory__rename_entity',
     'mcp__fused-memory__merge_entities',
+    'mcp__fused-memory__reassign_edge',
     'mcp__fused-memory__delete_entity',
     'mcp__fused-memory__rebuild_entity_summaries',
     'mcp__fused-memory__update_edge',
@@ -72,13 +89,82 @@ DISALLOW_RECON_REPORT_LEDGER_WRITES = [
     'mcp__recon-report__write_entity_standing_decision',
 ]
 
+# Escalation READ tools (disallowed in every stage — task 3163,
+# plans/escalation-store-ambiguity-prd.md task α).
+#
+# A stage's `escalation` MCP server is wired to the RECONCILIATION escalation
+# queue, never to a project's queue: harness.py `_start_escalation_server`
+# builds it over `config.escalation_queue_dir` and publishes the resulting URL,
+# which stages/base.py injects as the stage's `escalation` server. So a stage
+# asking "was an escalation ever filed for task X?" gets [] CATEGORICALLY — the
+# per-task record it is looking for lives in a different store and was never in
+# this one. That is not a race, and three incidents read the empty result as
+# positive proof of absence. Denying the read tools removes the false answer at
+# the source; the boundary paragraph in the stage prompts
+# (prompts/__init__.py ESCALATION_BOUNDARY_NOTE) explains the absence.
+#
+# The escalation WRITE tool (escalate_blocker) is deliberately NOT denied: it is
+# the sole sanctioned recon escalation use — Stage 2's Stale Flag Escalation
+# (FIX D) — and it writes to the reconciliation store, which is the correct
+# destination for it. Over-denying here breaks FIX D.
+#
+# PRD open question 4 (reject-vs-omit) resolved during α: `--disallowed-tools`
+# OMITS a denied MCP tool from the agent's tool listing rather than surfacing it
+# and rejecting the call. Verified against five live recon-stage transcripts
+# whose `deferred_tools_delta` → `addedNames` payload excludes exactly each
+# stage's denied names (Stage 3: 80 tools, no builtins / delete_entity /
+# submit_task; Stage 1: 93, no submit_task; Stage 2: 100, builtins only). Because
+# it is omission and not rejection, the agent gets no explanation for the missing
+# tool — which is what makes ESCALATION_BOUNDARY_NOTE load-bearing rather than
+# decorative.
+# `get_task_escalations` (task 3023) is denied for the SAME reason and is the
+# sharpest case of it: `escalation.server.create_server` backs BOTH escalation
+# servers — the orchestrator queue (port 8102) and the reconciliation queue
+# (port 8103, started by reconciliation/harness.py `_start_escalation_server`)
+# — so registering an archive-inclusive per-task lookup there exposes it to
+# recon stages pointed at the WRONG store. Its own docstring says an empty
+# result IS evidence of absence (true for the queue that server is backed by),
+# so a stage calling it against the reconciliation queue would read a
+# categorical [] as proof that an orchestrator gate record was never written —
+# re-arming the 16-instance false positive this task exists to kill, with more
+# authority than the pending-only probe had. The gating here is a DENY list
+# only (there is no allow-list; `_run_stage(disallowed_tools=...)`), so a new
+# read tool on the shared server is exposed to every stage until it is named
+# here — see test_stages.py::test_every_escalation_server_tool_is_classified,
+# which fails on any unclassified addition.
+#
+# `get_task_escalation_history` (task 3164) is the first tool that guard
+# actually caught, and it is the same hazard intensified. It DELEGATES to
+# `get_task_escalations`, so it inherits the identical archive-inclusive
+# cross-store read — but it wraps the result in an envelope that echoes
+# `task_id` and `level_filter` back to the caller. Against the reconciliation
+# queue that turns a categorical `count: 0` into what reads as an attributable,
+# query-specific answer ("no record was ever filed for this task at this
+# level"), when it is only the artefact of asking the wrong store. A bare []
+# at least looks anonymous; a self-describing zero invites being believed. Both
+# per-task archive-inclusive reads therefore sit adjacent below, as one class.
+DISALLOW_ESCALATION_READS = [
+    'mcp__escalation__get_pending_escalations',
+    'mcp__escalation__get_escalation',
+    'mcp__escalation__get_task_escalations',
+    'mcp__escalation__get_task_escalation_history',
+]
+
 # Per-stage disallowed lists
-STAGE1_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_RECON_REPORT_LEDGER_WRITES + DISALLOW_BUILTIN
-STAGE2_DISALLOWED = DISALLOW_BUILTIN  # Memory + task writes are allowed; only built-ins are blocked
+STAGE1_DISALLOWED = (
+    DISALLOW_TASK_WRITES
+    + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_ESCALATION_READS
+    + DISALLOW_BUILTIN
+)
+# Stage 2 keeps full memory + task write access; only built-ins and the
+# escalation reads are blocked.
+STAGE2_DISALLOWED = DISALLOW_ESCALATION_READS + DISALLOW_BUILTIN
 STAGE3_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_MEMORY_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_ESCALATION_READS
     + DISALLOW_BUILTIN
 )
 # NOTE: the IN-PROCESS-STATE `mcp__recon-report__*` tools (start_report, add_finding,

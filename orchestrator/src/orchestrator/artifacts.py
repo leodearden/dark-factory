@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 
 PLAN_SCHEMA_VERSION = 1
 
+# Matches one-or-more leading ``[COMMITTED <hex>]`` provenance tags (with any
+# trailing whitespace) at the START of a step description.  Used by
+# :meth:`TaskArtifacts.mark_step_committed` to strip a stale tag before
+# prepending the current one, so re-marking a step against a DIFFERENT sha
+# (e.g. an amended/squashed commit during re-planning) REPLACES the tag rather
+# than stacking provenance.  The ``+`` also cleans up any tags that a prior
+# (pre-strip) implementation may have already stacked.
+_COMMITTED_TAG_RE = re.compile(r'^(?:\[COMMITTED [0-9a-fA-F]+\]\s*)+')
+
 # Sidecar schema for ``agent_session.json`` (task 2771).  v1 carried only
 # session_id/role/started_at/owner_pid; v2 adds the durable task_id binding,
 # resume_count, and this discriminator.  Every write emits the current version.
@@ -452,6 +461,37 @@ class TaskArtifacts:
         """Remove ``.task/already_done.json`` if present."""
         self._clear_path('already_done.json')
 
+    def write_ready_to_merge(self, commit: str, evidence: str) -> None:
+        """Write ``.task/ready_to_merge.json`` — architect's claim that this
+        task's work is complete on the branch at ``commit`` and only the
+        physical merge to main is missing (a merge-landing desync).
+
+        The workflow validates the desync predicate first-hand (clean
+        fast-forward of main, verify PASSED on this tip, review PASS on this
+        tree) and, if it holds, deterministically enqueues a merge request
+        rather than filing a human escalation.  The exit never lands main
+        itself — the merge worker's scoped re-verify remains the sole gate.
+        """
+        data = {
+            'commit': commit,
+            'evidence': evidence,
+            'reported_at': datetime.now(UTC).isoformat(),
+        }
+        self._write_json(self.root / 'ready_to_merge.json', data)
+
+    def read_ready_to_merge(self) -> dict | None:
+        """Return the parsed ``.task/ready_to_merge.json`` artifact if
+        present, else ``None``.
+        """
+        path = self._read_path('ready_to_merge.json')
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+
+    def clear_ready_to_merge(self) -> None:
+        """Remove ``.task/ready_to_merge.json`` if present."""
+        self._clear_path('ready_to_merge.json')
+
     def write_unactionable_task(self, reason: str, evidence: str) -> None:
         """Write ``.task/unactionable_task.json`` — architect's claim that
         the task spec itself is unworkable (false premise, contradiction,
@@ -702,6 +742,49 @@ class TaskArtifacts:
                     return
 
         logger.warning(f'Step {step_id} not found in plan')
+
+    def mark_step_committed(self, step_id: str, sha: str) -> bool:
+        """Pre-satisfy a plan step/prerequisite at AUTHORING time.
+
+        Flips the matching item's ``status`` to ``'done'``, records the FULL
+        *sha* in its ``commit`` field, and prepends a ``[COMMITTED <sha[:12]>]``
+        provenance tag to its ``description``. Returns ``True`` on a match,
+        ``False`` (with a warning mirroring :meth:`update_step_status`) when no
+        step/prerequisite has ``id == step_id``.
+
+        Unlike :meth:`update_step_status` — contractually "status and commit
+        fields ONLY" — this DELIBERATELY mutates the description, which is why it
+        is a dedicated method rather than an extension of that one. Idempotent
+        per ``(step_id, sha)``: a repeated call keeps the item ``'done'`` and
+        does NOT double-prepend the tag. A re-mark with a DIFFERENT sha REPLACES
+        the tag (any stale leading ``[COMMITTED ...]`` tag is stripped first)
+        rather than stacking provenance, so the description carries exactly the
+        current commit's tag. Pure persistence, NO git — the
+        corroborate-before-acting guard that *sha* actually resolves on-branch
+        lives in ``plan_tools._sha_exists_on_branch``; this method does NOT
+        prove the step's semantics (VERIFY remains the gate).
+        """
+        plan = self.read_plan()
+        tag = f'[COMMITTED {sha[:12]}]'
+
+        for collection in ('prerequisites', 'steps'):
+            for item in plan.get(collection, []):
+                if not isinstance(item, dict):
+                    continue
+                if item.get('id') == step_id:
+                    item['status'] = 'done'
+                    item['commit'] = sha
+                    # Strip any existing leading [COMMITTED <sha>] tag(s) before
+                    # prepending the current one: idempotent for a repeat of the
+                    # same sha, and a clean replace (no stacking) for a re-mark
+                    # with a different sha.
+                    description = _COMMITTED_TAG_RE.sub('', item.get('description') or '')
+                    item['description'] = f'{tag} {description}'
+                    self.write_plan(plan)
+                    return True
+
+        logger.warning(f'Step {step_id} not found in plan')
+        return False
 
     def get_pending_steps(self) -> list[dict]:
         """Return all steps with status 'pending', in order."""
@@ -1187,12 +1270,29 @@ class TaskArtifacts:
         _validate_verdict_role(role)
         self._clear_path(f'verdicts/{role}.json')
 
-    def lock_plan(self, session_id: str) -> bool:
+    def lock_plan(self, session_id: str, *, run_id: str | None = None) -> bool:
         """Atomically acquire the plan lock.
 
         Uses O_CREAT|O_EXCL for atomic exclusive creation (POSIX).
         Returns True if the lock was acquired, False if already locked.
         Raises ValueError if os.getpid() returns a non-int (unexpected env).
+
+        *run_id* is the PROCESS-level run id (``Harness._run_id``, threaded
+        through as ``TaskWorkflow._process_run_id``).  Recording it lets
+        ``TaskGroundTruth._resolve_live_claimant`` compose a full
+        ``shared.task_claimant.compose_claimant_run_id`` identity from the
+        lock — byte-identical to the DB claimant stamp that this same
+        incarnation writes, since ``owner_pid`` below is this same process's
+        pid and the caller passes this same ``session_id`` (task 3563).
+
+        The ``run_id`` key is written ONLY when it is known and non-blank, so
+        its ABSENCE unambiguously means "unknown" — the state of every legacy
+        lock already on disk and of harness-less (test/eval) workflows, whose
+        ``_process_run_id`` is None.  TaskGroundTruth reads that as an unknown
+        claimant identity (``Claimant.run_id is None``) rather than composing
+        a partial one: a well-shaped-but-wrong identity would string-mismatch
+        the DB-composed filing identity and be read downstream as "a DIFFERENT
+        incarnation is live", which is the unsafe direction.
         """
         lock_path = self.root / 'plan.lock'
         try:
@@ -1205,11 +1305,15 @@ class TaskArtifacts:
                 raise ValueError(
                     f'plan.lock owner_pid must be a non-null int, got {owner_pid!r}'
                 )
-            data = json.dumps({
+            payload = {
                 'session_id': session_id,
                 'locked_at': datetime.now(UTC).isoformat(),
                 'owner_pid': owner_pid,
-            })
+            }
+            # Omit entirely when unknown — never write '' (see docstring).
+            if isinstance(run_id, str) and run_id.strip():
+                payload['run_id'] = run_id
+            data = json.dumps(payload)
             os.write(fd, data.encode())
         except Exception:
             # Clean up the empty file created by O_CREAT|O_EXCL so a subsequent

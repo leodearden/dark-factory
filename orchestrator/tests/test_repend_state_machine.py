@@ -53,7 +53,7 @@ from test_harness_reblock_signature_guard import (
 from test_stranded_blocked_sweep import _make_pending_l1, _make_resolved_l1
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
 from orchestrator.scheduler import TaskAssignment
@@ -118,6 +118,12 @@ def config(git_repo: Path) -> OrchestratorConfig:
             remote='origin',
             worktree_dir='.worktrees',
         ),
+        # These workflow-gate e2e tests drive real _invoke against a
+        # bare-minimum fake worktree (no linked-worktree .git gitdir file), so
+        # the sandbox write-set path (compute_write_set, gated on
+        # sandbox.enabled) has nothing valid to parse. They exercise gate
+        # logic, not sandboxing — keep sandbox off for hermeticity.
+        sandbox=SandboxConfig(enabled=False),
     )
 
 
@@ -187,16 +193,30 @@ def test_b1_b2_b3_predicate(severity: str, level: int, expected: bool):
 @pytest.mark.asyncio
 class TestWorkflowGatesB1B2:
     """Gate-in-context tests: born-at-L2 stops the workflow at MERGE-entry (B1)
-    and post-implementer (B2).  Asserts WorkflowOutcome.ESCALATED and that the
-    gate does not consume the pending escalation record."""
+    and post-implementer (B2), and the gate does not consume the pending
+    escalation record.
+
+    The B1 gate's DISPOSITION changed in task 3536 (γ₁, PRD
+    ``plans/task-escalation-state-graph-prd.md`` boundary #2): it used to
+    ``return WorkflowOutcome.ESCALATED`` with no steward and no task-status
+    write, which left the row ``in-progress`` with a nulled claimant once the
+    harness slot exited (spec E1 strand).  It now enters the same bounded
+    ESCALATED machinery every other phase uses; a born-at-L2 record trips
+    ``_wait_for_resolution``'s stop-the-line short-circuit immediately, so the
+    outcome is BLOCKED with the row written before the return.  What gates is
+    unchanged — ``_is_gating_escalation`` is untouched — and B2 still returns
+    ESCALATED because that gate sits on the execute/verify/review path, which
+    has always routed through ``run()``'s own ESCALATED branch.
+    """
 
     async def test_b1_merge_entry_gate(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
     ):
-        """[B1] Born-at-L2 (critical/level=2) pending at MERGE entry → ESCALATED;
-        escalation stays pending (gate does not consume)."""
+        """[B1] Born-at-L2 (critical/level=2) pending at MERGE entry → BLOCKED
+        (row written before the return); escalation stays pending (gate does
+        not consume)."""
         stub = AgentStub()
-        workflow, _, queue = _build_workflow_with_escalation(
+        workflow, scheduler, queue = _build_workflow_with_escalation(
             config, git_ops, task_assignment, stub, tmp_path,
         )
 
@@ -220,16 +240,29 @@ class TestWorkflowGatesB1B2:
 
         workflow._execute_verify_review_loop = _exec_and_escalate  # type: ignore[method-assign]
 
-        outcome = (await workflow.run()).outcome
+        # The born-at-L2 short-circuit fires BEFORE _wait_for_resolution's wait
+        # loop, so no steward window is ever ridden; the guard is here so a
+        # regression that DOES wait fails loudly instead of hanging CI on this
+        # module's stock (unshrunk) timeouts.steward.
+        outcome = (await asyncio.wait_for(workflow.run(), 60)).outcome
 
-        assert outcome == WorkflowOutcome.ESCALATED, (
-            f'MERGE-entry gate must return ESCALATED; got {outcome}'
+        assert outcome == WorkflowOutcome.BLOCKED, (
+            f'MERGE-entry gate must park the row via _mark_blocked; got {outcome}'
         )
-        # Gate does not consume — escalation stays pending.
+        # The row is written BEFORE the terminal return (spec S1) — the half
+        # of the strand shape the old bare-ESCALATED bail never did.
+        assert scheduler.statuses.get(task_id, [])[-1:] == ['blocked'], (
+            f'expected the row parked blocked before the return; got '
+            f'{scheduler.statuses.get(task_id)}'
+        )
+        # Gate does not consume — escalation stays pending.  _mark_blocked's
+        # straggler cleanup dismisses level-0 records only, so the human's L2
+        # survives the park untouched.
         still_pending = queue.get_by_task(task_id, status='pending', level=2)
         assert len(still_pending) == 1, (
             f'Pending L2 must survive the gate (not consumed); got {still_pending}'
         )
+        assert still_pending[0].severity == 'critical'
 
     async def test_b2_post_implementer_gate(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,

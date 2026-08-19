@@ -39,7 +39,7 @@ import argparse
 import pathlib
 import subprocess
 import sys
-from typing import Sequence
+from collections.abc import Sequence
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -51,16 +51,26 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 
 # Host-invariant safety switches that MUST be present in [Service] as
 # non-comment directives.  Extend this list to guard additional safety flags.
-# Restart=on-failure / RestartSec=5 / TimeoutStartSec=300 / TimeoutStopSec=90
-# are host-invariant literal strings (already present verbatim in
-# scripts/fused-memory.service.template) — exact membership matching both
-# detects a divergent value (e.g. a wrong TimeoutStopSec) and lets --fix
-# append the correct line.
+# Restart=on-failure / RestartSec=5 / RestartSteps=4 / TimeoutStartSec=300 /
+# TimeoutStopSec=90 are host-invariant literal strings (already present
+# verbatim in scripts/fused-memory.service.template) — exact membership
+# matching both detects a divergent value (e.g. a wrong TimeoutStopSec) and
+# lets --fix append the correct line.
+#
+# RestartSteps=4 is host-invariant for the same reason the others are, and is
+# listed here rather than left to the template alone because the template is
+# not what runs: the unit above RestartSteps in the template declares
+# RestartMaxDelaySec=60, and systemd DISCARDS that cap on any unit that does
+# not also declare RestartSteps= (it logs "Service has RestartMaxDelaySec= but
+# no RestartSteps= setting. Ignoring." at load and moves on). An installed unit
+# missing this line therefore has no growing backoff at all, silently, and the
+# only way that gets corrected on the host is for this checker to report it.
 REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
     "Environment=MEM0_TELEMETRY=false",
     "WatchdogSec=120",
     "Restart=on-failure",
     "RestartSec=5",
+    "RestartSteps=4",
     "TimeoutStartSec=300",
     "TimeoutStopSec=90",
 )

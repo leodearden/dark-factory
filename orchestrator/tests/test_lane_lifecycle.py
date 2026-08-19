@@ -9,7 +9,10 @@ Step test-quarantine: RED — quarantine method absent.
 
 from __future__ import annotations
 
+import codecs
 import json
+import locale
+import logging
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -23,6 +26,7 @@ from orchestrator.lane_lifecycle import (
     AcquireRoute,
     IllegalLaneTransition,
     LaneLifecycle,
+    LaneRecord,
     LaneState,
 )
 
@@ -68,6 +72,24 @@ class TestStaticContract:
 
     def test_legal_transitions_excludes_illegal_edge(self):
         assert (LaneState.RELEASED, LaneState.IN_USE) not in LEGAL_TRANSITIONS
+
+    def test_quarantined_has_exactly_one_sanctioned_recycle_edge(self):
+        # The ONE sanctioned exit from QUARANTINED: recycle a quarantined slot
+        # back into service (QUARANTINED -> RELEASED) once its bad worktree was
+        # relocated to quarantine_base, so a genuine fresh dispatch can bring
+        # the durable record back to ASSIGNED via the existing RELEASED edge.
+        assert (LaneState.QUARANTINED, LaneState.RELEASED) in LEGAL_TRANSITIONS
+        # Every OTHER QUARANTINED -> X stays illegal: a divergent quarantine
+        # record must never be silently adopted straight back into service.
+        for illegal_target in (
+            LaneState.ASSIGNED,
+            LaneState.IN_USE,
+            LaneState.SEED,
+            LaneState.REGISTERED,
+        ):
+            assert (
+                LaneState.QUARANTINED, illegal_target,
+            ) not in LEGAL_TRANSITIONS
 
     def test_illegal_lane_transition_is_an_exception(self):
         assert issubclass(IllegalLaneTransition, Exception)
@@ -489,3 +511,253 @@ class TestNoteAssigned:
 
         # Never silent-steal: the record is untouched on conflict.
         assert record_path.read_bytes() == before_bytes
+
+
+# ---------------------------------------------------------------------------
+# note_assigned recycles a durably-QUARANTINED slot (task 3029): a genuine
+# fresh dispatch onto a slot whose bad worktree was relocated to
+# quarantine_base must bring the durable record back to ASSIGNED via the
+# sanctioned QUARANTINED -> RELEASED -> ASSIGNED recycle, LOUDLY (never
+# silent-heal) — rather than raising IllegalLaneTransition and drifting the
+# record (the live esc-__lane_record_drift__-1 incident).
+# ---------------------------------------------------------------------------
+
+
+class TestNoteAssignedRecyclesQuarantined:
+    def _quarantined_lane_with_stale_pin(
+        self, tmp_path: Path, lifecycle: LaneLifecycle,
+    ) -> Path:
+        """Drive a lane to a QUARANTINED record still carrying a stale
+        task_id/title/branch from its prior (now-quarantined) assignment.
+        """
+        lane = tmp_path / '_lane-0'
+        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+        lifecycle.transition(lane, LaneState.REGISTERED, branch='task/old')
+        lifecycle.transition(
+            lane, LaneState.ASSIGNED, task_id='old', title='old-demo',
+        )
+        lifecycle.transition(lane, LaneState.QUARANTINED)
+        return lane
+
+    def test_quarantined_lane_recycled_to_assigned_without_raising(
+        self, tmp_path: Path, caplog,
+    ):
+        lifecycle = _lifecycle(tmp_path)
+        lane = self._quarantined_lane_with_stale_pin(tmp_path, lifecycle)
+        seeded = lifecycle.read(lane)
+        assert seeded is not None
+        assert seeded.state == LaneState.QUARANTINED
+
+        # Must NOT raise IllegalLaneTransition (the drift bug): it recycles.
+        with caplog.at_level(logging.WARNING, logger='orchestrator.lane_lifecycle'):
+            record = lifecycle.note_assigned(lane, task_id='42', branch='task/42')
+
+        # Recycled to a clean ASSIGNED record for the NEW task.
+        assert record.state == LaneState.ASSIGNED
+        assert record.task_id == '42'
+        assert record.branch == 'task/42'
+        # The stale prior pin does NOT leak: task_id/title were cleared by the
+        # RELEASED hop before the fresh ASSIGNED (task_id above proves the id;
+        # title proves the RELEASED clear happened).
+        assert record.title is None
+        # Durable record == returned record (record <-> cache consistent, no
+        # drift).
+        assert lifecycle.read(lane) == record
+
+        # LOUD, not silent (never-silent-heal): exactly one WARNING on the
+        # lane_lifecycle logger names the lane and the recycle.
+        recycle_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'orchestrator.lane_lifecycle'
+            and lane.name in r.getMessage()
+            and 'recycl' in r.getMessage().lower()
+        ]
+        assert len(recycle_warnings) == 1
+
+
+class TestDelegatesToSharedAtomicWriter:
+    """``LaneLifecycle._write`` delegates to ``shared.safe_io.atomic_write_text``.
+
+    Task 3223 consolidated the repo's tmp+rename writers into ``shared.safe_io``.
+    These pin that this site's semantics survived the move. Task 3387 fixed
+    the encoding: this site's payload is JSON (RFC 8259 requires JSON on disk
+    to be UTF-8), so the encoding is pinned utf-8 rather than following the
+    process's locale — regardless of the ambient ``LC_ALL``/``LANG`` AND of how
+    the platform happens to spell its UTF-8 alias.
+
+    Task 3387 also pins the READ half of that round-trip
+    (``test_read_decodes_with_an_explicit_utf8_encoding``) — writing utf-8 and
+    then decoding by locale would leave a record that is written correctly and
+    read back as ``CorruptLaneRecord``, which is the failure the write fix
+    exists to prevent, merely relocated.
+
+    Both WRITE pins below monkeypatch ``locale.getpreferredencoding``, and here
+    that patch is LOAD-BEARING rather than decorative: the pre-3387 body called
+    ``locale.getpreferredencoding(False)`` explicitly, at the Python level,
+    so the patch genuinely reaches it and both pins fail against that source on
+    EVERY host. (``session_registry``'s twin pin is deliberately NOT this
+    shape. Its unfixed body was a bare ``os.fdopen(fd, 'w')``, whose default
+    encoding comes from the C-level locale and is unreachable from Python — an
+    identical-looking monkeypatch there was measured INERT, which is exactly
+    how that half of task 3387 first shipped with a vacuous test. Do not
+    copy this shape over there, or that shape over here.)
+
+    MUTATION GATE. With the fix reverted at BOTH sites, both pins here were
+    observed FAILING before the fix was accepted:
+    ``test_delegates_with_preserved_semantics`` with ``assert 'ascii' ==
+    'utf-8'`` after normalisation, and
+    ``test_writes_non_ascii_json_as_utf8_regardless_of_locale`` with
+    ``UnicodeEncodeError: 'ascii' codec can't encode character '\\xe9'``
+    raised inside ``safe_io.atomic_write_text``. Re-run that gate before
+    trusting any future edit to either: BOTH of these passed against the
+    unfixed source once already, so green here is not by itself evidence.
+    A pin not observed failing is not a pin.
+    """
+
+    def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):
+        """One delegated call carrying mkdir=True, 0600, utf-8 encoding, no fsync."""
+        import shared.safe_io as _safe_io
+
+        # Load-bearing (see class docstring): the unfixed body forwards THIS
+        # value as `encoding=`, so with it patched to 'ascii' the assertion
+        # below fails on every host. Without it the pin only discriminated by
+        # the accident of this host spelling its alias 'UTF-8' (uppercase) —
+        # on a host returning lowercase 'utf-8' it was silently vacuous.
+        monkeypatch.setattr(
+            locale, 'getpreferredencoding', lambda do_setlocale=True: 'ascii'
+        )
+
+        calls = []
+        monkeypatch.setattr(
+            _safe_io,
+            'atomic_write_text',
+            lambda path, text, **kwargs: calls.append((path, text, kwargs)),
+        )
+
+        lifecycle = _lifecycle(tmp_path)
+        lifecycle.transition(tmp_path / 'lane-1', LaneState.SEED)
+
+        assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
+        _path, text, kwargs = calls[0]
+        assert json.loads(text)['state'] == LaneState.SEED.value
+        assert kwargs.get('mkdir') is True, 'this site created its parent dir'
+        assert kwargs.get('mode') == 0o600, 'mkstemp created 0600; must not widen'
+        assert not kwargs.get('fsync'), 'this site never fsynced'
+        # Normalised, not compared to the literal 'utf-8': this asserts the
+        # SEMANTIC contract (this names the utf-8 codec) rather than one
+        # spelling of it. The discriminating power comes from the locale patch
+        # above, deliberately, instead of from a string-case accident.
+        assert codecs.lookup(kwargs.get('encoding', 'ascii')).name == 'utf-8', (
+            f'JSON payloads must be written utf-8 regardless of ambient locale '
+            f'(task 3387); got encoding={kwargs.get("encoding")!r}'
+        )
+
+    def test_writes_non_ascii_json_as_utf8_regardless_of_locale(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end: non-ASCII JSON round-trips as utf-8 bytes on disk, even
+        under a non-UTF-8 ambient locale (task 3387 regression pin).
+
+        WHY ``to_json`` IS PATCHED — the naive version of this test cannot
+        discriminate, and shipped that way once. ``LaneRecord.to_json`` is
+        ``json.dumps(..., indent=2)`` with the default ``ensure_ascii=True``,
+        so ``seeded_from_sha='café'`` is flattened to the pure-ASCII escape
+        ``"caf\\u00e9"`` BEFORE it ever reaches the encoder. Encoding an
+        all-ASCII payload as 'ascii' succeeds and is byte-identical to
+        encoding it as utf-8, so no assertion downstream could tell the two
+        apart. Dropping ``ensure_ascii`` here is what actually puts U+00E9 in
+        front of the encoder; the ``isascii`` guard below fails loudly if that
+        ever stops being true, rather than letting the pin go quietly vacuous
+        again.
+        """
+        monkeypatch.setattr(
+            locale, 'getpreferredencoding', lambda do_setlocale=True: 'ascii'
+        )
+        monkeypatch.setattr(
+            LaneRecord,
+            'to_json',
+            lambda self: json.dumps(self.to_dict(), indent=2, ensure_ascii=False),
+        )
+
+        lifecycle = _lifecycle(tmp_path)
+        record = lifecycle.transition(
+            tmp_path / 'lane-1', LaneState.SEED, seeded_from_sha='café'
+        )
+
+        expected = record.to_json()
+        assert not expected.isascii(), (
+            'this pin is vacuous unless a genuinely non-ASCII character reaches '
+            'the encoder — see the ensure_ascii note in the docstring'
+        )
+
+        raw = lifecycle._record_path('lane-1').read_bytes()
+        assert raw == expected.encode('utf-8'), (
+            'on-disk bytes must be the utf-8 encoding of the record even when '
+            'getpreferredencoding() reports a non-UTF-8 codec'
+        )
+        assert 'café' in raw.decode('utf-8')
+
+    def test_read_decodes_with_an_explicit_utf8_encoding(self, tmp_path, monkeypatch):
+        """The READ half of the round-trip names utf-8 too (task 3387).
+
+        Pinning only the write left the round-trip ASYMMETRIC: on a genuinely
+        non-UTF-8 host a record containing non-ASCII bytes was written
+        correctly and then failed to DECODE on the way back in, and because
+        ``UnicodeDecodeError`` subclasses ``ValueError`` it lands in
+        ``_read_or_raise``'s ``except`` clause and resurfaces as
+        ``CorruptLaneRecord`` — the exact quarantined-as-corrupt outcome the
+        write fix exists to prevent.
+
+        A BOUNDARY SPY rather than a write-then-read-back round-trip, and
+        deliberately so: a round-trip CANNOT discriminate here.
+        ``Path.read_text()`` with no encoding resolves its codec through the
+        C-level locale (``io.text_encoding()`` returns the ``"locale"``
+        sentinel), which no in-process monkeypatch can reach — the same
+        measured hazard that made ``session_registry``'s first write pin inert.
+        Under this suite's UTF-8 ambient locale a round-trip therefore passes
+        either way. Spying the argument fails on EVERY host instead: against a
+        locale-dependent read there is no ``encoding`` kwarg at all to
+        accidentally agree with.
+        """
+        lifecycle = _lifecycle(tmp_path)
+        lifecycle.transition(tmp_path / 'lane-1', LaneState.SEED)
+
+        seen: list[dict] = []
+        real_read_text = Path.read_text
+
+        def _spy(self, *args, **kwargs):
+            seen.append(dict(kwargs))
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', _spy)
+
+        record = lifecycle.read(tmp_path / 'lane-1')
+
+        # The spy delegates, so the read really completed — this pin cannot
+        # pass by disabling the thing it is measuring.
+        assert record is not None, 'the delegated read must still return a record'
+        assert record.state == LaneState.SEED
+        assert len(seen) == 1, f'expected exactly one read_text call, recorded {seen}'
+        encoding = seen[0].get('encoding')
+        assert encoding is not None, (
+            'the record was read with no encoding= argument, so it decodes in '
+            'whatever the ambient locale happens to be — the task 3387 bug, '
+            'mirrored onto the read half'
+        )
+        assert codecs.lookup(encoding).name == 'utf-8', (
+            f'JSON on disk is utf-8 (RFC 8259) and must be decoded as utf-8 '
+            f'regardless of ambient locale (task 3387); got encoding={encoding!r}'
+        )
+
+    def test_transition_creates_missing_state_dir_and_round_trips(self, tmp_path):
+        """End-to-end: a first transition creates state_dir and the record reloads."""
+        lifecycle = _lifecycle(tmp_path)
+        assert not lifecycle.state_dir.exists()
+
+        lifecycle.transition(tmp_path / 'lane-1', LaneState.SEED)
+
+        record = lifecycle.read('lane-1')
+        assert record is not None
+        assert record.state is LaneState.SEED
+        assert lifecycle._record_path('lane-1').stat().st_mode & 0o777 == 0o600

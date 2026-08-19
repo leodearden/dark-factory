@@ -21,11 +21,16 @@ Every LLM / MCP / git side effect in this module is an INJECTED seam
 ``escalate_fn``, ``status_fetcher``, ``commit``, ``batch_source``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
 ``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
---project shared``) has no MCP client / httpx / live models, so every
-seam is ALWAYS faked in this module's own test suite; the deterministic
-core (duplicate/dup_rate, the mining batch loop + saturation stop, the
-origin x manifestation matrix, census-state advance, codebook lifecycle
-transforms, report rendering) is unit-tested with no network.
+--project shared``) has no MCP client and no live models, so every seam is
+ALWAYS faked in this module's own test suite; the deterministic core
+(duplicate/dup_rate, the mining batch loop + saturation stop, the origin x
+manifestation matrix, census-state advance, codebook lifecycle transforms,
+report rendering) is unit-tested with no network. Note that httpx IS
+available there -- a direct dependency of ``shared``
+(``shared/pyproject.toml``, ``httpx>=0.27``, task 2965) -- so the seams are
+what keep the suite off the network, not an absent HTTP client: an
+un-faked poster would really reach whatever is listening on
+``$FUSED_MEMORY_MCP_URL`` (default localhost:8002).
 
 Model routing (ratified static policy, PRD §5/§12 -- deliberately NOT the
 adaptive ``resolve_route`` ladder): Sonnet for mining + verification,
@@ -43,6 +48,7 @@ and ``codebook.assert_no_deletion()`` confirm the write is safe.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import functools
 import json
@@ -54,7 +60,7 @@ import sys
 import tempfile
 import traceback
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 # Self-bootstrap for standalone `python scripts/legibility/census.py` runs
@@ -66,13 +72,33 @@ from pathlib import Path
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Bind `shared` to the SAME checkout as this script via a __file__-relative
+# path, never a hardcoded absolute. An editable install puts the MAIN
+# checkout's shared/src on sys.path for a bare `python3`, so without this a
+# copy of this script running from a worktree would scan cap-banner text using
+# the MAIN checkout's marker list rather than its own. Same reasoning and same
+# form as scripts/audit_combine_gate_marker_loss.py:74-84 and
+# scripts/repair_wiped_metadata_files.py:65-75 (tasks 2881/2882/3329), with
+# parents[2] rather than parent.parent because census.py sits one directory
+# deeper (scripts/legibility/, not scripts/). Unconditional -- NOT inside the
+# `__main__` guard above -- because the `shared.cap_markers` import it enables
+# is module-level, so it must resolve under pytest and package import too.
+_SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
+
 import codebook  # noqa: E402
 import coder  # noqa: E402
-import config  # noqa: E402
 import digest  # noqa: E402
 import inventory  # noqa: E402
 import sampling  # noqa: E402
 from legibility import census_trigger  # noqa: E402
+
+# The banner marker list itself lives in shared.cap_markers and is never
+# restated here -- this module only asks the question, via the predicate.
+from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
+
+import config  # noqa: E402
 
 logger = logging.getLogger("legibility.census")
 
@@ -133,15 +159,23 @@ class MiningResult:
     across every consumed batch, per-batch stats, and why mining stopped
     (``"saturated"`` -- ``config.consecutive_batches`` consecutive batches
     at/above ``config.dup_rate``; ``"exhausted"`` -- ``batch_source`` ran
-    out first)."""
+    out first; ``"capped"`` -- the operator's ``max_batches`` cap was
+    reached, so coverage is deliberately PARTIAL).
+
+    ``max_batches`` echoes the operator cap this run was given (``None``
+    when uncapped -- the default). It travels on the result so
+    ``render_report`` can state the cap and its coverage consequence from
+    the mining facts it is already handed, without a second parameter."""
 
     records: list[dict] = field(default_factory=list)
     batch_stats: list[BatchStats] = field(default_factory=list)
     stop_reason: str = "exhausted"
+    max_batches: int | None = None
 
 
 def mine_to_saturation(
     batch_source, codebook_dict: dict, *, project: str, model: str, config, invoke,
+    max_batches: int | None = None,
 ) -> MiningResult:
     """Code batches from *batch_source* against *codebook_dict* via
     ``coder.code_digests`` until novelty saturates.
@@ -171,6 +205,31 @@ def mine_to_saturation(
     ``saturated`` is forced False and the consecutive-saturated counter is
     reset, exactly as if the batch scored below threshold.
 
+    *max_batches* is the OPERATOR COST CAP (``--max-batches``): mining
+    stops with ``stop_reason="capped"`` once that many batches have been
+    coded. The cap is enforced here, inside the loop, rather than by
+    islicing *batch_source* upstream, for two reasons: only this loop
+    knows WHY it stopped, so ``"capped"`` stays distinguishable from a
+    source that genuinely ran dry (an islice wrapper is indistinguishable
+    from ``"exhausted"`` -- exactly the silent-cap failure the cap must
+    not introduce), and the ``return`` happens before the next batch is
+    pulled, so a capped-away batch costs no digest render and no
+    ``coder.code_digests`` call. A capped run is deliberately PARTIAL
+    coverage: sessions beyond the cap were never mined, and
+    ``render_report`` says so in as many words. The saturation check
+    deliberately PRECEDES the cap check, so a run that saturates on
+    exactly the capped batch reports the stronger, more informative
+    ``"saturated"`` (novelty genuinely exhausted -- coverage was
+    sufficient regardless of the cap) rather than under-claiming as
+    partial. ``max_batches=None`` (the default) is exactly today's
+    behavior: no cap, no extra rendering, unbounded mining. A cap below 1
+    raises ``ValueError`` rather than degrading silently: because the cap
+    is checked AFTER a batch is coded, ``max_batches=0`` would still spend
+    one full ``coder.code_digests`` call and then render a
+    self-contradictory "mined 1 batch(es); operator batch cap = 0" line --
+    a silently mis-honored cap on a parameter whose whole purpose is to be
+    an explicit, legible bound.
+
     *config* is a ``config.Saturation``-shaped object (``.dup_rate``,
     ``.consecutive_batches`` -- i.e. a project's
     ``LegibilityConfig.census.saturation``), not the whole
@@ -178,7 +237,16 @@ def mine_to_saturation(
     id (Sonnet miner routing per the ratified static policy -- this
     function does not read ``config.Models`` itself).
     """
-    result = MiningResult()
+    if max_batches is not None and max_batches < 1:
+        raise ValueError(
+            f"max_batches must be >= 1 when set, got {max_batches!r} -- a cap of "
+            "0 or less cannot be honored (the cap is checked after a batch is "
+            "coded, so it would still spend one full coder.code_digests call) "
+            "and would render a self-contradictory coverage line; omit it "
+            "entirely for unbounded mining"
+        )
+
+    result = MiningResult(max_batches=max_batches)
     consecutive_saturated = 0
 
     for index, batch in enumerate(batch_source):
@@ -207,6 +275,18 @@ def mine_to_saturation(
         consecutive_saturated = consecutive_saturated + 1 if saturated else 0
         if consecutive_saturated >= config.consecutive_batches:
             result.stop_reason = "saturated"
+            return result
+
+        # Checked AFTER saturation, deliberately -- see the max_batches
+        # paragraph above. Returning here means batch N+1 is never pulled.
+        if max_batches is not None and len(result.batch_stats) >= max_batches:
+            logger.warning(
+                "mining stopped at the operator batch cap: %d batch(es) mined "
+                "(--max-batches=%d) -- coverage is PARTIAL, not saturated; "
+                "sessions beyond the cap were NOT mined",
+                len(result.batch_stats), max_batches,
+            )
+            result.stop_reason = "capped"
             return result
 
     result.stop_reason = "exhausted"
@@ -286,19 +366,44 @@ def render_matrix(matrix: dict[str, dict[str, int]]) -> str:
 # usage API assumed -- one tiny call, scan its reply for a banner)
 # ---------------------------------------------------------------------------
 
-_HEADROOM_BANNER_MARKERS = (
-    "usage limit",
-    "rate limit",
-    "please run /login",
-    "invalid api key",
-)
-"""Case-insensitive substrings that mark a usage-limit/auth banner reply
-from the headless `claude` CLI, rather than a genuine model response."""
-
 _HEADROOM_PROBE_PROMPT = "ping"
 """The tiny probe prompt -- a cheap single round trip, not a real mining
 call. Its content doesn't matter; only whether the reply carries a banner
 marker or raises."""
+
+_VERIFY_PROBE_EVERY = 5
+"""How many clusters the default verifier adjudicates between backstop
+headroom probes (``_build_default_verify_fn``'s third, weakest detector).
+
+The trade-off this number sets: one extra trickle-tier probe per N
+clusters, against up to N-1 clusters of misattributed verdicts in the one
+residual case the cheaper detectors cannot see (a cap presenting as a
+clean-but-wrong verdict). Verification is one agentic Sonnet call per
+cluster, so a probe per cluster would be cheap but not free, and pointless
+-- the two first-cluster-accurate detectors already cover the cases where
+a cap announces itself."""
+
+
+class CensusHeadroomExhausted(Exception):
+    """Raised when a headroom limit is detected DURING a census stage.
+
+    Not an error in the census -- an external condition that makes the
+    stage's output untrustworthy. It exists so an infra failure can never
+    be laundered into a verdict: ``run_census`` catches it and defers
+    before any persistence, instead of the cap-poisoned clusters landing
+    in the codebook as ordinary rejections.
+
+    Carries the counts an operator needs to size what was interrupted:
+    *verified* clusters adjudicated before the hit, *unverified* ones left
+    (the hitting cluster plus every one never attempted).
+    """
+
+    def __init__(self, *, stage: str, reason: str, verified: int = 0, unverified: int = 0):
+        super().__init__(f"census headroom exhausted during {stage}: {reason}")
+        self.stage = stage
+        self.reason = reason
+        self.verified = verified
+        self.unverified = unverified
 
 
 @dataclass
@@ -318,8 +423,10 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
 
     No usage API is assumed to exist (PRD decision 5) -- this is a cheap
     preflight probe, not a quota lookup. The reply is scanned
-    case-insensitively for a known usage-limit/auth banner marker
-    (``_HEADROOM_BANNER_MARKERS``); a match defers. An invocation error
+    case-insensitively for a known usage-limit/auth banner marker via
+    ``shared.cap_markers.looks_like_blocking_banner`` (capacity OR auth --
+    either means no useful model output is coming); a match defers, and
+    the reason quotes the marker that fired. An invocation error
     raised by *invoke* (e.g. a ``CoderInvocationError``-shaped failure)
     is also treated as a deferral -- fail-safe, never a crash, since a
     probe failure is exactly the kind of "the model isn't reachable right
@@ -331,14 +438,49 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
     except Exception as exc:  # noqa: BLE001 - any probe failure must fail safe
         return HeadroomResult(ok=False, reason=f"headroom probe invocation failed: {exc}")
 
-    lowered = (reply or "").lower()
-    for marker in _HEADROOM_BANNER_MARKERS:
-        if marker in lowered:
-            return HeadroomResult(
-                ok=False, reason=f"headroom probe reply carries a banner marker: {marker!r}",
-            )
+    marker = looks_like_blocking_banner(reply or "")
+    if marker is not None:
+        return HeadroomResult(
+            ok=False, reason=f"headroom probe reply carries a banner marker: {marker!r}",
+        )
 
     return HeadroomResult(ok=True, reason=None)
+
+
+def _stage_headroom_gate(
+    invoke, *, model: str, stage: str, probe_count: list | None = None,
+) -> HeadroomResult:
+    """Re-probe headroom at a stage boundary, logging which stage asked.
+
+    Deliberately NOT a second probe implementation -- it is a thin wrapper
+    over ``preflight_headroom`` that adds the stage name to the log and
+    nothing else, so the "one tiny call, no usage API assumed" decision
+    (PRD decision 5) and its fail-safe exception handling hold identically
+    at every gate.
+
+    *probe_count* is a one-element mutable counter incremented for every
+    probe this gate spends, so the report's cost note can state what the
+    run ACTUALLY paid rather than a hardcoded literal.
+
+    Gates exist only where an unnoticed cap CORRUPTS output, not at every
+    stage transition. Today that means the preflight and this one, before
+    verification. There is deliberately NO gate before synthesis: a cap
+    there makes ``synthesize_fn`` RAISE, which propagates into ``main()``'s
+    hard-failure path and is already loud and already distinguishable from
+    a verification result -- so a gate there would only abort a run whose
+    ``verified`` list is complete and honest, discarding work that was
+    genuinely paid for. Mining is the same: a storm batch is already
+    detected and reported. Do not "complete the pattern" by adding them.
+    """
+    if probe_count is not None:
+        probe_count[0] += 1
+    result = preflight_headroom(invoke, model=model)
+    if not result.ok:
+        logger.warning(
+            "census headroom gate FAILED at the %s stage boundary: %s",
+            stage, result.reason,
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +657,7 @@ def retire_entry(cb: dict, entry_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def advance_census_state(
-    path, *, now_iso: str, report_path: str, done_count: int,
+    path, *, now_iso: str, report_path: str, done_count: int | None,
 ) -> None:
     """Write the §7.5 census-state dict to *path*, atomically.
 
@@ -529,6 +671,34 @@ def advance_census_state(
     census-state.json's SOLE writer, so this is the one place that
     baseline can ever be supplied.
 
+    ``done_count`` is THREE-VALUED (task 3291):
+
+    * a positive int -- a real observed done-count;
+    * ``0`` -- also a real observed done-count, for a project with no done
+      tasks. Unchanged, and still never dropped as falsy;
+    * ``None`` -- the done-count could not be OBSERVED at census time
+      (get_statuses unreachable, or it answered with something that was not
+      a ``{"statuses": mapping}`` envelope). Serialised as JSON ``null``,
+      so the key is still always present and the MUST-persist contract
+      above holds literally. ``compute_tasks_landed`` treats ``null``
+      exactly like an absent key, so condition (b) fails SAFE until the
+      next successful census, with condition (a) (``max_interval_days``)
+      remaining the unconditional backstop.
+
+    Writing a fabricated ``0`` for an unobservable count, or carrying
+    forward the previous file's value, are both FORBIDDEN here. A fabricated
+    0 was written on 2026-07-24 and on 2026-07-31 (task 3291), and it is
+    unsound rather than merely untidy: it turns the delta into
+    ``current_done - 0`` -- every done task ever, ~2872 against a 120
+    threshold. That stayed latent only while the get_statuses fetch was ALSO
+    broken (the same defect zeroed ``current_done``, so the measured pre-fix
+    delta was ``0 - 0``); repairing the fetch alone would have detonated it.
+    See ``census_trigger``'s module docstring for the replayed measurements.
+    A carried-forward stale count is merely a quieter guess, silently
+    under-reporting the next window's delta. ``null`` is the only honest
+    value for an unknown, and it is the caller's job to pass it rather than
+    invent a number.
+
     Uses the same ``tempfile.mkstemp`` + ``os.replace`` atomic-write
     pattern as ``codebook.dump`` (temp file in the same directory as
     *path*, then an atomic rename): a crash or kill mid-write can never
@@ -541,22 +711,79 @@ def advance_census_state(
         "last_census_done_count": done_count,
     }
     directory = os.path.dirname(os.fspath(path)) or "."
+    # WRITER-SIDE parent creation, mirroring trickle_state.py's atomic
+    # writer -- deliberately belt-and-braces with run_census's own
+    # _ensure_output_parents, which serves a different purpose. That call
+    # buys FAIL-FAST (an un-creatable output path must cost nothing rather
+    # than a whole ~$100 mining run) and only covers run_census's four
+    # paths; this line makes the guarantee hold for EVERY caller of this
+    # function, present and future, so nobody can reintroduce the
+    # FileNotFoundError that mkstemp(dir=<missing>) raises just by writing
+    # census state from somewhere new. Idempotent, so the two do not fight.
+    os.makedirs(directory, exist_ok=True)
     fd, tmp_file = tempfile.mkstemp(prefix=".census-state-", suffix=".tmp", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(state, f)
         os.replace(tmp_file, path)
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(tmp_file)
-        except OSError:
-            pass
         raise
 
 
 # ---------------------------------------------------------------------------
 # render_report — dated plans/confusion-census-<date>.md markdown assembly
 # ---------------------------------------------------------------------------
+
+@dataclass
+class VerifyCoverage:
+    """Coverage record for the operator verify cap (``--max-verify-clusters``).
+
+    ``novel`` is how many novel clusters this run's mining actually
+    produced; ``verified`` is how many of them were handed to ``verify_fn``
+    (one Sonnet call each -- the cost being bounded); ``cap`` is the
+    operator cap that produced the split. The ``novel - verified``
+    remainder is DEFERRED, not dropped: those clusters still merge into
+    the codebook as ``pending`` candidates via the untouched
+    ``codebook.apply_coding_record`` path (which consumes raw mining
+    records, not verified clusters), so ``_find_pending_candidate_id`` can
+    still find them.
+
+    That pickup is CONDITIONAL, not automatic, and the report says so:
+    pending candidates are absent from ``coder.build_codebook_index``
+    (entries only), so a recurrence does re-emerge as a novel cluster and
+    gets promoted against the pending id -- but the sightings that produced
+    the deferred cluster in THIS window are never re-mined, because
+    ``advance_census_state`` re-anchors the next window at this run's
+    ``last_census_at``. A deferred cluster is therefore re-adjudicated only
+    if the same confusion RECURS; a one-off deferred by the cap sits pending
+    until a human adjudicates it.
+
+    ``None`` in place of this record means no verify cap was used and no
+    ``## Verification`` section is rendered."""
+
+    novel: int
+    verified: int
+    cap: int | None = None
+
+
+@dataclass
+class DryRunFiling:
+    """Outcome record for ``--dry-run-filing``: every would-be
+    ``submit_task`` payload this run built was written to ``path`` as JSON
+    for human review, and NOTHING was filed into a live task tree.
+
+    ``payload_count`` is how many payloads the file holds. Reused by both
+    ``render_report`` (which must not let an empty ``filed_task_ids`` read
+    as a normal run that filed nothing) and ``CensusOutcome`` (so
+    ``main``'s summary line can name the review file instead of printing a
+    misleading ``filed_tasks=0``). ``None`` in place of this record means
+    the run filed normally."""
+
+    path: str
+    payload_count: int
+
 
 def render_report(
     *,
@@ -568,11 +795,21 @@ def render_report(
     synthesis_md: str,
     filed_task_ids: list[str],
     cost_note: str,
+    verify_coverage: VerifyCoverage | None = None,
+    dry_run: DryRunFiling | None = None,
 ) -> str:
     """Assemble the dated census report as markdown, purely from the
     pieces passed in -- no clock, no model call, no I/O. *date* and every
     piece of LLM-produced prose (*synthesis_md*, *matrix_md*) are inputs,
     so the same inputs always render byte-identical output.
+
+    NO SILENT CAPS: when the operator bounded this run, the report says
+    so in as many words. The batch-cap coverage lines in ``## Saturation``
+    are rendered ONLY when ``mining_result.max_batches`` is not None, so a
+    FLAGLESS run's output is byte-identical to what it was before the
+    operator cost-control flags existed (locked by
+    ``test_render_report_flagless_output_is_byte_identical_golden``). The
+    same gating applies to every other cost-control rendering here.
     """
     lines = [f"# confusion census {date}", "", f"Project: {project_id}"]
 
@@ -585,12 +822,72 @@ def render_report(
     lines.append("")
     lines.append(f"- batches: {len(mining_result.batch_stats)}")
     lines.append(f"- stop reason: {mining_result.stop_reason}")
+    if mining_result.max_batches is not None:
+        # Deliberately states only counts this function was actually handed:
+        # the total number of ENUMERATED sessions is not knowable here
+        # (batch_source is a generic injected iterable), and claiming
+        # "X of Y" would assert a number the code never measured.
+        sessions = sum(stats.total for stats in mining_result.batch_stats)
+        if mining_result.stop_reason == "capped":
+            lines.append(
+                f"- coverage: mined {sessions} session digest(s) across "
+                f"{len(mining_result.batch_stats)} batch(es); operator batch cap = "
+                f"{mining_result.max_batches} batch(es) -- mining was BOUNDED BY THE CAP, "
+                "not run to saturation: sessions beyond the cap were NOT mined, so this "
+                "census is PARTIAL coverage, not a full sweep."
+            )
+            # PARTIAL is not the same as "the rest comes later" -- say which
+            # one this is. run_census always calls advance_census_state, and
+            # _census_window_dates anchors the NEXT window at last_census_at,
+            # so the capped-away sessions fall outside every future window.
+            lines.append(
+                "- NOT PICKED UP LATER: this run still advances last_census_at, so the "
+                "next census window starts here -- the capped-away sessions fall outside "
+                "it and are never re-enumerated. Sweeping them means rolling "
+                "last_census_at back in docs/legibility/census-state.json before the "
+                "next run; a plain re-run will not reach them."
+            )
+        else:
+            lines.append(
+                f"- operator batch cap: {mining_result.max_batches} batch(es) "
+                f"(not reached -- mining stopped by: {mining_result.stop_reason})"
+            )
     for stats in mining_result.batch_stats:
         lines.append(
             f"  - batch {stats.index}: dup_rate={stats.dup_rate:.2f} "
             f"(total={stats.total}, succeeded={stats.succeeded}, failed={stats.failed}, "
             f"saturated={stats.saturated})"
         )
+
+    if verify_coverage is not None:
+        deferred = verify_coverage.novel - verify_coverage.verified
+        lines.append("")
+        lines.append("## Verification")
+        lines.append("")
+        if deferred > 0:
+            lines.append(
+                f"- verified {verify_coverage.verified} of {verify_coverage.novel} novel "
+                f"clusters (operator verify cap: {verify_coverage.cap}); {deferred} deferred "
+                "as pending candidates -- merged into the codebook by this run but NOT "
+                "verified; adjudication deferred to a later census."
+            )
+            # Mirrors the batch-cap disclosure above: "a later census" is
+            # conditional, not automatic. This window's sightings are not
+            # re-mined (last_census_at re-anchors), so a deferred cluster is
+            # re-adjudicated only when the same confusion shows up again.
+            lines.append(
+                "- a deferred candidate is re-adjudicated only if the same confusion "
+                "RECURS in a later window: this run advances last_census_at, so these "
+                "sightings are never re-mined. A one-off deferred by the cap stays "
+                "pending until it is adjudicated by hand."
+            )
+        else:
+            # A cap that was SET BUT NOT REACHED must not emit the deferral
+            # clause -- nothing was deferred and nothing went unverified.
+            lines.append(
+                f"- verified all {verify_coverage.novel} novel cluster(s); operator "
+                f"verify cap: {verify_coverage.cap} (not reached)."
+            )
 
     lines.append("")
     lines.append("## Origin x Manifestation Matrix")
@@ -604,7 +901,15 @@ def render_report(
     lines.append("")
     lines.append("## Filed Tasks")
     lines.append("")
-    if filed_task_ids:
+    if dry_run is not None:
+        # Checked FIRST: under --dry-run-filing, filed_task_ids is empty by
+        # construction, and the plain "_none filed._" placeholder would read
+        # as a normal run that simply had nothing to file.
+        lines.append(
+            f"_dry-run: {dry_run.payload_count} payload(s) written to {dry_run.path} "
+            "-- NOTHING filed; review before filing._"
+        )
+    elif filed_task_ids:
         lines.extend(f"- {task_id}" for task_id in filed_task_ids)
     else:
         lines.append("_none filed._")
@@ -698,6 +1003,42 @@ def _find_pending_candidate_id(cb: dict, title: str | None) -> str | None:
     return None
 
 
+def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
+    """Return *path* if it is free, else the first unused numbered sibling
+    (``{stem}-2{suffix}``, ``{stem}-3{suffix}``, ...).
+
+    A ``--dry-run-filing`` payload file is a human-review deliverable AND
+    the only remaining handle on that run's remediation work -- the run
+    already advanced the codebook and census-state, so nothing can
+    regenerate it (see the dry-run WARNING in ``run_census``). A second
+    dry run on the same date must therefore never overwrite the first.
+
+    The probe is bounded by *limit*; exhausting it raises ``RuntimeError``
+    naming the directory. Raising here is safe precisely because this
+    write precedes ``codebook.dump``/``advance_census_state`` -- the
+    module's ordering invariant means an abort at this point leaves
+    nothing persisted, so a re-run starts clean.
+    """
+    if not path.exists():
+        return path
+    for n in range(2, limit + 1):
+        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(
+        f"census: could not find a free dry-run payload path near {path} -- "
+        f"{limit} numbered siblings already exist in {path.parent}; clear out "
+        "the reviewed ones before running another dry-run census"
+    )
+
+
+def _ensure_output_parents(*paths) -> None:
+    """Create the parent directory of every non-``None`` output path."""
+    for path in paths:
+        if path is not None:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+
 _VALID_ENTRY_SEVERITIES = ("high", "medium", "low")
 """codebook.py's own ``_ENTRY_SCHEMA["severity"]`` enum, duplicated here
 since codebook.py is NOT modified by this module (see the module
@@ -712,15 +1053,101 @@ already spent (reviewer_comprehensive finding #3)."""
 
 @dataclass
 class CensusOutcome:
-    """Outcome of ``run_census``. ``status`` is ``"deferred"`` (headroom
-    preflight failed -- no further work was done) or ``"done"`` (the full
-    pipeline ran to completion)."""
+    """Outcome of ``run_census``. ``status`` is ``"deferred"`` (a headroom
+    gate failed -- NOTHING was persisted) or ``"done"`` (the full pipeline
+    ran to completion)."""
 
     status: str
     reason: str | None = None
     report_path: str | None = None
     filed_task_ids: list[str] = field(default_factory=list)
     stop_reason: str | None = None
+    dry_run: DryRunFiling | None = None
+
+    deferred_stage: str | None = None
+    """Which headroom gate deferred this run: ``"preflight"`` (before any
+    work) or ``"verify"`` (after mining, before or during verification).
+    Meaningful ONLY when ``status == "deferred"``; ``None`` otherwise.
+
+    Exists so the two are distinguishable by FIELD rather than by parsing
+    prose out of ``reason``. They differ in what an operator has lost: a
+    preflight defer spent nothing, a verify defer sank the mining cost.
+    Neither persisted anything, so both recover by re-running."""
+
+    unverified_clusters: int = 0
+    """How many novel clusters were left unadjudicated by a ``"verify"``
+    deferral -- the hitting cluster plus every one never attempted.
+
+    NOT a loss count: because the abort happens before
+    ``advance_census_state``, ``last_census_at`` is untouched and these
+    sightings are re-mined by the next run. It is the size of the work the
+    cap interrupted, which is what makes a defer legible next to an
+    ordinary run in which the verifier genuinely rejected everything."""
+
+
+def _defer(
+    stage: str,
+    reason: str | None,
+    *,
+    escalate_fn,
+    verified: int = 0,
+    unverified: int = 0,
+) -> CensusOutcome:
+    """Abort the census at *stage*: log loudly, escalate, return the outcome.
+
+    ONE owner of the deferral shape, so the preflight gate, the
+    stage-boundary gate and the in-verify abort cannot drift into three
+    slightly different logs/escalations/outcomes (design-invariants:
+    one mechanism, one spelling). Every caller must ``return`` this
+    directly -- a defer that keeps going and persists something is the
+    exact failure this whole guard exists to prevent.
+
+    The escalation is best-effort, matching the mass-rejection site below:
+    a raising ``escalate_fn`` must never be what turns a clean abort into
+    a crash, and the warning above it is the real signal either way.
+    """
+    reason = reason or f"headroom gate failed at the {stage} stage"
+    logger.warning("census deferred at the %s stage: %s", stage, reason)
+
+    detail = reason
+    if stage != "preflight":
+        # BOTH counts. They size the interruption from either side, which is
+        # what tells "capped on cluster 2 of 5" apart from "capped before a
+        # single cluster was adjudicated" -- the stage-boundary gate always
+        # reports 0 verified, an in-verify abort reports where it got to.
+        detail = (
+            f"{reason}\n\n"
+            f"{verified} novel cluster(s) were verified before the cap; "
+            f"{unverified} were NOT verified. Nothing was "
+            "persisted: no report, no matrix, no codebook merge, no filed "
+            "tasks, and last_census_at was NOT advanced -- so this window "
+            "WILL be re-mined and these sightings are not lost. The mining "
+            "spend for this run is sunk. Recovery is a plain re-run once "
+            "capacity returns; re-mining is idempotent (apply_coding_record "
+            "dedups sightings by session)."
+        )
+
+    try:
+        escalate_fn(
+            category="infra_issue",
+            severity="info",
+            summary=(
+                f"legibility census deferred at the {stage} stage "
+                f"({verified} cluster(s) verified, {unverified} unverified): {reason}"
+                if stage != "preflight"
+                else f"legibility census deferred: {reason}"
+            ),
+            detail=detail,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort; the warning above is the real signal
+        logger.warning("census: deferral escalation failed (best-effort): %s", exc)
+
+    return CensusOutcome(
+        status="deferred",
+        reason=reason,
+        deferred_stage=stage,
+        unverified_clusters=unverified,
+    )
 
 
 def run_census(
@@ -742,6 +1169,9 @@ def run_census(
     report_path,
     date: str,
     force: bool = False,
+    max_batches: int | None = None,
+    max_verify_clusters: int | None = None,
+    dry_run_payloads_path: str | Path | None = None,
 ) -> CensusOutcome:
     """Run one periodic legibility census end to end.
 
@@ -756,7 +1186,22 @@ def run_census(
     whole census: files one INFO escalation via *escalate_fn* naming the
     deferral, logs loudly, and returns immediately -- no batch is pulled
     from *batch_source*, no ``submit_fn``/``codebook.dump``/
-    ``advance_census_state`` call happens. Otherwise falls through to the
+    ``advance_census_state`` call happens.
+
+    There is a SECOND headroom gate, after mining and before ``verify_fn``
+    (``_stage_headroom_gate``, skipped when there is nothing to verify).
+    Mining is long and expensive, so a cap absent at preflight can easily
+    have arrived by the time verification starts -- and verification is
+    where an unnoticed cap goes SILENT rather than loud, because the
+    default verifier fails closed per cluster and would record every
+    cap-poisoned call as an ordinary rejection. A mid-run cap detected
+    INSIDE verification surfaces as ``CensusHeadroomExhausted`` and lands
+    on this same path. Both defer through ``_defer``, so all three aborts
+    emit an identical log/escalation/outcome shape, and all three return
+    BEFORE any persistence -- crucially before ``advance_census_state``,
+    so ``last_census_at`` is untouched and the window is re-mined. The
+    outcome's ``deferred_stage``/``unverified_clusters`` tell the two
+    apart. Otherwise falls through to the
     happy path: ``mine_to_saturation`` (Sonnet miners, ``census_miner``) ->
     split records into duplicates vs novel clusters -> ``verify_fn``
     (Sonnet, ``census_verify``, asserts observations vs current main, never
@@ -793,18 +1238,155 @@ def run_census(
     A storm batch encountered during mining (see ``mine_to_saturation``) is
     logged loudly and called out in the report's cost note rather than
     silently folded into a clean-looking result.
+
+    OPERATOR COST CONTROL. *max_batches* bounds mining to that many
+    batches (``--max-batches``). It is the reusable spend brake for a run
+    that cannot rely on saturation to bound itself -- most sharply a FIRST
+    census against an empty codebook, where every batch's ``dup_rate``
+    only measures "the miner found nothing to match" and mining therefore
+    runs to source exhaustion. It defaults to ``None`` = today's
+    behavior: unbounded, no extra rendering. A capped run is deliberately
+    PARTIAL coverage and never pretends otherwise: the report states the
+    cap and says so in as many words, and ``CensusOutcome.stop_reason``
+    is ``"capped"`` -- distinct from the ``"exhausted"`` a source that
+    genuinely ran dry produces. PARTIAL here does NOT mean "the rest is
+    picked up next time": this run still calls ``advance_census_state``,
+    and ``_census_window_dates`` anchors the next window at
+    ``last_census_at``, so the capped-away sessions fall outside every
+    future window and are never re-enumerated. Sweeping them means rolling
+    ``last_census_at`` back in ``docs/legibility/census-state.json`` first;
+    the report bullet says exactly that, so a bounded run cannot be read as
+    a deferred-but-recoverable one. A cap below 1 raises ``ValueError``
+    (see ``mine_to_saturation``) rather than degrading into a half-applied
+    cap.
+
+    *max_verify_clusters* bounds the per-cluster verification spend
+    (``--max-verify-clusters``) to the first N novel clusters in mining
+    order. Selection is a plain ``[:N]`` slice of ``_novel_clusters``'s
+    own first-occurrence-wins ordering -- deterministic given the run,
+    with no invented "most important first" heuristic (any such ranking
+    would need a signal the census does not have pre-verification). The
+    deferred remainder is NOT dropped: the codebook merge below consumes
+    the raw ``mining_result.records``, not the verified clusters, so a
+    deferred cluster still lands as a ``pending`` candidate that
+    ``_find_pending_candidate_id`` can resolve later. That later pickup is
+    CONDITIONAL, though, and the report says so: this run advances
+    ``last_census_at``, so this window's sightings are never re-mined, and
+    a deferred cluster is re-adjudicated only if the same confusion RECURS
+    in a later window (pending candidates are absent from
+    ``coder.build_codebook_index``, so a recurrence does re-emerge as novel
+    and promote against the pending id). A one-off deferred by the cap sits
+    pending until a human adjudicates it. What a deferred cluster
+    unconditionally forgoes is this run's adjudication: the matrix and the
+    synthesis necessarily cover only the VERIFIED subset, and the report's
+    ``## Verification`` section states that split rather than letting a
+    bounded run read as a complete one. A cap below 1 raises ``ValueError``
+    up front -- a negative cap would slice from the END of the cluster list
+    rather than bounding it, which is precisely the silently mis-honored cap
+    this flag exists to make impossible.
+
+    *dry_run_payloads_path* switches filing to review mode
+    (``--dry-run-filing``): every would-be ``submit_task`` payload is
+    written there as JSON for a human to read, *submit_fn* is never
+    called, and ``filed_task_ids`` stays empty. ONLY the external filing
+    is stubbed -- mining, verification, synthesis, the matrix, the
+    codebook merge and promotions, the report write, ``codebook.dump``
+    and ``advance_census_state`` all proceed exactly as on a normal run,
+    so the payload file is a faithful preview of what a real run would
+    file rather than the output of a half-executed census. The write sits
+    at the same point in the sequence the filing loop occupies (after
+    ``build_task_payloads``, before ``codebook.dump``), preserving the
+    ordering invariant above, and the file is appended to the best-effort
+    *commit* paths -- a dry run's deliverable IS the payload file, so it
+    is versioned alongside the report and codebook it came from.
+
+    A dry run is consequently NOT resumable by re-running: the mining, the
+    codebook merge, the promotions, ``codebook.dump`` and
+    ``advance_census_state`` all really happened, so a later census codes
+    these same confusions as ``matches`` (no novel clusters, empty
+    payloads) over a window that has re-anchored at this run's
+    ``last_census_at``. The payload file is the sole remaining handle on
+    the remediation work, which is why it is never overwritten: a
+    colliding path is left untouched and the payloads go to a numbered
+    sibling instead (see ``_free_payloads_path``), so ``dry_run.path`` --
+    not the requested path -- is what the report, the commit paths and
+    ``CensusOutcome`` name.
     """
+    # Validated BEFORE the headroom probe spends anything: a nonsense cap on a
+    # flag whose entire purpose is to be an explicit, legible bound must be
+    # rejected outright, never half-applied. Left unchecked,
+    # max_verify_clusters=-1 would slice novel_clusters[:-1] -- silently
+    # verifying all but the LAST cluster and reporting cap=-1 as if honored.
+    if max_batches is not None and max_batches < 1:
+        raise ValueError(
+            f"max_batches must be >= 1 when set, got {max_batches!r} -- omit it "
+            "entirely for unbounded mining"
+        )
+    if max_verify_clusters is not None and max_verify_clusters < 1:
+        raise ValueError(
+            f"max_verify_clusters must be >= 1 when set, got {max_verify_clusters!r} "
+            "-- a negative cap would slice novel_clusters[:N] from the END rather "
+            "than bounding it; omit it entirely to verify every novel cluster"
+        )
+
+    # Real probe accounting for the report's cost note. A legibility tool
+    # that under-reports its own spend -- in the very artifact an operator
+    # reads to check --max-verify-clusters -- is the same defect class this
+    # pipeline exists to find. Counts THIS function's probes (the preflight
+    # below and the stage gate); the verifier's own in-verify probes are
+    # added from its reported count at the verify site.
+    probe_count = [1]
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
-        reason = headroom.reason or "headroom preflight failed"
-        logger.warning("census deferred: %s", reason)
-        escalate_fn(
-            category="infra_issue",
-            severity="info",
-            summary=f"legibility census deferred: {reason}",
-            detail=reason,
+        return _defer(
+            "preflight",
+            headroom.reason or "headroom preflight failed",
+            escalate_fn=escalate_fn,
         )
-        return CensusOutcome(status="deferred", reason=reason)
+
+    # Every output parent, created ONCE, here -- not at each of the four
+    # write sites below. Three reasons, in order of how much they cost when
+    # ignored:
+    #
+    # (1) FAIL-FAST. On 2026-08-03 a census of /home/leo/src/reify mined to
+    #     saturation (~12.5h, ~$100) and only THEN died on its first output
+    #     write: `[Errno 2] No such file or directory:
+    #     '/home/leo/src/reify/plans/confusion-census-2026-08-02-payloads.json'`
+    #     -- reify simply has no plans/ directory. Creating (or failing to
+    #     create) the parents before mining means an un-creatable output path
+    #     costs nothing instead of a whole mining run.
+    # (2) ONE PLACE. report_path, the dry-run payloads, codebook_path and
+    #     census_state_path are four writers of the SAME run's outputs; a
+    #     mkdir at each is lockstep duplication (INV-5) that drifts the moment
+    #     a fifth output is added. Note this covers codebook.dump and
+    #     advance_census_state too, not just the two write_text calls: both
+    #     write atomically via `tempfile.mkstemp(dir=os.path.dirname(path))`,
+    #     which raises the same FileNotFoundError on a missing directory as
+    #     write_text does. reify tripped only the plans/ pair because main()
+    #     loads its config from <root>/docs/legibility/legibility.yaml, so
+    #     that directory necessarily existed; a target reached via --config
+    #     pointing elsewhere trips the codebook/state pair identically.
+    #     dark-factory's own plans/ + docs/legibility/ are the ONLY reason
+    #     none of this was ever hit before.
+    #     This "one place" argument is honest only for run_census's OWN four
+    #     paths, so it is not the whole guard: advance_census_state also
+    #     creates its parent writer-side (mirroring trickle_state), which
+    #     covers every OTHER caller too. codebook.dump has no such
+    #     writer-side guard yet -- codebook.py sits outside this task's lock
+    #     scope -- so nightly.py's codebook.dump call remains exposed to the
+    #     same FileNotFoundError. Follow-up, not fixed here.
+    # (3) AFTER THE GATE. Sitting below the headroom-defer return rather than
+    #     at the top of run_census keeps the DEFER branch side-effect-free --
+    #     a deferred census creates no empty directories in the target
+    #     project.
+    #
+    # Creating an empty directory is not persisted census state, so the
+    # documented report -> codebook.dump -> advance_census_state ordering
+    # invariant (see this function's docstring and the comments at those
+    # three sites) is untouched by this call.
+    _ensure_output_parents(
+        report_path, codebook_path, census_state_path, dry_run_payloads_path,
+    )
 
     mining_result = mine_to_saturation(
         batch_source,
@@ -813,13 +1395,127 @@ def run_census(
         model=config.models.census_miner,
         config=config.census.saturation,
         invoke=invoke,
+        max_batches=max_batches,
     )
 
     novel_clusters = _novel_clusters(mining_result.records)
-    verify_result = verify_fn(novel_clusters, model=config.models.census_verify) or {}
+    if max_verify_clusters is None:
+        clusters_to_verify = novel_clusters
+        verify_coverage = None
+    else:
+        clusters_to_verify = novel_clusters[:max_verify_clusters]
+        verify_coverage = VerifyCoverage(
+            novel=len(novel_clusters),
+            verified=len(clusters_to_verify),
+            cap=max_verify_clusters,
+        )
+        deferred_count = len(novel_clusters) - len(clusters_to_verify)
+        if deferred_count:
+            logger.warning(
+                "census: operator verify cap (--max-verify-clusters=%d) reached -- "
+                "%d of %d novel cluster(s) DEFERRED, not verified this run; they still "
+                "merge into the codebook as pending candidates (deferred, never "
+                "dropped), but a later census re-adjudicates them only if the same "
+                "confusion RECURS -- this run advances last_census_at, so these "
+                "sightings are not re-mined",
+                max_verify_clusters, deferred_count, len(novel_clusters),
+            )
+
+    # Stage-boundary gate. Mining is long and expensive, so a cap that was
+    # absent at preflight can easily have arrived by now -- and the stage it
+    # guards is the one where an unnoticed cap goes SILENT rather than loud:
+    # the default verifier fails closed per cluster, so every cap-poisoned
+    # verify call would land as an ordinary rejection and the run would exit 0
+    # looking unremarkable. Guarded by `if clusters_to_verify` so a run with
+    # nothing to verify spends no probe on a stage it is about to skip.
+    if clusters_to_verify:
+        stage_headroom = _stage_headroom_gate(
+            invoke, model=config.models.trickle, stage="verify", probe_count=probe_count,
+        )
+        if not stage_headroom.ok:
+            # The reason NAMES the stage. The preflight's reason is left
+            # byte-identical to what it has always been (nothing downstream
+            # that reads it changes), so the stage name is added here, where
+            # it is new information, rather than in _defer where it would
+            # rewrite both.
+            return _defer(
+                "verify",
+                "headroom gate failed at the verify stage boundary: "
+                f"{stage_headroom.reason or 'no headroom'}",
+                escalate_fn=escalate_fn,
+                unverified=len(clusters_to_verify),
+            )
+
+    # A cap detected INSIDE verification lands here. The except must sit so
+    # the abort returns BEFORE the mass-rejection detector, synthesize_fn,
+    # compute_matrix, the codebook merge and every write -- the whole point is
+    # that nothing is persisted, so no cap-poisoned cluster is ever recorded
+    # as a verdict and last_census_at never advances past a window that was
+    # not actually adjudicated.
+    try:
+        verify_result = verify_fn(clusters_to_verify, model=config.models.census_verify) or {}
+    except CensusHeadroomExhausted as exc:
+        return _defer(
+            "verify",
+            f"headroom exhausted during verification: {exc.reason}",
+            escalate_fn=escalate_fn,
+            verified=exc.verified,
+            unverified=exc.unverified,
+        )
+    # The default verifier probes internally (detectors (a)/(b)/(c)) and
+    # reports how many probes it spent, so the cost note below counts those
+    # too rather than only run_census's own two. A verify_fn that omits the
+    # key -- every fake in the tests, any custom verifier -- contributes 0,
+    # and a non-int is ignored rather than crashing a finished census over a
+    # cosmetic count.
+    reported_probes = verify_result.get("headroom_probes")
+    probe_count[0] += reported_probes if isinstance(reported_probes, int) else 0
+
     verified = verify_result.get("verified") or []
     rejected = verify_result.get("rejected") or []
     fixed_entry_ids = verify_result.get("fixed") or []
+
+    # DETECTOR for a systemic verifier failure. Scoping the subprocess cwd
+    # removed one CAUSE of the 2026-08-03 silent mass rejection; it is not a
+    # detector for the class. _build_default_verify_fn fails CLOSED per
+    # cluster -- correctly, an unverifiable claim must reject rather than
+    # crash -- so ANY systemic failure (model unreachable mid-run, a
+    # different permission denial, a persistent parse failure) still
+    # presents as an ordinary all-rejected run, and the report below states
+    # zero verified clusters in the same voice it would use for a genuinely
+    # unremarkable census. "clusters were offered and NONE survived" is the
+    # observable signature of that incident, so say it out loud.
+    #
+    # Not an error and not a defer: an all-rejected run is legitimately
+    # possible, so this must not fail a census whose mining is already
+    # paid for. The escalate_fn call is wrapped because, unlike the
+    # defer-path escalation above (which returns immediately afterwards),
+    # this one sits between the mining spend and the output writes -- a
+    # raising escalate_fn must not be what discards the run's results.
+    if clusters_to_verify and not verified:
+        suspect = (
+            f"census: ALL {len(clusters_to_verify)} verified-candidate cluster(s) were "
+            "REJECTED and none survived -- suspect a systemic verifier failure "
+            "(model unreachable, tool access denied, or unparseable verdicts) rather "
+            "than genuinely unfounded claims. This is the observable signature of the "
+            "2026-08-03 sandbox incident, where the verify subprocess was rooted "
+            "outside the censused tree and every read was permission-denied. Check "
+            "the per-cluster 'verify failed' warnings above; a run with real findings "
+            "is being reported as an empty census if this is systemic."
+        )
+        logger.warning("%s", suspect)
+        try:
+            escalate_fn(
+                category="infra_issue",
+                severity="info",
+                summary=(
+                    f"legibility census: all {len(clusters_to_verify)} cluster(s) rejected "
+                    "-- possible systemic verifier failure"
+                ),
+                detail=suspect,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort; the warning above is the real signal
+            logger.warning("census: mass-rejection escalation failed (best-effort): %s", exc)
 
     synthesis_md = synthesize_fn(verified, model=config.models.census_synthesis)
 
@@ -878,22 +1574,66 @@ def run_census(
     # already-advanced codebook.
     task_payloads = build_task_payloads(verified, project_root=project_root, project_id=project_id)
     filed_task_ids = []
-    for payload in task_payloads:
-        try:
-            submit_result = submit_fn(**payload)
-        except Exception as exc:  # noqa: BLE001 - best-effort, see comment above
+    dry_run_filing = None
+    if dry_run_payloads_path is not None:
+        # --dry-run-filing: write the payloads for human review and file
+        # NOTHING. submit_fn is deliberately left untouched (not swapped for
+        # a collector) so a test can assert it was never reached, and so the
+        # id-less-result WARNING below can never fire for an intentional
+        # operator mode.
+        requested_path = Path(dry_run_payloads_path)
+        resolved_path = _free_payloads_path(requested_path)
+        if resolved_path != requested_path:
             logger.warning(
-                "census: submit_fn failed for payload %r: %s", payload.get("title"), exc,
+                "census: dry-run payload path %s already exists and was left "
+                "UNTOUCHED (an earlier review artifact no re-run can "
+                "regenerate) -- this run's payloads were written to %s instead",
+                requested_path, resolved_path,
             )
-            continue
-        task_id = submit_result.get("id") if isinstance(submit_result, dict) else None
-        if task_id is None:
-            logger.warning(
-                "census: submit_fn returned no usable id for payload %r (result=%r) "
-                "-- not counted as filed", payload.get("title"), submit_result,
-            )
-            continue
-        filed_task_ids.append(task_id)
+        resolved_path.write_text(
+            json.dumps(task_payloads, indent=2) + "\n", encoding="utf-8",
+        )
+        # The WARNING deliberately does NOT offer a repeat census as the
+        # recovery path, because that path is dead: this run merges the
+        # candidates into the codebook and dumps it, so the same confusions
+        # code as `matches` next time, _novel_clusters() comes back empty and
+        # build_task_payloads() returns [] -- and advance_census_state() moves
+        # last_census_at, which _census_window_dates() anchors on, so the
+        # window these payloads came from is never enumerated again. Hand
+        # filing is the only remaining handle on the work; do not reintroduce
+        # the "just run it again without the flag" guidance.
+        logger.warning(
+            "census: --dry-run-filing -- %d task payload(s) written to %s; "
+            "NOTHING was filed into a live task tree. This run HAS ALREADY "
+            "advanced the codebook and census-state, so filing those payloads "
+            "by hand is the only remaining way to land the work: a later "
+            "census will NOT re-file them (these confusions now code as "
+            "matches, not candidates, and the census window has re-anchored).",
+            len(task_payloads), resolved_path,
+        )
+        # Every downstream consumer -- the report's Filed Tasks section, the
+        # commit paths and CensusOutcome -- reads the path off this one
+        # object, so they all name the file actually written.
+        dry_run_filing = DryRunFiling(
+            path=str(resolved_path), payload_count=len(task_payloads),
+        )
+    else:
+        for payload in task_payloads:
+            try:
+                submit_result = submit_fn(**payload)
+            except Exception as exc:  # noqa: BLE001 - best-effort, see comment above
+                logger.warning(
+                    "census: submit_fn failed for payload %r: %s", payload.get("title"), exc,
+                )
+                continue
+            task_id = submit_result.get("id") if isinstance(submit_result, dict) else None
+            if task_id is None:
+                logger.warning(
+                    "census: submit_fn returned no usable id for payload %r (result=%r) "
+                    "-- not counted as filed", payload.get("title"), submit_result,
+                )
+                continue
+            filed_task_ids.append(task_id)
 
     storm_batch_indices = [s.index for s in mining_result.batch_stats if s.status == "failure"]
     if storm_batch_indices:
@@ -904,12 +1644,17 @@ def run_census(
             len(storm_batch_indices), storm_batch_indices,
         )
 
+    # verify is ONE call PER CLUSTER (_build_default_verify_fn), not one call
+    # total -- and the per-cluster count is precisely what an operator using
+    # --max-verify-clusters reads this line to check. headroom-probe is the
+    # run's REAL probe spend: this function's preflight and stage gate PLUS
+    # whatever the verifier reported spending on its own in-verify detectors.
     cost_note = (
         f"invoke calls: {config.models.census_miner} miner="
         f"{sum(s.total for s in mining_result.batch_stats)}, "
-        f"{config.models.census_verify} verify=1, "
+        f"{config.models.census_verify} verify={len(clusters_to_verify)}, "
         f"{config.models.census_synthesis} synthesis=1, "
-        f"{config.models.trickle} headroom-probe=1"
+        f"{config.models.trickle} headroom-probe={probe_count[0]}"
     )
     if storm_batch_indices:
         cost_note += (
@@ -926,6 +1671,8 @@ def run_census(
         synthesis_md=synthesis_md,
         filed_task_ids=filed_task_ids,
         cost_note=cost_note,
+        verify_coverage=verify_coverage,
+        dry_run=dry_run_filing,
     )
     # Written BEFORE codebook.dump()/advance_census_state() below -- a
     # failure here (e.g. a disk-full write_text) leaves nothing but this one
@@ -934,8 +1681,32 @@ def run_census(
     # (reviewer_comprehensive finding #4).
     Path(report_path).write_text(report_md, encoding="utf-8")
 
-    status = status_fetcher()
-    done_count = sum(1 for v in (status.get("statuses") or {}).values() if v == "done")
+    # An unobservable done-count degrades ONLY the next window's condition-(b)
+    # baseline -- it must never abandon a run whose mining has already been
+    # paid for and whose dated report is already on disk above. Aborting would
+    # also leave last_census_at unadvanced, so condition (a) would re-fire the
+    # census every single night -- a strictly more over-eager loop than any
+    # this task set out to fix.
+    #
+    # Both the fetch and the extraction are guarded. extract_done_count is what
+    # stops fused-memory's {"error", "error_type"} envelope -- which rides an
+    # isError:false JSON-RPC response and so arrives here looking like a
+    # perfectly good dict -- from being counted as a done-count of 0 and
+    # persisted as a REAL baseline. Such a fabricated 0 arms condition (b)
+    # with a delta of every-done-task-ever the moment the fetch works again
+    # (task 3291; see census_trigger's module docstring for the replayed
+    # measurements). See advance_census_state's docstring for why null, not 0
+    # and not a carried-forward value, is the honest degradation.
+    try:
+        done_count = census_trigger.extract_done_count(status_fetcher())
+    except Exception as exc:  # noqa: BLE001 - a bad baseline must not fail the census
+        done_count = None
+        logger.warning(
+            "census: done-count unobservable (%s) -- persisting a null "
+            "last_census_done_count; the tasks-landed trigger condition will "
+            "fail safe until the next successful census",
+            exc,
+        )
 
     # codebook.dump() and advance_census_state() are adjacent on purpose
     # (reviewer_comprehensive finding #4): nothing else here can raise
@@ -948,11 +1719,11 @@ def run_census(
         census_state_path, now_iso=date, report_path=str(report_path), done_count=done_count,
     )
 
+    commit_paths = [str(report_path), str(codebook_path), str(census_state_path)]
+    if dry_run_filing is not None:
+        commit_paths.append(dry_run_filing.path)
     try:
-        commit(
-            paths=[str(report_path), str(codebook_path), str(census_state_path)],
-            message=f"legibility census {date}",
-        )
+        commit(paths=commit_paths, message=f"legibility census {date}")
     except Exception as exc:  # noqa: BLE001 - best-effort, never fails the census
         logger.warning("census: best-effort commit failed: %s", exc)
 
@@ -961,6 +1732,7 @@ def run_census(
         report_path=str(report_path),
         filed_task_ids=filed_task_ids,
         stop_reason=mining_result.stop_reason,
+        dry_run=dry_run_filing,
     )
 
 
@@ -1094,10 +1866,17 @@ def default_batch_source(cfg, *, projects_root, now: datetime,
 def _verify_prompt(cluster: dict, *, project_root: str) -> str:
     """Prompt for the real Sonnet verify_fn: confirm-or-refute one novel
     cluster against *project_root*'s current main via targeted file reads.
-    Absolute paths only -- this function never sets a subprocess cwd, so a
-    relative path in the model's own tool calls would resolve against
-    whatever directory the CLI process happens to inherit. Asks for an
-    OBSERVATION, never a diagnosis (codebook lesson
+
+    The CLI subprocess this prompt is delivered to runs with its cwd set to
+    *project_root* (``_build_stage_invokes`` binds it). That is load-bearing
+    for a reason that is NOT relative-path resolution: ``claude -p``
+    SANDBOXES tool access to the cwd tree, so a verifier launched from
+    anywhere else has every Read/Bash against this tree permission-denied,
+    with no interactive prompt to approve (proven 2026-08-03). The
+    absolute-paths instruction below is retained as belt-and-braces on top
+    of that scoping, not as a substitute for it.
+
+    Asks for an OBSERVATION, never a diagnosis (codebook lesson
     guards-assert-unverified-diagnoses)."""
     return (
         "You are the periodic-census verifier for the dark-factory "
@@ -1128,7 +1907,13 @@ def _synthesis_prompt(verified: list) -> str:
     )
 
 
-def _build_default_verify_fn(project_root: str, invoke):
+def _build_default_verify_fn(
+    project_root: str,
+    invoke,
+    *,
+    headroom_probe=None,
+    probe_every: int = _VERIFY_PROBE_EVERY,
+):
     """Build the real ``verify_fn(clusters, *, model)`` seam: one Sonnet
     call per cluster via *invoke* (default ``coder._invoke_cli`` --
     headless ``claude -p --model``), parsed via ``coder.parse_coder_output``.
@@ -1136,22 +1921,241 @@ def _build_default_verify_fn(project_root: str, invoke):
     that cluster rather than crashing the whole census -- a conservative
     fail-closed default for an unverifiable claim. This default never
     reports a "fixed" entry (a stronger claim than a per-cluster verify
-    prompt is designed to elicit)."""
+    prompt is designed to elicit).
+
+    That fail-closed default is correct, and it is also what made the
+    2026-08-03 sandbox gap SILENT: with the CLI subprocess rooted outside
+    the censused tree, every permission-denied verifier read became an
+    ordinary per-cluster rejection, so a whole census mass-rejected without
+    a single error surfacing. What keeps the default honest rather than
+    indiscriminate is ``_build_stage_invokes`` scoping the subprocess cwd to
+    *project_root* -- a rejection then means the claim really could not be
+    verified, not that the verifier could not see the tree.
+
+    Scoping the cwd removed one CAUSE, not the class: a model that goes
+    unreachable mid-run, a different permission denial, or persistently
+    unparseable verdicts all still land here as ordinary rejections. So
+    ``run_census`` additionally DETECTS the signature -- clusters offered,
+    none verified -- and says so loudly rather than quietly reporting an
+    empty census.
+
+    **The cap case is carved out of the fail-closed default.** A usage cap
+    is an infra failure, not a verdict about a claim, and must never be
+    laundered into one -- that is the same silent-mass-rejection class the
+    2026-08-03 incident above describes, arriving by a different route and
+    invisible to the all-rejected detector whenever a cap lands partway
+    through (some clusters verified, so the total-wipeout signature never
+    fires). When *headroom_probe* is supplied, two detectors fire at the
+    FIRST corrupted cluster:
+
+    (a) a reply that FAILED TO PARSE as a verdict carries a blocking banner,
+        and ONE re-probe then confirms no capacity. Banner-matching CONTENT
+        may only TRIGGER a probe, never itself decide that the account is
+        capped -- which makes (a) structurally identical to (b): content or
+        exception triggers, the probe decides.
+
+        The scan is confined to the parse-failure path because **a reply that
+        parses into a verdict IS a verdict and must never be re-read as a
+        banner.** The loose OR-substring marker list is safe on the ``"ping"``
+        -> ``"pong"`` preflight probe precisely because that reply is fixed
+        and contentless; it is unsafe the moment it is pointed at arbitrary
+        model output, because a verify reply is a model-authored
+        ``{"verified":..., "reason":...}`` whose reason legitimately QUOTES the
+        cluster under adjudication -- and this repo's codebook is dominated by
+        clusters ABOUT usage/weekly limits, so the markers match ordinary
+        healthy content. Scanning pre-parse aborted the run on those clusters,
+        and because the abort precedes ``advance_census_state`` the next run
+        re-mined the same window and aborted again: a permanent census stall
+        plus a stream of false "the account is capped" escalations. The
+        probe-confirmation closes the residual half of that class, where the
+        model ignores the prompt's STRICT-JSON instruction and answers in
+        prose about a cap-themed cluster.
+
+        Splitting on parse success loses no detection -- a real CLI cap banner
+        is plain prose, and every entry of ``REAL_CLI_CAP_MESSAGES`` raises
+        ``CoderParseError``, so all of them still reach the scan. That premise
+        is load-bearing, so it is pinned directly rather than asserted here:
+        ``test_every_real_cli_cap_message_fails_to_parse_as_a_verdict``
+        parametrizes the whole corpus, and the detector's own test does too --
+        a newly-observed phrasing that happened to embed a ``{...}`` fragment
+        would parse, bypass this detector and go red there. The probe is
+        reliable in BOTH directions here: ``preflight_headroom`` folds any
+        probe exception into ``HeadroomResult(ok=False)``, so a genuinely
+        capped account confirms whether its probe returns a banner or raises.
+        Cost is bounded and paid only on a path that has ALREADY failed to
+        parse AND matched a marker -- one trickle-tier probe, against a
+        cap-themed cluster permanently stalling the census.
+    (b) a per-cluster invocation exception triggers ONE re-probe. No
+        headroom means ``CensusHeadroomExhausted``, and the hitting cluster
+        is NOT recorded as rejected. Headroom still available means the
+        claim really was unverifiable, and it rejects exactly as before --
+        the fail-closed default is narrowed to non-cap causes, not removed.
+
+    (c) every *probe_every* clusters, a backstop probe. Ordered LAST because
+        it is the weakest: it is the only detector that can miss the first
+        corrupted cluster, letting up to ``probe_every - 1`` clusters be
+        fail-closed rejected before the cap is noticed -- which is the defect
+        above reproduced in miniature. It earns its place by covering the one
+        residual case neither (a) nor (b) can see: a cap presenting as a
+        clean-but-wrong verdict, where the reply parses fine and nothing
+        raises. It is a BACKSTOP for (a) and (b), never the primary, and a
+        counter alone would not be an acceptable design.
+
+        The cost trade-off, stated plainly: one extra trickle-tier probe per
+        *probe_every* clusters, against up to ``probe_every - 1`` clusters of
+        misattributed verdicts in that residual case. No probe is spent after
+        the last cluster, where it would guard a stage already over.
+
+    All three are no-ops without a *headroom_probe* -- literally, now that (a)
+    confirms rather than assumes -- so every existing call site keeps its
+    current behaviour exactly. Production reach is unaffected: ``main()``
+    wires ``headroom_probe=functools.partial(preflight_headroom,
+    verify_invoke, model=cfg.models.trickle)``, so every real run keeps full
+    detection.
+
+    Two properties of the probe seam itself, both owned by the ``_probe()``
+    wrapper below rather than restated at the three call sites:
+
+    * **It is counted.** The result dict carries ``headroom_probes`` -- how
+      many probes this verifier actually spent -- which ``run_census`` folds
+      into the report's cost note. Reported through the return value rather
+      than a counter passed in, because the seam is wired by ``main()`` and a
+      counter would need a second wiring site nothing forces anyone to
+      connect. A caller that ignores the key loses only the count.
+    * **It never raises.** *headroom_probe* is injected and carries no
+      exception contract, so a raising seam is folded into
+      ``HeadroomResult(ok=False)`` exactly as ``preflight_headroom`` folds an
+      invocation error -- a deferral, not an exception escaping into
+      ``main()``'s exit-1 path after the whole mining spend.
+    """
     def _verify_fn(clusters, *, model):
         verified, rejected = [], []
-        for cluster in clusters:
+        # Every probe THIS verifier spends, reported back in the result dict
+        # so run_census's cost note can state the run's real probe spend.
+        # It rides the return value rather than a mutable counter passed in
+        # because the probe seam is wired by main(), not by run_census: a
+        # counter would need a second wiring site that nothing forces anyone
+        # to connect, and an unwired counter is exactly how the cost note
+        # came to under-report in the first place.
+        probes = [0]
+
+        def _probe():
+            """Call the injected probe seam: counted, and never raising.
+
+            *headroom_probe* is an injected seam with no exception contract.
+            Production wires ``preflight_headroom``, which folds any failure
+            into ``HeadroomResult(ok=False)`` -- but a seam that RAISES here
+            would escape ``_verify_fn``, sail past ``run_census``'s
+            ``except CensusHeadroomExhausted`` and land in ``main()``'s
+            hard-failure path: exit 1 plus a traceback escalation, after the
+            whole mining spend, on a path that has ALREADY failed once.
+            Matching ``preflight_headroom``'s own fail-safe stance turns that
+            into the deferral this guard exists to produce.
+            """
+            if headroom_probe is None:
+                # Unreachable -- every call site below is guarded by
+                # `headroom_probe is not None`. Stated rather than asserted so
+                # a future caller that forgets the guard gets the DOCUMENTED
+                # no-probe behaviour (the detectors are no-ops; nothing says
+                # the account is capped) and spends no probe, instead of a
+                # TypeError escaping mid-verification.
+                return HeadroomResult(ok=True, reason=None)
+            probes[0] += 1
+            try:
+                return headroom_probe()
+            except Exception as exc:  # noqa: BLE001 - a raising probe defers, never crashes the census
+                return HeadroomResult(ok=False, reason=f"headroom probe raised: {exc}")
+
+        for index, cluster in enumerate(clusters):
+            # The hitting cluster plus everything never attempted. Computed
+            # identically at every raise site so the counts cannot disagree
+            # about what "unverified" means.
+            remaining = len(clusters) - index
             prompt = _verify_prompt(cluster, project_root=project_root)
             try:
                 raw = invoke(prompt, model)
-                verdict = coder.parse_coder_output(raw)
             except Exception as exc:  # noqa: BLE001 - an unverifiable claim rejects, never crashes
+                # (b) One re-probe, only on a path that has already failed.
+                if headroom_probe is not None:
+                    probe = _probe()
+                    if not probe.ok:
+                        raise CensusHeadroomExhausted(
+                            stage="verify",
+                            reason=(
+                                "verify invocation failed and the headroom re-probe "
+                                f"reports no capacity: {probe.reason or 'no headroom'}"
+                            ),
+                            verified=len(verified),
+                            unverified=remaining,
+                        ) from exc
+                logger.warning(
+                    "census: verify failed for cluster %r: %s", cluster.get("title"), exc,
+                )
+                rejected.append(cluster)
+                continue
+
+            try:
+                verdict = coder.parse_coder_output(raw)
+            except Exception as exc:  # noqa: BLE001 - an unparseable verdict rejects, never crashes
+                # (a) Only a reply that failed to parse as a verdict is
+                # eligible for the banner scan. A parsed verdict is a verdict,
+                # however cap-themed the cluster it adjudicates. And even
+                # here the marker only TRIGGERS: a probe decides.
+                marker = looks_like_blocking_banner(raw or "")
+                if marker is not None and headroom_probe is not None:
+                    probe = _probe()
+                    if not probe.ok:
+                        raise CensusHeadroomExhausted(
+                            stage="verify",
+                            reason=(
+                                "verify reply failed to parse and carries a banner "
+                                f"marker {marker!r}; headroom probe confirms no "
+                                f"capacity: {probe.reason or 'no headroom'}"
+                            ),
+                            verified=len(verified),
+                            unverified=remaining,
+                        ) from exc
+                    logger.warning(
+                        "census: verify reply for cluster %r carries banner marker %r "
+                        "but the headroom probe reports capacity available -- "
+                        "treating it as an ordinary unparseable verdict",
+                        cluster.get("title"),
+                        marker,
+                    )
                 logger.warning(
                     "census: verify failed for cluster %r: %s", cluster.get("title"), exc,
                 )
                 rejected.append(cluster)
                 continue
             (verified if verdict.get("verified") else rejected).append(cluster)
-        return {"verified": verified, "rejected": rejected, "fixed": []}
+
+            # (c) The backstop. Guarded on `remaining > 1` so no probe is
+            # spent after the last cluster, where it would guard a stage
+            # already over.
+            if (
+                headroom_probe is not None
+                and probe_every > 0
+                and (index + 1) % probe_every == 0
+                and remaining > 1
+            ):
+                probe = _probe()
+                if not probe.ok:
+                    raise CensusHeadroomExhausted(
+                        stage="verify",
+                        reason=(
+                            "headroom backstop probe after "
+                            f"{index + 1} cluster(s) reports no capacity: "
+                            f"{probe.reason or 'no headroom'}"
+                        ),
+                        verified=len(verified),
+                        unverified=remaining - 1,
+                    )
+        return {
+            "verified": verified,
+            "rejected": rejected,
+            "fixed": [],
+            "headroom_probes": probes[0],
+        }
 
     return _verify_fn
 
@@ -1177,26 +2181,35 @@ project's get_statuses call already targets."""
 
 
 def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
-    """POST one JSON-RPC ``tools/call`` envelope to *url* and unwrap the
-    result via ``census_trigger._extract_tool_result`` (reused rather than
-    reimplemented -- the same MCP envelope shape applies everywhere in this
-    codebase). ``httpx`` is imported lazily since it is not a ``scripts/``
-    dependency (mirrors ``census_trigger.default_status_fetcher`` /
-    ``nightly._default_poster``)."""
-    import httpx
+    """Call MCP tool *tool_name* at *url*, returning its unwrapped result.
 
-    response = httpx.post(
-        url,
-        json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments},
-        },
-        timeout=30.0,
-    )
-    response.raise_for_status()
-    return census_trigger._extract_tool_result(response.json())
+    A thin delegate to ``census_trigger.post_mcp_tool_call``, which
+    single-sources the whole MCP transport contract for this subsystem
+    (headers, session handshake, body decoding, envelope unwrap). The seam
+    NAME and signature are preserved deliberately: ~6 tests monkeypatch this
+    function as THE single MCP boundary, and both consumers --
+    :func:`default_submit_fn` and :func:`_build_default_escalate_fn` -- keep
+    routing through it.
+
+    Two transport facts, both verified live and both previously unhandled
+    here, are why this is no longer a bare POST (task 3644):
+
+    * The escalation server (:8103) is a STATEFUL streamable-HTTP server. A
+      session-less ``tools/call`` is rejected at the transport layer, before
+      the tool runs, with ``400 Bad Request`` / ``"Missing session ID"``. The
+      client must first ``initialize`` (session-less), carry the
+      server-assigned ``mcp-session-id``, and retry.
+    * With a session, that server answers ``tools/call`` with
+      ``content-type: text/event-stream``, so ``response.json()`` raises.
+
+    Because :func:`_build_default_escalate_fn` swallows POST failures
+    best-effort, both defects were silent: every legibility census escalation
+    ever filed was dropped at the transport layer. The fused-memory server
+    (:8002) is STATELESS by contrast -- one bare POST, ``application/json``,
+    no session -- and ``post_mcp_tool_call`` handshakes only on a 400, so
+    :func:`default_submit_fn`'s path is unchanged.
+    """
+    return census_trigger.post_mcp_tool_call(url, tool_name, arguments, timeout=30.0)
 
 
 def default_submit_fn(**kwargs) -> dict:
@@ -1272,11 +2285,36 @@ def _parse_cli_date(value: str) -> date:
     return date.fromisoformat(value)
 
 
-def _build_stage_invokes(cfg):
+def _positive_int(value: str) -> int:
+    """``argparse`` ``type=`` for the operator cost caps: an int >= 1.
+
+    A cap of 0 or a negative value is rejected at the CLI boundary (exit
+    2, with a message) rather than half-applied downstream: ``--max-batches
+    0`` would still code one full batch (the cap is checked after a batch
+    is coded) and then render a self-contradictory coverage line, and
+    ``--max-verify-clusters -1`` would slice ``novel_clusters[:-1]``,
+    verifying all but the LAST cluster while reporting ``cap=-1`` as if
+    honored. Both are exactly the silent, mis-honored cap these flags exist
+    to make impossible -- so a nonsense value fails loud. Omitting the flag,
+    not passing 0, is how you ask for no cap."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected an integer, got {value!r}"
+        ) from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be 1 or greater, got {parsed} -- omit the flag entirely for no cap"
+        )
+    return parsed
+
+
+def _build_stage_invokes(cfg, *, project_root):
     """Build the three per-stage ``invoke(prompt, model)`` seams, each
     carrying its OWN claude-CLI subprocess timeout from ``cfg.timeouts``
     (see ``config.Timeouts`` for the rationale — why each stage needs its
-    own budget).
+    own budget) and each scoped to *project_root* as its subprocess cwd.
 
     Returns ``(mining_invoke, verify_invoke, synthesis_invoke)``. Every
     census stage calls its invoke as ``invoke(prompt, model)`` with two
@@ -1285,14 +2323,50 @@ def _build_stage_invokes(cfg):
     ``mining_invoke`` also backs the headroom probe (``run_census`` routes
     both through its single ``invoke`` param).
 
+    *project_root* is bound as ``cwd`` on ALL THREE partials, not on verify
+    alone. VERIFY is where the gap was proven fatal (fleet session
+    census-reify-3386101, 2026-08-03): it is the only stage whose prompt
+    directs the model to read the target tree, and ``claude -p`` sandboxes
+    tool access to its cwd tree, so censusing a project from some other
+    directory permission-denied every verifier read. Scoping only verify
+    would nonetheless leave mining and synthesis silently rooted in
+    whatever directory the operator launched from — an asymmetry with no
+    defensible reason that a later reader would file as a bug. Binding all
+    three makes "the census subprocess runs inside the censused project" a
+    uniform invariant instead of a verify-only patch.
+
+    That uniformity is NOT free, and the cost belongs on the record.
+    Mining and synthesis take no tool action, but their cwd is still
+    observable: ``claude -p`` assembles context from the directory it runs
+    in — CLAUDE.md, ``.claude/settings.json`` (hooks included) and
+    ``.mcp.json`` are all cwd-relative. Scoping the subprocess to the
+    censused project therefore prepends THAT project's CLAUDE.md to every
+    mining call — and mining is both the highest-volume stage (hundreds of
+    calls) and the dominant cost of a ~$100 census — and can fire that
+    project's session hooks inside the census subprocess. It is still the
+    right trade: reading the censused project's own conventions is if
+    anything more correct for mining, and the alternative is two stages
+    silently rooted in an arbitrary directory. But if the added per-call
+    context ever measures material, the lever is an explicit
+    ``--settings``/``--strict-mcp-config``-style flag on the mining and
+    synthesis partials — NOT un-scoping their cwd, which would restore the
+    asymmetry this paragraph exists to rule out.
+
     ``coder._invoke_cli`` is looked up here at call time (inside this
     function, invoked from ``main``), never bound at import, so
     monkeypatching ``coder._invoke_cli`` in tests takes effect.
     """
+    cwd = str(project_root)
     return (
-        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_mining_secs),
-        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_verify_secs),
-        functools.partial(coder._invoke_cli, timeout=cfg.timeouts.census_synthesis_secs),
+        functools.partial(
+            coder._invoke_cli, timeout=cfg.timeouts.census_mining_secs, cwd=cwd,
+        ),
+        functools.partial(
+            coder._invoke_cli, timeout=cfg.timeouts.census_verify_secs, cwd=cwd,
+        ),
+        functools.partial(
+            coder._invoke_cli, timeout=cfg.timeouts.census_synthesis_secs, cwd=cwd,
+        ),
     )
 
 
@@ -1314,12 +2388,47 @@ def main(argv: list[str] | None = None) -> int:
     scoped git-commit helper) and runs the full pipeline via
     ``run_census``.
 
+    Three OPERATOR COST-CONTROL flags bound what a single run may spend,
+    each defaulting to today's unbounded behavior so a flagless
+    invocation -- notably the nightly trickle's, which passes no extra
+    argv -- is unchanged: ``--max-batches N`` bounds mining (the
+    capped-away sessions are NOT re-mined by a later census -- this run
+    still advances ``last_census_at``, so the next window starts here),
+    ``--max-verify-clusters N`` bounds per-cluster verification (a deferred
+    cluster is re-adjudicated only if that confusion RECURS in a later
+    window), and ``--dry-run-filing`` writes every would-be task payload to
+    ``plans/confusion-census-<date>-payloads.json`` (alongside the dated
+    report) for human review instead of filing it -- those payloads must
+    then be filed by hand, since this run still advances the codebook and
+    census-state and a later census will not re-file them. They are composable
+    and reusable, not first-census-only, though an attended FIRST census
+    against an empty codebook is where all three matter most: saturation
+    cannot bound that run, since every batch's dup_rate then only
+    measures "the miner found nothing to match". Both numeric caps take
+    ``type=_positive_int``, so a nonsense value (0 or negative) exits 2 at
+    the CLI boundary instead of being half-applied. None of the three lets
+    a bounded run masquerade as a complete one, or as one whose remainder
+    is automatically picked up later -- see ``run_census`` and
+    ``render_report``.
+
     Returns non-zero only on a genuine fail-loud error (a config-load
     failure, or an uncaught exception from ``run_census``) -- a deferred
     (headroom-preflight) outcome still exits 0, mirroring
     ``census_trigger``'s own CLI contract of reserving a non-zero exit for
     an operator-facing failure, not an expected defer/no-fire outcome.
+
+    Configures logging FIRST, before arg parsing and so before the trigger
+    gate, which is what gets this module's INFO lines (the empty-codebook
+    line, the per-stage progress lines) into the journal on EVERY
+    invocation -- including one that no-ops at the gate. Without it root
+    sits at its WARNING default and they are all silently dropped. Shares
+    ``config.configure_logging`` with ``nightly.main()`` rather than
+    inlining a second ``basicConfig``, so the env var
+    (``LEGIBILITY_LOG_LEVEL``), the default level and the format cannot
+    drift between the two entrypoints (INV-5 no-lockstep-duplication).
     """
+    config.configure_logging()
+
     parser = argparse.ArgumentParser(
         prog="census",
         description="Legibility periodic-census runner "
@@ -1342,9 +2451,64 @@ def main(argv: list[str] | None = None) -> int:
         "--date", default=None, type=_parse_cli_date,
         help="Census date YYYY-MM-DD (default: today UTC).",
     )
+    parser.add_argument(
+        "--max-batches", type=_positive_int, default=None,
+        help="Operator cost control: stop mining after N batches (N >= 1; omit "
+        "for no cap). Omit for today's behavior -- mine until novelty saturates "
+        "or the source runs out. A capped run is deliberately PARTIAL coverage "
+        "and says so in the report; its stop_reason is 'capped', not "
+        "'exhausted'. The capped-away sessions are NOT re-mined later: this run "
+        "still advances last_census_at, so the next census window starts here.",
+    )
+    parser.add_argument(
+        "--max-verify-clusters", type=_positive_int, default=None,
+        help="Operator cost control: verify at most N novel clusters (one "
+        "Sonnet call each), taken in mining order (N >= 1; omit for no cap). "
+        "Omit to verify every novel cluster. The deferred remainder still "
+        "merges into the codebook as pending candidates -- deferred, never "
+        "dropped -- but is re-adjudicated only if the same confusion RECURS in "
+        "a later window; this window's sightings are not re-mined.",
+    )
+    parser.add_argument(
+        "--dry-run-filing", action="store_true",
+        help="Operator cost control: write every would-be task payload to "
+        "plans/confusion-census-<date>-payloads.json for human review and "
+        "file NOTHING. Everything else (codebook update, promotions, report, "
+        "census-state advance) proceeds normally -- and because the codebook "
+        "and census-state DO advance, the payloads must be filed by hand; a "
+        "later census will not re-file them. An existing payload file is "
+        "never overwritten (the payloads go to a numbered sibling instead).",
+    )
     args = parser.parse_args(argv)
 
-    project_root = Path(args.project_root)
+    # Resolved, not used raw: --project-root defaults to "." and is routinely
+    # passed relative. An unresolved relative root would make the stage cwd
+    # binding below vacuous (cwd="." IS the launcher's cwd — exactly the bug
+    # that binding exists to close) and would silently falsify
+    # _verify_prompt's own "ABSOLUTE paths only" contract, since it
+    # interpolates str(project_root) straight into the prompt. One resolve()
+    # at the CLI boundary makes the prompt text, the subprocess cwd and all
+    # four output paths name the same absolute tree.
+    project_root = Path(args.project_root).resolve()
+
+    # Rejected LOUDLY here, at the CLI boundary, rather than left to fail
+    # somewhere downstream. Now that project_root is also the stage
+    # subprocess cwd, a typo'd root surfaces on the FIRST invoke -- the
+    # headroom probe -- as a CoderInvocationError, and preflight_headroom
+    # deliberately folds ANY probe exception into HeadroomResult(ok=False).
+    # Without this check `census --project-root /typo --config <real one>`
+    # would exit 0 with "census deferred: headroom probe invocation
+    # failed: ..." plus an INFO escalation: an operator typo wearing the
+    # exact costume of a usage-limit defer, on every subsequent run. A
+    # non-existent root is never a deferral -- it is a bad argument.
+    if not project_root.is_dir():
+        print(
+            f"census: --project-root {args.project_root!r} resolves to "
+            f"{project_root}, which is not an existing directory",
+            file=sys.stderr,
+        )
+        return 1
+
     config_path = (
         Path(args.config) if args.config
         else project_root / "docs" / "legibility" / "legibility.yaml"
@@ -1356,7 +2520,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"census: failed to load config at {config_path}: {exc}", file=sys.stderr)
         return 1
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     date_str = args.date.isoformat() if args.date is not None else now.date().isoformat()
     status_fetcher = census_trigger.default_status_fetcher(project_root)
 
@@ -1373,6 +2537,12 @@ def main(argv: list[str] | None = None) -> int:
     codebook_path = project_root / "docs" / "legibility" / "confusion-codebook.yaml"
     census_state_path = project_root / "docs" / "legibility" / "census-state.json"
     report_path = project_root / "plans" / f"confusion-census-{date_str}.md"
+    # Derived from report_path.parent so the human-review payload file stays
+    # co-located with the dated report even if the report location moves.
+    dry_run_payloads_path = (
+        report_path.parent / f"confusion-census-{date_str}-payloads.json"
+        if args.dry_run_filing else None
+    )
 
     try:
         codebook_dict = codebook.load(codebook_path)
@@ -1384,7 +2554,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Each census stage gets its OWN claude-CLI subprocess timeout; see
     # config.Timeouts for the rationale.
-    mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(cfg)
+    mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(
+        cfg, project_root=project_root,
+    )
 
     # One escalate_fn closure shared by BOTH consumers: run_census's
     # headroom-defer path (lines ~800) and main()'s hard-failure catch-all
@@ -1398,7 +2570,17 @@ def main(argv: list[str] | None = None) -> int:
                 cfg, projects_root=DEFAULT_PROJECTS_ROOT, now=now,
             ),
             invoke=mining_invoke,
-            verify_fn=_build_default_verify_fn(str(project_root), verify_invoke),
+            # The in-verify re-probe rides the SAME cwd-scoped invoke as the
+            # verifier it guards (so it fails exactly when the verifier would)
+            # but on the cheap trickle tier, matching every other headroom
+            # gate -- one probe implementation, one model tier, four sites.
+            verify_fn=_build_default_verify_fn(
+                str(project_root),
+                verify_invoke,
+                headroom_probe=functools.partial(
+                    preflight_headroom, verify_invoke, model=cfg.models.trickle,
+                ),
+            ),
             synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
             submit_fn=default_submit_fn,
             escalate_fn=escalate_fn,
@@ -1413,6 +2595,9 @@ def main(argv: list[str] | None = None) -> int:
             report_path=report_path,
             date=date_str,
             force=args.force,
+            max_batches=args.max_batches,
+            max_verify_clusters=args.max_verify_clusters,
+            dry_run_payloads_path=dry_run_payloads_path,
         )
     except Exception as exc:  # noqa: BLE001 - fail loud: escalate (PRD decision 8) AND exit non-zero, never a silent crash
         print(f"census: FAILED -- {exc}", file=sys.stderr)
@@ -1430,7 +2615,26 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if outcome.status == "deferred":
-        print(f"census: deferred -- {outcome.reason}")
+        # The FIELDS, not only the prose. The two defer flavours read much the
+        # same in `reason` but cost an operator completely different things: a
+        # preflight defer spent nothing, a verify defer sank the whole mining
+        # spend and left N clusters unadjudicated (re-mined next run, never
+        # lost). Printing neither hides that from the person watching the run.
+        print(
+            f"census: deferred -- stage={outcome.deferred_stage} "
+            f"unverified_clusters={outcome.unverified_clusters} -- {outcome.reason}"
+        )
+        return 0
+
+    if outcome.dry_run is not None:
+        # A bare filed_tasks=0 here would read as "a normal run that had
+        # nothing to file" -- name the review file and the count instead.
+        print(
+            f"census: done -- report={outcome.report_path} "
+            f"dry-run-filing: {outcome.dry_run.payload_count} payload(s) -> "
+            f"{outcome.dry_run.path} (nothing filed) "
+            f"stop_reason={outcome.stop_reason}"
+        )
         return 0
 
     print(

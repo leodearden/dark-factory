@@ -1,6 +1,6 @@
 """Contract tests for ``conftest.py`` correctness.
 
-This module guards five invariants that would silently regress under refactoring
+This module guards six invariants that would silently regress under refactoring
 and are NOT already covered by other tests:
 
 1. **sys.path ordering / module resolution** — ``conftest.py`` must insert
@@ -29,6 +29,15 @@ and are NOT already covered by other tests:
    fixture must set a concrete ``Path`` under ``tmp_path`` for
    ``overrides_db_path`` so ``OverrideStore.from_config(config)`` can call
    ``.parent.mkdir()`` and ``sqlite3.connect(str(...))`` without crashing.
+
+6. **``make_steward`` owns its worktree** — the shared steward factory (as of
+   task 3514, the suite's *only* one) must root every worktree it builds
+   strictly *below* the test's ``tmp_path``, whether the caller supplies one or
+   not, so pytest's retention policy reclaims both the worktree and the
+   ``.task-meta`` sibling the steward derives from it, and two default builds in
+   one test must not collide.  Its pass-through kwargs and the config /
+   collaborator defaults the folded-in factories depended on are pinned here
+   too.  See ``TestMakeStewardFixture``.
 
 Tests of plain attribute defaults (e.g. ``mock.usage_cap.enabled is False``)
 are deliberately omitted — they would just duplicate literals from
@@ -303,3 +312,425 @@ def test_mock_orch_config_overrides_db_path_default(mock_orch_config, tmp_path):
     assert db_path.suffix == '.db', (
         f'expected overrides_db_path to have .db suffix, got {db_path.name!r}'
     )
+
+
+class TestMakeStewardFixture:
+    """Contract tests for the ``make_steward`` conftest fixture-factory.
+
+    ``make_steward`` is the suite's ONLY steward factory.  Task 3461 merged the
+    two near-identical ``_make_steward`` copies from ``test_suggestion_triage.py``
+    and ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two
+    that remained (``test_out_of_band_routing.py``'s, and ``test_steward.py``'s
+    five-fixture graph, whose fixture names survive there as views onto a single
+    build).  See the fixture docstring in ``conftest.py``.
+
+    Because it closes over ``tmp_path`` it can *own* the worktree directory
+    rather than merely documenting a convention, which is what these tests pin:
+
+    - the default worktree is fixture-owned, created, and distinct per call, so
+      repeated default builds cannot share ``.task/``, the ``.task-meta`` sibling
+      that holds ``verdicts/triage.json``, or the derived escalation ``queue_dir``;
+    - a caller-supplied worktree is rejected unless it is strictly below
+      ``tmp_path``, checked *before* any ``mkdir``;
+    - ``config_overrides`` is applied last (the row-9 ``steward_max_attempts=1``
+      divergence rides on this channel — it is the only field the four former
+      factories genuinely disagreed on);
+    - the ``task`` / ``event_store`` / ``cost_store`` / ``escalation_queue``
+      kwargs pass through, and the config + collaborator defaults the folded-in
+      factories set locally are real values rather than child ``MagicMock``s.
+
+    Per this module's exclusion policy (see the module docstring), the scalar
+    config defaults and the collaborators' canned return values are NOT asserted
+    here: those literals live 20 lines away in ``conftest.py``, and the real
+    regression detector for them is the migrated call sites themselves.  The
+    defaults tests below therefore assert *types* and *containment*, never the
+    literals.
+    """
+
+    def test_default_worktree_is_created_under_tmp_path(self, make_steward, tmp_path):
+        """``make_steward()`` with no arguments yields a created, tmp_path-rooted worktree.
+
+        The steward's pre-flight auto-escalates "Worktree missing" on a path
+        that is not a directory, and the row-9 call site reads ``.task/``, so
+        both must exist.  Strictly-below-``tmp_path`` is the retention
+        invariant: the steward derives its artifacts root as
+        ``<worktree.parent>/.task-meta/<worktree.name>`` (see
+        ``orchestrator/config.py`` ``TASK_META_DIRNAME`` and
+        ``artifacts.TaskArtifacts.meta_root_for``), so a worktree AT
+        ``tmp_path`` would put that sibling outside the dir pytest reclaims.
+        """
+        from orchestrator.steward import TaskSteward
+
+        steward = make_steward()
+
+        assert isinstance(steward, TaskSteward), (
+            f'expected a TaskSteward, got {type(steward).__name__!r}'
+        )
+        wt = steward.worktree
+        assert wt.is_dir(), f'expected make_steward() to create {wt}, but it is not a directory'
+        assert wt.resolve() != tmp_path.resolve(), (
+            f'default worktree must be strictly below tmp_path, got {wt} == tmp_path'
+        )
+        assert wt.resolve().is_relative_to(tmp_path.resolve()), (
+            f'expected default worktree under tmp_path={tmp_path}, got {wt}'
+        )
+        assert (wt / '.task').is_dir(), (
+            f'expected a .task subdirectory under {wt} — row 9 of '
+            f'test_workflow_state_machine_boundary.py reads it'
+        )
+
+    def test_project_root_is_a_real_path_inside_the_sandbox(self, make_steward, tmp_path):
+        """``config.project_root`` is a real ``Path`` under ``tmp_path``, not a bare mock.
+
+        The sandbox invariant this refactor fixed: the retired triage factory
+        set the ``/tmp/project`` literal, which pointed outside the test's tmp
+        dir, so anything the steward wrote relative to it escaped pytest's
+        retention sweep.  A ``MagicMock`` here would also silently satisfy every
+        ``/``-join in the steward without producing a real directory.
+
+        The scalar config defaults (``steward_max_attempts``, ``models.*``,
+        ``escalation.port``, …) are deliberately NOT asserted — they would
+        restate ``conftest.py``'s literals without detecting a regression.
+        """
+        project_root = make_steward().config.project_root
+        assert isinstance(project_root, Path), (
+            f'expected project_root to be a real Path, got {type(project_root).__name__!r}'
+        )
+        assert project_root.resolve().is_relative_to(tmp_path.resolve()), (
+            f'expected project_root under tmp_path={tmp_path}, got {project_root} — '
+            f'the old /tmp/project literal pointed outside the test sandbox'
+        )
+
+    def test_config_overrides_applied_after_defaults(self, make_steward):
+        """``config_overrides`` wins over the defaults, and does not leak between builds.
+
+        This is the row-9 boundary variant's only real divergence from the
+        triage variant (``steward_max_attempts`` 1 vs 3), so it is the
+        regression pin for the override channel that lets one factory serve
+        both.  A sibling default-built steward must still report 3.
+        """
+        overridden = make_steward(config_overrides={'steward_max_attempts': 1})
+        default = make_steward()
+
+        assert overridden.config.steward_max_attempts == 1, (
+            'config_overrides must be applied AFTER the defaults'
+        )
+        assert default.config.steward_max_attempts == 3, (
+            'an override on one steward must not leak into a sibling build'
+        )
+
+    def test_config_mock_is_spec_set(self, make_steward):
+        """The config mock keeps ``spec_set=pydantic_spec(OrchestratorConfig)``.
+
+        Guards the move into conftest.py: both former factories built their
+        config with ``MagicMock(spec_set=pydantic_spec(OrchestratorConfig))``,
+        so a typo'd field name raised ``AttributeError`` on read and write.  A
+        refactor that dropped ``spec_set=`` would silently create phantom
+        attributes instead, and every existing call site would still pass.
+        """
+        steward = make_steward()
+        with pytest.raises(AttributeError):
+            steward.config.steward_max_attemptz = 1
+
+    @pytest.mark.asyncio
+    async def test_briefing_initial_prompt_is_awaitable(self, make_steward):
+        """``briefing.build_steward_initial_prompt`` is awaitable, not a plain ``MagicMock``.
+
+        Awaitability is a real contract rather than a value: the merged factory
+        builds ``briefing`` as an ``AsyncMock`` but then *reassigns* this
+        attribute, and reassigning it with a bare ``MagicMock`` would make the
+        steward's ``await`` raise ``TypeError`` at every call site.  Its return
+        literal, and the mcp/queue canned returns, are not asserted — those are
+        conftest literals restated.
+        """
+        steward = make_steward()
+
+        assert await steward.briefing.build_steward_initial_prompt(steward.task) is not None
+
+    # --- enforcement: a caller-supplied worktree must be strictly below tmp_path ---
+
+    def test_rejects_worktree_equal_to_tmp_path(self, make_steward, tmp_path):
+        """``worktree=tmp_path`` is rejected — it leaks ``.task-meta`` out of the sandbox.
+
+        This is the exact escape hatch task 3366 could only document.  The
+        steward's artifacts root is a SIBLING of the worktree
+        (``<worktree.parent>/.task-meta/<worktree.name>`` — see
+        ``TASK_META_DIRNAME`` in ``orchestrator/config.py`` and
+        ``TaskArtifacts.meta_root_for`` in ``orchestrator/artifacts.py``), so a
+        worktree AT ``tmp_path`` puts that sibling at
+        ``tmp_path.parent/.task-meta/<numbered-root>`` — outside the directory
+        pytest's retention policy reclaims.
+        """
+        with pytest.raises(AssertionError, match='strictly below'):
+            make_steward(worktree=tmp_path)
+
+    def test_rejects_worktree_outside_tmp_path(self, make_steward, tmp_path):
+        """A worktree outside ``tmp_path`` is rejected BEFORE the directory is created.
+
+        The mkdir-ordering half matters: a guard that fired after ``mkdir``
+        would litter the very location it is defending, leaving an unreclaimed
+        directory next to the test's tmp dir on every failure.
+        """
+        escaped = tmp_path.parent / 'escaped-wt'
+        assert not escaped.exists(), f'test precondition: {escaped} must not pre-exist'
+
+        with pytest.raises(AssertionError, match='strictly below'):
+            make_steward(worktree=escaped)
+
+        assert not escaped.exists(), (
+            f'the guard must reject {escaped} BEFORE mkdir — it was created anyway'
+        )
+
+    def test_two_stewards_in_one_test_are_both_accepted(self, make_steward, tmp_path):
+        """Two distinct sub-paths of ``tmp_path`` both pass — the no-false-positive control.
+
+        This case is what ruled out the cheaper module-level approximation
+        ("the worktree must not already exist"): a test that needs two stewards
+        must be able to build both.
+        """
+        a = make_steward(worktree=tmp_path / 'a')
+        b = make_steward(worktree=tmp_path / 'b')
+
+        assert a.worktree != b.worktree
+        assert a.worktree.is_dir() and b.worktree.is_dir()
+
+    def test_repeated_default_builds_are_isolated(self, make_steward, tmp_path):
+        """Two default builds get *different* fixture-owned worktrees.
+
+        Sharing one directory would be exactly the shared mutable state the
+        fixture otherwise defends against: both stewards would write the same
+        ``.task/`` and, via the ``<worktree.parent>/.task-meta/<worktree.name>``
+        sibling, the same ``verdicts/triage.json`` — whose staleness semantics
+        ``test_pre_triage_clears_stale_verdict_before_spawn``
+        (test_suggestion_triage.py) depends on.  No call site builds two default
+        stewards today; this pins isolation before one does.
+        """
+        first, second = make_steward(), make_steward()
+
+        assert second.worktree != first.worktree, (
+            'repeated default make_steward() builds must not share a worktree'
+        )
+        assert first.worktree.is_dir() and second.worktree.is_dir()
+        for wt in (first.worktree, second.worktree):
+            assert wt.resolve().is_relative_to(tmp_path.resolve()), (
+                f'every default worktree must stay under tmp_path={tmp_path}, got {wt}'
+            )
+            assert (wt / '.task').is_dir(), f'expected a .task subdirectory under {wt}'
+
+    # --- pass-through kwargs: task / event_store / cost_store (task 3514) ---
+
+    def test_task_kwarg_is_passed_through_and_drives_task_id(self, make_steward):
+        """``task=`` reaches ``steward.task`` verbatim and ``task_id`` derives from it.
+
+        The folded-in ``test_out_of_band_routing.py`` call sites vary
+        ``task['metadata']`` (``dispatch_count``, ``model_overrides``) and assert
+        on what reaches ``resolve_and_record_route``, so a hardcoded task dict
+        cannot serve them.  ``task_id`` must follow ``task['id']`` rather than
+        staying pinned at the default — a steward whose ``task_id`` disagreed
+        with ``task['id']`` would mis-key every artifact it writes.
+        """
+        task = {'id': '7', 'title': 't', 'description': 'd', 'metadata': {'dispatch_count': 2}}
+
+        steward = make_steward(task=task)
+
+        assert steward.task is task, (
+            'make_steward(task=...) must pass the caller dict through by identity, '
+            'so post-construction mutation of task["metadata"] is visible to the steward'
+        )
+        assert steward.task_id == '7', (
+            f"expected task_id to derive from task['id'], got {steward.task_id!r}"
+        )
+
+    def test_event_store_is_passed_through(self, make_steward):
+        """``event_store=`` reaches ``steward.event_store`` by identity."""
+        sentinel = MagicMock()
+
+        steward = make_steward(event_store=sentinel)
+
+        assert steward.event_store is sentinel, (
+            'make_steward(event_store=...) must forward the recorder verbatim — '
+            'the routing tests assert on events it records'
+        )
+
+    def test_cost_store_is_passed_through(self, make_steward):
+        """``cost_store=`` reaches ``steward.cost_store`` by identity."""
+        sentinel = MagicMock()
+
+        steward = make_steward(cost_store=sentinel)
+
+        assert steward.cost_store is sentinel, (
+            'make_steward(cost_store=...) must forward the store verbatim'
+        )
+
+    def test_passthrough_kwargs_default_to_todays_behaviour(self, make_steward):
+        """Omitting the new kwargs leaves the pre-3514 defaults exactly as they were.
+
+        The three already-migrated call sites pass none of them, so each new
+        kwarg must be strictly additive: no store injected, and the default
+        ``task_id`` unchanged.
+        """
+        steward = make_steward()
+
+        assert steward.event_store is None, (
+            'make_steward() with no event_store= must leave it unset (None)'
+        )
+        assert steward.cost_store is None, (
+            'make_steward() with no cost_store= must leave it unset (None)'
+        )
+        assert steward.task_id == '42', (
+            f'the default task_id must not move, got {steward.task_id!r}'
+        )
+
+    # --- config defaults: the KNOWN GAPS conftest used to list (task 3514) ---
+
+    def test_routing_config_is_resolvable_not_magicmock(self, make_steward):
+        """``config.routing.*`` carries real containers, i.e. ``stamp_stock_routing_config`` ran.
+
+        Not cosmetic: the folded-in ``test_out_of_band_routing.py`` tests that do
+        NOT patch the invoke seam reach the real ``resolve_route``, which does
+        membership and dict ops (``candidate not in ...allowed_models``,
+        ``...per_model_daily_ceiling_usd.get(...)``, ``for rule in ...rules``)
+        that a bare child ``MagicMock`` satisfies falsely and then fails on
+        deeper.  The stock *values* are ``_orch_helpers.py``'s literals and are
+        deliberately not restated here — only that real containers arrived.
+        """
+        routing = make_steward().config.routing
+
+        assert isinstance(routing.allowed_models, list), (
+            f'expected routing.allowed_models to be a real list, got '
+            f'{type(routing.allowed_models).__name__!r} — stamp_stock_routing_config did not run'
+        )
+        assert isinstance(routing.ladder, list), (
+            f'expected routing.ladder to be a real list, got {type(routing.ladder).__name__!r}'
+        )
+        assert isinstance(routing.per_model_daily_ceiling_usd, dict), (
+            f'expected routing.per_model_daily_ceiling_usd to be a real dict, got '
+            f'{type(routing.per_model_daily_ceiling_usd).__name__!r}'
+        )
+        assert isinstance(routing.rules, list), (
+            f'expected routing.rules to be a real list, got {type(routing.rules).__name__!r}'
+        )
+
+    def test_timeout_config_defaults_are_real_floats(self, make_steward):
+        """The spawn/completion timeouts are real numbers, not child ``MagicMock``s.
+
+        The steward compares these against elapsed wall-clock; a ``MagicMock``
+        silently satisfies the comparison operator and yields a confusing
+        ``TypeError`` (or a wrong branch) far from the missing default.
+        """
+        config = make_steward().config
+
+        assert isinstance(config.timeouts.steward, float), (
+            f'expected timeouts.steward to be a real float, got '
+            f'{type(config.timeouts.steward).__name__!r}'
+        )
+        assert isinstance(config.steward_completion_timeout, float), (
+            f'expected steward_completion_timeout to be a real float, got '
+            f'{type(config.steward_completion_timeout).__name__!r}'
+        )
+
+    def test_fused_memory_config_defaults_are_real_strings(self, make_steward):
+        """``config.fused_memory.url`` / ``.project_id`` are real strings.
+
+        They are interpolated into the MCP config the steward hands its agent, so
+        a ``MagicMock`` here reaches JSON serialization before it fails.
+        """
+        fused_memory = make_steward().config.fused_memory
+
+        assert isinstance(fused_memory.url, str), (
+            f'expected fused_memory.url to be a real str, got {type(fused_memory.url).__name__!r}'
+        )
+        assert isinstance(fused_memory.project_id, str), (
+            f'expected fused_memory.project_id to be a real str, got '
+            f'{type(fused_memory.project_id).__name__!r}'
+        )
+
+    # --- collaborator + worktree defaults, and the queue-override channel (3514) ---
+
+    def test_queue_dir_is_a_real_created_dir_and_unique_per_build(
+        self, make_steward, tmp_path,
+    ):
+        """The mock queue's ``queue_dir`` is real, created, sandboxed, and per-build.
+
+        ``steward.py`` reads ``escalation_queue.queue_dir`` into the escalation-
+        watcher argv, so it is real mutable state — the same reason
+        ``test_repeated_default_builds_are_isolated`` pins the worktree.  Two
+        default builds sharing one queue dir would be exactly that shared state,
+        so it is derived from the fixture-owned (already per-build) worktree
+        rather than a flat ``tmp_path/'escalations'`` literal.
+        """
+        first, second = make_steward(), make_steward()
+
+        for steward in (first, second):
+            qd = steward.escalation_queue.queue_dir
+            assert isinstance(qd, Path), (
+                f'expected queue_dir to be a real Path, got {type(qd).__name__!r}'
+            )
+            assert qd.is_dir(), f'expected make_steward to create queue_dir {qd}'
+            assert qd.resolve().is_relative_to(tmp_path.resolve()), (
+                f'queue_dir must stay under tmp_path={tmp_path} so pytest reclaims it, got {qd}'
+            )
+
+        assert first.escalation_queue.queue_dir != second.escalation_queue.queue_dir, (
+            'repeated default make_steward() builds must not share a queue_dir — '
+            'the escalation-watcher argv is built from it'
+        )
+
+    def test_mcp_url_is_a_real_string(self, make_steward):
+        """``mcp.url`` is a real ``str``, not an unconfigured child ``MagicMock``."""
+        url = make_steward().mcp.url
+        assert isinstance(url, str), f'expected mcp.url to be a real str, got {type(url).__name__!r}'
+
+    @pytest.mark.asyncio
+    async def test_briefing_continuation_prompt_is_awaitable(self, make_steward):
+        """``briefing.build_steward_continuation_prompt`` is awaitable, not a plain ``MagicMock``.
+
+        Same reassignment hazard as ``test_briefing_initial_prompt_is_awaitable``:
+        ``briefing`` is an ``AsyncMock``, but this attribute is *reassigned*, and
+        reassigning it with a bare ``MagicMock`` would make the steward's
+        ``await`` raise ``TypeError`` at the re-escalation call site.
+        """
+        steward = make_steward()
+
+        assert await steward.briefing.build_steward_continuation_prompt(steward.task) is not None
+
+    def test_default_worktree_task_dir_is_seeded(self, make_steward):
+        """The fixture-owned worktree's ``.task/`` carries parseable metadata + plan files.
+
+        Union-of-defaults with the folded-in ``test_steward.py`` worktree fixture.
+        ``steward.py`` reads neither file, so this is inert for existing
+        consumers — it exists so a call site that *does* read them (the retired
+        fixture's reason for writing them) finds valid JSON rather than a
+        missing path.
+        """
+        import json
+
+        task_dir = make_steward().worktree / '.task'
+
+        for name in ('metadata.json', 'plan.json'):
+            path = task_dir / name
+            assert path.is_file(), f'expected make_steward to seed {path}'
+            json.loads(path.read_text())  # raises if not valid JSON
+
+    def test_caller_supplied_escalation_queue_is_used_verbatim(self, make_steward, tmp_path):
+        """``escalation_queue=`` replaces the mock queue and keeps its own directory.
+
+        ``test_steward.py``'s ``steward_with_real_queue`` substitutes a real
+        filesystem-backed ``EscalationQueue`` to assert on-disk write locations.
+        The fixture must not build a mock queue at all in that case, and must not
+        stamp its own derived ``queue_dir`` over the one the caller's queue owns.
+        """
+        from escalation.queue import EscalationQueue
+
+        own_dir = tmp_path / 'caller-escalations'
+        real_queue = EscalationQueue(own_dir)
+
+        steward = make_steward(escalation_queue=real_queue)
+
+        assert steward.escalation_queue is real_queue, (
+            'make_steward(escalation_queue=...) must use the caller queue verbatim'
+        )
+        assert real_queue.queue_dir == own_dir, (
+            f'the fixture must not re-stamp queue_dir on a caller-supplied queue — '
+            f'expected {own_dir}, got {real_queue.queue_dir}'
+        )

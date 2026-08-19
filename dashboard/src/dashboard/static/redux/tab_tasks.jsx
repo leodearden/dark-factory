@@ -6,7 +6,18 @@ const DF_T = window.DF_DATA;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusSubset } = window.DF_GRAPH_LAYOUT;
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
+const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
+
+// Dot colour per activity pip. activityPips is pure and owns ORDER and
+// zero-suppression; colour is the caller's concern. Each reuses the hue
+// operators already associate with that status elsewhere in this tab
+// (PALETTE aliases `running` to the same hue as `in-progress`).
+const PIP_DOT_COLOR_T = {
+  running: CP_T.accent,
+  blocked: CP_T.bad,
+  'merge-deferred': 'var(--merge-deferred)',
+};
 
 // Persisted-state hook (same shape as elsewhere)
 function tasksPersistedState(key, def) {
@@ -173,6 +184,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
           <span className="status-pip"></span>
           <span className="id">{window.DF_SHELL.taskId(t.id)}</span>
           {t.train && <span className="train-badge" title={`train ${t.train.id} · order ${t.train.order}`}>🚂 {t.train.id}</span>}
+          {t.stranded && <span className="badge bad" title="stranded: in-progress with no live claimant / stale heartbeat">⚠</span>}
           <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
             {t.status === 'in-progress' ? rtAge(t.started) : t.status === 'done' ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : t.status}
           </span>
@@ -517,7 +529,11 @@ function TaskDetail({ task, allTasks }) {
 
       <div className="kv">
         <span className="k">status</span>
-        <span><span className={`badge ${task.status === 'blocked' ? 'bad' : task.status === 'done' ? 'ok' : task.status === 'deferred' ? 'muted' : task.status === 'cancelled' ? 'muted' : task.status === 'pending' ? 'warn' : task.status === 'merge-deferred' ? 'merge-deferred' : 'accent'}`}>{task.status}</span></span>
+        <span><span className={`badge ${task.status === 'blocked' ? 'bad' : task.status === 'done' ? 'ok' : task.status === 'deferred' ? 'muted' : task.status === 'cancelled' ? 'muted' : task.status === 'pending' ? 'warn' : task.status === 'merge-deferred' ? 'merge-deferred' : 'accent'}`}>{task.status}</span>
+          {/* Strand verdict (task 3543). Computed server-side from the claim
+              columns; deliberately INDEPENDENT of `agent` below, which is only
+              worktree presence and stays truthy after the agent dies. */}
+          {task.stranded && <span className="badge bad" style={{ marginLeft: 6 }} title="stranded: in-progress with no live claimant / stale heartbeat">stranded</span>}</span>
         <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.agent || <span style={{ color: 'var(--fg-3)' }}>unassigned</span>}</span>
         <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.loops)}</span>
         <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.attempts)}</span>
@@ -712,11 +728,29 @@ function TasksTab({ projectFilter, search }) {
           {projects.map(p => {
             const projTasks = allTasks.filter(t => t.project === p.id);
             const filtered = projTasks.filter(t => statusMatches(t.status) && searchMatches(t));
-            const _fallbackDone = projTasks.filter(t => t.status === 'done').length;
+            // One pass for every header tally. running / blocked / mergeDeferred
+            // are reported SEPARATELY rather than merged into one "N active"
+            // number: only `running` is bounded by max_concurrent_tasks — a
+            // blocked or merge-deferred task holds no agent slot — so the merged
+            // number routinely exceeded the cap and read as a cap breach.
+            // 2026-07-30: dark-factory showed "43 active" against a cap of 24,
+            // reify "50 active" against 48; neither was a real breach.
+            const statusCounts = projectStatusCounts(projTasks);
+            const _fallbackDone = statusCounts.done;
+            // Display keys are picked EXPLICITLY rather than spread in from
+            // statusCounts. Its `done` is the BOUNDED tally of the done rows
+            // actually loaded (≤50 per project); spreading it onto the display
+            // object would park it beside the authoritative `complete` under a
+            // near-synonymous name, and the next `{counts.done} done` edit
+            // would silently render the lower bound as if it were the real
+            // count. Keep it reachable only via `_fallbackDone`, whose
+            // underscore says "not for display".
             const counts = {
-              total:    projTasks.length,
-              active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'merge-deferred').length,
-              pending:  projTasks.filter(t => t.status === 'pending').length,
+              total: statusCounts.total,
+              running: statusCounts.running,
+              blocked: statusCounts.blocked,
+              mergeDeferred: statusCounts.mergeDeferred,
+              pending: statusCounts.pending,
               // DONE_COUNTS carries the authoritative full count from the server.
               // The fallback counts only the bounded done rows loaded into ACTIVE_TASKS
               // (≤50 per project). If we hit that cap without a server count, show
@@ -729,7 +763,12 @@ function TasksTab({ projectFilter, search }) {
             const groupByPrd = groupByPrdMap[p.id] === 'prd';
             const summary = (
               <>
-                <span className="pip"><span className="pip-dot" style={{ background: CP_T.accent }}></span>{counts.active} active</span>
+                {activityPips(counts).map(pip => (
+                  <span className="pip" key={pip.key}>
+                    <span className="pip-dot" style={{ background: PIP_DOT_COLOR_T[pip.key] }}></span>
+                    {pip.count} {pip.label}
+                  </span>
+                ))}
                 <span className="pip"><span className="pip-dot" style={{ background: CP_T.warn }}></span>{counts.pending} pending</span>
                 <span className="pip"><span className="pip-dot" style={{ background: CP_T.ok }}></span>{counts.complete} done</span>
                 <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{filtered.length}/{counts.total} shown</span>

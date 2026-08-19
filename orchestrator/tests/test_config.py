@@ -11,6 +11,8 @@ import yaml
 from pydantic import ValidationError
 
 from orchestrator.config import (
+    DEFAULT_TIER,
+    PRIORITY_TIERS,
     RELOADABLE_FIELDS,
     BackendsConfig,
     BudgetsConfig,
@@ -28,6 +30,7 @@ from orchestrator.config import (
     _deep_merge,
     _discover_module_configs,
     apply_reload,
+    coerce_tier,
     default_price_table,
     diff_config,
     load_config,
@@ -159,6 +162,12 @@ class TestDefaults:
 
         with pytest.raises(ValidationError):
             GitConfig(spare_warm_lanes=-1)
+
+    def test_warm_lane_drift_l2_threshold_default_three(self):
+        """GitConfig().warm_lane_drift_l2_threshold defaults to 3 (PRD Open Q2)."""
+        from orchestrator.config import GitConfig
+
+        assert GitConfig().warm_lane_drift_l2_threshold == 3
 
     def test_warm_lane_release_thin_field_defaults_false(self):
         """GitConfig.warm_lane_release_thin exists, is typed bool, and
@@ -1500,6 +1509,44 @@ class TestVerifyRunnerConfig:
         assert cfg.config_path == '/etc/orch.yaml'
         assert cfg.enabled is False
 
+    def test_verify_runner_config_df_checkout_path_defaults_none(self):
+        """df_checkout_path defaults None — INV-2 auto-sync opt-in/off (task 2884)."""
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(name='r', ssh_host='h', git_remote='g')
+        assert cfg.df_checkout_path is None
+
+    def test_verify_runner_config_df_checkout_path_accepts_string(self):
+        """df_checkout_path accepts a remote-host path string (task 2884)."""
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(
+            name='laptop', ssh_host='laptop.local', git_remote='origin',
+            df_checkout_path='/home/leo/src/dark-factory',
+        )
+        assert cfg.df_checkout_path == '/home/leo/src/dark-factory'
+
+    def test_verify_runner_config_df_checkout_path_roundtrip(self):
+        """df_checkout_path survives a model_dump → re-construct round-trip (task 2884)."""
+        from orchestrator.config import VerifyRunnerConfig
+
+        cfg = VerifyRunnerConfig(
+            name='laptop', ssh_host='laptop.local', git_remote='origin',
+            df_checkout_path='/remote/df',
+        )
+        dumped = cfg.model_dump()
+        assert dumped['df_checkout_path'] == '/remote/df'
+        rebuilt = VerifyRunnerConfig(**dumped)
+        assert rebuilt.df_checkout_path == '/remote/df'
+
+    def test_verify_runner_config_backcompat_block_without_df_checkout_path(self):
+        """An existing verify_runners block omitting df_checkout_path still validates
+        and defaults the field to None (back-compat — task 2884)."""
+        config = OrchestratorConfig(verify_runners=[  # type: ignore[arg-type]
+            {'name': 'laptop', 'ssh_host': 'laptop.local', 'git_remote': 'origin'},
+        ])
+        assert config.verify_runners[0].df_checkout_path is None
+
     def test_orchestrator_config_verify_runners_defaults_empty(self):
         """OrchestratorConfig.verify_runners defaults to [] not None."""
         config = OrchestratorConfig()
@@ -1977,6 +2024,136 @@ class TestStarvationWatchdogConfig:
         )
 
 
+class TestParkBackfillConfig:
+    """The four EASY-backfill admission knobs (task 3823 / PRD task η, C7).
+
+    Follows the ``TestStarvationWatchdogConfig`` template above — defaults /
+    full YAML override / partial override / bound rejection / reload tier —
+    but asserts on FLAT ``OrchestratorConfig`` attributes, because the four
+    knobs mirror the adjacent ``park_stop_*`` block rather than nesting in a
+    submodel.
+
+    Attribute access (not a source grep) is what pins the three MANDATED
+    literal names the capability manifest greps out of ``config.py``
+    (``backfill_safety_factor`` / ``backfill_min_samples`` /
+    ``backfill_max_park_age_secs``): a rename breaks these tests loudly
+    instead of silently breaking the admission gate.
+    """
+
+    def test_defaults(self):
+        """Bare OrchestratorConfig() exposes the four backfill leaves.
+
+        2.5 is bracketed by the two MEASURED 80%-coverage multipliers —
+        ×2.9 (dark-factory) and ×2.0 (reify) — at
+        plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:126.
+        """
+        cfg = OrchestratorConfig()
+        assert cfg.backfill_enabled is True, (
+            f'Expected backfill_enabled=True; got {cfg.backfill_enabled!r}'
+        )
+        assert cfg.backfill_safety_factor == 2.5, (
+            f'Expected backfill_safety_factor=2.5; got {cfg.backfill_safety_factor!r}'
+        )
+        assert cfg.backfill_min_samples == 3, (
+            f'Expected backfill_min_samples=3; got {cfg.backfill_min_samples!r}'
+        )
+        assert cfg.backfill_max_park_age_secs == 3600.0, (
+            f'Expected backfill_max_park_age_secs=3600.0; '
+            f'got {cfg.backfill_max_park_age_secs!r}'
+        )
+
+    def test_full_yaml_override(self, tmp_path: Path, monkeypatch):
+        """A project config overriding all four leaves is fully adopted."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({
+            'backfill_enabled': False,
+            'backfill_safety_factor': 2.9,
+            'backfill_min_samples': 5,
+            'backfill_max_park_age_secs': 900.0,
+        }))
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        cfg = load_config(project_cfg)
+
+        assert cfg.backfill_enabled is False, (
+            f'Expected backfill_enabled=False; got {cfg.backfill_enabled!r}'
+        )
+        assert cfg.backfill_safety_factor == 2.9, (
+            f'Expected backfill_safety_factor=2.9; got {cfg.backfill_safety_factor!r}'
+        )
+        assert cfg.backfill_min_samples == 5, (
+            f'Expected backfill_min_samples=5; got {cfg.backfill_min_samples!r}'
+        )
+        assert cfg.backfill_max_park_age_secs == 900.0, (
+            f'Expected backfill_max_park_age_secs=900.0; '
+            f'got {cfg.backfill_max_park_age_secs!r}'
+        )
+
+    def test_partial_override_merges_with_defaults(self, tmp_path: Path, monkeypatch):
+        """Overriding only backfill_enabled leaves the other three at defaults."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({'backfill_enabled': False}))
+        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+        cfg = load_config(project_cfg)
+
+        assert cfg.backfill_enabled is False, (
+            f'Expected backfill_enabled=False; got {cfg.backfill_enabled!r}'
+        )
+        assert cfg.backfill_safety_factor == 2.5, (
+            f'Expected backfill_safety_factor=2.5 (default preserved); '
+            f'got {cfg.backfill_safety_factor!r}'
+        )
+        assert cfg.backfill_min_samples == 3, (
+            f'Expected backfill_min_samples=3 (default preserved); '
+            f'got {cfg.backfill_min_samples!r}'
+        )
+        assert cfg.backfill_max_park_age_secs == 3600.0, (
+            f'Expected backfill_max_park_age_secs=3600.0 (default preserved); '
+            f'got {cfg.backfill_max_park_age_secs!r}'
+        )
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_safety_factor_rejects_non_positive(self, bad):
+        """backfill_safety_factor is gt=0 — a zero factor admits everything."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(backfill_safety_factor=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_min_samples_rejects_below_one(self, bad):
+        """backfill_min_samples is ge=1 — the bound IS the contract.
+
+        A floor of 0 would let an EMPTY hold history certify a backfill,
+        which C7 forbids by name ("An empty history must refuse, not
+        admit — a predicate that accepts the empty case certifies
+        structure, not capability").
+        """
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(backfill_min_samples=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_max_park_age_secs_rejects_non_positive(self, bad):
+        """backfill_max_park_age_secs is gt=0 — a zero cutoff refuses every park."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(backfill_max_park_age_secs=bad)
+
+    @pytest.mark.parametrize('leaf', [
+        'backfill_enabled',
+        'backfill_safety_factor',
+        'backfill_min_samples',
+        'backfill_max_park_age_secs',
+    ])
+    def test_backfill_leaves_are_green_tier_reloadable(self, leaf):
+        """All four leaves are hot-reloadable (green tier).
+
+        PRD Open Q3 ships 2.5 and lets production overstay data settle
+        2.5-vs-2.9, which is only actionable if the factor is retunable
+        without a restart.
+        """
+        assert leaf in RELOADABLE_FIELDS, (
+            f"'{leaf}' must be in RELOADABLE_FIELDS (green-tier hot-reloadable, "
+            'alongside fairness.skip_threshold in the scheduler-tuning slice)'
+        )
+
+
 class TestVerifyInfraRetryConfig:
     """Tests for verify_infra_retry_* config fields (step-5)."""
 
@@ -2122,6 +2299,18 @@ class TestWarmLaneGcConfig:
         assert config.warm_lane_gc_interval_secs == 600.0, (
             f'warm_lane_gc_interval_secs must default to 600.0s (10 min); '
             f'got {config.warm_lane_gc_interval_secs}'
+        )
+
+    def test_lane_stale_report_days_defaults_7(self):
+        """lane_stale_report_days defaults to 7.0 days (leaf γ census threshold).
+
+        Beyond this age, a non-terminal warm-lane assignment is surfaced in the
+        digest's stale-lane census section.
+        """
+        config = OrchestratorConfig()
+        assert config.lane_stale_report_days == 7.0, (
+            f'lane_stale_report_days must default to 7.0 days; '
+            f'got {config.lane_stale_report_days}'
         )
 
 
@@ -2981,7 +3170,7 @@ class TestSessionResumeConfig:
     SessionResumeConfig mirrors DeliveredChecksConfig's shape (an `enabled`
     kill-switch plus ge-bounded int knobs), is exposed on OrchestratorConfig
     under the literal field name `session_resume` (delivered-check contract),
-    and all four leaves are green-tier hot-reloadable via the
+    and all five leaves are green-tier hot-reloadable via the
     `_submodel_leaf_paths('session_resume', SessionResumeConfig)` whole-submodel
     group in RELOADABLE_FIELDS.
     """
@@ -2995,6 +3184,19 @@ class TestSessionResumeConfig:
         assert cfg.freshness_window_secs == 86400
         assert cfg.max_resumes_per_task == 3
         assert cfg.fallback_storm_threshold == 5
+        # task 3256: the storm streak is a rolling window, not a cumulative
+        # per-boot counter. 3600s is read off the measured signature — bursts
+        # are ~17 fallbacks inside one hour, quiet gaps are ~7h and ~39h.
+        assert cfg.storm_window_secs == 3600
+
+    def test_storm_window_secs_ge_1_rejects_zero(self):
+        """storm_window_secs < 1 must raise ValidationError (ge=1 bound)."""
+        from orchestrator.config import SessionResumeConfig
+
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(storm_window_secs=0)
+        with pytest.raises(ValidationError):
+            SessionResumeConfig(storm_window_secs=-1)
 
     def test_freshness_window_secs_ge_1_rejects_zero(self):
         """freshness_window_secs < 1 must raise ValidationError (ge=1 bound)."""
@@ -3035,16 +3237,439 @@ class TestSessionResumeConfig:
         assert config.session_resume.enabled is True
 
     def test_leaves_in_reloadable_fields(self):
-        """All four session_resume leaves are green-tier hot-reloadable
+        """All five session_resume leaves are green-tier hot-reloadable
         (membership assertions, robust to future growth of RELOADABLE_FIELDS).
+
+        `storm_window_secs` (task 3256) needed no RELOADABLE_FIELDS edit —
+        `_submodel_leaf_paths` enumerates `model_fields` dynamically, which is
+        exactly the property its docstring advertises. This assertion is what
+        pins that the property actually held.
         """
         for leaf in (
             'session_resume.enabled',
             'session_resume.freshness_window_secs',
             'session_resume.max_resumes_per_task',
             'session_resume.fallback_storm_threshold',
+            'session_resume.storm_window_secs',
         ):
             assert leaf in RELOADABLE_FIELDS, (
                 f'{leaf} must be a member of RELOADABLE_FIELDS '
                 '(green-tier hot-reloadable via _submodel_leaf_paths)'
+            )
+
+
+# ---------------------------------------------------------------------------
+# task 3095: main_tip_sweep_isolated_prefilter_enabled
+# ---------------------------------------------------------------------------
+
+
+class TestMainTipSweepIsolatedPrefilterEnabled:
+    """task 3095: operator kill-switch for the sweep's isolated PRE-FILTER.
+
+    ``run_main_tip_sweep`` gates its expensive full-suite retry behind a cheap
+    scoped+serial isolated re-run of the first-pass failing node-ids. The one
+    observable behavior delta is that a test which only passes as part of the
+    full suite is no longer rescued by a full-retry green and instead reaches
+    the harness's fresh-worktree confirm gate — so the loud-over-silent norm
+    calls for an operator revert path, mirroring
+    ``main_tip_sweep_rerun_confirm_enabled``.
+    """
+
+    def test_defaults_to_true(self):
+        """Default-on, matching the rest of the main_tip_sweep family."""
+        assert OrchestratorConfig().main_tip_sweep_isolated_prefilter_enabled is True
+
+    def test_false_round_trips(self):
+        """Explicit False round-trips — setting it restores byte-identical
+        pre-3095 behavior (the pre-filter is never invoked)."""
+        config = OrchestratorConfig(main_tip_sweep_isolated_prefilter_enabled=False)
+        assert config.main_tip_sweep_isolated_prefilter_enabled is False
+
+    def test_not_in_reloadable_fields(self):
+        """Restart-only, pinning the tier chosen to match its sibling.
+
+        No ``main_tip_sweep`` leaf is a member of RELOADABLE_FIELDS — in
+        particular ``main_tip_sweep_rerun_confirm_enabled`` is absent — so
+        adding this one would invent a new reload tier for the family. A
+        future edit must revisit that rationale rather than silently promoting
+        the leaf.
+        """
+        assert 'main_tip_sweep_rerun_confirm_enabled' not in RELOADABLE_FIELDS, (
+            'fixture precondition: the sibling whose tier this field matches '
+            'is expected to be restart-only'
+        )
+        assert 'main_tip_sweep_isolated_prefilter_enabled' not in RELOADABLE_FIELDS, (
+            'main_tip_sweep_isolated_prefilter_enabled is deliberately '
+            'restart-only (same tier as the rest of the main_tip_sweep '
+            'family) and must NOT be in RELOADABLE_FIELDS'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3227: coerce_tier() observability — warn on real anomalies only
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceTierObservability:
+    """coerce_tier() normalizes a priority value (possibly None/unknown) to a
+    canonical tier.
+
+    An absent/None priority is a NORMAL expected state — every one of this
+    repo's 39 subtasks carries priority=None, and the scheduler coerces
+    every task's priority on every tick — so it must return DEFAULT_TIER
+    silently rather than warn. Only a genuinely unrecognized non-None value
+    is a real anomaly worth a WARNING (see TestCoerceTierUnrecognizedValueDedup
+    below).
+    """
+
+    def test_unset_none_returns_default_tier_silently(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """coerce_tier(None) returns DEFAULT_TIER and emits zero WARNING
+        records on the 'orchestrator.config' logger — None is a default,
+        not a fail-soft fallback."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            result = coerce_tier(None)
+
+        assert result == DEFAULT_TIER
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert warning_records == [], (
+            f"coerce_tier(None) must not warn; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
+    def test_absent_key_dict_get_returns_default_tier_silently(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """The equivalent absent-key form used by the scheduler
+        (``tasks_by_id.get(tid, {}).get('priority')`` -> None, see
+        scheduler.py:4631) must also return DEFAULT_TIER silently."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            result = coerce_tier({}.get('priority'))
+
+        assert result == DEFAULT_TIER
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert warning_records == [], (
+            f"coerce_tier({{}}.get('priority')) must not warn; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
+    def test_each_known_tier_round_trips_unchanged_and_silently(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """Every tier in PRIORITY_TIERS passes through coerce_tier()
+        unchanged, with zero WARNING records (happy-path regression guard)."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            results = [coerce_tier(tier) for tier in PRIORITY_TIERS]
+
+        assert results == list(PRIORITY_TIERS)
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert warning_records == [], (
+            f"coerce_tier() on a known tier must not warn; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
+
+class TestCoerceTierUnrecognizedValueDedup:
+    """coerce_tier() warns on a genuinely unrecognized (non-None) priority
+    value, but only ONCE per distinct value per process — a persistent bad
+    value in tasks.json would otherwise re-fire its warning on every
+    scheduler tick (task 3227 review feedback). The dedupe memo is bounded
+    (see test_dedupe_memo_is_bounded_and_does_not_raise below) since
+    orchestrator.config lives inside a multi-day daemon process.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_warned_priority_values_dedup(self):
+        """Scoped to this class only — mirrors
+        fused-memory/tests/test_sqlite_task_backend.py:54-62's
+        hasattr-guarded module-level dedup-set fixture. The hasattr guard
+        keeps this file collectible while _warned_priority_values does not
+        yet exist (RED, before step-5 lands), so this class's tests RED on
+        an assertion rather than a collection error.
+        """
+        from orchestrator import config as _cfg
+        if hasattr(_cfg, '_warned_priority_values'):
+            _cfg._warned_priority_values.clear()
+        yield
+        if hasattr(_cfg, '_warned_priority_values'):
+            _cfg._warned_priority_values.clear()
+
+    def test_unrecognized_value_warns_exactly_once_and_names_the_value(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """A single call with a genuinely unrecognized value returns
+        DEFAULT_TIER and emits exactly one WARNING naming the value."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            result = coerce_tier('urgent')
+
+        assert result == DEFAULT_TIER
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert len(warning_records) == 1, (
+            f"expected exactly one WARNING for a single unrecognized value; "
+            f"got: {[r.getMessage() for r in warning_records]}"
+        )
+        assert 'urgent' in warning_records[0].getMessage()
+
+    def test_repeated_calls_with_same_unrecognized_value_warn_once(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """Three calls in a row with the SAME unrecognized value still emit
+        exactly one warning total (dedupe)."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            results = [coerce_tier('urgent') for _ in range(3)]
+
+        assert results == [DEFAULT_TIER, DEFAULT_TIER, DEFAULT_TIER]
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert len(warning_records) == 1, (
+            f"expected exactly one WARNING total across 3 repeated calls "
+            f"with the same unrecognized value; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
+    def test_dedupe_is_per_value_not_global(self, caplog: pytest.LogCaptureFixture):
+        """Two distinct unrecognized values each warn exactly once (2 total)
+        — dedupe is keyed per-value, not a single global 'already warned'
+        flag that would suppress the second, distinct value's warning."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            coerce_tier('urgent')
+            coerce_tier('urgent')
+            coerce_tier('P0')
+            coerce_tier('P0')
+            coerce_tier('P0')
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert len(warning_records) == 2, (
+            f"expected exactly one WARNING per distinct unrecognized value "
+            f"(2 total for 'urgent' and 'P0'); got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+        messages = [r.getMessage() for r in warning_records]
+        assert any('urgent' in m for m in messages), messages
+        assert any('P0' in m for m in messages), messages
+
+    def test_non_string_unrecognized_value_dedupes_safely(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """A non-string bad value (e.g. an int) must not raise when used as
+        a dedupe key, and still warns exactly once across repeats —
+        confirms the dedupe key tolerates non-str, hashable input. (The
+        unhashable case — where using ``value`` itself as the dedupe key
+        instead of ``repr(value)`` would raise — is covered separately by
+        test_unhashable_unrecognized_value_dedupes_safely below.)"""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            results = [coerce_tier(7) for _ in range(3)]
+
+        assert results == [DEFAULT_TIER, DEFAULT_TIER, DEFAULT_TIER]
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert len(warning_records) == 1, (
+            f"expected exactly one WARNING total for a repeated non-string "
+            f"unrecognized value; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
+    def test_unhashable_unrecognized_value_dedupes_safely(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """An unhashable bad value (e.g. a list — the shape a corrupt or
+        hand-edited tasks.json could produce for a 'priority' field) must
+        not raise, and still warns exactly once across repeats. This is
+        the case the repr(value) dedupe key exists to handle: an
+        implementation that memoized on ``value`` itself (instead of
+        ``repr(value)``) would raise ``TypeError: unhashable type`` on the
+        very first call here, so this is the test that actually pins the
+        repr()-keyed dedupe rather than merely exercising a non-str
+        value."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            results = [coerce_tier(['high']) for _ in range(3)]
+
+        assert results == [DEFAULT_TIER, DEFAULT_TIER, DEFAULT_TIER]
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert len(warning_records) == 1, (
+            f"expected exactly one WARNING total for a repeated unhashable "
+            f"unrecognized value; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
+    def test_dedupe_memo_is_bounded_and_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """config.py runs inside a multi-day daemon process, so the dedupe
+        memo must not grow without bound. Feeding more distinct
+        unrecognized values than the cap must not grow the set past the
+        cap, and coerce_tier must keep returning DEFAULT_TIER without
+        raising.
+
+        This also pins the cap-boundary LOG BEHAVIOUR, not just the final
+        memo size: filling the cap must emit exactly one cap-reached
+        notice (not zero, and not one per call past the cap — the latter
+        would silently reproduce the very flood the cap exists to
+        prevent), and no further unrecognized-priority warnings of any
+        kind may be emitted once the memo is full.
+        """
+        from orchestrator import config as _cfg
+
+        assert hasattr(_cfg, '_MAX_WARNED_PRIORITY_VALUES'), (
+            "orchestrator.config._MAX_WARNED_PRIORITY_VALUES must exist as "
+            "the dedupe memo's bound (introduced by task 3227 step-5); "
+            "currently absent, so the memo would be unbounded"
+        )
+        cap = _cfg._MAX_WARNED_PRIORITY_VALUES
+        assert cap > 0
+
+        def _warning_records():
+            return [
+                r for r in caplog.records
+                if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+            ]
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            for i in range(cap):
+                result = coerce_tier(f'not-a-real-tier-{i}')
+                assert result == DEFAULT_TIER
+
+            records_at_cap = _warning_records()
+            assert len(records_at_cap) == cap + 1, (
+                f"expected {cap} per-value warnings plus exactly one "
+                f"cap-reached notice ({cap + 1} records total) after "
+                f"feeding exactly {cap} distinct unrecognized values; got "
+                f"{len(records_at_cap)}: "
+                f"{[r.getMessage() for r in records_at_cap]}"
+            )
+            assert 'cap' in records_at_cap[-1].getMessage().lower(), (
+                "the final warning emitted upon filling the memo must be "
+                f"the cap-reached notice; got: "
+                f"{records_at_cap[-1].getMessage()!r}"
+            )
+
+            for i in range(cap, cap + 20):
+                result = coerce_tier(f'not-a-real-tier-{i}')
+                assert result == DEFAULT_TIER
+
+            records_after_overflow = _warning_records()
+            assert len(records_after_overflow) == len(records_at_cap), (
+                "no further records (neither per-value warnings nor "
+                "repeated cap-reached notices) may be emitted once the "
+                f"memo is full; had {len(records_at_cap)} records right "
+                f"after filling the cap, now have "
+                f"{len(records_after_overflow)} after 20 more distinct "
+                f"values: "
+                f"{[r.getMessage() for r in records_after_overflow]}"
+            )
+
+        assert hasattr(_cfg, '_warned_priority_values'), (
+            "orchestrator.config._warned_priority_values must exist "
+            "alongside the cap constant"
+        )
+        assert len(_cfg._warned_priority_values) <= cap, (
+            f"dedupe memo grew to {len(_cfg._warned_priority_values)} "
+            f"entries, exceeding cap {cap}"
+        )
+
+
+class TestRecoveryEmissionConfig:
+    """The structured recovery-decision emission knobs (task 3535).
+
+    PRD ``plans/task-escalation-state-graph-prd.md`` D5.  The canonical WHY
+    for the mechanism lives in
+    ``orchestrator/src/orchestrator/recovery_emission.py`` (module docstring);
+    this class only pins the operator-facing surface.
+    """
+
+    def test_section_is_registered_on_orchestrator_config(self):
+        """OrchestratorConfig exposes recovery_emission with the shipped defaults.
+
+        Registration is load-bearing, not cosmetic: ``model_config`` sets
+        ``extra='ignore'``, so an UNREGISTERED yaml block is silently dropped
+        and the operator edits a stanza that does nothing.
+        """
+        from orchestrator.config import OrchestratorConfig
+
+        cfg = OrchestratorConfig()
+        assert hasattr(cfg, 'recovery_emission'), (
+            'recovery_emission must be a registered field, or its yaml block '
+            'is silently dropped by extra="ignore"'
+        )
+        # Ships ENABLED: emission is the whole deliverable of task 3535, and
+        # shipping it off would leave every strand unexplained.
+        assert cfg.recovery_emission.enabled is True
+        assert cfg.recovery_emission.veto_streak_threshold == 3
+        assert cfg.recovery_emission.veto_streak_min_span_secs == 1500.0
+        # The narrower kill switch for the only part that WRITES to the
+        # escalation queue — separate from `enabled` on purpose.
+        assert cfg.recovery_emission.streak_escalation_enabled is True
+
+    def test_veto_streak_threshold_must_be_at_least_one(self):
+        """threshold=0 would file an L1 on the very first observed veto."""
+        from orchestrator.config import RecoveryEmissionConfig
+
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(veto_streak_threshold=0)
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(veto_streak_threshold=-1)
+
+    def test_veto_streak_min_span_secs_must_not_be_negative(self):
+        """0 is legal (disables the time half); negative is nonsense."""
+        from orchestrator.config import RecoveryEmissionConfig
+
+        assert RecoveryEmissionConfig(veto_streak_min_span_secs=0).veto_streak_min_span_secs == 0.0
+        with pytest.raises(ValidationError):
+            RecoveryEmissionConfig(veto_streak_min_span_secs=-1)
+
+    def test_defaults_yaml_block_matches_the_field_defaults(self):
+        """The shipped stanza must not drift from the pydantic defaults.
+
+        YamlSettingsSource layers defaults.yaml UNDER the project YAML, so the
+        STANZA — not the ``Field(default=...)`` — is what actually applies.  A
+        drifted stanza would silently win.
+        """
+        defaults = _load_package_defaults()
+        assert 'recovery_emission' in defaults, (
+            'the shipped defaults.yaml must declare the recovery_emission: '
+            'block so the knobs are discoverable without reading pydantic source'
+        )
+        block = defaults['recovery_emission']
+        assert block['enabled'] is True
+        assert block['veto_streak_threshold'] == 3
+        assert block['veto_streak_min_span_secs'] == 1500.0
+        assert block['streak_escalation_enabled'] is True
+
+    def test_leaves_are_green_tier_hot_reloadable(self):
+        """Every leaf is in RELOADABLE_FIELDS (whole-submodel-group idiom).
+
+        An operator must be able to retune the threshold or silence a noisy
+        detector live — a detector you can only silence by restarting the
+        fleet is one that gets silenced by ignoring it instead.
+        """
+        from orchestrator.config import RecoveryEmissionConfig
+
+        for leaf in RecoveryEmissionConfig.model_fields:
+            assert f'recovery_emission.{leaf}' in RELOADABLE_FIELDS, (
+                f'recovery_emission.{leaf} must be green-tier hot-reloadable; '
+                'register the whole submodel via _submodel_leaf_paths so new '
+                'leaves are covered automatically'
             )

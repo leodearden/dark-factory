@@ -11,10 +11,21 @@ See also:
   - dashboard/src/dashboard/config.py — DashboardConfig.from_env handling of DASHBOARD_KNOWN_PROJECT_ROOTS (COMMA-separated split)
 """
 
+import functools
+import os
 import pathlib
 import re
+import shutil
+import subprocess
+import typing
 
 import pytest
+from systemd_unit_invariants import (
+    assert_restart_backoff_effective as _assert_restart_backoff_effective,
+)
+from systemd_unit_invariants import (
+    restart_directive as _restart_directive,
+)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 TEMPLATE = REPO_ROOT / "scripts" / "dashboard.service.template"
@@ -28,6 +39,49 @@ TEMPLATE_EXPECTED_ENV_LINE = (
 HARDCODED_EXPECTED_ENV_LINE = (
     "Environment=DASHBOARD_KNOWN_PROJECT_ROOTS="
     "/home/leo/src/dark-factory"
+)
+
+# WorkingDirectory= is load-bearing on its own terms: ExecStart runs
+# `uv run --project dashboard python -m uvicorn dashboard.app:app`, and
+# `--project dashboard` is a RELATIVE path resolved against the unit's
+# process cwd. systemd sets that cwd only from WorkingDirectory= (it does not
+# inherit an interactive shell's), so dropping or repointing this directive
+# makes uv resolve the wrong project directory, or fail outright. Both files
+# also pin an ABSOLUTE path, which systemd requires: an unsubstituted
+# __REPO_ROOT__ sentinel trips a fatal "WorkingDirectory= path is not
+# absolute" error, corroborated in this file's
+# test_systemd_analyze_verify_reports_no_ignored_directives.
+# check_dashboard_unit_parity.py treats WorkingDirectory as presence-only by
+# design (it compares committed-vs-installed, where the directive's value can
+# legitimately diverge across hosts), so it does not guard the
+# template/hardcoded pair asserted below — that guard is
+# _assert_exact_unit_line, an anchored check (not a substring check),
+# so a repointed or commented-out directive still fails.
+TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE = "WorkingDirectory=__REPO_ROOT__"
+
+HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE = (
+    "WorkingDirectory=/home/leo/src/dark-factory"
+)
+
+# DASHBOARD_PROJECT_ROOT is declared EXPLICITLY (task 3572) because
+# dashboard/src/dashboard/config.py's `project_root` falls back to Path.cwd()
+# when it is unset — so without the line asserted below the dashboard's entire
+# data root is an undeclared SIDE EFFECT of WorkingDirectory=.  The units carry
+# that rationale on the line itself; the full version, including why the
+# installed copy cannot be value-compared, is on
+# scripts/check_dashboard_unit_parity.py's UnitSpec.env_matches_directive.
+#
+# What is pinned HERE is the two-part shape: each file declares the line
+# verbatim (these constants), AND the value equals WorkingDirectory= — a
+# separate assertion, since both lines can be individually well-formed while
+# one has been repointed.  See
+# test_project_root_env_matches_working_directory_in_both_unit_files below.
+TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE = (
+    "Environment=DASHBOARD_PROJECT_ROOT=__REPO_ROOT__"
+)
+
+HARDCODED_EXPECTED_PROJECT_ROOT_ENV_LINE = (
+    "Environment=DASHBOARD_PROJECT_ROOT=/home/leo/src/dark-factory"
 )
 
 # These are the literal paths baked into the committed hardcoded service file;
@@ -77,6 +131,94 @@ def _assert_known_project_roots_comma_separated(path: pathlib.Path) -> None:
     )
 
 
+def _assert_exact_unit_line(path: pathlib.Path, expected_line: str) -> None:
+    """Assert *expected_line* appears in *path* as a whole, anchored line.
+
+    Generic by construction — it asserts nothing about WHICH directive it is
+    given, so it serves every unit line whose exact value is load-bearing.  It
+    is used here for both ``WorkingDirectory=`` and
+    ``Environment=DASHBOARD_PROJECT_ROOT=``; see the module comments above
+    TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE and
+    TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE for why each of those is
+    load-bearing.
+
+    A plain substring check (``expected_line in content``) is satisfied by a
+    repointed value that merely starts with the expected text — e.g.
+    ``WorkingDirectory=__REPO_ROOT__/dashboard`` still contains
+    ``WorkingDirectory=__REPO_ROOT__`` — and by the same text sitting inside a
+    ``#`` comment, which systemd never parses as a directive.  Both leave the
+    unit's real cwd (or data root) wrong or unset while a substring check stays
+    green.  Anchoring the full line with ``^...$`` under ``re.MULTILINE``
+    rejects both: a suffix breaks the ``$`` boundary, and a leading ``#``
+    breaks the ``^`` boundary.
+    """
+    content = path.read_text(encoding="utf-8")
+    pattern = re.compile(rf"^{re.escape(expected_line)}\s*$", re.MULTILINE)
+    assert pattern.search(content) is not None, (
+        f"No line matching {expected_line!r} found in {path}. See the "
+        "rationale comments above TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE and "
+        "TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE for why these directives are "
+        "load-bearing."
+    )
+
+
+def _assert_project_root_env_matches_working_directory(path: pathlib.Path) -> None:
+    """Assert DASHBOARD_PROJECT_ROOT equals WorkingDirectory= WITHIN *path*.
+
+    This is the relation the two directives must satisfy, checked INSIDE a
+    single file rather than across the template/hardcoded pair.  The exact-line
+    assertions above already pin each file's literal value; what they cannot
+    catch is one of the two being repointed while the other stays put, since
+    each remains individually well-formed.
+
+    Checking the relation intra-file (rather than comparing one file's value to
+    the other's) is also what makes it host-invariant: the committed unit
+    hardcodes /home/leo/src/dark-factory while setup-host.sh renders the
+    installed copy with that host's real $REPO_ROOT, so the VALUES legitimately
+    differ per host while this EQUALITY holds on every one of them.
+    scripts/check_dashboard_unit_parity.py's env_matches_directive applies the
+    same relation to the installed copy for exactly that reason.
+
+    Both directives are matched anchored (``^...$`` under ``re.MULTILINE``), so
+    a commented-out or suffixed line does not satisfy either half — the same
+    property _assert_exact_unit_line's docstring records.
+    """
+    content = path.read_text(encoding="utf-8")
+
+    env_match = re.search(
+        r"^Environment=DASHBOARD_PROJECT_ROOT=(.*)$", content, re.MULTILINE
+    )
+    assert env_match is not None, (
+        f"No Environment=DASHBOARD_PROJECT_ROOT= line found in {path}. Without "
+        "it the dashboard's data root falls back to Path.cwd() and is an "
+        "undeclared side effect of WorkingDirectory= — see the comment above "
+        "TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE."
+    )
+    wd_match = re.search(r"^WorkingDirectory=(.*)$", content, re.MULTILINE)
+    assert wd_match is not None, (
+        f"No WorkingDirectory= line found in {path}; the DASHBOARD_PROJECT_ROOT "
+        "relation cannot be established without it."
+    )
+
+    project_root = env_match.group(1).strip()
+    working_directory = wd_match.group(1).strip()
+    assert project_root != "", (
+        f"DASHBOARD_PROJECT_ROOT is empty or whitespace-only in {path}. "
+        "config.py would then treat the empty string as the declared root "
+        "rather than falling back to cwd."
+    )
+    assert working_directory != "", (
+        f"WorkingDirectory= is empty or whitespace-only in {path}."
+    )
+    assert project_root == working_directory, (
+        f"DASHBOARD_PROJECT_ROOT ({project_root!r}) does not equal "
+        f"WorkingDirectory ({working_directory!r}) in {path}. The dashboard "
+        "would then read its databases from one directory while `uv run "
+        "--project dashboard` resolves relative paths against another. Repoint "
+        "whichever of the two moved."
+    )
+
+
 def test_template_sets_known_project_roots() -> None:
     """scripts/dashboard.service.template must declare DASHBOARD_KNOWN_PROJECT_ROOTS with __REPO_ROOT__ sentinel.
 
@@ -104,6 +246,60 @@ def test_hardcoded_service_file_sets_known_project_roots() -> None:
         f"Expected line not found in {HARDCODED}:\n  {HARDCODED_EXPECTED_ENV_LINE!r}\n"
         "Add it to the [Service] section after the ExecStart block."
     )
+
+
+def test_working_directory_is_pinned_in_both_unit_files() -> None:
+    """Both unit files must pin WorkingDirectory= to the repo root, exactly.
+
+    See the module comment on TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE above
+    for why the directive is load-bearing, and
+    _assert_exact_unit_line's docstring for why the check is anchored
+    rather than a substring match.
+
+    Kept for targeted diagnostics — this property is subsumed by
+    test_template_renders_to_hardcoded_file, but this test pinpoints which
+    file's WorkingDirectory= line broke without inspecting a full-file diff.
+    """
+    for path, expected_line in (
+        (TEMPLATE, TEMPLATE_EXPECTED_WORKING_DIRECTORY_LINE),
+        (HARDCODED, HARDCODED_EXPECTED_WORKING_DIRECTORY_LINE),
+    ):
+        _assert_exact_unit_line(path, expected_line)
+
+
+def test_project_root_env_var_is_pinned_in_both_unit_files() -> None:
+    """Both unit files must declare DASHBOARD_PROJECT_ROOT explicitly (task 3572).
+
+    See the module comment on TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE above for
+    why the variable is declared rather than left to config.py's Path.cwd()
+    fallback, and _assert_exact_unit_line's docstring for why the check is
+    anchored rather than a substring match.
+
+    The template must carry the __REPO_ROOT__ sentinel, never a hardcoded path,
+    so setup-host.sh's `sed 's|__REPO_ROOT__|$REPO_ROOT|g'` makes the installed
+    value track the real checkout — the same treatment
+    DASHBOARD_KNOWN_PROJECT_ROOTS' self entry already gets.
+    """
+    for path, expected_line in (
+        (TEMPLATE, TEMPLATE_EXPECTED_PROJECT_ROOT_ENV_LINE),
+        (HARDCODED, HARDCODED_EXPECTED_PROJECT_ROOT_ENV_LINE),
+    ):
+        _assert_exact_unit_line(path, expected_line)
+
+
+def test_project_root_env_matches_working_directory_in_both_unit_files() -> None:
+    """DASHBOARD_PROJECT_ROOT must equal WorkingDirectory= within each unit file.
+
+    Distinct from the exact-line tests above, which pin each directive's literal
+    value independently: this pins the RELATION between them, so repointing one
+    without the other fails even though both lines remain individually
+    well-formed.  See _assert_project_root_env_matches_working_directory's
+    docstring for why the relation is checked intra-file (it is host-invariant
+    that way), and scripts/check_dashboard_unit_parity.py's env_matches_directive
+    for the same relation applied to the installed copy.
+    """
+    for path in (TEMPLATE, HARDCODED):
+        _assert_project_root_env_matches_working_directory(path)
 
 
 def test_comma_separator_helper_rejects_empty_value(
@@ -168,6 +364,120 @@ def test_comma_separator_helper_detects_colon_in_any_position(
         encoding="utf-8",
     )
     _assert_known_project_roots_comma_separated(good_file)
+
+
+def test_working_directory_helper_rejects_suffix_or_comment(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_assert_exact_unit_line must not be satisfied by a substring match.
+
+    A plain ``expected in content`` check stays green if WorkingDirectory= is
+    repointed to a subdirectory (``.../dashboard``) or survives only inside a
+    ``#`` comment — both leave the unit's real cwd wrong while every
+    substring-based assertion keeps passing.  This pins the anchored check
+    against exactly those two regressions.
+    """
+    expected_line = "WorkingDirectory=/home/leo/src/dark-factory"
+
+    # Bad: repointed to a subdirectory — `expected_line in content` is still
+    # True, but the unit's cwd is now wrong.
+    suffixed = tmp_path / "suffixed.service"
+    suffixed.write_text(
+        "[Service]\nWorkingDirectory=/home/leo/src/dark-factory/dashboard\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_exact_unit_line(suffixed, expected_line)
+
+    # Bad: directive only present inside a comment — systemd never parses it.
+    commented = tmp_path / "commented.service"
+    commented.write_text(
+        "[Service]\n# WorkingDirectory=/home/leo/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_exact_unit_line(commented, expected_line)
+
+    # Good: exact, uncommented line — helper must not raise.
+    good = tmp_path / "good.service"
+    good.write_text(
+        "[Service]\nWorkingDirectory=/home/leo/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    _assert_exact_unit_line(good, expected_line)
+
+
+def test_project_root_env_helper_rejects_a_mismatch(tmp_path: pathlib.Path) -> None:
+    """_assert_project_root_env_matches_working_directory must not silently no-op.
+
+    Same convention as test_working_directory_helper_rejects_suffix_or_comment
+    above: a relational assertion helper earns its own negatives.  Without them
+    a helper whose regexes stopped matching — say after a directive was renamed
+    — would find nothing, assert nothing, and keep
+    test_project_root_env_matches_working_directory_in_both_unit_files green
+    forever against units that had actually drifted apart.  Every case pins its
+    own failure mode with ``match=`` so a bad case cannot "pass" by tripping a
+    different branch than the one it names.
+    """
+    # Bad: the two directives disagree — the dashboard would read its databases
+    # from one directory while uv resolves --project against another.
+    mismatched = tmp_path / "mismatched.service"
+    mismatched.write_text(
+        "[Service]\n"
+        "WorkingDirectory=/home/alice/src/dark-factory\n"
+        "Environment=DASHBOARD_PROJECT_ROOT=/tmp/wrong\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="does not equal"):
+        _assert_project_root_env_matches_working_directory(mismatched)
+
+    # Bad: the Environment= line is absent entirely — the relation cannot hold,
+    # and silence here would read as agreement.
+    missing_env = tmp_path / "missing_env.service"
+    missing_env.write_text(
+        "[Service]\nWorkingDirectory=/home/alice/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        AssertionError, match="No Environment=DASHBOARD_PROJECT_ROOT= line"
+    ):
+        _assert_project_root_env_matches_working_directory(missing_env)
+
+    # Bad: the Environment= line is present only inside a comment, which systemd
+    # never parses — the anchored match must reject it rather than reading the
+    # value out of the comment.
+    commented_env = tmp_path / "commented_env.service"
+    commented_env.write_text(
+        "[Service]\n"
+        "WorkingDirectory=/home/alice/src/dark-factory\n"
+        "# Environment=DASHBOARD_PROJECT_ROOT=/home/alice/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        AssertionError, match="No Environment=DASHBOARD_PROJECT_ROOT= line"
+    ):
+        _assert_project_root_env_matches_working_directory(commented_env)
+
+    # Bad: WorkingDirectory= absent — the other half of the relation.
+    missing_wd = tmp_path / "missing_wd.service"
+    missing_wd.write_text(
+        "[Service]\nEnvironment=DASHBOARD_PROJECT_ROOT=/home/alice/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError, match="No WorkingDirectory= line"):
+        _assert_project_root_env_matches_working_directory(missing_wd)
+
+    # Good: the two agree at a path that is NOT this host's — the relation is
+    # host-invariant, so a correctly-configured foreign checkout must pass.
+    # This is what makes the check safe to apply to an installed copy.
+    good = tmp_path / "good.service"
+    good.write_text(
+        "[Service]\n"
+        "WorkingDirectory=/home/alice/src/dark-factory\n"
+        "Environment=DASHBOARD_PROJECT_ROOT=/home/alice/src/dark-factory\n",
+        encoding="utf-8",
+    )
+    _assert_project_root_env_matches_working_directory(good)
 
 
 def test_known_project_roots_uses_comma_separator_not_colon() -> None:
@@ -280,3 +590,2027 @@ def test_template_renders_to_hardcoded_file() -> None:
         "in setup-host.sh lines 325-329 and updating "
         "dashboard/dark-factory-dashboard.service."
     )
+
+
+# ---------------------------------------------------------------------------
+# Bounded shutdown drain
+#
+# Without an explicit uvicorn drain bound, a restart with a live polling client
+# attached never finishes its connection drain, so systemd's TimeoutStopSec
+# elapses and the unit is SIGKILLed — turning every restart into a ~16s
+# contiguous dead window.  The invariant below is RELATIONAL, not existential:
+# a --timeout-graceful-shutdown at or above TimeoutStopSec would still end in
+# SIGKILL, so the mere presence of the flag is not the property that matters.
+# ---------------------------------------------------------------------------
+
+# Seconds that must remain between uvicorn's graceful-shutdown bound and
+# systemd's SIGKILL deadline, for uvicorn's post-drain lifespan shutdown, the
+# interpreter's exit, and the intermediate `uv run` parent's own teardown.
+MIN_SHUTDOWN_MARGIN_SECONDS = 5
+
+# The browser's poll interval is DERIVED from the client source, never restated
+# here.  plans/dashboard-availability-prd.md records that the dashboard polls
+# every 3 seconds and that the resulting keep-alive connections "never idle out
+# under a 3s poll" — which is exactly why the drain never completed before the
+# graceful-shutdown bound was added.  But the invariant this module protects is
+# RELATIONAL (keep-alive must exceed the interval at which the browser reuses
+# its connection), so a constant copied out of the JS would rot silently: bump
+# the poller to 6000ms and a hardcoded `3` keeps the test green (5 > 3) while
+# the real invariant (5 > 6) is violated.  Parsing the live value instead makes
+# that bump fail loudly, the same way test_template_renders_to_hardcoded_file
+# renders the template rather than restating its contents.
+#
+# CORRECTION (task 4087): deriving that value from data.js ALONE was the same
+# class of rot one level up.  The browser runs more than one recurring HTTP
+# poller, and each holds its own keep-alive connection and reuses it at its own
+# interval — so the bound must clear the SLOWEST of them, not whichever one this
+# module happened to know about.  tab_overview.jsx has polled /api/load every
+# 5000ms for the entire life of this invariant while the derivation saw only
+# data.js's 3000ms, leaving keep-alive=5 sitting exactly ON the boundary
+# (5000 > 5000 is false) with the suite green.  CLIENT_POLLERS below makes the
+# covered set explicit and _slowest_client_poll_ms() makes the bound relational
+# against all of it; test_every_client_setinterval_is_registered_or_allowlisted
+# makes an UNcovered new poller a loud failure rather than a silent one.
+REDUX_DIR = REPO_ROOT / "dashboard" / "src" / "dashboard" / "static" / "redux"
+POLL_JS = REDUX_DIR / "data.js"
+
+# The SECOND recurring HTTP poller: HostLoadCard's /api/load poll.  It is fully
+# independent of data.js's refresh — its own setInterval, its own connection,
+# its own reuse interval — so the keep-alive bound has to clear it too.
+LOAD_POLL_JSX = REDUX_DIR / "tab_overview.jsx"
+
+# The poller names its period explicitly, so anchor on that name rather than on
+# whichever call site happens to consume it.  An earlier revision scraped the
+# sole ``setInterval(..., <literal>)`` in the file; that broke the moment the
+# poller was refactored to pass a named constant (and gained unrelated
+# setTimeout-based fetch deadlines), because the literal no longer appeared at
+# the call site.  Binding to the declaration is both stabler and more precise.
+#
+# The name is a PARAMETER rather than a module constant because more than one
+# client poller declares a period (see CLIENT_POLLERS below).  The patterns are
+# otherwise byte-identical per name; in particular the ``^\s*(?:const|let|var)
+# \s+`` anchor is what makes LOAD_POLL_INTERVAL_MS and POLL_INTERVAL_MS
+# mutually non-matching, so one poller can never answer a lookup for another.
+@functools.cache
+def _int_decl_pattern(const_name: str) -> re.Pattern[str]:
+    """Return the compiled ``const <const_name> = <int literal>;`` pattern."""
+    return re.compile(
+        rf"^\s*(?:const|let|var)\s+{re.escape(const_name)}\s*=\s*(\d+)\s*;",
+        re.MULTILINE,
+    )
+
+
+@functools.cache
+def _poll_interval_patterns(const_name: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """Return the (declaration, use) regex pair for *const_name*, compiled once."""
+    return (
+        _int_decl_pattern(const_name),
+        re.compile(rf"setInterval\([^;]*?,\s*{re.escape(const_name)}\s*\)"),
+    )
+
+
+def _parse_declared_int(source: str, origin: str, const_name: str) -> int:
+    """Return the single integer literal *const_name* is declared with in *source*.
+
+    The declaration half of _parse_poll_interval_ms, factored out because not
+    every timing constant the keep-alive bound depends on is a ``setInterval``
+    period — data.js's ``JITTER_MAX_MS`` is awaited inside the request path, not
+    passed to a timer, so it has no call site to bind to.  Exactly one
+    declaration is still required, for the same reason: an ambiguous value is
+    not a value.
+    """
+    decls = _int_decl_pattern(const_name).findall(source)
+    assert len(decls) == 1, (
+        f"Expected exactly one {const_name} = <literal> declaration in "
+        f"{origin}, found {len(decls)}: {decls}. The keep-alive bound in this "
+        "module is derived from that constant; if it was renamed, moved, or "
+        "made non-literal, update the reader to identify the value explicitly "
+        "rather than dropping the check."
+    )
+    return int(decls[0])
+
+
+def _parse_poll_interval_ms(
+    source: str, origin: str, const_name: str = "POLL_INTERVAL_MS"
+) -> int:
+    """Return the period named *const_name* in *source*, in milliseconds.
+
+    Reads the ``<const_name>`` declaration, and separately asserts that the
+    constant is what actually drives a ``setInterval``.  Both halves must hold:
+    a declaration nobody schedules on would let this module measure a dead
+    constant, and a scheduler whose period we cannot read would let the
+    keep-alive bound be checked against nothing.  Exactly one declaration is
+    required so the period can never be ambiguous.
+
+    *const_name* defaults to data.js's ``POLL_INTERVAL_MS``, but is a parameter
+    because the browser runs more than one recurring HTTP poller and each names
+    its own period — tab_overview.jsx's host-load card declares
+    ``LOAD_POLL_INTERVAL_MS``.  Parameterizing the existing parser rather than
+    writing a second one carries both halves of the contract above to every
+    poller for free.  Every message names the REQUESTED constant, so a miss on
+    one poller cannot report itself as a problem with another.
+    """
+    _, use_re = _poll_interval_patterns(const_name)
+    period = _parse_declared_int(source, origin, const_name)
+    assert use_re.search(source), (
+        f"{const_name} is declared in {origin} but never passed as a "
+        "setInterval(...) period, so it may no longer be that poller's actual "
+        "interval. Update _parse_poll_interval_ms to read "
+        "whatever now schedules the poll."
+    )
+    return period
+
+
+def _client_poll_interval_ms() -> int:
+    """Return the browser's data-refresh poll interval, in milliseconds."""
+    return _parse_poll_interval_ms(POLL_JS.read_text(encoding="utf-8"), str(POLL_JS))
+
+
+class ClientPoller(typing.NamedTuple):
+    """One recurring HTTP poller the browser runs, for keep-alive purposes.
+
+    *what* is prose naming the poller, so a failure can say WHICH one set the
+    keep-alive floor instead of just printing a number.
+
+    *jitter_const* names a declared delay the poller adds ON TOP of its timer
+    period before issuing the request, or None when it adds none.  It is part of
+    the entry because the quantity this module actually needs is the worst-case
+    gap between two consecutive requests on one connection, not the timer period
+    — see _poller_reuse_ms.
+    """
+
+    path: pathlib.Path
+    const_name: str
+    what: str
+    jitter_const: str | None = None
+
+
+# Every recurring HTTP poller in the shipped client.  Membership is the property
+# that matters: an unregistered poller is one the keep-alive floor does not
+# clear, which is exactly how tab_overview.jsx's 5s /api/load poll went
+# unnoticed.  Periods are read from the live sources at run time (never restated
+# here), so there is no third copy to go stale.
+#
+# data.js registers its JITTER_MAX_MS too, because its timer period alone
+# UNDERSTATES how far apart its requests can land — refreshOne awaits
+# `sleep(random() * jitterMaxMs)` inside the in-flight window (data.js:261), so
+# consecutive requests on one endpoint can be POLL_INTERVAL_MS + JITTER_MAX_MS
+# apart.  Deriving the floor from the bare period would be the same silent
+# understatement this module is a correction for, one level further down.
+#
+# A new recurring poller MUST be added here.  The completeness guard
+# (test_every_client_setinterval_is_registered_or_allowlisted) fails on any
+# setInterval under redux/ that is neither registered here nor in
+# NON_POLLING_TIMERS, so forgetting is loud rather than silent.
+CLIENT_POLLERS: tuple[ClientPoller, ...] = (
+    ClientPoller(
+        POLL_JS, "POLL_INTERVAL_MS", "main data refresh", jitter_const="JITTER_MAX_MS"
+    ),
+    ClientPoller(
+        LOAD_POLL_JSX, "LOAD_POLL_INTERVAL_MS", "host-load card, /api/load"
+    ),
+)
+
+
+def _poller_reuse_ms(entry: ClientPoller) -> int:
+    """Return the worst-case gap between two of *entry*'s consecutive requests.
+
+    The keep-alive invariant is about the interval at which the browser REUSES
+    a connection, which is the timer period only when the poller fires its
+    request the instant the timer does.  data.js does not: refreshOne awaits a
+    random jitter of up to JITTER_MAX_MS *inside* the in-flight window before
+    fetching, so a zero-jitter tick followed by a max-jitter tick puts
+    POLL_INTERVAL_MS + JITTER_MAX_MS between the two requests.  Summing the two
+    is therefore the honest bound; using the period alone would certify a
+    keep-alive that the real spacing can exceed.
+    """
+    source = entry.path.read_text(encoding="utf-8")
+    period = _parse_poll_interval_ms(
+        source, str(entry.path), const_name=entry.const_name
+    )
+    if entry.jitter_const is None:
+        return period
+    jitter = _parse_declared_int(source, str(entry.path), entry.jitter_const)
+    # The declaration is only meaningful if something still applies it; a jitter
+    # constant left behind after the delay was removed would inflate the floor
+    # off a dead number.  Two occurrences = the declaration plus at least one use.
+    uses = len(re.findall(rf"\b{re.escape(entry.jitter_const)}\b", source))
+    assert uses >= 2, (
+        f"{entry.jitter_const} is declared in {entry.path} ({entry.what}) but "
+        "never referenced again, so it may no longer delay the request. Update "
+        "the CLIENT_POLLERS entry to name whatever now offsets the poll, or "
+        "drop jitter_const if the poller fires on its timer."
+    )
+    return period + jitter
+
+
+def _slowest_client_poll() -> tuple[int, ClientPoller]:
+    """Return (reuse_ms, poller) for the SLOWEST registered client poller.
+
+    Returns the entry alongside the interval so callers can name which poller
+    set the keep-alive floor; a bare number leaves the reader to go find it.
+    The interval is the connection-REUSE interval from _poller_reuse_ms, not the
+    bare timer period.
+    """
+    measured = [(_poller_reuse_ms(entry), entry) for entry in CLIENT_POLLERS]
+    return max(measured, key=lambda pair: pair[0])
+
+
+def _slowest_client_poll_ms() -> int:
+    """Return the slowest registered connection-reuse interval, in milliseconds."""
+    return _slowest_client_poll()[0]
+
+
+# Recurring client timers that are deliberately NOT pollers, keyed on
+# (relpath, period-text) with the reason they are exempt.
+#
+# ENTRY CRITERION — the timer must open NO network connection.  If it fetches
+# anything it belongs in CLIENT_POLLERS instead, because it then independently
+# holds a keep-alive socket and reuses it at its own interval, which is exactly
+# what the --timeout-keep-alive floor has to clear.  Parking a real poller here
+# would silence the guard while re-creating the bug it exists to catch.
+#
+# Entries are checked for staleness too: one that matches no live call site is
+# reported by test_every_client_setinterval_is_registered_or_allowlisted, so the
+# allowlist cannot quietly rot into a no-op.
+NON_POLLING_TIMERS: dict[tuple[str, str], str] = {
+    ("redux/app.jsx", "1000"): (
+        "App-wide clock tick: setInterval(() => setNow(new Date()), 1000) only "
+        "advances React state so rendered times refresh. No fetch, no "
+        "connection."
+    ),
+    ("redux/shell.jsx", "2000"): (
+        "LiveFeed re-tick: setInterval(() => tick(n => n + 1), 2000) re-renders "
+        "the relative `timeago` strings from the already-fetched window.DF_DATA "
+        "even when it has not changed. Issues no request."
+    ),
+}
+
+
+# Matches a `//` line comment or a `/* ... */` block comment.  Block first, so a
+# `//` inside a block does not end the line-comment match early.
+#
+# The `(?<![:\w])` guard keeps a URL's `//` from being read as a comment start.
+# The live client carries `http://www.w3.org/2000/svg` inside a template literal
+# at redux/tweaks-panel.jsx:82; without the guard everything after that `//` is
+# blanked, which would HIDE any call site sharing the line.
+_JS_COMMENT_RE = re.compile(r"/\*.*?\*/|(?<![:\w])//[^\n]*", re.DOTALL)
+
+
+def _strip_js_comments(source: str) -> str:
+    """Return *source* with comments blanked out, preserving line structure.
+
+    Comment bodies are replaced by their own newlines rather than deleted, so a
+    site's line number and the file's shape survive the strip.
+
+    Load-bearing, not cosmetic.  The live client mentions ``setInterval(...)``
+    inside a ``//`` comment in tab_tasks.jsx, so a raw-text scan would report a
+    call site that does not exist — training maintainers to allowlist fictions,
+    and (worse) letting an allowlist entry be "satisfied" by a commented-out
+    line.  This is the same hazard _uvicorn_int_flag already handles from the
+    other direction, by scoping its lookup to the logical ExecStart line rather
+    than the whole file, because both unit files discuss the very flags it reads
+    in prose above the command.  Scope to code, never to raw file text.
+
+    Still a regex, not a JS lexer, so it stays naive about strings and regex
+    literals — but the naivety is bounded where it actually bites.  The common
+    real case is a URL, whose ``//`` follows a ``:``, and the pattern's
+    ``(?<![:\\w])`` guard refuses to start a comment there; the live tree has
+    exactly that, inside a template literal at redux/tweaks-panel.jsx:82.  A
+    protocol-relative ``"//cdn…"`` or a ``//`` inside a regex literal would
+    still over-strip.
+
+    That residual is a real hole, NOT a safe direction.  An earlier version of
+    this docstring claimed over-stripping "can only HIDE a site, which the
+    stale-allowlist half then surfaces" — that is wrong, and worth recording so
+    nobody re-derives it: the stale check only fires for a site that ALREADY has
+    a NON_POLLING_TIMERS entry.  A newly added poller sharing a line with an
+    over-stripped ``//`` has no entry to go stale, so it would be hidden with
+    nothing to report it — precisely the silent-uncovered-poller failure this
+    guard exists to prevent.  If such a line ever appears, extend the stripper
+    to skip string/template spans rather than working around it.
+    """
+    return _JS_COMMENT_RE.sub(lambda m: "\n" * m.group(0).count("\n"), source)
+
+
+def _setinterval_period_args(source: str) -> list[str]:
+    """Return the period argument text of every ``setInterval(`` call in *source*.
+
+    Scans the argument list with a balanced-paren walk and takes the text after
+    the LAST top-level comma.  A naive ``setInterval\\([^)]*\\)`` regex stops at
+    the first ``)``, which both live non-polling timers contain in their
+    callbacks — ``setInterval(() => setNow(new Date()), 1000)`` and
+    ``setInterval(() => tick(n => n + 1), 2000)`` — so it would yield a garbled
+    period for exactly the sites this scanner exists to classify.
+    """
+    periods: list[str] = []
+    for match in re.finditer(r"\bsetInterval\s*\(", source):
+        depth = 1
+        last_comma = None
+        idx = match.end()
+        while idx < len(source) and depth:
+            char = source[idx]
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+                if not depth:
+                    break
+            elif char == "," and depth == 1:
+                last_comma = idx
+            idx += 1
+        if depth and idx >= len(source):
+            # Unbalanced call — report the whole tail rather than silently
+            # dropping a site the maintainer needs to see.
+            periods.append(source[match.end():].strip())
+            continue
+        arg_start = match.end() if last_comma is None else last_comma + 1
+        periods.append(source[arg_start:idx].strip())
+    return periods
+
+
+def _site_relpath(path: pathlib.Path) -> str:
+    """Return the short ``<dir>/<file>`` key a call site is reported under.
+
+    Two components, so the key is stable across checkouts and worktrees (an
+    absolute path would make every allowlist entry machine-specific) while still
+    being unambiguous and greppable within the client tree.
+    """
+    return f"{path.parent.name}/{path.name}"
+
+
+def _unclassified_setinterval_sites(
+    paths: typing.Iterable[pathlib.Path],
+    known_sites: typing.AbstractSet[tuple[str, str]],
+    allowlist: typing.Mapping[tuple[str, str], str],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Sort every live ``setInterval`` under *paths* into known / allowed / new.
+
+    *known_sites* is keyed on the ``(relpath, const_name)`` PAIR, not on the
+    constant name alone.  Matching on the name alone would wave through a
+    ``setInterval(fetchX, POLL_INTERVAL_MS)`` in some other file — covered, says
+    the guard; never read, says _slowest_client_poll, which only ever opens the
+    paths CLIENT_POLLERS registers — re-creating this task's silent-coverage
+    hole one level down.  That is reachable rather than theoretical for .jsx:
+    they load as ``type="text/babel"`` and Babel standalone evaluates each
+    separately, so a same-named top-level ``const`` in a second .jsx need not
+    collide with data.js's global (dashboard/tests/js/classic_script_scope.test.mjs).
+
+    Returns ``(unclassified, stale)``:
+
+    * *unclassified* — ``(relpath, period_text)`` for each call site that is
+      neither a *known_sites* pair (a registered poller, in the file it is
+      registered for) nor an *allowlist* key.  These are the sites nothing has
+      decided about, so the keep-alive floor may not clear them.
+    * *stale* — *allowlist* keys matching no live call site.  An entry that
+      matches nothing checks nothing, and rots the gate into a green no-op —
+      the same staleness reasoning as
+      test_registry_keys_are_all_declared_in_the_committed_units in
+      tests/scripts/test_check_dashboard_unit_parity.py.  Reporting it also
+      keeps a commented-out site from satisfying its own allowlist entry.
+
+    Both lists are returned rather than asserted here so the caller can name the
+    concrete remedy for each; see _strip_js_comments and
+    _setinterval_period_args for why the scan is done over comment-stripped
+    source with a balanced-paren walk.
+    """
+    unclassified: list[tuple[str, str]] = []
+    live: set[tuple[str, str]] = set()
+    for path in paths:
+        relpath = _site_relpath(path)
+        code = _strip_js_comments(path.read_text(encoding="utf-8"))
+        for period in _setinterval_period_args(code):
+            site = (relpath, period)
+            live.add(site)
+            if site in known_sites or site in allowlist:
+                continue
+            unclassified.append(site)
+    stale = sorted(key for key in allowlist if key not in live)
+    return unclassified, stale
+
+
+def _logical_exec_start(path: pathlib.Path) -> str:
+    """Return the ExecStart= command in *path* as a single logical line.
+
+    The dashboard unit writes ExecStart as a systemd backslash continuation
+    spanning several physical lines, so a naive per-line regex would miss any
+    flag that lives on a continuation line.  Joins the ExecStart= line with
+    each following line while the current line ends in a backslash, dropping
+    the trailing ``\\`` and collapsing continuation indentation to a single
+    space.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    start_idx = next(
+        (i for i, ln in enumerate(lines) if ln.startswith("ExecStart=")),
+        None,
+    )
+    assert start_idx is not None, f"No ExecStart= line found in {path}"
+
+    parts: list[str] = []
+    idx = start_idx
+    while True:
+        line = lines[idx].rstrip()
+        continued = line.endswith("\\")
+        if continued:
+            line = line[:-1]
+        # The first line keeps its ExecStart= prefix verbatim; continuation
+        # lines are stripped so the join yields single-space separation.
+        parts.append(line.rstrip() if idx == start_idx else line.strip())
+        if not continued or idx + 1 >= len(lines):
+            break
+        idx += 1
+    return " ".join(parts)
+
+
+def _uvicorn_int_flag(path: pathlib.Path, flag: str) -> int | None:
+    """Return the integer argument of ``--<flag>`` in *path*'s ExecStart, or None.
+
+    Both CLI spellings are recognised.  uvicorn's parser is click-based, so
+    ``--timeout-keep-alive 5`` and ``--timeout-keep-alive=5`` are equally valid
+    and behave identically; accepting only the space-separated form would make
+    an ``=``-form edit fail with "flag absent from ExecStart" while the flag is
+    plainly there.
+
+    The lookup is deliberately scoped to the logical ExecStart line rather than
+    the whole file: both unit files discuss these same flags in the explanatory
+    comment block above ExecStart, so a whole-file regex would keep reporting a
+    value after the flag had actually been deleted from the command.
+    """
+    command = _logical_exec_start(path)
+    match = re.search(rf"--{re.escape(flag)}[=\s]+(\d+)", command)
+    return int(match.group(1)) if match else None
+
+
+# systemd time specs this parser understands: a bare integer (seconds) or an
+# integer with an s/sec/seconds suffix.  Deliberately narrow — anything else is
+# reported by name so the reader extends the parser instead of guessing.
+_SECONDS_SPEC_RE = re.compile(r"^(\d+)\s*(?:s|sec|secs|second|seconds)?$")
+
+
+def _timeout_stop_sec(path: pathlib.Path) -> int:
+    """Return the unit's TimeoutStopSec= value in seconds.
+
+    The directive must be present: a unit without it inherits systemd's
+    DefaultTimeoutStopSec, which makes any margin assertion against it
+    meaningless.
+
+    systemd accepts far more than a bare integer here — ``15s``, ``1min`` and
+    ``infinity`` are all valid and all in common use — so the value is captured
+    as an opaque token first and parsed second.  Matching only ``(\\d+)`` would
+    report a perfectly present ``TimeoutStopSec=15s`` as a *missing* directive,
+    and would give ``TimeoutStopSec=infinity`` — the single value that most
+    severely breaks the margin invariant asserted below — that same misleading
+    diagnosis.  The absent-directive message is therefore reserved for a
+    genuinely missing line.
+    """
+    match = re.search(
+        r"^TimeoutStopSec=(.*)$",
+        path.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert match is not None, (
+        f"No TimeoutStopSec= directive found in {path}. "
+        "Without it the unit inherits systemd's DefaultTimeoutStopSec, so the "
+        "graceful-shutdown margin cannot be verified from the unit file alone."
+    )
+    spec = match.group(1).strip()
+    assert spec != "infinity", (
+        f"TimeoutStopSec=infinity leaves the stop unbounded in {path}. "
+        "systemd then never SIGKILLs a stuck shutdown, so a wedged unit hangs "
+        "instead of restarting and the drain margin asserted here has no "
+        "deadline to be measured against."
+    )
+    seconds = _SECONDS_SPEC_RE.match(spec)
+    assert seconds is not None, (
+        f"could not parse TimeoutStopSec={spec!r} in {path} as seconds; extend "
+        "the parser. Only a bare integer or an integer with an s/sec/seconds "
+        "suffix is understood today."
+    )
+    return int(seconds.group(1))
+
+
+def _assert_drain_bounded(path: pathlib.Path) -> None:
+    """Assert *path* bounds uvicorn's drain strictly below the SIGKILL deadline."""
+    graceful = _uvicorn_int_flag(path, "timeout-graceful-shutdown")
+    assert graceful is not None, (
+        f"No --timeout-graceful-shutdown flag in the ExecStart of {path}. "
+        "Without it uvicorn waits indefinitely for open connections to close; "
+        "a browser polling every 3s never lets them idle out, so systemd's "
+        "TimeoutStopSec elapses and the unit is SIGKILLed on every restart."
+    )
+    stop = _timeout_stop_sec(path)
+    assert graceful < stop, (
+        f"--timeout-graceful-shutdown {graceful} is not below TimeoutStopSec={stop} "
+        f"in {path}. A graceful timeout at or above the stop timeout still ends in "
+        "SIGKILL, so the presence of the flag alone does not bound the drain."
+    )
+    assert stop - graceful >= MIN_SHUTDOWN_MARGIN_SECONDS, (
+        f"Only {stop - graceful}s between --timeout-graceful-shutdown {graceful} and "
+        f"TimeoutStopSec={stop} in {path}; at least {MIN_SHUTDOWN_MARGIN_SECONDS}s are "
+        "needed for uvicorn's post-drain lifespan shutdown, interpreter exit and the "
+        "`uv run` parent's teardown."
+    )
+
+
+def _write_synthetic_unit(
+    path: pathlib.Path,
+    exec_start: str,
+    timeout_stop_sec: int | str = 15,
+    preamble: str = "",
+) -> pathlib.Path:
+    """Write a minimal synthetic unit file for guard-verification tests.
+
+    *timeout_stop_sec* is interpolated verbatim so a test can supply any systemd
+    time spec (``15s``, ``infinity``, ``1min``), not just a bare integer.
+    *preamble* is inserted above ExecStart= — used to reproduce the real units'
+    explanatory comment block, which mentions the very flags being looked up.
+    """
+    body = f"{preamble}\n" if preamble else ""
+    path.write_text(
+        f"[Service]\n{body}{exec_start}\nTimeoutStopSec={timeout_stop_sec}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_drain_bound_guard_rejects_unbounded_units(tmp_path: pathlib.Path) -> None:
+    """_assert_drain_bounded must fire on every way the drain can stay unbounded.
+
+    Follows the same convention as test_comma_separator_helper_* above: a
+    file-content assertion helper earns its own negative tests, so it cannot
+    silently no-op.  Without these, a regex that failed to join the
+    backslash-continued ExecStart would find no flag in ANY file and could be
+    "fixed" by loosening the assertion instead of the join.
+
+    Every case pins its own failure mode with ``match=``.  A bare
+    ``pytest.raises(AssertionError)`` is satisfied by ANY assertion firing
+    anywhere in the call chain, so the four bad cases — which exist precisely to
+    distinguish absent / above / equal / thin-margin — would all still pass if
+    they were tripping the missing-flag branch instead of the one they name.
+    """
+    # Bad: no --timeout-graceful-shutdown at all — the pre-fix state.
+    absent = _write_synthetic_unit(
+        tmp_path / "absent.service",
+        "ExecStart=/usr/bin/uv run python -m uvicorn app:app --host 127.0.0.1",
+    )
+    with pytest.raises(AssertionError, match="No --timeout-graceful-shutdown flag"):
+        _assert_drain_bounded(absent)
+
+    # Bad: graceful timeout ABOVE the stop timeout — still SIGKILLs.
+    above = _write_synthetic_unit(
+        tmp_path / "above.service",
+        "ExecStart=/usr/bin/uv run python -m uvicorn app:app "
+        "--timeout-graceful-shutdown 20",
+    )
+    with pytest.raises(AssertionError, match="20 is not below TimeoutStopSec=15"):
+        _assert_drain_bounded(above)
+
+    # Bad: graceful timeout EQUAL to the stop timeout — races the SIGKILL.
+    equal = _write_synthetic_unit(
+        tmp_path / "equal.service",
+        "ExecStart=/usr/bin/uv run python -m uvicorn app:app "
+        "--timeout-graceful-shutdown 15",
+    )
+    with pytest.raises(AssertionError, match="15 is not below TimeoutStopSec=15"):
+        _assert_drain_bounded(equal)
+
+    # Bad: below the stop timeout but with too little margin (3s < 5s) for
+    # lifespan shutdown, interpreter exit and the `uv run` parent's teardown.
+    thin_margin = _write_synthetic_unit(
+        tmp_path / "thin_margin.service",
+        "ExecStart=/usr/bin/uv run python -m uvicorn app:app "
+        "--timeout-graceful-shutdown 12",
+    )
+    with pytest.raises(AssertionError, match="Only 3s between"):
+        _assert_drain_bounded(thin_margin)
+
+    # Good: 8 vs 15 with the flag on a CONTINUATION line — must not raise.
+    # Guards against over-tightening, and exercises the continuation join in
+    # _logical_exec_start (a per-line regex would miss this flag entirely).
+    good = _write_synthetic_unit(
+        tmp_path / "good.service",
+        "ExecStart=/usr/bin/uv run --project dashboard \\\n"
+        "  python -m uvicorn app:app \\\n"
+        "  --host 127.0.0.1 --port 8080 \\\n"
+        "  --timeout-graceful-shutdown 8",
+    )
+    _assert_drain_bounded(good)
+
+    # Good: the click ``=`` spelling is equally valid and must be accepted.
+    # Rejecting it would fail with "flag absent from ExecStart" against a file
+    # that plainly carries the flag.
+    equals_form = _write_synthetic_unit(
+        tmp_path / "equals_form.service",
+        "ExecStart=/usr/bin/uv run python -m uvicorn app:app "
+        "--timeout-graceful-shutdown=8",
+    )
+    _assert_drain_bounded(equals_form)
+    assert _uvicorn_int_flag(equals_form, "timeout-graceful-shutdown") == 8
+
+
+def test_uvicorn_flag_lookup_is_scoped_to_exec_start(tmp_path: pathlib.Path) -> None:
+    """_uvicorn_int_flag must read the ExecStart command, not the whole file.
+
+    Both real unit files carry an explanatory comment block above ExecStart that
+    names these flags verbatim — dark-factory-dashboard.service literally
+    contains "--timeout-keep-alive" followed by its value in a comment (quoted
+    without the number here so this claim cannot rot on a retune).  So a future
+    refactor of _uvicorn_int_flag to a whole-file regex would keep every test in
+    this module green while the flag had actually been deleted from the command
+    systemd runs, which is the exact regression these tests exist to catch.
+    This pins the scoping so that refactor fails instead.
+    """
+    commented = _write_synthetic_unit(
+        tmp_path / "commented.service",
+        "ExecStart=/usr/bin/uv run python -m uvicorn app:app \\\n"
+        "  --timeout-graceful-shutdown 8",
+        preamble=(
+            "# --timeout-keep-alive 5 is uvicorn's own default, pinned deliberately.\n"
+            "# It is kept ABOVE the client's 3s poll interval on purpose."
+        ),
+    )
+    assert _uvicorn_int_flag(commented, "timeout-keep-alive") is None, (
+        "_uvicorn_int_flag found --timeout-keep-alive in a unit whose ExecStart "
+        "does not carry it — the lookup is matching the comment block instead of "
+        "the command. Scope it to _logical_exec_start()."
+    )
+    # The flag that IS on the command is still found, so the scoping did not
+    # over-tighten into finding nothing at all.
+    assert _uvicorn_int_flag(commented, "timeout-graceful-shutdown") == 8
+
+
+def test_timeout_stop_sec_parses_systemd_time_specs(tmp_path: pathlib.Path) -> None:
+    """_timeout_stop_sec must distinguish absent / infinity / unparseable / valid.
+
+    systemd accepts unit suffixes and the literal ``infinity`` here.  Collapsing
+    all of those into "No TimeoutStopSec= directive found" misdirects the fixer
+    precisely where the diagnosis matters most: ``infinity`` is the one value
+    that most severely breaks the margin invariant, and it must say so.
+    """
+    exec_start = (
+        "ExecStart=/usr/bin/uv run python -m uvicorn app:app "
+        "--timeout-graceful-shutdown 8"
+    )
+
+    # Good: bare integer, and the same value with each accepted suffix.
+    for spec in ("15", "15s", "15sec", "15secs", "15second", "15seconds"):
+        unit = _write_synthetic_unit(
+            tmp_path / f"stop_{spec}.service", exec_start, timeout_stop_sec=spec
+        )
+        assert _timeout_stop_sec(unit) == 15, (
+            f"TimeoutStopSec={spec} should parse as 15 seconds"
+        )
+        # A suffixed spec must not fall out of the drain guard either.
+        _assert_drain_bounded(unit)
+
+    # Bad: genuinely missing directive — this message is reserved for that case.
+    missing = tmp_path / "missing.service"
+    missing.write_text(f"[Service]\n{exec_start}\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="No TimeoutStopSec= directive found"):
+        _timeout_stop_sec(missing)
+
+    # Bad: infinity — valid systemd, but leaves the stop unbounded.
+    infinite = _write_synthetic_unit(
+        tmp_path / "infinite.service", exec_start, timeout_stop_sec="infinity"
+    )
+    with pytest.raises(AssertionError, match="TimeoutStopSec=infinity"):
+        _timeout_stop_sec(infinite)
+
+    # Bad: a spec this parser does not understand — say so, don't claim absence.
+    compound = _write_synthetic_unit(
+        tmp_path / "compound.service", exec_start, timeout_stop_sec="1min 30s"
+    )
+    with pytest.raises(AssertionError, match="could not parse"):
+        _timeout_stop_sec(compound)
+
+
+def test_poll_interval_parser_requires_exactly_one_interval() -> None:
+    """_parse_poll_interval_ms must fail loudly on zero or ambiguous matches.
+
+    The keep-alive bound is derived from this parse, so a silent miss would turn
+    the relational assertion into a no-op against a value nobody supplied.
+    """
+    assert (
+        _parse_poll_interval_ms(
+            "const POLL_INTERVAL_MS = 3000;\n"
+            "const handle = setInterval(() => pollTick(opts), POLL_INTERVAL_MS);\n",
+            "synthetic",
+        )
+        == 3000
+    )
+
+    with pytest.raises(AssertionError, match="found 0"):
+        _parse_poll_interval_ms("refreshDFData();\n", "synthetic")
+
+    with pytest.raises(AssertionError, match="found 2"):
+        _parse_poll_interval_ms(
+            "const POLL_INTERVAL_MS = 3000;\n"
+            "const POLL_INTERVAL_MS = 9000;\n"
+            "setInterval(tick, POLL_INTERVAL_MS);\n",
+            "synthetic",
+        )
+
+    # Declared but nothing schedules on it: the constant may be vestigial, so the
+    # keep-alive bound would be measured against a period the browser never uses.
+    with pytest.raises(AssertionError, match="never passed as a setInterval"):
+        _parse_poll_interval_ms(
+            "const POLL_INTERVAL_MS = 3000;\nsetInterval(tick, 250);\n", "synthetic"
+        )
+
+
+def test_poll_interval_parser_reads_an_arbitrary_constant_name() -> None:
+    """_parse_poll_interval_ms must parse ANY named period, not just POLL_INTERVAL_MS.
+
+    More than one client poller declares a period — data.js's POLL_INTERVAL_MS
+    (the main data refresh) and tab_overview.jsx's LOAD_POLL_INTERVAL_MS (the
+    host-load card's /api/load poll) — and the keep-alive lower bound is derived
+    from the SLOWEST of them.  Rather than growing a second bespoke parser, the
+    existing declaration-anchored one takes the constant name as a parameter, so
+    both halves of its contract (exactly-one-declaration, and the declared
+    constant actually schedules a setInterval) carry over to every poller for
+    free instead of being re-derived per poller.
+
+    Two properties beyond "it parses" are pinned here.  The failure messages must
+    name the REQUESTED constant: a LOAD_POLL_INTERVAL_MS miss that reported
+    itself as a POLL_INTERVAL_MS problem would send the fixer to the wrong file.
+    And the two names must not cross-match, or a max over the poller registry
+    could be computed twice from the same source with the other poller silently
+    dropping out — the exact silent-coverage failure this registry exists to
+    remove.
+    """
+    assert (
+        _parse_poll_interval_ms(
+            "const LOAD_POLL_INTERVAL_MS = 5000;\n"
+            "const id = setInterval(fetchLoad, LOAD_POLL_INTERVAL_MS);\n",
+            "synthetic",
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+        == 5000
+    )
+
+    # Both halves of the contract still hold for the requested name, and each
+    # failure names the constant it was actually looking for.
+    with pytest.raises(AssertionError, match="found 0") as absent:
+        _parse_poll_interval_ms(
+            "fetchLoad();\n", "synthetic", const_name="LOAD_POLL_INTERVAL_MS"
+        )
+    assert "LOAD_POLL_INTERVAL_MS" in str(absent.value)
+
+    with pytest.raises(AssertionError, match="found 2") as ambiguous:
+        _parse_poll_interval_ms(
+            "const LOAD_POLL_INTERVAL_MS = 5000;\n"
+            "const LOAD_POLL_INTERVAL_MS = 9000;\n"
+            "setInterval(fetchLoad, LOAD_POLL_INTERVAL_MS);\n",
+            "synthetic",
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+    assert "LOAD_POLL_INTERVAL_MS" in str(ambiguous.value)
+
+    with pytest.raises(AssertionError, match="never passed as a setInterval") as dead:
+        _parse_poll_interval_ms(
+            "const LOAD_POLL_INTERVAL_MS = 5000;\nsetInterval(fetchLoad, 250);\n",
+            "synthetic",
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+    assert "LOAD_POLL_INTERVAL_MS" in str(dead.value)
+
+    # The two live names must not cross-match in EITHER direction. The
+    # ``^\s*(?:const|let|var)\s+`` anchor is what keeps LOAD_POLL_INTERVAL_MS
+    # from satisfying a POLL_INTERVAL_MS lookup by suffix; a substring match
+    # would let one poller answer for both.
+    with pytest.raises(AssertionError, match="found 0"):
+        _parse_poll_interval_ms(
+            "const POLL_INTERVAL_MS = 3000;\n"
+            "setInterval(() => pollTick(opts), POLL_INTERVAL_MS);\n",
+            "synthetic",
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+
+    with pytest.raises(AssertionError, match="found 0"):
+        _parse_poll_interval_ms(
+            "const LOAD_POLL_INTERVAL_MS = 5000;\n"
+            "setInterval(fetchLoad, LOAD_POLL_INTERVAL_MS);\n",
+            "synthetic",
+        )
+
+
+def _write_synthetic_client(path: pathlib.Path, source: str) -> pathlib.Path:
+    """Write a synthetic client-side source file for scanner-verification tests.
+
+    The sibling of _write_synthetic_unit for the JS side: the scanner's own
+    behaviour is pinned against sources this module controls, so the live-tree
+    guard is the only test coupled to the real dashboard client.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+    return path
+
+
+def test_setinterval_scanner_classifies_every_call_site(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_unclassified_setinterval_sites must sort live timers into known/allowed/new.
+
+    This is the guard-the-guard test for the completeness check: a scanner that
+    silently reported nothing would turn
+    test_every_client_setinterval_is_registered_or_allowlisted into a green
+    no-op, which is the exact failure mode that let a second poller go
+    unnoticed in the first place.
+
+    Two hazards get their own cases.  Comment immunity: the live tree mentions
+    ``setInterval(...)`` inside a ``//`` comment at tab_tasks.jsx, so a raw-text
+    scan would report a phantom site and train maintainers to allowlist
+    fictions.  That is the same trap _uvicorn_int_flag already handles from the
+    other direction by scoping to the logical ExecStart line rather than the
+    whole file (see test_uvicorn_flag_lookup_is_scoped_to_exec_start).  And
+    nested calls: a naive ``setInterval\\([^)]*\\)`` match stops at the FIRST
+    ``)``, so ``setInterval(() => tick(n => n + 1), 2000)`` would yield a
+    garbled period — both live non-polling timers have exactly this shape.
+
+    Two more cases pin the edges of "classified".  A registered constant used
+    in an UNregistered file must still be reported: coverage is the
+    (file, constant) pair, because _slowest_client_poll only ever reads the
+    paths CLIENT_POLLERS names, so a name-only match would claim coverage
+    nothing provides.  And a URL's ``//`` must not start a comment, or a real
+    call site sharing that line is blanked out of the scan entirely — with no
+    allowlist entry to go stale and report it.
+    """
+    redux = tmp_path / "redux"
+
+    # Registered: driven by a known poller constant, in its registered file.
+    registered = _write_synthetic_client(
+        redux / "data.js",
+        "const POLL_INTERVAL_MS = 3000;\n"
+        "setInterval(() => pollTick(opts), POLL_INTERVAL_MS);\n",
+    )
+    # Same constant NAME, different (unregistered) file — must NOT be waved
+    # through: nothing reads this file's declaration, so nothing bounds it.
+    impostor = _write_synthetic_client(
+        redux / "tab_impostor.jsx",
+        "const POLL_INTERVAL_MS = 9000;\n"
+        "setInterval(fetchOther, POLL_INTERVAL_MS);\n",
+    )
+    # A live call site sharing a line with a URL inside a string literal.
+    urly = _write_synthetic_client(
+        redux / "tab_urly.jsx",
+        "const u = 'https://x/y'; setInterval(fetchUrly, 8000);\n",
+    )
+    # Allowlisted: a pure UI tick, and a NESTED call in the callback.
+    allowlisted = _write_synthetic_client(
+        redux / "app.jsx",
+        "setInterval(() => setNow(new Date()), 1000);\n",
+    )
+    # Unregistered and unallowlisted — must be reported.
+    unknown = _write_synthetic_client(
+        redux / "tab_thing.jsx",
+        "setInterval(fetchThing, 4000);\n",
+    )
+    # Also unclassified, and nested two deep: pins the balanced-paren scan.
+    nested = _write_synthetic_client(
+        redux / "shell.jsx",
+        "setInterval(() => tick(n => n + 1), 2000);\n",
+    )
+    # Comments only: a `//` mention and a `/* */` block. Neither is live code.
+    commented = _write_synthetic_client(
+        redux / "tab_tasks.jsx",
+        "// ...`setInterval(() => setNow(...), 1000)`, unrelated\n"
+        "/* legacy, removed:\n"
+        "setInterval(fetchOld, 7000);\n"
+        "*/\n",
+    )
+
+    allowlist = {
+        ("redux/app.jsx", "1000"): "clock tick — opens no connection",
+        # Points at a call site that now exists only inside a comment.
+        ("redux/tab_tasks.jsx", "1000"): "checks nothing anymore",
+    }
+    unclassified, stale = _unclassified_setinterval_sites(
+        [registered, impostor, urly, allowlisted, unknown, nested, commented],
+        known_sites={("redux/data.js", "POLL_INTERVAL_MS")},
+        allowlist=allowlist,
+    )
+
+    # (a) known (file, constant) pair, (b) allowlisted, (d) comment-only: none
+    # reported.  (c) every genuinely new timer is, named with file and period —
+    # including the name-collision impostor and the site sharing a URL's line.
+    assert sorted(unclassified) == [
+        ("redux/shell.jsx", "2000"),
+        ("redux/tab_impostor.jsx", "POLL_INTERVAL_MS"),
+        ("redux/tab_thing.jsx", "4000"),
+        ("redux/tab_urly.jsx", "8000"),
+    ], (
+        "Scanner must report exactly the unregistered, unallowlisted call sites "
+        f"— with their periods — and nothing else; got {sorted(unclassified)}. "
+        "A phantom from a commented-out site would train maintainers to "
+        "allowlist fictions; a missed real site is a poller the keep-alive "
+        "floor does not clear."
+    )
+
+    # (e) an allowlist entry whose site is now only a comment is STALE, not
+    # silently satisfied — otherwise the allowlist rots into a no-op gate.
+    assert stale == [("redux/tab_tasks.jsx", "1000")], (
+        "An allowlist entry matching no live call site must be reported stale; "
+        f"got {stale}."
+    )
+
+
+def test_client_poll_interval_is_readable_from_the_shipped_client() -> None:
+    """The live client source must still yield a poll interval to compare against.
+
+    Guards the derivation itself: if data.js moves or its poller is rewritten,
+    this fails here with a clear cause rather than silently weakening
+    test_keep_alive_timeout_is_pinned_above_poll_interval.
+    """
+    assert POLL_JS.is_file(), (
+        f"Client poll source not found at {POLL_JS}. The keep-alive lower bound "
+        "is derived from it; update POLL_JS if the client moved."
+    )
+    assert _client_poll_interval_ms() > 0
+
+
+def test_host_load_poller_declares_a_named_interval() -> None:
+    """The host-load card's /api/load poller must expose a parseable period too.
+
+    HostLoadCard in tab_overview.jsx runs an INDEPENDENT second HTTP poller: it
+    fetches /api/load on its own setInterval, entirely separate from data.js's
+    data refresh.  It therefore holds its own keep-alive connection and reuses
+    it at its own interval, so its period is a load-bearing input to the
+    keep-alive lower bound and must be derivable — a poller whose period cannot
+    be read is a poller the bound cannot clear.
+
+    Naming the period rather than leaving a bare ``setInterval(fetchLoad, 5000)``
+    literal is what makes that derivation stable.  This module already learned
+    and recorded that lesson for data.js (see the comment above
+    _poll_interval_patterns): scraping the literal at the call site broke the
+    moment the poller was refactored to pass a named constant, and binding to
+    the declaration is both stabler and more precise.  The same reasoning
+    applies here, and the declaration additionally gives the JSX a place to
+    carry the "this feeds the systemd keep-alive bound" warning.
+    """
+    assert LOAD_POLL_JSX.is_file(), (
+        f"Host-load poll source not found at {LOAD_POLL_JSX}. The keep-alive "
+        "lower bound is derived from it; update LOAD_POLL_JSX if the host-load "
+        "card moved."
+    )
+    assert (
+        _parse_poll_interval_ms(
+            LOAD_POLL_JSX.read_text(encoding="utf-8"),
+            str(LOAD_POLL_JSX),
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+        > 0
+    )
+
+
+def test_poller_reuse_interval_adds_declared_jitter(tmp_path: pathlib.Path) -> None:
+    """A poller's reuse interval must include any delay it adds before fetching.
+
+    Pinned against synthetic sources so the arithmetic is checked independently
+    of whatever the live client currently declares.  The keep-alive floor is
+    about how long a connection sits idle between two requests, and a poller
+    that sleeps up to J ms inside its request path spaces consecutive requests
+    by up to period + J — so deriving the floor from the timer period alone
+    understates it, silently, in the direction that certifies a too-low
+    keep-alive.  data.js does exactly this (JITTER_MAX_MS, awaited inside the
+    in-flight window at data.js:261).
+    """
+    plain = _write_synthetic_client(
+        tmp_path / "plain.js",
+        "const POLL_INTERVAL_MS = 3000;\nsetInterval(tick, POLL_INTERVAL_MS);\n",
+    )
+    assert (
+        _poller_reuse_ms(ClientPoller(plain, "POLL_INTERVAL_MS", "no jitter")) == 3000
+    ), "A poller that fires on its timer reuses at exactly its period."
+
+    jittered = _write_synthetic_client(
+        tmp_path / "jittered.js",
+        "const JITTER_MAX_MS = 1500;\n"
+        "const POLL_INTERVAL_MS = 3000;\n"
+        "setInterval(tick, POLL_INTERVAL_MS);\n"
+        "async function go() { await sleep(random() * JITTER_MAX_MS); }\n",
+    )
+    assert (
+        _poller_reuse_ms(
+            ClientPoller(
+                jittered, "POLL_INTERVAL_MS", "jittered", jitter_const="JITTER_MAX_MS"
+            )
+        )
+        == 4500
+    ), (
+        "Worst-case spacing is period + jitter: a zero-jitter tick followed by a "
+        "max-jitter tick puts POLL_INTERVAL_MS + JITTER_MAX_MS between requests."
+    )
+
+    # A jitter constant nothing applies would inflate the floor off a dead
+    # number — as wrong as omitting it, just in the other direction.
+    dead = _write_synthetic_client(
+        tmp_path / "dead.js",
+        "const JITTER_MAX_MS = 1500;\n"
+        "const POLL_INTERVAL_MS = 3000;\n"
+        "setInterval(tick, POLL_INTERVAL_MS);\n",
+    )
+    with pytest.raises(AssertionError, match="never referenced again") as unused:
+        _poller_reuse_ms(
+            ClientPoller(
+                dead, "POLL_INTERVAL_MS", "dead jitter", jitter_const="JITTER_MAX_MS"
+            )
+        )
+    assert "JITTER_MAX_MS" in str(unused.value)
+
+
+def test_slowest_client_poll_is_derived_from_every_registered_poller() -> None:
+    """The keep-alive floor must come from the SLOWEST poller, not from data.js.
+
+    CLIENT_POLLERS is the explicit statement of which recurring HTTP pollers the
+    keep-alive bound covers, and _slowest_client_poll_ms() reduces it with max()
+    — because each poller independently reuses its own connection at its own
+    interval, so a bound that clears only the fastest one still closes the
+    slower socket in the gap between its polls.
+
+    The registry gets the same staleness guard as
+    test_registry_keys_are_all_declared_in_the_committed_units in
+    tests/scripts/test_check_dashboard_unit_parity.py: every registered path must
+    exist and every registered constant must still parse, so a moved file or a
+    renamed constant fails loudly here instead of silently dropping a poller out
+    of the max and quietly lowering the floor.
+
+    The defect this task exists to remove is a registry that covers only
+    data.js, so what is pinned is MEMBERSHIP: at least two entries, both
+    specific pollers present, and the reduction returning one of them.  The
+    relative ORDER of the two periods is deliberately left unpinned — an earlier
+    revision asserted the slowest was strictly slower than data.js's, which
+    reads as "the registry collapsed" but would also fire on a perfectly
+    legitimate retune (dropping /api/load to 2s, or raising the data refresh
+    past 5s) that leaves the registry complete and the bound correct.  A guard
+    that reports a false cause is worse than one that reports nothing.
+    """
+    assert len(CLIENT_POLLERS) >= 2, (
+        f"CLIENT_POLLERS has {len(CLIENT_POLLERS)} entr(y/ies); the shipped "
+        "client runs at least two independent recurring HTTP pollers, so a "
+        "shorter registry means one has been dropped and the keep-alive floor "
+        "no longer clears it."
+    )
+    registered = {(entry.path, entry.const_name) for entry in CLIENT_POLLERS}
+    assert (POLL_JS, "POLL_INTERVAL_MS") in registered, (
+        "data.js's main data refresh is missing from CLIENT_POLLERS; the "
+        "keep-alive floor would stop covering it."
+    )
+    assert (LOAD_POLL_JSX, "LOAD_POLL_INTERVAL_MS") in registered, (
+        "tab_overview.jsx's /api/load host-load poll is missing from "
+        "CLIENT_POLLERS. It is an independent recurring HTTP poller and holds "
+        "its own keep-alive connection, so the floor must clear it too."
+    )
+
+    reuses = []
+    for entry in CLIENT_POLLERS:
+        assert entry.path.is_file(), (
+            f"CLIENT_POLLERS registers {entry.path} ({entry.what}) but that file "
+            "does not exist. Update the registry entry rather than leaving a "
+            "poller silently uncovered by the keep-alive floor."
+        )
+        period = _parse_poll_interval_ms(
+            entry.path.read_text(encoding="utf-8"),
+            str(entry.path),
+            const_name=entry.const_name,
+        )
+        assert period > 0
+        reuse = _poller_reuse_ms(entry)
+        assert reuse >= period, (
+            f"{entry.what}'s connection-reuse interval ({reuse}ms) is below its "
+            f"own timer period ({period}ms), which is incoherent — jitter can "
+            "only push consecutive requests further apart, never closer."
+        )
+        reuses.append(reuse)
+
+    # data.js's jitter must stay wired into the registry, not just exist in the
+    # source: dropping jitter_const would put the derivation back to the bare
+    # period and re-open the understatement (see _poller_reuse_ms).
+    data_entry = next(e for e in CLIENT_POLLERS if e.path == POLL_JS)
+    assert data_entry.jitter_const, (
+        "data.js's CLIENT_POLLERS entry no longer names a jitter constant. Its "
+        "refreshOne awaits a random delay inside the in-flight window, so its "
+        "requests land further apart than POLL_INTERVAL_MS; without "
+        "jitter_const the keep-alive floor is derived from a gap smaller than "
+        "the real one. Re-point jitter_const at whatever now delays the fetch, "
+        "or remove it only once the delay itself is gone."
+    )
+    assert _poller_reuse_ms(data_entry) > _parse_poll_interval_ms(
+        POLL_JS.read_text(encoding="utf-8"), str(POLL_JS)
+    ), (
+        "data.js's reuse interval equals its bare poll period, so the declared "
+        f"jitter ({data_entry.jitter_const}) is contributing nothing to the "
+        "keep-alive floor."
+    )
+
+    slowest_ms, slowest = _slowest_client_poll()
+    assert slowest_ms == max(reuses), (
+        "_slowest_client_poll() must be the max over every registered poller's "
+        f"connection-reuse interval; got {slowest_ms} against {reuses}."
+    )
+    assert slowest in CLIENT_POLLERS, (
+        f"_slowest_client_poll() returned {slowest}, which is not a registered "
+        "entry — the floor must be attributable to a poller the registry names."
+    )
+
+
+def test_every_client_setinterval_is_registered_or_allowlisted() -> None:
+    """Every recurring timer in the client must be classified, not merely absent.
+
+    This is the guard that would have caught the defect this module now carries
+    a correction for.  tab_overview.jsx polled /api/load every 5000ms for the
+    entire life of the keep-alive invariant; the derivation read data.js and
+    nothing else, so the second poller was never part of the bound and
+    keep-alive sat exactly ON its boundary (5000 > 5000 is false) with the whole
+    suite green.  Nothing failed, because nothing was looking.
+
+    So membership is checked from the CLIENT side, not just the registry side:
+    every setInterval under the shipped redux tree must be accounted for by one
+    of two explicit decisions, and an unclassified one fails loudly with both
+    remedies named.  Files are globbed live rather than enumerated, so a new
+    client file is covered the moment it lands rather than when someone
+    remembers to add it here.
+
+    ``.html`` is in the sweep alongside ``.js``/``.jsx`` because index.html sits
+    in this same directory and is where every ``<script>`` tag lives: an inline
+    ``<script>setInterval(...)</script>`` there would otherwise be exactly as
+    invisible as the /api/load poller was.  The comment-stripper and
+    balanced-paren scanner read inline script text unchanged.
+
+    Coverage is asserted per (file, constant) pair rather than per constant
+    name — see _unclassified_setinterval_sites for why a name-only match would
+    claim coverage that _slowest_client_poll does not actually provide.
+    """
+    sources = sorted(
+        path
+        for path in REDUX_DIR.rglob("*")
+        if path.suffix in (".js", ".jsx", ".html") and path.is_file()
+    )
+    assert sources, (
+        f"No .js/.jsx/.html sources found under {REDUX_DIR}. This guard would "
+        "pass vacuously — update REDUX_DIR to wherever the client moved rather "
+        "than leaving every client timer unchecked."
+    )
+
+    unclassified, stale = _unclassified_setinterval_sites(
+        sources,
+        known_sites={
+            (_site_relpath(entry.path), entry.const_name) for entry in CLIENT_POLLERS
+        },
+        allowlist=NON_POLLING_TIMERS,
+    )
+
+    assert not unclassified, (
+        "Unclassified setInterval call site(s) in the dashboard client: "
+        f"{unclassified}. Every recurring timer must be an explicit decision, "
+        "because a timer that performs HTTP holds its own keep-alive connection "
+        "and reuses it at its own interval — which is how tab_overview.jsx's 5s "
+        "/api/load poll went unnoticed while the keep-alive floor was derived "
+        "from data.js alone.\n"
+        "  - If it PERFORMS HTTP: name its period as a *_POLL_INTERVAL_MS "
+        "constant and register it in CLIENT_POLLERS. If it is the slowest "
+        "poller this raises the --timeout-keep-alive floor, and "
+        "test_keep_alive_timeout_is_pinned_above_poll_interval will say so.\n"
+        "  - If it is a pure UI tick that opens NO connection: add it to "
+        "NON_POLLING_TIMERS with a reason."
+    )
+    assert not stale, (
+        f"NON_POLLING_TIMERS entries matching no live call site: {stale}. "
+        "An entry that matches nothing checks nothing, so it silently rots this "
+        "gate — remove it, or fix it to match the timer it was meant to cover. "
+        "Note a commented-out call site does not count as live."
+    )
+
+
+def test_shutdown_drain_is_bounded_in_both_unit_files() -> None:
+    """Both unit files must bound uvicorn's drain below systemd's SIGKILL deadline.
+
+    uvicorn hard-bounds the connection drain: server.py wraps
+    _wait_tasks_to_complete() in asyncio.wait_for(timeout=timeout_graceful_shutdown)
+    and force-cancels every remaining task on TimeoutError.  Without the flag the
+    drain is unbounded and every restart ends in
+    "State 'stop-sigterm' timed out. Killing." → SIGKILL.
+    """
+    for path in (TEMPLATE, HARDCODED):
+        _assert_drain_bounded(path)
+
+
+def test_keep_alive_timeout_is_pinned_above_poll_interval() -> None:
+    """--timeout-keep-alive must be pinned explicitly, and pinned ABOVE the poll interval.
+
+    The lower bound is the non-obvious half of this test.  The tempting move —
+    dropping keep-alive below the slowest client poll so idle connections close
+    on their own — is wrong here: it would make the server close that polling
+    socket in the gap between its polls, exposing the classic
+    server-closes-while-client-writes race, i.e. trading a shutdown-time stall
+    for request-time failures on a change whose whole purpose is availability.
+    The hard drain guarantee already comes from --timeout-graceful-shutdown, so
+    keep-alive is not being asked to do that job.
+
+    The bound must clear EVERY recurring HTTP poller, not just the busiest one.
+    Each poller holds its own keep-alive connection and reuses it at its OWN
+    interval, so a keep-alive above data.js's 3s data refresh but at-or-below
+    tab_overview.jsx's 5s /api/load poll still exposes that race on the slower
+    socket — which is precisely the state this test used to certify as green
+    (see the CORRECTION note above CLIENT_POLLERS).  Hence the comparison is
+    against _slowest_client_poll_ms().
+
+    That comparison is against the connection-REUSE interval, which is not the
+    same as the timer period: data.js delays each request by up to
+    JITTER_MAX_MS inside the in-flight window, so its requests can land
+    POLL_INTERVAL_MS + JITTER_MAX_MS apart.  Comparing against the bare period
+    would understate the gap the socket actually has to survive — see
+    _poller_reuse_ms.
+
+    Pinning it explicitly is still worth doing beyond the bound itself: it
+    surfaces the interaction that caused the incident — keep-alive exceeds the
+    poll interval, which is precisely why the connection never idles out —
+    makes it greppable, and gives the unit-file parity check a concrete
+    directive to diff.
+
+    Every period is read out of the live client sources rather than restated,
+    so raising a poller past the pinned keep-alive fails here instead of passing
+    against a stale copy of the number.  The comparison is done in milliseconds
+    to keep a non-whole-second poll (e.g. 3500ms) from being floored into a
+    looser bound than the client actually uses.
+    """
+    poll_ms, slowest = _slowest_client_poll()
+    for path in (TEMPLATE, HARDCODED):
+        keep_alive = _uvicorn_int_flag(path, "timeout-keep-alive")
+        assert keep_alive is not None, (
+            f"No --timeout-keep-alive flag in the ExecStart of {path}. "
+            "Leaving it implicit hides the interaction that caused the incident: "
+            "keep-alive exceeds the slowest client connection-reuse interval — "
+            f"{poll_ms / 1000:g}s, from {slowest.what} ({slowest.path}) — which "
+            "is why the polling connection never idles out."
+        )
+        assert keep_alive * 1000 > poll_ms, (
+            f"--timeout-keep-alive {keep_alive}s is not above the slowest client "
+            f"connection-reuse interval of {poll_ms / 1000:g}s — {slowest.what}, "
+            f"{slowest.const_name} in {slowest.path} — in {path}. "
+            "Below that poller's interval the server closes its socket in the "
+            "gap between polls, exposing the server-closes-while-client-writes "
+            "race and turning a shutdown fix into a source of failed polls. The "
+            "drain is already bounded by --timeout-graceful-shutdown; do not "
+            "retune keep-alive to compensate for it — raise keep-alive above the "
+            "new poll interval (in BOTH unit files), or lower the poll interval."
+        )
+        stop = _timeout_stop_sec(path)
+        assert keep_alive < stop, (
+            f"--timeout-keep-alive {keep_alive} is not below TimeoutStopSec={stop} "
+            f"in {path}. A keep-alive idle window longer than the stop timeout "
+            "would be incoherent with the drain bound."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Restart backoff
+#
+# The invariant and its directive reader now live in systemd_unit_invariants,
+# imported at the top of this module under the private aliases this file has
+# always used.  They were lifted out of here by task 3408 so that the
+# fleet-wide sweep in test_systemd_restart_backoff.py applies the SAME
+# assertion rather than a second copy of it — see that module's docstring.
+#
+# Nothing asserts that the sharing holds, deliberately: the `from
+# systemd_unit_invariants import (...)` at the top of this module IS the
+# sharing, structurally, and a drifted private copy would be caught by that
+# fleet sweep failing on whichever unit the copy stopped checking.  An earlier
+# meta-test pinning it by object identity was dropped as testing the shape of
+# the refactor rather than any behaviour of a systemd unit.
+#
+# The negative-case guard for the helper stays here, below, next to the
+# drain-bound guard it is modelled on.
+# ---------------------------------------------------------------------------
+
+
+def _write_restart_unit(path: pathlib.Path, body: str) -> pathlib.Path:
+    """Write a minimal synthetic unit carrying only a [Service] restart stanza.
+
+    _write_synthetic_unit above is shaped for the ExecStart/TimeoutStopSec drain
+    tests and would have to be contorted through its *preamble* argument to
+    express a restart stanza, so the restart guards get their own one-line
+    builder rather than bending a fixture that means something else.
+    """
+    path.write_text(f"[Service]\n{body}\n", encoding="utf-8")
+    return path
+
+
+# Shared by test_restart_backoff_guard_rejects_ineffective_units' `no_steps`
+# case and _write_backoff_canary below: both need the exact pre-fix "a cap
+# declared with nothing to interpolate over" shape, and hoisting it to one
+# constant makes their "same shape" claim hold structurally instead of by
+# comment — editing one no longer leaves the other's claim quietly false.
+_INERT_CAP_BODY = "Restart=on-failure\nRestartSec=5\nRestartMaxDelaySec=60"
+
+
+def test_restart_backoff_guard_rejects_ineffective_units(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_assert_restart_backoff_effective must fire on every inert-cap spelling.
+
+    Same convention as test_drain_bound_guard_rejects_unbounded_units above: an
+    assertion helper earns its own negatives so it cannot silently no-op, and
+    every case pins its own failure mode with ``match=``.  A bare
+    ``pytest.raises(AssertionError)`` is satisfied by ANY assertion firing
+    anywhere in the chain, so the distinct bad cases below — absent steps / zero
+    steps / absent floor — would all still "pass" while tripping one shared
+    branch, which is exactly the confusion they exist to rule out.
+    """
+    # Bad: the pre-fix state — a cap declared with nothing to interpolate over.
+    no_steps = _write_restart_unit(tmp_path / "no_steps.service", _INERT_CAP_BODY)
+    with pytest.raises(AssertionError, match="but no RestartSteps="):
+        _assert_restart_backoff_effective(no_steps)
+
+    # Bad: present but zero — a zero-step curve is no backoff at all, so mere
+    # presence of the directive is not the property being asserted.
+    zero_steps = _write_restart_unit(
+        tmp_path / "zero_steps.service",
+        "Restart=on-failure\nRestartSec=5\nRestartSteps=0\nRestartMaxDelaySec=60",
+    )
+    with pytest.raises(AssertionError, match="produces no backoff curve"):
+        _assert_restart_backoff_effective(zero_steps)
+
+    # Bad: overridden to zero by a later repeat.  systemd is LAST-WINS for these
+    # scalars, so this unit's effective RestartSteps is 0 and its cap is
+    # discarded — measured on systemd 255.4, which emits the pairing warning for
+    # exactly this file while staying silent on the reverse order (0 then 4).
+    # A first-match read of the directive would report 4 and pass, so this case
+    # pins _restart_directive's last-wins semantics through the guard that
+    # depends on them.
+    overridden_steps = _write_restart_unit(
+        tmp_path / "overridden_steps.service",
+        "Restart=on-failure\nRestartSec=5\nRestartSteps=4\n"
+        "RestartSteps=0\nRestartMaxDelaySec=60",
+    )
+    with pytest.raises(AssertionError, match="produces no backoff curve"):
+        _assert_restart_backoff_effective(overridden_steps)
+    assert _restart_directive(overridden_steps, "RestartSteps") == "0"
+
+    # Bad: cap and steps, but no floor to interpolate up FROM.
+    no_floor = _write_restart_unit(
+        tmp_path / "no_floor.service",
+        "Restart=on-failure\nRestartSteps=4\nRestartMaxDelaySec=60",
+    )
+    with pytest.raises(AssertionError, match="no RestartSec="):
+        _assert_restart_backoff_effective(no_floor)
+
+    # Good: the full curve — must not raise (guards against over-tightening).
+    good = _write_restart_unit(
+        tmp_path / "good.service",
+        "Restart=on-failure\nRestartSec=5\nRestartSteps=4\nRestartMaxDelaySec=60",
+    )
+    _assert_restart_backoff_effective(good)
+
+    # Good: no cap declared at all — the invariant is conditional on the cap
+    # being declared, not a blanket requirement that every unit implement
+    # backoff.  Pins that a later author cannot tighten it into an
+    # unconditional "RestartSteps= must be present".
+    no_cap = _write_restart_unit(
+        tmp_path / "no_cap.service", "Restart=on-failure\nRestartSec=5"
+    )
+    _assert_restart_backoff_effective(no_cap)
+
+    # Good: a suffixed spec is still a declared cap.  This is why
+    # _restart_directive captures the value opaquely — a (\d+) parse would read
+    # `60s` as an absent directive and skip the invariant without a word.
+    suffixed = _write_restart_unit(
+        tmp_path / "suffixed.service",
+        "Restart=on-failure\nRestartSec=5s\nRestartSteps=4\nRestartMaxDelaySec=60s",
+    )
+    _assert_restart_backoff_effective(suffixed)
+    assert _restart_directive(suffixed, "RestartMaxDelaySec") == "60s"
+
+    # ...and the inert form of that same spelling must STILL be caught, so the
+    # opaque capture above bought precision, not laxity.
+    suffixed_no_steps = _write_restart_unit(
+        tmp_path / "suffixed_no_steps.service",
+        "Restart=on-failure\nRestartSec=5s\nRestartMaxDelaySec=60s",
+    )
+    with pytest.raises(AssertionError, match="but no RestartSteps="):
+        _assert_restart_backoff_effective(suffixed_no_steps)
+
+    # Bad: the same inert cap, spelled with the leading and around-separator
+    # whitespace systemd.syntax permits.  This is a VALID unit whose cap systemd
+    # parses and discards, so it must be caught — a column-0-only anchor reads
+    # it as declaring no cap at all and returns early, skipping the invariant
+    # without a word.  That is the one failure direction this guard cannot
+    # afford: it masks the very defect the helper exists to surface, unlike the
+    # opaque-value capture above, which errs toward checking MORE.
+    spaced_no_steps = _write_restart_unit(
+        tmp_path / "spaced_no_steps.service",
+        "Restart=on-failure\n  RestartSec = 5\n\tRestartMaxDelaySec\t=\t60",
+    )
+    with pytest.raises(AssertionError, match="but no RestartSteps="):
+        _assert_restart_backoff_effective(spaced_no_steps)
+    assert _restart_directive(spaced_no_steps, "RestartMaxDelaySec") == "60"
+
+    # Good: the whitespace-tolerant read is complete, not just detection-only —
+    # a properly paired unit in that same spelling must not raise.
+    spaced_good = _write_restart_unit(
+        tmp_path / "spaced_good.service",
+        "Restart=on-failure\n  RestartSec = 5\n  RestartSteps = 4\n"
+        "  RestartMaxDelaySec = 60",
+    )
+    _assert_restart_backoff_effective(spaced_good)
+
+
+def test_restart_backoff_is_effective_in_both_unit_files() -> None:
+    """Both unit files must pair RestartMaxDelaySec= with a usable RestartSteps=.
+
+    Without the pairing systemd discards the cap at load time, so a dashboard
+    stuck in a crash loop retries every 5s indefinitely instead of backing off
+    toward 60s — the unit's comment claims a backoff that the unit does not do.
+    """
+    for path in (TEMPLATE, HARDCODED):
+        _assert_restart_backoff_effective(path)
+
+
+def _ignored_directive_lines(output: str, unit: pathlib.Path) -> list[str]:
+    """Return systemd-analyze lines reporting a discarded directive in *unit*.
+
+    Split out of the test below so it can be exercised against captured
+    systemd-analyze output WITHOUT a systemd runtime — the filter is the part
+    that can silently no-op, and a guard that only runs where systemd is
+    installed is no guard at all.  See
+    test_ignored_directive_filter_matches_both_systemd_spellings for the
+    negatives; the measured samples it pins are quoted there verbatim.
+    """
+    return [
+        line
+        for line in output.splitlines()
+        # Case-insensitive: systemd writes "Ignoring." for a semantic discard
+        # and "ignoring." for an unknown key, and on systemd < 254 the latter is
+        # the ONLY form this unit's backoff directives can produce.
+        if "ignoring." in line.lower()
+        # Scoped to the unit under test: verify also loads dependencies, and
+        # each warning names the unit it belongs to.  A semantic warning is
+        # prefixed with the bare unit name, a parse warning with the full path
+        # and line number.
+        and (line.startswith(f"{unit.name}:") or str(unit) in line)
+    ]
+
+
+def _write_backoff_canary(directory: pathlib.Path) -> pathlib.Path:
+    """Write a unit systemd-analyze will actually warn about, as a positive control.
+
+    Thin wrapper over ``_write_restart_unit`` rather than a second
+    hand-rolled unit writer.  The body is ``_INERT_CAP_BODY`` — the same
+    pre-fix "cap declared with nothing to interpolate over" shape
+    ``test_restart_backoff_guard_rejects_ineffective_units``'s ``no_steps``
+    case writes — with ``ExecStart=/bin/true`` prepended.
+
+    The ExecStart is not decoration: measured 2026-08-16 in this worktree
+    (systemd 255.4-1ubuntu8.17), the bare restart stanza alone is REFUSED by
+    systemd-analyze before the pairing check ever runs
+    (``canary-noexec.service: Service has no ExecStart=, ExecStop=, or
+    SuccessAction=. Refusing.``, exit 1, zero "Ignoring." line) — a canary in
+    that shape would fail on every healthy host instead of drawing the
+    warning it exists to draw.  With the ExecStart present it instead draws
+    ``canary-exec.service: Service has RestartMaxDelaySec= but no
+    RestartSteps= setting. Ignoring.`` at exit 0.  See
+    test_backoff_canary_is_the_shape_systemd_must_warn_about for the pinned,
+    host-independent contract this shape must satisfy.
+
+    ``df-restart-backoff-canary.service`` is a name chosen not to collide
+    with any real unit on any host; measured working.
+    """
+    return _write_restart_unit(
+        directory / "df-restart-backoff-canary.service",
+        f"ExecStart=/bin/true\n{_INERT_CAP_BODY}",
+    )
+
+
+def test_ignored_directive_filter_matches_both_systemd_spellings() -> None:
+    """_ignored_directive_lines must catch both casings and only this unit.
+
+    The samples below are real ``systemd-analyze verify`` output captured on
+    2026-08-01 (systemd 255.4), not invented strings: the capital-I form from a
+    unit with RestartMaxDelaySec= and no RestartSteps=, the lowercase form from
+    a deliberately misspelled ``RestartStepz=``, and the dependency noise from
+    ``systemd-analyze verify --user`` on the real dashboard unit.
+
+    This is the guard that keeps the systemd test below honest.  Both of its
+    ways of degrading into a silent pass — wrong casing, or another unit's
+    warning counted as this one's — are pinned here, and they are pinned
+    without needing systemd, so they hold on every host.
+    """
+    semantic = (
+        f"{HARDCODED.name}: Service has RestartMaxDelaySec= but no "
+        "RestartSteps= setting. Ignoring."
+    )
+    parse = (
+        f"{HARDCODED}:42: Unknown key name 'RestartStepz' in section "
+        "'Service', ignoring."
+    )
+    # Another unit's identical defect, plus genuinely unrelated noise.
+    foreign = (
+        "orchestrator-dark-factory.service: Service has RestartMaxDelaySec= "
+        "but no RestartSteps= setting. Ignoring."
+    )
+    noise = "Failed to bind private socket: Address already in use"
+
+    # Caught: the capital-I semantic warning...
+    assert _ignored_directive_lines(semantic, HARDCODED) == [semantic]
+    # ...and the lowercase parse warning, which is the ONLY signal available on
+    # systemd < 254, where both backoff directives degrade to unknown keys.
+    assert _ignored_directive_lines(parse, HARDCODED) == [parse]
+
+    # Ignored: a warning that belongs to a different unit must not be blamed on
+    # this file, and non-warning chatter must not trip the assertion.
+    assert _ignored_directive_lines(f"{foreign}\n{noise}", HARDCODED) == []
+
+    # Mixed stream: exactly the two lines that name this unit, in order.
+    combined = "\n".join([noise, foreign, semantic, parse])
+    assert _ignored_directive_lines(combined, HARDCODED) == [semantic, parse]
+
+    # A clean run reports nothing.
+    assert _ignored_directive_lines("", HARDCODED) == []
+
+
+def _systemd_analyze_verify_skip_reason() -> str | None:
+    """Return why the systemd-analyze verify test must skip, or None to run it.
+
+    Two independent preconditions, checked in order:
+
+    1. The ``systemd-analyze`` binary must be on PATH.
+    2. ``XDG_RUNTIME_DIR`` must be set to a non-empty value.  Measured
+       2026-08-12 in this worktree (systemd 255.4): with the variable unset,
+       ``systemd-analyze verify --user`` cannot initialise a --user manager
+       at all and its combined stdout+stderr is ONLY "Failed to lookup
+       RuntimeDirectory path: No such device or address" / "Failed to
+       initialize manager: No such device or address" (exit 1) -- it never
+       gets far enough to emit the per-unit diagnostic lines the guarded
+       test greps for, so ``assert not ignored`` there would pass having
+       checked nothing.  An empty value reproduces that identical no-op
+       byte-for-byte, which is why this checks truthiness
+       (``os.environ.get(...)``) rather than key membership -- and a
+       nonexistent-but-declared path (e.g. /tmp/does-not-exist) still yields
+       real per-unit diagnostics at exit 0, which is why this does not
+       "harden" into a directory-existence check either.  Contexts that hit
+       this in practice: cron, ssh host-cmd, any headless invocation with no
+       pam_systemd session -- ``shutil.which()`` succeeds there and the old
+       inline decorator condition never fired.  DBUS_SESSION_BUS_ADDRESS was
+       also measured (unsetting it alone still yields real diagnostics at
+       exit 0) and is deliberately NOT checked here: requiring it too would
+       over-skip on hosts where the guarded test works correctly.
+    """
+    if shutil.which("systemd-analyze") is None:
+        return (
+            "no systemd-analyze on this PATH; the file-content invariants "
+            "above are the primary guard and this module requires no "
+            "systemd runtime"
+        )
+    if not os.environ.get("XDG_RUNTIME_DIR"):
+        return (
+            "XDG_RUNTIME_DIR is not set (or is empty): systemd-analyze "
+            "verify --user cannot initialise a --user manager without it "
+            'and prints only "Failed to lookup RuntimeDirectory path" / '
+            '"Failed to initialize manager", emitting zero per-unit '
+            "diagnostic lines -- the guarded assertion would pass having "
+            "checked nothing"
+        )
+    return None
+
+
+_SYSTEMD_ANALYZE_SKIP_REASON = _systemd_analyze_verify_skip_reason()
+
+
+def test_systemd_analyze_skip_reason_requires_both_binary_and_user_runtime_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_systemd_analyze_verify_skip_reason must gate on BOTH preconditions.
+
+    Four cases below, each host-independent: both the binary lookup and
+    XDG_RUNTIME_DIR are monkeypatched rather than read from this host's real
+    environment, so this test itself needs no systemd runtime -- honouring
+    the module docstring's "no systemd runtime is required" contract.  See
+    _systemd_analyze_verify_skip_reason's docstring for the measured basis
+    (the observed output strings, exit codes, and why DBUS_SESSION_BUS_ADDRESS
+    is deliberately not part of the discriminator) that each case below
+    exercises:
+
+      (a) systemd-analyze binary absent.
+      (b) binary present, XDG_RUNTIME_DIR absent -- the regression under
+          repair.
+      (c) binary present, XDG_RUNTIME_DIR="" -- empty must count as absent.
+      (d) binary present, XDG_RUNTIME_DIR set to a nonexistent path -- must
+          still run.
+    """
+    # (a) Binary absent: the predicate must still gate the test, even with a
+    # perfectly valid XDG_RUNTIME_DIR alongside it.
+    monkeypatch.setattr(shutil, "which", lambda *_a, **_k: None)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    reason = _systemd_analyze_verify_skip_reason()
+    assert reason is not None
+
+    # (b) Binary present, XDG_RUNTIME_DIR absent: the predicate must still
+    # gate the test. This is the regression under repair -- the old inline
+    # decorator condition never checked this at all.
+    monkeypatch.setattr(
+        shutil, "which", lambda *_a, **_k: "/usr/bin/systemd-analyze"
+    )
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    reason = _systemd_analyze_verify_skip_reason()
+    assert reason is not None
+
+    # (c) Binary present, XDG_RUNTIME_DIR="": empty must count as absent, or
+    # a membership test ("XDG_RUNTIME_DIR" in os.environ) would treat this as
+    # present and let the vacuous pass through.
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "")
+    reason = _systemd_analyze_verify_skip_reason()
+    assert reason is not None
+
+    # (d) Binary present, XDG_RUNTIME_DIR set to a nonexistent path: the
+    # guarded test must be able to RUN. A directory-existence check would
+    # wrongly skip here, on a host where systemd-analyze verify still
+    # succeeds against a declared-but-missing runtime dir.
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/tmp/does-not-exist")
+    reason = _systemd_analyze_verify_skip_reason()
+    assert reason is None
+
+
+def test_backoff_canary_is_the_shape_systemd_must_warn_about(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_write_backoff_canary must produce a unit systemd will actually warn about.
+
+    This pins the shape of the positive control that
+    test_systemd_analyze_verify_reports_no_ignored_directives uses below (its
+    docstring point 7): a canary deliberately defective in exactly the way
+    systemd's own pairing warning reports, so a verify run that draws no
+    warning for it means the invocation checked nothing, not that everything
+    is fine.  Pinned here host-independently -- (a) and (c) need no systemd
+    runtime -- so it holds even on a host where the canary can never actually
+    be FIRED through systemd-analyze.
+
+    (a) The trap is armed and not defused, checked through the repo's own
+        backoff invariant rather than by re-deriving the pairing rule by
+        hand: the canary must trip _assert_restart_backoff_effective's "but
+        no RestartSteps=" branch, backed by two direct reads of the
+        directives that branch depends on.
+
+    (b) The canary declares an ExecStart=.  LOAD-BEARING, not decoration.
+        Measured 2026-08-16 in this worktree (systemd 255.4-1ubuntu8.17): a
+        [Service]-only unit carrying just the restart stanza -- ``_INERT_CAP_BODY``,
+        the same body test_restart_backoff_guard_rejects_ineffective_units'
+        ``no_steps`` case writes -- is REFUSED by systemd-analyze before it
+        ever reaches the pairing check::
+
+          canary-noexec.service: Service has no ExecStart=, ExecStop=, or
+          SuccessAction=. Refusing.
+          Unit canary-noexec.service has a bad unit file setting.
+
+        (exit 1, and ZERO "Ignoring." line for the canary).  Adding
+        ``ExecStart=/bin/true`` to the same stanza restores the warning::
+
+          canary-exec.service: Service has RestartMaxDelaySec= but no
+          RestartSteps= setting. Ignoring.
+
+        (exit 0).  A canary left in the first shape would make the positive
+        control below FAIL on every healthy host -- the same defect class
+        this whole task removes, a guard reporting the opposite of the
+        truth.
+
+    (c) The written trap is detectable by the same filter the positive
+        control uses below (_ignored_directive_lines), read under the
+        canary's own path -- connecting the two halves of the mechanism
+        rather than pinning them in isolation.  The line asserted here is
+        real output measured today, not invented.
+    """
+    canary = _write_backoff_canary(tmp_path)
+
+    # (a) Armed, not defused.
+    with pytest.raises(AssertionError, match="but no RestartSteps="):
+        _assert_restart_backoff_effective(canary)
+    assert _restart_directive(canary, "RestartMaxDelaySec") is not None
+    assert _restart_directive(canary, "RestartSteps") is None
+
+    # (b) ExecStart present -- see docstring point (b) for why this is
+    # load-bearing rather than incidental.
+    assert _restart_directive(canary, "ExecStart") is not None
+
+    # (c) Detectable by the same filter the positive control below uses.
+    line = (
+        f"{canary.name}: Service has RestartMaxDelaySec= but no "
+        "RestartSteps= setting. Ignoring."
+    )
+    assert _ignored_directive_lines(line, canary) == [line]
+
+
+@pytest.mark.skipif(
+    _SYSTEMD_ANALYZE_SKIP_REASON is not None,
+    reason=_SYSTEMD_ANALYZE_SKIP_REASON or "",
+)
+def test_systemd_analyze_verify_reports_no_ignored_directives(
+    tmp_path: pathlib.Path,
+) -> None:
+    """systemd itself must not report discarding any directive in the unit.
+
+    Confirmatory corroboration of the file-content invariant above, deliberately
+    skippable so the module keeps the "no systemd runtime is required" contract
+    stated in its docstring.
+
+    Seven details here are load-bearing, each verified by measurement rather
+    than assumed (2026-08-01, systemd 255.4 unless noted):
+
+    1. stderr is captured, not just stdout.  The warning goes to stderr while
+       stdout is empty, so a stdout-only assertion would be a silent no-op that
+       passes forever regardless of the unit's contents.
+    2. The assertion is on the WARNING TEXT, never on ``returncode``.
+       ``systemd-analyze verify`` exits 1 when the ExecStart binary does not
+       exist ("Command /... is not executable"), and this unit bakes in
+       /home/leo/.local/bin/uv — so a returncode check would fail on any other
+       host for a reason entirely unrelated to this invariant.  (It exits 0 even
+       while emitting the warnings this test hunts, so the code carries no
+       signal in either direction.)
+    3. It runs against HARDCODED only.  The raw template cannot be verified at
+       all: its ``__REPO_ROOT__`` sentinel trips a fatal "WorkingDirectory= path
+       is not absolute" error.  test_template_renders_to_hardcoded_file already
+       asserts the two files are byte-identical modulo the sentinels, so the
+       property carries across without verifying the same bytes twice.
+    4. The match is CASE-INSENSITIVE, because systemd spells its two discard
+       paths differently and only one of them is the pairing warning:
+         - ``t1.service: Service has RestartMaxDelaySec= but no RestartSteps=
+           setting. Ignoring.``           (capital I)
+         - ``/path/t2.service:8: Unknown key name 'RestartStepz' in section
+           'Service', ignoring.``          (lowercase)
+       This matters precisely where the guard is needed most.  RestartSteps= AND
+       RestartMaxDelaySec= both landed in systemd v254, so on any host below
+       that — and scripts/setup-host.sh renders this template onto arbitrary
+       machines — the whole backoff fix degrades to two unknown keys, systemd
+       emits only the lowercase form, and a capital-I filter would report green
+       on a unit doing no backoff at all.  Matching one casing would blind this
+       test to its single most important failure mode.
+    5. Warnings are SCOPED to the unit under test.  ``systemd-analyze verify``
+       loads the unit's dependencies too and prefixes each warning with the
+       offending unit's own name, so an unscoped filter blames this file for
+       another unit's defect.  Measured: ``--user`` verification of this unit
+       emits eight such lines for orchestrator-*.service and fused-memory.service
+       (which genuinely lack RestartSteps=) and zero for the dashboard unit.
+       Both prefix forms above are covered — bare unit name for a semantic
+       warning, full path plus line number for a parse warning.
+    6. The test needs a user RUNTIME DIR, not just the binary on PATH, or it
+       passes having checked nothing — the same silent-no-op class point 1
+       guards against for stdout-only capture, reached here through a
+       different missing precondition.  See ``_systemd_analyze_verify_skip_reason``
+       above for the measured basis (the observed output strings, exit
+       codes, the contexts this bites in, and why DBUS_SESSION_BUS_ADDRESS is
+       deliberately not part of the gate) and for the gate itself.
+    7. The assertion below is corroborated by a POSITIVE CONTROL, not just a
+       skip gate, because a wired gate is not the only way this test can pass
+       vacuously — see test_backoff_canary_is_the_shape_systemd_must_warn_about
+       for why the control's own shape needed pinning first.  A
+       ``df-restart-backoff-canary.service`` built by ``_write_backoff_canary``
+       is verified in the SAME invocation as HARDCODED, and the run must draw
+       an "Ignoring." line for the canary before the real assertion is trusted
+       at all.  Measured 2026-08-16 in this worktree (systemd
+       255.4-1ubuntu8.17):
+         - A healthy run emits, verbatim: ``df-restart-backoff-canary.service:
+           Service has RestartMaxDelaySec= but no RestartSteps= setting.
+           Ignoring.``
+         - The degenerate run emits it NOT AT ALL: with XDG_RUNTIME_DIR both
+           unset and set to ``""``, the combined output for this same
+           two-unit invocation collapses to only "Failed to lookup
+           RuntimeDirectory path: No such device or address" / "Failed to
+           initialize manager: No such device or address" (exit 1) — the
+           exact state point 6 describes, and this control fires on any other
+           degeneration too, whatever its cause, because it asserts the
+           property that actually matters (this invocation can detect a
+           defective unit) rather than a specific failure signature.
+         - WHY both units are verified in ONE invocation rather than two: a
+           control run in a separate subprocess would attest to a different
+           run than the one that produced this assertion's evidence.  The two
+           are also demonstrably not interchangeable — verifying the canary
+           ALONE loads the INSTALLED ``~/.config/systemd/user/dark-factory-dashboard.service``,
+           which on this host is stale (``RestartMaxDelaySec=60``, no
+           ``RestartSteps=``) and DOES emit the pairing warning under the
+           same unit name the filter scopes on; passing HARDCODED's repo path
+           explicitly shadows it, measured as zero
+           ``dark-factory-dashboard.service:`` lines in the combined run.
+         - WHY the canary is passed LAST, after HARDCODED: systemd-analyze
+           verify processes positional units in argument order, so an
+           "Ignoring." line for the LAST argument implies every earlier
+           argument was already reached — making the control transitively
+           attest to HARDCODED having actually been verified, not merely to
+           the invocation being alive in general.  This is a forward-looking
+           hardening rather than a fix for an observed failure: measured
+           2026-08-16 in this worktree (systemd 255.4-1ubuntu8.17), passing a
+           unit systemd REFUSES outright first (``bad-first.service: Service
+           has no ExecStart=, ExecStop=, or SuccessAction=. Refusing.``)
+           still lets a well-formed SECOND unit draw its own "Ignoring." line
+           in the same invocation, so today's systemd does not stop at the
+           first argument either way.  Ordering the canary last removes the
+           dependency on that continuing to hold.
+         - On a systemd < 254 host the canary would degrade to the lowercase
+           full-path "Unknown key name 'RestartMaxDelaySec' ... ignoring."
+           form instead, which ``_ignored_directive_lines`` still matches via
+           its ``str(unit) in line`` arm, so the control survives the version
+           split point 4 exists for.  This is an INFERENCE from point 4's
+           measured ``RestartStepz`` behaviour, not a fresh measurement on
+           such a host — this host is 255.
+
+    Scoping is what makes ``--user`` safe to pass, and passing it is the point:
+    this is a --user unit (WantedBy=default.target, installed under
+    ~/.config/systemd/user), so system-scope verification checks it in a manager
+    scope it never runs in and silently fails to resolve its user-scope
+    dependencies.
+    """
+    canary = _write_backoff_canary(tmp_path)
+    result = subprocess.run(
+        ["systemd-analyze", "verify", "--user", str(HARDCODED), str(canary)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    combined = f"{result.stdout}{result.stderr}"
+    assert _ignored_directive_lines(combined, canary), (
+        f"systemd-analyze verify produced no 'Ignoring.' line for {canary.name}, a unit "
+        "built specifically to draw one — so this invocation did not actually verify "
+        "anything and the assertion below would pass having checked nothing. Causes, in "
+        "likelihood order: no usable --user manager in this environment (the skip gate "
+        "above should have caught that); this systemd no longer warns for a "
+        "RestartMaxDelaySec= without RestartSteps=; or _ignored_directive_lines has "
+        f"regressed.\nFull output:\n{combined}"
+    )
+    ignored = _ignored_directive_lines(combined, HARDCODED)
+    assert not ignored, (
+        f"systemd-analyze verify reports directives it is IGNORING in {HARDCODED}:\n"
+        + "\n".join(f"  {line}" for line in ignored)
+        + "\nEach such line is a directive systemd parsed, warned about, and then "
+        "discarded — the unit does not do what its text says it does. An "
+        "'Unknown key name' line means this host's systemd predates the "
+        "directive (RestartSteps= and RestartMaxDelaySec= both require v254), "
+        "so the backoff is inert here even though the file reads correctly."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Clean-stop exit-code classification
+#
+# `uv run` propagates its child's signal death as a numeric exit code, so a
+# perfectly graceful SIGTERM stop surfaces to systemd as exit 143 (128+15).
+# Under systemd's default classification that is a FAILURE: the journal records
+# "Failed with result exit-code" (status=143) and the unit is left in a failed
+# state for a stop that was clean, expected and successful — observed
+# 2026-07-30 22:23:53 BST on the bounded-drain unit from task 3306, with six
+# keep-alive clients attached.  The cost is diagnostic, and compounding: every
+# routine restart plants a false failure, so the failed state stops meaning
+# anything and a real crash reads exactly like a deploy.
+#
+# Note there is no systemd-analyze corroboration in this section, unlike the
+# restart-backoff one above.  A missing SuccessExitStatus= is a perfectly VALID
+# configuration, not a misconfiguration, so systemd emits nothing about it — the
+# file-content invariant is the only signal available.
+# ---------------------------------------------------------------------------
+
+
+def _success_exit_statuses(path: pathlib.Path) -> set[str]:
+    """Return every exit status *path* declares as success, as a flat token set.
+
+    Two systemd behaviours are load-bearing here and neither is optional:
+
+    1. A single directive accepts a SPACE-SEPARATED LIST
+       (``SuccessExitStatus=143 SIGPIPE``), so each value is split.
+    2. Repeated directives ACCUMULATE rather than override, so every match is
+       collected — ``re.findall``, not ``re.search``.
+
+    A ``re.search(...).group(1)`` parser would satisfy neither: it would read a
+    unit that correctly declares ``SuccessExitStatus=SIGPIPE`` on one line and
+    ``SuccessExitStatus=143`` on another as missing 143, sending a future author
+    to "fix" a unit that is already right.  Same failure mode _timeout_stop_sec
+    guards against, where a valid ``15s`` must not be misdiagnosed as absent.
+
+    The ``^`` anchor also keeps this reading DIRECTIVES, not prose: both real
+    unit files discuss this directive by name in the comment above it, and a
+    commented-out mention must never be counted as a live declaration.
+    """
+    values = re.findall(
+        r"^SuccessExitStatus=(.*)$",
+        path.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    return {token for value in values for token in value.split()}
+
+
+def _assert_clean_sigterm_is_success(path: pathlib.Path) -> None:
+    """Assert *path* classifies a clean SIGTERM stop (exit 143) as success."""
+    statuses = _success_exit_statuses(path)
+    assert statuses, (
+        f"{path} declares no SuccessExitStatus= at all, so systemd applies its "
+        "default classification and records every clean stop as a failure. "
+        "`uv run` propagates its child's SIGTERM death as exit code 143 "
+        "(128+15), which the journal reports as 'Failed with result exit-code' "
+        "(status=143) — observed 2026-07-30 22:23:53 BST on the bounded-drain "
+        "unit from task 3306. Declare SuccessExitStatus=143."
+    )
+    assert "143" in statuses, (
+        f"{path} declares SuccessExitStatus={sorted(statuses)}, which does not "
+        "include 143 — the status this unit actually exits with on a graceful "
+        "stop. `uv run` translates its child's SIGTERM death into exit 143 "
+        "(128+15), so a stop that was clean and expected is still recorded as "
+        "'Failed with result exit-code'. Declaring some OTHER status successful "
+        "does not fix the exit this unit really produces."
+    )
+
+    # Context for the trade being made, not an independent property: 143 being
+    # "success" is precisely what stops Restart=on-failure re-firing on it, so a
+    # reader of this assertion should be able to see the restart policy it
+    # interacts with rather than having to go find it.
+    restart = _restart_directive(path, "Restart")
+    assert restart is not None, (
+        f"{path} declares SuccessExitStatus but no Restart= policy. "
+        "SuccessExitStatus= reclassifies exactly the exits Restart=on-failure "
+        "reacts to, so the two belong together; without a restart policy the "
+        "directive only relabels the recorded result and this assertion is "
+        "pinning an interaction that is not there."
+    )
+
+
+def test_success_exit_status_parser_handles_systemd_spellings(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_success_exit_statuses must handle every spelling systemd itself accepts.
+
+    Per the module convention, the helper earns its own negatives so it cannot
+    silently no-op, and each case pins its own failure mode with ``match=``
+    rather than a bare ``pytest.raises(AssertionError)`` that any assertion in
+    the chain would satisfy.
+
+    The good cases matter as much as the bad ones here: a parser too strict to
+    read a valid unit would send a future author to "fix" something already
+    correct, which is the more expensive error of the two.
+    """
+    # Bad: no directive at all — the pre-fix state.
+    absent = _write_restart_unit(
+        tmp_path / "absent.service", "Restart=on-failure\nRestartSec=5"
+    )
+    assert _success_exit_statuses(absent) == set()
+    with pytest.raises(AssertionError, match="declares no SuccessExitStatus"):
+        _assert_clean_sigterm_is_success(absent)
+
+    # Bad: named only in a comment.  Not hypothetical — the real unit files
+    # carry an explanatory comment naming this directive directly above it, so a
+    # parser that dropped the ^ anchor would report those files as compliant
+    # while the live directive had been deleted.  Same trap
+    # test_uvicorn_flag_lookup_is_scoped_to_exec_start guards for the flags.
+    commented = _write_restart_unit(
+        tmp_path / "commented.service",
+        "# SuccessExitStatus=143 because `uv run` exits 143 on SIGTERM\n"
+        "Restart=on-failure\nRestartSec=5",
+    )
+    assert _success_exit_statuses(commented) == set(), (
+        "a commented-out mention was counted as a live declaration"
+    )
+    with pytest.raises(AssertionError, match="declares no SuccessExitStatus"):
+        _assert_clean_sigterm_is_success(commented)
+
+    # Bad: present, but not the status this unit actually exits with.  Guards
+    # against a helper that merely checks the directive exists.
+    wrong = _write_restart_unit(
+        tmp_path / "wrong.service", "Restart=on-failure\nSuccessExitStatus=75"
+    )
+    with pytest.raises(AssertionError, match="does not include 143"):
+        _assert_clean_sigterm_is_success(wrong)
+
+    # Bad: the right status but no restart policy to interact with.
+    no_restart = _write_restart_unit(
+        tmp_path / "no_restart.service", "SuccessExitStatus=143"
+    )
+    with pytest.raises(AssertionError, match="no Restart= policy"):
+        _assert_clean_sigterm_is_success(no_restart)
+
+    # Good: the plain form — must not raise.
+    plain = _write_restart_unit(
+        tmp_path / "plain.service", "Restart=on-failure\nSuccessExitStatus=143"
+    )
+    _assert_clean_sigterm_is_success(plain)
+
+    # Good: space-separated list on ONE line.  Pins the whitespace split — a
+    # whole-value parser would compare the string "143 SIGPIPE" against "143".
+    listed = _write_restart_unit(
+        tmp_path / "listed.service", "Restart=on-failure\nSuccessExitStatus=143 SIGPIPE"
+    )
+    assert _success_exit_statuses(listed) == {"143", "SIGPIPE"}
+    _assert_clean_sigterm_is_success(listed)
+
+    # Good: split across REPEATED directives, which systemd accumulates.  Pins
+    # the findall — a single re.search would read only the SIGPIPE line and
+    # declare this correctly-configured unit broken.
+    repeated = _write_restart_unit(
+        tmp_path / "repeated.service",
+        "Restart=on-failure\nSuccessExitStatus=SIGPIPE\nSuccessExitStatus=143",
+    )
+    assert _success_exit_statuses(repeated) == {"143", "SIGPIPE"}
+    _assert_clean_sigterm_is_success(repeated)
+
+
+def test_clean_sigterm_stop_is_not_recorded_as_a_unit_failure() -> None:
+    """Both unit files must classify exit 143 as a successful stop.
+
+    Without it every ordinary `systemctl restart` leaves a "Failed with result
+    exit-code" entry in the journal for a shutdown that worked exactly as
+    designed, so a genuinely failed unit is indistinguishable from a routine one.
+    """
+    for path in (TEMPLATE, HARDCODED):
+        _assert_clean_sigterm_is_success(path)

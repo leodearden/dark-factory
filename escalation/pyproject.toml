@@ -49,9 +49,23 @@ timeout_method = "signal"
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "tests", "../shared/src"]
+# ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
+# df_pytest_isolation module without letting project dirs shadow their own src/.
+extraPaths = ["src", "tests", "../shared/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
+# Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own
+# .venv (venvPath is resolved relative to this file's directory, so it can
+# never name another tree's environment). Without it, a bare `cd escalation &&
+# npx pyright` resolves the interpreter from ambient VIRTUAL_ENV/PATH — which
+# verify._target_subprocess_env deliberately strips — so a cold merge worktree
+# type-checks against an env holding none of the workspace's third-party
+# packages: measured 39 phantom reportMissingImports here, 0 with this pin.
+# Today this member is type-checked via `uv run --project escalation ... pyright`,
+# which resolves the SAME root .venv, so the pin changes no current result —
+# it only removes the dependency on ambient resolution.
+venvPath = ".."
+venv = ".venv"
 
 [tool.ruff]
 line-length = 100
@@ -60,6 +74,11 @@ line-length = 100
 select = ["E", "F", "UP", "B", "SIM", "I"]
 ignore = ["E501"]
 
+# NOT an enforced gate — style config only: it shapes an ad-hoc or editor-on-save
+# `ruff format` into a repo-consistent single-quoted diff. Do not delete as unused,
+# do not promote to a gate. Why, and the measurements: CONTRIBUTING.md section 3;
+# both directions guarded by tests/scripts/test_ruff_format_policy.py (task 3441).
 [tool.ruff.format]
 quote-style = "single"
 indent-style = "space"
+docstring-code-format = true

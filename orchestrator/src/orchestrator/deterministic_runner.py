@@ -202,16 +202,31 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      ``asyncio.wait_for(timeout_secs + run_timeout_grace_secs)``).
    - ``rc == 0`` (invariant holds): set task ``done`` with
      ``done_provenance.kind='deterministic-milestone'`` (never
-     ``'deterministic-deploy'`` — no deploy happened).
+     ``'deterministic-deploy'`` — no deploy happened).  The ``note`` carries
+     a BOUNDED STRUCTURED VERDICT from ``_summarize_predicate_output``, not
+     the raw stdout tail (task 3286): the note is appended to a Mem0
+     completion summary downstream, so raw subprocess output landing there is
+     ingested into memory (task 2902's specimen).  The raw output is logged
+     at INFO first, so nothing is silently discarded.
    - ``rc != 0`` (invariant violated — a VERDICT, not an infra fault): file a
      born-at-L2 ``milestone_check_failed`` escalation, stamp
      ``gate_escalated_at`` (reusing the gate resume machinery so a human
      resolving the escalation on the next dispatch routes through section 1's
-     quiescence/resolve-to-done fork), and block.
-   - Timeout or an unexpected ``run_fn`` error (no verdict was produced — an
-     infra fault, not a check failure): file born-at-L2 ``infra_issue`` (the
-     existing timeout→escalate path) and block — NO ``gate_escalated_at``
-     stamp, so the check is simply re-attempted on the next dispatch.
+     quiescence/resolve-to-done fork), and block.  A non-zero rc reaching this
+     branch is always a verdict — the default runner's own timeout no longer
+     arrives as one (next bullet).
+   - ``ScriptTimeout`` — the DEFAULT runner's INNER per-script timeout (task
+     4065) — is an infra fault, NOT a verdict: ``infra_issue`` + blocked with
+     NO ``gate_escalated_at`` stamp.  See the ``ScriptTimeout`` class
+     docstring for the full rationale.
+   - Outer-guard timeout or an unexpected ``run_fn`` error (likewise no
+     verdict — an infra fault, not a check failure): file born-at-L2
+     ``infra_issue`` and block — again NO ``gate_escalated_at`` stamp, so the
+     check is simply re-attempted on the next dispatch.  The outer
+     ``asyncio.wait_for`` guard is the backstop for a seam that never returns
+     AT ALL (a detached/unkillable child, or a hanging custom runner).  All
+     three infra arms file the same category, so their escalation wording is
+     deliberately distinct.
    - Section-1 resume: when ``gate_escalated_at`` is set and the
      ``milestone_check_failed`` escalation is resolved, RE-RUNS the predicate
      check (delegating back to ``_run_predicate`` — read-only, so repeating it
@@ -234,20 +249,79 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      stamp failure re-files rather than silently skipping the gate).
    - Set task status to ``blocked``.
    - Return BLOCKED (B2).
+
+   **Resuming a pure gate** — the proof ladder has TWO rungs, not one:
+
+   (i) An archive-inclusive, role-scoped escalation record must exist (task
+   2954). This proves a gate was established and is no longer pending. An
+   empty PENDING queue alone is not proof: a LOST escalation would otherwise
+   let an operator's re-pend of a stuck task silently bypass the gate.
+
+   (ii) If ``metadata.human_curator_gate`` is truthy, then
+   ``metadata.human_curator_adjudicated_at`` must carry a non-empty string (task
+   3341). This proves the human-judgment CONTENT work actually happened.
+
+   Rung (i) passing is NOT evidence rung (ii) holds. Task 3181 was a
+   ``human_curator_gate`` pure gate; ``esc-3181-1`` was resolved by
+   ``escalation-watcher`` with ``action='resume'`` on 2026-07-30T19:41Z, and
+   that resolution's own text says the ~13-entry Mem0 corpus edit was
+   "curator action, deliberately NOT executed here". The resume path
+   nonetheless drove the task to ``done`` with the generic
+   ``note='pure gate resolved'``, contradicting the task's own
+   ``consolidation_note``. Closing an escalation record and performing the
+   curator's content review are different propositions.
+
+   Rung (ii) is a PURE-gate rung only: ``human_curator_gate`` and a
+   ``before_done`` action are contradictory (one says only a human closes
+   this, the other is a machine step that does), so a task carrying both
+   takes the act-then-ask path with the marker unread. That combination is a
+   task-authoring defect and is logged as a WARNING on every dispatch rather
+   than being silently ignored. It is ALSO rejected at write time by
+   ``shared.task_metadata``'s cross-field validator (task 3369), so it can no
+   longer land through the ``submit_task``/``update_task`` boundary; this
+   WARNING is retained as the defence-in-depth backstop for records that did
+   not pass through it.
+
+   Both rung-(ii) checks fail CLOSED: a truthy-but-not-``True`` marker still
+   trips the guard, and a non-``str`` or blank stamp is not proof. An
+   unproven curator gate files a born-at-L2 ``curator_adjudication_missing``
+   escalation — a DISTINCT category, so the re-ask is legible in the census
+   and does not present to a resolver as "the same gate again" — and stays
+   BLOCKED. The block → resolve → re-dispatch → block loop is bounded by the
+   harness ``reblock_guard`` (``Harness._check_reblock_guard``), which keys
+   on ``category:summary``, so the distinct category gets its own counter
+   (INV-4's storm-escape, with no second counter built here — INV-5).
+
+   Ordering matters and is pinned by test: rung (i) runs FIRST. Zero records
+   anywhere means the gate was never established, so re-filing the ORIGINAL
+   ``milestone_gate`` is the correct recovery; asking for an adjudication
+   stamp on a gate nobody has yet seen would be incoherent.
+
+   A curator gate that DOES close carries a specific ``done_provenance.note``
+   naming the adjudication stamp (plus the gate record via
+   ``escalation_id``), never the generic string — that genericness is what
+   made 3181's phantom closure indistinguishable from a genuine one. The
+   interpolated stamp is length-capped because this note is memory-ingested
+   downstream (``_format_outcome_echo``, task 3286) — the same constraint
+   section 2's predicate subsection documents, so both note-writing sites in
+   this module read consistently.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
+import re
 import signal
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from shared.task_metadata import DoneProvenance
+from shared.proc_group import _unsafe_pgid_reason
+from shared.task_metadata import HUMAN_CURATOR_GATE_KEY, DoneProvenance
 
 from orchestrator import systemd_inspect
 from orchestrator.deploy_state import (
@@ -301,7 +375,66 @@ _REAP_GRACE_SECS: float = 5.0
 # it must never fire before the inner script-runner timeout in the normal
 # case, so 30s is deliberately generous (covers process-group teardown +
 # reap_grace_secs with room to spare) rather than tight.
+#
+# Task 4065: because this guard is a strict superset, the INNER timeout is
+# what actually fires for any real, SIGKILL-able subprocess — and for the
+# DEFAULT runner that event is now a distinct signal (`ScriptTimeout`, below).
+# This guard's remaining job is the case it was always for: a seam that never
+# returns at all (a detached/unkillable child, or a custom script_runner that
+# simply hangs).
 _RUN_TIMEOUT_GRACE_SECS: float = 30.0
+
+
+class ScriptTimeout(Exception):
+    """Raised by ``_default_run_script`` when its INNER per-subprocess
+    ``asyncio.wait_for`` fires — i.e. the script itself overran
+    ``before_done['timeout_secs']`` and its process group was SIGKILLed
+    (task 4065).
+
+    THIS DOCSTRING IS THE CANONICAL EXPLANATION of the classification.  The
+    other 4065 sites (module docstring, ``_default_run_script``,
+    ``_run_predicate``, both seam wrappers, the ``script_runner`` ctor arg)
+    deliberately carry one-line pointers here rather than restating it, so
+    the next change to this rule has ONE place to update, not ten that can
+    independently rot.
+
+    Why an exception rather than a ``(rc, tail)`` return: the previous
+    ``return 1, '<script timed out after Ns>'`` was indistinguishable, at the
+    ``run_fn`` seam, from a predicate check script genuinely EXITING non-zero
+    — which on the γ-predicate path is a milestone VERDICT ("the invariant
+    does not hold"), complete with a ``gate_escalated_at`` stamp latching the
+    task into the resolve-to-done path.  A timed-out script produced no exit
+    code and therefore no verdict; it is an INFRA fault.  A sentinel rc (e.g.
+    GNU ``timeout``'s 124) would merely move the collision — a script that
+    genuinely exits with the sentinel would be misclassified the other way —
+    whereas an exception type cannot collide with any exit code at all.
+
+    Deliberately NOT a ``TimeoutError`` subclass: both ``run_fn`` seam
+    wrappers (``_invoke_run_fn_translating_timeout`` and ``_run_predicate``'s
+    local ``_invoke_run_fn``) translate a seam-internal ``TimeoutError`` into
+    ``RuntimeError``, precisely so that an ``except TimeoutError`` around the
+    OUTER ``asyncio.wait_for`` can only ever mean "the outer wall-clock guard
+    itself fired".  A ``TimeoutError`` subclass would be swallowed by that
+    translation and re-reported as a generic "unexpected error" — trading one
+    misattribution for another, one layer down.
+
+    ONLY the default runner raises this.  An injected ``script_runner`` keeps
+    the plain ``(rc, tail)`` contract, so a custom runner's non-zero rc is
+    still an honest verdict on the predicate path.  Classification keys on
+    this exception TYPE — never on substring-matching the tail, which would
+    misclassify any check script that merely PRINTS "timed out".
+
+    ``rc``/``tail`` carry the legacy pair as structured data so the deploy
+    seam wrapper can restore the pre-4065 return value verbatim (the deploy
+    classifiers have no verdict semantics — every non-zero rc there already
+    routes to ``infra_issue``, so nothing there needed to change).
+    """
+
+    def __init__(self, timeout_secs: float) -> None:
+        self.timeout_secs = timeout_secs
+        self.rc = 1
+        self.tail = f'<script timed out after {timeout_secs}s>'
+        super().__init__(self.tail)
 
 # Task 2091 / 2119: bound `_default_inspect_unit`'s `systemctl --user show`
 # call — a parallel latent-hang gap to task 2090, which only wraps the
@@ -339,6 +472,54 @@ OPERATIONAL_LLM_NEEDS_LANE_TOKEN: str = 'operational_llm_needs_lane'
 # decision+operational_mode='llm' gate does NOT get it, so this (not the raw
 # operational_mode) is the precise signal to key on.
 OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
+
+# Task 3341: the human-curator-gate contract — a marker key plus a stamp key.
+#
+# `human_curator_gate` marks a pure deterministic gate whose resolution requires
+# human CONTENT adjudication, not merely a closed escalation record.  It is
+# written today by reconciliation Stage 2 (LLM-authored; no code produces it).
+# `human_curator_adjudicated_at` is the ISO-8601 stamp that PROVES the per-entry
+# review actually happened — stamped on the task via `update_task` by whoever
+# performed the review.  Both are blessed Tier-A keys
+# (shared.task_metadata._BLESSED_METADATA_KEYS) because this module reads them.
+#
+# The two are deliberately separate: the marker says "a human must judge the
+# CONTENT", the stamp says "a human did".  Task 3181 is the incident where the
+# runner had the first and inferred the second from a closed escalation record.
+#
+# SINGLE SOURCE (task 3369): the MARKER's spelling is imported from
+# `shared.task_metadata` (see the import block above) rather than restated as a
+# local literal.  That module's `_deterministic_invariants` validator now reads
+# the key too — to reject the marker alongside a non-null `before_done` at the
+# write boundary — so a second definition would put two spellings of one key in
+# the two modules that both act on it, which is exactly the drift a named
+# constant exists to prevent.  The STAMP keeps a bare literal because `shared`
+# offers no constant to import: it names the stamp only inside
+# `_BLESSED_METADATA_KEYS`, with no validator reading it.
+#
+# NAMING (reviewer amendment): the stamp is `human_curator_adjudicated_at`, NOT
+# `curator_adjudicated_at`.  The bare `curator_*` metadata namespace is already
+# owned by a different subsystem — `curator_action` / `curator_justification` /
+# `combined_at` are written by the AUTOMATED task curator's combine flow
+# (fused_memory.task_interceptor).  Squatting that prefix for the HUMAN content
+# curator would invite a reader of the Tier-A list, or a census consumer
+# grouping by prefix, to conflate two unrelated actors.  The `human_curator_`
+# prefix pairs the stamp unambiguously with its marker.
+HUMAN_CURATOR_ADJUDICATED_AT_KEY: str = 'human_curator_adjudicated_at'
+
+# Length bound applied to the externally-supplied `human_curator_adjudicated_at`
+# value when it is interpolated into the curator-gate `done_provenance.note`.
+#
+# Task 3286 established that `done_provenance.note` is NOT a private field:
+# fused-memory reconciliation's `_format_outcome_echo` appends it to the
+# "Task '<title>' completed." Mem0 write under a 500-char `max_note_chars` cap.
+# `_curator_adjudication_confirmed` deliberately proves only "a human stamped
+# something" — it is NOT a length validator, because rejecting a long-but-
+# genuine stamp would re-open the very phantom-done failure mode task 3341
+# exists to close.  So the bound lives here, at the note-construction site,
+# where an over-length stamp degrades the audit string but never the safety
+# decision.
+_CURATOR_STAMP_NOTE_MAX_CHARS: int = 64
 
 # Task 2238 (W10-δ): a guaranteed-non-self placeholder `own_unit` fed to
 # proc_supervision.RestartPlan.execute() on the cross-unit blocking deploy
@@ -388,6 +569,126 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)  # type: ignore[arg-type]
 
 
+# The payload budget.  Sits safely inside the 500-char `max_note_chars` cap
+# that fused-memory's `_format_outcome_echo` applies downstream (tasks
+# 2049/2054/2080), so a surviving note is not re-truncated there.
+_PREDICATE_NOTE_MAX_PAYLOAD_CHARS = 400
+
+# Log shape: a leading ISO/logging timestamp, OR a standalone level token
+# anywhere in the line.  Used only to REJECT a tier-2 candidate line.
+_LOG_LINE_RE = re.compile(
+    r'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}'
+    r'|\b(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\b'
+)
+
+
+def _summarize_predicate_output(out: object, *, rc: int) -> str:
+    """Summarize a predicate check's raw output into a bounded provenance note.
+
+    Anything the extractor does not recognize is dropped, leaving the bare
+    verdict prefix — an unrecognized shape therefore yields a less
+    informative note, never a corrupted one.
+
+    Motivating specimen — task 2902.  ``_default_run_script`` merges stderr
+    into stdout and returns ``decode()[-2000:]``, so a chatty predicate
+    script's server-log noise reached ``done_provenance.note`` verbatim: a
+    1999-char blob starting mid-token, carrying FalkorDB identity-scan
+    WARNINGs for an unrelated project and ``httpx`` request lines.
+
+    Why this matters beyond tidiness: ``note`` is not a private field.
+    fused-memory's reconciliation ``_format_outcome_echo`` reads
+    ``done_provenance['note']`` and appends it to the ``"Task '<title>'
+    completed."`` Mem0 write, so whatever lands here is INGESTED INTO MEMORY.
+    Raw subprocess output is dropped at this seam for that reason alone; it
+    stays recoverable in the orchestrator log, which is not memory-ingested.
+
+    Extraction runs two tiers with DIFFERENT guarantees — do not read the
+    whole of it as an allowlist.  Tier 1 (the script's own trailing JSON
+    block) IS a true allowlist: only a parseable structured payload survives,
+    and every preceding log line is excluded STRUCTURALLY rather than by
+    pattern-matching.  Tier 2 (a single clean final line) is a best-effort
+    heuristic guarded by a log-shape DENYLIST (``_LOG_LINE_RE``), and it
+    inherits a denylist's weakness: a log line under a formatter nobody
+    anticipated still reaches the note.  Concretely, a ``%(name)s
+    %(message)s`` line such as ``httpx HTTP Request: GET http://...`` carries
+    neither timestamp nor level token and is kept verbatim.
+
+    Tier 2 cannot be tightened into a grammar-based allowlist without
+    discarding the very verdicts it exists to preserve: the real in-repo
+    predicate outputs ``check ok: 0 flakes`` and
+    ``check_merge_flakiness: ... -- invariant holds`` are prose-shaped and
+    structurally indistinguishable from a formatter-less log line.  The
+    residual exposure is therefore bounded rather than closed: at most ONE
+    line, at most ``_PREDICATE_NOTE_MAX_PAYLOAD_CHARS`` of it — never the
+    multi-KB blob task 2902 stamped.  ``scripts/scan_provenance_note_log_leaks.py``
+    shares this blind spot (its discriminator also requires a timestamp), so
+    a predicate script that wants its verdict preserved intact should emit
+    trailing JSON — tier 1 is the only tier with a real guarantee.
+
+    The denylist rejection is otherwise deliberately CONSERVATIVE and will
+    drop an otherwise clean final line that merely contains a standalone
+    ``INFO``/``ERROR`` token.  Losing a payload is the safe failure
+    direction: the verdict prefix always survives, and ``_run_predicate``
+    logs the raw output before calling this, so nothing is silently
+    discarded.
+
+    An oversized payload is replaced WHOLESALE with a marker naming the
+    dropped size — never sliced.  Task 2054 found a raw ``note[:N]`` slice
+    downstream cutting mid-token (garbling ``8679,8680`` into ``8679,868``);
+    a sliced JSON object is worse still, unparseable yet still
+    structured-looking to a reader.
+
+    *rc* is rendered as both a word and a number, and the word is DERIVED
+    from the number (``passed`` iff ``rc == 0``).  Today the only caller is
+    ``_run_predicate``'s ``rc == 0`` branch, but a hardcoded ``passed`` would
+    let a future non-zero caller stamp the self-contradictory note
+    ``predicate check passed (rc=2)``; the text cannot contradict the value.
+    """
+    verdict = f'predicate check {"passed" if rc == 0 else "failed"} (rc={rc})'
+    payload = _extract_predicate_payload(out)
+    if payload is None:
+        return verdict
+    if len(payload) > _PREDICATE_NOTE_MAX_PAYLOAD_CHARS:
+        payload = (
+            f'<verdict payload elided: {len(payload)} chars exceeds '
+            f'{_PREDICATE_NOTE_MAX_PAYLOAD_CHARS}-char cap '
+            f'— see the orchestrator log>'
+        )
+    return f'{verdict}: {payload}'
+
+
+def _extract_predicate_payload(out: object) -> str | None:
+    """Return the recognized structured payload in *out*, or None.
+
+    Tier 1 — a trailing JSON block: walk backwards to the last line whose
+    strip opens a ``{``/``[``, and try to parse from there to end of output.
+    Re-dumped with compact separators so the note stays a single line.
+
+    Tier 2 — the last non-blank line, iff it carries no log shape
+    (``_LOG_LINE_RE``).  This is what preserves the real in-repo predicate
+    verdicts (``check ok: 0 flakes``, ``-- invariant holds``,
+    ``measured_median_ms=…``).
+
+    Otherwise None: an unrecognized shape yields no payload at all.
+    """
+    lines = out.splitlines() if isinstance(out, str) else []
+    for index in range(len(lines) - 1, -1, -1):
+        if not lines[index].strip().startswith(('{', '[')):
+            continue
+        try:
+            parsed = json.loads('\n'.join(lines[index:]))
+        except ValueError:
+            continue
+        return json.dumps(parsed, separators=(',', ':'))
+
+    for line in reversed(lines):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        return None if _LOG_LINE_RE.search(candidate) else candidate
+    return None
+
+
 def _is_operational_llm_gate(metadata: dict) -> bool:
     """Return True iff *metadata* carries β's operational-llm-gate marker.
 
@@ -398,6 +699,146 @@ def _is_operational_llm_gate(metadata: dict) -> bool:
     marker, so reading the raw mode would false-positive that case.
     """
     return metadata.get(OPERATIONAL_LLM_GATE_MARKER_KEY) is True
+
+
+def _is_human_curator_gate(metadata: dict) -> bool:
+    """Return True iff *metadata* marks a gate needing human CONTENT adjudication.
+
+    Task 3341.  Keys on ``HUMAN_CURATOR_GATE_KEY`` via plain TRUTHINESS —
+    a DELIBERATE divergence from ``_is_operational_llm_gate`` directly above,
+    which uses a strict ``is True``.  The two markers have opposite failure
+    costs, so they get opposite postures:
+
+    * ``_is_operational_llm_gate`` is a ROUTING hint. A false positive
+      misroutes a human-handling lane, so failing open (``is True``) is right.
+    * This is a SAFETY gate. A false NEGATIVE silently reproduces the task-3181
+      phantom-done — the exact failure this predicate exists to prevent. So a
+      truthy-but-not-``True`` value (e.g. the string ``'true'`` from a hand
+      edit or a JSON round-trip) must fail CLOSED: the guard still applies.
+
+    Pinned by ``test_string_truthy_curator_gate_marker_still_trips_the_guard``.
+    """
+    return bool(metadata.get(HUMAN_CURATOR_GATE_KEY))
+
+
+def _curator_adjudication_confirmed(metadata: dict) -> bool:
+    """Return True iff *metadata* carries positive proof the content review happened.
+
+    Task 3341.  Proof is ``HUMAN_CURATOR_ADJUDICATED_AT_KEY`` holding a non-empty,
+    non-whitespace ``str`` (an ISO-8601 stamp).  Every other value — ``bool``,
+    ``int``, ``None``, an empty or blank string — is NOT proof and fails CLOSED.
+
+    Note ``bool`` is excluded explicitly rather than incidentally: ``True`` is
+    the single most likely wrong value a hand edit produces here (it reads as
+    "yes, adjudicated"), and it must not be accepted as a stamp.
+
+    This checks TYPE and EMPTINESS only, never length or ISO shape — see
+    ``_CURATOR_STAMP_NOTE_MAX_CHARS`` for why bounding belongs at the
+    note-construction site instead. Pinned by
+    ``test_blank_adjudication_stamp_is_not_proof``.
+    """
+    stamp = metadata.get(HUMAN_CURATOR_ADJUDICATED_AT_KEY)
+    return isinstance(stamp, str) and bool(stamp.strip())
+
+
+def _is_scheduled_self_deploy_complete(task: dict | None) -> bool:
+    """Return True iff *task* is an already-completed scheduled self-deploy.
+
+    Task 2983 fix (a).  A deterministic self-restart deploy that took the ε
+    scheduled path completes by stamping ``before_done_scheduled_at`` and
+    setting the task ``done`` with
+    ``done_provenance.kind == 'deterministic-deploy-scheduled'`` (done =
+    *scheduled*, not *verified*; verification is out-of-band).  When a STALE
+    eligibility snapshot re-selects such a task after its first dispatch has
+    completed, ``run()`` must recognize the FRESH task shape as deploy-complete
+    rather than tripping the crash-window detector.
+
+    True iff a fresh read of *task* shows EITHER ``metadata['done_provenance']``
+    is a dict with ``kind == 'deterministic-deploy-scheduled'`` OR
+    ``metadata['before_done_scheduled_at']`` is truthy.
+
+    Fail-safe (mirrors ``harness._is_terminal_merged``'s shape): a ``None``
+    *task* (``get_task`` failure or absence) or a missing/non-dict ``metadata``
+    is treated as non-matching rather than raising — the caller then falls
+    through to the unchanged crash-window re-escalation path, so a genuine
+    crash-window is never silently dismissed.
+
+    This detects the scheduled-self-deploy SHAPE only; it deliberately does
+    NOT read ``always_escalates`` (the before_done_scheduled_at stamp is
+    written on BOTH the always_escalates=False done path AND the act-then-ask
+    always_escalates=True gate path).  A True result therefore means "drive
+    to DONE" ONLY for always_escalates=False — the caller MUST apply the
+    always_escalates policy split (re-file the milestone gate + block when
+    always_escalates=True), exactly as the (b-self) branch does; short-
+    circuiting to DONE on a bare True would bypass a still-open act-then-ask
+    gate (reviewer_comprehensive amendment, task 2983).
+    """
+    if not isinstance(task, dict):
+        return False
+    metadata = task.get('metadata')
+    if not isinstance(metadata, dict):
+        return False
+    provenance = metadata.get('done_provenance')
+    if (
+        isinstance(provenance, dict)
+        and provenance.get('kind') == 'deterministic-deploy-scheduled'
+    ):
+        return True
+    return bool(metadata.get('before_done_scheduled_at'))
+
+
+def build_milestone_gate_escalation_fields(
+    task: dict | None, metadata: dict,
+) -> tuple[str, str, list]:
+    """Build ``(summary, detail, options)`` for a born-at-L2 ``milestone_gate``.
+
+    THE single seam both born-at-L2 pure-gate producers route through:
+      - the runner's own gate filing
+        (``DeterministicRunner._file_milestone_gate_and_block``), and
+      - the harness recon-sweep's strand recovery
+        (``Harness._recover_stranded_deterministic_gate``, task 2954).
+
+    Extracted (task 2954 amendment) so a re-filed gate is byte-identical to
+    what the runner would have filed.  Critically this includes the
+    operational-LLM token prefix (task 2803 γ): a naive re-build in the sweep
+    would DROP the ``OPERATIONAL_LLM_NEEDS_LANE_TOKEN`` on summary+detail and
+    misroute the human handling lane, so centralizing the construction keeps
+    the two producers in lockstep.
+
+    ``detail`` = description + a "Landed dependencies:" line when the task has
+    dependencies; ``summary`` = ``title[:200]``.  For an operational-LLM gate
+    (``_is_operational_llm_gate``) both are token-prefixed (token-first so the
+    token survives the summary's ``[:200]`` truncation and any tail-only log
+    scrape; ``detail`` itself is not truncated).  Plain gates (marker absent)
+    are byte-unchanged.  ``options`` is the task's ``gate_options`` (empty list
+    when absent).  None/empty *task* is tolerated (defensive; the sweep's task
+    dict is read back from the scheduler).
+    """
+    task = task or {}
+    title = task.get('title', '')
+    description = task.get('description', '')
+    deps = task.get('dependencies', []) or []
+    dep_ids = [
+        str(d.get('id', d) if isinstance(d, dict) else d) for d in deps
+    ]
+    detail_parts = [description]
+    if dep_ids:
+        detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
+    detail = '\n'.join(detail_parts)
+    summary = title[:200]
+    if _is_operational_llm_gate(metadata):
+        # Task 2803 (γ): token-first prefix/build so the token survives
+        # downstream truncation (the summary's [:200] slice) and any
+        # tail-only log scrape; detail itself is not truncated. Plain
+        # gates (marker absent) are byte-unchanged.
+        detail = (
+            f'[{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}] This operational ask needs '
+            'LLM-operational handling; no automated lane exists yet — resolve '
+            'by hand.\n\n'
+        ) + detail
+        summary = f'{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}: {title}'[:200]
+    options = list(metadata.get('gate_options') or [])
+    return summary, detail, options
 
 
 class DeterministicRunner:
@@ -418,6 +859,13 @@ class DeterministicRunner:
             that runs the deploy script to completion.  Defaults to
             ``_default_run_script`` (awaited create_subprocess_exec).
             Injected in tests to avoid spawning real processes.
+            Seam contract (task 4065): an injected runner returns a plain
+            ``(rc, tail)`` and never raises ``ScriptTimeout`` — only the
+            default implementation does — so on the γ-predicate path an
+            injected runner's non-zero rc is always a milestone VERDICT,
+            whatever its tail says.  A custom runner wanting the infra-fault
+            classification for its own timeout must raise ``ScriptTimeout``
+            explicitly; see that class's docstring.
         writeback_backoffs: Bound + pacing for the post-deploy verify+writeback
             retry loop (task 2066), as a list of between-attempt sleep
             seconds (``attempts = len(writeback_backoffs) + 1``).  Defaults
@@ -510,8 +958,17 @@ class DeterministicRunner:
 
             <script> <args>
             __rc=$?
-            if [ "$__rc" -ne 0 ]; then <escalation submit …>; fi
+            if [ "$__rc" -ne 0 ]; then <escalation submit …>; __esc=$?
+              if [ "$__esc" -ne 0 ]; then echo "RP-4: …" >&2; exit 97; fi
+            fi
             exit "$__rc"
+
+        A FAILING ``escalation submit`` is no longer swallowed (task 3404): it
+        exits ``proc_supervision.RP4_ESCALATION_SUBMIT_FAILED_RC`` with an
+        ``RP-4: on-failure escalation submit failed rc=… (payload rc=…)`` line
+        on stderr, so an unfiled L2 is both visible in journald and
+        machine-distinguishable.  When the submit succeeds the wrapper still
+        exits the payload's own code, so journald keeps the real restart cause.
 
         Why not a separate ``OnFailure=`` handler unit?  ``systemd-run`` has no
         register-without-start mode — registering a companion handler transient
@@ -558,15 +1015,58 @@ class DeterministicRunner:
         # ``python -m escalation submit`` argv construction (byte-identical to
         # this method's prior inline argv — see EscalationSpec.to_submit_argv).
         #
-        # Deployment assumption: the `escalation` package must be importable from
-        # sys.executable's interpreter (i.e. installed into site-packages, not
-        # just reachable via a PYTHONPATH side-channel from the orchestrator
-        # service unit).  If it is not, the OnFailure branch itself fails and no
-        # L2 is filed — the task is already marked done=scheduled at this point,
-        # so the failure would be silently lost.  Operators should verify with:
+        # Deployment assumption: the `escalation` package must be importable
+        # from sys.executable's interpreter.  That importability rests on TWO
+        # independent legs (task 3453, both MEASURED):
+        #
+        #  1. Interpreter identity — `sys.executable` IS the workspace venv
+        #     interpreter (`uv run --frozen --project orchestrator` resolves
+        #     ExecStart to `<repo>/.venv/bin/python3`, which carries an editable
+        #     install of `escalation`).  This leg is load-bearing and cannot be
+        #     substituted: `python -S -m escalation submit` with the src roots on
+        #     PYTHONPATH still dies at `shared.async_sqlite_base` ->
+        #     `import aiosqlite`, a site-packages-only wheel.  So PYTHONPATH
+        #     alone is NOT sufficient.
+        #  2. Workspace src roots — supplied explicitly by the
+        #     `--setenv=PYTHONPATH=` token `RestartPlan`'s detached argv now
+        #     carries (proc_supervision._submit_child_pythonpath).  This is the
+        #     only leg systemd-run can break: it propagates NONE of the caller's
+        #     environment to a transient unit.
+        #
+        # NOT via "a PYTHONPATH side-channel from the orchestrator service
+        # unit", as this comment previously claimed — MEASURED FALSE:
+        # orchestrator-dark-factory.service sets only Environment=PATH=/LANG=/
+        # ORCH_UNIT= and no PYTHONPATH, and systemd-run would not propagate it
+        # anyway.
+        #
+        # If `escalation` is nonetheless unimportable, the OnFailure branch
+        # itself fails and no L2 is filed — the task is already marked
+        # done=scheduled at this point, so nothing downstream would notice.
+        # That loss is reported twice over, at both ends of the deferral:
+        #
+        #  - At REGISTRATION time, `RestartPlan._execute_detached_systemd_run`
+        #    WARNs as soon as it can prove the import fails in-process (the
+        #    `escalation.submit` canary, task 3453) — while a human is still
+        #    watching the deploy.
+        #  - At FIRE time, the loss is no longer SILENT either (task 3404): the
+        #    fired unit exits the reserved
+        #    proc_supervision.RP4_ESCALATION_SUBMIT_FAILED_RC and prints an
+        #    `RP-4: on-failure escalation submit failed rc=… (payload rc=…)`
+        #    line, so journald carries both the fact and the cause.
+        #
+        # Operators can still verify the same thing directly, ahead of a deploy:
         #   <sys.executable> -c "import escalation"
-        # before deploying.  A marker-file fallback is intentionally not
-        # implemented here to keep the failure path auditable via journald.
+        # A marker-file fallback is intentionally not implemented here to keep
+        # the failure path auditable via journald.
+        #
+        # End-to-end coverage of this branch lives in
+        # test_deterministic_runner.py's TestDefaultScheduleDetachedRestart,
+        # which fires the deferred wrapper for real.  Those tests now preflight
+        # interpreter importability via `_assert_submit_cli_invokable` and hand
+        # the child the repo src roots on PYTHONPATH — a fresh interpreter
+        # inherits none of conftest.py's in-process sys.path injection, so
+        # without that the branch silently filed nothing in a venv lacking the
+        # `escalation` editable install (task 3404).
         escalation_spec = EscalationSpec(
             queue_dir=str(self.escalation_queue.queue_dir),
             task_id=task_id,
@@ -626,7 +1126,17 @@ class DeterministicRunner:
 
         Returns:
             (rc, output_tail) — rc is the process return code; output_tail is
-            the last 2000 chars of combined stdout/stderr.
+            the last 2000 chars of combined stdout/stderr.  Returned ONLY when
+            the script ran to completion; a timeout raises instead (below).
+
+        Raises:
+            ScriptTimeout — the script overran ``before_done['timeout_secs']``
+                and its whole process group was SIGKILLed (task 2090 Layer A
+                runs FIRST, before the raise).  An infra fault, not a verdict;
+                see the ``ScriptTimeout`` docstring for why it is deliberately
+                not a ``(1, tail)`` return.  Deploy callers are unaffected —
+                ``_invoke_run_fn_translating_timeout`` restores the legacy pair
+                from ``exc.rc``/``exc.tail``.
         """
         script = before_done['script']
         args = before_done.get('args') or []
@@ -644,6 +1154,11 @@ class DeterministicRunner:
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
+        # Capture the pgid NOW, while proc is guaranteed alive and unreaped: with
+        # start_new_session=True, pgid == proc.pid by POSIX guarantee.  Reading it
+        # later via os.getpgid could hit a recycled pid and signal a stranger's
+        # group (task 845) — see `_terminate_process_tree`'s docstring.
+        pgid = proc.pid
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
             tail = (stdout or b'').decode(errors='replace')[-2000:]
@@ -657,10 +1172,20 @@ class DeterministicRunner:
             # running indefinitely.  start_new_session=True (above) makes this
             # process its own session/group leader so the WHOLE tree can be
             # torn down together instead of leaking orphaned processes.
-            await self._terminate_process_tree(proc)
-            return 1, f'<script timed out after {timeout_secs}s>'
+            #
+            # The teardown stays FIRST: task 4065 only changed how the timeout
+            # is REPORTED, not the Layer-A guarantee that the process group is
+            # dead before this frame unwinds.  `_terminate_process_tree` never
+            # raises (see its docstring), so the raise below is always reached.
+            await self._terminate_process_tree(proc, pgid)
+            # `from None` suppresses the noisy asyncio.TimeoutError context —
+            # ScriptTimeout already carries the overrun budget as structured
+            # data (timeout_secs), so the chained cause adds nothing.
+            raise ScriptTimeout(timeout_secs) from None
 
-    async def _terminate_process_tree(self, proc: asyncio.subprocess.Process) -> None:
+    async def _terminate_process_tree(
+        self, proc: asyncio.subprocess.Process, pgid: int,
+    ) -> None:
         """Kill *proc*'s entire process group and bound the reap (task 2090).
 
         ``proc`` must have been spawned with ``start_new_session=True`` so its
@@ -685,25 +1210,75 @@ class DeterministicRunner:
         stuck in an uninterruptible state cannot hang this helper (and
         therefore ``_default_run_script``) forever.
 
-        Note (residual race): ``os.killpg(os.getpgid(proc.pid), ...)`` targets
-        ``proc.pid`` by number.  If asyncio's child watcher has already reaped
-        the zombie in the background before this call runs, the OS could in
-        principle recycle that PID before ``os.getpgid``/``os.killpg`` execute,
-        making the SIGKILL target an unrelated process group.  This is a
-        low-probability race shared with any PID-based kill (not specific to
-        this helper); the ``ProcessLookupError``/``OSError`` suppression above
-        is the existing mitigation, not a full fix for the underlying race.
+        Args:
+            proc: the timed-out child, spawned with ``start_new_session=True``.
+            pgid: the process group id, which MUST be the value captured
+                immediately after that spawn (where ``pgid == proc.pid`` by
+                POSIX guarantee).  It is never refreshed here via
+                ``os.getpgid``: once ``proc`` has been reaped the kernel may
+                recycle its pid, and ``os.getpgid`` would then return an
+                unrelated group's id — in the task-845 incidents that resolved
+                to the user ``systemd --user`` manager's group and killed the
+                whole login session.  ``shared/src/shared/proc_group.py``'s
+                module docstring is the canonical statement of this contract.
+
+        A frozen capture alone is necessary but not sufficient, because the
+        captured NUMBER also goes stale the moment the leader is reaped.  The
+        ``proc.returncode is not None`` short-circuit below is what closes that
+        residual window: it dispatches no signal at all rather than risk
+        signalling a stranger.  Accepted trade-off, matching the shared
+        helper's: if the leader is already reaped we forgo killing surviving
+        grandchildren — refusing to kill a stranger beats reaping an orphan.
+
+        The third layer is ``shared.proc_group._unsafe_pgid_reason``, applied
+        below: even a frozen, unreaped pgid is refused if it resolves to init,
+        this process, our parent, our own group, or anything other than
+        ``proc.pid``.  This helper deliberately REUSES that predicate rather
+        than growing a third copy of it — the repo's other two group-killers
+        (``shared.proc_group.terminate_process_group`` and
+        ``df_pytest_isolation._kill_process_group``) both apply it, and a
+        divergent hand-rolled copy here would be the weakest of the three.  A
+        refusal degrades to the direct ``proc.kill()``, exactly as
+        ``df_pytest_isolation``'s does.
+
+        Why this does NOT simply delegate to ``terminate_process_group``, which
+        it otherwise resembles: that helper escalates SIGTERM → wait →
+        SIGKILL, while this path SIGKILLs immediately and bounds the reap once.
+        The immediate SIGKILL is deliberate for a deploy script that has
+        already blown its timeout budget, and delegation would also double the
+        worst-case wait (``2 * grace_secs``) and drop both the ``proc.kill()``
+        fallback and the reap-abandoned warning below.  Delegating is a
+        behaviour change, not a refactor; the shared *predicate* is the part
+        that is genuinely common, so that is what is shared.
         """
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError) as exc:
+        if proc.returncode is not None:
             logger.debug(
-                'DeterministicRunner: killpg(%s) failed (%s: %s) — falling back '
-                'to direct kill()',
-                proc.pid, type(exc).__name__, exc,
+                'DeterministicRunner: proc %s already reaped — skipping killpg '
+                '(its pid may already be recycled onto another group)',
+                proc.pid,
+            )
+        elif (reason := _unsafe_pgid_reason(pgid, proc.pid)) is not None:
+            # Residual defence, degrading to the direct child exactly as
+            # df_pytest_isolation._kill_process_group does on the same refusal.
+            logger.error(
+                'DeterministicRunner: refusing to killpg — %s. Falling back to '
+                'a direct kill() of pid %s; any grandchildren will be left to '
+                'the caller. This indicates a bug in the pgid capture.',
+                reason, proc.pid,
             )
             with contextlib.suppress(ProcessLookupError, OSError):
                 proc.kill()
+        else:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError) as exc:
+                logger.debug(
+                    'DeterministicRunner: killpg(%s) failed (%s: %s) — falling back '
+                    'to direct kill()',
+                    pgid, type(exc).__name__, exc,
+                )
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    proc.kill()
 
         try:
             await asyncio.wait_for(proc.wait(), timeout=self._reap_grace_secs)
@@ -952,6 +1527,117 @@ class DeterministicRunner:
                 '(connection may still be severed): %s: %s — the stop_instruction '
                 'escalation is already durable on local disk, so returning '
                 'BLOCKED regardless',
+                task_id, type(exc).__name__, exc,
+            )
+        return WorkflowOutcome.BLOCKED
+
+    async def _file_curator_adjudication_missing_and_block(
+        self, task_id: str, task: dict,
+    ) -> WorkflowOutcome:
+        """File a born-at-L2 ``curator_adjudication_missing`` escalation and block.
+
+        Task 3341.  Reached when a ``human_curator_gate`` pure gate resumes with
+        its own escalation record closed but NO ``human_curator_adjudicated_at``
+        stamp — i.e. the record says "someone closed the gate", nothing says
+        "the human reviewed the content".
+
+        Modelled on ``_file_stop_instruction_and_block``: a born-at-L2
+        ``Escalation`` that survives the server's downgrade gate, and a
+        best-effort blocked writeback wrapped so a severed fused-memory
+        connection cannot turn a durable on-disk escalation into a propagated
+        exception.
+
+        NO dedup guard (reviewer amendment).  ``_file_stop_instruction_and_block``
+        carries one because its caller is not gated on the pending set; this
+        method's sole call site sits inside section 1's ``else:`` of
+        ``if pending:``, where ``pending`` is the *identical*
+        ``get_by_task(task_id, status='pending', agent_role=...)`` query — so a
+        dedup filter here is provably always empty, i.e. dead code asserting a
+        justification that does not transfer.  A future second call site NOT
+        gated that way must re-introduce a category-scoped filter.
+
+        Two deliberate omissions:
+
+        * It does NOT re-stamp ``gate_escalated_at`` — already stamped; this is
+          a re-ask on an established gate, not a new one.
+        * It does NOT re-file a ``milestone_gate``. A DISTINCT category keeps
+          the census legible, stops the re-ask presenting to a resolver as
+          "the same gate again" (which would invite the identical auto-
+          resolution that caused task 3181), gives the harness ``reblock_guard``
+          its own signature — it keys on ``category:summary``, so INV-4's
+          storm-escape is satisfied without building a second counter (INV-5) —
+          and lets a future watcher policy special-case "never auto-resolve
+          this category".
+
+        Returns:
+            WorkflowOutcome.BLOCKED
+        """
+        from escalation.models import Escalation
+
+        title = task.get('title') or task_id
+        summary = f'Human curator gate {task_id} resumed without content adjudication'
+        detail = (
+            f"Task {task_id} ({title!r}) is a deterministic pure gate marked "
+            f"`metadata.{HUMAN_CURATOR_GATE_KEY}`, meaning it closes only when a "
+            f"human has adjudicated its CONTENT — not merely when its escalation "
+            f"record is closed.\n\n"
+            f"An escalation record for this gate exists and is no longer pending, "
+            f"so the task-2954 proof check passed. But "
+            f"`metadata.{HUMAN_CURATOR_ADJUDICATED_AT_KEY}` is absent or is not a "
+            f"non-empty string, so there is NO evidence the per-entry review "
+            f"actually happened. Driving to done here would repeat task 3181, "
+            f"where esc-3181-1 was resolved by the automated escalation-watcher "
+            f"whose own resolution text said the curator work was "
+            f"'deliberately NOT executed here' — and the task was nonetheless "
+            f"closed with the generic note 'pure gate resolved'.\n\n"
+            f"REMEDIATION — one of:\n"
+            f"  (a) Perform the per-entry content review this gate asks for, then "
+            f"stamp the proof and resolve this escalation:\n"
+            f"      update_task({task_id}, metadata={{'{HUMAN_CURATOR_ADJUDICATED_AT_KEY}': "
+            f"'<ISO-8601 timestamp>'}}, metadata_mode='merge')\n"
+            f"      The stamp must be a non-empty string; a bare `true` is NOT "
+            f"accepted (it asserts the conclusion without recording when the "
+            f"review happened).\n"
+            f"  (b) Cancel the task, if the content work is no longer wanted.\n\n"
+            f"Resolving THIS escalation without doing (a) or (b) will simply "
+            f"re-file it on the next dispatch."
+        )
+
+        # No dedup filter — see the docstring: the sole call site already ran
+        # the identical pending query and only reaches here when it came back
+        # empty, so any filter written here would be unreachable by
+        # construction.
+        esc = Escalation(
+            id=self.escalation_queue.make_id(task_id),
+            task_id=task_id,
+            agent_role=DETERMINISTIC_AGENT_ROLE,
+            severity='critical',
+            category='curator_adjudication_missing',
+            summary=summary[:200],
+            detail=detail,
+            level=2,
+        )
+        self.escalation_queue.submit(esc)
+        logger.info(
+            'DeterministicRunner: filed L2 curator_adjudication_missing '
+            'escalation %s for task %s',
+            esc.id, task_id,
+        )
+
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+            logger.info(
+                'DeterministicRunner: task %s blocked — curator adjudication missing',
+                task_id,
+            )
+        except Exception as exc:
+            # Same rationale as _file_stop_instruction_and_block: the escalation
+            # is already durable on local disk, so return BLOCKED regardless.
+            logger.warning(
+                'DeterministicRunner: task %s blocked-status writeback failed '
+                '(connection may still be severed): %s: %s — the '
+                'curator_adjudication_missing escalation is already durable on '
+                'local disk, so returning BLOCKED regardless',
                 task_id, type(exc).__name__, exc,
             )
         return WorkflowOutcome.BLOCKED
@@ -1350,29 +2036,13 @@ class DeterministicRunner:
         """
         from escalation.models import Escalation
 
-        title = task.get('title', '')
-        description = task.get('description', '')
-        deps = task.get('dependencies', [])
-        dep_ids = [
-            str(d.get('id', d) if isinstance(d, dict) else d) for d in deps
-        ]
-        detail_parts = [description]
-        if dep_ids:
-            detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
-        detail = '\n'.join(detail_parts)
-        summary = title[:200]
-        if _is_operational_llm_gate(metadata):
-            # Task 2803 (γ): token-first prefix/build so the token survives
-            # downstream truncation (the summary's [:200] slice) and any
-            # tail-only log scrape; detail itself is not truncated. Plain
-            # gates (marker absent) are byte-unchanged.
-            detail = (
-                f'[{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}] This operational ask needs '
-                'LLM-operational handling; no automated lane exists yet — resolve '
-                'by hand.\n\n'
-            ) + detail
-            summary = f'{OPERATIONAL_LLM_NEEDS_LANE_TOKEN}: {title}'[:200]
-        gate_options = metadata.get('gate_options') or []
+        # Task 2954 amendment: summary/detail/options built via the shared
+        # `build_milestone_gate_escalation_fields` seam so the harness recon-
+        # sweep's strand recovery re-files a byte-identical gate (including the
+        # operational-LLM token prefix) and the two producers stay in lockstep.
+        summary, detail, gate_options = build_milestone_gate_escalation_fields(
+            task, metadata,
+        )
 
         # File the born-at-L2 escalation FIRST (crash-safe ordering: a stamp
         # failure on the following update_task re-files the gate on next dispatch
@@ -1550,14 +2220,34 @@ class DeterministicRunner:
 
         Maps the outcome:
         - ``rc == 0`` -> ``WorkflowOutcome.DONE``, with
-          ``done_provenance.kind='deterministic-milestone'``.
-        - ``rc != 0`` -> a milestone VERDICT failure: born-at-L2
-          ``milestone_check_failed`` escalation + ``gate_escalated_at`` stamp
-          + blocked (routes through section-1's resume/quiescence machinery
-          on the next dispatch).
-        - Timeout / unexpected error -> an INFRA fault (no verdict was
-          produced): born-at-L2 ``infra_issue`` escalation + blocked
-          (re-attempted on the next dispatch, no ``gate_escalated_at`` stamp).
+          ``done_provenance.kind='deterministic-milestone'`` and a BOUNDED,
+          STRUCTURED ``note`` from ``_summarize_predicate_output`` — never the
+          raw stdout tail (task 3286, specimen 2902).  The note is not a
+          private field: fused-memory's ``_format_outcome_echo`` appends it to
+          a Mem0 completion-summary write, so raw subprocess output landing
+          there is ingested into memory.  The full raw output is logged at
+          INFO immediately before summarizing, so nothing is silently lost.
+        - ``rc != 0`` -> a milestone VERDICT failure ("the invariant does not
+          hold"): born-at-L2 ``milestone_check_failed`` escalation +
+          ``gate_escalated_at`` stamp + blocked (routes through section-1's
+          resume/quiescence machinery on the next dispatch).  Any non-zero rc
+          returned by the seam is a verdict — including one from an injected
+          ``script_runner``, whatever its tail text says.
+        - ``ScriptTimeout`` (task 4065) -> an INFRA fault, not a verdict: the
+          DEFAULT runner's own inner per-script timeout fired, so no exit code
+          exists.  born-at-L2 ``infra_issue`` + blocked, with NO
+          ``gate_escalated_at`` stamp, so the read-only check is re-attempted
+          on the next dispatch instead of being latched into the
+          resolve-to-done path.  See the ``ScriptTimeout`` docstring.
+        - Outer-guard timeout / unexpected error -> likewise an INFRA fault
+          (no verdict was produced): born-at-L2 ``infra_issue`` escalation +
+          blocked (re-attempted on the next dispatch, no ``gate_escalated_at``
+          stamp).  The outer ``asyncio.wait_for`` guard
+          (``timeout_secs + run_timeout_grace_secs``) stays the backstop for a
+          seam that never returns at all.  All three infra arms share one
+          category, so each carries deliberately distinct summary/detail
+          wording — that text is the only thing telling a human which guard
+          fired.
 
         Returns:
             WorkflowOutcome.DONE or WorkflowOutcome.BLOCKED.
@@ -1570,6 +2260,9 @@ class DeterministicRunner:
             # TimeoutError into a distinct exception type here so `except
             # TimeoutError` below can only ever mean "the outer wall-clock
             # guard itself fired" — never a misattributed application error.
+            #
+            # Task 4065: do NOT broaden this except clause — ScriptTimeout must
+            # propagate UNTOUCHED to the dedicated arm below (see ScriptTimeout).
             try:
                 return await run_fn(before_done)
             except TimeoutError as exc:
@@ -1601,6 +2294,32 @@ class DeterministicRunner:
                 summary='Predicate check timed out (subprocess hung)',
                 detail=timeout_detail,
             )
+        except ScriptTimeout as exc:
+            # Task 4065: the DEFAULT runner's own per-script timeout fired — no
+            # exit code, so no verdict (see ScriptTimeout).  Wording is
+            # deliberately distinct from the two sibling arms: all three file
+            # the same infra_issue category, so the text is the only thing
+            # telling a human WHICH guard fired.
+            inner_timeout_detail = '\n'.join([
+                description,
+                f'Predicate check script exceeded its own per-script timeout '
+                f"({exc.timeout_secs}s = before_done['timeout_secs']) and its whole "
+                f'process group was SIGKILLed.',
+                'No exit code was produced, so there is NO verdict — this is an '
+                'INFRA fault, deliberately not milestone_check_failed ("the '
+                'invariant does not hold").',
+                'No gate_escalated_at stamp is written: this read-only check is '
+                'simply re-attempted on the next dispatch rather than latched '
+                'into the resolve-to-done path.',
+                "Either the check is genuinely too slow for its configured "
+                "before_done['timeout_secs'] budget (raise it), or whatever it "
+                'probes is itself wedged.',
+            ])
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Predicate check script timed out (no verdict produced)',
+                detail=inner_timeout_detail,
+            )
         except Exception as exc:
             # Likewise an infra fault, not a verdict — an unexpected error
             # means the check never ran to completion.
@@ -1619,6 +2338,17 @@ class DeterministicRunner:
             # hold"), not an infra fault — file milestone_check_failed (NOT
             # infra_issue) and stamp gate_escalated_at so a human resolving
             # the escalation drives the task to done on the next dispatch.
+            #
+            # Task 4065: the DEFAULT runner's inner per-script timeout can no
+            # longer reach this branch (it raises ScriptTimeout, handled above
+            # as an infra fault).  A non-zero rc from an INJECTED script_runner
+            # IS still a verdict by contract, whatever its tail says —
+            # classification keys on the exception type, never on the text.
+            #
+            # The RAW `out` below is deliberate and must stay raw (task 3286):
+            # unlike done_provenance.note, an escalation detail is read by a
+            # human diagnosing the failing check and is never ingested into
+            # memory, so full subprocess output is exactly what is wanted here.
             fail_detail = '\n'.join([
                 description,
                 f'Predicate check exit code: rc={rc}',
@@ -1630,6 +2360,16 @@ class DeterministicRunner:
                 detail=fail_detail,
             )
 
+        # Log the RAW output before summarizing it.  `_summarize_predicate_output`
+        # deliberately discards everything it does not recognize, and dropping
+        # data with no trace would be a silent degradation — so the full text
+        # lands here first, in the orchestrator log, which (unlike the note) is
+        # never ingested into Mem0/Graphiti.
+        logger.info(
+            'DeterministicRunner: task %s predicate raw output (%d chars, '
+            'summarized into done_provenance.note): %s',
+            task_id, len(out) if isinstance(out, str) else 0, out,
+        )
         logger.info(
             'DeterministicRunner: task %s predicate check passed (rc=0) — setting done',
             task_id,
@@ -1637,7 +2377,10 @@ class DeterministicRunner:
         await self.scheduler.set_task_status(
             task_id,
             'done',
-            done_provenance=_build_done_provenance('deterministic-milestone', note=out),
+            done_provenance=_build_done_provenance(
+                'deterministic-milestone',
+                note=_summarize_predicate_output(out, rc=rc),
+            ),
         )
         return WorkflowOutcome.DONE
 
@@ -1678,9 +2421,22 @@ class DeterministicRunner:
         named-target ``RestartPlan`` shim runner, and the target_unit-less
         direct invocation below) so the translation logic cannot drift
         between the two copies.
+
+        Task 4065: also converts the default runner's ``ScriptTimeout`` back
+        into the legacy ``(1, '<script timed out after Ns>')`` pair, so the
+        DEPLOY classifiers see byte-for-byte what they saw before that
+        exception existed.  Unlike the γ-predicate path they have no
+        milestone-verdict semantics to protect — every non-zero rc there
+        already routes to ``_file_infra_issue_and_block`` (target_unit-less)
+        or ``RESTART_FAILED`` -> the same (named target).  Restoring the pair
+        HERE, once, rather than at each deploy call site, keeps the anti-drift
+        property this helper exists for; both branches are pinned by
+        ``TestDefaultRunnerInnerTimeoutDeployParity``.
         """
         try:
             return await run_fn(before_done)
+        except ScriptTimeout as exc:
+            return exc.rc, exc.tail
         except TimeoutError as exc:
             raise RuntimeError(
                 f'run_fn raised TimeoutError internally (not the '
@@ -1790,6 +2546,46 @@ class DeterministicRunner:
         always_escalates = metadata.get('always_escalates', False)
         gate_escalated_at = metadata.get('gate_escalated_at')
 
+        # Task 3341 (reviewer amendment) — a curator gate is a PURE gate by
+        # construction: `human_curator_gate` declares "only a human's CONTENT
+        # judgement closes this", while a `before_done` action is a machine step
+        # that closes it.  The two are contradictory, so the rung-two guard below
+        # lives only on the pure-gate resume path.  But the marker is LLM-authored
+        # (reconciliation Stage 2), so a misauthored task CAN carry both — and
+        # would then take the act-then-ask path with the marker never read.  Say
+        # so LOUDLY rather than degrading silently (repo norm), on every dispatch
+        # of such a task and before any branch consumes it.
+        #
+        # Deliberately a WARNING and not a block: the defect is in task
+        # AUTHORING, and hard-failing here would strand a deploy that may have
+        # no curator semantics at all — trading a silent fail-open for a silent-
+        # to-the-author fail-closed.
+        #
+        # Task 3369 landed the durable fix: `shared.task_metadata` now REJECTS
+        # the marker alongside a non-null before_done at write time, so this
+        # combination can no longer reach us through the fused-memory
+        # submit_task/update_task boundary.  This WARNING is deliberately KEPT
+        # at WARNING level as defence-in-depth, because three routes still reach
+        # the runner without passing that boundary: `task_metadata.enforce` is a
+        # RED-TIER restart-only flag (a restart into warn-mode leaves this as the
+        # only remaining signal), records written before the validator existed,
+        # and any writer that does not go through SqliteTaskBackend (operator
+        # hand-edit, direct sqlite write, a future backend).  Downgrading it
+        # would delete the signal in exactly the configurations where it is the
+        # last one standing.
+        # Pinned by test_curator_marker_on_a_non_pure_gate_is_loud.
+        if before_done is not None and _is_human_curator_gate(metadata):
+            logger.warning(
+                'DeterministicRunner: task %s carries metadata.%s but ALSO a '
+                'before_done action. A curator gate is a pure gate by '
+                'construction, so the content-adjudication guard (task 3341) '
+                'does NOT apply on the act-then-ask path — the marker is being '
+                'IGNORED. Fix the task metadata: drop before_done to make this a '
+                'real curator gate, or drop the marker if the machine step is '
+                'what closes the task.',
+                task_id, HUMAN_CURATOR_GATE_KEY,
+            )
+
         # ── 1. Idempotency / quiescence ──────────────────────────────────────
         # If the gate escalation was already filed in a prior dispatch, check
         # whether it is still open or has been resolved.
@@ -1834,6 +2630,12 @@ class DeterministicRunner:
                     )
                     return await self._run_predicate(task_id, before_done, description)
 
+                # Task 3341: bound here rather than only inside the pure-gate
+                # branch below, so the symmetric `if before_done is not None:`
+                # at the done write has a definite assignment to read.  Stays
+                # empty on the act-then-ask path, which never consults it.
+                own_records: list = []
+
                 # γ: if before_done is set, the action must have already ran (I1) for us
                 # to safely drive to done here.  Check before_done_ran_at as proof.
                 if before_done is not None:
@@ -1853,6 +2655,81 @@ class DeterministicRunner:
                         'before_done_ran_at=%s, gate resolved — setting done',
                         task_id, before_done_ran_at_check,
                     )
+                else:
+                    # Pure-gate resume (before_done is None): an empty PENDING
+                    # queue is NOT proof a human resolved the gate.  Require the
+                    # SAME archive-inclusive positive proof the deploy path
+                    # demands below (section 2's own_escalation_resolved) before
+                    # driving to done — otherwise a LOST born-at-L2 gate
+                    # escalation (task 2954 strand) would let an operator's
+                    # re-pend of the stuck task silently BYPASS the human gate.
+                    # status=None scans the archive too, so a resolved/dismissed
+                    # record counts as proof a human was in the loop; agent_role
+                    # scopes it to the runner's OWN gate escalations.  When NO
+                    # record ever landed, re-establish the gate via
+                    # _file_milestone_gate_and_block and stay BLOCKED rather than
+                    # phantom-completing.
+                    # Task 3341: keep the RECORDS, not just the boolean — the
+                    # curator-gate done write below cites the newest one as
+                    # rung-one evidence via done_provenance.escalation_id.  The
+                    # `bool(...)` semantics below are byte-identical to task
+                    # 2954's original expression.
+                    own_records = self.escalation_queue.get_by_task(
+                        task_id, agent_role=DETERMINISTIC_AGENT_ROLE,
+                    )
+                    own_escalation_resolved = bool(own_records)
+                    if not own_escalation_resolved:
+                        logger.warning(
+                            'DeterministicRunner: task %s pure-gate resume — '
+                            'gate_escalated_at stamped but NO escalation record '
+                            'exists (pending or archived); the gate was never '
+                            'proven resolved (likely lost across a restart) — '
+                            're-filing the born-at-L2 gate instead of driving to '
+                            'done (task 2954)',
+                            task_id,
+                        )
+                        return await self._file_milestone_gate_and_block(
+                            task_id, task, metadata,
+                        )
+                    # ORDERING INVARIANT (task 3341) — these two branches are
+                    # NOT interchangeable, and the curator guard below MUST stay
+                    # second:
+                    #   no record at all  ⇒ the gate was never established
+                    #                     ⇒ re-file the ORIGINAL milestone_gate
+                    #                       (above); asking for an adjudication
+                    #                       stamp on a gate nobody has yet seen
+                    #                       would be incoherent.
+                    #   a record exists,
+                    #   content unproven  ⇒ ask for the adjudication stamp
+                    #                       (below).
+                    # Pinned by
+                    # test_curator_gate_with_zero_records_still_refiles_milestone_gate.
+                    #
+                    # Second rung of the pure-gate proof ladder (task 3341): an
+                    # existing, no-longer-pending record proves a gate was
+                    # established and closed — it does NOT prove a human did the
+                    # CONTENT work a curator gate asks for. Task 3181 is where
+                    # the two diverged. Fail closed.
+                    if (
+                        _is_human_curator_gate(metadata)
+                        and not _curator_adjudication_confirmed(metadata)
+                    ):
+                        logger.warning(
+                            'DeterministicRunner: task %s pure-gate resume — '
+                            'metadata.%s is set but metadata.%s carries no '
+                            'non-empty string, so the human CONTENT adjudication '
+                            'is unproven; a closed escalation record is not '
+                            'evidence the review happened (task 3181 precedent: '
+                            'esc-3181-1 was auto-resolved by escalation-watcher '
+                            'and the curator work was explicitly not done) — '
+                            'filing curator_adjudication_missing and staying '
+                            'BLOCKED instead of driving to done',
+                            task_id, HUMAN_CURATOR_GATE_KEY,
+                            HUMAN_CURATOR_ADJUDICATED_AT_KEY,
+                        )
+                        return await self._file_curator_adjudication_missing_and_block(
+                            task_id, task,
+                        )
                 logger.info(
                     'DeterministicRunner: task %s gate resolved — setting done',
                     task_id,
@@ -1868,6 +2745,79 @@ class DeterministicRunner:
                             'deterministic-deploy',
                             unit=_ata_unit,
                             note='resumed after gate resolution',
+                        ),
+                    )
+                elif _is_human_curator_gate(metadata):
+                    # Curator gate closing legitimately (task 3341).  Reaching
+                    # here means BOTH rungs of the proof ladder held: a closed
+                    # own-role escalation record exists (rung one, task 2954)
+                    # AND `human_curator_adjudicated_at` carries a non-empty string
+                    # (rung two, checked above) — otherwise the guard returned
+                    # BLOCKED and never got here.
+                    #
+                    # The note deliberately differs from the generic
+                    # 'pure gate resolved' below: that string is what made task
+                    # 3181's phantom closure indistinguishable from a genuine
+                    # one in the audit trail.  A curator gate that closes must
+                    # name the evidence it closed on — the adjudication stamp
+                    # here, plus the gate record via `escalation_id`.
+                    #
+                    # BOUND THE STAMP (task 3286's finding): this note is
+                    # memory-ingested — fused-memory's `_format_outcome_echo`
+                    # appends it to the "Task '<title>' completed." Mem0 write
+                    # under a 500-char cap — and the stamp is an externally-
+                    # supplied metadata value that `_curator_adjudication_confirmed`
+                    # validates for TYPE only, never length.  So truncate here,
+                    # at construction, where over-length degrades the audit
+                    # string but never the safety decision.  `_summarize_predicate_output`
+                    # is deliberately NOT reused: it strips log noise from raw
+                    # subprocess output, a different threat model, and borrowing
+                    # it would imply a sanitization guarantee this single
+                    # structured field does not need.
+                    _raw_stamp = str(metadata.get(HUMAN_CURATOR_ADJUDICATED_AT_KEY, ''))
+                    _stamp_for_note = (
+                        _raw_stamp
+                        if len(_raw_stamp) <= _CURATOR_STAMP_NOTE_MAX_CHARS
+                        else _raw_stamp[:_CURATOR_STAMP_NOTE_MAX_CHARS] + '…'
+                    )
+                    # Cite the GATE record — NOT merely the newest own-role one
+                    # (reviewer amendment).  The standard remediation round-trip
+                    # this very guard creates leaves TWO own-role records behind:
+                    #   (A) the original `milestone_gate`, resolved WITHOUT a
+                    #       stamp — the record that proves rung one, and
+                    #   (B) the `curator_adjudication_missing` re-ask this guard
+                    #       filed, resolved once the human finally stamped.
+                    # `escalation_id` is rung-ONE evidence, and both the module
+                    # docstring and docs/task-authoring.md promise it names the
+                    # gate record.  Taking the newest own record would cite (B),
+                    # the re-ask — the one record that proves nothing about the
+                    # gate — quietly mis-aiming the audit trail this whole change
+                    # exists to sharpen.  So filter to the gate category first
+                    # and take the newest of those; fall back to the newest own
+                    # record only when no gate-category record survives (e.g. a
+                    # gate filed under an older category), and to omitting the
+                    # key when `own_records` is empty (unreachable — the strand
+                    # branch already returned — but an empty list must never be
+                    # indexed; `exclude_none=True` then simply drops the key).
+                    # Pinned by test_curator_gate_remediation_round_trip_cites_the_gate_record.
+                    _gate_records = [
+                        e for e in own_records if e.category == 'milestone_gate'
+                    ]
+                    _citable = _gate_records or own_records
+                    _gate_esc_id = (
+                        sorted(_citable, key=lambda e: e.timestamp)[-1].id
+                        if _citable else None
+                    )
+                    await self.scheduler.set_task_status(
+                        task_id,
+                        'done',
+                        done_provenance=_build_done_provenance(
+                            'deterministic-gate',
+                            note=(
+                                'human curator gate: per-entry content '
+                                f'adjudication confirmed at {_stamp_for_note}'
+                            ),
+                            escalation_id=_gate_esc_id,
                         ),
                     )
                 else:
@@ -2028,6 +2978,59 @@ class DeterministicRunner:
                         task_id,
                     )
                     return await self._file_milestone_gate_and_block(task_id, task, metadata)
+
+                # (b-self-stale) Task 2983 fix (a): the b-self branch above only
+                # fires when before_done_scheduled_at is present in the IN-HAND
+                # snapshot.  The reported incident (task 2912 / γ3 self-unit
+                # restart) re-selected this deterministic self-deploy off a
+                # STALE eligibility snapshot that carried ONLY
+                # before_done_ran_at — the scheduled stamp and the done-writeback
+                # had not yet landed when the snapshot was read — so b-self was
+                # skipped and the second dispatch fell through to the
+                # crash-window detector below, filing a born-at-L2 infra_issue
+                # false positive.  Re-read the CURRENT task (a fresh get_task,
+                # taken at execution time ~seconds later, after the first
+                # dispatch's writes landed): if it is an already-completed
+                # scheduled self-deploy, the deploy is done (scheduled) — return
+                # DONE with NO escalation and NO status write (the task is
+                # already terminal; a status write would trip the terminal-exit
+                # gate that produced the observed TerminalExitRejection).  A
+                # fresh read that is NOT scheduled-complete falls through to the
+                # unchanged re-verify/re-escalate handling below, so a genuine
+                # crash-window still re-escalates exactly as today.
+                current_task = await self.scheduler.get_task(task_id)
+                if _is_scheduled_self_deploy_complete(current_task):
+                    # Amendment (reviewer_comprehensive): the scheduled stamp is
+                    # written on BOTH the always_escalates=False path (task set
+                    # 'done' via 'deterministic-deploy-scheduled') AND the
+                    # act-then-ask always_escalates=True path (b-self above,
+                    # which RE-FILES the milestone gate and BLOCKS).  Mirror
+                    # b-self's policy split here so the DONE short-circuit
+                    # applies ONLY to the always_escalates=False shape: for an
+                    # always_escalates=True self-deploy whose fresh get_task now
+                    # carries before_done_scheduled_at, re-file the gate and
+                    # block instead of silently bypassing the still-open
+                    # act-then-ask gate with a phantom-done.
+                    if always_escalates:
+                        logger.info(
+                            'DeterministicRunner: task %s stale-snapshot '
+                            'double-dispatch of a scheduled self-deploy with '
+                            'always_escalates=True — re-filing milestone gate '
+                            '(gate not bypassed, task 2983)',
+                            task_id,
+                        )
+                        return await self._file_milestone_gate_and_block(
+                            task_id, task, metadata,
+                        )
+                    logger.info(
+                        'DeterministicRunner: task %s double-dispatch of a '
+                        'completed scheduled self-deploy detected via fresh '
+                        'get_task — returning DONE with no escalation and no '
+                        'status write (crash-window false positive avoided, '
+                        'task 2983)',
+                        task_id,
+                    )
+                    return WorkflowOutcome.DONE
 
                 if resolution_proven:
                     # (b) A failure escalation was filed and resolved by a human.

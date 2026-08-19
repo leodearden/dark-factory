@@ -127,10 +127,36 @@ result = mcp__escalation__promote_to_l2(
     options=["A: ...", "B: ...", "C: ...", "D: something else"],
     summary="<one-line cluster hypothesis>",
     category="<category>",                # e.g. "infra_issue", "design_concern"
-    severity="blocking",                  # default; use "critical" for urgent
+    # severity: OMIT IT. Omitted = inherited as max(member severities).
+    # See "Severity of a promoted L2" below before passing it explicitly.
 )
-# result: {'id': <l2_id>, 'status': 'created'|'updated', 'members': [...]}
+# result: {'id': <l2_id>, 'status': 'created'|'updated', 'members': [...],
+#          'severity': <what was actually filed>}
 ```
+
+### Severity of a promoted L2
+
+1. **Omit `severity` and the L2 inherits the highest severity among its
+   members.** This is what you want in the overwhelming majority of cases —
+   an L2 clustering purely-informational L1s is itself informational, and
+   filing it as `blocking` puts a human in the loop for something no member
+   claimed was blocking.
+
+2. **Pass it EXPLICITLY and UPWARD when your RCA concluded the cluster is
+   collectively worse than any individual member** — a set of individually
+   informational findings that together indicate a real blocker. This remains
+   fully available and is *not* discouraged; it is a judgement you are expected
+   to make when the evidence supports it. Say so in `evidence` when you do.
+
+3. **Never pass a severity LOWER than the members' max to quiet a record.**
+   Post-mint the server enforces a monotonic floor: an L2's severity is
+   non-decreasing after it is minted, so a demotion on an append is ignored.
+   (At mint time a lower explicit value *is* honoured — but if you find
+   yourself reaching for it, the honest move is usually to not promote at all.)
+
+4. **The response carries `severity`** — report the value actually filed in the
+   rotation digest, not the one you asked for. On an `'updated'` result it is
+   the post-floor value, which may be higher than your argument.
 
 ### Case A — single judgement-class item (1-member L2)
 
@@ -201,7 +227,9 @@ The three classes, and the evidence each requires you to **quote verbatim in `re
 |-------|--------------|------------------------------------------------------|
 | **`superseded_main_sweep`** | `agent_role == "orchestrator-main-sweep"` | BOTH: (1) the newer sweep escalation's id (`esc-...`), AND (2) proof the failing tip is an ancestor of a now-green main — a `merge-base`/`is-ancestor` check result or a gate re-run "verifies clean" output |
 | **`self_cleared_infra`** | `category == "infra_issue"` | A quoted live-probe `key=value` liveness token, e.g. `curator paused=false`, `ActiveState=active`, `MainPID=1234` |
-| **`stale_task_scoped`** | any category/role (subject to the denylist above) | A live `get_task` status citation showing the subject task went terminal or moved on — `status=done`, `status=cancelled`, `re-scoped`, or `re-dispatched` |
+| **`stale_task_scoped`** | any category/role (subject to the denylist above) | A live `get_task` status citation showing the subject task went terminal or moved on — `status=done`, `status=cancelled`, `re-scoped to task 3821` (also `into` / `as`, with or without the word `task`), or `re-dispatched as run-abc123/3821` (note: `as`, **not** `to`) |
+
+For the two "moved on" shapes, the citation must name the task or run it moved to, as a token carrying a digit. Bare `re-scoped` / `re-dispatched` prose with no identifier — "was re-scoped per get_task", "re-dispatched it this morning" — no longer satisfies the gate (task 4192): the server checks this evidence structurally against your own free-form close prose, so an unanchored word would let an incidental turn of phrase carry the close. Punctuation around the identifier is free: `re-scoped to task #3821`, `re-scoped to #3821`, and a backtick- or quote-wrapped `` re-scoped to `3821` `` all pass, so write the `#3821` spelling if it reads more naturally.
 
 **Stamp `resolution_class="benign"` on every one of these three closes.** They are allowlisted precisely *because* they are predictably benign — a superseded sweep, a self-cleared infra probe, or a stale/terminal task-scoped record is a confirmed **no-action** close (the escalation's stated condition already resolved itself; nothing was fixed or decided). Passing the class explicitly keeps the archived record's provenance **stamped, not inferred** by the origin analytics panel — see [Classify the resolution](#classify-the-resolution-resolution_class).
 
@@ -283,6 +311,8 @@ mcp__escalation__stamp_triage(
 ```
 
 `triaged_by` is server-attributed from your connection's `X-Escalation-Identity` header (non-spoofable, same contract as `resolved_by` — see [Hard Constraints](#hard-constraints--never-violate)); you do not need to pass it explicitly. Stamping is an **ungated annotation** — unlike `resolve_issue`, it is exempt from the `{0,1}` level cap, so you can stamp a pending L2 you are still forbidden to resolve. It changes neither `status` nor `level` nor `updated_at`.
+
+**Human-judgment-category guard (`design_concern` / `risk_identified` L2s):** these categories wait on a HUMAN ruling, surfaced through a cockpit DecisionRecord — which you cannot file (you hold no `write-decision`). A probe that only re-checks the *subject task's* status (e.g. `stale_task_scoped`) does NOT handle the human question, and a fresh `triaged_at` from such a probe makes later rotations and the L2 watcher's parked-pile audits skip the record as "handled" while the question was never surfaced — esc-3223-4/-5 kept task 3223 blocked for 11 days exactly this way. For a pending L2 in these two categories, either leave it **unstamped** so a full L2 session picks it up, or stamp it ONLY with a note whose predicate names the visibility gap itself (e.g. `no DecisionRecord exists for this esc-id | probe: cockpit registry lookup -> absent`) — never with a task-status-only predicate that reads as coverage.
 
 **`triage_note` MUST carry a verified predicate and the probe that verified it — never a bare conclusion:**
 1. The **PREDICATE** — a machine-checkable condition, e.g. `` `task-604 status==done` `` — not a conclusion like "resume will close it". A conclusion-only note is untrusted prose: exactly this anti-pattern on esc-2584 was empirically refuted twice, costing two churn cycles and five separate `resolve_issue` calls before the item was actually closed.
@@ -552,6 +582,8 @@ mcp__escalation__promote_to_l2(
   ],
   summary="bad merge on main — recovery ref-move required",
   category="infra_issue",
+  # Explicit upward override, deliberate: main being RED blocks the whole fleet
+  # regardless of how any individual member happened to be filed.
   severity="blocking",
 )
 ```
@@ -623,7 +655,7 @@ mcp__escalation__promote_to_l2(
   options=["A: restart the affected service", "B: investigate logs/connectivity", "C: pause orchestration until resolved", "D: something else"],
   summary="Infrastructure issue: " + <summary>,
   category="infra_issue",
-  severity="blocking",
+  # severity omitted — inherited from the clustered members.
 )
 ```
 

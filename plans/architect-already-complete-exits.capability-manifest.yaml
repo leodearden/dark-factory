@@ -1,0 +1,129 @@
+prd: plans/architect-already-complete-exits.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 3030
+  title: mark_step_committed plan-tool
+  capabilities:
+  - name: mark-step-committed-tool-registered
+    binding: capability→producer (self, wired) — new @mcp.tool() beside report_task_already_done
+      (plan_tools.py:712); sets status=done + [COMMITTED <sha>] tag
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def mark_step_committed
+      paths:
+      - orchestrator/src/orchestrator/mcp/plan_tools.py
+      expect: present
+  - name: all-done-plan-accepted-by-confirm-plan
+    binding: capability→producer (self) — confirm_plan (plan_tools.py:660) must accept
+      an all-done plan; get_pending_steps (artifacts.py:706) already excludes done
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: acceptance of an all-done plan is a behavior asserted by α's own tests,
+        not a single grep
+- label: β
+  task_id: 3031
+  title: report_ready_to_merge exit + _handle_ready_to_merge_report handler
+  capabilities:
+  - name: ready-to-merge-handler-wired
+    binding: capability→producer (self, wired) — handler sibling to _handle_already_done_report
+      (workflow.py:5211); validates desync predicate first-hand then enqueue_merge_request(source='architect-desync')
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _handle_ready_to_merge_report
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+  - name: ready-to-merge-exit-tool-registered
+    binding: 'capability→producer (self, wired) — new @mcp.tool() writing .task/ready_to_merge.json
+      (convention: workflow.py:5212 already_done.json)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def report_ready_to_merge
+      paths:
+      - orchestrator/src/orchestrator/mcp/plan_tools.py
+      expect: present
+  - name: enqueue-and-found-on-main-reused-not-copied
+    binding: no-lockstep-duplication (INV-5) — reuse/extract the reaper block (harness.py:4400
+      MergeRequest, :4418 enqueue_merge_request, :4431 marker, kind='found_on_main'
+      :975/:4160); merge worker re-verify (merge_queue.py) is the sole gate
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: helper-reuse (no lock-step copy) + structured validation-fail reason
+        (INV-2) are code-shape properties judged by β's tests/review, not a grep
+- label: γ
+  task_id: 3033
+  title: Architect all-mark_step_committed wiring → 0 EXECUTE iterations
+  capabilities:
+  - name: zero-execute-iterations-end-to-end
+    binding: capability→producer:α upstream + EXECUTE empty-skip (workflow.py:5931)
+      + execute_iterations metric (workflow.py:922); VERIFY remains the semantic gate
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 0 EXECUTE iterations is a runtime event-log property (boundary tests
+        A1-1..A1-3), not mechanically greppable on main
+- label: δ
+  task_id: 3032
+  title: Veto relax for merge-remediable escalations
+  capabilities:
+  - name: merge-remediable-veto-predicate
+    binding: capability→producer (self, wired) — single predicate helper gating the
+      three open_escalations veto sites (harness.py:4792,4812,5087); reaper submit
+      (harness.py:4324) + detect_verified_green (stranded_verified_green.py:115) retained
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: MERGE_REMEDIABLE_ESC_CATEGORIES
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: human-concern-still-vetoes
+    binding: safety (INV-4) — non-remediable class ⇒ unchanged LEAVE veto; stranded_merge_request
+      marker (harness.py:4431) suppresses re-submit storm
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'the negative branch (D-2: human-concern still vetoes) is a behavioral
+        assertion in δ''s boundary tests'
+- label: ε
+  task_id: 3035
+  title: Update SOP canonical memories (operational, no-code)
+  capabilities:
+  - name: sop-canonicals-reference-shipped-exits
+    binding: capability→producer:β,γ,δ upstream — the exits ε documents are all delivered
+      by prerequisites; SOP cluster consolidated in task 3011 (done)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Mem0 canonical content edit; verified via get_memory_by_id read-back,
+        not a repo grep
+- label: ζ
+  task_id: 3034
+  title: Architect prompt/skill exit-enumeration update
+  capabilities:
+  - name: prompt-enumerates-mark-step-committed
+    binding: capability→producer:α upstream — architect exit enumeration source (agents/roles.py:205-210,334-339,1446-1450)
+      gains mark_step_committed
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: mark_step_committed
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: present
+  - name: prompt-enumerates-report-ready-to-merge
+    binding: capability→producer:β upstream — same enumeration gains report_ready_to_merge
+      for the merge-landing desync
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: report_ready_to_merge
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: present

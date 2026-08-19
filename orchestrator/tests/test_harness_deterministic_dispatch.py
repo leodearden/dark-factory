@@ -344,3 +344,76 @@ class TestRestartStampClear:
             and c.args[1].get('gate_escalated_at') is None
         ]
         assert not stamp_clear_calls, 'abandon must NOT clear stamps'
+
+
+@pytest.mark.asyncio
+class TestDeterministicDispatchDoubleDispatchGuard:
+    """Task 2983 fix (b): _run_deterministic_slot re-reads the live status at
+    dispatch time and short-circuits an already-terminal double-dispatch.
+
+    The reported incident (task 2912): the scheduler re-dispatched a
+    deterministic self-deploy off a STALE eligibility snapshot after its first
+    dispatch had already driven the task to 'done'.  A fresh single-task
+    get_status at dispatch collapses the seconds-wide snapshot-age window: if
+    the task is already terminal ({done, cancelled}), skip WITHOUT constructing
+    or invoking DeterministicRunner (no escalation, no second workflow).
+    Fail-open: a None/non-terminal status proceeds to run() normally.
+    """
+
+    async def test_terminal_status_short_circuits_without_running_runner(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """get_status == 'done' → benign DONE report, no runner, no escalation."""
+        task = _det_task(task_id='2912')
+        assignment = _make_assignment(task)
+
+        harness.scheduler.is_deterministic = MagicMock(return_value=True)
+        harness.scheduler.get_status = AsyncMock(return_value='done')
+        queue = EscalationQueue(tmp_path)
+        harness._escalation_queue = queue
+
+        with patch('orchestrator.harness.DeterministicRunner') as mock_dr:
+            # Configure a runner mock so that, WITHOUT the guard, dispatch would
+            # proceed and return a BLOCKED report — making the RED failure a
+            # clean assertion mismatch rather than an await-on-MagicMock error.
+            mock_runner = MagicMock()
+            mock_runner.run = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+            mock_dr.return_value = mock_runner
+
+            report = await harness._run_deterministic_slot(assignment)
+
+        # Runner never constructed or invoked (no second workflow).
+        mock_dr.assert_not_called()
+        # Fresh status was read for the dispatched task id.
+        harness.scheduler.get_status.assert_awaited_once_with(assignment.task_id)
+        # Benign DONE report, no block reason.
+        assert report.outcome == WorkflowOutcome.DONE
+        assert report.block_reason == ''
+        # No escalation filed by the skip.
+        assert queue.get_by_task('2912') == []
+
+    async def test_non_terminal_status_proceeds_into_runner(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """get_status non-terminal (e.g. 'pending') → guard does NOT short-circuit;
+        dispatch proceeds into DeterministicRunner (fail-through preserved)."""
+        task = _det_task(task_id='2913')
+        assignment = _make_assignment(task)
+
+        harness.scheduler.is_deterministic = MagicMock(return_value=True)
+        harness.scheduler.get_status = AsyncMock(return_value='pending')
+        harness._escalation_queue = EscalationQueue(tmp_path)
+
+        with patch('orchestrator.harness.DeterministicRunner') as mock_dr:
+            mock_runner = MagicMock()
+            mock_runner.run = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+            mock_dr.return_value = mock_runner
+
+            report = await harness._run_deterministic_slot(assignment)
+
+        # Guard did NOT short-circuit: runner constructed and run() awaited.
+        mock_dr.assert_called_once()
+        mock_runner.run.assert_awaited_once_with(assignment)
+        # Report reflects the runner's outcome (not the benign skip).
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.block_reason == 'deterministic_gate'

@@ -100,6 +100,36 @@ The breaker itself is a pure read/decide component; the Harness pass owns all si
 | `frozen_prefix` | dict | `{request_ids, tip_merge_commit, verify_depth}` — current frozen-prefix state (ε=1890) |
 | `metrics` | dict | `{retries_per_landing, drift_at_detection: {count, last, mean, max}, landings_total}` (ι=1894) |
 | `two_layer_invariants` | list\[str\] | `[]` when all §5.3 invariants hold; violation strings otherwise (λ=1895) |
+| `hosts` | list\[dict\] | Per-verify-host state: `{name, is_local, slot_state: free\|busy\|parked\|null, quarantined, quarantine_class: ru\|divergence\|null, unavailable_since, unavailable_secs, streak, reason}` (task 3275) |
+
+`hosts` is what makes an under-full `verifying N/M hosts` line diagnosable — it
+has four possible causes, each with its own discriminator: **RU-quarantine**
+(`quarantine_class == 'ru'` — auto-recovers via `_reprobe_quarantined_hosts`);
+**divergence-quarantine** (`quarantine_class == 'divergence'` — held for verdict
+parity, operator-cleared only); **leaked slot** (`slot_state` `busy`/`parked`
+with no matching `occupancy.inflight_by_host` occupant); and **free and never
+asked for** (`slot_state == 'free'`, `quarantined == false`). `unavailable_since`
+/ `unavailable_secs` / `streak` / `reason` are populated whenever the host is
+RU-tracked, independent of quarantine, so a host accumulating failures below the
+quarantine threshold is visible too — `unavailable_since` is an absolute epoch
+(for log correlation), `unavailable_secs` the derived downtime relative to the
+snapshot's own clock (the "how long has this host been down" form, matching every
+other age field). `hosts == []` means the allocator has not been built yet (no
+verify dispatched) — deliberately not a fabricated `local` entry.
+
+An RU-tracked host with **no allocator slot** (an orphan — e.g. a remote dropped
+from the pool while its failure streak was live; the streak map is pruned only on
+recovery, and the allocator is built once per worker) is appended after the
+managed hosts with `slot_state: null`, so an orphaned streak is never invisible.
+Hence `len(hosts) == occupancy.hosts_total + <orphan count>`, the two being equal
+in the steady state.
+
+The `occupancy` block: `hosts_busy` is the count of **distinct busy hosts**, NOT
+the number of verifies in flight — read `inflight_total` for that.
+`inflight_by_host` is the authoritative lossless `{host: [task_id, ...]}` view
+(finalize head first, then `_inflight` order); `by_host` is the
+retained-for-compatibility lossy `{host: task_id}` map, which keeps only the last
+occupant when two entries share a host.
 
 ---
 

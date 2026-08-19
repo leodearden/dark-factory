@@ -1,0 +1,421 @@
+prd: plans/flake-ledger-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 3785
+  title: flake_occurrence + flake_debt in runs.db with the flake_ledger writer/reader
+    API
+  capabilities:
+  - name: runs-db-additive-schema
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/event_store.py:24
+      + run_store.py:19/34/70 CREATE TABLE IF NOT EXISTS; runs.db already hosts 6
+      tables from 4 owners
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: CREATE TABLE IF NOT EXISTS flake_occurrence
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: debt-table-one-row-per-test
+    binding: capability→producer (wired) — same additive-schema substrate; §5.3 makes
+      test_id the PRIMARY KEY so re-entry UPDATEs rather than inserts
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: CREATE TABLE IF NOT EXISTS flake_debt
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: wal-busy-timeout-durability
+    binding: capability→producer (wired) — grep:shared/src/shared/sqlite_sync_base.py:26
+      apply_full_durability_pragmas_sync, called at event_store.py:512 and run_store.py:90
+      with busy_timeout_ms=5000
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def record_flake_occurrence
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: psi-sampling-not-loadavg
+    binding: capability→producer (wired) — grep:shared/src/shared/psi.py:133 read_psi_sample
+      → PsiSample(read_ok=...) at :105, fail-open sentinel at :129
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: psi_cpu_some10
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: ledger-owned-timestamps
+    binding: field-population — .taskmaster/tasks/tasks.db has NO created_at [INV],
+      and planning_mode bypasses the curator ticket store (grep:fused-memory/src/fused_memory/middleware/task_interceptor.py:2611),
+      so opened_at/resolved_at MUST be ledger-owned or the age backstop has no clock
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: that the column is POPULATED (not merely declared) is pinned by α's
+        round-trip test and by B10; a grep can only prove the column exists
+- label: β
+  task_id: 3786
+  title: One isolated-rerun discriminator; both existing gates become thin wrappers
+  capabilities:
+  - name: both-wrapper-gates-exist-with-tests
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:7377
+      confirm_merge_verify_flake_suppressible and :7538 _main_probe_failure_is_isolated_flake;
+      existing tests at orchestrator/tests/test_verify_merge_flake_suppression.py
+      (4 refs) and test_verify_preexisting_main_break.py (16 refs), so 'both wrappers'
+      existing tests pass unchanged' is a real, non-empty assertion
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def confirm_isolated_rerun_verdict
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: unconfirmable-is-already-computed-and-dropped
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:6956
+      _group_node_ids_by_subproject returns None and logs the literal word at :7027
+      (INFO). The fact exists in a variable; only its structured form is missing (INV-2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class FlakeVerdict
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: serial-isolated-generous-timeout-override
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:7374
+      _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS = 300, applied at :7468. `-o addopts=` clears
+      pyproject addopts but NOT [tool.pytest.ini_options] timeout=60, so the explicit
+      override is load-bearing
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 8.1 invariants 1 (never raises → fail-CLOSED) and 4 (serial+isolated+timeout
+        preserved) are behavioural; pinned by β's wrapper tests, not by a pattern
+- label: γ
+  task_id: 3787
+  title: Resolve effective module_configs once at the merge boundary (kills task-scoped
+    blindness on both paths)
+  capabilities:
+  - name: merge-boundary-call-sites-exist
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/merge_queue.py:2543
+      build_merge_verify_spec(req.config, req.module_configs, ...) and :2591 / :2806
+      / :16631 LocalRunner(...); the helper must land AHEAD of both
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: effective_merge_module_configs\(
+      paths:
+      - orchestrator/src/orchestrator/merge_queue.py
+      expect: present
+  - name: helper-home-and-inline-rebinding-site
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:5916-5917
+      the local-only rebinding inside run_verification, guarded by verify_plan._merge_breadth_is_full(config);
+      §8.2 replaces it with a call to the same helper (INV-5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def effective_merge_module_configs
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: merge-flake-suppressed-event-exists-but-has-never-fired
+    binding: capability→producer (wired) + measured floor — EventType.merge_flake_suppressed
+      emitted at orchestrator/src/orchestrator/verify.py:7727 via _emit_merge_flake_suppressed(:7710);
+      LIFETIME count is 0 across 311,758 runs.db event rows spanning 2026-04-09→2026-08-06
+      [RV], so the signal cannot close vacuously
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]merge_gate[''"]'
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+- label: δ
+  task_id: 3788
+  title: 'Gate the task-μ fork: discriminate before verify_failure_is_preexisting_on_main
+    returns wholly-preexisting'
+  capabilities:
+  - name: mu-fork-early-return-site
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:6472
+      `if failing_result.failing_test_ids is not None:` → :6479 `return wholly, (main_sha
+      if wholly else '')`. Both line anchors RE-RESOLVED exact on 2026-08-06
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]main_probe[''"]'
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: gate-is-live-but-structurally-unreachable
+    binding: 'capability→producer (wired) + measured floor — _main_probe_failure_is_isolated_flake
+      is DEFINED at verify.py:7538 and CALLED at :6537, but only in the legacy probe
+      path BELOW the μ fork''s :6479 return; dark-factory-orchestrator.yaml:694 sets
+      merge_verify_breadth: "full", which makes failing_test_ids non-None on every
+      merge. journald lines naming the gate, ever: 0 [RV]'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: δ's deliverable is an ORDERING property — the discriminator must run
+        BEFORE the :6479 return — which no single-line ERE can express, and a `_main_probe_failure_is_isolated_flake\(`
+        grep would be VACUOUS (1 call already exists at :6537). The mechanical twin
+        above ('main_probe' call_site literal, 0 on main) is deliberately the weaker
+        check; the ordering itself is pinned by boundary rows B4/B5 in task λ
+  - name: worktree-available-at-the-fork
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:6337
+      verify_failure_is_preexisting_on_main already receives the branch worktree as
+      its first parameter, so the SAME-TREE re-run (INV-3, contract 8.1 inv. 3) needs
+      no new plumbing
+    verdict: PASS
+- label: ε
+  task_id: 3789
+  title: 'Split recorder from discriminator: typed flake_suppression on VerifyResult,
+    recorded on the dispatcher'
+  capabilities:
+  - name: verifyresult-codec-round-trips-optional-fields
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify_runner.py:2066
+      result_to_json / :2071 result_from_json; failing_test_ids is the landed precedent
+      (task μ) for exactly this optional-field-over-the-wire shape
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: flake_suppression['"]?\s*[:=]
+      paths:
+      - orchestrator/src/orchestrator/verify_runner.py
+      expect: present
+  - name: remote-path-drops-all-three-side-effects-today
+    binding: capability→producer (wired) + measured floor — grep:orchestrator/src/orchestrator/verify_runner.py:562-571
+      run_merge_verify_on_worktree constructs LocalRunner with NO event_store and
+      NO escalation_queue (both default None at :649-650, re-resolved exact). So on
+      the remote/CLI path merge_flake_suppressed is silently dropped AND the storm
+      streak silently resets — INV-4's escape hatch disarmed exactly where load is
+      highest
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: flake_suppression['"]?\s*[:=]
+      paths:
+      - orchestrator/src/orchestrator/merge_queue.py
+      expect: present
+  - name: storm-streak-sentinel-to-bump
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:7791
+      _bump_suppression_streak_and_maybe_escalate, fixed sentinel `merge-flake-suppression-storm`
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: '''the streak BUMPS on the dispatcher for a remote-host suppression''
+        is a behavioural postcondition; boundary row B3 asserts all three side-effects
+        together'
+  - name: wire-skew-safe-in-both-directions
+    binding: 'rejection-mechanism — §8.4: the field is OPTIONAL defaulting to None,
+      so a new dispatcher against an old remote receives None (degraded, never wrong)
+      and an old dispatcher ignores an unknown key. Pinned by boundary row B13'
+    verdict: PASS
+- label: ζ
+  task_id: 3790
+  title: Enforce the debt invariant inside open_debt() — file the de-flake task at
+    write time
+  capabilities:
+  - name: orchestrator-side-task-filing-client
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/chronic_flake.py:357
+      and :617 `async def submit_task` (the task_client protocol §8.3's open_debt
+      takes), the de-flake argument builder at :233, and the live call at :507. This
+      is the SAME facility task 2358 landed; ζ reuses it rather than inventing one
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def open_debt
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: owner-task-id-recorroborated-not-trusted
+    binding: capability→producer (wired) — INV-3. The stored owner_task_id is a snapshot;
+      ζ must re-read LIVE task status before trusting it. Dedup models _bump_suppression_streak_and_maybe_escalate's
+      fixed-sentinel pattern (verify.py:7791). Pinned by boundary row B8
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: owner_task_id\s*[:=]
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: coupling-rule-ledger-never-writes-task-status
+    binding: 'rejection-mechanism — §5.9''s binding coupling rule: the ledger reads
+      task status but NEVER writes it, except the initial filing. This is what keeps
+      INV-6 N/A by construction (no new exit path can strand a task)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'a NEGATIVE behavioural property (no set_task_status call reachable
+        from the ledger) — pinned by ζ''s tests; an `expect: absent` grep over the
+        whole package would be too coarse to be meaningful'
+- label: η
+  task_id: 3791
+  title: 'Resolution + recurrence: resolve_debt, prior-cycle carry-forward, regressed_after_resolution
+    L2'
+  capabilities:
+  - name: born-at-l2-with-fixed-sentinel-dedup
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:7791
+      _bump_suppression_streak_and_maybe_escalate is the landed born-at-L2 + fixed-sentinel
+      dedup pattern to model on
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: regressed_after_resolution
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: prior-cycle-columns-delivered-upstream
+    binding: 'capability→producer (upstream) — producer:task-α delivers prior_resolved_at
+      and prior_resolving_commit on flake_debt (§5.3 schema). DAG-direction verified:
+      α is in η''s transitive closure (η←ζ←α)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: prior_resolving_commit
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: recurrence-is-the-measured-dominant-pathology
+    binding: measured floor — 12 distinct recurrence chains; test_spawn_claude.py
+      took 7 de-flake tasks in 7 weeks; reify test_verify_semaphore_e2e.sh 4 rounds
+      in 6 days [INV]. The trigger fires on a population that demonstrably exists
+    verdict: PASS
+- label: θ
+  task_id: 3792
+  title: Ledger-health sweep as a BackgroundService + FlakeLedgerConfig (green-tier)
+    + the three classes
+  capabilities:
+  - name: green-tier-hot-reload-for-a-config-submodel
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/config.py:4924
+      _submodel_leaf_paths('chronic_flake', ChronicFlakeConfig) is the EXACT idiom
+      to copy; registering flake_ledger the same way is what makes θ's signal ('applied',
+      not 'restart_required') true
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _submodel_leaf_paths\(['"]flake_ledger['"]
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: flakeledgerconfig-submodel-exists
+    binding: capability→producer (wired) — ChronicFlakeConfig at orchestrator/src/orchestrator/config.py:2224
+      is the shape precedent; §10 fixes the seven leaf keys and their defaults
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class FlakeLedgerConfig
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: registered-periodic-sweep-seam
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/harness.py:1955-2025
+      BackgroundService registry (stranded-reconcile at :1983, alongside main-tip-sweep
+      and deterministic-recon-sweep)
+    verdict: PASS
+  - name: psi-saturation-discriminates-class-3-from-class-2
+    binding: capability→producer (wired) — grep:shared/src/shared/psi.py:133 read_psi_sample;
+      §5.6 makes DISTINCT-test count the discriminator (one test repeating = class
+      2; N distinct at once = class 3). PSI, not load average
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: '''ONE class-3 escalation, not N class-2 ones'' is a behavioural postcondition
+        — boundary row B11'
+  - name: T-is-provisional-and-survivorship-filtered
+    binding: measured floor, stated honestly — T=3d (DF) / 4d (reify) rests on closed-de-flake-task
+      P98 2.6-2.7d / 2.8-2.9d [INV]. '0/35 ever exceeded 3d' is a SURVIVORSHIP artifact
+      (computed over CLOSED tasks, which by construction excludes what an age trigger
+      fires on — task 3552 is over T right now). Bound is therefore green-tier hot-reloadable
+      and re-derived after ~30 days live; recurrence, not age, carries the load
+    verdict: PASS
+- label: ι
+  task_id: 3793
+  title: orchestrator flake-ledger — read-only operator report
+  capabilities:
+  - name: click-subcommand-seam
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/cli.py:15
+      `import click` + the @main.command() idiom at :311 (status); console_script
+      `orchestrator = "orchestrator.cli:main"` at orchestrator/pyproject.toml:29
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: flake.ledger
+      paths:
+      - orchestrator/src/orchestrator/cli.py
+      expect: present
+  - name: report-surfaces-the-hold-with-its-owner-and-age
+    binding: 'capability→producer (upstream) — producer:task-α delivers the reader
+      API and the ledger-owned opened_at clock. This is what discharges INV-7 for
+      every debt row: machine-readable owner (owner_task_id) + operator-visible age'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: owner_task_id
+      paths:
+      - orchestrator/src/orchestrator/cli.py
+      expect: present
+- label: κ
+  task_id: 3794
+  title: Migrate chronic_flake.py off JSONL; retire 3-in-20 as a gate; markers become
+    occurrence producers
+  capabilities:
+  - name: marker-parser-is-storage-independent
+    binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/chronic_flake.py:110
+      parse_chronic_flaky_markers parses verify STDOUT, unioned with the JSONL reader
+      at :371 _merge_evidence_by_test. κ replaces ONLY the JSONL reader; reify's own
+      authoritative CHRONIC-FLAKY trigger keeps working untouched
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]chronic_marker[''"]'
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: jsonl-reader-stops-being-read
+    binding: 'rejection-mechanism — grep:orchestrator/src/orchestrator/chronic_flake.py:478
+      `ledger_path = project_root / cfg.ledger_relpath` is the read κ removes. §11
+      Q4''s resolution is DEPRECATE-IN-PLACE: the ChronicFlakeConfig field stays (so
+      no client project''s config fails validation on upgrade), only the READ goes'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ledger_relpath
+      paths:
+      - orchestrator/src/orchestrator/chronic_flake.py
+      expect: absent
+  - name: report-surface-is-upstream-not-sibling
+    binding: 'capability→producer (upstream) — producer:task-ι. κ''s signal reads
+      ''an occurrence appears in the REPORT'', and the report is ι''s deliverable.
+      The PRD §10 prereq column listed only ζ; the decompose G6 branch-3 walk found
+      ι absent from κ''s dependency closure, and the κ→ι edge was WIRED at Step 4
+      to resolve it. DAG-direction verified: ι does not depend on κ, so this is a
+      missing-prereq fix, not an inversion'
+    verdict: PASS
+  - name: no-duplicate-de-flake-task-for-a-marker
+    binding: rejection-mechanism — the ζ invariant already guarantees one non-terminal
+      task per test, deduped on owner_task_id; a chronic_marker occurrence must NOT
+      file a second. Pinned by boundary row B14
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a negative postcondition (no SECOND task filed) — asserted by B14, not
+        expressible as a pattern
+- label: λ
+  task_id: 3795
+  title: Integration gate — the §9 boundary suite, both sides of the seam
+  capabilities:
+  - name: every-boundary-leg-produced-upstream
+    binding: 'DAG-direction — B1/B2←γ, B3/B13←ε, B4/B5←δ, B6←β+γ, B7/B8←ζ, B9←η, B10/B11←θ,
+      B12←α, B14←κ. All nine producers are in λ''s transitive dependency closure (direct:
+      γ δ ε η θ ι κ; transitive: α β ζ). No leg is owned by a task that depends on
+      λ'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task IS the check suite; its signal is all 14 rows of PRD §9 green
+        end-to-end, which is what a delivered_check would otherwise be asserting about
+        itself

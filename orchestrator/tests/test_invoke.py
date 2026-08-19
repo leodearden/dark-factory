@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -320,6 +321,204 @@ class TestRunSubprocessLocalTimedOut:
         assert call_args.args[0] is proc
         assert call_args.args[1] == 12345
         assert result.timed_out is True
+
+
+# ── _run_subprocess_local cancellation (task 3224) ──────────────────────────
+#
+# shared/tests is NOT on this suite's sys.path (conftest.py adds
+# orchestrator/tests, orchestrator/src, shared/src, escalation/src only), so
+# these helpers mirror shared/tests/test_proc_group.py's _pgid_gone_within /
+# _kill_group rather than importing them.
+
+
+async def _pgid_gone_within(pgid: int, timeout: float = 5.0, step: float = 0.1) -> bool:
+    """Poll until a process group is fully reaped by the kernel.
+
+    A one-shot ``os.killpg(pgid, 0)`` right after a kill is racy: reaping is
+    asynchronous (grandchildren can be reparented to a subreaper and linger
+    as zombies briefly), so this asserts the real contract — eventual group
+    death — via a bounded poll instead of a single check.
+
+    PermissionError (EPERM) is also treated as "gone": it can only fire once
+    the kernel has recycled *pgid* to a process owned by another user, which
+    means the group this test spawned is definitively no longer around.
+    """
+    iterations = max(1, int(timeout / step))
+    for _ in range(iterations):
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return True
+        await asyncio.sleep(step)
+    return False
+
+
+def _kill_group(pgid: int) -> None:
+    """Best-effort SIGKILL of an entire process group (test cleanup only).
+
+    Precondition: *pgid* must belong to a process known to still be ALIVE.
+    Calling this after the process has already been reaped risks landing on
+    a recycled, unrelated process group.
+    """
+    with contextlib.suppress(ProcessLookupError, OSError):
+        os.killpg(pgid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+class TestRunSubprocessLocalCancellation:
+
+    @pytest.mark.timeout(20)
+    async def test_cancellation_reaps_real_process_group(self, tmp_path):
+        """Cancelling the awaiting task must reap the real OS process group.
+
+        Regression test for task 3224: _run_subprocess_local spawns with
+        start_new_session=True but (pre-fix) has no except asyncio.CancelledError
+        handler, so asyncio.wait_for(proc.communicate(...)) is cancelled while
+        the spawned process group is never signalled — the agent survives as
+        an orphan still editing/committing in its worktree.
+
+        Drives a REAL ``sleep 30`` subprocess (not a mock) and asserts the OS
+        process group is actually gone after cancellation, via a bounded poll
+        on os.killpg(pgid, 0). A mock-only "terminate_process_group was
+        called" assertion would pass even with the wrong pgid and would not
+        have caught the original orphan.
+        """
+        # Capture the real spawner BEFORE patching -- orchestrator.agents.invoke.asyncio
+        # IS the global asyncio module, so a self-delegating spy captured after
+        # patching would recurse into itself.
+        real_exec = asyncio.create_subprocess_exec
+
+        spawned: list[asyncio.subprocess.Process] = []
+
+        async def spy_exec(*args, **kwargs):
+            proc = await real_exec(*args, **kwargs)
+            # This patches the *global* asyncio module attribute, so for the
+            # duration of the `with` block below EVERY subprocess spawned
+            # anywhere in this worker process (e.g. this suite's background
+            # git-subprocess workers, see conftest.py's
+            # _reap_leaked_merge_workers) flows through this spy too. Only
+            # record the ``sleep 30`` this test actually launched, so an
+            # unrelated concurrent spawn landing first can't be mistaken for
+            # it and have its process group polled/killed below.
+            if args[:2] == ('sleep', '30'):
+                spawned.append(proc)
+            return proc
+
+        pgid = None
+        try:
+            with patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
+                        side_effect=spy_exec):
+                task = asyncio.ensure_future(_run_subprocess_local(
+                    ['sleep', '30'],
+                    cwd=tmp_path,
+                    env=dict(os.environ),
+                    backend='codex',
+                    model='gpt-5.4',
+                    max_budget_usd=1.0,
+                    timeout_seconds=30.0,
+                ))
+
+                # Bounded poll (~2s max) until the spy has recorded the spawned proc.
+                deadline = asyncio.get_running_loop().time() + 2.0
+                while not spawned and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.05)
+                assert len(spawned) == 1, (
+                    f'expected exactly one matching "sleep 30" spawn within 2s, '
+                    f'got {len(spawned)}: {spawned}'
+                )
+
+                proc = spawned[0]
+                pgid = proc.pid  # start_new_session ⇒ pgid == pid
+
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+            assert await _pgid_gone_within(pgid), (
+                f'Process group {pgid} was not reaped within 5s after '
+                f'cancellation — orphaned agent process group left running.'
+            )
+        finally:
+            if pgid is not None and spawned and spawned[0].returncode is None:
+                _kill_group(pgid)
+
+    async def test_cancel_during_timeout_kill_still_reaps_group(self, tmp_path):
+        """A cancel landing inside the TimeoutError handler's kill must still reap.
+
+        If the awaiting task is cancelled while terminate_process_group is
+        already running (SIGTERM sent, SIGKILL escalation pending), a handler
+        that is only a SIBLING of `except TimeoutError:` cannot catch it --
+        an exception raised inside an except block is not caught by a sibling
+        handler of the same try. That would abandon the escalation with a
+        SIGTERM-ignoring child left alive. This asserts the cancellation is
+        instead caught by something that also wraps the timeout-kill path, so
+        terminate_process_group is retried.
+
+        Fully mocked -- no real process, no sleep-based timing. The fake
+        terminate_process_group hangs deterministically (on an unset Event)
+        on its first call so the test can synchronize on "the task is now
+        suspended inside the kill" without guessing at a sleep duration.
+        """
+        proc = MagicMock()
+        proc.pid = 12345  # int so pgid capture and safety-check pass
+        proc.communicate = AsyncMock(side_effect=TimeoutError)
+        proc.wait = AsyncMock()
+        proc.returncode = None
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        calls: list[tuple] = []
+        entered = asyncio.Event()
+        hang_forever = asyncio.Event()  # never set -- first call hangs until cancelled
+
+        async def fake_terminate_process_group(*args, **kwargs):
+            # *args/**kwargs (rather than a `grace_secs=5.0`-defaulted
+            # parameter) so the recorded call distinguishes "grace_secs was
+            # passed as a keyword" from "grace_secs was omitted and a local
+            # default filled in" -- the real
+            # shared.proc_group.terminate_process_group declares grace_secs
+            # keyword-only, and a defaulted fake parameter would silently
+            # accept (and record 5.0 for) a positional-arg regression too.
+            calls.append((args, kwargs))
+            if len(calls) == 1:
+                entered.set()
+                await hang_forever.wait()
+
+        with (
+            patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
+                  side_effect=fake_exec),
+            patch('orchestrator.agents.invoke.terminate_process_group',
+                  side_effect=fake_terminate_process_group),
+        ):
+            task = asyncio.ensure_future(_run_subprocess_local(
+                ['fake'], cwd=tmp_path, env={}, backend='codex', model='gpt-5.4',
+                max_budget_usd=1.0, timeout_seconds=0.01,
+            ))
+
+            # Wait until the task is provably suspended inside the
+            # TimeoutError handler's terminate_process_group await.
+            await asyncio.wait_for(entered.wait(), timeout=5)
+
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert len(calls) == 2, (
+            f'expected terminate_process_group to be retried once the cancel '
+            f'landed during the abandoned timeout-kill, got {len(calls)} '
+            f'call(s): {calls}'
+        )
+        second_args, second_kwargs = calls[1]
+        assert second_args[1] == 12345, f'pgid mismatch on retry: {calls[1]}'
+        # Must be a keyword, equal to 5.0 -- catches both "kwarg dropped"
+        # (kwargs would be {}) and "passed positionally" (it would show up
+        # in second_args instead, not second_kwargs).
+        assert second_kwargs.get('grace_secs') == 5.0, (
+            f'expected grace_secs=5.0 passed as a keyword on retry (the real '
+            f'shared.proc_group.terminate_process_group declares grace_secs '
+            f'keyword-only), got {calls[1]}'
+        )
 
 
 _CODEX_VALID_JSONL_STDOUT = (
@@ -1031,7 +1230,7 @@ class TestSandboxPathForwardsSessionConfig:
             ),
             patch(
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
-                side_effect=lambda cmd, cwd, mods: cmd,
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
             patch(
                 'orchestrator.agents.invoke._run_subprocess',
@@ -1122,7 +1321,7 @@ class TestStartupGraceSecsForwarding:
             ),
             patch(
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
-                side_effect=lambda cmd, cwd, mods: cmd,
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
             patch(
                 'orchestrator.agents.invoke._run_subprocess',
@@ -1224,7 +1423,7 @@ class TestSpawnEnvForwarding:
             ),
             patch(
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
-                side_effect=lambda cmd, cwd, mods: cmd,
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
             patch(
                 'orchestrator.agents.invoke._run_subprocess',
@@ -1281,7 +1480,7 @@ class TestSpawnEnvForwarding:
             ),
             patch(
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
-                side_effect=lambda cmd, cwd, mods: cmd,
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
             patch(
                 'orchestrator.agents.invoke._run_subprocess',
@@ -1365,7 +1564,7 @@ class TestProgressExtensionParamsForwarding:
             ),
             patch(
                 'orchestrator.agents.sandbox_dispatch.wrap_command',
-                side_effect=lambda cmd, cwd, mods: cmd,
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
             ),
             patch(
                 'orchestrator.agents.invoke._run_subprocess',
@@ -1389,6 +1588,133 @@ class TestProgressExtensionParamsForwarding:
         )
         assert captured_kwargs.get('absolute_cap_secs') == 7200.0, (
             f'absolute_cap_secs not forwarded to _run_subprocess; captured={captured_kwargs!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestSandboxExtrasForwarding:
+    """invoke_agent and _invoke_claude_with_sandbox must thread sandbox_extras
+    → wrap_command(writable_extras=...) (task 2905 step-3).
+
+    sandbox_extras is the carve-out vehicle carrying compute_write_set()'s
+    absolute contract paths (worktree root + carve-outs) into the sandbox —
+    distinct from sandbox_modules/writable_modules (relative, join-to-worktree,
+    makedirs). RED: fails until invoke.py threads sandbox_extras through
+    invoke_agent and the four sub-invokers to wrap_command's writable_extras.
+    """
+
+    async def test_sandbox_path_forwards_sandbox_extras_to_wrap_command(self, tmp_path):
+        """_invoke_claude_with_sandbox passes sandbox_extras to wrap_command as
+        writable_extras=, with sandbox_modules=[] the positional writable_modules.
+
+        Fails today: _invoke_claude_with_sandbox has no sandbox_extras param →
+        TypeError.
+        """
+        captured: dict = {}
+
+        def capturing_wrap_command(cmd, cwd, mods, writable_extras=None):
+            captured['writable_modules'] = mods
+            captured['writable_extras'] = writable_extras
+            return cmd
+
+        async def mock_run_subprocess(cmd, cwd, env, model, timeout_seconds, **kwargs):
+            return _SubprocessResult(
+                stdout='', stderr='', returncode=0, duration_ms=50, timed_out=False,
+            )
+
+        with (
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=capturing_wrap_command,
+            ),
+            patch(
+                'orchestrator.agents.invoke._run_subprocess',
+                side_effect=mock_run_subprocess,
+            ),
+        ):
+            await _invoke_claude_with_sandbox(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=[],
+                effort=None, timeout_seconds=30.0,
+                sandbox_extras=['/abs/carveout'],
+            )
+
+        assert captured.get('writable_extras') == ['/abs/carveout'], (
+            f"Expected wrap_command called with writable_extras=['/abs/carveout']; "
+            f"got {captured.get('writable_extras')!r}"
+        )
+        assert captured.get('writable_modules') == [], (
+            f'Expected positional writable_modules=[] (sandbox_modules=[]); '
+            f"got {captured.get('writable_modules')!r}"
+        )
+
+    async def test_invoke_agent_forwards_sandbox_extras_to_claude_subinvoker(self, tmp_path):
+        """invoke_agent(backend='claude') forwards sandbox_extras to
+        _invoke_claude_with_sandbox.
+
+        Fails today: invoke_agent has no sandbox_extras param → TypeError.
+        """
+        with patch(
+            'orchestrator.agents.invoke._invoke_claude_with_sandbox',
+            new_callable=AsyncMock,
+            return_value=AgentResult(success=True, output=''),
+        ) as mock_claude:
+            await invoke_agent(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                backend='claude', sandbox_modules=[],
+                sandbox_extras=['/abs/carveout'],
+            )
+
+        assert mock_claude.await_args is not None, 'await_args must be set after one await'
+        assert mock_claude.await_args.kwargs.get('sandbox_extras') == ['/abs/carveout'], (
+            f'sandbox_extras not forwarded to _invoke_claude_with_sandbox; '
+            f'captured={mock_claude.await_args.kwargs!r}'
+        )
+
+    @pytest.mark.parametrize(
+        ('backend', 'subinvoker'),
+        [
+            ('codex', '_invoke_codex'),
+            ('gemini', '_invoke_gemini'),
+            ('pi', '_invoke_pi'),
+        ],
+    )
+    async def test_invoke_agent_forwards_sandbox_extras_to_nonclaude_subinvoker(
+        self, tmp_path, backend, subinvoker,
+    ):
+        """invoke_agent(backend=codex|gemini|pi) forwards sandbox_extras to the
+        matching _invoke_<backend> sub-invoker.
+
+        The claude path is covered by
+        test_invoke_agent_forwards_sandbox_extras_to_claude_subinvoker; this
+        parametrized guard exercises the identical sandbox_extras →
+        wrap_command(writable_extras=...) forwarding threaded through the other
+        three sub-invokers (task 2905 step-4), so a future edit that drops the
+        kwarg from codex/gemini/pi is caught here too.
+        """
+        with patch(
+            f'orchestrator.agents.invoke.{subinvoker}',
+            new_callable=AsyncMock,
+            return_value=AgentResult(success=True, output=''),
+        ) as mock_subinvoker:
+            await invoke_agent(
+                prompt='hello', system_prompt='sys', cwd=tmp_path,
+                backend=backend, sandbox_modules=[],
+                sandbox_extras=['/abs/carveout'],
+            )
+
+        assert mock_subinvoker.await_args is not None, 'await_args must be set after one await'
+        assert mock_subinvoker.await_args.kwargs.get('sandbox_extras') == ['/abs/carveout'], (
+            f'sandbox_extras not forwarded to {subinvoker}; '
+            f'captured={mock_subinvoker.await_args.kwargs!r}'
         )
 
 
@@ -1560,3 +1886,100 @@ class TestMakeGateFactory:
             f'_make_gate_yielding is missing factory keys: {factory_keys - yielding_keys!r}'
         )
 
+
+
+@pytest.mark.asyncio
+class TestSandboxPathRejectsBlankPrompt:
+    """The SANDBOXED claude path builds its own argv and calls _run_subprocess
+    directly, BYPASSING shared.cli_invoke._invoke_claude entirely -- so it needs
+    its own non-blank-prompt precondition or the esc-3118-1 failure stays
+    reachable through it (task 3143).
+
+    The claude argv carries no positional prompt and no '-' stdin marker, so the
+    prompt is delivered solely by ``stdin_data = prompt.encode()``: a blank one
+    is piped happily and the CLI then rejects the invocation before any model
+    turn with an opaque argument error.
+    """
+
+    @staticmethod
+    def _sandbox_patches(run_subprocess, argv_mock=None):
+        argv_patch = (
+            patch('orchestrator.agents.invoke.build_claude_argv', argv_mock)
+            if argv_mock is not None
+            else contextlib.nullcontext()
+        )
+        return (
+            patch(
+                'orchestrator.agents.sandbox_dispatch.resolve_active_backend',
+                return_value='bwrap',
+            ),
+            patch(
+                'orchestrator.agents.sandbox_dispatch.wrap_command',
+                side_effect=lambda cmd, cwd, mods, writable_extras=None: cmd,
+            ),
+            patch('orchestrator.agents.invoke._run_subprocess', side_effect=run_subprocess),
+            argv_patch,
+        )
+
+    async def _assert_blank_prompt_rejected(self, prompt, tmp_path):
+        # A real _SubprocessResult so that a leak past the guard fails on the
+        # missing ValueError rather than exploding inside _parse_claude_output.
+        run_mock = AsyncMock(
+            return_value=_SubprocessResult(
+                stdout='', stderr='', returncode=0, duration_ms=10, timed_out=False,
+            )
+        )
+        argv_mock = MagicMock(return_value=(['claude', '--print'], []))
+        backend_p, wrap_p, run_p, argv_p = self._sandbox_patches(run_mock, argv_mock)
+
+        with backend_p, wrap_p, run_p, argv_p, pytest.raises(ValueError):
+            await _invoke_claude_with_sandbox(
+                prompt=prompt, system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=['m'],
+                effort=None, timeout_seconds=30.0,
+            )
+
+        # No temp files may be created and no subprocess spawned for a blank
+        # prompt: the guard has to fire strictly before build_claude_argv.
+        argv_mock.assert_not_called()
+        run_mock.assert_not_called()
+
+    async def test_empty_prompt_raises_before_argv_or_subprocess(self, tmp_path):
+        await self._assert_blank_prompt_rejected('', tmp_path)
+
+    async def test_whitespace_only_prompt_raises_before_argv_or_subprocess(self, tmp_path):
+        await self._assert_blank_prompt_rejected('  \n\t ', tmp_path)
+
+    async def test_a_normal_prompt_still_reaches_the_subprocess_via_stdin(self, tmp_path):
+        """REGRESSION: the guard must not narrow the happy path, and must not
+        change how the prompt is delivered."""
+        captured: dict = {}
+
+        async def mock_run_subprocess(cmd, cwd, env, model, timeout_seconds, **kwargs):
+            captured.update(kwargs)
+            captured['cmd'] = cmd
+            return _SubprocessResult(
+                stdout='', stderr='', returncode=0, duration_ms=50, timed_out=False,
+            )
+
+        backend_p, wrap_p, run_p, _ = self._sandbox_patches(mock_run_subprocess)
+
+        with backend_p, wrap_p, run_p:
+            await _invoke_claude_with_sandbox(
+                prompt='a real prompt', system_prompt='sys', cwd=tmp_path,
+                model='claude-sonnet-4-5', max_turns=5, max_budget_usd=1.0,
+                allowed_tools=None, disallowed_tools=None,
+                mcp_config=None, output_schema=None,
+                permission_mode='bypassPermissions',
+                sandbox_modules=['m'],
+                effort=None, timeout_seconds=30.0,
+            )
+
+        assert captured['stdin_data'] == b'a real prompt'
+        assert 'a real prompt' not in captured['cmd'], (
+            'the prompt is a stdin payload, never an argv element'
+        )

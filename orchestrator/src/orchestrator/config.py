@@ -1,5 +1,6 @@
 """Configuration schema for the orchestrator."""
 
+import fnmatch
 import hashlib
 import importlib.resources
 import logging
@@ -8,7 +9,8 @@ import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from types import UnionType
+from typing import Any, Literal, NamedTuple, Union, get_args, get_origin
 
 import yaml
 from pydantic import (
@@ -34,9 +36,13 @@ logger = logging.getLogger(__name__)
 
 # --- Priority-tier constants (value/h scheduler) ---
 #
-# Canonical 5-tier priority order.  Lower rank = higher priority.  Unknown
-# priority strings coerce to DEFAULT_TIER so legacy tasks and typos never crash
-# the scheduler.
+# Canonical 5-tier priority order.  Lower rank = higher priority.  An unset
+# (None) priority silently coerces to DEFAULT_TIER — that is a normal,
+# expected state (e.g. subtasks in this repo's tasks.json routinely carry no
+# priority), not an anomaly.  An unrecognized non-None value (a typo or a
+# stale tier string) also coerces to DEFAULT_TIER so it never crashes the
+# scheduler, but that path is logged loudly instead, since it means some
+# upstream caller passed something the config layer doesn't understand.
 PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish')
 PRIORITY_RANK: dict[str, int] = {tier: i for i, tier in enumerate(PRIORITY_TIERS)}
 DEFAULT_TIER: str = 'medium'
@@ -52,11 +58,79 @@ TIER_BASE: dict[str, int] = {
     'polish': 1000,
 }
 
+# Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
+# below, keyed by a length-capped repr(value) (safe for unhashable/non-str
+# inputs) — mirrors the b3_gate._warned_description_read_failures /
+# sqlite_task_backend._warned_malformed_task_ids house pattern for
+# module-level dedup sets. A process restart clears the memo and
+# re-enables the warning.
+#
+# Bounded in two dimensions because orchestrator.config is imported into
+# the scheduler's multi-day daemon process:
+#   - entry COUNT: an unbounded stream of distinct bad priority values (an
+#     adversarial or corrupt tasks.json) would otherwise grow this set
+#     forever. Once the cap is reached, coerce_tier() emits exactly one
+#     final WARNING noting the cap and then suppresses further
+#     unrecognized-priority warnings entirely (rather than either leaking
+#     memory or re-flooding the log on every call past the cap).
+#   - entry SIZE: the same adversarial/corrupt tasks.json could hand a
+#     large nested blob as a "priority", so both the memo key and the
+#     logged value are truncated to _MAX_PRIORITY_VALUE_REPR_LEN instead
+#     of retaining/logging the full repr().
+_warned_priority_values: set[str] = set()
+_MAX_WARNED_PRIORITY_VALUES = 1000
+_MAX_PRIORITY_VALUE_REPR_LEN = 200
+
 
 def coerce_tier(value: Any) -> str:
-    """Normalize a priority value (possibly None/unknown) to a canonical tier."""
+    """Normalize a priority value (possibly None/unknown) to a canonical tier.
+
+    An unset (None) priority is a NORMAL expected state — not an anomaly —
+    so it falls back to DEFAULT_TIER silently; it is a default, not a
+    fail-soft fallback, and the repo's no-silent-fail-soft invariant does
+    not apply to it. An unrecognized non-None value (a typo or a stale tier
+    string) still falls back to DEFAULT_TIER so legacy tasks and typos never
+    crash the scheduler, but that fallback IS logged loudly (rather than
+    silently): it means some upstream caller passed something the config
+    layer doesn't understand, and that should be observable.
+    ``stacklevel=2`` attributes the log record to the caller's file/line
+    (the actual call site) rather than to this helper. To avoid flooding a
+    hot path (e.g. the scheduler re-coercing the same raw values every
+    tick), each distinct unrecognized value is only warned about once per
+    process — see ``_warned_priority_values`` above.
+    """
     if isinstance(value, str) and value in PRIORITY_RANK:
         return value
+    if value is None:
+        return DEFAULT_TIER
+
+    key = repr(value)[:_MAX_PRIORITY_VALUE_REPR_LEN]
+    # Cap not yet reached and this value hasn't been warned about before —
+    # if the memo is already full, or this value was already warned about,
+    # fall straight through and suppress silently (the cap-reached notice
+    # below fires exactly once, on the call that fills the last slot).
+    if (
+        key not in _warned_priority_values
+        and len(_warned_priority_values) < _MAX_WARNED_PRIORITY_VALUES
+    ):
+        _warned_priority_values.add(key)
+        # Log the (already-truncated) key rather than %r-formatting the raw
+        # value again — for a large/adversarial value that second repr()
+        # would blow the log-line-size bound the truncation above exists
+        # to enforce.
+        logger.warning(
+            'coerce_tier: unrecognized priority %s, falling back to %r',
+            key,
+            DEFAULT_TIER,
+            stacklevel=2,
+        )
+        if len(_warned_priority_values) >= _MAX_WARNED_PRIORITY_VALUES:
+            logger.warning(
+                'coerce_tier: unrecognized-priority warning memo reached '
+                'its cap of %d distinct values; suppressing further '
+                'unrecognized-priority warnings until process restart',
+                _MAX_WARNED_PRIORITY_VALUES,
+            )
     return DEFAULT_TIER
 
 
@@ -755,14 +829,17 @@ class SessionResumeConfig(BaseModel):
     (INV-3). Any ineligible session degrades to today's fresh dispatch
     (I3 — never a stall, never a scheduler-visible error), emitting a
     reason-carrying ``session_resume_fallback``/``session_resume_capped``
-    event; a per-boot run of consecutive fallbacks above
-    ``fallback_storm_threshold`` files one L1 escalation (INV-4).
+    event; a run of UNEXPLAINED fallbacks above
+    ``fallback_storm_threshold``, each chained within ``storm_window_secs``
+    of the previous, files one L1 escalation (INV-4). By-design
+    degradations (``capped``, and ``reseeded`` since task 3256) emit their
+    event but never feed that run.
 
     ``enabled=false`` is the kill switch: no ``--resume`` is ever injected
     (B6), and no ``session_resume_*`` event or streak is produced.
 
     Mirrors DeliveredChecksConfig's shape (a kill switch plus ge-bounded
-    int knobs); all four leaves are green-tier hot-reloadable via the
+    int knobs); all five leaves are green-tier hot-reloadable via the
     ``session_resume`` whole-submodel group in RELOADABLE_FIELDS.
     """
 
@@ -801,12 +878,35 @@ class SessionResumeConfig(BaseModel):
         default=5,
         ge=1,
         description=(
-            'Consecutive per-boot session_resume_fallback degradations '
-            '(reset to 0 on any eligible resume) before one L1 escalation is '
-            'filed (INV-4 storm escape — suspected systematic clock skew / '
-            'wiped transcripts / mass reseed). Must be >= 1. Default 5 is '
-            'above both the resume cap and ordinary collision noise, so only '
-            'systematic corroboration breakage trips it.'
+            'Consecutive UNEXPLAINED session_resume_fallback degradations '
+            'before one L1 escalation is filed (INV-4 storm escape — '
+            'suspected systematic clock skew, or transcripts vanishing while '
+            'their config dir survives). Only reason in {stale, no_transcript} '
+            'counts: reason=reseeded is a by-design lane reseed and is '
+            'excluded, exactly as session_resume_capped is. The run is chained '
+            'within storm_window_secs (and reset to 0 on any eligible resume) '
+            'rather than accumulating unbounded per boot. Must be >= 1. '
+            'Default 5 is above both the resume cap and ordinary collision '
+            'noise, so only systematic corroboration breakage trips it.'
+        ),
+    )
+    storm_window_secs: int = Field(
+        default=3600,
+        ge=1,
+        description=(
+            'Maximum gap, in seconds, between two consecutive unexplained '
+            'session-resume fallbacks for them to count as the same storm '
+            'run; a larger gap decays the streak to 0 before the next '
+            'fallback is counted. Without this the streak is cumulative '
+            'rather than consecutive, so a slow drip of isolated failures '
+            'accumulates into a false storm. Must be >= 1. Default 3600 is '
+            'read off the measured signature: real bursts land ~17 fallbacks '
+            'inside one hour, while quiet gaps between isolated failures run '
+            '~7h and ~39h — so a 1h chain window separates burst from drip '
+            'with a wide margin on both sides. Measured on the monotonic '
+            'clock, deliberately: the stale reason is itself PRODUCED by '
+            'clock skew, so a wall-clock decay would be corrupted by the very '
+            'failure mode it must detect.'
         ),
     )
 
@@ -888,6 +988,50 @@ class SpeculationProbeConfig(BaseModel):
         return v
 
 
+class MergeDeepConfig(BaseModel):
+    """Deep merge-ahead chains (task 3183, plans/deep-merge-ahead-prd.md α).
+
+    Lets a single verify cover a CHAIN of k queued merge items (one scratch
+    worktree, sequential in-order merges, one verify on the tip) instead of one
+    item at a time, so a passing tip lands the whole clean prefix in one round.
+
+    ``chain_cap`` is the single gate for the whole feature. The dispatch contract
+    it feeds (when a chain is built, and how ``target_depth`` is derived) and the
+    cap-staging plan live in the PRD, which is the ONE canonical narrative for
+    both — deliberately not restated here, because β (task 3184, the chain
+    builder) and γ (task 3185, the dispatch gate) are the consumers that
+    implement that contract and may change it. Nothing in the orchestrator reads
+    the knob yet.
+
+    ``chain_cap=0`` (the shipped default) is the KILL SWITCH: the gate can never
+    open, so no chain code runs on any dispatch path and behaviour is
+    byte-identical to pre-PRD merging — the ``probe_fraction=0.0`` precedent in
+    :class:`SpeculationProbeConfig`.
+
+    Plain BaseModel (no ``frozen``, no ``validate_assignment``) so ``_set_leaf``
+    can mutate it in place on hot-reload and held references observe the update
+    (invariant I3) — see :class:`RetentionConfig`'s docstring, below, for the
+    same requirement. Every leaf is green-tier hot-reloadable via
+    RELOADABLE_FIELDS (PRD decision #7), so an operator can enable, retune, or
+    KILL the feature (cap -> 0) via ``mcp__escalation__reload_config`` without a
+    process restart.
+    """
+
+    chain_cap: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            'Maximum number of queued items a single deep merge-ahead chain may '
+            'contain. 0 (the default) disables the feature entirely -- the kill '
+            'switch: no chain is ever built, so merge behaviour is byte-identical '
+            'to pre-task-3183 behaviour. Must be >= 0; a negative cap is rejected '
+            'at load rather than reaching dispatch. No upper bound is imposed. '
+            'See plans/deep-merge-ahead-prd.md for the dispatch contract this '
+            'gates and for the cap-staging plan.'
+        ),
+    )
+
+
 class RetentionConfig(BaseModel):
     """Retention bounds for the archived-transcript tree (task 2742, PRD α).
 
@@ -916,7 +1060,7 @@ class RetentionConfig(BaseModel):
 class TranscriptArchiveConfig(BaseModel):
     """Agent-transcript archival (task 2742, plans/agent-transcript-archival-prd.md α).
 
-    The producer hook in TaskWorkflow._invoke's finally gzips each finished
+    The producer hook in TaskWorkflow._invoke's finally archives each finished
     agent session's transcripts (see shared.transcript_archive) to
     ``<project_root>/<root>`` — a durable location OUTSIDE the per-task
     worktree so the archive survives worktree teardown.
@@ -946,6 +1090,43 @@ class TranscriptArchiveConfig(BaseModel):
         ),
     )
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    storm_threshold: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Archival-failure burst detector (task 3619, INV-4): how many '
+            'per-file archive failures within storm_window_secs constitute a '
+            'storm worth one L1 escalation. One failure is routine and is '
+            'already counted + logged by shared.transcript_archive; a BURST '
+            'is the systemic condition (archive root full, unmounted, or '
+            'permission-denied) an operator has to act on. Harness reads this '
+            'LIVE on every failure, so a hot reload takes effect without a '
+            'restart.'
+            ' Must be >= 1, matching session_resume.fallback_storm_threshold: '
+            'both leaves are green-tier hot-reloadable and are read LIVE on '
+            'every failure, so an unbounded 0 or negative would take effect '
+            'immediately and fire the L1 on the very first routine failure, '
+            'with no validation error and no log line to say so.'
+        ),
+    )
+    storm_window_secs: float = Field(
+        default=600.0,
+        gt=0,
+        description=(
+            'Rolling window for storm_threshold, and the rate limit between '
+            'archival-storm escalations — at most one L1 per window, on top '
+            'of the has_open_l1 dedup. Also read LIVE on every failure. '
+            'Must be > 0, matching session_resume.storm_window_secs. A value '
+            '<= 0 does not merely shrink the window, it DISABLES the '
+            'detector permanently and silently: StormCounter._prune uses a '
+            'half-open window (events[0] <= cutoff), so a zero window makes '
+            'the cutoff equal now and the event record() just appended is '
+            'popped again — the count is always 0 and no burst can ever '
+            'fire. Exactly the silent-degradation-on-misconfiguration this '
+            'escalation exists to prevent, so it is rejected loudly at '
+            'validation instead.'
+        ),
+    )
 
 
 class FusedMemoryConfig(BaseModel):
@@ -1297,6 +1478,64 @@ class CpuGovernConfig(BaseModel):
 TASK_META_DIRNAME: str = '.task-meta'
 
 
+class LaneCommand(BaseModel):
+    """A single per-project offline-lane generic command entry (task 2789).
+
+    Drives one generic offline-lane sub-run: the runner launches ``command``
+    (a shell string, via ``sh -c``) at idle nice/ionice in ``<worktree>/<cwd>``
+    with ``DF_VERIFY_ROLE=offline``, off the merge hot path, always from the
+    current ``main`` head. A red result routes through the existing
+    ``OfflineLaneWorker`` red path (confirm → fingerprint → dedup'd fix task →
+    staged L2), filing the fix task at ``fix_task_priority`` — no new mechanism
+    (INV-5). This generalizes the previously reify-hard-coded run seams to
+    per-project config (PRD plans/integration-test-lane-prd.md, task alpha).
+    """
+
+    name: str = Field(
+        description=(
+            'Short, stable identifier for this sub-run, used in the '
+            "``offline-lane: <name> sub-run ...`` log line. Required."
+        ),
+    )
+    command: str = Field(
+        description=(
+            'Shell command string launched via ``sh -c`` for this sub-run '
+            '(e.g. ``pytest -m integration``). Required. NOTE: the default '
+            'confirm/dedup path is pytest-oriented — it serializes via '
+            '``_serial_pytest_str`` and extracts still-failing pytest '
+            'node-ids. A non-pytest command that reproduces red (non-zero '
+            'exit, no parseable node-ids) is filed under a stable '
+            '``<name>::nonzero-exit`` sentinel rather than being swallowed as '
+            'a flake; inject a custom ``command_confirmation_runner`` for '
+            'richer per-failure dedup.'
+        ),
+    )
+    cwd: str = Field(
+        default='.',
+        description=(
+            "Working directory for the command, relative to the reset "
+            "``_offline-deep`` worktree root. Defaults to '.' (the worktree "
+            'root == project_root inside the worktree); a static string, since '
+            'a pydantic default cannot reference the runtime project_root.'
+        ),
+    )
+    fix_task_priority: Literal['low', 'medium', 'high'] = Field(
+        default='medium',
+        description=(
+            'Priority for the fix task auto-filed when this sub-run is '
+            "confirmed red. Defaults to 'medium' (the generic per-project "
+            "default; the legacy reify numeric/infra seams stay 'high')."
+        ),
+    )
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'When False this command is skipped by the offline-lane runner '
+            '(a config-only off switch that leaves the entry in place).'
+        ),
+    )
+
+
 class GitConfig(BaseModel):
     """Git operations configuration."""
 
@@ -1510,6 +1749,28 @@ class GitConfig(BaseModel):
             '§11.3 / C4) tolerates before promoting its filed fix task to a '
             'born-at-L2 escalate_blocker. Not frozen — retunable via '
             'orchestrator.yaml without a code change.'
+        ),
+    )
+    offline_lane_commands: list[LaneCommand] = Field(
+        default_factory=list,
+        description=(
+            'Per-project generic offline-lane commands (task 2789). Each '
+            'entry drives one additional offline-lane sub-run — launched at '
+            'idle nice/ionice via ``sh -c`` in ``<worktree>/<cwd>`` with '
+            '``DF_VERIFY_ROLE=offline``, off the merge hot path, always from '
+            'head — that reuses the existing red path (confirm → dedup fix '
+            'task → staged L2). Generic commands run IN ADDITION to whichever '
+            'legacy seams (numeric / infra) are enabled. Defaults to [] '
+            '(opt-in, byte-identical no-op). Uses default_factory to avoid a '
+            'shared mutable default across model instances.'
+        ),
+    )
+    offline_lane_legacy_numeric_enabled: bool = Field(
+        default=True,
+        description=(
+            'D2 gate: when True the legacy unconditional numeric '
+            'run-offline-deep.sh sub-run fires; projects without that script '
+            'set False; default True keeps reify byte-identical.'
         ),
     )
     persistent_merge_worktree_safety_valve_every_n: int = Field(
@@ -1830,7 +2091,7 @@ class GitConfig(BaseModel):
         ),
     )
     warm_lane_reclaim_on_exhaustion: bool = Field(
-        default=False,
+        default=True,
         description=(
             'When True, GitOps.acquire_warm_lane() engages the reclaim-on-exhaustion '
             'SAFETY VALVE (task 1933): instead of returning EXHAUSTED immediately when '
@@ -1841,13 +2102,74 @@ class GitConfig(BaseModel):
             'fresh-reset path — zero new git plumbing.  A WARNING log records every steal '
             '(ops signal: safety valve fired = real pool pressure).  NEVER steals a '
             'dispatched (live) lane — the is_dispatched predicate is re-checked '
-            'synchronously under the pool lock (TOCTOU guard, task 1933).  '
+            'synchronously under the pool lock (TOCTOU guard, task 1933, '
+            'git_ops.py _try_reclaim_lane_for / warm_lane_pool.py reclaim_victim).  '
             'Falls back to EXHAUSTED/cold only when no eligible victim exists.  '
             'Requires warm_lane_pool=True.  '
-            'Default False → byte-identical, trivially revertible, matches '
-            'warm_lane_pool/warm_lane_disk_guard convention; enable when ready '
-            '(the INTERIM MARGIN reify spare_warm_lanes deployed 2026-06-29 '
-            'covers headroom until then).'
+            'Default True (flipped fleet-wide: PRD warm-lane-exhaustion-hardening W4) — '
+            'there is no surviving reason to keep this False (Leo investigation '
+            '2026-07-23).  The prior deferral rationale referenced the reify '
+            '"INTERIM MARGIN" spare_warm_lanes key, which never parsed (a top-level '
+            'key with no reader; 2026-07-22 incident).  The 2854 reseed-verify guard '
+            '(merge 0c8137d560) protects the steal path\'s shared reseed tail.  '
+            'Callbacks are installed in Harness.__init__, so the fleet adopts the new '
+            'default on each unit\'s next restart (<=8h redeploy cadence), not '
+            'instantaneously.  defaults.yaml deliberately does NOT list this knob — '
+            'the Field default here is the single source of truth (do not add it '
+            'there; a second source would drift).  Residual accepted risk (decision '
+            '6): untracked victim-worktree files are NOT preserved across a steal '
+            '(only tracked WIP is committed to the victim branch, per 1912 '
+            'retention), and sustained over-demand causes steal-churn, which is '
+            'WARNING-logged per steal (ops signal, not silently absorbed).'
+        ),
+    )
+    warm_lane_drift_l2_threshold: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Number of consecutive durable-record mirror failures the '
+            'WarmLanePool tolerates before firing its _on_lane_record_drift '
+            'callback (the Harness installs a born-at-L2 lane_record_drift '
+            'filer there).  A durable-write failure (OSError — .lane-state '
+            'unwritable — or IllegalLaneTransition) increments a drift counter '
+            'and logs a WARNING but NEVER fails acquire/release (fail-open, '
+            'PRD warm-lane-exhaustion-hardening W2b I3); at this threshold the '
+            'callback fires ONCE (deduped to a single pending L2 via '
+            'find_pending_l2_by_root_cause), and any subsequent SUCCESSFUL '
+            'durable write resets the counter to 0 (re-arm, I4).  GitOps plumbs '
+            'this straight into the pool constructor (self.config IS the '
+            'GitConfig).  Default 3 per PRD Open Q2; green-tier/hot-reloadable.  '
+            'defaults.yaml deliberately does NOT list this knob — the Field '
+            'default here is the single source of truth (matching the other '
+            'warm_lane_* knobs; a second source would drift).'
+        ),
+    )
+    warm_lane_structural_exhaustion_l2_threshold: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Number of CONSECUTIVE WarmLanePoolExhausted acquires GitOps '
+            'tolerates before firing its _on_structural_exhaustion callback '
+            '(the Harness installs a born-at-L2 '
+            'warm_lane_pool_structurally_exhausted filer there).  Task 2988 '
+            '(PRD ε / W3) closes the second failure pole of the 2026-07-22 '
+            'incident (silent infinite requeue): with EXHAUSTED no longer '
+            'counting against the per-task requeue cap, a pool that stays '
+            'exhausted would otherwise requeue forever with no loud signal.  '
+            'The counter is pool-GLOBAL instance state on GitOps, incremented '
+            'at the single EXHAUSTED return in _acquire_warm_lane_impl and '
+            'reset to 0 on ANY successful fresh lane allocation (acquire_for '
+            'reused=False) or reclaim — a reuse/live-requeue does NOT reset '
+            'it (not evidence of free capacity).  At this threshold the '
+            'callback fires ONCE (deduped to a single pending L2 via '
+            'find_pending_l2_by_root_cause), carrying the α pool census.  '
+            'Unlike warm_lane_drift_l2_threshold, GitOps reads this straight '
+            'off self.config (the GitConfig) — no pool-constructor plumbing, '
+            'since the counter lives on GitOps itself.  Default 5 per PRD '
+            'Open Q1; green-tier/hot-reloadable.  defaults.yaml deliberately '
+            'does NOT list this knob — the Field default here is the single '
+            'source of truth (matching the other warm_lane_* knobs; a second '
+            'source would drift).'
         ),
     )
     max_interactive_worktrees: int = Field(
@@ -2005,6 +2327,150 @@ class ChronicFlakeConfig(BaseModel):
     )
 
 
+class ZeroProgressRequeueConfig(BaseModel):
+    """Zero-progress requeue backstop configuration (task 3068).
+
+    Backstops a blind spot the per-task requeue cap structurally cannot see:
+    a task that requeues forever without ever invoking an agent. The full
+    causal chain — why ``_disposition_table``'s non-counting warm-lane
+    dispositions make this invisible to both ceilings in
+    ``Harness._apply_retry_cap`` — is documented once, canonically, in
+    ``orchestrator.zero_progress_requeue``'s module docstring. Read that
+    before retuning anything here.
+
+    The alarm predicate is deliberately two-dimensional: ``threshold``
+    consecutive zero-agent-invocation requeues AND ``min_span_seconds`` of
+    wall clock. Requiring both is what separates a stuck task from ordinary
+    busy-fleet contention, which is why those dispositions are non-counting
+    in the first place.
+
+    Unlike ``chronic_flake`` (shipped ``enabled: false``, gated on an
+    un-landed reify substrate) this ships ENABLED: it reads only
+    ``TaskReport`` fields that already exist, so shipping it off would leave
+    the gap open indefinitely.  All fields are green-tier hot-tunable via
+    RELOADABLE_FIELDS, so a noisy detector can be retuned or silenced live.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to disable the zero-progress requeue detector. '
+            'Shipped enabled — this is the ONLY backstop for requeue loops '
+            'that the per-task requeue cap cannot see by design. Disabling '
+            'suppresses new alerts only; an already-filed alert still '
+            'auto-resolves when its task resumes progress.'
+        ),
+    )
+    threshold: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Consecutive requeues-with-zero-agent-invocations for a single '
+            'task before a blocking L1 is filed (both this AND '
+            'min_span_seconds must be satisfied). Must be >= 1. Grounded in '
+            'the origin incident (reify esc-5556-1): ~349 requeues across '
+            '~24 tasks is ~14.5 consecutive zero-progress requeues per task, '
+            'so 5 fires at roughly a third of the observed loop — hours into '
+            'a 46h incident rather than at its end.'
+        ),
+    )
+    min_span_seconds: float = Field(
+        default=900.0,
+        ge=0.0,
+        description=(
+            'Wall-clock seconds the streak must ALSO span before a blocking '
+            'L1 is filed. Set to 0 to alarm on streak count alone. Exists '
+            'because the dispositions this watches are non-counting '
+            'precisely because they represent NORMAL busy-fleet backpressure '
+            '(task 2988 flipped warm_lane_pool_exhausted to non-counting for '
+            'exactly that reason): where max_concurrent_tasks exceeds the '
+            'warm-lane pool size, a low-priority task can lose the pool race '
+            'several dispatches in a row within seconds, and paging a human '
+            'at the loudest severity tier for that would be a false '
+            'positive. 900s (15 min) of CONTINUOUS zero progress is well '
+            'past any contention blip but still hours short of the 46h '
+            'origin incident.'
+        ),
+    )
+
+
+class RecoveryEmissionConfig(BaseModel):
+    """Structured recovery-decision emission (task 3535, PRD D5).
+
+    Every veto/LEAVE site in the recovery machinery — the reconcile sweep, the
+    scheduler's stranded-blocked redispatch phase, the deterministic recon
+    pair, the already-landed dispatch gate — emits a structured
+    ``recovery_vetoed`` / ``recovery_left`` event describing the decision it
+    ALREADY made.  This section changes NO disposition; the canonical
+    explanation (including why emission is signature-transition-gated rather
+    than one row per observation) is documented once, canonically, in
+    ``orchestrator.recovery_emission``'s module docstring.  Read that before
+    retuning anything here.
+
+    The streak alarm predicate is two-dimensional like ``zero_progress_requeue``
+    — ``veto_streak_threshold`` consecutive IDENTICAL vetoes AND
+    ``veto_streak_min_span_secs`` of wall clock — for the same reason: a streak
+    count alone would page a human for a hold that is only seconds old.
+
+    Ships ENABLED: emission is the whole deliverable, and shipping it off would
+    leave every strand unexplained.  ``streak_escalation_enabled`` is the
+    separate, narrower kill switch for the only part that WRITES to the
+    escalation queue.  All fields are green-tier hot-tunable via
+    RELOADABLE_FIELDS, so a noisy detector can be retuned or silenced live.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to disable structured recovery-decision emission '
+            '(recovery_vetoed / recovery_left events and the veto streak '
+            'counter). Shipped enabled — without it a stranded task held by '
+            'an open escalation leaves no machine-readable trace of WHAT held '
+            'it. Disabling suppresses new emissions only; it never changes a '
+            'recovery disposition, in either direction.'
+        ),
+    )
+    veto_streak_threshold: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Consecutive IDENTICAL vetoes of the same (site, task) before a '
+            'blocking L1 is filed against the streak sentinel (both this AND '
+            'veto_streak_min_span_secs must be satisfied). Must be >= 1. A '
+            'DIFFERENT veto signature restarts the count, so the alarm only '
+            'ever describes N genuinely identical consecutive holds.'
+        ),
+    )
+    veto_streak_min_span_secs: float = Field(
+        default=1500.0,
+        ge=0.0,
+        description=(
+            'Wall-clock seconds the veto streak must ALSO span before a '
+            'blocking L1 is filed. Set to 0 to alarm on streak count alone. '
+            'The default is derived, not picked: stranded_reconcile_interval_'
+            'secs and deterministic_recon_sweep_interval_secs are both 900.0s, '
+            'so three consecutive sweeps span 1800s at the threshold crossing '
+            'and 1500s clears that with 300s of jitter headroom. It is ALSO '
+            'the backstop that makes it impossible for a per-dispatch-TICK '
+            'veto site to file an L1 within seconds of a strand appearing '
+            'should a future site charge the counter by mistake (only the '
+            'sweep-frequency sites charge it today).'
+        ),
+    )
+    streak_escalation_enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to keep emitting recovery_vetoed / recovery_left '
+            'events while suppressing the blocking L1 the veto streak files. '
+            'The narrower kill switch: this is the only part of the mechanism '
+            'that WRITES to the escalation queue, so an operator can silence '
+            'a noisy alarm without losing the telemetry that explains it. '
+            'Disabling suppresses new filings only; an already-filed L1 still '
+            'auto-resolves when its veto stops.'
+        ),
+    )
+
+
 class VerifyRunnerConfig(BaseModel):
     """Configuration for a single remote verify runner (Lever C).
 
@@ -2026,6 +2492,20 @@ class VerifyRunnerConfig(BaseModel):
             'Path to the orchestrator YAML config on the remote host.  '
             'Passed as --config to the remote orchestrator verify-merge CLI.  '
             'None omits --config (remote uses its own ORCH_CONFIG_PATH).'
+        ),
+    )
+    df_checkout_path: str | None = Field(
+        default=None,
+        description=(
+            'Remote-host filesystem path to the Dark-Factory orchestrator '
+            '*code* checkout — the tree whose `orchestrator verify-merge` gate '
+            'this runner executes over ssh.  Distinct from git_remote (the '
+            'PROJECT checkout where the merge sha is pushed/tested).  When set, '
+            'enables the INV-2 contract-currency auto-sync at dispatch '
+            '(HEAD-compare vs the dispatcher, then git pull --ff-only + uv sync '
+            'when stale; plans/merge-verdict-integrity-prd.md §1, §3.1).  '
+            'Default None keeps auto-sync OFF (opt-in), byte-identical to the '
+            'pre-INV-2 behaviour for every not-yet-migrated runner.'
         ),
     )
     enabled: bool = Field(
@@ -2232,6 +2712,85 @@ class PriceEntry(BaseModel):
 def default_price_table() -> dict[str, dict[str, float]]:
     """Return a fresh copy of the packaged default per-model price seeds."""
     return {model: dict(rates) for model, rates in _DEFAULT_PRICES.items()}
+
+
+class ConfigUnknownKey(NamedTuple):
+    """A project-YAML key that has no matching model field.
+
+    Emitted by the unknown-config-key census (see ``census_unknown_config_keys``
+    below OrchestratorConfig).  ``path`` is the dotted location of the key in the
+    project YAML (e.g. ``spare_warm_lanes`` or ``git.bogus_nested``).
+    ``shadow_hint`` names the real dotted home when the same field name lives
+    elsewhere in the model tree (e.g. a top-level ``spare_warm_lanes`` →
+    ``git.spare_warm_lanes``), else ``None``.
+
+    Defined here (before OrchestratorConfig) so the ``_unknown_key_census``
+    PrivateAttr can reference it eagerly, mirroring the ModuleConfig precedent.
+    """
+
+    path: str
+    shadow_hint: str | None
+
+
+class ConfigIgnoredKey(NamedTuple):
+    """A project-YAML key with no matching model field that was DELIBERATELY
+    excused from the unknown-key census by an escape hatch.
+
+    ``path`` is the dotted location (same shape as ``ConfigUnknownKey.path``).
+    ``reason`` is ``'reserved_prefix'`` (the key's name starts with ``x_``/``x-``
+    — the forward-looking convention for non-orchestrator knobs, mirroring the
+    task-metadata Tier-C ``x_`` namespace) or ``'allowlist'`` (an operator listed
+    it under ``config_key_census.ignore``).
+
+    Ignored keys are excluded from ``.unknown`` and therefore from the census
+    signature and the born-at-L2, but are still reported informationally by
+    ``orchestrator check-config`` (at exit 0) so an over-broad glob stays
+    auditable rather than becoming an invisible blind spot.
+    """
+
+    path: str
+    reason: str
+
+
+class ConfigKeyCensus(NamedTuple):
+    """Both views produced by the ONE census walk (INV-5).
+
+    ``unknown`` drives the loud paths (WARNING, born-at-L2, check-config exit
+    code); ``ignored`` is informational only.  Because a single walk classifies
+    every key into exactly one of the two, the escalation and the lint can never
+    disagree about what is suppressed.
+    """
+
+    unknown: list[ConfigUnknownKey]
+    ignored: list[ConfigIgnoredKey]
+
+
+class ConfigKeyCensusConfig(BaseModel):
+    """Operator escape hatch for the unknown-config-key census.
+
+    MUST be declared as a real ``OrchestratorConfig`` field (it is, below):
+    otherwise the very block that suppresses false positives becomes a new
+    false positive, and an operator applying the documented remediation would
+    trade one born-at-L2 for another.
+    """
+
+    ignore: list[str] = Field(
+        default_factory=list,
+        description=(
+            'Dotted paths of project-YAML keys that are deliberately present for '
+            'NON-OrchestratorConfig consumers (e.g. keys read by the project\'s own '
+            'scripts) and must therefore not be reported as unknown config keys. '
+            'Entries are matched against the dotted key path with '
+            'fnmatch.fnmatchcase, so shell-style globs work — NOTE that `*` spans '
+            'dots, so `cpu_governance.*` opts out that whole namespace. The '
+            'converse fnmatch trap: `<name>.*` does NOT match the bare parent key '
+            '`<name>`, so opting out a top-level dict key requires listing it '
+            'exactly. Prefer renaming a new non-orchestrator knob under the '
+            'reserved `x_`/`x-` prefix (auto-excused at any depth, no config '
+            'ceremony) and reserve this list for existing key names that other '
+            'tooling already greps for.'
+        ),
+    )
 
 
 # --- Top-level ---
@@ -2566,6 +3125,31 @@ class OrchestratorConfig(BaseSettings):
     # ``cargo --workspace`` → ``cargo -p <crate>`` for the touched crates.
     # Post-merge verify always runs workspace-wide regardless.
     scope_cargo: bool = Field(default=True)
+    # Cold-verify shared-venv pre-provision command (task 2997, esc-2913-3).
+    # On a COLD verify worktree the shared ``.venv`` is populated only as a SIDE
+    # EFFECT of the TEST leg's ``cd <module> && uv run pytest``; the full-repo-
+    # scope root LINT (``uv run ruff check …``) and TYPE (``… npx pyright``)
+    # commands race that sync and fail spuriously (``Failed to spawn: ruff``;
+    # ``Import "pytest" could not be resolved``).  When non-empty,
+    # run_verification runs this command ONCE (coalesced per worktree) through
+    # ``_run_cmd`` BEFORE the concurrent test/lint/type gather, gated on
+    # ``is_cold``, so the venv is populated before the racing commands spawn.
+    #
+    # Split default: the Pydantic default is '' so every directly-constructed
+    # OrchestratorConfig (all ``_run_cmd`` test doubles) AND every unconfigured
+    # target (reify=cargo, autopilot-video) is a byte-identical no-op — the
+    # gate short-circuits on the empty command.  The deployed value
+    # (``uv sync --all-packages`` — see that file for why ``--extra dev`` is
+    # WRONG here: the dev deps live in each member's dependency-groups, not an
+    # optional ``dev`` extra) lives ONLY in dark-factory-orchestrator.yaml: the
+    # orchestrator is project-agnostic, so the uv-workspace assumption must NOT
+    # be hardcoded in verify.py.
+    # Mirrors the concurrent_verify / verify_cold_command_timeout_secs split-
+    # default convention.  Green-tier hot-reloadable (RELOADABLE_FIELDS, beside
+    # verify_env): read fresh each verify with no in-flight-split risk.
+    # Deliberately NOT in _OVERRIDABLE_FIELDS — it is a whole-worktree concern,
+    # not a per-module override.
+    verify_cold_preprovision_command: str = Field(default='')
 
     # Per-model USD/1M-token prices for backends without native cost
     # reporting (codex, gemini). Seeded from defaults.yaml's `prices:` block
@@ -2989,6 +3573,35 @@ class OrchestratorConfig(BaseSettings):
     orphan_l0_reaper_enabled: bool = Field(default=True)
     orphan_l0_timeout_secs: float = Field(default=600.0)
     orphan_l0_check_interval_secs: float = Field(default=60.0)
+    # Task 2931: freshness grace (seconds) for the divergence-class
+    # ``routing.latest`` liveness gate in the orphan-L0 reaper. The
+    # plan.files/metadata.files divergence false positive recurred after task
+    # 2878 because the lock-free ``reviewer_comprehensive`` /
+    # ``resettled_adjudicator`` stages hold no module locks and are absent
+    # from ``_dispatched``, so ``Scheduler.is_actively_held`` cannot see a task
+    # that is genuinely live mid-dispatch. Those stages DO stamp
+    # ``metadata.routing.latest.decided_at`` fresh per LLM invocation; if that
+    # timestamp is within this grace of the reaper's sweep ``now`` snapshot the
+    # task is live mid-dispatch and its divergence L0 is deferred (not
+    # promoted). Default 300s covers a single long reviewer/adjudicator
+    # invocation while staying well under ``orphan_l0_timeout_secs``=600, so a
+    # genuinely stranded task's stale decision still ages out and promotes.
+    # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
+    orphan_l0_dispatch_freshness_secs: float = Field(default=300.0)
+    # Task 2991: freshness grace (seconds) for the merge-phase-liveness gate in
+    # the orphan-L0 divergence reaper. The divergence false positive recurred
+    # for MERGE-stage tasks (successor to task 2931): the pre-enqueue merge
+    # loop (rebase + scoped verify + queue submit) makes NO LLM calls, so it
+    # never refreshes ``metadata.routing.latest.decided_at`` — a legitimately
+    # live merge-stage task therefore fails the ``_has_fresh_dispatch`` gate
+    # and gets false-promoted. A durable ``metadata.merge_phase_liveness.
+    # entered_at`` stamp (restart-survivable, written at merge entry) is read
+    # by ``_has_fresh_merge_phase``; if within this grace of the sweep ``now``
+    # the divergence L0 is deferred (not promoted). Default 600.0 anchored to
+    # ``orchestrator_restart_merge_phase_grace_secs`` (the existing legitimate
+    # pre-enqueue merge-phase duration bound), not a guessed threshold.
+    # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
+    orphan_l0_merge_phase_freshness_secs: float = Field(default=600.0)
 
     # Terminal-status watcher — periodically polls fused-memory for active
     # workflow tasks whose status has gone terminal out-of-band (typical
@@ -3074,6 +3687,23 @@ class OrchestratorConfig(BaseSettings):
     # filing (tip arm disabled — byte-identical post-2370 behavior).
     main_tip_sweep_rerun_confirm_enabled: bool = Field(default=True)
 
+    # Isolated PRE-FILTER gating the main-tip sweep's full-suite retry (task
+    # 3095).  When a first-pass sweep fails, run_main_tip_sweep used to
+    # unconditionally re-run the WHOLE suite a second time in the same
+    # worktree — minutes of background CPU that itself worsens the contention
+    # it is trying to measure.  With this on, the sweep first re-runs just the
+    # first-pass failing node-ids, scoped + forced-serial + generous-timeout,
+    # in the already-pinned worktree: a deterministic reproduction SKIPS the
+    # expensive full retry, while a non-reproduction (or any unconfirmable
+    # outcome) still pays for it, so a genuine full-verify PASS remains the
+    # precondition for the harness's escalation self-heal.  The pre-filter is
+    # a COST gate only and never suppresses — the harness's fresh-worktree
+    # confirm_main_tip_failure_is_real gate remains the sole suppression
+    # authority.  Default-on, mirrors main_tip_sweep_rerun_confirm_enabled's
+    # operator kill-switch convention; set to False to restore byte-identical
+    # pre-3095 behavior (unconditional full retry).
+    main_tip_sweep_isolated_prefilter_enabled: bool = Field(default=True)
+
     # Category allowlist narrowing the terminal-subject auto-close (task 2724).
     # The subject-terminal Source-C close (criterion a above) used to fire for
     # ANY category — a status-only heuristic that silently dropped still-required
@@ -3123,6 +3753,17 @@ class OrchestratorConfig(BaseSettings):
             'reactive admit-time disk-pressure gate (warm_lane_disk_guard).'
         ),
     )
+    lane_stale_report_days: float = Field(
+        default=7.0,
+        description=(
+            'Age threshold in days beyond which a NON-terminal warm-lane '
+            'assignment (durable ASSIGNED/IN_USE record for a '
+            'pending/in-progress/blocked task) is reported in the digest '
+            "stale-lane census (leaf γ).  Such lanes are never auto-reclaimed "
+            '(WIP-preserving invariant) — the census only surfaces them for '
+            'operator attention.'
+        ),
+    )
 
     # No-landings circuit-breaker (θ=1893, Phase-2 backstop, PRD §5.5).
     # When rolling landing-rate == 0 AND warm-lane free-bytes is monotonically
@@ -3170,6 +3811,18 @@ class OrchestratorConfig(BaseSettings):
     # (``_on_escalation_resolved``) then performs the actual flip once that L1
     # is resolved.  Self-dedupes via the pending-escalation check.
     stranded_blocked_escalate_enabled: bool = Field(default=True)
+
+    # Kill-switch for the verified-green merge-queue-direct remediation
+    # (stranding-remediation-scheduler-ergonomics-prd.md leaf α).  When enabled
+    # (default), a stranded-`blocked` task whose warm lane holds an ASSIGNED,
+    # verified-green branch (all steps done, lane tip == last passed
+    # workflow_verify tip) is submitted DIRECTLY to the merge queue instead of
+    # re-filed/re-pended — the merge queue runs even under a scheduler pause, so
+    # this rescues work that a paused scheduler would never re-dispatch.
+    # Disabling it falls back byte-identically to today's stranded_blocked
+    # re-file/re-pend path (above): the verified-green detector is never
+    # consulted and no merge_request is submitted.
+    stranded_verified_green_merge_enabled: bool = Field(default=True)
 
     # Task 2408 — claimant-liveness gate.  Two mechanisms share one liveness
     # signal (shared.task_claimant): mechanism 1 refuses dispatch into a
@@ -3221,6 +3874,74 @@ class OrchestratorConfig(BaseSettings):
         gt=0,
         description=(
             'Rolling-window length (hours) for the park-stop parked-count threshold.'
+        ),
+    )
+
+    # EASY-backfill admission through parks (task 3823 / PRD task η, C7).
+    # A candidate blocked ONLY by another task's park may be admitted through
+    # it when its predicted hold, times a safety factor, provably fits inside
+    # the gap the park's owner is going to wait anyway.  Flat top-level fields
+    # (not a submodel) mirroring the park_stop_* block above: the capability
+    # manifest greps config.py for the three literal leaf names below, and
+    # nesting would rename them.
+    #
+    # Evidence base:
+    # plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md
+    # :116-126 — module hold-history median is the ONLY predictor with a
+    # positive R² (0.26 dark-factory / 0.68 reify); every static-attribute
+    # predictor scored WORSE than the test-set mean.
+    backfill_enabled: bool = Field(
+        default=True,
+        description=(
+            'Enable EASY-backfill admission through parks (PRD C7). When '
+            'disabled, a candidate blocked by a foreign park is simply passed '
+            'over as before — the operator kill switch, mirroring '
+            'park_stop_enabled / starvation_watchdog.enabled.'
+        ),
+    )
+    backfill_safety_factor: float = Field(
+        default=2.5,
+        gt=0,
+        description=(
+            'Multiplier applied to a candidate\'s predicted hold before it is '
+            'compared against the parked owner\'s provable assembly delay; '
+            'admission requires predicted_hold * factor <= provable_delay. '
+            '2.5 is INTERPOLATED BETWEEN two measured 80%-coverage multipliers '
+            '(PARKING_MODEL_REPORT.md:126: x2.9 dark-factory, x2.0 reify) '
+            'rather than guessed, and the modelled overstay rate at x2.5 is '
+            '7-9% (:254-255). Green-tier so production park_backfill_overstay '
+            'data can settle 2.5-vs-2.9 without a restart (PRD Open Q3).'
+        ),
+    )
+    backfill_min_samples: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Minimum observed hold samples on a task\'s modules before the '
+            'predictor will answer at all; below it, predicted_hold is None '
+            'and backfill REFUSES. This is the SINGLE SOURCE OF TRUTH for '
+            'HoldHistory\'s sample floor — the Scheduler constructs its '
+            'HoldHistory with this value, and hold_history.py deliberately '
+            'carries only a module default so it can stand alone without the '
+            'config object. ge=1 is contract, not decoration: a floor of 0 '
+            'would let an EMPTY history certify a backfill, which C7 forbids '
+            'by name.'
+        ),
+    )
+    backfill_max_park_age_secs: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'Refuse backfill through any park older than this many seconds, '
+            'measured from the owner\'s FIRST install (its total wait). The '
+            'CLAUSE is measured, the NUMBER is a judgment call: '
+            'PARKING_MODEL_REPORT.md:256 names the casualty of having no '
+            'cutoff (one reify starver flips to never-dispatched in-window) '
+            'but publishes no figure. 1h is ~40% of the measured 2.2-3h median '
+            'process era, so it protects parks that have already burned a '
+            'substantial fraction of an era while still admitting backfill in '
+            'the fresh window where most grants occur. Green-tier, so a replay '
+            'can retune it from production data without a deploy.'
         ),
     )
 
@@ -3449,6 +4170,12 @@ class OrchestratorConfig(BaseSettings):
     # the disabled-by-default instance (probe_fraction=0.0, byte-identical).
     speculation_probe: SpeculationProbeConfig = Field(default_factory=SpeculationProbeConfig)
 
+    # Deep merge-ahead chains (task 3183, plans/deep-merge-ahead-prd.md α).
+    # An absent stanza in orchestrator.yaml yields the kill-switch instance
+    # (chain_cap=0, byte-identical current merge behaviour); the shipped
+    # defaults.yaml declares the block explicitly so the knob is discoverable.
+    merge_deep: MergeDeepConfig = Field(default_factory=MergeDeepConfig)
+
     # Agent-transcript archival (task 2742, plans/agent-transcript-archival-prd.md
     # alpha). An absent stanza yields the enabled-by-default instance; the
     # producer hook lives in TaskWorkflow._invoke's finally and resolves its
@@ -3482,6 +4209,21 @@ class OrchestratorConfig(BaseSettings):
     # stanza in orchestrator.yaml yields the disabled-by-default instance
     # (gated until reify:5142's ledger/marker substrate is confirmed).
     chronic_flake: ChronicFlakeConfig = Field(default_factory=ChronicFlakeConfig)
+
+    # Zero-progress requeue backstop (task 3068). An absent stanza in
+    # orchestrator.yaml yields the ENABLED-by-default instance — this is the
+    # only detector for requeue loops the per-task requeue cap cannot see.
+    zero_progress_requeue: ZeroProgressRequeueConfig = Field(
+        default_factory=ZeroProgressRequeueConfig
+    )
+
+    # Structured recovery-decision emission (task 3535, PRD D5). An absent
+    # stanza in orchestrator.yaml yields the ENABLED-by-default instance —
+    # without it a stranded task held by an open escalation leaves no
+    # machine-readable trace of what held it.
+    recovery_emission: RecoveryEmissionConfig = Field(
+        default_factory=RecoveryEmissionConfig
+    )
 
     # κ: shared sccache backend (the laptop warm multiplier)
     # An absent stanza in orchestrator.yaml yields the disabled default;
@@ -3582,6 +4324,16 @@ class OrchestratorConfig(BaseSettings):
     # 'judge' here. See _build_agent_env (workflow.py).
     role_env_overrides: dict[str, dict[str, str]] = Field(default_factory=dict)
 
+    # Unknown-config-key census escape hatch.  Declared as a REAL model field
+    # (not read off the raw tree alone) so the census does not self-flag the very
+    # key that configures it — see ConfigKeyCensusConfig.  The allowlist is still
+    # READ from the raw YAML tree by census_config_keys, because check-config must
+    # keep working when the config has an unrelated value-level validation error
+    # that would make a full load raise.
+    config_key_census: ConfigKeyCensusConfig = Field(
+        default_factory=ConfigKeyCensusConfig
+    )
+
     # Project
     project_root: Path = Field(default=Path('.'))
 
@@ -3597,6 +4349,18 @@ class OrchestratorConfig(BaseSettings):
     # Prefer the `module_configs_or_empty` property below over inline `or {}`
     # guards so new consumers cannot silently omit the normalization.
     _module_configs: dict[str, ModuleConfig] | None = PrivateAttr(default=None)
+
+    # Unknown-config-key census (populated by load_config via
+    # census_unknown_config_keys).  None means "census never ran" (direct
+    # OrchestratorConfig() instantiation in evals/tests); any list (including [])
+    # means "census ran".  Read through the `unknown_key_census` property below,
+    # which normalizes the None sentinel to [] — mirrors _module_configs.
+    _unknown_key_census: list[ConfigUnknownKey] | None = PrivateAttr(default=None)
+
+    # Escape-hatched keys from the SAME census walk (reserved x_/x- prefix or an
+    # operator config_key_census.ignore entry).  Same None-sentinel contract as
+    # _unknown_key_census above; read through `ignored_key_census`.
+    _ignored_key_census: list[ConfigIgnoredKey] | None = PrivateAttr(default=None)
 
     @field_validator('project_root', mode='after')
     @classmethod
@@ -3896,6 +4660,27 @@ class OrchestratorConfig(BaseSettings):
         """
         return self._module_configs or {}
 
+    @property
+    def unknown_key_census(self) -> list[ConfigUnknownKey]:
+        """Return the unknown-config-key census, normalizing the None sentinel to [].
+
+        Populated by ``load_config`` (which stashes
+        ``census_unknown_config_keys(config_path)``).  A directly-constructed
+        ``OrchestratorConfig()`` never ran the census, so the sentinel stays None
+        and this returns [] — mirrors ``module_configs_or_empty``.
+        """
+        return self._unknown_key_census or []
+
+    @property
+    def ignored_key_census(self) -> list[ConfigIgnoredKey]:
+        """Return the escape-hatched half of the census, None sentinel → [].
+
+        Informational only: these keys were deliberately excused (reserved
+        ``x_``/``x-`` prefix, or an operator ``config_key_census.ignore`` entry)
+        and therefore never reach the WARNING, the signature, or the L2.
+        """
+        return self._ignored_key_census or []
+
     def for_module(self, module_path: str) -> ModuleConfig | None:
         """Return the ModuleConfig whose registered prefix is the longest (deepest) match
         for *module_path*, or None if no registered prefix matches at all.
@@ -3972,6 +4757,200 @@ class OrchestratorConfig(BaseSettings):
         return (init_settings, env_settings, yaml_settings, dotenv_settings)
 
 
+# ---------------------------------------------------------------------------
+# Unknown-config-key census (plans/warm-lane-exhaustion-hardening-prd.md leaf ζ)
+#
+# Pydantic's ``extra='ignore'`` silently DISCARDS unknown keys before validation
+# on both OrchestratorConfig and every nested BaseModel, so a misplaced key like
+# a top-level ``spare_warm_lanes: 8`` (the field actually lives on GitConfig)
+# vanishes with no error.  These pure helpers detect that class of typo by
+# walking the RAW project YAML against the model schema — a separate pass from
+# pydantic validation, because validation never sees the dropped keys.
+#
+# ``ConfigUnknownKey`` itself is defined above OrchestratorConfig (so the
+# ``_unknown_key_census`` PrivateAttr can reference it eagerly); the walk
+# functions live here because they reference OrchestratorConfig's schema.
+# ---------------------------------------------------------------------------
+
+
+def _model_from_annotation(annotation: Any) -> type[BaseModel] | None:
+    """Return the single nested ``BaseModel`` subclass an annotation refers to.
+
+    Handles a bare ``SubModel`` and an ``Optional``/``SubModel | None`` wrapper.
+    Returns ``None`` for scalars, ``dict[...]`` and ``list[...]`` (whose value
+    models carry arbitrary operator DATA keys — the walk deliberately stops
+    there) and any other non-single-BaseModel annotation.
+    """
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    origin = get_origin(annotation)
+    # Only unwrap a Union (Optional[X] / X | None); NEVER dict[...]/list[...],
+    # whose get_args would expose a DATA value-model (e.g. dict[str, PriceEntry]).
+    if origin is Union or origin is UnionType:
+        for arg in get_args(annotation):
+            if isinstance(arg, type) and issubclass(arg, BaseModel):
+                return arg
+    return None
+
+
+def _build_shadow_index(
+    model_cls: type[BaseModel],
+    prefix: str = '',
+    index: dict[str, list[str]] | None = None,
+    _ancestors: frozenset[type[BaseModel]] = frozenset(),
+) -> dict[str, list[str]]:
+    """Map every field NAME (lowercased) in the model tree → its dotted path(s).
+
+    Recurses into single nested ``BaseModel`` fields only (mirroring the walk),
+    so an unknown top-level ``spare_warm_lanes`` can be pointed at its real home
+    ``git.spare_warm_lanes``.  ``_ancestors`` guards against pathological
+    recursion cycles while still allowing the same submodel at sibling paths.
+    """
+    if index is None:
+        index = {}
+    if model_cls in _ancestors:
+        return index
+    child_ancestors = _ancestors | {model_cls}
+    for name, field in model_cls.model_fields.items():
+        dotted = f'{prefix}{name}'
+        index.setdefault(name.lower(), []).append(dotted)
+        sub = _model_from_annotation(field.annotation)
+        if sub is not None:
+            _build_shadow_index(sub, dotted + '.', index, child_ancestors)
+    return index
+
+
+# Key-name prefixes that excuse a key from the census at ANY depth, with no
+# config ceremony.  Mirrors the task-metadata Tier-C ``x_`` namespace documented
+# at docs/task-authoring.md — the forward-looking convention for a knob that
+# lives in the project YAML but is consumed by the project's OWN tooling rather
+# than by OrchestratorConfig.
+_CENSUS_RESERVED_PREFIXES = ('x_', 'x-')
+
+
+def _walk_unknown_keys(
+    tree: dict[Any, Any],
+    model_cls: type[BaseModel],
+    prefix: str,
+    shadow_index: dict[str, list[str]],
+    ignore_patterns: tuple[str, ...],
+    ignored: list[ConfigIgnoredKey],
+) -> list[ConfigUnknownKey]:
+    """Recursively collect keys in ``tree`` with no matching field on ``model_cls``.
+
+    Matching is case-insensitive on the field NAME (mirrors
+    ``model_config.case_sensitive=False``; OrchestratorConfig defines no field
+    aliases).  A key with no matching field is CLASSIFIED — reserved-prefix or
+    allowlisted keys are appended to *ignored*, everything else is returned as
+    unknown — and in all three cases is NOT descended into.  A known key is
+    descended into only when its field is a single nested ``BaseModel`` AND its
+    value is a dict — scalars, ``list`` values, and ``dict`` DATA fields stop the
+    walk so arbitrary operator data keys are never flagged.
+
+    Classification happens at this ONE site (INV-5), so the loud consumers
+    (WARNING/L2) and the informational one (check-config) can never disagree.
+    """
+    fields_lower = {
+        name.lower(): (name, field) for name, field in model_cls.model_fields.items()
+    }
+    unknown: list[ConfigUnknownKey] = []
+    for key, value in tree.items():
+        key_name = str(key)
+        key_lower = key_name.lower()
+        dotted = f'{prefix}{key_name}'
+        match = fields_lower.get(key_lower)
+        if match is None:
+            if key_lower.startswith(_CENSUS_RESERVED_PREFIXES):
+                ignored.append(ConfigIgnoredKey(dotted, 'reserved_prefix'))
+            elif any(fnmatch.fnmatchcase(dotted, pat) for pat in ignore_patterns):
+                ignored.append(ConfigIgnoredKey(dotted, 'allowlist'))
+            else:
+                candidates = [c for c in shadow_index.get(key_lower, []) if c != dotted]
+                hint = ' or '.join(candidates) if candidates else None
+                unknown.append(ConfigUnknownKey(dotted, hint))
+            continue
+        _name, field = match
+        sub = _model_from_annotation(field.annotation)
+        if sub is not None and isinstance(value, dict):
+            unknown.extend(
+                _walk_unknown_keys(
+                    value, sub, dotted + '.', shadow_index, ignore_patterns, ignored
+                )
+            )
+    return unknown
+
+
+def _census_ignore_patterns(tree: dict[Any, Any]) -> tuple[str, ...]:
+    """Read ``config_key_census.ignore`` off the RAW project tree, fail-open.
+
+    Read from the raw tree rather than a validated OrchestratorConfig so the
+    census keeps working when the config has an unrelated value-level validation
+    error (the same reason check-config calls the census directly).  A malformed
+    hatch — non-dict block, non-list ``ignore``, non-str entries — degrades to
+    "no allowlist" instead of raising: a broken escape hatch must never take out
+    the census that surfaces real phantom keys.
+    """
+    block = tree.get('config_key_census')
+    if not isinstance(block, dict):
+        return ()
+    raw = block.get('ignore')
+    if not isinstance(raw, list):
+        return ()
+    return tuple(entry for entry in raw if isinstance(entry, str))
+
+
+def census_config_keys(config_path: Path) -> ConfigKeyCensus:
+    """Return BOTH census views for the PROJECT YAML at *config_path*.
+
+    Parses the project file directly (NOT the defaults-merged YamlSettingsSource
+    tree — defaults.yaml is version-controlled and trusted; see design decision
+    1) and walks it against ``OrchestratorConfig``'s schema in ONE pass,
+    classifying every non-model key as either genuinely ``unknown`` or
+    deliberately ``ignored`` (reserved ``x_``/``x-`` prefix, or an operator
+    ``config_key_census.ignore`` entry).  A ``None``/non-dict document or an
+    unreadable/malformed file yields an empty census (fail-open — the census
+    cannot detect keys it cannot parse; load_config surfaces parse errors loudly
+    on its own path).
+    """
+    try:
+        with open(config_path) as f:
+            tree = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return ConfigKeyCensus([], [])
+    if not isinstance(tree, dict):
+        return ConfigKeyCensus([], [])
+    shadow_index = _build_shadow_index(OrchestratorConfig)
+    ignored: list[ConfigIgnoredKey] = []
+    unknown = _walk_unknown_keys(
+        tree, OrchestratorConfig, '', shadow_index,
+        _census_ignore_patterns(tree), ignored,
+    )
+    return ConfigKeyCensus(unknown, ignored)
+
+
+def census_unknown_config_keys(config_path: Path) -> list[ConfigUnknownKey]:
+    """Return only the GENUINELY-unknown half of the census for *config_path*.
+
+    Thin wrapper over ``census_config_keys`` (one walk, two views — INV-5).  Its
+    signature and semantics are unchanged from before the escape hatches existed;
+    escape-hatched keys are simply never in this list, which is what keeps them
+    out of the census signature and therefore out of the born-at-L2.
+    """
+    return census_config_keys(config_path).unknown
+
+
+def config_unknown_keys_signature(census: list[ConfigUnknownKey]) -> str:
+    """Short, order-independent sha256 hex of the census's unknown-key PATHS.
+
+    Paths only (hints are deterministically derived from paths + model, so they
+    are redundant).  Single-sources the escalation dedup discriminator: an
+    identical key-set yields a stable signature (same-set dedup, the storm
+    escape) while any change to the set re-files.
+    """
+    joined = ','.join(sorted(uk.path for uk in census))
+    return hashlib.sha256(joined.encode('utf-8')).hexdigest()[:16]
+
+
 def load_config(config_path: Path | None = None) -> OrchestratorConfig:
     """Load configuration from an explicit YAML file.
 
@@ -4032,6 +5011,40 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
                 'Move the orchestrator.yaml up or raise lock_depth.',
                 prefix, prefix_depth, config.lock_depth,
             )
+    # Unknown-config-key census: detect project-YAML keys that pydantic's
+    # extra='ignore' silently dropped (the 2026-07-22 spare_warm_lanes incident).
+    # Stash it beside _module_configs so consumers (startup L2 filer, reload
+    # response, check-config) read one computed result, and warn loudly now
+    # (loud-over-silent) so the phantom key is never invisible.
+    #
+    # SCOPE (intentional): the census walks the TOP-LEVEL project config only.
+    # The per-module orchestrator.yaml files discovered just above by
+    # _discover_module_configs are deliberately NOT censused, so a typo'd key in
+    # a per-package orchestrator.yaml is still silently dropped by pydantic
+    # extra='ignore'.  This mirrors design decision 1 (project-config-only walk):
+    # the incident key lived in the top-level project YAML.  Extending the census
+    # to module configs (walk each discovered ModuleConfig YAML against
+    # ModuleConfig's schema) is a deferred follow-up, not an oversight.
+    #
+    # Both views come from ONE walk (INV-5): escape-hatched keys (reserved
+    # x_/x- prefix, or an operator config_key_census.ignore entry) are stashed
+    # separately and deliberately kept OUT of the WARNING below — they are
+    # informational only, surfaced by `orchestrator check-config`.
+    full_census = census_config_keys(config_path)
+    census = full_census.unknown
+    config._unknown_key_census = census
+    config._ignored_key_census = full_census.ignored
+    if census:
+        logger.warning(
+            'Config %s has %d unknown key(s) that pydantic silently dropped '
+            '(extra=ignore): %s',
+            config_path,
+            len(census),
+            '; '.join(
+                uk.path + (f' (did you mean {uk.shadow_hint}?)' if uk.shadow_hint else '')
+                for uk in census
+            ),
+        )
     return config
 
 
@@ -4099,11 +5112,30 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # dedicated submodel, so its whole-submodel group auto-covers every
     # leaf (idiom shared with psi_admission/routing above).
     _submodel_leaf_paths('chronic_flake', ChronicFlakeConfig),
+    # Zero-progress requeue backstop (task 3068) — same whole-submodel-group
+    # idiom.  Green-tier deliberately: an operator must be able to retune the
+    # threshold or silence a noisy detector WITHOUT a fleet restart, because a
+    # detector you can only silence by restarting is one that gets silenced by
+    # ignoring it instead.
+    _submodel_leaf_paths('zero_progress_requeue', ZeroProgressRequeueConfig),
+    # Structured recovery-decision emission (task 3535) — same
+    # whole-submodel-group idiom, and green-tier for the same reason: an
+    # operator must be able to retune the streak threshold, or silence a noisy
+    # detector, WITHOUT a fleet restart.  streak_escalation_enabled in
+    # particular is the narrow kill switch for the only part that writes to the
+    # escalation queue, and a kill switch behind a restart is not one.
+    _submodel_leaf_paths('recovery_emission', RecoveryEmissionConfig),
     # Variable-depth speculative verify placement (task 2359) — a new
     # dedicated submodel, same whole-submodel-group idiom: every probe knob
     # (probe_fraction/probe_depths/suppress_flake_rate) is green-tier
     # hot-reloadable with no separate RELOADABLE_FIELDS edit.
     _submodel_leaf_paths('speculation_probe', SpeculationProbeConfig),
+    # Deep merge-ahead chains (task 3183, PRD alpha, decision #7) — a new
+    # dedicated submodel, same whole-submodel-group idiom: chain_cap (and any
+    # knob beta/gamma add later) is green-tier hot-reloadable with no separate
+    # RELOADABLE_FIELDS edit, so the cap can be raised, retuned, or killed
+    # (-> 0) without a restart. See MergeDeepConfig for the rest.
+    _submodel_leaf_paths('merge_deep', MergeDeepConfig),
     # Agent-transcript archival (task 2742, PRD alpha) — a new dedicated
     # submodel, same whole-submodel-group idiom: enabled/root and the atomic
     # .retention leaf are all green-tier hot-reloadable with no separate
@@ -4118,12 +5150,29 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # / fallback_storm_threshold) are green-tier hot-reloadable with no separate
     # RELOADABLE_FIELDS edit.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
+    # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
+    # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the
+    # operator to add a path to config_key_census.ignore and hot-reload, and a
+    # restart-only leaf would make that remediation line a lie (the reload would
+    # report restart_required instead of applying).  Given the watchdog revive
+    # and the 8h fleet-redeploy cadence, clearing a false-positive L2 without a
+    # restart is materially better.
+    _submodel_leaf_paths('config_key_census', ConfigKeyCensusConfig),
     {
         # Steward grace
         'steward_completion_timeout',
         'steward_lifetime_budget',
         # Scheduler tuning
         'fairness.skip_threshold',
+        # EASY-backfill admission (task 3823 / PRD C7).  Explicit literals, not
+        # a _submodel_leaf_paths group: these are FLAT top-level fields, not a
+        # submodel.  Green-tier on purpose — PRD Open Q3 ships safety_factor
+        # 2.5 and lets production park_backfill_overstay data settle
+        # 2.5-vs-2.9, which is only actionable if the factor retunes live.
+        'backfill_enabled',
+        'backfill_safety_factor',
+        'backfill_min_samples',
+        'backfill_max_park_age_secs',
         'starvation_watchdog.enabled',
         'starvation_watchdog.skip_threshold',
         'starvation_watchdog.idle_secs',
@@ -4135,6 +5184,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # failure-mode family and stay restart-only)
         'idle_poll_secs',
         'orphan_l0_timeout_secs',
+        # Task 2931: sibling of orphan_l0_timeout_secs — freshness grace for
+        # the divergence-class routing.latest liveness gate; hot-reloadable so
+        # the FP-suppression window can be tuned without a redeploy.
+        'orphan_l0_dispatch_freshness_secs',
+        # Task 2991: sibling of orphan_l0_dispatch_freshness_secs — freshness
+        # grace for the merge-phase-liveness gate in the divergence reaper;
+        # hot-reloadable so the merge-phase FP-suppression window can be tuned
+        # without a redeploy.
+        'orphan_l0_merge_phase_freshness_secs',
         'watcher_rotation_escalations',
         'watcher_rotation_hours',
         'watcher_max_crashloop_restarts',
@@ -4150,6 +5208,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'review.full_review_min_tasks',
         # Verify env (fresh config's value already carries the sccache fold)
         'verify_env',
+        # Cold-verify shared-venv pre-provision command (task 2997) — green-tier
+        # beside verify_env: read fresh each verify (per-verify, no in-flight
+        # split), so an operator can tune or disable the pre-provision live
+        # without a restart.
+        'verify_cold_preprovision_command',
         # Per-land remote-green cross-check gate (task 2822, fix b) — green-tier
         # unlike its restart-only merge_verify_workspace/merge_verify_breadth
         # siblings: it only ever ADDS a second-opinion local verify, so flipping
@@ -4166,6 +5229,14 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'git.offline_lane_test_threads',
         'git.offline_lane_poll_interval_secs',
         'git.offline_lane_red_advances_before_blocker',
+        # Generic per-project offline-lane commands + legacy-numeric gate (task
+        # 2789, D6 green-tier): the worker re-reads config.git each _run_once,
+        # so the command list, per-command priorities, and the legacy-numeric
+        # toggle hot-reload cleanly. offline_lane_commands is a whole
+        # list[LaneCommand] leaf compared by equality (like routing.rules).
+        # The offline_lane_enabled START gate stays restart-only (unchanged).
+        'git.offline_lane_commands',
+        'git.offline_lane_legacy_numeric_enabled',
         # Verify admission control (task 2390 T2; task 2394 T6 adds the
         # seventh, `_pytest_n`) — all seven knobs are green-tier: an operator
         # can retune slot counts / nice tiers / the -n cap / toggle the gate

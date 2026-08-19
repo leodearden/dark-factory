@@ -153,6 +153,67 @@ class TestDualCounter:
         assert scheduler.transient_requeue_count('no-such-task') == 0
 
 
+class TestRecordRequeueNonCounting:
+    """Task 2988 (PRD ε / W3): ``record_requeue(counts_against_cap=False)`` is
+    a THIRD route — the requeue is recorded in ``_requeue_history`` (preserving
+    the attempt timeline for a later genuine failure's cap-exhaust report) but
+    increments NEITHER the genuine ``_requeue_counts`` nor the transient
+    ``_transient_requeue_counts``, so a WarmLanePoolExhausted requeue never
+    trips either retry-cap escalation.  A pool-level structural-exhaustion L2
+    is the sole loud signal for sustained exhaustion.  Backward-compatible:
+    the kwarg defaults True, so every existing caller is unchanged.
+    """
+
+    _EXHAUSTED_REASON = 'warm_lane_pool_exhausted'
+
+    def _record_non_counting(self, scheduler: Scheduler, task_id: str = 't1') -> int:
+        return scheduler.record_requeue(
+            task_id,
+            phase='plan',
+            reason=self._EXHAUSTED_REASON,
+            detail=self._EXHAUSTED_REASON + ' (pool census attached)',
+            run_id='run-abc',
+            cost_usd=2.0,
+            counts_against_cap=False,
+        )
+
+    def test_non_counting_returns_zero_and_touches_no_counter(self, scheduler: Scheduler):
+        count = self._record_non_counting(scheduler)
+        assert count == 0
+        assert 't1' not in scheduler._requeue_counts
+        assert 't1' not in scheduler._transient_requeue_counts
+        assert scheduler.transient_requeue_count('t1') == 0
+
+    def test_non_counting_still_records_history(self, scheduler: Scheduler):
+        self._record_non_counting(scheduler)
+        history = scheduler.requeue_history('t1')
+        assert len(history) == 1
+        assert history[0].reason == self._EXHAUSTED_REASON
+        assert history[0].attempt == 1
+
+    def test_non_counting_does_not_shift_a_later_genuine_count(self, scheduler: Scheduler):
+        # A non-counting requeue leaves the genuine counter at 0, so the very
+        # next genuine (default) requeue returns 1 — not 2.
+        assert self._record_non_counting(scheduler) == 0
+        assert _record_one(scheduler, 't1') == 1
+        # ...but the timeline still shows BOTH attempts, chronologically.
+        assert [r.attempt for r in scheduler.requeue_history('t1')] == [1, 2]
+
+    def test_non_counting_overrides_transient_classification(self, scheduler: Scheduler):
+        # Even a 5xx reason (normally routed to the transient bucket) is
+        # history-only when counts_against_cap=False — the flag is the third
+        # route, decided BEFORE is_transient_api_requeue.
+        _529 = 'Planning failed: agent API error: HTTP 529'
+        count = scheduler.record_requeue(
+            't1', phase='plan', reason=_529, detail=_529, run_id='r',
+            cost_usd=1.0, counts_against_cap=False,
+        )
+        assert count == 0
+        assert 't1' not in scheduler._requeue_counts
+        assert 't1' not in scheduler._transient_requeue_counts
+        assert len(scheduler.requeue_history('t1')) == 1
+
+
 class TestCounter:
     def test_record_requeue_increments_per_task(self, scheduler: Scheduler):
         assert _record_one(scheduler, 't1') == 1

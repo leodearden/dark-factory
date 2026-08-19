@@ -25,7 +25,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1598,6 +1598,177 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
 
 
 # ---------------------------------------------------------------------------
+# Task 3709 (PRD δ): index_health stat wiring
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorIndexHealthWiring:
+    """MemoryConsolidator.run() must surface index_health in report.stats.
+
+    The stage is a SURFACING POINT ONLY — it deliberately does not file the
+    escalation (unlike the HOR/gate-backlog path). The startup sweep has no
+    stage, so the filing lives in the harness detector both Q3 paths share; a
+    stage-resident filer would fork δ into two divergent detectors.
+
+    step-13 (RED): the index_health attribute and stat-wiring don't exist yet.
+    step-14 (GREEN): add class attribute + stat block in run().
+    """
+
+    def _base_report(self) -> StageReport:
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+    async def _run(self, stage, run_id: str) -> StageReport:
+        dedup_mock = AsyncMock(return_value=[])
+        with (
+            patch.object(
+                BaseStage, 'run', new=AsyncMock(return_value=self._base_report())
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id=run_id,
+            )
+
+    @pytest.mark.asyncio
+    async def test_index_health_stat_set_when_unhealthy(self):
+        """An unhealthy record is carried into report.stats verbatim."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        health_record = {
+            'healthy': False,
+            'missing': [['Entity', 'NODE', 'name', 'RANGE']],
+            'unexpected': [],
+            'expected_total': 38,
+            'actual_total': 37,
+        }
+        stage.index_health = health_record
+
+        report = await self._run(stage, 'run-3709-ih-unhealthy')
+
+        assert 'index_health' in report.stats, (
+            "run() must set report.stats['index_health'] when stage.index_health "
+            f'is set; got stats={report.stats!r}'
+        )
+        assert report.stats['index_health'] == health_record
+
+    @pytest.mark.asyncio
+    async def test_index_health_warning_when_unhealthy(self, caplog):
+        """run() logs a WARNING naming the project_id, run_id and missing count."""
+        import logging
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.index_health = {
+            'healthy': False,
+            'missing': [['Entity', 'NODE', 'name', 'RANGE']],
+            'unexpected': [],
+            'expected_total': 38,
+            'actual_total': 37,
+        }
+
+        dedup_mock = AsyncMock(return_value=[])
+        with (
+            patch.object(
+                BaseStage, 'run', new=AsyncMock(return_value=self._base_report())
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-3709-ih-warn',
+            )
+
+        drift_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'index_drift_stage1' in r.getMessage()
+        ]
+        assert drift_warnings, (
+            'Expected a reconciliation.index_drift_stage1 WARNING when '
+            'index_health.healthy=False'
+        )
+        record = drift_warnings[0]
+        assert getattr(record, 'missing_count', None) == 1
+        assert getattr(record, 'run_id', None) == 'run-3709-ih-warn'
+        assert getattr(record, 'project_id', None) is not None
+
+    @pytest.mark.asyncio
+    async def test_healthy_record_is_still_surfaced_without_warning(self, caplog):
+        """A HEALTHY record must be observable too — ζ's activation check reads it."""
+        import logging
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        health_record = {
+            'healthy': True,
+            'missing': [],
+            'unexpected': [],
+            'expected_total': 38,
+            'actual_total': 38,
+        }
+        stage.index_health = health_record
+
+        dedup_mock = AsyncMock(return_value=[])
+        with (
+            patch.object(
+                BaseStage, 'run', new=AsyncMock(return_value=self._base_report())
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-3709-ih-healthy',
+            )
+
+        assert report.stats['index_health'] == health_record, (
+            'ζ verifies activation by reading this record, so the healthy case '
+            'must be observable, not just the drifted one'
+        )
+        assert not [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'index_drift_stage1' in r.getMessage()
+        ], 'A healthy graph must not warn'
+
+    @pytest.mark.asyncio
+    async def test_index_health_key_absent_when_none(self):
+        """None must leave the key ABSENT — never a null a consumer reads as 'fine'."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        # Explicitly leave index_health at the default (None)
+
+        report = await self._run(stage, 'run-3709-ih-none')
+
+        assert 'index_health' not in report.stats, (
+            'When stage.index_health is None the key must be ABSENT — a null '
+            'would read as "checked and fine"; got '
+            f'stats={report.stats!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests for task 1938: MemoryConsolidator.run() status_correction_reconciliation
 # surfacing
 # ---------------------------------------------------------------------------
@@ -3047,3 +3218,276 @@ class TestAlreadyTrackedSystemicPatternWiring:
             'Finding must be KEPT when dark_factory is not in known_projects '
             f'(no-op guard); got items_flagged={report.items_flagged!r}'
         )
+
+
+class TestMemoryConsolidatorCitationVerificationWiring:
+    """MemoryConsolidator.run() must re-verify each flagged finding's cited
+    Mem0 memories (verify_cited_memories) AFTER super().run() and BEFORE the
+    remediation early-return, so a phantom (non-resolving) mem0 citation is
+    stripped + marked, and the stage1_* citation stats are always present on
+    report.stats (task 2978).
+
+    Driven through the remediation path: its early-return fires immediately
+    after the verifier, isolating the verifier wiring from the full-path
+    filter chain AND proving the check runs BEFORE that early-return (so both
+    full and remediation passes are covered). RED until step-8 wires
+    verify_cited_memories into run().
+    """
+
+    @pytest.mark.asyncio
+    async def test_phantom_citation_stripped_and_marked_via_run(self):
+        stage = _make_consolidator(project_root='/tmp/reify')
+        # Remediation mode: run() early-returns right after the verifier, before
+        # the full-path filter chain.
+        stage.remediation_findings = [{'description': 'remediation'}]
+
+        async def _get(project_id, memory_id):
+            # 'good-id' resolves; 'phantom-id' is genuinely not found.
+            if memory_id == 'good-id':
+                return {'id': 'good-id', 'content': 'x', 'metadata': {}}
+            return None
+
+        assert stage.memory is not None  # AsyncMock() from _make_consolidator
+        stage.memory.get_memory_by_id = AsyncMock(side_effect=_get)  # type: ignore[union-attr]
+
+        finding = {
+            'description': 'a stage-1 finding',
+            'severity': 'medium',
+            'cited_memories': [
+                {'memory_id': 'good-id', 'store': 'mem0'},
+                {'memory_id': 'phantom-id', 'store': 'mem0'},
+            ],
+        }
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[finding],
+            stats={},
+        )
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-citation-verify',
+            )
+
+        verified_finding = report.items_flagged[0]
+        # The phantom is stripped; the resolving id remains.
+        assert [c['memory_id'] for c in verified_finding['cited_memories']] == ['good-id'], (
+            'run() must strip the non-resolving mem0 citation via verify_cited_memories; '
+            f'got cited_memories={verified_finding.get("cited_memories")!r}. '
+            'RED: verify_cited_memories is not yet wired into run().'
+        )
+        # The dropped phantom is named on the finding.
+        assert verified_finding.get('citation_failures') == [
+            {'memory_id': 'phantom-id', 'store': 'mem0', 'reason': 'memory_not_found'},
+        ]
+        # Citation stats are merged onto the returned report (present on this
+        # remediation path — and, by construction, on the full path too).
+        assert report.stats['stage1_phantom_citations_dropped'] == 1
+        assert 'stage1_citations_verified' in report.stats
+        assert 'stage1_citation_verification_errors' in report.stats
+
+
+# ---------------------------------------------------------------------------
+# Gate-backlog age-check wiring in MemoryConsolidator.run (task 3017)
+# ---------------------------------------------------------------------------
+
+
+_GATE_FIXED_NOW = datetime(2026, 7, 24, 12, 0, 0, tzinfo=UTC)
+
+
+class _FrozenGateDatetime(datetime):
+    """datetime subclass whose .now() returns a fixed instant (task 3017 wiring).
+
+    Patched onto the memory_consolidator module so the gate-backlog block's
+    ``datetime.now(UTC)`` is deterministic; ``gate_escalated_at`` stamps are
+    built relative to ``_GATE_FIXED_NOW``.
+    """
+
+    @classmethod
+    def now(cls, tz=None):
+        return _GATE_FIXED_NOW
+
+
+def _blocked_gate_task(tid, *, hours_ago: float) -> dict:
+    """A blocked human-decision gate task aged ``hours_ago`` relative to fixed-now."""
+    stamp = (_GATE_FIXED_NOW - timedelta(hours=hours_ago)).isoformat()
+    return {
+        'id': tid,
+        'status': 'blocked',
+        'title': f'Gate task {tid}',
+        'metadata': {'operational_mode': 'gate', 'gate_escalated_at': stamp},
+    }
+
+
+class TestMemoryConsolidatorGateBacklogWiring:
+    """MemoryConsolidator.run() files a level-1 reconciliation_stale_gate_backlog
+    escalation for a blocked gate task whose gate_escalated_at has aged past 48h,
+    and records stage1_gate_backlog_stalled / stage1_gate_backlog_escalated stats.
+
+    Reuses the real-EscalationQueue-on-tmp_path + filtered_task_tree wiring harness
+    and freezes datetime.now(UTC) in the memory_consolidator module so the age is
+    deterministic.  RED until step-8 wires the gate-backlog block into run().
+    """
+
+    def _make_tree(self, tasks: list[dict]) -> FilteredTaskTree:
+        return FilteredTaskTree(
+            active_tasks=tasks,
+            done_tasks=[],
+            cancelled_tasks=[],
+            done_count=0,
+            cancelled_count=0,
+            other_count=0,
+            total_count=len(tasks),
+            max_task_id=0,
+        )
+
+    def _base_report(self) -> StageReport:
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+    async def _run(self, stage, monkeypatch, run_id: str) -> StageReport:
+        monkeypatch.setattr(
+            'fused_memory.reconciliation.stages.memory_consolidator.datetime',
+            _FrozenGateDatetime,
+        )
+        with (
+            patch.object(
+                BaseStage, 'run', new=AsyncMock(return_value=self._base_report())
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id=run_id,
+            )
+
+    @pytest.mark.asyncio
+    async def test_stale_gate_backlog_files_l1_and_sets_stats(self, tmp_path, monkeypatch):
+        """(a) blocked gate aged 49h → one pending L1 gate-backlog + stalled=1, escalated=1."""
+        from escalation.queue import EscalationQueue
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        queue = EscalationQueue(tmp_path / 'gate_esc')
+        stage._escalation_queue = queue
+        stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=49)])
+
+        report = await self._run(stage, monkeypatch, 'run-gate-a')
+
+        pending = queue.get_by_task('645', status='pending', level=1)
+        gate_backlog = [
+            e for e in pending if e.category == 'reconciliation_stale_gate_backlog'
+        ]
+        assert len(gate_backlog) == 1, (
+            'run() must file exactly one level-1 reconciliation_stale_gate_backlog '
+            f'escalation for the >48h blocked gate task; got {pending!r}. '
+            'RED: the gate-backlog block is not yet wired into run().'
+        )
+        assert gate_backlog[0].task_id == '645'
+        assert report.stats['stage1_gate_backlog_stalled'] == 1
+        assert report.stats['stage1_gate_backlog_escalated'] == 1
+
+    @pytest.mark.asyncio
+    async def test_two_cycles_fold_into_one_record(self, tmp_path, monkeypatch):
+        """(a2) Two consecutive run() cycles over the same stale gate → ONE record.
+
+        End-to-end proof of the signal this task exists to produce: a gate that
+        stays past its threshold accumulates ``dedupe_count`` on a single pending
+        escalation instead of vanishing after cycle 1 (old has_open_l1 skip) or
+        minting a fresh record every cycle.  ``stage1_gate_backlog_stalled`` keeps
+        reporting the gate every cycle; ``stage1_gate_backlog_escalated`` keeps its
+        NEW-filings-only meaning and drops to 0 on the fold cycle.
+        """
+        from escalation.queue import EscalationQueue
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        queue = EscalationQueue(tmp_path / 'gate_esc')
+        stage._escalation_queue = queue
+        stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=49)])
+
+        report1 = await self._run(stage, monkeypatch, 'run-gate-cycle-1')
+        pending = queue.get_pending()
+        assert len(pending) == 1
+        parent_id = pending[0].id
+        assert report1.stats['stage1_gate_backlog_stalled'] == 1
+        assert report1.stats['stage1_gate_backlog_escalated'] == 1
+
+        report2 = await self._run(stage, monkeypatch, 'run-gate-cycle-2')
+
+        pending = [
+            e for e in queue.get_pending()
+            if e.category == 'reconciliation_stale_gate_backlog'
+        ]
+        assert len(pending) == 1, (
+            'cycle 2 must fold, not mint a second record; got '
+            f'{[e.id for e in pending]}'
+        )
+        assert pending[0].id == parent_id, 'the fold target must be the SAME record'
+        assert pending[0].dedupe_count == 1
+
+        # The gate is still stalled and still reported as such...
+        assert report2.stats['stage1_gate_backlog_stalled'] == 1
+        # ...but nothing NEW was filed, so the escalated stat stays new-filings-only.
+        # Counting folds here would make it identically equal to _stalled every
+        # cycle, destroying the new-vs-recurring distinction for operators.
+        assert report2.stats['stage1_gate_backlog_escalated'] == 0
+
+    @pytest.mark.asyncio
+    async def test_fresh_gate_no_escalation_stats_zero(self, tmp_path, monkeypatch):
+        """(b) control: gate aged 1h (< 48h) → no gate-backlog L1; both stats 0."""
+        from escalation.queue import EscalationQueue
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        queue = EscalationQueue(tmp_path / 'gate_esc')
+        stage._escalation_queue = queue
+        stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=1)])
+
+        report = await self._run(stage, monkeypatch, 'run-gate-b')
+
+        assert not any(
+            e.category == 'reconciliation_stale_gate_backlog' for e in queue.get_pending()
+        )
+        assert report.stats['stage1_gate_backlog_stalled'] == 0
+        assert report.stats['stage1_gate_backlog_escalated'] == 0
+
+    @pytest.mark.asyncio
+    async def test_none_tree_noops(self, tmp_path, monkeypatch):
+        """(c1) filtered_task_tree is None → block no-ops: no escalation, no raise, no stat."""
+        from escalation.queue import EscalationQueue
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        queue = EscalationQueue(tmp_path / 'gate_esc')
+        stage._escalation_queue = queue
+        stage.filtered_task_tree = None
+
+        report = await self._run(stage, monkeypatch, 'run-gate-c1')
+
+        assert not any(
+            e.category == 'reconciliation_stale_gate_backlog' for e in queue.get_pending()
+        )
+        assert 'stage1_gate_backlog_stalled' not in report.stats
+
+    @pytest.mark.asyncio
+    async def test_none_queue_noops(self, monkeypatch):
+        """(c2) _escalation_queue is None → block no-ops: no raise, no stat."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage._escalation_queue = None
+        stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=49)])
+
+        report = await self._run(stage, monkeypatch, 'run-gate-c2')
+
+        assert 'stage1_gate_backlog_stalled' not in report.stats

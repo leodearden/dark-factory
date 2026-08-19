@@ -1,0 +1,350 @@
+{
+  "chosen_t_high": 0.8868282526657318,
+  "chosen_t_low": 0.5229672433064231,
+  "reason": null,
+  "deterministic_band_false_positives": 0,
+  "distributions": {
+    "true_dup": {
+      "n": 301,
+      "min": 0.3044689234163344,
+      "max": 0.96570744126053,
+      "mean": 0.7009787622581548,
+      "median": 0.709713152372983,
+      "p05": 0.5229672433064231,
+      "p25": 0.6164660007110104,
+      "p75": 0.7847931720229323,
+      "p95": 0.8646358352421091
+    },
+    "unrelated": {
+      "n": 5037,
+      "min": 0.1491529252563599,
+      "max": 0.8349988478146576,
+      "mean": 0.4341117479202444,
+      "median": 0.4254931064390011,
+      "p05": 0.2786760529807258,
+      "p25": 0.3639902745784614,
+      "p75": 0.49766807005413743,
+      "p95": 0.6136026802068789
+    },
+    "hard_negative": {
+      "n": 18,
+      "min": 0.722523229400382,
+      "max": 0.8843433935965617,
+      "mean": 0.7883216672937455,
+      "median": 0.7846337403069573,
+      "p05": 0.722523229400382,
+      "p25": 0.7481496080601845,
+      "p75": 0.8215389446744906,
+      "p95": 0.8843433935965617
+    }
+  },
+  "per_band": {
+    "true_dup": {
+      "deterministic": 7,
+      "judge": 279,
+      "store": 15
+    },
+    "unrelated": {
+      "deterministic": 0,
+      "judge": 920,
+      "store": 4117
+    },
+    "hard_negative": {
+      "deterministic": 0,
+      "judge": 18,
+      "store": 0
+    }
+  },
+  "per_category": {
+    "procedural_knowledge": {
+      "distributions": {
+        "true_dup": {
+          "n": 242,
+          "min": 0.5076461513969943,
+          "max": 0.96570744126053,
+          "mean": 0.7178710565283163,
+          "median": 0.7203316687045846,
+          "p05": 0.5750178537519799,
+          "p25": 0.6458155072965306,
+          "p75": 0.7914273741185776,
+          "p95": 0.8618487614353623
+        },
+        "unrelated": {
+          "n": 3316,
+          "min": 0.1491529252563599,
+          "max": 0.8349988478146576,
+          "mean": 0.4400026151672054,
+          "median": 0.43193891823894615,
+          "p05": 0.27786910079730626,
+          "p25": 0.3647672582371951,
+          "p75": 0.5085338588661676,
+          "p95": 0.6272986832234049
+        },
+        "hard_negative": {
+          "n": 12,
+          "min": 0.7245013614771467,
+          "max": 0.8388495151705722,
+          "mean": 0.7857889153308962,
+          "median": 0.7846337403069573,
+          "p05": 0.7245013614771467,
+          "p25": 0.7481496080601845,
+          "p75": 0.8153625631981813,
+          "p95": 0.8388495151705722
+        }
+      },
+      "t_high": 0.839045608910388,
+      "t_low": 0.5750178537519799,
+      "reason": null,
+      "pair_counts": {
+        "true_dup": 242,
+        "unrelated": 3316,
+        "hard_negative": 12
+      },
+      "pooled_t_high_negatives_admitted": 0
+    },
+    "observations_and_summaries": {
+      "distributions": {
+        "true_dup": {
+          "n": 4,
+          "min": 0.6030506494744563,
+          "max": 0.8868282526657318,
+          "mean": 0.7836518628483499,
+          "median": 0.8189230982197944,
+          "p05": 0.6030506494744563,
+          "p25": 0.6030506494744563,
+          "p75": 0.8258054510334168,
+          "p95": 0.8868282526657318
+        },
+        "unrelated": {
+          "n": 45,
+          "min": 0.2974050660532761,
+          "max": 0.6600816503204221,
+          "mean": 0.4580490855615139,
+          "median": 0.47277485019395593,
+          "p05": 0.33674659981701993,
+          "p25": 0.3843751495779087,
+          "p75": 0.523341314602434,
+          "p95": 0.5667145829571415
+        },
+        "hard_negative": {
+          "n": 6,
+          "min": 0.722523229400382,
+          "max": 0.8843433935965617,
+          "mean": 0.7933871712194439,
+          "median": 0.7600880313453288,
+          "p05": 0.722523229400382,
+          "p25": 0.7478583084443828,
+          "p75": 0.830515869150983,
+          "p95": 0.8843433935965617
+        }
+      },
+      "t_high": null,
+      "t_low": null,
+      "reason": "insufficient_pairs: 4 duplicate and 51 negative pair(s) measured, below the 20/20 minimum. A fresh pair falls outside a sample this small's observed extreme with expected probability 1/(n+1), and both band edges are fitted to exactly that extreme. Refusing a cutoff the sample size cannot support \u2014 this category runs on the disclosed pooled fallback instead.",
+      "pair_counts": {
+        "true_dup": 4,
+        "unrelated": 45,
+        "hard_negative": 6
+      },
+      "pooled_t_high_negatives_admitted": 0
+    },
+    "preferences_and_norms": {
+      "distributions": {
+        "true_dup": {
+          "n": 28,
+          "min": 0.48436164811765825,
+          "max": 0.7935816256565051,
+          "mean": 0.655500708039061,
+          "median": 0.649687808904173,
+          "p05": 0.49163325143081005,
+          "p25": 0.591201365635598,
+          "p75": 0.729501420003076,
+          "p95": 0.777318897858907
+        },
+        "unrelated": {
+          "n": 0,
+          "min": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "p05": null,
+          "p25": null,
+          "p75": null,
+          "p95": null
+        },
+        "hard_negative": {
+          "n": 0,
+          "min": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "p05": null,
+          "p25": null,
+          "p75": null,
+          "p95": null
+        }
+      },
+      "t_high": null,
+      "t_low": null,
+      "reason": "empty_class: cannot separate two classes when one is empty (n_duplicate=28, n_negative=0)",
+      "pair_counts": {
+        "true_dup": 28,
+        "unrelated": 0,
+        "hard_negative": 0
+      },
+      "pooled_t_high_negatives_admitted": 0
+    }
+  },
+  "recall_at_k": {
+    "per_k": [
+      {
+        "k": 1,
+        "hits": 17,
+        "total": 63,
+        "recall": 0.2698412698412698
+      },
+      {
+        "k": 3,
+        "hits": 25,
+        "total": 63,
+        "recall": 0.3968253968253968
+      },
+      {
+        "k": 5,
+        "hits": 32,
+        "total": 63,
+        "recall": 0.5079365079365079
+      },
+      {
+        "k": 10,
+        "hits": 45,
+        "total": 63,
+        "recall": 0.7142857142857143
+      }
+    ],
+    "canonical_absent": [
+      {
+        "memory_id": "0e46ec63-01c9-4505-a0c9-dcd3a003ad28",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "166f5106-00da-4364-9c6f-d0a0d514db7a",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "1d54d1d7-da71-44fe-894b-3011a41161af",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "31632470-5c39-4929-a768-23e98cd9217c",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "335028f7-0e0e-4aac-a4c3-9c47885c36f3",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "6fa72085-4198-4a2e-8bfa-8e7a82a55a3a",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "74fc3315-f5e3-4544-972e-32e8a2c3eaaa",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "77bf2f5c-523b-41af-8ce4-9eb0cd3cb08e",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "8a3fad31-386b-4102-aa8d-1abf2984450d",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "8b47b378-d154-4460-9cf6-0fa681a02ce1",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "a390babf-8bad-4d98-b047-35c75e25755b",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "ce42b17f-2c80-47c8-ae92-61f1f7bbef0e",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "f6a4bd31-0414-4a8a-a900-5520655b9af2",
+        "canonical_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      {
+        "memory_id": "18cbefc3-5845-443b-95cb-1d14b265befd",
+        "canonical_id": "168c3a6b-55dd-4f53-88e4-3a829ea210fc"
+      },
+      {
+        "memory_id": "1a265e20-6e4d-4c7c-a1dd-cdf880c865e4",
+        "canonical_id": "168c3a6b-55dd-4f53-88e4-3a829ea210fc"
+      },
+      {
+        "memory_id": "80936e18-6a91-4b74-9bb8-cae79e6490b8",
+        "canonical_id": "168c3a6b-55dd-4f53-88e4-3a829ea210fc"
+      },
+      {
+        "memory_id": "8110c809-04cf-4de8-9aad-1c2c00e25053",
+        "canonical_id": "168c3a6b-55dd-4f53-88e4-3a829ea210fc"
+      },
+      {
+        "memory_id": "ad415479-f6b6-441b-b95f-6bf1d4168804",
+        "canonical_id": "168c3a6b-55dd-4f53-88e4-3a829ea210fc"
+      },
+      {
+        "memory_id": "4743c358-c9dc-4197-a475-651e16edc809",
+        "canonical_id": "417d86d0-36fe-42c8-851a-9ed0a18c64bb"
+      },
+      {
+        "memory_id": "c77d25d9-70b0-44f4-a6fd-b00c7a63118b",
+        "canonical_id": "417d86d0-36fe-42c8-851a-9ed0a18c64bb"
+      },
+      {
+        "memory_id": "e17a20d2-8011-4e3a-8f9e-21c302ae5ed8",
+        "canonical_id": "417d86d0-36fe-42c8-851a-9ed0a18c64bb"
+      }
+    ]
+  },
+  "provenance": {
+    "fixture_path": "tests/fixtures/write_triage_calibration.jsonl",
+    "project_id": "reify",
+    "embedder_model": "text-embedding-3-small",
+    "embedder_dimensions": 1536,
+    "search_stores": "mem0 (MemoryService.search, stores=[mem0])",
+    "search_categories": "all",
+    "record_count": 104,
+    "cluster_count": 20,
+    "per_category_record_counts": {
+      "procedural_knowledge": 85,
+      "observations_and_summaries": 11,
+      "preferences_and_norms": 8
+    },
+    "cross_category_dropped": 1703,
+    "pair_counts": {
+      "true_dup": 301,
+      "unrelated": 5037,
+      "hard_negative": 18
+    },
+    "per_category_pair_counts": {
+      "procedural_knowledge": {
+        "true_dup": 242,
+        "unrelated": 3316,
+        "hard_negative": 12
+      },
+      "observations_and_summaries": {
+        "true_dup": 4,
+        "unrelated": 45,
+        "hard_negative": 6
+      },
+      "preferences_and_norms": {
+        "true_dup": 28,
+        "unrelated": 0,
+        "hard_negative": 0
+      }
+    }
+  }
+}

@@ -35,11 +35,20 @@ _DEFAULT_NEAR_DUP_GUARD_ENABLED = True
 # Surfaced in the soft-block dict, the add_memory tool docstring, and
 # FUSED_MEMORY_INSTRUCTIONS so the override is discoverable at the point of
 # rejection, not just in documentation the agent may not have read.
+#
+# "Update" names a real tool as of task 3088: update_memory amends a Mem0
+# record in place, preserving its point id. Before that shipped, this hint
+# instructed agents to do something the API could not do — the only ways to
+# "update" were delete-then-re-add (which mints a new id and breaks every
+# reference) or nothing at all. Name the tool and its arguments so the
+# instruction is executable at the point of rejection.
 _NEAR_DUPLICATE_HINT = (
     'This procedural_knowledge content is highly similar to an existing memory '
-    '(see matched_memory_id/matched_excerpt). Search first and update or skip '
-    'instead of writing a duplicate. If the content is genuinely distinct, '
-    "override with metadata={'allow_near_duplicate': True}."
+    '(see matched_memory_id/matched_excerpt). Either skip this write, or amend '
+    'that record in place with update_memory(memory_id=<matched_memory_id>, '
+    "store='mem0', project_id=..., content=<merged text>, reason=...) — which "
+    'preserves its id, unlike delete-then-re-add. If the content is genuinely '
+    "distinct, override with metadata={'allow_near_duplicate': True}."
 )
 
 # Fallback hint for a topic-cluster soft-block when the matched cluster carries
@@ -49,11 +58,30 @@ _NEAR_DUPLICATE_HINT = (
 _TOPIC_CLUSTER_DEFAULT_HINT = (
     'This procedural_knowledge content matches a KNOWN-contradictory topic '
     'cluster (see topic_id/matched_phrases) that is gated to a human review '
-    'task. Do NOT add another entry — search first and update/consolidate the '
-    'existing entries for this topic, or add context to the referenced human '
-    'gate task, instead of accumulating another paraphrased restatement. If the '
-    "content is genuinely distinct, override with metadata={'allow_near_duplicate': True}."
+    'task. Do NOT add another entry — search first, then consolidate the '
+    'existing entries for this topic by amending one in place with '
+    "update_memory(memory_id=..., store='mem0', project_id=..., content=..., "
+    'reason=...) and deleting the ones it subsumes, or add context to the '
+    'referenced human gate task, instead of accumulating another paraphrased '
+    'restatement. If the content is genuinely distinct, override with '
+    "metadata={'allow_near_duplicate': True}."
 )
+
+
+def _cosine_of(r: MemoryResult) -> float | None:
+    """Read the per-store cosine a search result carries, or ``None``.
+
+    Since task 3658 ``MemoryService.search`` puts the honest per-store
+    similarity in ``metadata['store_score']`` (the Mem0 cosine; ``None`` for
+    Graphiti, which exposes no scores).  Uses the same defensive coercion as
+    :func:`resolve_near_dup_threshold` — ``bool`` is excluded despite being an
+    ``int`` subclass, as is any attribute an unspecced test double might
+    auto-generate — so a non-measurement can never be read as a similarity.
+    """
+    value = (r.metadata or {}).get('store_score')
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return None
 
 
 def find_near_duplicate_memory(
@@ -65,11 +93,21 @@ def find_near_duplicate_memory(
 ) -> MemoryResult | None:
     """Select the best near-duplicate candidate from already-fetched *results*.
 
-    Returns the highest ``relevance_score`` result that matches *category*
-    and *source_store* and whose ``relevance_score >= threshold``, or
+    Returns the result with the highest per-store COSINE that matches
+    *category* and *source_store* and whose cosine is ``>= threshold``, or
     ``None`` if no result qualifies. Defensively filters out results with a
     mismatched category or source_store even when their score is high —
     callers may pass unfiltered/mixed search results.
+
+    The cosine is read from ``metadata['store_score']`` (see :func:`_cosine_of`),
+    **not** from ``relevance_score`` — which since task 3658 is an ordinal RRF
+    fusion value (single-store rank-1 ~ 0.0164) and would never clear a 0.92
+    cosine threshold, silently disabling this guard for every input.
+
+    A result carrying no numeric ``store_score`` — a Graphiti result, where it
+    is ``None``, or any result predating the stamping — can never qualify, at
+    any threshold. A missing cosine means "not comparable", which is not the
+    same as a measured similarity of 0.0 that a low threshold might clear.
 
     Pure and synchronous: does no I/O and raises nothing on empty input.
     """
@@ -78,27 +116,52 @@ def find_near_duplicate_memory(
         for r in results
         if r.category == category
         and r.source_store == source_store
-        and r.relevance_score >= threshold
+        and (cosine := _cosine_of(r)) is not None
+        and cosine >= threshold
     ]
     if not qualifying:
         return None
-    return max(qualifying, key=lambda r: r.relevance_score)
+    # Every qualifying result has a non-None cosine by construction above.
+    return max(qualifying, key=lambda r: _cosine_of(r) or 0.0)
 
 
 def find_matching_topic_cluster(
     content: str,
     clusters: list[ProceduralTopicCluster],
 ) -> tuple[ProceduralTopicCluster, list[str]] | None:
-    """Select the first topic cluster *content* matches by distinct-phrase count.
+    """Select the first topic cluster *content* matches, by phrase count OR sufficiency.
 
     For each cluster in order, counts the DISTINCT ``phrases`` (compared
     case-insensitively) that appear as substrings of *content*, and returns
-    ``(cluster, sorted matched phrases)`` for the first cluster whose distinct
-    hit count is ``>= cluster.min_phrase_hits``. A phrase repeated in *content*
-    counts once (distinct-phrase membership, not occurrence count); an empty
-    phrase is ignored (it would otherwise substring-match everything). Returns
-    ``None`` when *content* is empty, *clusters* is empty, or no cluster
-    qualifies.
+    ``(cluster, sorted matched phrases)`` for the first cluster that qualifies.
+    A cluster qualifies when EITHER:
+
+    * its distinct hit count is ``>= cluster.min_phrase_hits`` (the original
+      rule), OR
+    * at least one hit phrase is declared in ``cluster.sufficient_phrases``
+      -- phrases so distinctive they cannot appear incidentally, which
+      therefore qualify the cluster alone (task 3054).
+
+    The second arm exists because hits do NOT aggregate across clusters: a
+    write touching one distinctive phrase in each of several clusters used to
+    be blocked by none, even though each phrase unambiguously identified its
+    own topic. Note the consequence for callers -- on a sufficient-phrase
+    match the returned ``matched_phrases`` may contain FEWER entries than the
+    cluster's ``min_phrase_hits``. That is correct, not a guard bug: it
+    reports exactly what fired.
+
+    PRECEDENCE (deliberate): sufficiency decides WHETHER a cluster qualifies,
+    never WHICH qualifying cluster wins. The scan is a single pass in list
+    order, so an EARLIER cluster qualifying on a plain count beats a LATER
+    cluster qualifying on a declared-sufficient phrase. Seed order stays the
+    one priority knob rather than gaining a second, implicit axis -- and both
+    candidates are on-topic by construction, so the cost of the arbitration
+    is at most routing a soft block to the neighbouring human gate task.
+
+    A phrase repeated in *content* counts once (distinct-phrase membership,
+    not occurrence count); an empty phrase is ignored (it would otherwise
+    substring-match everything). Returns ``None`` when *content* is empty,
+    *clusters* is empty, or no cluster qualifies.
 
     Pure and synchronous — mirrors :func:`find_near_duplicate_memory`: it does
     no I/O and no embedding round-trip, and raises nothing on empty input. This
@@ -114,7 +177,8 @@ def find_matching_topic_cluster(
             for phrase in cluster.phrases
             if phrase and phrase.lower() in content_lower
         }
-        if len(matched) >= cluster.min_phrase_hits:
+        sufficient = {phrase.lower() for phrase in cluster.sufficient_phrases if phrase}
+        if matched and (len(matched) >= cluster.min_phrase_hits or matched & sufficient):
             return cluster, sorted(matched)
     return None
 
@@ -183,6 +247,14 @@ def build_near_duplicate_block(
     (``count_snapshot_write_blocked`` et al.): a flat dict with ``error``/
     ``error_type``, echoed ``agent_id``/``content_excerpt``, plus fields
     identifying the matched memory and a remediation ``hint``.
+
+    ``similarity`` is the per-store cosine from ``match.metadata['store_score']``
+    — deliberately NOT ``relevance_score``, which since task 3658 is an ordinal
+    RRF rank score.  The point is that the blocked agent can compare it
+    directly against the ``threshold`` emitted beside it (0.97 vs 0.92); a
+    payload quoting 0.0164 against a threshold of 0.92 would read as a guard
+    malfunction rather than a decision.  ``None`` if the match somehow carries
+    no numeric cosine — an honest absence beats a fabricated number.
     """
     return {
         'error': 'procedural_knowledge_near_duplicate_write_blocked',
@@ -190,7 +262,7 @@ def build_near_duplicate_block(
         'agent_id': agent_id,
         'content_excerpt': content[:200],
         'matched_memory_id': match.id,
-        'similarity': match.relevance_score,
+        'similarity': _cosine_of(match),
         'threshold': threshold,
         'matched_excerpt': match.content[:200],
         'hint': _NEAR_DUPLICATE_HINT,
@@ -212,6 +284,13 @@ def build_topic_cluster_block(
     two guards' agent-facing diagnostics stay cleanly separable. Uses the
     matched cluster's ``hint`` when set, else the module default
     (:data:`_TOPIC_CLUSTER_DEFAULT_HINT`).
+
+    ``matched_phrases`` may contain FEWER entries than the matched cluster's
+    ``min_phrase_hits`` -- that is a correct sufficient-phrase block, not a
+    guard bug. :func:`find_matching_topic_cluster` also qualifies a cluster on
+    a single phrase declared in its ``sufficient_phrases`` (task 3054), and
+    this field then reports exactly the one phrase that fired, which is what
+    makes the routing unambiguous.
     """
     return {
         'error': 'procedural_knowledge_known_topic_cluster_write_blocked',

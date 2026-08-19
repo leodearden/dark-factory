@@ -1,0 +1,162 @@
+{
+  "alarmed_metric_count": 4,
+  "alarms": [
+    {
+      "alpha": 0.002777777777777778,
+      "baseline": 0.8,
+      "detail": "12/30 against a pooled baseline of 72/90 over 3 run(s). p=1.84e-06 < alpha=0.00278, below baseline (lower_is_worse).",
+      "direction": "lower_is_worse",
+      "metric_id": "canonical-in-top-5",
+      "p_value": 1.8424481488582588e-06,
+      "rule_kind": "proportion",
+      "value": 0.4
+    },
+    {
+      "alpha": 0.002777777777777778,
+      "baseline": 5.0,
+      "detail": "20 event(s) over n=30 against an expected 5 (0.166667/unit pooled over 3 run(s), exposure 90). p=3.45e-07 < alpha=0.00278, above baseline (higher_is_worse).",
+      "direction": "higher_is_worse",
+      "metric_id": "dangling-pointers",
+      "p_value": 3.452135820914455e-07,
+      "rule_kind": "count",
+      "value": 20.0
+    },
+    {
+      "baseline": 2.0,
+      "detail": "Item 't-worktree-lifecycle' newly fails and is not grandfathered.",
+      "item_key": "t-worktree-lifecycle",
+      "metric_id": "topic-canonical-present",
+      "rule_kind": "tripwire",
+      "value": 2.0
+    }
+  ],
+  "alpha": 0.002777777777777778,
+  "baseline_run_stamps": [
+    "20260701T031500Z",
+    "20260702T031500Z",
+    "20260703T031500Z"
+  ],
+  "baseline_window": 3,
+  "eval_id": "e1-retrieval-health",
+  "false_alarm_budget": 1.0,
+  "generator": "shared.memory_eval_limits",
+  "grandfather_set": [
+    "topic-canonical-present::t-recon-watcher-triage"
+  ],
+  "grandfather_set_hash": "f8c46981970a2cc2265806d08e9705ecceb66889e30476dcba0921a45a05dec5",
+  "min_samples": 10,
+  "run_stamp": "20260704T031500Z",
+  "runs_per_quarter": 90,
+  "schema_version": 1,
+  "snapshotted_metric_ids": [
+    "topic-canonical-present"
+  ],
+  "verdicts": [
+    {
+      "alarms": [
+        {
+          "alpha": 0.002777777777777778,
+          "baseline": 0.8,
+          "detail": "12/30 against a pooled baseline of 72/90 over 3 run(s). p=1.84e-06 < alpha=0.00278, below baseline (lower_is_worse).",
+          "direction": "lower_is_worse",
+          "metric_id": "canonical-in-top-5",
+          "p_value": 1.8424481488582588e-06,
+          "rule_kind": "proportion",
+          "value": 0.4
+        }
+      ],
+      "alpha": 0.002777777777777778,
+      "baseline": 0.8,
+      "baseline_run_stamps": [
+        "20260701T031500Z",
+        "20260702T031500Z",
+        "20260703T031500Z"
+      ],
+      "detail": "12/30 against a pooled baseline of 72/90 over 3 run(s).",
+      "direction": "lower_is_worse",
+      "metric_id": "canonical-in-top-5",
+      "n": 30,
+      "p_value": 1.8424481488582588e-06,
+      "rule_kind": "proportion",
+      "status": "alarm",
+      "value": 0.4
+    },
+    {
+      "alarms": [
+        {
+          "alpha": 0.002777777777777778,
+          "baseline": 5.0,
+          "detail": "20 event(s) over n=30 against an expected 5 (0.166667/unit pooled over 3 run(s), exposure 90). p=3.45e-07 < alpha=0.00278, above baseline (higher_is_worse).",
+          "direction": "higher_is_worse",
+          "metric_id": "dangling-pointers",
+          "p_value": 3.452135820914455e-07,
+          "rule_kind": "count",
+          "value": 20.0
+        }
+      ],
+      "alpha": 0.002777777777777778,
+      "baseline": 5.0,
+      "baseline_run_stamps": [
+        "20260701T031500Z",
+        "20260702T031500Z",
+        "20260703T031500Z"
+      ],
+      "detail": "20 event(s) over n=30 against an expected 5 (0.166667/unit pooled over 3 run(s), exposure 90).",
+      "direction": "higher_is_worse",
+      "metric_id": "dangling-pointers",
+      "n": 30,
+      "p_value": 3.452135820914455e-07,
+      "rule_kind": "count",
+      "status": "alarm",
+      "value": 20.0
+    },
+    {
+      "alarms": [],
+      "alpha": 0.002777777777777778,
+      "baseline": 2.0,
+      "baseline_run_stamps": [
+        "20260701T031500Z",
+        "20260702T031500Z",
+        "20260703T031500Z"
+      ],
+      "detail": "2 event(s) over n=30 against an expected 2 (0.0666667/unit pooled over 3 run(s), exposure 90).",
+      "direction": "higher_is_worse",
+      "metric_id": "superseded-above-successor",
+      "n": 30,
+      "p_value": 1.0,
+      "rule_kind": "count",
+      "status": "ok",
+      "value": 2.0
+    },
+    {
+      "alarms": [
+        {
+          "baseline": 2.0,
+          "detail": "Item 't-worktree-lifecycle' newly fails and is not grandfathered.",
+          "item_key": "t-worktree-lifecycle",
+          "metric_id": "topic-canonical-present",
+          "rule_kind": "tripwire",
+          "value": 2.0
+        }
+      ],
+      "baseline": 2.0,
+      "baseline_run_stamps": [],
+      "detail": "2 failing, 2 grandfathered, 1 new; 1 fixed and released.",
+      "metric_id": "topic-canonical-present",
+      "n": 8,
+      "rule_kind": "tripwire",
+      "status": "alarm",
+      "value": 2.0
+    },
+    {
+      "alarms": [],
+      "baseline_run_stamps": [],
+      "detail": "Scalar: reported for trend, no alarm rule attached (M2).",
+      "metric_id": "search-latency-p50-ms",
+      "n": 30,
+      "rule_kind": "scalar",
+      "status": "ok",
+      "value": 44.0
+    }
+  ]
+}

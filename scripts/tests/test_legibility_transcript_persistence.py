@@ -16,22 +16,22 @@ separately-landing ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` preventer.
 from __future__ import annotations
 
 import json
+import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-
 from legibility import check_transcript_persistence as mod
 from legibility.config import load_config
-from orchestrator import session_registry
 
+from orchestrator import session_registry
 
 # ---------------------------------------------------------------------------
 # Shared fixtures / helpers
 # ---------------------------------------------------------------------------
 
-FIXED_NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
+FIXED_NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=UTC)
 
 
 def _iso(dt: datetime) -> str:
@@ -356,6 +356,91 @@ def test_find_matching_transcript_missing_dir_returns_none(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# task 3272: underscore cwds must resolve to their REAL on-disk encoded dir
+#
+# ``find_matching_transcript`` uses ``inventory.encode_cwd`` as a DIRECT
+# LOOKUP KEY (``session_dir.is_dir()`` -> None), with no ``is_member``
+# re-check to save it — unlike inventory.py's two superset pre-filters. So an
+# encoder that drops a character silently turns every present transcript of
+# an underscore-bearing member cwd into a FALSE-POSITIVE "session ran, no
+# transcript" finding, which escalates, and reports a non-existent
+# ``expected_dir`` to the human reading it.
+#
+# The fixture dir below is a HARD-CODED literal copied from a real
+# ``~/.claude/projects`` entry. It is deliberately NOT built via
+# ``_write_transcript`` (which derives its dir through the encoder under
+# test): a fixture encoded by the buggy function lands in the same wrong
+# place the lookup looks, so the assertion passes vacuously. That is exactly
+# how this divergence survived a fully green suite.
+# ---------------------------------------------------------------------------
+
+_UNDERSCORE_MEMBER_CWD = "/home/leo/src/dark-factory/.eval-worktrees/df_task_12/run-5383f6a8"
+_UNDERSCORE_MEMBER_DIR = "-home-leo-src-dark-factory--eval-worktrees-df-task-12-run-5383f6a8"
+
+
+def _write_transcript_in_literal_dir(
+    projects_root: Path,
+    encoded_dir: str,
+    name: str,
+    first_user_text: str,
+    *,
+    cwd: str | None = None,
+) -> Path:
+    """Write a transcript into an EXPLICITLY NAMED encoded dir.
+
+    Sibling of :func:`_write_transcript` that takes the encoded dir name as a
+    literal instead of deriving it via ``inventory.encode_cwd``, so the
+    fixture cannot track a bug in the encoder it is meant to test.
+
+    When *cwd* is given it is recorded on the user line, the way a real
+    transcript carries its session's REAL cwd. That is the field
+    ``inventory.session_cwd`` reads, and the only evidence
+    ``mod.resolve_session_dir``'s degrade path will accept as confirmation
+    that an unexpectedly-named dir actually belongs to a cwd.
+    """
+    session_dir = projects_root / encoded_dir
+    session_dir.mkdir(parents=True, exist_ok=True)
+    path = session_dir / name
+    line: dict = {"type": "user", "message": {"content": first_user_text}}
+    if cwd is not None:
+        line["cwd"] = cwd
+    path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    return path
+
+
+def test_find_matching_transcript_resolves_underscore_cwd(tmp_path):
+    projects = tmp_path / "projects"
+    rec = _spawn_record("sess-underscore", _UNDERSCORE_MEMBER_CWD, _USABLE_PROMPT)
+
+    match_path = _write_transcript_in_literal_dir(
+        projects, _UNDERSCORE_MEMBER_DIR, "sess-underscore.jsonl", _USABLE_PROMPT
+    )
+
+    got = mod.find_matching_transcript(
+        rec, projects, now=FIXED_NOW, skew=timedelta(hours=6),
+    )
+    assert got == match_path
+
+
+def test_find_missing_transcripts_no_false_positive_for_underscore_cwd(tmp_path):
+    # The live impact: a member session whose transcript IS on disk must not
+    # be reported MISSING just because its cwd contains an underscore.
+    projects = tmp_path / "projects"
+    rec = _spawn_record("sess-underscore", _UNDERSCORE_MEMBER_CWD, _USABLE_PROMPT)
+
+    _write_transcript_in_literal_dir(
+        projects, _UNDERSCORE_MEMBER_DIR, "sess-underscore.jsonl", _USABLE_PROMPT
+    )
+
+    findings = mod.find_missing_transcripts(
+        [rec], projects, ["/home/leo/src/dark-factory"],
+        now=FIXED_NOW, lookback=timedelta(hours=48),
+    )
+
+    assert findings == []
+
+
+# ---------------------------------------------------------------------------
 # step-9/10: pure preventer guard — payload_exports_force_persistence
 # (fixture strings ONLY — never the real committed spawn-claude.sh)
 # ---------------------------------------------------------------------------
@@ -428,6 +513,60 @@ def test_payload_exports_force_persistence_true_for_indented_assignment():
     ) is True
 
 
+def test_payload_exports_force_persistence_true_for_midline_after_semicolon():
+    # A `;`-separated export mid-line (no line-start anchor) must still match
+    # (task 2923 regression: the line-start-only regex missed this).
+    assert mod.payload_exports_force_persistence(
+        "trap 'exit 143' TERM; export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; "
+        "cd /tmp && claude\n"
+    ) is True
+
+
+def test_payload_exports_force_persistence_true_for_midline_after_interpolation():
+    # Mirrors skills/spawn/spawn-claude.sh:350's real construction: prior
+    # `${..._export}` vars (each either empty or `export VAR=val; `)
+    # concatenate directly before `export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`
+    # inside an eval'd string — neither at line start nor preceded by
+    # whitespace, just a `}` boundary from the preceding interpolation
+    # (task 2923).
+    assert mod.payload_exports_force_persistence(
+        'inner="trap foo EXIT; '
+        '${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}'
+        'export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude '
+        '$flags $q_prompt; ec=\\$?; exit \\$ec"\n'
+    ) is True
+
+
+def test_payload_exports_force_persistence_false_for_midline_without_export_keyword():
+    # Mid-line WITHOUT the `export` keyword must still be rejected — the
+    # mandatory-`export` branch exists precisely so a bare mid-line `VAR=1`
+    # substring embedded in prose can't false-positive.
+    assert mod.payload_exports_force_persistence(
+        "trap foo; CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd /tmp && claude\n"
+    ) is False
+
+
+def test_payload_exports_force_persistence_false_for_commented_midline_continuation():
+    # A comment continuing mid-line after a semicolon (a space, not a
+    # boundary char, precedes the token) must not match either.
+    assert mod.payload_exports_force_persistence(
+        "cd /tmp; # do not export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 here\n"
+    ) is False
+
+
+def test_payload_exports_force_persistence_false_for_quoted_echo():
+    # A merely-quoted/echoed token must NOT satisfy the guard — `"`/`'` are
+    # deliberately excluded from the mid-line boundary set, since including
+    # them would match an `echo "export ...=1"` that never actually exports
+    # anything (reviewer_comprehensive/robustness, task 2923 amendment).
+    assert mod.payload_exports_force_persistence(
+        'echo "export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"\n'
+    ) is False
+    assert mod.payload_exports_force_persistence(
+        "echo 'export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1'\n"
+    ) is False
+
+
 # ---------------------------------------------------------------------------
 # step-11/12: escalation envelope + best-effort poster
 # ---------------------------------------------------------------------------
@@ -435,7 +574,7 @@ def test_payload_exports_force_persistence_true_for_indented_assignment():
 def _missing_finding(
     slug: str = "sess-lost",
     cwd: str = "/home/leo/src/dark-factory/.worktrees/2701",
-) -> "mod.MissingTranscript":
+) -> mod.MissingTranscript:
     return mod.MissingTranscript(
         session_slug=slug,
         cwd=cwd,
@@ -454,6 +593,58 @@ class _RecordingPoster:
 
     def __call__(self, url: str, envelope: dict) -> None:
         self.calls.append((url, envelope))
+
+
+class _FakeHttpxResponse:
+    """A 200 `application/json` reply with an empty JSON-RPC body.
+
+    `status_code`, `headers` and `json()` were added for task 3644:
+    `_default_poster` now delegates to `census_trigger.post_mcp_envelope`,
+    which reads `status_code` (to detect the stateful escalation server's 400
+    "Missing session ID") and `content-type` (to detect an SSE-framed body)
+    before decoding. Without them this fake would die on an AttributeError
+    and stop exercising the real code path -- so the task-2953 header
+    contract below keeps being asserted against the transport that actually
+    ships, not against a fake the implementation has outgrown."""
+
+    status_code = 200
+    headers = {"content-type": "application/json"}
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {}
+
+
+def test_default_poster_sends_streamable_http_accept_headers(install_fake_httpx):
+    """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
+    lacking an Accept header covering both application/json and
+    text/event-stream (verified live against a local MCP /mcp endpoint).
+    `_default_poster`'s httpx import is lazy, but httpx IS importable here --
+    a direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
+    task 2965) -- so an un-faked call would really hit the network. The
+    shared `install_fake_httpx` fixture substitutes a stub so the outbound
+    request shape is assertable independent of any live listener.
+    Mirrors nightly.py's identical test for its own `_default_poster`."""
+    captured_kwargs = {}
+
+    def _fake_post(url, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeHttpxResponse()
+
+    install_fake_httpx(_fake_post)
+
+    mod._default_poster('http://localhost:8199/mcp', {'jsonrpc': '2.0'})
+
+    headers = captured_kwargs.get('headers') or {}
+    assert 'application/json' in headers.get('Accept', '')
+    assert 'text/event-stream' in headers.get('Accept', '')
+    # Content-Type is part of the same transport contract -- pin it too so a
+    # future edit dropping it can't pass on the Accept assertions alone.
+    assert headers.get('Content-Type') == 'application/json'
+    # The envelope must still ride along unchanged on the same POST.
+    assert captured_kwargs.get('json') == {'jsonrpc': '2.0'}
 
 
 def test_build_escalation_arguments_shape(tmp_path):
@@ -714,3 +905,142 @@ def test_read_spawn_script_unreadable_returns_empty(tmp_path):
     a_dir = tmp_path / "a_dir"
     a_dir.mkdir()
     assert mod._read_spawn_script(a_dir) == ""
+
+
+# ---------------------------------------------------------------------------
+# task 3644: the transcript-loss alarm must survive a STATEFUL server
+# ---------------------------------------------------------------------------
+#
+# Same defect as nightly.py's and census.py's posters: `_default_poster`
+# bare-POSTed `tools/call`, the escalation server rejects it at the transport
+# layer with `400 Bad Request` / "Missing session ID" (captured live
+# 2026-08-05), and `post_findings` swallows that best-effort and returns
+# False -- so the transcript-loss alarm never reached anyone. Fixed by the
+# same single-sourced transport in census_trigger.
+
+
+class _FakeStatefulResponse:
+    """An `httpx.Response` stand-in for the stateful-server handshake."""
+
+    def __init__(self, *, status_code=200, headers=None, payload=None, text=""):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+        self._payload = payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            # A plain RuntimeError, not httpx.HTTPStatusError: the shared
+            # install_fake_httpx stub exposes only `post` and pytest.fails on
+            # any other attribute (task 3376).
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("response has no JSON body")
+        return self._payload
+
+
+def _stateful_escalation_post(recorded, *, session_id="sid-transcript"):
+    """A fake `httpx.post` behaving like the STATEFUL escalation server:
+    session-less `tools/call` -> 400; `initialize` -> 200 + the assigned id
+    as a response header; `notifications/initialized` -> 202; `tools/call`
+    WITH that header -> 200."""
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        method = envelope.get("method")
+        if method == "initialize":
+            return _FakeStatefulResponse(
+                headers={"mcp-session-id": session_id,
+                         "content-type": "application/json"},
+                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
+            )
+        if method == "notifications/initialized":
+            return _FakeStatefulResponse(status_code=202)
+        if (kwargs.get("headers") or {}).get("mcp-session-id") != session_id:
+            return _FakeStatefulResponse(
+                status_code=400,
+                headers={"content-type": "application/json"},
+                payload={"jsonrpc": "2.0", "id": "server-error",
+                         "error": {"code": -32600,
+                                   "message": "Bad Request: Missing session ID"}},
+            )
+        return _FakeStatefulResponse(
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1,
+                     "result": {"structuredContent": {"id": "esc-11", "status": "queued"}}},
+        )
+
+    return _post
+
+
+def _recording_delete(deleted):
+    """A fake `httpx.delete` recording the MCP session-termination call the
+    transport makes after a handshake, so the long-lived escalation server does
+    not leak a session per transcript-loss alarm."""
+    def _delete(url, **kwargs):
+        deleted.append((url, kwargs))
+        return _FakeStatefulResponse(status_code=200)
+
+    return _delete
+
+
+def test_post_findings_lands_against_a_stateful_server(tmp_path, install_fake_httpx):
+    """The DEFAULT poster (no `poster=` injection) must handshake and land.
+
+    `post_findings` -- NOT `post_escalation`; this module's escalation
+    entrypoint takes a `Sequence[MissingTranscript]` -- so a minimal non-empty
+    findings list is what reaches the POST."""
+    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+    recorded = []
+    deleted = []
+    install_fake_httpx(
+        _stateful_escalation_post(recorded), delete=_recording_delete(deleted),
+    )
+
+    assert mod.post_findings(cfg, [_missing_finding("sess-lost-1")]) is True
+
+    methods = [(kwargs.get("json") or {}).get("method") for _url, kwargs in recorded]
+    assert methods == [
+        "tools/call", "initialize", "notifications/initialized", "tools/call",
+    ]
+    # The retried call carries the server-assigned session id...
+    assert (recorded[-1][1].get("headers") or {}).get("mcp-session-id") == "sid-transcript"
+    # ...and is still the escalate_info the alarm meant to file.
+    params = (recorded[-1][1].get("json") or {})["params"]
+    assert params["name"] == "escalate_info"
+    assert "sess-lost-1" in params["arguments"]["detail"]
+    # ...and the session opened to file it is released again.
+    assert [(kw.get("headers") or {}).get("mcp-session-id") for _u, kw in deleted] == [
+        "sid-transcript"
+    ]
+
+
+def test_post_findings_reports_false_on_a_tool_error_envelope(
+    tmp_path, install_fake_httpx, caplog
+):
+    """HTTP 200 is not success. `post_findings` discards the response body and
+    reports True on "no exception", so a tool-level failure
+    (`result.isError: true`) would otherwise read as a landed alarm -- the same
+    green-on-paper/nothing-filed failure task 3644 exists to close, one layer
+    up from the transport."""
+    cfg = load_config(_write_config(tmp_path, project_id="proj_a"))
+
+    def _post(url, **kwargs):
+        return _FakeStatefulResponse(
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1, "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": "unknown category 'nope'"}],
+            }},
+        )
+
+    install_fake_httpx(_post)
+
+    with caplog.at_level(logging.WARNING):
+        assert mod.post_findings(cfg, [_missing_finding("sess-lost-1")]) is False
+
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("escalation post failed" in m for m in warned), warned
+    assert any("isError" in m or "reported an error" in m for m in warned), warned

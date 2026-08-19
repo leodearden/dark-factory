@@ -1045,3 +1045,74 @@ class TestMapAdvanceFailurePerBranchStillBlocks:
         assert outcome.reason == f'advance_main failed ({result}) for task {task_id}'
         halt.assert_not_called()
         assert task_id not in cas_retries
+
+
+class TestIsCrossRepoTask:
+    """Unit tests for the pure ``is_cross_repo_task`` cross-repo classifier.
+
+    The helper lets the pre-merge Decision-1 gate recognize a task whose
+    declared plan files ALL belong to a *different* project (the reify-task
+    5308 shape) so the workflow can route it to the honest
+    ``plan_files_cross_repo`` terminal outcome instead of false-flagging the
+    (legitimately empty) branch as "plan files not touched".
+    """
+
+    def test_marker_true_with_any_files(self, tmp_path):
+        # (a) explicit metadata.cross_repo marker → True regardless of paths.
+        from orchestrator.merge_gates import is_cross_repo_task
+
+        assert is_cross_repo_task(
+            ['orchestrator/src/orchestrator/offline_lane.py'],
+            tmp_path / 'reify',
+            {'cross_repo': True},
+        ) is True
+
+    def test_all_absolute_foreign_no_marker(self, tmp_path):
+        # (b) every entry is an absolute path resolving OUTSIDE project_root → True.
+        from orchestrator.merge_gates import is_cross_repo_task
+
+        project_root = tmp_path / 'reify'
+        files = [
+            '/home/leo/src/dark-factory/orchestrator/src/orchestrator/offline_lane.py',
+            '/home/leo/src/dark-factory/orchestrator/tests/test_offline_lane.py',
+        ]
+        assert is_cross_repo_task(files, project_root, None) is True
+
+    def test_mixed_absolute_foreign_and_relative_local(self, tmp_path):
+        # (c) one absolute-foreign + one relative entry, no marker → False.
+        from orchestrator.merge_gates import is_cross_repo_task
+
+        files = [
+            '/home/leo/src/dark-factory/orchestrator/src/orchestrator/offline_lane.py',
+            'reify/src/reify/local.py',
+        ]
+        assert is_cross_repo_task(files, tmp_path / 'reify', None) is False
+
+    def test_all_relative_no_marker(self, tmp_path):
+        # (d) all relative entries, no marker → False (orchestrator can't
+        # classify a relative foreign path without the fused-memory registry).
+        from orchestrator.merge_gates import is_cross_repo_task
+
+        files = [
+            'orchestrator/src/orchestrator/offline_lane.py',
+            'orchestrator/tests/test_offline_lane.py',
+        ]
+        assert is_cross_repo_task(files, tmp_path / 'reify', None) is False
+
+    def test_empty_plan_files(self, tmp_path):
+        # (e) empty plan_files → False (empty check precedes the marker).
+        from orchestrator.merge_gates import is_cross_repo_task
+
+        assert is_cross_repo_task([], tmp_path / 'reify', None) is False
+        assert is_cross_repo_task([], tmp_path / 'reify', {'cross_repo': True}) is False
+
+    def test_absolute_path_inside_project_root(self, tmp_path):
+        # (f) no marker and an absolute file INSIDE project_root → False.
+        from orchestrator.merge_gates import is_cross_repo_task
+
+        project_root = tmp_path / 'proj'
+        project_root.mkdir()
+        inside = project_root / 'src' / 'mod.py'
+        assert is_cross_repo_task([str(inside)], project_root, None) is False
+        # A falsy marker is treated as absent.
+        assert is_cross_repo_task([str(inside)], project_root, {'cross_repo': False}) is False

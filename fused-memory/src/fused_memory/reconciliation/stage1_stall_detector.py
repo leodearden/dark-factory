@@ -28,6 +28,33 @@ Escalation category note:
   ``reconciliation_stale_flag`` category to allow filtering on each
   independently.
 
+  A second, independent Stage 1 category ``reconciliation_stale_gate_backlog``
+  (task 3017) is filed by ``maybe_escalate_stalled_gate_backlog`` when a
+  blocked human-decision gate task's ``metadata.gate_escalated_at`` stamp has
+  aged past ``STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS`` (48h).  It is a
+  deterministic age check — no Mem0 marker accumulation, no LLM finding.  It is
+  deduped by FOLDING, via ``submit_or_dedupe(..., DedupeConfig.for_gate_backlog())``
+  (task 3522): a gate that stays stalled re-files every cycle and each filing
+  collapses into the same pending parent, incrementing ``dedupe_count`` instead
+  of minting a second record.  That count is the steward's recurrence /
+  triage-order signal (``skills/recon-escalation-watcher/SKILL.md`` §Draining) —
+  it lets a drain float the longest-rotting gates first.  It replaces the
+  earlier ``has_open_l1(task_id, category=...)`` skip, which suppressed every
+  cycle after the first and so pinned ``dedupe_count`` at 0 forever.  The fold
+  is keyed on a ``(category, project_id, task_id)`` content fingerprint over an
+  UNBOUNDED window, so a gate open 300h still folds into its original parent.
+
+  As before, this path is never *suppressed by* an unrelated open L1 — a
+  ``reconciliation_stale_human_operator`` L1 or the DeterministicRunner's
+  born-at-L2 ``milestone_gate`` escalation — since folding requires a matching
+  category, level, AND fingerprint.  The independence is still only guaranteed
+  in that one direction: the HOR path (``maybe_escalate_stalled_tasks``) dedups
+  with an UN-categorized ``has_open_l1(task_id)`` (its own task-1201 "at most one
+  open L1 per task" contract), so a pre-existing open gate-backlog L1 WOULD
+  *suppress* a same-task HOR escalation.  In practice the two populations
+  (LLM-finding ``human_operator_required`` flags vs. blocked born-at-L2 gates)
+  are disjoint, so this asymmetry does not bite.
+
 Stall marker accumulation:
   ``stage1_human_operator_stall_marker`` memories accumulate indefinitely —
   there is no cleanup hook tied to task resolution or escalation resolution.
@@ -58,14 +85,30 @@ Dedup interaction:
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from fused_memory.utils.async_utils import gather_collect
 
 try:
+    # One combined block, deliberately: TestEscalationBinding stubs
+    # ``sys.modules['escalation'] = None``, which fails BOTH imports, so all
+    # four names bind or fail together and a single ``is None`` check remains
+    # sufficient at RUNTIME.  A second try block would let the dedupe names bind
+    # while Escalation did not (or vice versa) and split that guard in two.
+    # Call sites still name every symbol they use in the guard, because only an
+    # identity check on the name itself narrows it for the type checker.
+    from escalation.dedupe import (  # type: ignore[import-untyped]
+        DedupeConfig,
+        compute_content_fingerprint,
+        submit_or_dedupe,
+    )
     from escalation.models import Escalation  # type: ignore[import-untyped]
     _HAS_ESCALATION = True
 except ImportError:
     Escalation = None  # type: ignore[assignment,misc]
+    DedupeConfig = None  # type: ignore[assignment,misc]
+    compute_content_fingerprint = None  # type: ignore[assignment]
+    submit_or_dedupe = None  # type: ignore[assignment]
     _HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
@@ -79,6 +122,18 @@ a level-1 escalation is submitted."""
 _STAGE1_HUMAN_OPERATOR_STALL_MARKER_SOURCE = 'stage1_human_operator_stall_marker'
 """Mem0 metadata ``source`` tag used to accumulate per-task stall-cycle
 markers.  Kept private to this module — callers use the public helpers."""
+
+STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS: float = 48 * 3600
+"""Age (in seconds) a blocked human-decision gate task's
+``metadata.gate_escalated_at`` stamp may reach before a level-1
+``reconciliation_stale_gate_backlog`` escalation is filed (task 3017).  A
+module constant, mirroring ``STAGE1_HUMAN_OPERATOR_STALL_THRESHOLD`` (not
+config)."""
+
+_GATE_BACKLOG_ESCALATION_CATEGORY = 'reconciliation_stale_gate_backlog'
+"""``Escalation.category`` used for the deterministic gate-backlog age check.
+Kept distinct from ``reconciliation_stale_human_operator`` so the two Stage 1
+aging signals dedup and filter independently (task 3017)."""
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────
@@ -113,6 +168,98 @@ def extract_human_operator_task_ids(flags: list[dict]) -> list[str]:
             seen.add(tid)
             result.append(tid)
     return result
+
+
+def gate_escalated_age_secs(metadata: dict | None, *, now: datetime) -> float | None:
+    """Age (in seconds) of ``metadata['gate_escalated_at']``, or ``None``.
+
+    ``gate_escalated_at`` is a DeterministicRunner idempotency stamp written
+    ONLY by ``_file_milestone_gate_and_block`` whenever a born-at-L2
+    human-decision gate is filed (blessed key
+    ``shared/src/shared/task_metadata.py``).  Its presence is therefore the
+    unambiguous, authoritative "a human decision has been pending since this
+    instant" signal (task 3017), so the age check keys purely on a parseable
+    stamp — it deliberately does NOT filter on ``operational_mode``.
+
+    Rationale for ignoring ``operational_mode`` (reviewer amendment): the
+    operational-routing contract
+    (``fused_memory/middleware/operational_routing_guard.py``) coerces a
+    ``decision`` task (ANY mode) and an ``operational`` + ``llm`` task into a
+    *pure gate* that ``_file_milestone_gate_and_block`` blocks and stamps —
+    while leaving ``operational_mode='llm'`` on the metadata.  The
+    LLM-operational lane that would route such a gate to an agent instead of a
+    human is explicit future work (``deterministic_runner.py``
+    ``operational_llm_needs_lane``), so today an ``operational_mode=='llm'``
+    gate STILL awaits a human decision.  An ``operational_mode``-based filter
+    would silently exclude exactly that population and defeat the feature; the
+    ``gate_escalated_at`` stamp already captures the "human gate filed" fact
+    precisely.
+
+    Returns ``None`` — never raises — when:
+
+    - *metadata* is not a ``dict``;
+    - ``gate_escalated_at`` is missing, ``None``, empty, or not a ``str``;
+    - ``gate_escalated_at`` is not a parseable ISO-8601 timestamp
+      (``ValueError`` swallowed);
+    - subtracting an aware *now* from a naive parsed stamp raises
+      ``TypeError`` (swallowed) — a naive stamp yields ``None``.
+
+    The helper does NOT clamp: a future ``gate_escalated_at`` returns a
+    negative age.  Swallowing parse/subtraction errors upholds the module's
+    fail-soft contract so one malformed stamp never aborts the Stage 1 pass.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    raw = metadata.get('gate_escalated_at')
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+        return (now - parsed).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+def extract_stalled_gate_backlog_task_ids(
+    tasks: list[dict],
+    *,
+    now: datetime,
+    threshold_secs: float = STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
+) -> list[str]:
+    """Return sorted, deduped str task_ids of blocked gate tasks aged past threshold.
+
+    A task qualifies when ALL hold (task 3017):
+
+    - ``task['status'] == 'blocked'`` (a human-decision gate blocks while its
+      born-at-L2 escalation is open);
+    - ``gate_escalated_age_secs(task['metadata'], now=now)`` is not ``None``
+      (i.e. it carries a parseable ``gate_escalated_at`` stamp — the
+      authoritative born-at-L2 human-gate signal, regardless of
+      ``operational_mode``) AND that age is strictly greater than
+      *threshold_secs*;
+    - ``task['id']`` is not ``None`` (coerced to ``str``).
+
+    Pure (no I/O).  Mirrors ``compute_stalled_task_ids``' sorted return and
+    ``extract_human_operator_task_ids``' first-seen dedup + ``str(id)``
+    coercion.  Callers restrict *tasks* to ``filtered_task_tree.active_tasks``
+    so resolved-and-done gates are excluded for free.  Empty input → ``[]``.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for task in tasks:
+        if task.get('status') != 'blocked':
+            continue
+        age = gate_escalated_age_secs(task.get('metadata'), now=now)
+        if age is None or age <= threshold_secs:
+            continue
+        raw_tid = task.get('id')
+        if raw_tid is None:
+            continue
+        tid = str(raw_tid)
+        if tid not in seen:
+            seen.add(tid)
+            result.append(tid)
+    return sorted(result)
 
 
 # ── Async I/O helpers ────────────────────────────────────────────────────────
@@ -305,6 +452,196 @@ async def maybe_escalate_stalled_tasks(
         except Exception as exc:
             logger.warning(
                 'stage1_stall_detector: failed to escalate task_id=%s (id-gen, construction, or submit): %s',
+                task_id,
+                exc,
+                extra={'project_id': project_id, 'task_id': task_id},
+            )
+
+    return escalated
+
+
+async def maybe_escalate_stalled_gate_backlog(
+    escalation_queue,
+    project_id: str,
+    run_id: str,
+    stalled_task_ids: list[str],
+    task_by_id: dict[str, dict],
+    *,
+    now: datetime,
+    threshold_secs: float = STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
+) -> list[str]:
+    """File level-1 gate-backlog escalations for stalled gate tasks, folding repeats.
+
+    Mirrors ``maybe_escalate_stalled_tasks`` (task 3017).  For each *task_id* in
+    *stalled_task_ids*:
+
+    - File through ``submit_or_dedupe(..., DedupeConfig.for_gate_backlog())``
+      (task 3522).  A gate that stays stalled therefore FOLDS into its existing
+      pending record rather than being suppressed: same parent id, no second
+      pending record, and ``dedupe_count`` incremented once per cycle the gate
+      stays stale.  That count is the steward's recurrence / triage-order signal
+      (``skills/recon-escalation-watcher/SKILL.md`` §Draining) — under the old
+      ``has_open_l1`` skip it was pinned at 0 forever.  The fold key is the
+      ``(category, project_id, task_id)`` content fingerprint stamped below, and
+      the window is UNBOUNDED, so a gate open 300h still folds into its original
+      parent.  A fold logs INFO and, filing no new record, excludes the task_id
+      from the returned list.
+    - Note the HOR path is unchanged and still asymmetric: it dedups with an
+      UN-categorized ``has_open_l1(task_id)`` (its own task-1201 "at most one
+      open L1 per task" contract), so a pending gate-backlog L1 CAN still
+      *suppress* a same-task HOR escalation — harmless because the two
+      populations are disjoint in practice.  Only the gate path's own dedup
+      mechanism changed.
+    - Build an ``Escalation`` with ``level=1``, ``severity='blocking'``,
+      ``category=_GATE_BACKLOG_ESCALATION_CATEGORY`` and submit it.  The summary
+      states the ``gate_escalated_at`` anchor from
+      ``task_by_id[task_id]['metadata']`` together with the static
+      ``threshold_secs`` fact — both true at any later read time, including
+      through a ``compact=True`` drain, which keeps ``summary`` but drops
+      ``detail`` (see ``_COMPACT_ESCALATION_FIELDS`` in
+      ``escalation/src/escalation/server.py``).  Naming the threshold alongside
+      the anchor lets a compact-drain read convey urgency without requiring a
+      mental diff against "now".  The age recomputed via
+      ``gate_escalated_age_secs`` is retained only as a filing-time forensic
+      value in the detail block (``age_hours_at_filing``), since it goes stale
+      while the escalation sits open.  The ``age_hours is not None`` branch
+      condition doubles as a guard: it holds only when ``gate_escalated_at``
+      parsed successfully, so the summary anchor is provably a real timestamp;
+      an unparseable or absent stamp falls through to the threshold-named
+      fallback summary below instead.  Any failure (id-gen, construction,
+      fingerprint, submit, or fold) logs WARNING and excludes the task_id from
+      the returned list.
+
+    Returns the list of task_ids that received a NEW escalation — folds are
+    deliberately excluded, so the caller's ``stage1_gate_backlog_escalated``
+    stat keeps meaning "new gate-backlog filings this cycle" and reads 0 on a
+    fold cycle.  Recurrence is carried by ``dedupe_count`` on the record (and
+    the fold INFO log), not by this list.  Returns ``[]`` immediately when the
+    ``escalation`` package is unavailable.
+
+    *threshold_secs* is accepted for signature symmetry with
+    ``extract_stalled_gate_backlog_task_ids`` (the caller has already applied
+    the age filter) and names the boundary in both summary branches: paired
+    with the live anchor when the age is known, alone in the fallback summary
+    when it cannot be recomputed.
+    """
+    # All four names bind or fail together (one combined try/except), so any
+    # ONE identity check is sufficient at RUNTIME.  Every name used below is
+    # still listed explicitly because only an identity check on the name itself
+    # NARROWS that optionally-imported symbol for the type checker — a guard on
+    # ``Escalation`` alone leaves the other three typed ``... | None`` and their
+    # call/attribute sites below fail to type-check.
+    if (
+        Escalation is None
+        or DedupeConfig is None
+        or compute_content_fingerprint is None
+        or submit_or_dedupe is None
+    ):
+        return []
+
+    escalated: list[str] = []
+    for task_id in stalled_task_ids:
+        task = task_by_id.get(task_id) or {}
+        metadata = task.get('metadata') if isinstance(task, dict) else None
+        age_secs = gate_escalated_age_secs(metadata, now=now)
+        age_hours = round(age_secs / 3600, 1) if age_secs is not None else None
+        gate_escalated_at = (
+            metadata.get('gate_escalated_at') if isinstance(metadata, dict) else None
+        )
+
+        if age_hours is not None:
+            summary = (
+                f'Gate task {task_id} has awaited a human decision since '
+                f'{gate_escalated_at} (past the {threshold_secs / 3600:.0f}h '
+                f'gate-backlog threshold)'
+            )
+        else:
+            summary = (
+                f'Gate task {task_id} has awaited a human decision beyond the '
+                f'{threshold_secs / 3600:.0f}h gate-backlog threshold'
+            )
+
+        detail_parts = [
+            f'project_id: {project_id}',
+            f'run_id: {run_id}',
+            f'task_id: {task_id}',
+            f'gate_escalated_at: {gate_escalated_at}',
+            f'age_hours_at_filing: {age_hours if age_hours is not None else "unknown"}',
+        ]
+        title = task.get('title') if isinstance(task, dict) else None
+        if title:
+            detail_parts.append(f'title: {title}')
+        description = task.get('description') if isinstance(task, dict) else None
+        if description:
+            detail_parts.append(f'description: {description}')
+        detail = '\n'.join(detail_parts)
+
+        try:
+            # make_id() and Escalation() are inside the try so that id-generation
+            # or constructor failures are caught and logged rather than escaping.
+            #
+            # Fold key = (category, project_id, task_id) and nothing else.  It
+            # MUST NOT include the age, run_id, or any summary/detail prose:
+            # those drift every cycle, and a drifting key never folds, which
+            # would re-pin dedupe_count at 0 — the defect this stamp fixes.
+            # Stability is structural rather than by discipline: because
+            # ``affected_ids`` is non-empty, compute_content_fingerprint ignores
+            # the description argument entirely, so prose *cannot* enter the key.
+            # ``''`` for finding_category is the documented "no finding in
+            # scope" sentinel used by harness._escalate.
+            fingerprint = compute_content_fingerprint(
+                _GATE_BACKLOG_ESCALATION_CATEGORY, '', [f'{project_id}:{task_id}'], ''
+            )
+            # Fail closed on a falsy key rather than filing anyway: find_dedupe_parent
+            # treats one as "never fold", so the record would silently become a
+            # second visible pending record for this gate.  `raise`, not `assert`
+            # (stripped under `python -O`); the handler below logs WARNING and drops
+            # the task_id, and the still-stalled gate retries next cycle.  Unreachable
+            # via today's sha256-hexdigest callee — it guards a future change to it,
+            # and is covered by test_empty_fingerprint_is_not_filed.
+            if not fingerprint:
+                raise ValueError(
+                    f'empty dedupe_fingerprint for gate-backlog task_id={task_id}'
+                )
+            esc = Escalation(
+                id=escalation_queue.make_id(task_id),
+                task_id=task_id,
+                agent_role='reconciliation-stage1',
+                severity='blocking',
+                category=_GATE_BACKLOG_ESCALATION_CATEGORY,
+                summary=summary,
+                detail=detail,
+                level=1,
+                dedupe_fingerprint=fingerprint,
+            )
+            result = submit_or_dedupe(
+                escalation_queue, esc, DedupeConfig.for_gate_backlog()
+            )
+            if result.get('status') == 'dedup_skipped':
+                # Loud-over-silent: the recurrence is visible in the log stream,
+                # not only on disk.  Replaces the old
+                # ``..._escalation_suppressed`` line, which reported a filing
+                # that had been dropped; this one reports a filing that landed
+                # as an increment on the parent.
+                logger.info(
+                    'reconciliation.stage1_gate_backlog_escalation_folded: '
+                    'task_id=%s folded into parent_id=%s (child_id=%s)',
+                    task_id,
+                    result.get('parent_id'),
+                    result.get('child_id'),
+                    extra={'project_id': project_id, 'task_id': task_id},
+                )
+            else:
+                # Only NEW records are reported — see the docstring's Returns
+                # contract and the caller's ``stage1_gate_backlog_escalated``
+                # stat.  Tested with ``!=`` rather than ``== 'queued'`` so
+                # observed_submit_response's auto-resolved/dismissed branch (a
+                # record WAS minted) still counts as a filing.
+                escalated.append(task_id)
+        except Exception as exc:
+            logger.warning(
+                'stage1_stall_detector: failed to escalate gate-backlog task_id=%s '
+                '(id-gen, construction, fingerprint, submit, or fold): %s',
                 task_id,
                 exc,
                 extra={'project_id': project_id, 'task_id': task_id},

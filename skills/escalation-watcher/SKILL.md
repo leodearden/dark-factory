@@ -47,15 +47,78 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 # Claim watcher-<project> (e.g. watcher-df) — STAND_DOWN policy: a live duplicate wins the lease
 # and this session must exit rather than run a second watch loop against the same project.
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-claim \
-  --name watcher-<project> --slug watcher-<project>-$$ --pid $$ --policy stand-down
+  --name watcher-<project> --slug "watcher-<project>-${CLAUDE_PID:-$PPID}" --policy stand-down
 ```
 
-Parse the two printed lines: `decision=<acquired|stand-down|proceed>` followed by a human-readable
-message.
-- **`decision=stand-down`**: print the message verbatim (`lease held by <session> (alive, heartbeat
-  Ns ago) — standing down`) and **exit immediately** — do not start the watcher, do not drain.
+**Never `$$` — it is both the wrong pid and an unusable slug.** Inside a Claude Code Bash tool call
+`$$` is the transient `/bin/bash -c` wrapper, dead the instant the call returns; the long-lived
+`claude` process is `$CLAUDE_PID` (fall back to `$PPID`). Verify with:
+
+```bash
+ps -o comm= -p "${CLAUDE_PID:-$PPID}"   # prints: claude
+```
+
+This bit twice over (task 3994). A `$$` **pid** made the lease's liveness guard inert — every holder
+read as dead, so the lease silently degraded to a bare heartbeat TTL. A `$$` **slug** is worse now
+that ownership is enforced: every Bash tool call gets a fresh `$$`, so the slug you claimed with
+would never match the one your own later `lease-heartbeat`/`lease-release` present, and every one of
+them would be refused. `${CLAUDE_PID:-$PPID}` is stable across tool calls — that is exactly why it
+works as the slug.
+
+`--pid` is now **optional**: omitted, the CLI resolves it from `$CLAUDE_PID` itself, so the correct
+pid no longer depends on this document getting one shell token right. Pass `--pid <n>` only as a
+deliberate operator override. If `$CLAUDE_PID` is unset the CLI records **pid 0** — a sentinel that
+reads as never-alive, so the lease degrades to heartbeat-only staleness (loudly logged) rather than
+recording some other durable-but-unrelated pid that would make the lease unreapable forever. On that
+path the body's pid won't match the `$PPID` in your slug; pass `--pid "$PPID"` explicitly if you want
+the two to agree.
+
+Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-readable message, then
+`holder_liveness=<none|held|orphaned>`.
 - **`decision=acquired` or `decision=proceed`**: continue into the Main Loop below. `proceed` is the
-  fail-open outcome (see below) and is handled identically to `acquired`.
+  fail-open outcome (see below) and is handled identically to `acquired`. An acquired claim prints
+  `holder_liveness=none` — there is no contending holder, the lease is yours; a faulted (`proceed`)
+  claim prints no `holder_liveness` line at all, because nothing is known about a holder.
+- **`decision=stand-down` + `holder_liveness=held`**: print the message verbatim and **exit
+  immediately** — do not start the watcher, do not drain.
+- **`decision=stand-down` + `holder_liveness=orphaned`**: the pid recorded in the lease body is not
+  running — that is the whole signal, a pid probe and nothing more. It is provably gone *at the pid
+  level*, but its heartbeat is still within TTL so the lease is not yet reclaimable. **Do not exit
+  silently.** This skill is the only L2 consumer, so
+  standing down for a holder that no longer exists is how a queue sits unhandled for hours. Inspect,
+  file a DecisionRecord naming the orphan (the same `write-decision` verb used for parked decisions
+  below), print it, **then** exit:
+
+  ```bash
+  python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-show \
+    --name watcher-<project>     # holder_slug / holder_pid / heartbeat_age_secs / reclaimable
+
+  python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
+    --id watcher-lease-orphan-<project> --project <project> \
+    --text "watcher-<project> lease held by orphaned holder <holder_slug> (pid <holder_pid> not running, heartbeat <n>s ago); no live L2 consumer until it is reclaimed" \
+    --session-id "watcher-<project>-${CLAUDE_PID:-$PPID}"
+  ```
+
+  Do **not** force-release it on this evidence alone — `holder_liveness` is a single-signal
+  diagnostic, and a dead-*looking* holder that is merely quiet is the duplicate-spawn incident. This
+  guard carries the whole weight here: a pid probe is the *only* corroboration there is. (Task 3994
+  designed a second signal — cross-checking the holder's own session-registry record — then measured
+  it structurally impossible, because a lease slug is a claimant-chosen ownership token and not a
+  record key, and withdrew it rather than ship a check that never fires.) Reclaiming is the human's
+  call, or the reaper's once the TTL expires.
+
+**Reading the contention message.** It reports two INDEPENDENT axes — whether the holder's *pid* is
+running, and how fresh its *heartbeat* is — and then states the decision they imply:
+
+```
+lease held by watcher-df-1348600 (pid 1348600 alive, heartbeat 42s ago) — standing down
+lease held by watcher-df-1348600 (pid 1348600 is not running, but its heartbeat is FRESH — 42s ago;
+the lease is still held and is NOT reclaimable for another 7158s) — standing down
+```
+
+A **fresh heartbeat means you stand down**, even when the pid reads as not running: staleness
+requires BOTH a dead pid AND a heartbeat past the TTL. Reading "dead" and concluding "therefore
+mine" is precisely what force-released a live holder's lease on 2026-08-08.
 
 **INTERACTIVE-ONLY.** This lease claim belongs to the interactive L2 watcher (this skill) only. The
 headless `escalation-watcher-auto` rotation (L1) never claims or contends this lease — it has no
@@ -63,17 +126,52 @@ headless `escalation-watcher-auto` rotation (L1) never claims or contends this l
 single-owner-per-session actor). If you are running as `escalation-watcher-auto`, skip this section
 entirely.
 
+The split is by SHAPE, not by queue: an interactive, hand-launched, single-owner-per-session watcher
+claims a lease; a supervised always-on rotation does not. So `recon-escalation-watcher` — likewise
+hand-launched, unsupervised, and the sole closer of the 8103 queue — claims its own
+`recon-watcher-<project>` lease under the same contract (task 3994; see
+`skills/recon-escalation-watcher/SKILL.md` §"Claiming the Recon Watcher Lease"). Separate lease
+names, so the two watchers never contend with each other.
+
 **Fail-soft (fail-open).** A lease-substrate fault (disk error, unwritable `~/.claude/fleet/`, …) is
 logged loudly by `session_registry` and reported back as `decision=proceed` — never a false
 `stand-down`. A lease fault must never block a watch session from starting.
 
 **Heartbeat + release.** Once claimed, touch the lease every Main Loop cycle (see "Starting the
 watcher" below) so it never appears stale to another session's claim attempt, and release it when
-the watch session ends (clean exit, or the human stops it):
+the watch session ends (clean exit, or the human stops it). Both verbs **require** the slug you
+claimed with — a mismatch is refused, so no other session can evict your lease, and no stranger can
+keep a dead holder's lease alive forever:
 
 ```bash
-python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release --name watcher-<project>
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release \
+  --name watcher-<project> --slug "watcher-<project>-${CLAUDE_PID:-$PPID}"
 ```
+
+Both print `result=<applied|forced|absent|refused|faulted>` as their first line:
+- **`applied`** — you are the holder and the mutation happened.
+- **`absent`** — no such lease. On a **release** that is plain idempotence, not an error. On a
+  **heartbeat** it is a real condition and must not be ignored — see "Lease heartbeat (each cycle)"
+  below.
+- **`refused`** — you are **not** the holder; nothing was touched. Do not re-run with `--force`
+  reflexively: inspect first with `lease-show` (below). A refusal usually means your slug drifted
+  (see `$$` above) or another session legitimately holds it.
+- **`forced`** — `--force` overrode a refusal. Operator recovery only; logged loudly naming both the
+  forcing slug and the displaced holder.
+- **`faulted`** — the mutation itself failed (a substrate error). Logged, never raised; the exit
+  code stays 0 so a lease fault cannot break your loop.
+
+**Inspecting a lease — use `lease-show`, never `cat`.**
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-show --name watcher-<project>
+```
+
+`cat` shows the holder's slug/pid and the immutable `start_ts` they claimed at — it **cannot** show
+freshness, because the heartbeat is the file's mtime. `lease-show` prints `state`, `holder_slug`,
+`holder_pid`, `holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs` and `reclaimable` as
+`key=value` lines, computed by the same reader `lease-claim` decides with. It is read-only: it never
+bumps the heartbeat.
 
 ## The Main Loop
 
@@ -147,20 +245,29 @@ every run — do NOT pipe `2>&1` when you parse stdout as the escalation JSON, o
 parse.
 
 **Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice before
-returning. Run as a **background** task (`run_in_background: true`), it is exempt from the Bash
-tool's foreground timeouts — it runs detached across turns and notifies on exit — so use the long
+returning, and **every** call — background *and* foreground — must carry an explicit Bash-tool
+`timeout` parameter sized to at least `(--timeout + 60s) × 1000` ms — e.g. `timeout: 3660000` for
+`--timeout 3600`. `run_in_background: true` does **not** exempt a call from the harness timeout:
+measured 2026-08-10, background arms launched with no `timeout` parameter were killed after ~116s
+(≈ the 120000ms Bash default) against a configured `--timeout 540` slice, so the slice length was
+never the constraint; re-arming the identical command with `timeout: 3660000` survived 6m32s and
+exited cleanly with `WATCHER_REARM_OUTCOME: FIRED exit=0`. With that parameter passed, use the long
 canonical slice: `--timeout 3600` yields at most one heartbeat wake per hour (`CEILING`) while a
-real L2 escalation still fires instantly via inotify. A short slice buys no protection in the
-background — the old `--timeout 540` merely forced a wake-notify-rearm turn every 9 minutes.
-Only **foreground** calls (e.g. debugging outside the background task) are governed by the harness
-timeouts. An omitted Bash `timeout` parameter kills the call at the 2-minute default before the
-wait can return (the 07-09 exit-143 failure mode this wrapper exists to prevent). For a foreground
-call, size the Bash `timeout` parameter to at least `(--timeout + 60s) × 1000` ms — e.g.
-`timeout: 3660000` for `--timeout 3600` — which requires `BASH_MAX_TIMEOUT_MS` ≥ that value in the
-settings env (dark-factory onboarding provisions it — see `skills/factory-init`). Only on a
-machine WITHOUT that setting does the harness's 600000ms (10 min) foreground cap apply: there,
-cap the slice at `--timeout 540` and set the Bash tool's `timeout` **≥ 600000ms** so the slice
-can return before the harness kills it.
+real L2 escalation still fires instantly via inotify. A short slice buys no protection — the old
+`--timeout 540` merely forced a wake-notify-rearm turn every 9 minutes. A slice that long requires
+`BASH_MAX_TIMEOUT_MS` ≥ that value in the settings env (dark-factory onboarding provisions it —
+see `skills/factory-init`). Only on a machine WITHOUT that setting does the harness's 600000ms
+(10 min) cap apply: there, cap the slice at `--timeout 540` and set the Bash tool's `timeout`
+**≥ 600000ms** so the slice can return before the harness kills it.
+
+**Diagnostic — watcher dies at ~2 minutes with no outcome line:** if an arm disappears after
+roughly 120s and stderr carries **no** `WATCHER_REARM_OUTCOME` line, the Bash `timeout` parameter
+was omitted. The wrapper emits that line on every exit path including its own timeout, so its
+absence means the exit handler never ran — an external SIGKILL to the process group, not a wrapper
+or watcher fault (the 07-09 exit-143 failure mode the wrapper exists to bound; it cannot bound a
+kill of the whole group). This hides during a backlog drain, where every arm FIRES within seconds
+and finishes well inside the 120s window; the kills only start once the queue is fully triaged and
+the watcher genuinely waits, leaving a loop that looks armed but reaps itself every ~2 minutes.
 
 **Re-arming over deliberately-pending items:** any L2 item you deliberately left pending (Priority
 3b, `design_concern`, `risk_identified`, `infra_issue`, AFK leave-pending paths) sits in the queue
@@ -181,11 +288,22 @@ and 7), also touch the `watcher-<project>` lease claimed at session startup (see
 Watcher Lease" above):
 
 ```bash
-python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat --name watcher-<project>
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
+  --name watcher-<project> --slug "watcher-<project>-${CLAUDE_PID:-$PPID}"
 ```
 
 This is what makes a second session's `lease-claim` observe this session as "alive" and stand down —
-there is no need to separately pgrep/ps-tree for other watcher processes.
+there is no need to separately pgrep/ps-tree for other watcher processes. `--slug` must be the exact
+slug you claimed with; `result=refused` means you are not the holder and your heartbeat did **not**
+land — investigate with `lease-show` (see "Claiming the Watcher Lease" above) rather than repeating
+the call with `--force`.
+
+**`result=absent` on a heartbeat is not idempotence — it means your lease is GONE** (reaped after a
+TTL lapse, or force-released by an operator). You are now running **un-leased**: a duplicate watcher
+can claim `watcher-<project>` freely, which is the exact condition this lease exists to prevent. Do
+not keep beating into the void — re-run the `lease-claim` from "Claiming the Watcher Lease" above and
+follow its decision: `acquired` (you have it back, carry on) or `stand-down` (a live duplicate now
+holds it — print the message and exit, do not run a second watch loop against the same project).
 
 ### When the watcher fires
 
@@ -251,13 +369,23 @@ already reads it breaks.
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
   --id <stable-id> --project <project> --text "<one-line question>" \
-  [--task-id <task_id>] [--escalation-id <escalation_id>] [--session-id watcher-<project>-$$] \
-  [--severity <esc.severity>]
+  [--task-id <task_id>] [--escalation-id <escalation_id>] \
+  [--session-id "watcher-<project>-${CLAUDE_PID:-$PPID}"] \
+  [--severity <esc.severity>] [--escalations-dir <project_root>/data/escalations]
 ```
 
 - **`--id`**: a stable id you can recompute idempotently for the same pending item — the
   escalation id (`esc-42-1`) is usually the natural choice. Re-filing the same id overwrites the
   prior record rather than duplicating it (`write-decision` always writes the whole file).
+  **INTERIM RULE — check before you overwrite.** Decision ids are fleet-global, so *another*
+  watcher (notably the recon watcher, which runs its own queue) may already have filed a decision
+  for the same underlying human gate under this id. Before filing, check whether a decision for
+  that id already exists and is still `open`; if it is, do **not** overwrite it — a second watcher
+  observing the same gate must enrich or no-op, never clobber richer context or downgrade an
+  existing record's severity. Park your own record and add the id to your handled set instead.
+  (Observed with `esc-5914-1`, where both queues surfaced the same reify gate; that duplicate
+  landing on one id is the *correct* outcome — one question, one cockpit row — but only if the
+  second filer doesn't degrade the first one's record.)
 - **`--text`**: the one-line question a human needs to answer — the same summary you'd otherwise
   only give in-session or in the digest.
 - **`--task-id` / `--escalation-id` / `--session-id`**: thread through whatever you have — the
@@ -267,6 +395,20 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
   under stale awaiting-input sessions.
+- **`--escalations-dir`**: the escalation **queue** your `--escalation-id` belongs to — for this
+  watcher, `<project_root>/data/escalations`. It must name the SAME queue you later pass to
+  `reap-decisions` (below). Decision records are fleet-global while an escalation id
+  (`esc-<taskid>-<n>`) is unique only *within* one queue, and a project can run several
+  (dark_factory also runs `data/reconciliation/escalations` over the same id namespace), so this is
+  what lets the reaper join a decision back to the right per-queue id namespace instead of matching
+  an unrelated same-named escalation. Stored normalized, so any spelling of the same directory
+  works. Omitting it files a queue-less record — see the reaper caveat below.
+  There is a third value the field can hold: `<unknown>` (`session_registry.UNKNOWN_QUEUE`) —
+  "this record's owning queue was investigated and could not be determined". You never write it;
+  task 3640's back-fill did, for legacy records whose escalation id resolved in several queues at
+  once. It is **not** a respelling of the queue-less `''` state: `''` means *nobody told us* and
+  falls back to project-only scoping, while `<unknown>` means *we looked and could not tell* and
+  the reaper refuses to close it at all.
 - The verb always files `state=open` and prints the filed id on success for your own cross-link
   (e.g. into the digest line). It is fail-soft — a registry fault is logged and swallowed, never
   raised, so filing a decision can never crash the watch loop or block the park itself.
@@ -292,6 +434,24 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py rea
 This closes (`answered`/`dropped`) any `state=open`, `escalation_id`-bearing decision whose
 escalation has since resolved (`resolved` → `answered`) or been dismissed (`dismissed` →
 `dropped`) — regardless of who resolved it: this session, `/unblock`, an L2 cascade, or the human.
+The join is scoped on **two** axes, project *and* queue: a decision stamped (via
+`write-decision --escalations-dir`) with a queue **other** than the `--escalations-dir` you pass
+here is skipped outright, so your reaper can never close the recon watcher's decisions against
+your own same-named escalations. A decision filed **without** `--escalations-dir` — every record
+predating that flag — falls back to project-only scoping and therefore has **no** such protection:
+it can still be closed by whichever queue's reaper reaches it first. That is the reason to always
+pass the flag when filing. Task 3640 then **back-filled** the pre-existing open population, so
+that unprotected set is now drained rather than merely shrinking as new records are filed — but
+only for records that existed at back-fill time. A decision you file today without the flag lands
+straight back in it.
+
+A decision stamped `<unknown>` is **refused**, not closed: its owning queue was investigated and
+could not be determined, so *no* reaper may close it and it stays a visible cockpit row until a
+human closes it. The reaper never defaults to closing on doubt — that direction is deliberate,
+since an over-held decision is a triageable row while a falsely-closed one is invisible.
+If unstamped open records ever reappear, the re-runnable remedy is
+`scripts/backfill_decision_queue_stamp.py` (dry-run by default; `--verify` exits non-zero while
+any open record still lacks a stamp).
 It is read-only with respect to escalations (it only ever writes the decision's own state field)
 and fail-soft, exactly like `write-decision` — a registry fault is logged and swallowed, never
 raised, so it can never crash the watch loop. A decision filed with **no** `escalation_id` (e.g.
@@ -567,14 +727,16 @@ task β, `orchestrator/src/orchestrator/merge_disposition.py`). It is a **closed
 | `branch_bug` | No landed commit is implicated — the failure is the branch's own bug. |
 | `indeterminate` | The classifier couldn't reach a verdict (evidence inconclusive, or an internal error — fail-open). Treat exactly like today's undifferentiated failure. |
 
-**Where it surfaces:** `integration_skew` does **not** get its own escalation
-category — it still arrives here as an ordinary `task_failure` / `wip_conflict`
-escalation. What changes is the content: the task's block reason carries an
-appended suffix of the form `integration_skew: port landed commit(s) <sha[, sha...]>
+**Where it surfaces:** `integration_skew` **does** get its own escalation
+category: the workflow layer files the block with `category='integration_skew'`
+and `suggested_action='port_landed_change'` (workflow.py, INTEGRATION_SKEW
+disposition branch). The task's block reason also carries an appended suffix of
+the form `integration_skew: port landed commit(s) <sha[, sha...]>
 touching <files> — do not hunt your own diff`, and the same disposition +
 implicated commits + overlap files are available verbatim in `merge_status`'s
-`failure_diagnostic` field. Look for that suffix/field before you (or a spawned
-`/unblock` session) start reading the branch's own diff for a bug that isn't there.
+`failure_diagnostic` field. Look for that category/suffix/field before you (or a
+spawned `/unblock` session) start reading the branch's own diff for a bug that
+isn't there.
 
 **Triage rule — the load-bearing part:**
 
@@ -759,8 +921,15 @@ Architectural or design questions. These already failed steward auto-resolution 
 
 **Always escalate to the human:**
 1. Present the concern with full context
-2. Leave the escalation pending
-3. Create a local task/todo to track it
+2. Leave the escalation pending — the open escalation record IS the durable record that something
+   needs doing
+3. Create a local todo **for this session only** — it does not survive session end and is not the
+   record
+3a. File (or confirm one already exists for this `esc-id`) a cockpit DecisionRecord via
+   `write-decision` — **this, not the todo, is what makes the item recoverable across sessions and
+   after this session ends** (same registry as the Priority-3b instructions above). Skipping this
+   step is how esc-3223-4/-5 kept task 3223 blocked for 11 days: the question never reached the
+   cockpit queue the human actually reads.
 4. Continue handling other escalations while waiting
 5. Append `<esc-id>` to the wrapper-owned exclude-file (see "Starting the watcher" above) while this item is pending
 
@@ -768,8 +937,11 @@ Architectural or design questions. These already failed steward auto-resolution 
 
 An agent flagged a risk during development. Risk assessment requires human judgment.
 
-**Escalate to the human.** Tell them, track as todo, continue with other work. Append `<esc-id>` to
-the wrapper-owned exclude-file (see "Starting the watcher" above) while this item is pending.
+**Escalate to the human.** Tell them; create a session-only todo (an attention aid — the pending
+escalation, not the todo, is the durable record); file (or confirm) a cockpit DecisionRecord via
+`write-decision` for this `esc-id`, exactly as in `design_concern` step 3a; continue with other
+work. Append `<esc-id>` to the wrapper-owned exclude-file (see "Starting the watcher" above) while
+this item is pending.
 
 ### `cleanup_needed` (info, rarely blocking)
 
@@ -806,6 +978,12 @@ Technical debt or cleanup discovered during development.
 
   if resolve["status"] in ("created", "combined"):
       task_id = resolve["task_id"]
+  elif resolve["status"] == "refused":
+      # Deliberately NOT in the tuple above: a refusal has no task_id.
+      # A deterministic guard rejected the candidate; no task was created.
+      # Record resolve["reason"] in the escalation resolution note.
+      # Do NOT retry and do NOT record a task id.
+      note_refused(resolve["reason"])
   elif resolve["status"] == "failed":
       # Record reason in escalation resolution note; skip this item.
       # See skills/_shared/ticket-failure-handling.md for the retryable/terminal reason matrix.

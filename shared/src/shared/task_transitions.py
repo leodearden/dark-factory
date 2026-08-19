@@ -28,11 +28,11 @@ from typing import cast
 from shared.task_statuses import TERMINAL, TaskStatus
 
 __all__ = [
-    "ActorClass",
-    "derive_actor_class",
-    "TRANSITIONS",
-    "is_legal_transition",
-    "outcome_allows_status",
+    'ActorClass',
+    'derive_actor_class',
+    'TRANSITIONS',
+    'is_legal_transition',
+    'outcome_allows_status',
 ]
 
 
@@ -43,11 +43,11 @@ class ActorClass(enum.StrEnum):
     ``TaskStatus`` idiom in ``shared.task_statuses``.
     """
 
-    ORCHESTRATOR = "orchestrator"
-    RECONCILIATION = "reconciliation"
-    ESCALATION = "escalation"
-    DETERMINISTIC = "deterministic"
-    HUMAN = "human"
+    ORCHESTRATOR = 'orchestrator'
+    RECONCILIATION = 'reconciliation'
+    ESCALATION = 'escalation'
+    DETERMINISTIC = 'deterministic'
+    HUMAN = 'human'
 
 
 def derive_actor_class(agent_id: str | None) -> ActorClass:
@@ -74,13 +74,13 @@ def derive_actor_class(agent_id: str | None) -> ActorClass:
     """
     if agent_id is None:
         return ActorClass.HUMAN
-    if agent_id.startswith(("recon-stage-", "reconciliation-stage")):
+    if agent_id.startswith(('recon-stage-', 'reconciliation-stage')):
         return ActorClass.RECONCILIATION
-    if agent_id.startswith("orchestrator-deterministic"):
+    if agent_id.startswith('orchestrator-deterministic'):
         return ActorClass.DETERMINISTIC
-    if agent_id.startswith(("orchestrator", "harness", "steward")):
+    if agent_id.startswith(('orchestrator', 'harness', 'steward')):
         return ActorClass.ORCHESTRATOR
-    if agent_id.startswith("escalation"):
+    if agent_id.startswith('escalation'):
         return ActorClass.ESCALATION
     return ActorClass.HUMAN
 
@@ -107,23 +107,44 @@ _UNION: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
         # dispatch
         (TaskStatus.PENDING, TaskStatus.IN_PROGRESS),  # workflow.py:1510
         # completion
-        (TaskStatus.IN_PROGRESS, TaskStatus.DONE),  # merged workflow.py:1380; found_on_main workflow.py:3809/7396/harness.py:3623
+        (
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.DONE,
+        ),  # merged workflow.py:1380; found_on_main workflow.py:3809/7396/harness.py:3623
         (TaskStatus.MERGE_DEFERRED, TaskStatus.DONE),  # workflow.py:1015/6424, harness.py:619/646
         (TaskStatus.BLOCKED, TaskStatus.DONE),  # train attribution workflow.py:6424
-        (TaskStatus.PENDING, TaskStatus.DONE),  # recon found_on_main; operator direct-complete of a never-dispatched task is an out-of-band manual set_task_status/update_task write with no enumerated call site (unlike the anchored half of this pair)
-        (TaskStatus.DEFERRED, TaskStatus.DONE),  # operator/vehicle direct-complete of a deferred task whose deliverable landed out-of-band (planning-mode/merge-vehicle task landed via merge queue); manual set_task_status write, no enumerated orchestrator call site — mirrors the (PENDING, DONE) found-on-main rationale above
+        (
+            TaskStatus.PENDING,
+            TaskStatus.DONE,
+        ),  # recon found_on_main; operator direct-complete of a never-dispatched task is an out-of-band manual set_task_status/update_task write with no enumerated call site (unlike the anchored half of this pair)
+        (
+            TaskStatus.DEFERRED,
+            TaskStatus.DONE,
+        ),  # operator/vehicle direct-complete of a deferred task whose deliverable landed out-of-band (planning-mode/merge-vehicle task landed via merge queue); manual set_task_status write, no enumerated orchestrator call site — mirrors the (PENDING, DONE) found-on-main rationale above
         # park
         (TaskStatus.IN_PROGRESS, TaskStatus.MERGE_DEFERRED),  # workflow.py:867/896
         # requeue
-        (TaskStatus.IN_PROGRESS, TaskStatus.PENDING),  # workflow.py:2464/3755, blast-radius scheduler.py:4484, stranded-revert harness.py:3487/3567
-        (TaskStatus.BLOCKED, TaskStatus.PENDING),  # steward re-pend workflow.py:8007, escalation resume harness.py:8739
+        (
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.PENDING,
+        ),  # workflow.py:2464/3755, blast-radius scheduler.py:4484, stranded-revert harness.py:3487/3567
+        (
+            TaskStatus.BLOCKED,
+            TaskStatus.PENDING,
+        ),  # steward re-pend workflow.py:8007, escalation resume harness.py:8739
         (TaskStatus.MERGE_DEFERRED, TaskStatus.PENDING),  # re-drive harness.py:682
         (TaskStatus.DEFERRED, TaskStatus.PENDING),  # stage2 commit_planning
         # block
-        (TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED),  # _mark_blocked workflow.py:7758, retry-cap scheduler.py:4659, substrate harness.py:4687, dep harness.py:3905
+        (
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.BLOCKED,
+        ),  # _mark_blocked workflow.py:7758, retry-cap scheduler.py:4659, substrate harness.py:4687, dep harness.py:3905
         (TaskStatus.MERGE_DEFERRED, TaskStatus.BLOCKED),  # train failer workflow.py:6464
         (TaskStatus.DEFERRED, TaskStatus.BLOCKED),  # recon targeted.py:1041
-        (TaskStatus.PENDING, TaskStatus.BLOCKED),  # deterministic pure-gate born-at-L2 deterministic_runner.py:755/853; human block of a pending task is an out-of-band manual write with no enumerated call site (unlike the anchored half of this pair)
+        (
+            TaskStatus.PENDING,
+            TaskStatus.BLOCKED,
+        ),  # deterministic pure-gate born-at-L2 deterministic_runner.py:755/853; human block of a pending task is an out-of-band manual write with no enumerated call site (unlike the anchored half of this pair)
         # cancel — recon's any-non-terminal->cancelled (targeted.py:1001)
         # covers pending/blocked/deferred/merge-deferred; harness.py:8417
         # covers the orchestrator abandon path from in-progress/blocked.
@@ -142,7 +163,10 @@ _UNION: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
         # comment above describes. Also the persisted-write sibling of recon's
         # any-non-terminal->cancelled (targeted.py:1001), which already sweeps
         # merge-deferred rows.
-        (TaskStatus.MERGE_DEFERRED, TaskStatus.CANCELLED),  # W9-θ cancel workflow.py:2639; recon targeted.py:1001
+        (
+            TaskStatus.MERGE_DEFERRED,
+            TaskStatus.CANCELLED,
+        ),  # W9-θ cancel workflow.py:2639; recon targeted.py:1001
         # infra resume-at-verify (D3 migrates this to blocked->infra-hold)
         (TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS),  # harness.py:8713
         # forward-compat D3 infra-hold edges (C7/workflow.py:4842) — live
@@ -253,9 +277,9 @@ def is_legal_transition(
 # ---------------------------------------------------------------------------
 
 _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
-    "done": frozenset({TaskStatus.DONE}),
+    'done': frozenset({TaskStatus.DONE}),
     # Internal-only sub-phase — the task stays claimed (in-progress).
-    "planned": frozenset({TaskStatus.IN_PROGRESS}),
+    'planned': frozenset({TaskStatus.IN_PROGRESS}),
     # BLOCKED is TaskWorkflow's own dominant exit for _mark_blocked, but the
     # post-escalation resume guard ("Fix 1", orchestrator/workflow.py ~2057)
     # also returns BLOCKED when a steward resolves an L0 by setting the task
@@ -269,18 +293,23 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
     # rewriting task status, so the row stays at whatever it was mid-merge —
     # the same "preserves in-progress" shape already noted below for
     # 'escalated'.
-    "blocked": frozenset({
-        TaskStatus.BLOCKED, TaskStatus.CANCELLED, TaskStatus.DEFERRED,
-        TaskStatus.MERGE_DEFERRED, TaskStatus.IN_PROGRESS,
-    }),
+    'blocked': frozenset(
+        {
+            TaskStatus.BLOCKED,
+            TaskStatus.CANCELLED,
+            TaskStatus.DEFERRED,
+            TaskStatus.MERGE_DEFERRED,
+            TaskStatus.IN_PROGRESS,
+        }
+    ),
     # Self-repend / deferred-to-stranded-sweep window / requeue-cap
     # exhausted -> blocked.
-    "requeued": frozenset({TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED}),
+    'requeued': frozenset({TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED}),
     # Dominant _mark_blocked + open L1 / merge-gating bail preserves
     # in-progress.
-    "escalated": frozenset({TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS}),
-    "cancelled": frozenset({TaskStatus.CANCELLED}),
-    "merge-deferred": frozenset({TaskStatus.MERGE_DEFERRED}),
+    'escalated': frozenset({TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS}),
+    'cancelled': frozenset({TaskStatus.CANCELLED}),
+    'merge-deferred': frozenset({TaskStatus.MERGE_DEFERRED}),
     # preserved / release_workflow park->blocked / stranded-sweep->pending.
     # MERGE_DEFERRED is included for the W9-θ soft-cancel-of-a-parked-train-
     # member path: _await_cancellable(future) inside _maybe_enqueue_group_merge
@@ -290,10 +319,14 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
     # is still 'merge-deferred' (release_workflow parks it to blocked only
     # after run() returns). This is the same "preserved — row left wherever it
     # was" case as the IN_PROGRESS entry, not a new terminal write.
-    "soft-cancelled": frozenset({
-        TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED, TaskStatus.PENDING,
-        TaskStatus.MERGE_DEFERRED,
-    }),
+    'soft-cancelled': frozenset(
+        {
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.BLOCKED,
+            TaskStatus.PENDING,
+            TaskStatus.MERGE_DEFERRED,
+        }
+    ),
 }
 
 
@@ -307,7 +340,7 @@ def outcome_allows_status(outcome: object, status: TaskStatus | str) -> bool:
     or an out-of-vocabulary status (no silent fallthrough, matching the
     repo's loud-escalation norm).
     """
-    key = str(getattr(outcome, "value", outcome))
+    key = str(getattr(outcome, 'value', outcome))
     if key not in _OUTCOME_ALLOWED:
-        raise ValueError(f"unknown workflow outcome: {outcome!r}")
+        raise ValueError(f'unknown workflow outcome: {outcome!r}')
     return TaskStatus(status) in _OUTCOME_ALLOWED[key]

@@ -1,0 +1,24 @@
+[Unit]
+Description=Nightly closure-staleness sweep + re-dispatch-request drain for reify (task 3102)
+# The NORMATIVE contract for the request files this job produces and consumes
+# is the reify sweep script itself -- its `--emit-requests consumer contract`
+# header block and `_write_request`. Read that, not any dark-factory-side
+# paraphrase, before changing either half.
+Documentation=file:///home/leo/src/reify/scripts/deterministic-gate-closure-staleness-sweep.sh
+Documentation=file:///home/leo/src/dark-factory/scripts/consume_redispatch_requests.py
+
+[Service]
+Type=oneshot
+# All logic lives in the committed wrapper script -- the unit itself is a thin
+# systemd shell around it (mirrors
+# scripts/reclaim-orphaned-worktrees.service). The wrapper runs the reify sweep
+# and then the consumer, in sequence, and always exits 0: a recurring `oneshot`
+# that can fail enters systemd `failed` state and STAYS there, silently
+# stopping the whole nightly job.
+WorkingDirectory=/home/leo/src/dark-factory
+ExecStart=/home/leo/src/dark-factory/scripts/reify-closure-staleness-sweep.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=timers.target

@@ -46,6 +46,21 @@ CREATE TABLE IF NOT EXISTS task_results (
     steward_cost_usd    REAL DEFAULT 0.0,
     steward_invocations INTEGER DEFAULT 0,
     completed_at        TEXT,
+    -- Task 3068 (origin incident: reify esc-5556-1).  The classified block
+    -- reason + PRE-block working phase, so a requeue loop leaves a durable,
+    -- GROUP-BY-able WHY here and not only in a rotated journald log.
+    --
+    -- These MUST stay LAST, after completed_at: SQLite's ALTER TABLE ADD
+    -- COLUMN can only append, so declaring them anywhere else would give a
+    -- freshly-created runs.db a different physical column ORDER than one
+    -- migrated by _migrate_task_results_block_context.  Both writers name
+    -- their columns explicitly, but an operator forensic `SELECT *` — exactly
+    -- the use case this task exists to serve — is positional.
+    --
+    -- block_detail is deliberately NOT persisted: unbounded raw agent/verify
+    -- output in an operationally-queried store (see task 3068 decisions).
+    block_reason        TEXT,
+    block_phase         TEXT,
     PRIMARY KEY (run_id, task_id)
 );
 
@@ -94,8 +109,69 @@ class RunStore:
         conn = self._connect()
         try:
             conn.executescript(_SCHEMA)
+            # Task 3068: CREATE TABLE IF NOT EXISTS is a no-op on an existing
+            # table, so the _SCHEMA additions above reach FRESH DBs only.  Every
+            # already-deployed runs.db needs the explicit ALTER.
+            self._migrate_task_results_block_context(conn)
         finally:
             conn.close()
+
+    def _migrate_task_results_block_context(self, conn: sqlite3.Connection) -> None:
+        """Add ``block_reason``/``block_phase`` to a pre-3068 ``task_results``.
+
+        Deliberately additive-only, with no ``PRAGMA user_version`` ladder:
+        ``RunStore`` has never had one, and this change needs no destructive
+        table rebuild, so the light feature-detect idiom
+        (``ticket_store._migrate_add_escalated_at`` /
+        ``write_journal._migrate``) is sufficient.  Introducing a version
+        header to an existing un-versioned DB would itself need a "version 0
+        means unknown" special case, for no benefit.
+
+        Idempotent, and a no-op on a fresh DB — ``_SCHEMA`` already declares
+        both columns there, so ``PRAGMA table_info`` finds them present.
+
+        Existing rows read NULL for both columns, which is exactly right: NULL
+        means "row predates task 3068", while ``''`` (what both writers now
+        always store) means "clean exit, no block".
+
+        FAILURE BEHAVIOUR — note what this actually is, not what would be
+        tidy.  A genuinely unrecoverable ``ALTER`` propagates out of
+        ``__init__``, but the sole production caller (``Harness.run``) wraps
+        ``RunStore(db_path)`` in ``except Exception: logger.error(...)`` and
+        continues, so a raise here does NOT halt the run — it drops
+        ``task_results`` persistence for the whole run.  That is strictly worse
+        than writing NULLs, so we do NOT raise on the one failure mode that is
+        both plausible and benign: a concurrent construction that already added
+        the column.  ``duplicate column name`` means the migration's goal is
+        met, and is swallowed per-column.  Everything else (a corrupt DB, a
+        lock we could not take inside the busy_timeout) still surfaces, because
+        those are real and a silent half-migrated schema would be worse.
+        """
+        existing = {row[1] for row in conn.execute('PRAGMA table_info(task_results)')}
+        added = []
+        for column in ('block_reason', 'block_phase'):
+            if column in existing:
+                continue
+            try:
+                # Column name is a hard-coded literal, never caller input.
+                conn.execute(f'ALTER TABLE task_results ADD COLUMN {column} TEXT')
+            except sqlite3.OperationalError as exc:
+                # Another RunStore construction won the race between our
+                # table_info read and this ALTER.  The column exists, which is
+                # all we wanted; raising would cost the caller task_results
+                # persistence for an entire run over a no-op.
+                if 'duplicate column name' not in str(exc).lower():
+                    raise
+                logger.debug(
+                    'RunStore: task_results.%s already added concurrently', column,
+                )
+                continue
+            added.append(column)
+        if added:
+            conn.commit()
+            logger.info(
+                'RunStore: migrated task_results — added %s', ', '.join(added)
+            )
 
     def start_run(
         self,
@@ -136,8 +212,9 @@ class RunStore:
                 '(run_id, task_id, project_id, title, outcome, '
                 ' cost_usd, duration_ms, agent_invocations, '
                 ' execute_iterations, verify_attempts, review_cycles, '
-                ' steward_cost_usd, steward_invocations, completed_at) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                ' steward_cost_usd, steward_invocations, completed_at, '
+                ' block_reason, block_phase) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (
                     run_id,
                     task_report.task_id,
@@ -153,6 +230,10 @@ class RunStore:
                     task_report.steward_cost_usd,
                     task_report.steward_invocations,
                     task_report.completed_at,
+                    # Task 3068 — '' on clean exits, never NULL, so a NULL here
+                    # unambiguously means "row predates 3068".
+                    task_report.block_reason,
+                    task_report.block_phase,
                 ),
             )
             conn.commit()
@@ -258,8 +339,9 @@ class RunStore:
                     '(run_id, task_id, project_id, title, outcome, '
                     ' cost_usd, duration_ms, agent_invocations, '
                     ' execute_iterations, verify_attempts, review_cycles, '
-                    ' steward_cost_usd, steward_invocations, completed_at) '
-                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    ' steward_cost_usd, steward_invocations, completed_at, '
+                    ' block_reason, block_phase) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     (
                         run_id,
                         tr.task_id,
@@ -275,6 +357,10 @@ class RunStore:
                         tr.steward_cost_usd,
                         tr.steward_invocations,
                         tr.completed_at,
+                        # Task 3068 — the batch path must stay in lockstep with
+                        # save_task_result above, or it silently writes NULLs.
+                        tr.block_reason,
+                        tr.block_phase,
                     ),
                 )
             conn.commit()

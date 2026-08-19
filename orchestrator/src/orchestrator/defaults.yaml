@@ -125,6 +125,14 @@ verify_env: {}
 # Task-phase verify rewrites cargo --workspace → cargo -p <crate> when
 # all task files live in one (or a few) workspace crates.
 scope_cargo: true
+# Cold-verify shared-venv pre-provision command (task 2997). Empty "" default =
+# no-op: the orchestrator is project-agnostic and verifies heterogeneous targets
+# (reify=cargo, autopilot-video), so the uv-workspace value lives ONLY in each
+# project's dark-factory-orchestrator.yaml, never here. When non-empty,
+# run_verification runs it ONCE per cold worktree before the test/lint/type
+# gather so the shared .venv is populated before full-repo-scope root LINT/TYPE
+# race the TEST-driven sync.
+verify_cold_preprovision_command: ""
 
 # Per-model USD price per 1M tokens, for backends without native cost
 # reporting (codex, gemini). Migrated from invoke.py's former hardcoded
@@ -260,6 +268,35 @@ routing:
       set:
         model: opus
         max_turns: 120
+    # Task nu (Phase 4, boundary test 8): simple-task turn-cap saturation.
+    # Once a SIMPLE_TASK dispatch exhausts its turn cap without completing,
+    # workflow._stamp_simple_saturated stamps
+    # metadata.routing.simple_saturated=true (nu's non-default flag). THIS rule
+    # turns that flag into a policy-rule attribution on the architect -- always
+    # the first agent on the full path -- so its routing_decision reliably
+    # NAMES the saturation (boundary test 8's observable). The actual re-route
+    # to the full path is done by the SIMPLE_TASK gate
+    # (_should_run_simple_task skips a saturated task); this rule only makes the
+    # attribution legible.
+    #
+    # set.model=opus is byte-equivalent today (the architect's config model is
+    # already opus), so it changes no behaviour -- it only makes
+    # source_layer=policy_rule for unambiguous attribution and expresses "treat
+    # a demonstrably-hard task at full strength".
+    #
+    # Inert unless simple_saturated is stamped (a non-default state), so the
+    # default-state resolution is byte-equivalent to pre-nu (invariant 3) -- a
+    # normal task never matches this rule. Placed immediately BEFORE
+    # retry-tier-up (which stays LAST): saturation is the more-specific
+    # attribution for a saturated+retried architect, and the architect already
+    # clamps at opus under either rule, so first-match-wins here changes no
+    # model outcome.
+    - id: simple-saturated-full-path
+      match:
+        role: [architect]
+        simple_saturated: true
+      set:
+        model: opus
     # Task mu (Phase 4): retry-escalation rung. On a re-dispatch after a
     # failed dispatch the harness bumps metadata.routing.routing_tier (gamma's
     # harness-owned, monotonic counter), and THIS rule turns that tier>=1 into
@@ -289,6 +326,14 @@ routing:
 
 # Models per role
 models:
+  # architect: EVAL-GOVERNED (task iota, plans/adaptive-model-routing-prd.md
+  # §ι) -- measured against opus-high/sonnet-high/fable-high alternatives via
+  # the eval campaign of 2026-07-27
+  # (plans/eval-architect-effort-verdict-2026-07-27.md, esc-2848-1/task 2848).
+  # Verdict MARGINAL: held at opus/max rather than flipped -- see
+  # plans/architect-effort-adoption-decision-2026-07-28.md. Decisive next step
+  # before revisiting: re-run the OFAT screen at --trials 3 for the opus
+  # candidates only.
   architect: "opus"
   implementer: "sonnet"
   debugger: "sonnet"
@@ -306,7 +351,15 @@ budgets:
   architect: 15.0
   implementer: 10.0
   debugger: 5.0
-  reviewer: 5.0
+  # 5.0 -> 12.0 (2026-08-17, task-3543 /unblock investigation; see task 3321).
+  # Measured over 475 reviewer_comprehensive invocations since 2026-08-10:
+  # 5.3% hit the $5 ceiling, and $268 of $908 total reviewer spend (29.5%) went
+  # to cap-killed runs that produced nothing. Successful reviews cost p50=$1.46,
+  # p95=$3.10, max=$4.92 — the ceiling sat barely above the largest legitimate
+  # review. $12 is ~4x p95 / ~2.4x observed max: a runaway guard normal
+  # operation never touches. Reduces net spend, since a cap-killed run burns the
+  # full ceiling, yields nothing, then retries up to 4 more times.
+  reviewer: 12.0
   merger: 5.0
   steward: 5.0
   triage: 2.0
@@ -322,7 +375,16 @@ max_turns:
   architect: 100
   implementer: 80
   debugger: 50
-  reviewer: 30
+  # 30 -> 60 (2026-08-17, task-3543 /unblock investigation; see task 3321).
+  # Same failure mode simple_task hit below, and worse: over 475
+  # reviewer_comprehensive invocations since 2026-08-10, 19.6% exceeded 30
+  # turns, and of 79 failures 43 sat at EXACTLY turns=31 while only 11 were
+  # anything other than a cap hit. Successful reviews run p50=19, p90=31,
+  # p95=33, max=43 — so the cap was firing BELOW the p90 of normal successful
+  # operation, which makes it a throttle rather than a runaway guard. 60 leaves
+  # ~40% headroom over the observed max. NB the observed maxima are CENSORED by
+  # the cap itself, so true demand may run higher.
+  reviewer: 60
   merger: 50
   steward: 100
   triage: 25
@@ -336,6 +398,9 @@ max_turns:
 
 # Reasoning effort per role
 effort:
+  # architect: EVAL-GOVERNED -- see the models.architect comment above and
+  # plans/architect-effort-adoption-decision-2026-07-28.md (task iota; MARGINAL
+  # verdict 2026-07-27, held at max rather than flipped to high).
   architect: "max"
   implementer: "max"
   debugger: "max"
@@ -387,6 +452,34 @@ fairness:
     medium: 2
     low: 4
     polish: 9999
+
+# Unknown-config-key census escape hatch (task 2989).
+#
+# Pydantic's extra='ignore' DISCARDS unknown keys before validation, so a
+# misplaced key is accepted silently (the 2026-07-22 incident: a top-level
+# `spare_warm_lanes: 8` did nothing for 3 weeks — the field lives on git.).
+# A separate raw-YAML-vs-model walk detects that class of typo and files a
+# born-at-L2; `orchestrator check-config --config <path>` is the offline gate.
+#
+# A key deliberately present for NON-orchestrator consumers (read by the
+# project's own scripts) must not be escalated.  Excuse it either by naming it
+# with the reserved `x_`/`x-` prefix — works at ANY depth, no config ceremony,
+# and is the preferred form for a NEW knob — or by listing its dotted path
+# here, for an existing name other tooling already greps for.
+#
+# Entries are fnmatch globs where `*` spans dots, so `cpu_governance.*` excuses
+# a whole namespace.  TRAP: `<name>.*` does NOT match the bare parent key
+# `<name>`, so a top-level dict key must be listed EXACTLY.
+#
+# Excused keys stay listed by check-config (at exit 0) and in reload_config's
+# `ignored_config_keys`, so an over-broad glob remains auditable.
+# See OPERATIONS.md §6a.
+config_key_census:
+  ignore: []
+  # ignore:
+  #   - 'cpu_governance.*'       # whole namespace
+  #   - 'fairness.scheduler_v2'  # exact path
+  #   - 'warm_lane_pool'         # top-level dict key — must be exact
 
 # Starvation watchdog (task 1880).
 #
@@ -516,6 +609,15 @@ git:
   # _lane- (warm-lane pool) or _spec- (merge-speculation pool).
   iact_prefix: "_iact-"
 
+# Deep merge-ahead chains (task 3183).  chain_cap is the single gate for the
+# whole feature: the maximum number of queued items one verify may cover as a
+# chain.  0 (shipped default) is the KILL SWITCH — byte-identical to pre-PRD
+# merge behaviour.  Green-tier hot-reloadable, so enable/retune/kill never needs
+# a restart; set it with scripts/merge-deep-set-cap.sh.  Dispatch contract and
+# cap-staging plan: plans/deep-merge-ahead-prd.md.
+merge_deep:
+  chain_cap: 0
+
 # Chronic pool-infra flake auto-file detector (task 2358). Gated OFF until
 # reify task 5142's flaky-ledger.jsonl + CHRONIC-FLAKY marker substrate is
 # confirmed on the target project's main (mirrors git.offline_lane_infra_enabled).
@@ -525,6 +627,37 @@ chronic_flake:
   window: 20
   rate_limit_days: 7
   ledger_relpath: "data/verify-logs/flaky-ledger.jsonl"
+
+# Zero-progress requeue backstop (task 3068, origin incident reify
+# esc-5556-1).  Files a blocking L1 when one task requeues `threshold` times
+# CONSECUTIVELY without invoking a single agent AND that streak spans at least
+# `min_span_seconds` — a class the per-task requeue cap cannot see by design.
+# See orchestrator/src/orchestrator/zero_progress_requeue.py (module docstring)
+# for the full causal chain and why both halves of the predicate are needed.
+# Shipped ENABLED (unlike chronic_flake): it reads only TaskReport fields that
+# already exist, so no substrate gating is needed.
+zero_progress_requeue:
+  enabled: true
+  threshold: 5
+  min_span_seconds: 900.0
+
+# Structured recovery-decision emission (task 3535, PRD
+# plans/task-escalation-state-graph-prd.md D5).  Every veto/LEAVE site in the
+# recovery machinery emits a recovery_vetoed / recovery_left event naming WHAT
+# held a stranded task, and a blocking L1 is filed against a streak sentinel
+# after `veto_streak_threshold` IDENTICAL consecutive vetoes spanning at least
+# `veto_streak_min_span_secs`.  Changes no recovery disposition — see
+# orchestrator/src/orchestrator/recovery_emission.py (module docstring) for the
+# canonical WHY, the signature-transition emission cadence, and the derivation
+# of the 1500.0s span default.  Shipped ENABLED: without it a strand held by an
+# open escalation leaves no machine-readable trace of what held it.
+recovery_emission:
+  enabled: true
+  veto_streak_threshold: 3
+  veto_streak_min_span_secs: 1500.0
+  # The narrower kill switch: the only part of the mechanism that WRITES to the
+  # escalation queue.  Turn this off to keep the telemetry and silence the L1.
+  streak_escalation_enabled: true
 
 # Autonomous dry-run unblock hook
 unblock_auto:
@@ -618,6 +751,42 @@ usage_cap:
 park_stop_enabled: true
 park_stop_parked_threshold: 15
 park_stop_parked_window_hours: 1.0
+
+# EASY-backfill admission through parks (task 3823, PRD task η / C7)
+#
+# A candidate blocked ONLY by another task's park may be admitted through it
+# when its predicted hold, times a safety factor, provably fits inside the gap
+# the park's owner is going to wait anyway.  The final acquisition still goes
+# through try_acquire, and only the PARK gate is bypassed — the held-lock limit
+# gate is untouched, so an admitted-but-actually-contended candidate simply
+# fails to acquire.
+#
+# Evidence: plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md
+#
+# backfill_enabled: operator kill switch.  When false, a park-blocked candidate
+#   is passed over exactly as before (no admission is even attempted).
+#
+# backfill_safety_factor: multiplier on the candidate's predicted hold before it
+#   is compared against the parked owner's provable assembly delay (gt=0;
+#   default 2.5).  2.5 is INTERPOLATED between two measured 80%-coverage
+#   multipliers — x2.9 (dark-factory) and x2.0 (reify), report :126 — not
+#   guessed; modelled overstay at x2.5 is 7-9% (:254-255).  Raise it toward 2.9
+#   if park_backfill_overstay events show a sustained higher rate.
+#
+# backfill_min_samples: minimum observed hold samples before the predictor will
+#   answer at all (ge=1; default 3).  Below it predicted_hold is None and
+#   backfill REFUSES.  This is the single source of truth for HoldHistory's
+#   sample floor.  A floor of 0 would let an empty history certify a backfill.
+#
+# backfill_max_park_age_secs: refuse backfill through any park older than this,
+#   measured from the owner's FIRST install (gt=0; default 3600.0).  The clause
+#   is measured (report :256 — without a cutoff one reify starver flips to
+#   never-dispatched in-window); the 1h figure is a judgment default, ~40% of
+#   the measured 2.2-3h median process era.
+backfill_enabled: true
+backfill_safety_factor: 2.5
+backfill_min_samples: 3
+backfill_max_park_age_secs: 3600.0
 
 # Escalation-watcher subprocess supervisor (AFK hardening, task 1326)
 #

@@ -38,9 +38,13 @@ Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/home/leo/
 Environment=LANG=en_US.UTF-8
 Restart=on-failure
 RestartSec=10
+# Without RestartSteps= systemd IGNORES the cap below (backoff 10s -> 60s over 4).
+RestartSteps=4
 RestartMaxDelaySec=60
-TimeoutStopSec=90      # async shutdown reaps agents + releases the lock
-TimeoutStartSec=300    # must exceed the 280s ExecStartPre budget (one start attempt)
+# async shutdown reaps agents + releases the lock
+TimeoutStopSec=90
+# must exceed the 280s ExecStartPre budget (one start attempt)
+TimeoutStartSec=300
 StandardOutput=journal
 StandardError=journal
 

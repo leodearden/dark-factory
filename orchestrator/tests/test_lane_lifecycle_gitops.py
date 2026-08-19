@@ -28,7 +28,6 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.lane_lifecycle import (
-    ACQUIRE_ROUTE_TRANSITIONS,
     LANE_STATE_DIRNAME,
     AcquireRoute,
     LaneState,
@@ -121,6 +120,69 @@ def _assert_route_logged(caplog: pytest.LogCaptureFixture, route: AcquireRoute) 
 
 
 # ---------------------------------------------------------------------------
+# I2 (contract-literal): the WarmLanePool is the SOLE durable-assignment writer
+# ---------------------------------------------------------------------------
+
+
+_ORCH_SRC_DIR = Path(__file__).resolve().parent.parent / 'src' / 'orchestrator'
+
+
+class TestSingleWriterSourceScan:
+    """Architectural fitness function for I2 (single-writer consolidation).
+
+    The task's contract-literal I2 is "zero LaneLifecycle.note_assigned callers
+    outside warm_lane_pool.py; grep-checkable".  Encoded as two source scans:
+
+      (i)  tree-wide, the ONLY orchestrator/src/orchestrator file containing a
+           ``.note_assigned(`` CALL is warm_lane_pool.py.  (lane_lifecycle.py
+           DEFINES ``def note_assigned`` and its body is
+           ``self.transition(lane, LaneState.ASSIGNED, ...)`` — neither is a
+           ``.note_assigned(`` call, so the primitive is naturally excluded.)
+           Already true for the pool seam; this locks it against regression.
+
+      (ii) git_ops.py contains ZERO ``LaneState.ASSIGNED`` / ``LaneState.RELEASED``
+           references — the real consolidation teeth.  Both GitOps assignment
+           writers (``_note_assigned_via_route``'s ASSIGNED ladder and
+           ``_lifecycle_note_released``'s RELEASED write) are gone after step-12;
+           the only durable LaneState GitOps still touches is
+           ``LaneState.QUARANTINED`` (a NON-assignment read, retained).
+
+    NOT asserted: "no ASSIGNED/RELEASED transition anywhere in the tree" —
+    harness.py's crash-recovery terminal-release finalizer
+    (``_lane_lifecycle.transition(entry, LaneState.RELEASED)``) is a legitimate
+    NON-pool lifecycle write the task does not consolidate, and the
+    lane_lifecycle.py primitive body is the writer of record.  Both are excluded
+    by construction (this scan targets ``.note_assigned(`` callers and git_ops.py
+    only).
+    """
+
+    def test_note_assigned_called_only_from_warm_lane_pool(self):
+        callers = sorted(
+            py.name
+            for py in _ORCH_SRC_DIR.rglob('*.py')
+            if '.note_assigned(' in py.read_text()
+        )
+        assert callers == ['warm_lane_pool.py'], (
+            'LaneLifecycle.note_assigned() must be called ONLY from '
+            'warm_lane_pool.py (the sole durable ASSIGNED writer, I2); '
+            f'found callers in {callers}'
+        )
+
+    def test_git_ops_has_no_assigned_or_released_lane_state_writes(self):
+        text = (_ORCH_SRC_DIR / 'git_ops.py').read_text()
+        assert 'LaneState.ASSIGNED' not in text, (
+            'git_ops.py must not write/normalize the durable ASSIGNED state — '
+            'the WarmLanePool is the sole ASSIGNED writer (I2). The '
+            '_note_assigned_via_route ASSIGNED ladder must be removed.'
+        )
+        assert 'LaneState.RELEASED' not in text, (
+            'git_ops.py must not write the durable RELEASED state — the '
+            'WarmLanePool is the sole RELEASED writer (I2). '
+            '_lifecycle_note_released must be removed.'
+        )
+
+
+# ---------------------------------------------------------------------------
 # acquire_warm_lane -> durable ASSIGNED record
 # ---------------------------------------------------------------------------
 
@@ -129,14 +191,20 @@ def _assert_route_logged(caplog: pytest.LogCaptureFixture, route: AcquireRoute) 
 class TestAcquireWarmLaneWritesAssignedRecord:
     """acquire_warm_lane must write a durable ASSIGNED LaneLifecycle record."""
 
-    async def test_create_once_acquire_writes_assigned_record(self, git_repo: Path):
+    async def test_create_once_acquire_writes_assigned_record(
+        self, git_repo: Path, caplog: pytest.LogCaptureFixture,
+    ):
         await _add_warm_lane_scripts(git_repo)
         git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
         start_ref = await _get_head(git_repo)
 
-        wt = await git_ops.acquire_warm_lane('321', start_ref, expected_title='Fix X')
+        with caplog.at_level(logging.INFO, logger='orchestrator.git_ops'):
+            wt = await git_ops.acquire_warm_lane('321', start_ref, expected_title='Fix X')
 
         assert isinstance(wt, WorktreeInfo), f'Expected WorktreeInfo; got {wt!r}'
+        # The durable ASSIGNED record is now written by the WarmLanePool (single
+        # writer, I2) with task_id/title/branch threaded from the GitOps acquire
+        # — NOT by _note_assigned_via_route, which now only classifies the route.
         record = git_ops._lane_lifecycle.read(wt.path)
         assert record is not None, 'expected a durable record after acquire'
         assert record.state is LaneState.ASSIGNED, (
@@ -152,168 +220,24 @@ class TestAcquireWarmLaneWritesAssignedRecord:
         assert record_path.is_file(), (
             f'expected a durable record file to exist at {record_path}'
         )
+        # Observability retained (PRD W11 eta Mechanism 3): the route-
+        # classification INFO log still fires even though the durable ASSIGNED
+        # write moved from _note_assigned_via_route onto the pool.
+        _assert_route_logged(caplog, AcquireRoute.CREATE_ONCE_FRESH)
 
 
 # ---------------------------------------------------------------------------
-# _note_assigned_via_route: route-table-driven ASSIGNED writer (W11 eta)
+# _note_assigned_via_route no longer writes the durable ASSIGNED record
 # ---------------------------------------------------------------------------
-
-
-def _bare_git_ops(tmp_path: Path) -> GitOps:
-    """A GitOps instance over a plain (non-git) directory.
-
-    _note_assigned_via_route only touches self._lane_lifecycle (file-based
-    JSON records) and never shells out to git, so — like
-    TestPoolStorageSentinelDelegation above — these tests don't need a real
-    git repo or the warm-lane scripts/base fixtures.
-    """
-    project_root = tmp_path / 'project'
-    project_root.mkdir()
-    return GitOps(_warm_config(), project_root)
-
-
-class TestNoteAssignedViaRoute:
-    """GitOps._note_assigned_via_route must reproduce _lifecycle_note_assigned's
-    dynamic FROM-state normalization while reading its terminal target from
-    ACQUIRE_ROUTE_TRANSITIONS[route] (making the table load-bearing)."""
-
-    def test_none_origin_bootstraps_to_assigned(self, tmp_path: Path):
-        git_ops = _bare_git_ops(tmp_path)
-        lane = git_ops.worktree_base / '_lane-0'
-
-        git_ops._note_assigned_via_route(
-            lane, AcquireRoute.CREATE_ONCE_FRESH, '321', 'Fix X', 'task/321',
-        )
-
-        record = git_ops._lane_lifecycle.read(lane)
-        assert record is not None
-        assert record.state is LaneState.ASSIGNED
-        assert record.task_id == '321'
-        assert record.title == 'Fix X'
-        assert record.branch == 'task/321'
-
-    def test_registered_transitions_to_assigned(self, tmp_path: Path):
-        git_ops = _bare_git_ops(tmp_path)
-        lane = git_ops.worktree_base / '_lane-0'
-        git_ops._lane_lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc')
-        git_ops._lane_lifecycle.transition(lane, LaneState.REGISTERED, branch='task/foo')
-
-        git_ops._note_assigned_via_route(
-            lane, AcquireRoute.CREATE_ONCE_FRESH, '321', 'Fix X', 'task/321',
-        )
-
-        record = git_ops._lane_lifecycle.read(lane)
-        assert record is not None
-        assert record.state is LaneState.ASSIGNED
-        assert record.task_id == '321'
-
-    def test_released_transitions_to_assigned(self, tmp_path: Path):
-        git_ops = _bare_git_ops(tmp_path)
-        lane = git_ops.worktree_base / '_lane-0'
-        git_ops._lane_lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc')
-        git_ops._lane_lifecycle.transition(lane, LaneState.REGISTERED, branch='task/foo')
-        git_ops._lane_lifecycle.transition(
-            lane, LaneState.ASSIGNED, task_id='999', title='old',
-        )
-        git_ops._lane_lifecycle.transition(lane, LaneState.IN_USE)
-        git_ops._lane_lifecycle.transition(lane, LaneState.RELEASED)
-
-        git_ops._note_assigned_via_route(
-            lane, AcquireRoute.REUSE, '321', 'Fix X', 'task/321',
-        )
-
-        record = git_ops._lane_lifecycle.read(lane)
-        assert record is not None
-        assert record.state is LaneState.ASSIGNED
-        assert record.task_id == '321'
-        assert record.title == 'Fix X'
-
-    def test_same_task_assigned_is_idempotent_noop(self, tmp_path: Path):
-        git_ops = _bare_git_ops(tmp_path)
-        lane = git_ops.worktree_base / '_lane-0'
-        git_ops._lane_lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc')
-        git_ops._lane_lifecycle.transition(lane, LaneState.REGISTERED, branch='task/321')
-        before = git_ops._lane_lifecycle.transition(
-            lane, LaneState.ASSIGNED, task_id='321', title='Fix X', branch='task/321',
-        )
-
-        git_ops._note_assigned_via_route(
-            lane, AcquireRoute.REUSE, '321', 'Fix X', 'task/321',
-        )
-
-        after = git_ops._lane_lifecycle.read(lane)
-        assert after == before, (
-            f'expected an idempotent no-op for same-task reuse; '
-            f'before={before!r} after={after!r}'
-        )
-
-    def test_different_task_releases_first_then_assigns(self, tmp_path: Path):
-        git_ops = _bare_git_ops(tmp_path)
-        lane = git_ops.worktree_base / '_lane-0'
-        git_ops._lane_lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc')
-        git_ops._lane_lifecycle.transition(lane, LaneState.REGISTERED, branch='task/999')
-        git_ops._lane_lifecycle.transition(
-            lane, LaneState.ASSIGNED, task_id='999', title='old',
-        )
-
-        git_ops._note_assigned_via_route(
-            lane, AcquireRoute.RECYCLE, '321', 'Fix X', 'task/321',
-        )
-
-        record = git_ops._lane_lifecycle.read(lane)
-        assert record is not None
-        assert record.state is LaneState.ASSIGNED
-        assert record.task_id == '321'
-        assert record.title == 'Fix X'
-
-    def test_in_use_releases_first_then_assigns(self, tmp_path: Path):
-        git_ops = _bare_git_ops(tmp_path)
-        lane = git_ops.worktree_base / '_lane-0'
-        git_ops._lane_lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc')
-        git_ops._lane_lifecycle.transition(lane, LaneState.REGISTERED, branch='task/999')
-        git_ops._lane_lifecycle.transition(
-            lane, LaneState.ASSIGNED, task_id='999', title='old',
-        )
-        git_ops._lane_lifecycle.transition(lane, LaneState.IN_USE)
-
-        git_ops._note_assigned_via_route(
-            lane, AcquireRoute.RECYCLE, '321', 'Fix X', 'task/321',
-        )
-
-        record = git_ops._lane_lifecycle.read(lane)
-        assert record is not None
-        assert record.state is LaneState.ASSIGNED
-        assert record.task_id == '321'
-
-    def test_quarantined_lane_never_raises_and_record_unchanged(self, tmp_path: Path):
-        git_ops = _bare_git_ops(tmp_path)
-        lane = git_ops.worktree_base / '_lane-0'
-        git_ops._lane_lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc')
-        before = git_ops._lane_lifecycle.transition(lane, LaneState.QUARANTINED)
-
-        git_ops._note_assigned_via_route(
-            lane, AcquireRoute.CREATE_ONCE_FRESH, '321', 'Fix X', 'task/321',
-        )  # must not raise
-
-        after = git_ops._lane_lifecycle.read(lane)
-        assert after == before, (
-            f'expected the QUARANTINED record to be left untouched; '
-            f'before={before!r} after={after!r}'
-        )
-
-    def test_write_targets_the_routes_canonical_assigned_edge(self, tmp_path: Path):
-        """No route's canonical target is anything other than ASSIGNED (by
-        construction, per ACQUIRE_ROUTE_TRANSITIONS) — assert the writer
-        actually uses that table lookup (not a hardcoded constant) across
-        every route."""
-        git_ops = _bare_git_ops(tmp_path)
-        for route in AcquireRoute:
-            lane = git_ops.worktree_base / f'_lane-{route.value}'
-            git_ops._note_assigned_via_route(lane, route, '321', 'Fix X', 'task/321')
-            record = git_ops._lane_lifecycle.read(lane)
-            assert record is not None
-            assert record.state is ACQUIRE_ROUTE_TRANSITIONS[route][1]
-            assert record.state is LaneState.ASSIGNED
+#
+# RETIRED (task 2986, W2b I2 single-writer consolidation): the former
+# TestNoteAssignedViaRoute suite asserted that GitOps._note_assigned_via_route
+# normalized the durable record onto an ASSIGNED edge. That durable write moved
+# onto the WarmLanePool (the SOLE ASSIGNED/RELEASED writer); the route method
+# now only emits the route-classification INFO log. The pool's own write-through
+# is covered by test_warm_lane_pool.py, and TestAcquireRouteClassification below
+# still exercises the end-to-end record-is-ASSIGNED + route-log behavior through
+# acquire_warm_lane. TestSingleWriterSourceScan locks the consolidation.
 
 
 # ---------------------------------------------------------------------------
@@ -915,8 +839,8 @@ class TestReleaseWarmLaneWritesReleasedRecord:
 
     async def test_release_already_released_lane_is_a_noop(self, git_repo: Path):
         """A second release_warm_lane call on an already-RELEASED lane must
-        not raise. RELEASED -> RELEASED is not a legal edge, so
-        _lifecycle_note_released must no-op rather than attempt it."""
+        not raise. RELEASED -> RELEASED is not a legal edge, so the pool's
+        release -> _note_released_durable must no-op rather than attempt it."""
         await _add_warm_lane_scripts(git_repo)
         git_ops = GitOps(_warm_config(), git_repo, warm_lane_pool_size=1)
         start_ref = await _get_head(git_repo)

@@ -1,0 +1,45 @@
+{
+  "id": "reify_task_2330",
+  "name": "Freshness: implement Failed production and Pending propagation with diagnostic chain",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "8a15412b9d44fa64a8dc11b7b7c01fe56d269366",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "Freshness: implement Failed production and Pending propagation with diagnostic chain",
+    "description": "PRD docs/prds/freshness-4-variant.md. Implement the complete Failed-state handling per arch \u00a79.1-\u00a79.2 (lines 868-890): (1) catch evaluation failures (panic boundary, kernel error, out-of-bounds, missing-key map lookup) and produce Failed { error: ErrorRef }; emit EventKind::error realization event exactly once per failure; (2) per arch \u00a77.2 line 748 (\"Pending as propagation gate\") and \u00a79.2 line 890, when a node consumes a Failed input produce Pending { last_substantive } with a diagnostic chain referencing the original failure node \u2014 Pending must NOT trigger downstream re-evaluation, naturally quieting the downstream subtree. Constraint violations stay separate (\u00a79.3) \u2014 produce cached `violated`, NOT Failed; pin this with a regression test."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [
+    "crates/reify-eval/src",
+    "crates/reify-types/src"
+  ],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "status_autocommit",
+    "task_status": "done",
+    "reference_unavailable": "No single \"Merge task/2330 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'status_autocommit'."
+  },
+  "verify_outcome": {
+    "source": "unavailable",
+    "passed": null,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    },
+    "reason": "No landed post-commit is available for task 2330 (terminal status 'done'), so there is no commit at which these gates can be claimed to have passed. This fixture is planRate-only and is never scored against a landed verify outcome; the commands are carried for provenance only."
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

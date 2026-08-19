@@ -17,7 +17,13 @@ from typing import NamedTuple, Self
 
 import aiosqlite
 
-__all__ = ['apply_wal_pragmas', 'apply_full_durability_pragmas', 'connect_daemon', 'CheckpointResult', 'AsyncSqliteBase']
+__all__ = [
+    'apply_wal_pragmas',
+    'apply_full_durability_pragmas',
+    'connect_daemon',
+    'CheckpointResult',
+    'AsyncSqliteBase',
+]
 
 
 class CheckpointResult(NamedTuple):
@@ -47,14 +53,14 @@ async def apply_wal_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int)
         row = await cur.fetchone()
     if row is None or row[0] != 'wal':
         got = row[0] if row is not None else None
-        raise RuntimeError(
-            f'Failed to enable WAL journal mode (got {got!r})'
-        )
+        raise RuntimeError(f'Failed to enable WAL journal mode (got {got!r})')
     if busy_timeout_ms != 0:
         await conn.execute(f'PRAGMA busy_timeout={busy_timeout_ms}')
 
 
-async def apply_full_durability_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int) -> None:
+async def apply_full_durability_pragmas(
+    conn: aiosqlite.Connection, *, busy_timeout_ms: int
+) -> None:
     """Configure WAL mode, busy_timeout, and the Phase 3 durability triad.
 
     Delegates to ``apply_wal_pragmas`` for WAL + busy_timeout, then sets the

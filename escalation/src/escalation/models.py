@@ -16,14 +16,26 @@ L2 cluster fields (default-empty; L0/L1 are unaffected):
 Structured-evidence field (default-empty; task 2558):
   evidence:   list of EvidenceEntry {observation, measured_at, ref} raw
               OBSERVATIONS backing the escalation (not causal diagnoses)
+
+Filing-identity field (default-None; task 3533):
+  filing_claimant_run_id:
+              the FILING incarnation's claimant id in
+              `shared.task_claimant.compose_claimant_run_id` format;
+              None = unknown.  Semantics and the fail-safe rule are stated
+              once on `escalation.pins.classify_pins` (normative source:
+              spec docs/task-escalation-state-spec.md S6) — do not restate
+              them here.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import TypedDict
+
+logger = logging.getLogger(__name__)
 
 
 class TrainState(TypedDict):
@@ -38,6 +50,31 @@ class TrainState(TypedDict):
     order: int            # this task's position in the train (0-based)
     parked_members: list[str]  # sibling task_ids at merge-deferred, excluding self
     failing_member: str   # this task's id (the one that triggered BLOCKED)
+
+
+class IndexHealthState(TypedDict):
+    """FalkorDB index-provisioning drift context for `recon_missing_index` (task 3709).
+
+    Shape mirrors the record produced by
+    fused_memory.reconciliation.index_health.summarize_index_health(), projected
+    by the drift detector (PRD δ, D8 + D11).
+
+    The drifted graph and the missing specs are carried as FIRST-CLASS FIELDS so
+    no consumer parses `summary`/`detail` prose to recover a fact the emitter
+    already had in a variable (INV-2).
+
+    Index specs are stored as JSON LISTS, never tuples: a tuple deserialises
+    back as a list, so storing tuples would make the on-disk record fail to
+    round-trip identically and break equality for any payload comparison.
+
+    TypedDict at runtime is a plain dict; existing from_dict / to_dict /
+    asdict() paths are unaffected — round-trip fidelity is unchanged.
+    """
+
+    group_id: str                  # the graph whose index state drifted
+    missing: list[list[str]]       # expected-but-absent specs, sorted
+    unexpected: list[list[str]]    # present-but-unexpected specs (reported, never acted on)
+    expected_total: int            # size of the expected set this was diffed against
 
 
 class EvidenceEntry(TypedDict):
@@ -69,6 +106,53 @@ BORN_AT_L2_SEVERITIES: frozenset[str] = frozenset({'critical', 'urgent'})
 # rather than silently misrouting escalations.
 KNOWN_SEVERITIES: frozenset[str] = frozenset({'info', 'blocking'}) | BORN_AT_L2_SEVERITIES
 
+# Urgency ordering over KNOWN_SEVERITIES, used by every severity FOLD in the
+# system (dedupe-child promotion, L2 member inheritance, the L2 update-path
+# floor).  Alphabetical comparison is wrong ('blocking' < 'info'), so the rank
+# is explicit.
+#
+# TOTAL over KNOWN_SEVERITIES by contract: adding a severity to the vocabulary
+# without adding it here is a bug, not a silent rank-0 — TestSeverityRank
+# (escalation/tests/test_models.py) fails on the gap.  The BORN_AT_L2
+# severities (critical/urgent) outrank 'blocking', which is what lets a
+# born-at-L2 child promote a lower-severity parent.
+#
+# The ordering mirrors the repo's only other canonical escalation-severity
+# ranking — cockpit/src/cockpit/priority.py's _ESCALATION_SEVERITIES and its
+# severity_weights (urgent 6.0 > critical 5.0 > blocking 2.5 > info 0.25) — so
+# the two are traceably one decision rather than two guesses that can drift.
+SEVERITY_RANK: dict[str, int] = {'info': 0, 'blocking': 1, 'critical': 2, 'urgent': 3}
+
+
+def max_severity(a: str, b: str) -> str:
+    """Return the higher-urgency severity string between *a* and *b*.
+
+    Fail-soft on unknown input: an unrecognised severity is WARNed about and
+    treated as rank 0 (info-level) rather than raising, so malformed input can
+    never crash a fold nor cause an unexpected upward promotion.  The ``>=``
+    tie-break on *a* makes equal-rank comparisons — including unknown-vs-unknown
+    — deterministic rather than arbitrary.
+    """
+    for val in (a, b):
+        if val not in SEVERITY_RANK:
+            logger.warning(
+                'max_severity: unrecognised severity %r — treating as info-level '
+                '(rank 0). Known values: %s',
+                val,
+                ', '.join(SEVERITY_RANK),
+            )
+    return a if SEVERITY_RANK.get(a, 0) >= SEVERITY_RANK.get(b, 0) else b
+
+# Ladder levels an AGENT-side MCP filing (escalate_blocker) may be born at.
+# 0 = agent→steward, 1 = steward re-escalation→escalation-watcher-auto.
+# Level 2 is deliberately excluded: agents must not self-mint an L2 that
+# bypasses the auto-watcher and pages a human.  The legitimate routes to L2
+# are a born-at-L2 *severity* filed by a harness sentinel role (see
+# BORN_AT_L2_SEVERITIES and the agent-role downgrade in server.py) or the
+# promote_to_l2 handler tool.  This mirrors the existing policy that
+# downgrades an agent-filed critical/urgent to 'blocking'.
+AGENT_FILABLE_LEVELS: frozenset[int] = frozenset({0, 1})
+
 # Legal values for Escalation.resolution_class (escalation-lifecycle-dashboard-prd.md
 # Seam 1).  Used to validate the resolve/dismiss chokepoint's optional
 # resolution_class param and return a clear error naming the legal
@@ -92,7 +176,14 @@ class Escalation:
     severity: str  # "blocking" | "info" | "critical" | "urgent"
     category: str  # scope_violation, design_concern, cleanup_needed,
     # dependency_discovered, risk_identified, infra_issue,
-    # reconciliation_stale_human_operator
+    # reconciliation_stale_human_operator, reconciliation_stale_gate_backlog,
+    # recon_missing_index
+    # REFACTOR TRIGGER (task 3709): this vocabulary is prose, not a checked
+    # contract — nothing rejects a typo'd category at submit time, and the
+    # dedup correctness of every categorized detector depends on filer and
+    # reader spelling it identically.  The NEXT category addition promotes
+    # this comment to an enum (or a submit-time lint) instead of growing
+    # another line.
     summary: str  # one-line
     detail: str = ''  # full context
     suggested_action: str = ''  # expand_scope, create_followup_task, abort_task, etc.
@@ -126,6 +217,15 @@ class Escalation:
     # None for all non-train escalations; legacy JSON (pre-field) deserialises to None
     # via the from_dict __dataclass_fields__ filter — no migration required.
     train_state: TrainState | None = None
+    # PRD δ (task 3709) — FalkorDB index-provisioning drift context for
+    # `recon_missing_index` escalations filed by the reconciliation harness's
+    # index drift detector.  None for every other escalation kind; legacy JSON
+    # (pre-field) deserialises to None via the from_dict __dataclass_fields__
+    # filter — zero migration, same pattern as members / train_state above.
+    # to_dict's asdict() serialises it for free, and submit / submit_resolved /
+    # _atomic_write / resolve / park / stamp_triage are field-agnostic
+    # passthroughs that need no change.
+    index_health: IndexHealthState | None = None
     # C1 action chosen at resolve_issue time (resume/restart/park/abandon/close_only).
     # None for records resolved before α1 or for L2 cascade members (β derives theirs
     # from the parent via resolved_by='l2-cascade:<id>' attribution).
@@ -157,6 +257,16 @@ class Escalation:
     # legacy JSON without this key deserialises to [] via the from_dict
     # __dataclass_fields__ filter below — no migration required.
     granted_files: list[str] = field(default_factory=list)
+    # The FILING incarnation's claimant identity (task 3533) — semantics are
+    # documented once on `escalation.pins.classify_pins` (see the module
+    # docstring's field summary above). Zero migration, same pattern as
+    # members / evidence / train_state / the triage quad / granted_files
+    # above: legacy JSON without this key deserialises to None via the
+    # from_dict __dataclass_fields__ filter below, to_dict's asdict()
+    # serialises it automatically, and queue.submit / submit_resolved /
+    # _atomic_write / resolve / park / stamp_triage need NO change (they are
+    # field-agnostic passthroughs or RMW-on-hydrated-record).
+    filing_claimant_run_id: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

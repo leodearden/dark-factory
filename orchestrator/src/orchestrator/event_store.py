@@ -175,20 +175,99 @@ class EventType(StrEnum):
     # in-worktree path is None-safe (correctness fix still applies; only the
     # event is dispatch-local, mirroring merge_flake_suppressed).
     trivial_pass_escalated = 'trivial_pass_escalated'
+    # Contract-currency (INV-2, plans/merge-verdict-integrity-prd.md §1, §3.1,
+    # §3.7) telemetry for the RemoteRunner auto-sync-at-dispatch gate.  A
+    # RemoteRunner's adoptable post-merge verdict is trustworthy only if the
+    # runner executed CURRENT gate logic; incident bb834dd42a is the laptop's
+    # Dark-Factory *code* checkout frozen ~5 weeks, rubber-stamping trivial
+    # PASSes (966f23a6).  Both are queue/runner-scoped (task_id optional; the
+    # sync happens before/around dispatch, not necessarily bound to one task).
+    #
+    # runner_stale: emitted by RemoteRunner.sync_if_stale when the remote
+    # DF-code checkout HEAD differs from the dispatcher's local DF HEAD
+    # (staleness detected, BEFORE any sync/pull is attempted).  data carries
+    # {runner, local_head, remote_head}.
+    #
+    # runner_synced: emitted when the remote git state was brought current with
+    # the dispatcher — either the DF-code checkout (git pull --ff-only + uv
+    # sync, kind='df_checkout') or the project checkout's main ref (mirror
+    # force-push after a non-fast-forward, kind='project_main_mirror').  data
+    # carries {runner, kind, from_head, to_head, forced}; kind ∈ {'df_checkout',
+    # 'project_main_mirror'}; forced is True only on the project-main mirror
+    # force-push arm.
+    runner_stale = 'runner_stale'
+    runner_synced = 'runner_synced'
+    # INV-3 chain-intact enforcement (PRD plans/merge-verdict-integrity-prd.md
+    # §3.7 new vocab).  Emitted whenever a verdict (PASS or FAIL) is VOIDED
+    # because its verified tree no longer chains onto a still-live prefix — the
+    # item's base_sha points at a dead commit (failed/ejected/superseded/
+    # re-merged since verify dispatch).  A distinct type (not speculative_discard)
+    # so the phantom-block-avoided signal is separately countable via the event
+    # census.  data: {dead_link, reason ('chain_dead'), point ('dispatch'|'adoption')}.
+    verdict_voided = 'verdict_voided'
 
     # Task lifecycle
     task_started = 'task_started'
     task_completed = 'task_completed'
+
+    # Zero-progress requeue backstop (task 3068, origin incident reify
+    # esc-5556-1).  Emitted when a task has been burning dispatch slots with
+    # nothing to show for it — a class the requeue cap cannot see by design;
+    # see orchestrator/src/orchestrator/zero_progress_requeue.py (module
+    # docstring) for why.  This event is its only telemetry.  Both are keyed on
+    # the REAL task_id (the escalation uses a synthetic sentinel id, but the
+    # events must stay joinable against task_completed).
+    # data: {streak, threshold, span_seconds, reason, block_phase}
+    zero_progress_requeue = 'zero_progress_requeue'
+    # ...and its recovery half, emitted when the streak breaks and the filed
+    # blocking L1 is auto-resolved.  data: {streak, resolved}
+    zero_progress_requeue_recovered = 'zero_progress_requeue_recovered'
 
     # Warm-lane session resume (task γ, plans/warm-lane-session-resume-prd.md).
     # Emitted by the _run_slot eligibility guard, only when a recovered agent
     # session was present for the dispatched task:
     #   session_resume          — an eligible session was injected as --resume.
     #   session_resume_fallback — an ineligible session degraded to fresh
-    #                             dispatch; data.reason ∈ {stale, no_transcript}.
+    #                             dispatch; data.reason ∈ {stale, no_transcript,
+    #                             reseeded}.
     #   session_resume_capped   — resume_count reached max_resumes_per_task;
     #                             by-design throttling, degrades to fresh dispatch.
     # (enabled=False degrades silently — no event.)
+    #
+    # Of the fallback reasons, `reseeded` is EXPECTED, not a failure (task
+    # 3256): warm-lane acquire ALWAYS re-seeds a lane from base, wiping
+    # <lane>/.task/ and the whole claude-config transcript store with it, so a
+    # session adopted at boot routinely finds its store gone by re-dispatch. It
+    # therefore does NOT feed the fallback-storm streak (like
+    # session_resume_capped); only {stale, no_transcript} do. The event is still
+    # emitted so the rate stays measurable (PRD open question 3 — lane-collision
+    # rate is read off these reasons post-deploy).
+    #
+    # Ratio recipe: there is no separate "attempt" row — attempts are the SUM of
+    # the three outcome events (session_resume + session_resume_fallback +
+    # session_resume_capped) for a window, since the guard emits exactly one per
+    # dispatch that carried a recovered session. Read the fallback RATE as a
+    # ratio against that denominator rather than as an absolute count, and split
+    # the numerator by json_extract(data, '$.reason') to separate expected
+    # reseeds from genuine corroboration failures. (enabled=False emits nothing,
+    # so a zero total means either no recovered sessions or the kill switch.)
+    #
+    # session_resume_fallback additionally carries `data.archive_available: bool`
+    # (task 3727) on BOTH reasons — reseeded and {stale, no_transcript} alike —
+    # answering "was this session actually RECOVERABLE from the durable
+    # transcript archive?", i.e. did its transcript survive outside the wiped
+    # worktree. Query it as json_extract(data, '$.archive_available') alongside
+    # the existing '$.reason' split, so the fallback population can be cut into
+    # recoverable vs genuinely lost.
+    #
+    # session_resume and session_resume_capped deliberately do NOT carry the
+    # field, so the ratio recipe's DENOMINATOR above is unchanged — the
+    # instrument was added to exactly one of the three outcome events.
+    #
+    # The rate this field exposes is a MEASUREMENT, not a target: it quantifies
+    # a recoverable population that nothing yet acts on (INV-3
+    # instrument-before-acting). Task 3619 will deliberately move it upward, so
+    # a rising archive_available rate is that work landing, not a regression.
     session_resume = 'session_resume'
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'
@@ -209,6 +288,29 @@ class EventType(StrEnum):
     # Scheduler-scoped (task_id=None). Payload: {consecutive_failures}.
     park_eviction_deferred_fm_unavailable = 'park_eviction_deferred_fm_unavailable'
     scheduler_tier_cap_idle = 'scheduler_tier_cap_idle'
+    # EASY-backfill admission through parks (task 3823 / scheduler-scoring PRD
+    # C7).  Emitted when a candidate blocked ONLY by another task's park is
+    # admitted through it because its predicted hold, times the configured
+    # safety factor, fits inside the gap that park is provably still waiting
+    # on.  Payload: {predicted_hold, safety_factor, admission_bound,
+    # provable_assembly_delay, park_owners, modules}.
+    #
+    # Predicted AND (via park_backfill_overstay) realized are both recorded so
+    # the modelled 7-9% overstay rate at safety x2.5
+    # (plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:254-255)
+    # is MEASURED in production rather than assumed.  backfill_safety_factor
+    # is green-tier reloadable precisely so that measurement can retune it.
+    park_backfill_granted = 'park_backfill_granted'
+    # The settlement of the above: emitted at release when a back-filled hold
+    # ran LONGER than the bound its admission promised.  Payload:
+    # {predicted_hold, safety_factor, admission_bound, realized_hold,
+    # overstay_secs, park_owners, modules}.  Predicted and realized both ride
+    # on the event on purpose — the comparison is the finding, and nobody
+    # should have to reconstruct it from log lines.
+    #
+    # NOT emitted through _emit_lock_event: that chokepoint is contractually
+    # the lock-event single writer and raises on any other event type.
+    park_backfill_overstay = 'park_backfill_overstay'
 
     # Scheduler priority overrides
     #
@@ -264,6 +366,19 @@ class EventType(StrEnum):
     # cap) but had already written a finalized, valid plan to disk; the
     # workflow uses that plan instead of discarding it and re-planning.
     plan_salvaged = 'plan_salvaged'
+
+    # Architect merge-landing-desync exit (plans/architect-already-complete-
+    # exits.md §β) — emitted once per `.task/ready_to_merge.json` report by
+    # TaskWorkflow._handle_ready_to_merge_report, on BOTH dispositions, so the
+    # decision is legible without scraping logs:
+    #   accepted  → data: {decision: 'enqueued', tip, main_sha, request_id,
+    #                      evidence}
+    #   duplicate → data: {decision: 'duplicate', tip, main_sha, marker}
+    #   rejected  → data: {decision: 'rejected', predicate: <name>,
+    #                      measured: {...}}  — `predicate` names the FIRST
+    #               desync predicate that failed and `measured` carries the
+    #               first-hand values it was judged against.
+    architect_desync_merge = 'architect_desync_merge'
 
     # Phase skipped — emitted when an optimistic-path optimisation
     # short-circuits a workflow phase (B: revalidation skipped on overlap=0;
@@ -387,6 +502,81 @@ class EventType(StrEnum):
     # verified amendment can never silently fail to land.  Phase 'review'.
     # data keys: {amendment_round:int, recovery:'auto_commit', wip_sha:str|None}
     amendment_uncommitted_recovered = 'amendment_uncommitted_recovered'
+
+    # OS-sandbox worktree containment (plans/os-sandbox-worktree-containment-prd.md
+    # task β2, §Goal 3 / INV-2). Gives operators (and γ1's soak predicate) a
+    # mechanical, per-invocation record of whether OS containment was active for
+    # each sandboxed dispatch: every sandboxed invocation emits exactly one of
+    # these two — a real/none-escape wrap emits sandbox_applied, a fail-closed
+    # refusal emits sandbox_unavailable.
+    #
+    # sandbox_unavailable — emitted in TaskWorkflow._guard_sandbox's
+    #   except-SandboxUnavailable branch on the β1 fail-closed refusal, ONCE PER
+    #   REFUSAL (deliberately NOT deduped — unlike the accompanying blocking
+    #   escalation, which stays deduped per backend-state change, INV-4). The
+    #   event store is the per-invocation structured record γ1 queries ("0
+    #   sandbox-attributed blocks" must see EACH refusal), so suppressing repeat
+    #   events would blind the soak predicate. role/task_id are first-class
+    #   columns. Payload: {backend} — the configured backend that failed to
+    #   resolve (SandboxUnavailable.backend_state).
+    sandbox_unavailable = 'sandbox_unavailable'
+    # sandbox_applied — emitted once per sandboxed invocation by
+    #   TaskWorkflow._invoke on the NON-refusing guard path: a real backend
+    #   (landlock/bwrap) OR the explicit ``backend=none`` operator escape hatch
+    #   (still emitted — data.backend lets γ1 distinguish deliberately-
+    #   unsandboxed from real containment without a third event type).
+    #   role/task_id are first-class columns. Payload: {backend, digest} —
+    #   ``digest`` is WriteSet.digest(), the STABLE sha256 of the resolved
+    #   writable set so an operator can diff exactly what a given invocation
+    #   could touch (INV-2 structured facts). Consumed by γ1's soak predicate.
+    sandbox_applied = 'sandbox_applied'
+
+    # Recovery-decision emission (PRD plans/task-escalation-state-graph-prd.md
+    # D5; spec docs/task-escalation-state-spec.md S6/E12; task beta 3535).  The
+    # canonical WHY lives in orchestrator/src/orchestrator/recovery_emission.py
+    # (module docstring) — every other site carries a pointer, never a copy.
+    #
+    # Both members share ONE payload key vocabulary:
+    #   {task_id, site, shape, reason, escalation_ids, ages_secs, measured_at,
+    #    store_unavailable, streak}
+    #   site           — a RecoverySite member naming WHICH veto/LEAVE site
+    #                    spoke (the deterministic-recon pair deliberately use
+    #                    two distinct labels so their duplication is countable).
+    #   shape          — the pipe-joined 5-tuple task_ground_truth._shape keys
+    #                    the _RECOVERY table on, rendered by render_shape.
+    #   reason         — the closed LeaveReason vocabulary: escalation_pinned,
+    #                    escalation_store_unavailable, unmapped_shape,
+    #                    live_claimant, deploy_phase_in_flight,
+    #                    provenance_arbitration.
+    #   escalation_ids — the open records that held it, bucketed by
+    #                    escalation.pins.classify_pins
+    #                    ({dead_l0, queue_handoff, non_pinning}).
+    #   ages_secs      — {escalation_id: seconds}, a MAPPING (join by id, never
+    #                    by position); an unparseable timestamp maps to null
+    #                    rather than dropping the id.
+    # task_id is ALSO a first-class column, so these rows stay joinable against
+    # task_completed / escalation_created.
+    #
+    # The discriminator between the two:
+    #   recovery_vetoed — an open escalation actively vetoed a recovery /
+    #     redispatch / done-flip / dispatch that would OTHERWISE have been
+    #     taken.  Something was held back, and the payload names by what:
+    #     reason escalation_pinned, or provenance_arbitration for the
+    #     already-landed gate's contested-task withhold.
+    #   recovery_left   — a LEAVE fall-through for a NON-veto reason: an
+    #     unmapped shape, an in-flight deploy phase, or escalation_store_
+    #     unavailable.  Nothing was held back by a record; the site simply had
+    #     no mapped action (or could not read the store to find out).
+    #
+    # Read these as STATE, not as a rate.  Emission is signature-transition-
+    # gated (new-or-changed (site, task_id) veto signature, plus exactly once at
+    # the streak threshold crossing) rather than one row per observation,
+    # because two of the sites run per dispatch TICK and unconditional emission
+    # would storm the store (INV-4).  Per-sweep cadence is carried by the
+    # reconcile sweep's always-logged summary line instead.  The ABSENCE of
+    # these rows for a stranded task is therefore meaningful: nothing held it.
+    recovery_vetoed = 'recovery_vetoed'
+    recovery_left = 'recovery_left'
 
 
 class EventStore:

@@ -91,6 +91,10 @@ import logging
 import sys
 from typing import Any
 
+from fused_memory.backends.mem0_client import (
+    DEFAULT_SCROLL_MAX_PAGES,
+    ScrollPageBudgetExhausted,
+)
 from fused_memory.maintenance.cross_graph_move import (  # noqa: F401
     SubgraphEdgeResult,
     create_moved_episode,
@@ -433,7 +437,17 @@ async def merge_graph_family(
         ``mentions_recreated``, ``mentions_skipped`` (straight from the
         batch's ``SubgraphEdgeResult``), ``dropped_cross_target`` and
         ``blocked`` (both lists, passed through from the
-        ``SubgraphEdgeResult`` verbatim -- never silently dropped).
+        ``SubgraphEdgeResult`` verbatim -- never silently dropped), plus
+        ``merge_mentions_dropped`` and ``merge_mentions_dropped_uuids``
+        (task 4183's census of the MENTIONS links AT RISK -- destroyed if a
+        MERGE spec's wrong copy is deleted -- likewise passed through
+        verbatim).
+        This script builds MOVE specs only (see the ``move_specs`` assembly
+        below), so the census is structurally always 0/``[]`` here -- it
+        fires only for MERGE specs -- but both keys are surfaced anyway
+        under the same "never silently dropped" convention as
+        ``dropped_cross_target``/``blocked``, and so the field is already
+        wired should MERGE specs ever be added.
     """
     # --- Phase A: create every entity + episode in canonical ---------------
     create_failed: dict[str, Exception] = {}
@@ -580,6 +594,8 @@ async def merge_graph_family(
         'mentions_skipped': edge_result.mentions_skipped,
         'dropped_cross_target': edge_result.dropped_cross_target,
         'blocked': edge_result.blocked,
+        'merge_mentions_dropped': edge_result.merge_mentions_dropped,
+        'merge_mentions_dropped_uuids': edge_result.merge_mentions_dropped_uuids,
     }
 
 
@@ -588,41 +604,66 @@ async def merge_graph_family(
 # ---------------------------------------------------------------------------
 
 async def scroll_collection_points(
-    qdrant_client: Any,
+    backend: Any,
     collection: str,
     *,
-    limit: int = 1000,
-) -> list:
-    """Read-only scroll of every point in *collection*, WITH vectors.
+    page_size: int = 1000,
+    max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
+) -> tuple[list, bool]:
+    """Read-only PAGED scroll of every point in *collection*, WITH vectors.
 
     ``with_vectors=True`` is essential: omitting it drops embeddings from
     the returned points, which would silently destroy them once re-upserted
     into the target collection (see ``merge_collection``).
 
-    Single-page fetch: this issues exactly ONE ``scroll(..., limit=limit)``
-    call and discards the returned ``next_offset`` rather than paging
-    through it, so a collection with more than *limit* points is
-    permanently reported UNRESOLVED at the given --limit. Callers must pass
-    a *limit* larger than the true point count of every collection they
-    intend to migrate in this run; the full result set (with vectors) is
-    held in memory, so raising *limit* trades completeness for peak memory.
+    Drains ``Mem0Backend.scroll_collection_pages``, which walks Qdrant's
+    ``next_offset`` to exhaustion. This used to issue exactly ONE scroll and
+    discard ``next_offset``, so a collection with more than *page_size*
+    points was permanently reported UNRESOLVED and never migrated; it now
+    migrates fully. *collection* is passed VERBATIM -- ``COLLECTION_MERGES``
+    holds legacy mis-named collections (``fused_dark-factory``,
+    ``reify_reify``) that a ``Scope`` structurally cannot produce, which is
+    why this enters at the collection-addressed backend layer.
+
+    The full result set (with vectors) is held in memory, so *page_size* x
+    *max_pages* still bounds peak memory.
+
+    Returns:
+        ``(points, capped)``. ``capped`` can no longer be inferred from
+        ``len(points)`` -- a fully-drained multi-page scroll returns any
+        count -- so it is returned explicitly. The caller's
+        ``if args.apply and not capped`` guard is what stops
+        ``merge_collection`` deleting a source it only half-migrated.
+
+    A ``ScrollPageBudgetExhausted`` is CAUGHT, never propagated: a raising
+    sub-operation must not abort the whole consolidation run, because
+    earlier keys/sections of the same ``--apply`` pass may already hold
+    committed mutations (the same rationale the sibling ``count_graph_nodes``
+    guard states). Exhaustion maps onto the existing capped contract instead
+    -- item UNRESOLVED, no upsert, no source delete, non-zero exit -- so the
+    externally visible behaviour on a too-large collection is unchanged.
     """
-    points, _next_offset = await qdrant_client.scroll(
-        collection_name=collection,
-        with_payload=True,
-        with_vectors=True,
-        limit=limit,
-    )
-    if len(points) >= limit:
+    points: list = []
+    try:
+        async for point in backend.scroll_collection_pages(
+            collection,
+            page_size=page_size,
+            max_pages=max_pages,
+            with_vectors=True,
+        ):
+            points.append(point)
+    except ScrollPageBudgetExhausted:
         logger.warning(
-            "consolidate_namespace_families: scrolled %d point(s) from "
-            "collection '%s', which hit limit=%d -- scroll may be "
-            "incomplete/capped. Re-run with a higher --limit value before "
-            "merging, or the source collection will not be deleted "
-            '(see merge_collection).',
-            len(points), collection, limit,
+            "consolidate_namespace_families: scroll of collection '%s' exhausted "
+            'its page budget (%d page(s) of %d) after %d point(s) -- the '
+            'enumeration is INCOMPLETE, so this collection is reported '
+            'UNRESOLVED and its source will not be deleted (see '
+            'merge_collection). Re-run with a higher --limit (page size) or '
+            'raise the page budget.',
+            collection, max_pages, page_size, len(points),
         )
-    return points
+        return points, True
+    return points, False
 
 
 async def merge_collection(
@@ -794,7 +835,13 @@ async def run(
     ``has_dropped_cross_target``/``has_blocked_items`` exit-code folding,
     adapted to this script's per-item disposition rather than a parallel
     top-level predicate -- ``has_unresolved`` already scans every section
-    for ``'UNRESOLVED'``, so no new predicate is needed. A source whose
+    for ``'UNRESOLVED'``, so no new predicate is needed. The summary's
+    ``merge_mentions_dropped``/``merge_mentions_dropped_uuids`` census is
+    DELIBERATELY excluded from that predicate (task 4183, operator ruling
+    2026-08-12: visibility only) -- it is informational, like
+    ``migrate_cross_graph_leak.py``'s ``embedding_omitted``, and must not
+    flip an otherwise-clean family to ``UNRESOLVED``; the omission is a
+    decision, not an oversight. A source whose
     deletion was withheld (Phase-A create failure or Phase-B ``blocked``)
     leaves recoverable residue in the sibling graph, which also keeps that
     sibling's junk-key node count > 0 -- so its GRAPH.DELETE (step 3 below)
@@ -845,8 +892,12 @@ async def run(
     # --- 2. Qdrant collection merges ----------------------------------------
     collection_items: list[dict] = []
     for source, target in COLLECTION_MERGES.items():
-        points = await scroll_collection_points(qdrant_client, source, limit=limit)
-        capped = len(points) >= limit
+        # The backend pages; --limit is this scroll's PAGE SIZE. `capped` is
+        # the flag the scroll returns, NOT len(points) >= limit -- a
+        # fully-drained multi-page scroll can return any count.
+        points, capped = await scroll_collection_points(
+            memory_service.mem0, source, page_size=limit,
+        )
         canonical_user_id = canonical_user_id_for(target)
         item = {
             'source': source,
@@ -964,12 +1015,15 @@ def main() -> int:
     )
     parser.add_argument(
         '--limit', type=int, default=1000,
-        help='Maximum rows/points fetched in a SINGLE page per item (default: '
-             '1000 -- no further pages are fetched). Must exceed the true '
-             'row/point count of the largest graph/collection being '
-             'migrated, or that item is permanently reported UNRESOLVED. '
-             'Increase if the dry-run report logs a scroll/limit-cap '
-             'WARNING; memory scales with this value.',
+        help='Page/row size (default: 1000). For the GRAPH enumerations it is '
+             'a single-page row cap: it must exceed the true row count of the '
+             'largest graph being migrated, or that item is permanently '
+             'reported UNRESOLVED. For the COLLECTION scroll it is the PAGE '
+             'SIZE -- pages are followed to exhaustion, so a collection larger '
+             'than this now migrates fully instead of being permanently '
+             f'UNRESOLVED; the page budget ({DEFAULT_SCROLL_MAX_PAGES} pages) '
+             'bounds the total. Increase if the dry-run report logs a '
+             'row-cap or page-budget WARNING; memory scales with this value.',
     )
     parser.add_argument(
         '--config', default=None,

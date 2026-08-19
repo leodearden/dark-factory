@@ -1,0 +1,358 @@
+# Machine-readable twin of toolcall-markup-containment-prd.capability-manifest.md
+# Schema: shared/src/shared/capability_manifest.py (CapabilityManifestDoc).
+# Built at decompose 2026-08-05 against main tip 37f761f5a4.
+#
+# task_id values for α β γ δ ε ζ θ ι were stamped automatically by commit_planning
+# (task 2578) when the batch was flipped deferred -> pending.
+#
+# η (3697) was HAND-STAMPED: it was deliberately held out of that flip and filed `deferred`,
+# because its only FAIL binding below (authority-to-mutate-task-3083) was reserved to the
+# operator (see the .md twin, Finding 1). That hold has since been DISCHARGED by operator
+# Ruling 1 on 2026-08-05: η was released, task 3697 is `pending`, and the binding now reads
+# PASS. Its decompose-time FAIL claim is preserved verbatim in that capability's binding
+# prose rather than deleted — mirroring the .md twin, which leaves its findings as written
+# and records rulings alongside them. See the .md twin, "Operator rulings, 2026-08-05
+# (post-decompose)", Ruling 1.
+prd: plans/toolcall-markup-containment-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 3688
+  title: 'shared.toolcall_markup: detector, deterministic repairer, committed fixture
+    corpus'
+  capabilities:
+  - name: detector-and-repairer-module-exists
+    binding: capability→producer (wired) — shared/ is a live workspace package imported
+      by fused-memory, orchestrator and escalation today
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def repair\(
+      paths:
+      - shared/src/shared/toolcall_markup.py
+      expect: present
+  - name: fixture-corpus-committed-with-expected-outcomes
+    binding: capability→producer (measured) — 4498 .jsonl.gz present under data/orchestrator/agent-transcripts/
+      at decompose
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: expected_outcome
+      paths:
+      - shared/tests/fixtures/toolcall_markup_corpus.jsonl
+      expect: present
+  - name: single-literal-source-inv5
+    binding: 'capability→producer (wired) — both divergent sites exist to consolidate:
+      markup_tripwire.py:85 (3 literals), toolcall_xml_leak.py:115 (4 closers)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'MCP_MARKUP_PATTERNS: tuple\[str, \.\.\.\] = \('
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: absent
+  - name: expectation-agreement-not-a-bare-threshold
+    binding: 'numeric floor DELIBERATELY ABSENT — PRD §9 α''s own G6 note: pinning
+      the literal 308 would make a better repairer look like a regression'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the signal is agreement with committed per-specimen expectations, which
+        is a replay assertion, not a grep
+  - name: d5-prefix-and-verbatim-substring-invariant
+    binding: capability→producer (wired) — directly testable over the committed corpus;
+      no external substrate
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: prefix/substring purity is a property asserted across every corpus record,
+        not a greppable literal
+- label: β
+  task_id: 3689
+  title: 'MarkupGuardMiddleware: policy enum, structured facts, storm escape'
+  capabilities:
+  - name: repair-policy-declared-enum-inv1
+    binding: capability→producer (producer:α + wired) — fastmcp 3.2.2 Middleware/on_call_tool
+      re-probed live at decompose
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class RepairPolicy
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: markup-detected-structured-fact-inv2
+    binding: capability→producer (producer:β) — emitted at the failure point; no consumer
+      log-scrapes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: markup_detected
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: exempt-tools-declared-at-registration-inv1
+    binding: capability→producer (producer:β) — declared frozenset, machine-checked,
+      not discovered by failure
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: exempt_tools
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: storm-escape-keyed-by-outcome-inv4
+    binding: capability→producer (wired) — MarkupStormCounter at markup_tripwire.py:294
+      generalises; emit_markup_storm_escalation at :374
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the (project, outcome) keying is a behavioural property exercised by
+        β's burst test, not a literal
+  - name: unrepairable-never-guessed-under-either-policy
+    binding: rejection-mechanism — built+bound by β; boundary rows B5/B8/B9 observe
+      each rejection path fire
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality is judged by β's boundary fixtures, not a grep
+- label: γ
+  task_id: 3690
+  title: Register the middleware on all four servers; retire the in-line gates
+  capabilities:
+  - name: middleware-registered-on-four-servers
+    binding: capability→producer (measured) — all four FastMCP( sites confirmed at
+      the PRD's cited lines on 37f761f5a4
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: add_middleware
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+      - orchestrator/src/orchestrator/mcp/plan_tools.py
+      - orchestrator/src/orchestrator/mcp/verdict_tools.py
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: inline-markup-gate-call-sites-retired-inv5
+    binding: capability→producer (measured) — exactly four call sites at tools.py:1828,2020,5446,5990
+      (def at :1121) to remove per D1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: if block := _markup_gate\(
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: absent
+  - name: live-submit-task-rejected-with-repaired-call
+    binding: capability→producer (producer:β, in γ's transitive closure γ←β←α) — in-flight
+      argument access proven by PRD §6 live probe
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the signal is a live MCP round-trip observed through the tool response,
+        not a repo grep
+  - name: live-escalate-info-lands-with-suggested-action
+    binding: capability→producer (producer:β, in γ's closure) — argument mutation
+      reaching the tool confirmed by PRD §6 live probe
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: observed through the filed escalation record, not by reading storage
+- label: δ
+  task_id: 3691
+  title: Retro-sweep of terminal state, atomic
+  capabilities:
+  - name: sweep-script-exists
+    binding: capability→producer (producer:δ) — pure stdlib; no new substrate
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def main
+      paths:
+      - scripts/sweep_toolcall_markup.py
+      expect: present
+  - name: atomic-temp-verify-replace-c3
+    binding: capability→producer (producer:δ) — os.replace onto the target after a
+      verify-parse, operator's atomicity requirement (D4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: os\.replace
+      paths:
+      - scripts/sweep_toolcall_markup.py
+      expect: present
+  - name: escalation-corpus-sweep-target-measured
+    binding: extent measured at decompose — 49 corrupted strings across 48 of 3377
+      data/escalations/**/*.json (PRD said 51; live corpus, drift expected)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the binding signal is the predicate invariant (a second --apply run
+        reports 0 remaining), deliberately NOT the literal 51 — see manifest Finding
+        3
+  - name: orphaned-plan-sweep-target-measured
+    binding: extent measured at decompose — 2 corrupted strings in 1 of 15 .worktrees-orphaned/**/.task/plan.json;
+      the 21-file pocket is LIVE and belongs to ε (D4)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: extent is pinned in δ's description as a decompose-time observation,
+        not a threshold to hit
+  - name: committed-evidence-file-survives-the-sweep
+    binding: rejection-mechanism (must-not-touch) — docs/task-recovery-2026-05-13/worktree-inventory.json
+      is git-tracked, legitimately carries 3 predicate matches, and is replicated
+      into every worktree (47 hits across 16 orphaned dirs under a loose glob). See
+      manifest Finding 4
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: </invoke>
+      paths:
+      - docs/task-recovery-2026-05-13/worktree-inventory.json
+      expect: present
+- label: ε
+  task_id: 3692
+  title: plan-tools lazy write-back for live plans
+  capabilities:
+  - name: corrupted-live-plans-exist-to-repair
+    binding: extent measured at decompose — 88 corrupted strings across 21 of 265
+      live .worktrees/**/.task/plan.json; reproduces PRD §2.4's 21/296 as the LIVE
+      set
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the live worktree set is transient state, not a repo artifact a dispatch-time
+        grep can assert
+  - name: plan-tools-read-path-hooked
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/mcp/plan_tools.py:596
+      is the live FastMCP server
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: toolcall_markup
+      paths:
+      - orchestrator/src/orchestrator/mcp/plan_tools.py
+      expect: present
+  - name: atomic-write-back-under-concurrency-c3
+    binding: capability→producer (producer:α repairer + producer:ε write path) — boundary
+      row B12
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: os\.replace
+      paths:
+      - orchestrator/src/orchestrator/mcp/plan_tools.py
+      expect: present
+- label: ζ
+  task_id: 3693
+  title: Correct docs/mcp-toolcall-xml-leak.md §1 (over-consumption, not early termination)
+  capabilities:
+  - name: incorrect-early-termination-claim-is-present
+    binding: premise measured TRUE at decompose — docs/mcp-toolcall-xml-leak.md:26-27
+      reads 'terminates a string **argument** early'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: terminates a string
+      paths:
+      - docs/mcp-toolcall-xml-leak.md
+      expect: absent
+  - name: over-consumption-direction-stated
+    binding: capability→producer (producer:α) — the corpus is the evidence for the
+      corrected direction
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: over-consum
+      paths:
+      - docs/mcp-toolcall-xml-leak.md
+      expect: present
+- label: η
+  task_id: 3697
+  title: Retire the non-canonical evidence-log metadata convention
+  capabilities:
+  - name: non-canonical-keys-present-on-task-3083
+    binding: premise measured TRUE at decompose — markup_tripwire_rejections_20260730
+      and _burst3 both present on task 3083 metadata (read-only get_task)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: task metadata is fused-memory state, not a repo artifact; asserted via
+        get_task, never by peeking at storage
+  - name: allow-mcp-markup-documented-as-the-correct-move
+    binding: capability→producer (producer:η) — docs-only half of the leaf, unaffected
+      by the hold
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: allow_mcp_markup
+      paths:
+      - docs/
+      expect: present
+  - name: authority-to-mutate-task-3083
+    binding: 'DECOMPOSE-TIME VERDICT, 2026-08-05 — FAIL, left as written: "rejection-absent
+      (authority not held) — mutating task 3083 is reserved to the operator by standing
+      instruction. This FAIL is the binding that blocks η from queueing: η is filed
+      deferred and deliberately EXCLUDED from the commit_planning flip. Every other
+      task in the batch clears. See manifest Finding 1". || DISCHARGED by operator
+      Ruling 1, 2026-08-05 (post-decompose): the operator authorized the mutation,
+      so the capability is now HELD and the verdict below reads PASS. Task 3697 was
+      set `pending`; the η title and description were rewritten in place to drop the
+      hold notice. Resolved by operator authorization, NOT by re-scoping — the capability
+      asserted is unchanged, only the authority behind it. The manifest schema
+      (shared/src/shared/capability_manifest.py, extra=forbid) has no rulings field,
+      so the superseded claim and its discharge are both recorded here in prose,
+      mirroring the .md twin, which leaves Finding 1 as written and records the ruling
+      alongside it. See the .md twin, "Operator rulings, 2026-08-05 (post-decompose)",
+      Ruling 1'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'authority is an operator decision (INV-7: owner named, reason recorded
+        here and in the task description), never a repo grep; the hold exit — a one-call
+        release — was taken by Ruling 1 on 2026-08-05'
+- label: θ
+  task_id: 3695
+  title: Upstream harness bug report (parser over-consumption)
+  capabilities:
+  - name: specimen-backed-report-committed
+    binding: capability→producer (producer:α) — the four shapes, incidence and repairability
+      figures all come from α's corpus
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: over-consum
+      paths:
+      - docs/upstream/toolcall-parser-overconsumption.md
+      expect: present
+  - name: self-contained-without-this-repo
+    binding: capability→producer (producer:θ) — new file in a new directory; no substrate
+      dependency
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: self-containedness is an editorial judgement, not a greppable property
+- label: ι
+  task_id: 3696
+  title: Paired edit to the owning PRD (G4 bookkeeping)
+  capabilities:
+  - name: owning-prd-still-names-3083-as-pending
+    binding: premise measured TRUE at decompose — docs/prds/memory-write-path-convergence.md:115
+      reads 'DF 3083 (pending)'; :5 repeats it; §9 leaf ο at :144
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: DF 3083 \(pending\)
+      paths:
+      - docs/prds/memory-write-path-convergence.md
+      expect: absent
+  - name: superseding-mechanism-has-landed
+    binding: capability→producer (producer:γ) — ι depends on γ, so the middleware
+      exists when ι asserts it supersedes the in-line tripwire
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: toolcall-markup-containment
+      paths:
+      - docs/prds/memory-write-path-convergence.md
+      expect: present

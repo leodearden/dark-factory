@@ -15,8 +15,12 @@ its rendered sections at a later task (ξ). Those prompts currently import
 nothing from harness.py/flag_dedup.py/recon_ledger.py, so — to stay safely
 importable from the prompt-import path without pulling in aiosqlite
 (recon_ledger's dependency) or other reconciliation internals — this module
-imports ONLY reconciliation.recon_pool_map (itself a leaf — see that
-module's docstring) plus stdlib. Consistency with recon_ledger.MARKER_KINDS,
+imports ONLY reconciliation.recon_pool_map and
+reconciliation.standing_decision_constants (both pure leaves — see those
+modules' docstrings; standing_decision_constants imports only
+`from __future__ import annotations`, so it pulls no reconciliation
+internals onto the prompt-import path) plus stdlib. Consistency with
+recon_ledger.MARKER_KINDS,
 harness._derive_affected_ids, and flag_dedup's content-fingerprint fallback
 is cross-checked by tests (fused-memory/tests/test_recon_self_model.py),
 which may import those modules freely.
@@ -48,6 +52,11 @@ from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
     STAGE1_CYCLE_SUMMARY_RECON_POOL,
     STAGE2_CYCLE_SUMMARY_RECON_POOL,
+)
+from fused_memory.reconciliation.standing_decision_constants import (
+    GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    MEM0_KIND_INVESTIGATION_OUTCOME,
+    RECORD_KIND_ENTITY_STANDING_DECISION,
 )
 
 # --------------------------------------------------------------------------- #
@@ -94,7 +103,13 @@ class MarkerLifecycle:
     deleter: str
 
 
-# One entry per MARKER_KINDS value. The GC-on-terminal subset (deleter ==
+# A SUPERSET of MARKER_KINDS: one entry per MARKER_KINDS value, plus
+# mem0_tombstone (task 3041), which is deliberately in NEITHER MARKER_KINDS
+# constant. Its ledger task_id column holds a Mem0 memory uuid rather than a
+# Taskmaster task id, so it must never enter recon_ledger.MARKER_KINDS (which
+# drives gc()'s terminal-task DELETE arm and marker_task_ids()) nor this
+# module's MARKER_KINDS — but its lifecycle still belongs documented here.
+# The GC-on-terminal subset (deleter ==
 # DELETER_GC) is exactly recon_ledger.MARKER_KINDS — the per-task marker
 # kinds ReconLedgerStore.gc() is *eligible* to delete once their task_id goes
 # terminal (its record_kind IN (...) clause matches on these three kinds).
@@ -120,6 +135,26 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
             'Stage 1 flag_dedup post-processor, for flagged items carrying '
             'metadata.flag_for_stage2=true'
         ),
+        # Classified DELETER_GC because this record_kind is one of the three
+        # recon_ledger.MARKER_KINDS ReconLedgerStore.gc() is eligible to
+        # match — kept exactly DELETER_GC (not a distinct sentinel) so this
+        # entry keeps cross-checking against recon_ledger.MARKER_KINDS via
+        # test_recon_self_model.py's DELETER_GC-subset assertion. In current
+        # practice, though, gc() never actually collects a flag_for_stage2
+        # row: this kind's only writer (the Stage 1 flag_dedup/LLM
+        # add_memory path above) writes solely to Mem0
+        # (metadata.flag_for_stage2=true) and no code path upserts a
+        # flag_for_stage2 row into the ledger — the identical
+        # declared-vs-actual gap documented on stage2_persistence_marker
+        # below (task 2228 W5-κ, review finding model_drift). The live
+        # collector is the separate Mem0 age-based sweep
+        # task_knowledge_sync._sweep_stale_mem0_flag_for_stage2_markers
+        # (task 2966), which — unlike stage2_persistence_marker's sweep —
+        # enumerates via the boolean payload filter
+        # {'flag_for_stage2': True} rather than a {'source': ...} filter,
+        # since these markers carry no source metadata field. Migrating the
+        # writer onto the ledger — so DELETER_GC becomes true in practice and
+        # not just in eligibility — is a follow-up.
         deleter=DELETER_GC,
     ),
     'stage2_persistence_marker': MarkerLifecycle(
@@ -154,6 +189,16 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
             "(metadata.kind='cycle_summary')"
         ),
         deleter=DELETER_POOL_TRIM,
+    ),
+    # Not a MARKER_KINDS member — see the superset note above.
+    'mem0_tombstone': MarkerLifecycle(
+        writer=(
+            'Python, from mem0_tombstone.record_mem0_deletion_tombstone — one '
+            'per CONFIRMED recon-initiated Mem0 delete (both the marker-GC '
+            'sweeps and the cycle_summary pool-cap trim), keyed by the deleted '
+            "record's memory uuid"
+        ),
+        deleter=DELETER_TTL,
     ),
 }
 
@@ -212,7 +257,11 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     ),
     'resolve_ticket': (
         'resolve_ticket(ticket, project_root) -> '
-        "{'status': 'created'|'combined'|'failed', 'task_id'?: ..., 'reason'?: ...}"
+        "{'status': 'created'|'combined'|'failed'|'refused', 'task_id'?: ..., "
+        "'reason'?: ...}  "
+        '# refused = a deterministic guard rejected the candidate: NO task was '
+        'created and NO task_id key is present. Terminal and intended; never '
+        'retry it and never record a task id for it.'
     ),
     'add_finding': (
         'add_finding(severity, category, flag_type, actionable, description, '
@@ -221,6 +270,16 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
         "resolves to False if task_id is None or category starts with "
         "'cross_project', else True; an explicit True/False from the caller "
         'is always honored. '
+        "# prefix match, not an allowlist: a NEW 'cross_project'-prefixed "
+        'category that is genuinely actionable must still pass '
+        'actionable=True explicitly, or it silently resolves to False. '
+        '# task-1654 ripple: an actionable=False finding can vanish from '
+        'flagged_items when ALL of its citations trace to same-run '
+        'Stage-1 (memory_consolidator) findings (never when the finding '
+        'itself is Stage 1, and never with zero typed citations or any '
+        'uncovered citation) — pass actionable=True explicitly only in '
+        "that shape (see ReconReportState.add_finding's docstring for "
+        'the full rationale). '
         '# dedup key: cited_tasks is the authoritative dedup key, not this '
         'task_id param — a None / single / comma-joined / foreign top-level '
         'task_id is normalized to the cited-task set (see cite_task below '
@@ -232,9 +291,12 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
         'add_finding.task_id. cite_task also performs an in-run fold '
         '(task-2432): a finding whose top-level task_id is None, equals this '
         'cited task_id, or (if comma-joined) contains it among its parts, '
-        'collapses onto whichever finding first cited this task — so None, '
-        'single, comma-joined, and foreign top-level task_id shapes all '
-        'dedup through this one path once they share a cited task.'
+        'collapses onto whichever finding first cited this task — same-project '
+        'only where that first citer pinned a project, since two projects can '
+        'carry the same task NUMBER (task-4185: cross-project near-collisions '
+        'are kept distinct) — so None, single, comma-joined, and foreign '
+        'top-level task_id shapes all dedup through this one path once they '
+        'share a cited task.'
     ),
     'cite_entity': (
         "cite_entity(finding_id, name) -> {'ok': True}  "
@@ -328,6 +390,85 @@ def render_suppression_schema_section() -> str:
     )
 
 
+def render_entity_standing_decision_schema_section() -> str:
+    """Render the SHARED entity-standing-decision schema section (task 2898 ε,
+    PRD plans/stage1-entity-standing-decision-prd.md §ε).
+
+    Rendered byte-identically into BOTH the Stage-1 and Stage-2 system prompts
+    (the record schema, the demotion fact, and the advisory-read fact are all
+    system-wide invariants each stage must understand). It covers three
+    both-stages facts:
+
+    * the ``entity_standing_decision`` ledger record schema — record kind +
+      grounds enum, single-sourced from ``standing_decision_constants`` (task
+      2894 α) so the rendered text carries the constant VALUES, not re-hardcoded
+      literals (INV-5);
+    * the demotion (PRD decision 6): the ledger kind is the SOLE
+      machine-consulted standing-decision form, and the ad-hoc mem0 kinds
+      ``recurring_flag_standing_decision`` / ``stage1_finding_correction`` are
+      evidence-only;
+    * the pre-emission advisory ``get_memories_by_metadata`` check against the
+      mem0 mirror — advisory ONLY, because the authoritative gate is Stage 1's
+      deterministic filter (γ) and reads never consult mem0 for authority.
+    """
+    return (
+        '## Entity Standing Decisions\n'
+        f'The `{RECORD_KIND_ENTITY_STANDING_DECISION}` ledger record is the SOLE '
+        'machine-consulted standing-decision form — the durable record that a prior '
+        'investigation adjudicated a recurring class of complaint about an entity and '
+        'dismissed it as a known false positive. Canonical recon_ledger record schema:\n'
+        f'  - `record_kind = "{RECORD_KIND_ENTITY_STANDING_DECISION}"`\n'
+        '  - `grounds` ∈ the closed grounds enum — currently the single value '
+        f'`"{GROUNDS_STRUCTURAL_SIZE_CONFLATION}"`; a complaint citing a specific edge '
+        'uuid is by definition outside it (the per-edge escape hatch).\n'
+        '  - `entity_uuid`, `decided_at`, and a never-None `expires_at`.\n\n'
+        'Demotion (PRD decision 6): the ad-hoc mem0 kinds '
+        '`recurring_flag_standing_decision` and `stage1_finding_correction` are demoted '
+        'to evidence-only. No machine gate consults them; only the '
+        f'`{RECORD_KIND_ENTITY_STANDING_DECISION}` ledger record governs suppression.\n\n'
+        'Pre-emission advisory check: before emitting a standing decision you MAY run an '
+        'advisory `get_memories_by_metadata` lookup against the mem0 mirror to see '
+        'whether a matching decision already exists. This is ADVISORY ONLY — the '
+        "authoritative gate is Stage 1's deterministic filter (γ), the sole enforcement "
+        'point. Reads never consult mem0 for authority: a mem0 hit or miss changes '
+        'nothing about whether a finding is suppressed; only the ledger record does.'
+    )
+
+
+def render_investigation_outcome_section() -> str:
+    """Render the STAGE-2-ONLY investigation_outcome section (task 2898 ε,
+    PRD plans/stage1-entity-standing-decision-prd.md §ε).
+
+    Wired into the Stage-2 prompt only — Stage 1 has no writer path and does not
+    conclude investigations, so instructing it to write these records would be
+    misleading (never tell a stage to use a capability it lacks). Covers the
+    ``investigation_outcome`` mem0-kind schema (kind single-sourced from
+    ``standing_decision_constants`` / task 2894 α) and the Stage-2 write
+    instruction: on every not-actionable investigation conclusion going forward,
+    write one record. The pool of these records feeds β's authorization arm-2
+    evidence (the writer counts them before it may emit an
+    entity_standing_decision); day-one emptiness is expected and accepted by
+    design (PRD decision 8).
+    """
+    return (
+        '## Investigation Outcome Records\n'
+        'When you (Stage 2) conclude an investigation of a flagged entity and '
+        'determine it is not actionable, write an '
+        f'`{MEM0_KIND_INVESTIGATION_OUTCOME}` mem0 record so the conclusion is durable '
+        'evidence. Schema (observations_and_summaries category):\n'
+        f'  - `metadata.kind = "{MEM0_KIND_INVESTIGATION_OUTCOME}"`\n'
+        "  - `metadata.entity_uuid = <the investigated entity's uuid>`\n"
+        '  - `metadata.actionable = false`\n'
+        '  - `metadata.run_id = <current run_id>`\n\n'
+        'Write one such record on every not-actionable investigation conclusion going '
+        "forward. These records feed the standing-decision writer's authorization arm-2 "
+        'evidence pool — the writer counts matching '
+        f'`{MEM0_KIND_INVESTIGATION_OUTCOME}` records before it is permitted to emit an '
+        f'`{RECORD_KIND_ENTITY_STANDING_DECISION}`. Day-one emptiness of this pool is '
+        'expected and accepted by design; it fills forward as investigations conclude.'
+    )
+
+
 def render_cycle_summary_section() -> str:
     """Render the per-cycle summary metadata convention, faithful to
     reconciliation/prompts/stage2.py:236-302, interpolating the
@@ -368,6 +509,21 @@ def render_cycle_summary_section() -> str:
         'deleting the oldest members once the cap is exceeded — a summary '
         'written without this tag is invisible to that trim and the pool grows '
         'unboundedly.\n\n'
+        'IMPORTANT — a missing older cycle_summary mirror is NOT data loss. '
+        'That Mem0 pool is CAP-BOUNDED (cap=2 per stage per project), and the '
+        'trim runs inside `write_cycle_summary` itself, so every cycle evicts '
+        "an older mirror seconds after writing the new one. A mirror for any "
+        'run older than the last couple of cycles is EXPECTED to be absent. '
+        'The Mem0 record is a best-effort searchable copy; the AUTHORITATIVE '
+        'record is the ReconLedgerStore cycle_summary row — check it with '
+        '`get_cycle_summary_presence`, never by looking for the mirror.\n\n'
+        'Any recon-initiated Mem0 deletion now leaves a TOMBSTONE, returned by '
+        "`get_memory_by_id` on its not-found branch as a `'tombstone'` key "
+        'naming the sweep that deleted the record, the run that did it, and the '
+        "victim's metadata. Before reporting a missing memory as silent loss, "
+        'consult it: a tombstone means the record was deliberately reaped by a '
+        'named sweep. Reporting a capped-pool eviction as fleet-wide data loss '
+        'is a real failure mode — it happened (recon gate 165, task 3041).\n\n'
         "The `record_type` metadata key discriminates cycle_summary writers by "
         "purpose, not by shape: `'ledger_stamp'` marks Python's deterministic "
         "code mirror described above; `'narrative'` marks the distinct "
@@ -423,8 +579,13 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
     The tool-holding recon stage ALREADY holds the memory-mutation tools
     (add_memory / delete_memory / merge_entities): per
     reconciliation/cli_stage_runner.py, DISALLOW_MEMORY_WRITES is folded into
-    STAGE3_DISALLOWED ONLY (STAGE1_DISALLOWED = DISALLOW_TASK_WRITES +
-    DISALLOW_BUILTIN; STAGE2_DISALLOWED = DISALLOW_BUILTIN). So both Stage 1 and
+    STAGE3_DISALLOWED ONLY — neither Stage 1 nor Stage 2 denies it.  That is the
+    only per-stage fact this section needs, so the composition of the three
+    STAGE*_DISALLOWED lists is deliberately NOT restated here: cli_stage_runner.py
+    owns them, they grow additively, and a mirrored inventory in a docstring goes
+    stale silently.  (Exactly that failure mode is what hid the Stage-2
+    escalation-read gap until task 3163 — read the lists at their source.)
+    So both Stage 1 and
     Stage 2 can COMPLETE safe memory merges inline instead of filing a task to
     ask someone else to do work they can already do — cutting the redundant
     relay-then-bounce class off at its origin — and file ONLY the residual
@@ -470,6 +631,68 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
         "`metadata.execution_class='operational'` and "
         "`metadata.operational_mode='gate'` (the human-gated routing mode, not "
         "the `'llm'` mode). " + residual_clause
+    )
+
+
+def render_task_creation_accounting_section() -> str:
+    """Render the Task-Creation Accounting section (task 3046, run_id
+    507bc25b evidence).
+
+    Stage 2's `tasks_created` increment mandate (`## Verifying Task
+    Operations`, prompts/stage2.py) is stated once, but never declares the
+    counter's SCOPE: whether a task confirmed via a mid-cycle side quest —
+    the Proactive Task Sample, the Done-Task Completion-Memory Audit,
+    Cross-Project Routing, a Source-Completion residual, or a
+    predicate-contradiction gate — counts the same as one confirmed from a
+    Stage 1 flagged item. Run 507bc25b filed task 3045 via the
+    proactive/cross-project sample-review surface yet Stage 2 self-reported
+    `tasks_created: 0` — exactly the gap this section closes, by stating the
+    counter is path-agnostic and by giving the framework an action-record
+    ground truth (`task_created_records`) it can repair from, modeled
+    directly on `flag_deleted_records`' established convention (see
+    `## Per-Cycle Counter Schema` in prompts/stage2.py).
+
+    Rendered once, as a shared renderer (INV-5) — not restated in
+    `assemble_payload`'s "Your Task" block, where the Proactive Task Sample /
+    Cross-Project Routing instructions actually live, to avoid two copies of
+    the same rule drifting apart. Like `render_source_completion_section`,
+    this is new canonical text with no prior prompt precedent, and is
+    written as a plain (non-f) string so its literal `{`/`}` record-shape
+    example needs no brace-doubling when interpolated into the f-string
+    ``STAGE2_SYSTEM_PROMPT``.
+    """
+    return (
+        '## Task-Creation Accounting\n'
+        '`tasks_created` is PATH-AGNOSTIC: it counts EVERY task you confirm '
+        'this cycle, regardless of which surface produced the work — a '
+        'Stage 1 flagged item, the **Proactive Task Sample**, the '
+        '`### Done-Task Completion-Memory Audit`, Cross-Project Routing (a '
+        "task filed into ANOTHER project's `project_root` still counts — it "
+        'is a task you created this cycle), a Source-Completion residual, '
+        'or a predicate-contradiction gate. A creation is never exempt from '
+        'the count because it was a mid-cycle side-quest rather than the '
+        'finding you started from.\n\n'
+        'Confirmation rule: see `## Verifying Task Operations` above for the '
+        'full rule, including its `get_task`-verified fallback for a status '
+        'other than `created`/`combined`/`failed`. Only the '
+        '`resolve_ticket`-confirmed subset of that rule — `status` `created` '
+        'or `combined` WITH a `task_id` — is machine-countable via the '
+        'action record below; never record on the `submit_task` call '
+        'attempt, and `failed` never counts. A creation you confirm via the '
+        '`get_task` fallback still counts toward your own `tasks_created` '
+        'self-report, but has no `task_created_records` entry of its own — '
+        'so under-reporting it is not auto-repaired the way an omitted '
+        '`created`/`combined` record is.\n\n'
+        'Action record: at the moment of each confirmation, append one '
+        "entry to `stats['task_created_records']`:\n"
+        '  `{"action": "task_created", "task_id": <id>, '
+        '"status": "created"|"combined", "project_id": <project the task '
+        'was filed into>, "source_path": <short label of the surface that '
+        'produced it>}`\n\n'
+        'The framework treats this list as ground truth and REPAIRS '
+        '`tasks_created` upward when the two disagree (recording the '
+        'pre-repair value under `tasks_created_reported`), so a missed '
+        'increment is recovered rather than lost.'
     )
 
 

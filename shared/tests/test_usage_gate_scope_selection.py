@@ -29,60 +29,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import os
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
-from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import AccountPhase, ScopeCap, UsageGate
+from _usage_gate_test_helpers import SCOPE, make_gate, make_mock_cost_store, set_scope_cap
 
-SCOPE = 'claude-fable-5'
-
-
-# ---------------------------------------------------------------------------
-# Local helpers (mirroring test_usage_gate_scope_attribution.py)
-# ---------------------------------------------------------------------------
-
-def make_gate(account_names: list[str], *, cost_store=None, **cfg) -> UsageGate:
-    """Create a real UsageGate with fake accounts, probe + reset-wait disabled."""
-    acct_cfgs = []
-    env_vars: dict[str, str] = {}
-    for name in account_names:
-        env_key = f'TEST_TOKEN_{name.upper().replace("-", "_")}'
-        env_vars[env_key] = f'fake-token-{name}'
-        acct_cfgs.append(AccountConfig(name=name, oauth_token_env=env_key))
-    cfg.setdefault('wait_for_reset', False)
-    config = UsageCapConfig(accounts=acct_cfgs, **cfg)
-    with patch.dict(os.environ, env_vars):
-        gate = UsageGate(config, cost_store=cost_store)
-    # Mock _run_probe to prevent real subprocess spawning.
-    gate._run_probe = AsyncMock(return_value=True)
-    return gate
-
-
-def make_mock_cost_store() -> AsyncMock:
-    store = AsyncMock()
-    store.save_account_event = AsyncMock(return_value=None)
-    store.save_invocation = AsyncMock(return_value=None)
-    return store
-
-
-def set_scope_cap(
-    acct,
-    scope: str = SCOPE,
-    *,
-    capped: bool = True,
-    resets_at: datetime | None = None,
-    capped_at: datetime | None = None,
-    near_cap: bool = False,
-) -> ScopeCap:
-    """Directly install a ScopeCap overlay on *acct* (bypassing the β handler)."""
-    sc = ScopeCap(
-        capped=capped, resets_at=resets_at, near_cap=near_cap, capped_at=capped_at,
-    )
-    acct.scope_caps[scope] = sc
-    return sc
-
+from shared.usage_gate import AccountPhase
 
 # ===========================================================================
 # Step 1 — scope-uncap sweep + deadline mechanics (S6 core)

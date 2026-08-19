@@ -21,12 +21,23 @@ regression) for why this repo removed that pattern previously.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import aiosqlite
 import pytest
 import pytest_asyncio
 
-from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.reconciliation.mem0_tombstone import (
+    RECORD_KIND_MEM0_TOMBSTONE,
+    record_mem0_deletion_tombstone,
+    record_mem0_deletion_tombstones,
+)
+from fused_memory.reconciliation.recon_ledger import (
+    MARKER_KINDS,
+    ReconLedgerRecord,
+    ReconLedgerStore,
+)
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_TTL,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
@@ -1160,3 +1171,433 @@ async def test_gc_flip_defensively_wraps_non_dict_standing_payload(store):
     }
     assert await store.get_active_entity_standing_decision('proj-p', 'uuid-scalar') is None
     assert count == 1
+
+
+# --------------------------------------------------------------------------
+# mem0_tombstone rows (task 3041)
+#
+# A tombstone is a plain recon_ledger row with record_kind='mem0_tombstone'
+# and task_id=<the deleted Mem0 record's uuid>, written after every confirmed
+# recon-initiated Mem0 delete. It deliberately reuses three existing store
+# mechanisms rather than adding a fourth store: the five-part-PK ON CONFLICT
+# for idempotence, get_by_identity for the lookup, and gc()'s expires_at pass
+# for TTL-bounded growth.
+#
+# The load-bearing NON-membership invariant these tests pin: 'mem0_tombstone'
+# is NOT in MARKER_KINDS, because its task_id column holds a Mem0 memory uuid
+# rather than a Taskmaster task id. Both task-id-keyed paths (gc()'s
+# terminal-task DELETE arm and marker_task_ids(), which _gc_recon_markers
+# feeds straight back into gc()) must therefore never see it.
+# --------------------------------------------------------------------------
+
+
+def _tombstone_ms(store):
+    """Minimal memory_service stand-in exposing the real store as recon_ledger.
+
+    record_mem0_deletion_tombstone resolves its store via
+    getattr(memory_service, 'recon_ledger', None), so this is the whole
+    surface it needs — driving the REAL writer here keeps these store-level
+    tests honest about the row shape the production path actually produces.
+    """
+    return SimpleNamespace(recon_ledger=store)
+
+
+@pytest.mark.asyncio
+async def test_get_mem0_tombstone_returns_row_for_memory_uuid(store):
+    """get_mem0_tombstone(project, memory_id) answers on the auditor's ONLY key.
+
+    An auditor arriving from `get_memory_by_id -> {found: false}` knows exactly
+    one thing: the memory uuid. So the accessor must be satisfiable from
+    (project_id, memory_id) alone — flag_type/run_id stay at their '' defaults.
+    """
+    written = await record_mem0_deletion_tombstone(
+        _tombstone_ms(store),
+        'proj-p',
+        'mem-victim',
+        victim_metadata={'kind': 'cycle_summary', 'record_type': 'ledger_stamp'},
+        victim_created_at='2026-07-01T00:00:00+00:00',
+        deleter='stage1_cycle_summary_trim',
+        deleting_run_id='run-deleter',
+        now=datetime(2026, 7, 20, tzinfo=UTC),
+    )
+    assert written is True
+
+    fetched = await store.get_mem0_tombstone('proj-p', 'mem-victim')
+    assert fetched is not None
+    assert fetched.record_kind == RECORD_KIND_MEM0_TOMBSTONE
+    assert fetched.task_id == 'mem-victim'
+    assert fetched.flag_type == ''
+    assert fetched.run_id == ''
+    payload = json.loads(fetched.payload_json)
+    assert payload['deleter'] == 'stage1_cycle_summary_trim'
+    assert payload['deleting_run_id'] == 'run-deleter'
+
+
+@pytest.mark.asyncio
+async def test_get_mem0_tombstone_absent_returns_none(store):
+    """No tombstone for this uuid (or for this project) returns None, not a raise.
+
+    This is the ordinary never-existed case: the record was simply never
+    written, which must stay distinguishable from a deliberate reap.
+    """
+    assert await store.get_mem0_tombstone('proj-p', 'mem-never-deleted') is None
+
+    await record_mem0_deletion_tombstone(
+        _tombstone_ms(store),
+        'proj-p',
+        'mem-victim',
+        victim_metadata={},
+        victim_created_at=None,
+        deleter='stage1_flag_marker_gc_sweep',
+        deleting_run_id='run-deleter',
+    )
+    # Scoped by project: the same uuid under another project is still absent.
+    assert await store.get_mem0_tombstone('other-proj', 'mem-victim') is None
+
+
+@pytest.mark.asyncio
+async def test_repeat_tombstone_for_same_victim_keeps_one_row(store):
+    """A second tombstone for the same victim upserts in place (row count 1).
+
+    Idempotence comes free from the five-part PRIMARY KEY's ON CONFLICT — a
+    sweep that somehow re-deletes (or is replayed against) the same uuid must
+    not accumulate duplicate rows.
+    """
+    for run in ('run-1', 'run-2'):
+        await record_mem0_deletion_tombstone(
+            _tombstone_ms(store),
+            'proj-p',
+            'mem-victim',
+            victim_metadata={'kind': 'cycle_summary'},
+            victim_created_at='2026-07-01T00:00:00+00:00',
+            deleter='stage1_cycle_summary_trim',
+            deleting_run_id=run,
+            now=datetime(2026, 7, 20, tzinfo=UTC),
+        )
+
+    cursor = await store._db.execute(
+        'SELECT COUNT(*) FROM recon_ledger WHERE record_kind = ?',
+        (RECORD_KIND_MEM0_TOMBSTONE,),
+    )
+    row = await cursor.fetchone()
+    assert row[0] == 1
+
+    fetched = await store.get_mem0_tombstone('proj-p', 'mem-victim')
+    assert fetched is not None
+    assert json.loads(fetched.payload_json)['deleting_run_id'] == 'run-2' # last write wins
+
+
+@pytest.mark.asyncio
+async def test_gc_expires_tombstones_but_keeps_unexpired(store):
+    """gc()'s expires_at pass reaps an expired tombstone and spares a fresh one.
+
+    This is what makes tombstone growth bounded with no new cleanup code: the
+    pass already runs every cycle from _gc_recon_markers, and
+    MEM0_TOMBSTONE_TTL_DAYS puts expires_at within its reach.
+    """
+    # Written at 2026-06-01 -> expires 30 days later, before `now` below.
+    await record_mem0_deletion_tombstone(
+        _tombstone_ms(store),
+        'proj-p',
+        'mem-old',
+        victim_metadata={'kind': 'cycle_summary'},
+        victim_created_at='2026-06-01T00:00:00+00:00',
+        deleter='stage1_cycle_summary_trim',
+        deleting_run_id='run-old',
+        now=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    await record_mem0_deletion_tombstone(
+        _tombstone_ms(store),
+        'proj-p',
+        'mem-fresh',
+        victim_metadata={'kind': 'cycle_summary'},
+        victim_created_at='2026-07-20T00:00:00+00:00',
+        deleter='stage1_cycle_summary_trim',
+        deleting_run_id='run-fresh',
+        now=datetime(2026, 7, 20, tzinfo=UTC),
+    )
+
+    await store.gc('proj-p', now='2026-07-25T00:00:00+00:00', terminal_task_ids=[])
+
+    assert await store.get_mem0_tombstone('proj-p', 'mem-old') is None
+    assert await store.get_mem0_tombstone('proj-p', 'mem-fresh') is not None
+
+
+@pytest.mark.asyncio
+async def test_terminal_task_gc_never_reaches_an_unexpired_tombstone(store):
+    """A memory uuid colliding with a terminal task id must not reap a tombstone.
+
+    gc()'s terminal-referenced DELETE arm is gated on
+    `record_kind IN MARKER_KINDS`; 'mem0_tombstone' is deliberately excluded
+    from that tuple because its task_id column holds a Mem0 memory uuid, not a
+    Taskmaster task id. Without that exclusion an unlucky id collision would
+    delete the audit trail of the very record someone is investigating.
+    """
+    assert RECORD_KIND_MEM0_TOMBSTONE not in MARKER_KINDS
+
+    await record_mem0_deletion_tombstone(
+        _tombstone_ms(store),
+        'proj-p',
+        'mem-victim',
+        victim_metadata={'kind': 'cycle_summary'},
+        victim_created_at='2026-07-20T00:00:00+00:00',
+        deleter='stage1_cycle_summary_trim',
+        deleting_run_id='run-deleter',
+        now=datetime(2026, 7, 20, tzinfo=UTC),
+    )
+
+    await store.gc(
+        'proj-p',
+        now='2026-07-25T00:00:00+00:00', # before the 30-day expiry
+        terminal_task_ids=['mem-victim'], # the collision
+    )
+
+    assert await store.get_mem0_tombstone('proj-p', 'mem-victim') is not None
+
+
+@pytest.mark.asyncio
+async def test_marker_task_ids_excludes_tombstone_memory_uuids(store):
+    """A memory uuid must never surface from marker_task_ids().
+
+    _gc_recon_markers feeds marker_task_ids() straight back into gc()'s
+    terminal_task_ids, so a uuid leaking into that set would widen the
+    terminal DELETE arm against ids that are not tasks at all.
+    """
+    await record_mem0_deletion_tombstone(
+        _tombstone_ms(store),
+        'proj-p',
+        'mem-victim',
+        victim_metadata={'kind': 'cycle_summary'},
+        victim_created_at='2026-07-20T00:00:00+00:00',
+        deleter='stage1_cycle_summary_trim',
+        deleting_run_id='run-deleter',
+        now=datetime(2026, 7, 20, tzinfo=UTC),
+    )
+    await store.upsert(
+        ReconLedgerRecord(
+            project_id='proj-p',
+            record_kind='stage1_flag_marker',
+            payload_json='{}',
+            state='active',
+            created_at='2026-07-20T00:00:00+00:00',
+            task_id='task-42',
+        )
+    )
+
+    assert await store.marker_task_ids('proj-p') == {'task-42'}
+
+
+# ---------------------------------------------------------------------------
+# upsert_many: ONE transaction per sweep, not one per row
+# (task 3041 amendment pass — reviewer finding efficiency)
+# ---------------------------------------------------------------------------
+
+
+def _row(task_id, payload='{}', *, kind='mem0_tombstone', project='proj-p'):
+    return ReconLedgerRecord(
+        project_id=project,
+        record_kind=kind,
+        task_id=task_id,
+        payload_json=payload,
+        state='deleted',
+        created_at='2026-07-20T00:00:00+00:00',
+        expires_at='2026-08-19T00:00:00+00:00',
+    )
+
+
+@pytest.mark.asyncio
+async def test_upsert_many_writes_every_row(store):
+    """A batch writes all its rows, and reports how many it submitted.
+
+    The point of the batch is cost, not semantics: each single upsert is its
+    own transaction — hence its own commit and its own fsync under this
+    store's full-durability pragmas, serialized on one aiosqlite worker
+    thread — so a sweep reaping N records paid N sequential fsyncs on the
+    reconciliation cycle's critical path.
+    """
+    written = await store.upsert_many([_row('mem-1'), _row('mem-2'), _row('mem-3')])
+
+    assert written == 3
+    for task_id in ('mem-1', 'mem-2', 'mem-3'):
+        assert await store.get_mem0_tombstone('proj-p', task_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_upsert_many_is_atomic(store):
+    """A mid-batch failure rolls the WHOLE batch back — proof of one txn.
+
+    NOT NULL on payload_json makes the third row fail. If the batch were N
+    separate transactions the first two would survive; because it is one, the
+    store is left exactly as it was. This is what makes the tombstone batch's
+    failure mode all-or-nothing rather than a partial audit trail.
+    """
+    bad = ReconLedgerRecord(
+        project_id='proj-p',
+        record_kind='mem0_tombstone',
+        task_id='mem-bad',
+        payload_json=None,  # type: ignore[arg-type]
+        state='deleted',
+        created_at='2026-07-20T00:00:00+00:00',
+        expires_at=None,
+    )
+
+    with pytest.raises(aiosqlite.IntegrityError):
+        await store.upsert_many([_row('mem-1'), _row('mem-2'), bad])
+
+    assert await store.get_mem0_tombstone('proj-p', 'mem-1') is None
+    assert await store.get_mem0_tombstone('proj-p', 'mem-2') is None
+
+
+@pytest.mark.asyncio
+async def test_upsert_many_empty_opens_no_transaction(store):
+    """An empty batch is a no-op: a caller with nothing to write pays nothing."""
+    assert await store.upsert_many([]) == 0
+
+
+@pytest.mark.asyncio
+async def test_upsert_many_conflict_is_last_write_wins(store):
+    """Same five-part identity twice in one batch → one row, the last payload.
+
+    Identical to what a sequence of upsert() calls would leave behind, so the
+    batched path cannot drift from the single-row path's conflict semantics
+    (both bind the same single-sourced _UPSERT_SQL).
+    """
+    await store.upsert_many([
+        _row('mem-dup', payload='{"seq": 1}'),
+        _row('mem-dup', payload='{"seq": 2}'),
+    ])
+
+    fetched = await store.get_mem0_tombstone('proj-p', 'mem-dup')
+    assert fetched is not None
+    assert json.loads(fetched.payload_json)['seq'] == 2
+
+
+@pytest.mark.asyncio
+async def test_record_mem0_deletion_tombstones_writes_the_whole_sweep(store):
+    """The batched writer: every victim of one sweep, one transaction.
+
+    Drives the REAL production path (both delete sweeps call this form) into
+    a REAL store, so the row shape here is the row shape an auditor gets.
+    """
+    victims = [
+        {
+            'id': 'mem-a',
+            'created_at': '2026-07-01T00:00:00+00:00',
+            'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp',
+                         'run_id': 'run-victim-a'},
+        },
+        {
+            'id': 'mem-b',
+            'created_at': '2026-07-02T00:00:00+00:00',
+            'metadata': {'source': 'stage1_flag_marker', 'run_id': 'run-victim-b'},
+        },
+        # No usable id — skipped rather than written as an unqueryable row.
+        {'id': '', 'created_at': None, 'metadata': {}},
+    ]
+
+    written = await record_mem0_deletion_tombstones(
+        _tombstone_ms(store),
+        'proj-p',
+        victims,
+        deleter='stage1_flag_marker_gc_sweep',
+        deleting_run_id='run-deleter',
+        now=datetime(2026, 7, 20, tzinfo=UTC),
+    )
+
+    assert written == 2
+    for victim in victims[:2]:
+        fetched = await store.get_mem0_tombstone('proj-p', victim['id'])
+        assert fetched is not None, f"{victim['id']} left no tombstone"
+        assert fetched.record_kind == RECORD_KIND_MEM0_TOMBSTONE
+        payload = json.loads(fetched.payload_json)
+        # The DELETING run on every row, distinct from each victim's own.
+        assert payload['deleter'] == 'stage1_flag_marker_gc_sweep'
+        assert payload['deleting_run_id'] == 'run-deleter'
+        assert payload['run_id'] == victim['metadata'].get('run_id')
+        assert payload['created_at'] == victim['created_at']
+
+
+@pytest.mark.asyncio
+async def test_no_ledger_wired_writes_no_batch_and_does_not_raise():
+    """The batched writer degrades exactly like the singular one."""
+    assert await record_mem0_deletion_tombstones(
+        SimpleNamespace(recon_ledger=None),
+        'proj-p',
+        [{'id': 'mem-a', 'created_at': None, 'metadata': {}}],
+        deleter='stage1_flag_marker_gc_sweep',
+        deleting_run_id='run-deleter',
+    ) == 0
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: real writer -> real store -> real MemoryService reader
+# (task 3041 amendment pass — reviewer finding test-coverage)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tombstone_round_trips_from_writer_to_memory_service(store, mock_config):
+    """The auditor-facing payload, end to end, with NO mock in the middle.
+
+    Every other tombstone test mocks one side of a seam: the writer's payload
+    is asserted against a mocked ledger, and MemoryService.get_mem0_deletion_
+    tombstone against a hand-authored row. Both can pass while the two halves
+    disagree — a drift between _VICTIM_IDENTITY_KEYS and the key set the MCP
+    get_memory_by_id tool advertises would silently drop a field from the
+    answer an auditor actually reads. So this one runs the REAL writer into a
+    REAL ReconLedgerStore and reads it back through a REAL MemoryService, and
+    pins the key set EXACTLY (not a subset) so a lost or renamed field fails.
+    """
+    service = MemoryService(mock_config)
+    service.set_recon_ledger(store)
+
+    await record_mem0_deletion_tombstone(
+        service,
+        'proj-p',
+        'mem-victim',
+        victim_metadata={
+            'kind': 'cycle_summary',
+            'record_type': 'ledger_stamp',
+            'source': 'cycle_summary_mirror',
+            'recon_pool': 'stage1_cycle_summary',
+            'run_id': 'run-victim',
+            'stage': 'memory_consolidator',
+            'data': 'the summary text — must NOT be copied into the tombstone',
+        },
+        victim_created_at='2026-07-01T00:00:00+00:00',
+        deleter='stage1_cycle_summary_trim',
+        deleting_run_id='run-deleter',
+        now=datetime(2026, 7, 20, tzinfo=UTC),
+    )
+
+    tombstone = await service.get_mem0_deletion_tombstone('proj-p', 'mem-victim')
+
+    assert tombstone is not None
+    # EXACTLY the key set server/tools.py's get_memory_by_id docstring
+    # advertises on its miss branch — no more, no less.
+    assert set(tombstone) == {
+        'deleter',
+        'deleting_run_id',
+        'deleted_at',
+        'kind',
+        'record_type',
+        'source',
+        'recon_pool',
+        'run_id',
+        'created_at',
+        'tombstone_created_at',
+        'tombstone_expires_at',
+    }
+    assert tombstone['deleter'] == 'stage1_cycle_summary_trim'
+    assert tombstone['deleting_run_id'] == 'run-deleter'
+    assert tombstone['deleted_at'] == '2026-07-20T00:00:00+00:00'
+    assert tombstone['kind'] == 'cycle_summary'
+    assert tombstone['record_type'] == 'ledger_stamp'
+    assert tombstone['source'] == 'cycle_summary_mirror'
+    assert tombstone['recon_pool'] == 'stage1_cycle_summary'
+    # The VICTIM's run and age, never the deleting run's.
+    assert tombstone['run_id'] == 'run-victim'
+    assert tombstone['created_at'] == '2026-07-01T00:00:00+00:00'
+    # The ROW's own timestamps, kept separate so neither clobbers the victim's.
+    assert tombstone['tombstone_created_at'] == '2026-07-20T00:00:00+00:00'
+    assert tombstone['tombstone_expires_at'] == '2026-08-19T00:00:00+00:00'

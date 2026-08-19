@@ -935,6 +935,316 @@ class TestSamplesDownsampling:
 
 
 # ---------------------------------------------------------------------------
+# archives_present — the payload's own "did this scan reach the archive?" signal
+# ---------------------------------------------------------------------------
+
+_ANALYTICS_KEYS = {'generated_at', 'parse_failures', 'regime_markers', 'per_project',
+                   'archives_present', 'archives_reached'}
+
+
+class TestArchivesPresent:
+    """Did every configured project's escalation archive actually exist?
+
+    The COMPLETENESS diagnostic: ``all()`` over the configured roots.  It
+    answers "was this scan whole?", which is an operator's question — the
+    cache's question ("did this scan reach anything at all?") is answered by
+    ``archives_reached`` next door, and the two are deliberately not the same
+    field.  Nothing else in the payload can answer either one:
+    ``iter_all_escalation_paths`` returns silently on a missing dir and
+    ``Path.glob`` swallows ``PermissionError``, so an absent archive, an
+    unreadable one and a genuinely empty one are otherwise byte-identical —
+    zero filings, zero parse failures, same shape.
+
+    Deliberately NOT derived from ``parse_failures``.  That counts unparseable
+    RECORDS and is a permanent property of a corrupt file, so a cache keyed on
+    it would be defeated forever by one bad record sitting in front of the
+    expensive walk.  The two fields answer different questions, and the last
+    test here pins that they stay independent in both directions.
+    """
+
+    def test_a_present_archive_reports_true(self, tmp_path):
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['archives_present'] is True
+
+    def test_an_absent_archive_reports_false(self, tmp_path):
+        """The dir was never created — the walk had nothing to reach.
+
+        Indistinguishable from an empty archive in every other field, which is
+        exactly why this key has to exist.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        never_created = tmp_path / 'nope' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', never_created, runs_db)], now=now)
+
+        assert result['archives_present'] is False
+        # The rest of the payload is unchanged: still a well-formed, empty,
+        # NON-erroring entry.  This signal reports on the scan, it does not
+        # degrade the answer.
+        assert result['parse_failures'] == 0
+        assert len(result['per_project']) == 1
+        assert result['per_project'][0]['project'] == 'dark_factory'
+
+    def test_one_absent_project_of_two_reports_false(self, tmp_path):
+        """It is ``all()``, not ``any()`` — this field reports COMPLETENESS.
+
+        A multi-project payload where one root's archive is missing is a
+        partial scan, and this field says so.  It does NOT follow that a
+        partial scan is uncacheable: see ``TestArchivesReached``, which pins
+        the cache predicate onto ``any()`` precisely because the ordinary
+        production config is permanently partial.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        present = tmp_path / 'primary' / 'data' / 'escalations'
+        present.mkdir(parents=True)
+        absent = tmp_path / 'secondary' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics(
+            [('primary', present, runs_db), ('secondary', absent, runs_db)], now=now,
+        )
+
+        assert result['archives_present'] is False
+        assert [p['project'] for p in result['per_project']] == ['primary', 'secondary']
+
+    def test_the_existing_contract_keys_are_untouched(self, tmp_path):
+        """Additive: the four Seam-2 keys keep their names, values and shapes."""
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert set(result) == _ANALYTICS_KEYS
+        assert result['generated_at'] == now.isoformat()
+        assert isinstance(result['regime_markers'], list)
+        entry = result['per_project'][0]
+        assert {'project', 'origin', 'lifespan', 'workflow'} <= set(entry)
+
+    def test_a_corrupt_record_does_not_flip_archives_present(self, tmp_path):
+        """The two signals are independent, and this is the load-bearing case.
+
+        ``build_golden_archive`` plants one non-JSON file, so ``parse_failures``
+        is >= 1 permanently.  If ``archives_present`` tracked it, the route's
+        cache would be permanently defeated by a single corrupt record — the
+        exact failure the reviewer's suggestion was NOT asking for.  The
+        archive dir exists and was walked; that a record inside it is garbage
+        is a different fact, reported by a different field.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['parse_failures'] >= 1
+        assert result['archives_present'] is True
+
+
+# ---------------------------------------------------------------------------
+# archives_reached — the payload's "did this scan reach ANY archive?" signal
+# ---------------------------------------------------------------------------
+
+
+class TestArchivesReached:
+    """Did the scan reach AT LEAST ONE configured archive?
+
+    ``archives_present`` (``all``) and ``archives_reached`` (``any``) answer
+    two different questions, and conflating them is what this class exists to
+    prevent.  ``all`` is the completeness DIAGNOSTIC an operator reads; ``any``
+    is the CACHE predicate, and only ``any`` is sound for that job.
+
+    Measured on this machine, 2026-08-01, against the installed unit's own
+    root list (``systemctl --user cat dark-factory-dashboard`` ->
+    ``DASHBOARD_KNOWN_PROJECT_ROOTS``, 9 roots): 2 roots
+    (``/home/leo/src/autotrade``, ``/home/leo/mission-control``) have no
+    ``data/escalations`` dir at all, while the other 7 hold ~9.1k ``esc-*.json``
+    records between them (dark_factory 3278, reify 5561, autopilot-video 69,
+    +4 smaller).  So in the CURRENT production config ``all`` is permanently
+    False and ``any`` is True.  Keying the cache on ``all`` means the 60s TTL
+    never stores anything and every 3s poll (``POLL_INTERVAL_MS``,
+    static/redux/data.js) re-runs the whole multi-second walk — i.e. ``all``
+    reports "this scan was free to redo" at exactly the moment it was most
+    expensive.  A root that has simply never escalated must not delete the
+    cache in front of the other seven.
+
+    The remaining question — is ``any`` too lax? — is answered by what the
+    predicate is FOR: a build that walked nothing is genuinely free to redo
+    (one ``is_dir`` stat per project, all of them negative), and pinning it
+    would keep the tab reporting an empty archive for a full TTL window after
+    the volume mounts.  A build that walked something paid for that walk, and
+    the cache is what stops it being paid again three seconds later.
+    """
+
+    def test_a_present_archive_reports_true(self, tmp_path):
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['archives_reached'] is True
+
+    def test_an_absent_archive_reports_false(self, tmp_path):
+        """Nothing was walked, so nothing is worth pinning — both signals agree."""
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        never_created = tmp_path / 'nope' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', never_created, runs_db)], now=now)
+
+        assert result['archives_reached'] is False
+        assert result['archives_present'] is False
+
+    def test_one_absent_project_of_two_is_reached_but_not_present(self, tmp_path):
+        """THE case, and the whole reason this field exists.
+
+        This is the shape of the installed 9-root config (2 archive-less roots,
+        7 holding ~9.1k records — see the class docstring).  The scan reached
+        an archive and paid the full walk for it, so the payload MUST be
+        cacheable; it did not reach every archive, so the diagnostic must still
+        say the picture is partial.  One field cannot be both.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        present = tmp_path / 'primary' / 'data' / 'escalations'
+        present.mkdir(parents=True)
+        absent = tmp_path / 'secondary' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics(
+            [('primary', present, runs_db), ('secondary', absent, runs_db)], now=now,
+        )
+
+        assert result['archives_reached'] is True
+        assert result['archives_present'] is False
+        assert [p['project'] for p in result['per_project']] == ['primary', 'secondary']
+
+    def test_two_absent_projects_report_false_on_both_signals(self, tmp_path):
+        """Reached nothing AND complete-of-nothing: the one case that agrees."""
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        runs_db = _make_runs_db(tmp_path, [])
+        first = tmp_path / 'primary' / 'data' / 'escalations'
+        second = tmp_path / 'secondary' / 'data' / 'escalations'
+
+        result = build_escalation_analytics(
+            [('primary', first, runs_db), ('secondary', second, runs_db)], now=now,
+        )
+
+        assert result['archives_reached'] is False
+        assert result['archives_present'] is False
+
+    def test_no_configured_projects_reports_not_reached(self, tmp_path):
+        """The degenerate case, pinned deliberately rather than left to fall out.
+
+        ``any([])`` is False and ``all([])`` is True, so an empty config is the
+        one shape where the two signals INVERT: nothing was reached, yet
+        everything configured was present.  Reached-nothing is the correct
+        answer for the cache — there is no walk to protect — and writing it
+        down here means a later refactor that flips either default trips a
+        test instead of silently pinning an empty payload.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        result = build_escalation_analytics([], now=golden_now())
+
+        assert result['archives_reached'] is False
+        assert result['archives_present'] is True
+        assert result['per_project'] == []
+
+    def test_a_corrupt_record_does_not_flip_archives_reached(self, tmp_path):
+        """Twin of the ``archives_present`` case: the three signals stay independent.
+
+        ``build_golden_archive`` plants one non-JSON file, so ``parse_failures``
+        is >= 1 permanently.  If the cache predicate tracked it, a single
+        corrupt record would defeat the cache forever in front of the very
+        walk it protects.  The archive was reached; that a record inside it is
+        garbage is a different fact, reported by a different field.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['parse_failures'] >= 1
+        assert result['archives_reached'] is True
+
+
+class TestArchiveScanSucceeded:
+    """The exported cache predicate, unit-tested away from the route.
+
+    Mirrors ``memory_evals.root_scan_succeeded``: a NAMED function rather than
+    a lambda in the route, so the rule is testable in isolation and its
+    rationale has somewhere to live that a route docstring is not.
+    """
+
+    def test_a_reached_archive_is_cacheable(self):
+        from dashboard.data.escalation_analytics import archive_scan_succeeded
+
+        assert archive_scan_succeeded({'archives_reached': True}) is True
+
+    def test_a_partial_scan_is_cacheable(self):
+        """The behaviour change, stated as a unit fact.
+
+        Reached some, missed some — the walk was paid for, so it is cached.
+        ``archives_present: False`` rides along as the diagnostic and has no
+        say in the cacheability decision.
+        """
+        from dashboard.data.escalation_analytics import archive_scan_succeeded
+
+        payload = {'archives_reached': True, 'archives_present': False}
+
+        assert archive_scan_succeeded(payload) is True
+
+    def test_an_unreached_archive_is_not_cacheable(self):
+        from dashboard.data.escalation_analytics import archive_scan_succeeded
+
+        assert archive_scan_succeeded({'archives_reached': False}) is False
+
+    def test_a_payload_without_the_key_is_not_cacheable(self):
+        """Reads through ``.get`` because it runs in the cache WRITE path.
+
+        A partially-built or older-shaped payload must degrade to "don't
+        cache" — a raise here surfaces as a 500 on a 3s dashboard poll.
+        """
+        from dashboard.data.escalation_analytics import archive_scan_succeeded
+
+        assert archive_scan_succeeded({'parse_failures': 0}) is False
+        assert archive_scan_succeeded({}) is False
+
+
+# ---------------------------------------------------------------------------
 # step-16: row 7 — perf: cold ~10k-record build_escalation_analytics() < 5s
 # ---------------------------------------------------------------------------
 
@@ -977,10 +1287,15 @@ def _write_perf_archive(esc_dir: Path, now: datetime, n: int) -> int:
 
 
 class TestBuildEscalationAnalyticsPerf:
-    """PRD boundary row 7: a cold ~10k-record archive walk completes in < 5s."""
+    """PRD boundary row 7: a cold ~10k-record archive walk stays within a
+    CPU-time budget.
 
-    def test_cold_10k_archive_under_5_seconds(self, tmp_path):
-        import os
+    This is an O(n^2) archive-walk regression guard, not a wall-clock SLA
+    — see the in-body comment on the assertion for why the measure is
+    CPU time rather than wall-clock, and how the budget was derived.
+    """
+
+    def test_cold_10k_archive_cpu_budget(self, tmp_path):
         import time
 
         from dashboard.data.escalation_analytics import build_escalation_analytics
@@ -993,26 +1308,40 @@ class TestBuildEscalationAnalyticsPerf:
             ('perf-done-1', 'done', f'{(now - timedelta(days=1)).date().isoformat()}T09:00:00+00:00'),
         ])
 
-        started = time.monotonic()
+        started = time.process_time()
         result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
-        elapsed = time.monotonic() - started
+        cpu_elapsed = time.process_time() - started
 
         # The bound guards against an O(n^2) archive-walk regression, NOT a
-        # wall-clock SLA. Under 32-worker xdist merge-verify contention the
-        # 10k-file fixture's disk I/O + CPU oversubscription made a
-        # second-level budget flaky (observed 8.32s and 5.05s, task 2702),
-        # mirroring test_single_call_latency_smoke
-        # (fused-memory/tests/test_task_interceptor.py). So this timing
-        # assertion only runs single-worker, where idle runtime is a few
-        # seconds; 15s gives generous headroom for single-worker CI variance
-        # while still catching a real blowup (minutes at 10k records under
-        # an O(n^2) regression). The correctness assertions below always
+        # wall-clock SLA. A wall-clock (time.monotonic) budget here proved
+        # contention-sensitive twice: first to intra-process xdist worker
+        # contention (task 2702/2722, observed 8.32s/5.05s against a then-5s
+        # bound, widened to 15s and gated to single-worker-only), then to
+        # cross-worktree contention from concurrent orchestrator verifies on
+        # the same host (task 3344, observed 34.78s single-worker against
+        # the widened 15s bound; nproc=32 with loadavg 78-138 at the time).
+        # time.process_time() measures actual CPU seconds consumed by this
+        # process — it excludes time spent waiting for a CPU slot or for
+        # disk I/O while other processes (xdist workers, sibling worktree
+        # verifies) are scheduled, so it stays stable regardless of host
+        # contention while still catching a real O(n^2) blowup. No
+        # single-worker gate is needed: the measure itself is
+        # contention-insensitive. The correctness assertions below always
         # run, including under xdist.
-        if not os.environ.get('PYTEST_XDIST_WORKER'):
-            assert elapsed < 15.0, (
-                f'cold build_escalation_analytics took {elapsed:.2f}s '
-                '(budget 15.0s, single-worker)'
-            )
+        #
+        # Budget derivation (task 3344 amendment): observed 0.81-1.09s CPU
+        # across 4 repeated runs on this dev host, taken *while* it was
+        # itself under heavy contention (32 cores, loadavg 150+) — if
+        # anything an overestimate of a quiet-host baseline, since
+        # process_time is expected to be stable regardless of load. Budget
+        # is 5.0s, ~5x that observed baseline: enough slack for slower or
+        # differently-provisioned CI hardware, tight enough that a real
+        # O(n^2) blowup at 10k records — which would cost orders of
+        # magnitude more CPU, not a small multiple — still trips it.
+        assert cpu_elapsed < 5.0, (
+            f'cold build_escalation_analytics used {cpu_elapsed:.2f}s of CPU time '
+            '(budget 5.0s)'
+        )
 
         # Well-formed at scale: parse_failures==0 (every fixture record is
         # valid), one per-project entry with non-empty samples.
@@ -1028,3 +1357,300 @@ class TestBuildEscalationAnalyticsPerf:
         # record 1:1 — no downsampling triggered.
         assert len(samples) == terminal_count
         assert 'samples_downsampled' not in project['lifespan']
+
+
+# ---------------------------------------------------------------------------
+# task 3543 step-25: pins_recovery annotation on open_items
+# ---------------------------------------------------------------------------
+#
+# `fetch_pins_recovery` (dashboard/data/escalations.py) reads each escalation
+# MCP's computed `pins_recovery` and returns a THREE-state per-project map.
+# This module is the PURE-SYNC archive walker that renders it: it must NOT
+# fetch anything (it runs inside asyncio.to_thread behind a TTL cache), so the
+# annotation is passed IN and only ever stamped onto open_items.
+#
+# The whole point is that "unknown" survives the trip.  Two omissions carry it:
+#
+#   * the project's annotation is None (its escalation MCP could not be read)
+#     -> no open_item carries the keys at all;
+#   * an individual id is absent from a non-None annotation (a pre-3543 server,
+#     or a server that computed the annotation and deliberately withheld it)
+#     -> that item carries neither key.
+#
+# Both render as nothing.  Stamping False in either case would assert "this
+# escalation pins no recovery" on evidence nobody produced — the esc-3163
+# false negative.  Render-when-present is the module's own existing idiom
+# (`triage_segments` is emitted only when there are deltas).
+
+
+def _pending_esc(esc_id: str, task_id: str, *, now: datetime, hours: int = 7,
+                 level: int = 1) -> dict:
+    """A pending escalation record aged *hours* before *now*."""
+    return {
+        'id': esc_id, 'task_id': task_id, 'agent_role': 'implementer',
+        'severity': 'blocking', 'category': 'design_concern',
+        'summary': f'open on {task_id}',
+        'timestamp': _iso(now - timedelta(hours=hours)),
+        'status': 'pending', 'level': level,
+    }
+
+
+def _pins_archive(esc_dir: Path, now: datetime) -> None:
+    """Three pending records on three tasks — the fixture every test here uses."""
+    for esc in (
+        _pending_esc('esc-300-1', '300', now=now),
+        _pending_esc('esc-301-1', '301', now=now),
+        _pending_esc('esc-302-1', '302', now=now, hours=3),
+    ):
+        _write_escalation(esc_dir, esc, archived=False)
+
+
+class TestLifespanPinsRecovery:
+    """`_lifespan_block(..., pins_by_id=...)` stamps open_items."""
+
+    def test_annotated_ids_carry_the_flag_and_task_ids(self, tmp_path):
+        """Non-empty task list -> True; empty list -> False (both are ANSWERS)."""
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+
+        entry, _ = _aggregate_project(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            pins_by_id={'esc-300-1': ['300'], 'esc-301-1': []},
+        )
+        open_by_id = {i['id']: i for i in entry['lifespan']['open_items']}
+
+        assert open_by_id['esc-300-1']['pins_recovery'] is True
+        assert open_by_id['esc-300-1']['pins_recovery_task_ids'] == ['300']
+        assert open_by_id['esc-301-1']['pins_recovery'] is False
+        assert open_by_id['esc-301-1']['pins_recovery_task_ids'] == []
+
+        # breach_6h is untouched — the two badges are independent signals.
+        assert open_by_id['esc-300-1']['breach_6h'] is True
+        assert open_by_id['esc-302-1']['breach_6h'] is False
+
+    def test_id_absent_from_a_non_none_annotation_is_unknown(self, tmp_path):
+        """An unannotated id carries NEITHER key — not `pins_recovery: False`.
+
+        The escalation server omits the key when it could not compute it, and
+        `fetch_pins_recovery` faithfully drops those ids rather than defaulting
+        them.  Re-introducing the default here would undo both.
+        """
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+
+        entry, _ = _aggregate_project(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            pins_by_id={'esc-300-1': ['300']},
+        )
+        open_by_id = {i['id']: i for i in entry['lifespan']['open_items']}
+
+        assert open_by_id['esc-300-1']['pins_recovery'] is True
+        for unannotated in ('esc-301-1', 'esc-302-1'):
+            assert 'pins_recovery' not in open_by_id[unannotated]
+            assert 'pins_recovery_task_ids' not in open_by_id[unannotated]
+
+    def test_none_annotation_omits_the_keys_everywhere(self, tmp_path):
+        """A project whose escalation MCP could not be read stamps nothing."""
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+
+        entry, _ = _aggregate_project(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            pins_by_id=None,
+        )
+        open_items = entry['lifespan']['open_items']
+
+        assert len(open_items) == 3
+        for item in open_items:
+            assert 'pins_recovery' not in item
+            assert 'pins_recovery_task_ids' not in item
+
+    def test_default_call_is_byte_identical_to_the_pre_3543_shape(self, tmp_path):
+        """Omitting the parameter entirely leaves open_items exactly as before."""
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+
+        entry, _ = _aggregate_project(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+        )
+        for item in entry['lifespan']['open_items']:
+            assert set(item) == {'id', 'task_id', 'level', 'age_secs', 'breach_6h'}
+
+    def test_empty_annotation_is_not_the_same_as_none(self, tmp_path):
+        """`{}` (read succeeded, nothing annotated) also stamps nothing.
+
+        It reaches the same rendered outcome as None by a different route —
+        every id is simply absent — and that is correct: an empty successful
+        read still tells us nothing about any specific record.
+        """
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+
+        entry, _ = _aggregate_project(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now, pins_by_id={},
+        )
+        for item in entry['lifespan']['open_items']:
+            assert 'pins_recovery' not in item
+
+    def test_annotation_ids_outside_this_archive_are_ignored(self, tmp_path):
+        """Ids the archive has never seen are dropped without error.
+
+        The live queue and the on-disk archive are read at different instants
+        and by different mechanisms, so they routinely disagree at the edges.
+        A stale or foreign id must not raise inside a poll cycle, and must not
+        appear as a phantom open_item.
+        """
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+
+        entry, _ = _aggregate_project(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            pins_by_id={
+                'esc-300-1': ['300'],
+                'esc-999-9': ['999'],        # never filed here
+                'esc-recon-1': [],           # a different queue's record
+            },
+        )
+        open_by_id = {i['id']: i for i in entry['lifespan']['open_items']}
+
+        assert set(open_by_id) == {'esc-300-1', 'esc-301-1', 'esc-302-1'}
+        assert open_by_id['esc-300-1']['pins_recovery'] is True
+
+    def test_terminal_records_are_never_annotated(self, tmp_path):
+        """Only open_items carry the annotation — samples/percentiles are untouched.
+
+        A resolved record cannot pin a recovery; if the live queue somehow
+        names one, it must not leak into the lifespan block's other outputs.
+        """
+        from dashboard.data.escalation_analytics import _aggregate_project
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _pins_archive(esc_dir, now)
+        resolved = {
+            'id': 'esc-303-1', 'task_id': '303', 'agent_role': 'implementer',
+            'severity': 'blocking', 'category': 'design_concern',
+            'summary': 'already resolved',
+            'timestamp': _iso(now - timedelta(hours=9)),
+            'status': 'resolved', 'level': 1,
+            'resolved_at': _iso(now - timedelta(hours=8)),
+            'resolved_by': 'interactive',
+        }
+        _write_escalation(esc_dir, resolved, archived=True)
+
+        entry, _ = _aggregate_project(
+            'dark_factory', esc_dir, tmp_path / 'runs.db', now=now,
+            pins_by_id={'esc-303-1': ['303']},
+        )
+        lifespan = entry['lifespan']
+
+        assert {i['id'] for i in lifespan['open_items']} == {
+            'esc-300-1', 'esc-301-1', 'esc-302-1',
+        }
+        assert all(len(row) == 4 for row in lifespan['samples'])
+
+
+class TestBuildEscalationAnalyticsPins:
+    """`build_escalation_analytics(..., pins_by_project=...)` routing."""
+
+    def test_per_project_annotation_is_routed_by_label(self, tmp_path):
+        """Each project's own annotation reaches its own open_items — only its own."""
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        dir_a = tmp_path / 'a' / 'escalations'
+        dir_b = tmp_path / 'b' / 'escalations'
+        _write_escalation(dir_a, _pending_esc('esc-400-1', '400', now=now), archived=False)
+        _write_escalation(dir_b, _pending_esc('esc-500-1', '500', now=now), archived=False)
+
+        result = build_escalation_analytics(
+            [
+                ('proj-a', dir_a, tmp_path / 'a' / 'runs.db'),
+                ('proj-b', dir_b, tmp_path / 'b' / 'runs.db'),
+            ],
+            now=now,
+            pins_by_project={'proj-a': {'esc-400-1': ['400']}, 'proj-b': None},
+        )
+        by_project = {p['project']: p for p in result['per_project']}
+
+        a_items = {i['id']: i for i in by_project['proj-a']['lifespan']['open_items']}
+        assert a_items['esc-400-1']['pins_recovery'] is True
+        assert a_items['esc-400-1']['pins_recovery_task_ids'] == ['400']
+
+        # proj-b's escalation MCP was unreadable -> unknown, stamp nothing.
+        b_items = {i['id']: i for i in by_project['proj-b']['lifespan']['open_items']}
+        assert 'pins_recovery' not in b_items['esc-500-1']
+
+    def test_project_missing_from_the_map_is_unknown(self, tmp_path):
+        """A root with no discovered escalation URL never appears in the fanout."""
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _write_escalation(esc_dir, _pending_esc('esc-600-1', '600', now=now), archived=False)
+
+        result = build_escalation_analytics(
+            [('proj-x', esc_dir, tmp_path / 'runs.db')],
+            now=now,
+            pins_by_project={'some-other-project': {'esc-600-1': ['600']}},
+        )
+        item = result['per_project'][0]['lifespan']['open_items'][0]
+        assert 'pins_recovery' not in item
+        assert 'pins_recovery_task_ids' not in item
+
+    def test_none_pins_by_project_matches_the_unparameterised_call(self, tmp_path):
+        """Passing None (the default) changes nothing about the payload."""
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _write_escalation(esc_dir, _pending_esc('esc-700-1', '700', now=now), archived=False)
+        dirs = [('proj-y', esc_dir, tmp_path / 'runs.db')]
+
+        bare = build_escalation_analytics(dirs, now=now)
+        explicit = build_escalation_analytics(dirs, now=now, pins_by_project=None)
+        assert bare == explicit
+        assert 'pins_recovery' not in explicit['per_project'][0]['lifespan']['open_items'][0]
+
+    def test_annotation_does_not_read_the_clock(self, tmp_path):
+        """The threaded `now` is the only instant the annotated payload reports.
+
+        `build_escalation_analytics` runs inside `asyncio.to_thread` under a
+        TTL cache, so every timestamp it emits must come from the caller's
+        `now` rather than a fresh clock read — otherwise two rows in one pass
+        could be judged against different instants.  Annotating with
+        `pins_by_project` must not disturb that: `generated_at` stays exactly
+        the passed instant, and the pins stamp still lands.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        _write_escalation(esc_dir, _pending_esc('esc-800-1', '800', now=now), archived=False)
+        result = build_escalation_analytics(
+            [('proj-z', esc_dir, tmp_path / 'runs.db')],
+            now=now,
+            pins_by_project={'proj-z': {'esc-800-1': ['800']}},
+        )
+        assert result['generated_at'] == now.isoformat()
+        item = result['per_project'][0]['lifespan']['open_items'][0]
+        assert item['pins_recovery'] is True
+        assert item['pins_recovery_task_ids'] == ['800']

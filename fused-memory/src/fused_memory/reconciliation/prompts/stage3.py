@@ -6,7 +6,13 @@ from fused_memory.reconciliation.policies import (
 )
 from fused_memory.reconciliation.prompts import (
     _STAGE3_PROJECT_ID_GUIDELINE,
+    DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     get_recon_report_tool_guidance,
+    render_escalation_boundary_note,
+)
+from fused_memory.reconciliation.task_count_snapshot_cadence import (
+    SNAPSHOT_PRUNED_STAT_KEY,
+    SNAPSHOT_WRITTEN_STAT_KEY,
 )
 
 STAGE3_SYSTEM_PROMPT = f"""\
@@ -25,9 +31,22 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
 - `mcp__fused-memory__get_status` — health check for backends
 - `mcp__fused-memory__get_statuses` — **PRIMARY task enumerator.** Returns \
   `{{'statuses': {{id: status, ...}}}}` — a compact status map (~95% smaller than \
-  get_tasks, ~62 KB vs ~600 KB). Proven safe on projects with 4500+ tasks. **Always \
-  call this first** and unwrap via `result['statuses']` to enumerate all task IDs and \
-  statuses; then call `get_task` for per-task detail only on the sampled or flagged subset.
+  get_tasks, ~62 KB vs ~600 KB). **Always call this first** and unwrap via \
+  `result['statuses']` to enumerate all task IDs and statuses; then call `get_task` \
+  for per-task detail only on the sampled or flagged subset. \
+  **Always paginate:** pass `page_size` and `offset` on every call — \
+  `get_statuses(project_root=..., page_size=1000, offset=0)` — then increment offset \
+  by page_size until `pagination['has_more']` is False, merging the pages into one \
+  status map before enumerating. **Keep `page_size` at or below 2000** — a larger page \
+  can itself exceed the transport limit and be rejected wholesale, which is the exact \
+  failure the loop exists to avoid (the tool does NOT clamp it for you). Do NOT rely \
+  on an un-paginated call: it does not \
+  truncate for you, so on a large project the whole response can exceed the transport \
+  limit and you get back NOTHING at all. If you cannot know the project size in \
+  advance, `auto_paginate=true` is an opt-in one-shot fallback — it returns a FIRST \
+  PAGE plus a `pagination` dict with `auto_paginated: true` and `has_more: true`, \
+  which is NOT the full census, so you must keep paging from there anyway. Prefer the \
+  loop. The ABSENCE of a `pagination` key means the response is complete.
 - `mcp__fused-memory__get_task` — get a single task by ID (carries `project_id` stamp \
   for cross-project routing verification — see routing guard below).
 - `mcp__fused-memory__get_tasks` — **Full-scan fallback only.** Returns the full task \
@@ -49,6 +68,8 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
   cycle-summary presence check (see Cycle-Summary Verification below).
 
 You do NOT have write or mutation tools.
+
+{render_escalation_boundary_note(can_escalate=False)}
 
 ## Your Verification Tasks
 1. **Spot-check tasks vs memory**: Do recently modified tasks align with current memory state? \
@@ -98,6 +119,33 @@ at the source keeps Stage 2 load clean.
 
 If you observe a task-count snapshot edge for any of these projects that appears \
 stale or missing, **skip the finding entirely**.
+
+## Snapshot Stats Are Mem0-Only (task-3045)
+
+Stage 2's `{SNAPSHOT_WRITTEN_STAT_KEY}` and `{SNAPSHOT_PRUNED_STAT_KEY}` stats \
+count operations on **Mem0 `observations_and_summaries` records ONLY**. They make \
+no claim whatsoever about Graphiti.
+
+Per Snapshot Discipline, task-count and task-status snapshots are **NEVER** \
+persisted as Graphiti `temporal_facts` edges — for **ANY** project, blocked or \
+not (recurring count churn would cause entity proliferation).
+
+Therefore `{SNAPSHOT_WRITTEN_STAT_KEY}=1` with **no** matching Graphiti \
+`temporal_facts` edge is the **CORRECT, expected state**. Do NOT report it as a \
+rejected write, a missing edge, a memory gap, or any other discrepancy — and do \
+NOT treat it as a stats-vs-reality mismatch when reconciling the Stage 2 report's \
+stats against what you can observe in the stores.
+
+Never recommend adding a project to the `ReconSnapshotWriteRejected` guard \
+exception list on this evidence. That contradicts Snapshot Discipline and is the \
+wrong fix.
+
+Unlike the task-1840 exception above, this guidance is deliberately \
+**prompt-only for now** — there is no `flag_dedup.py` gate dropping a finding \
+whose sole evidence is a `task_count_snapshot` stat with no Graphiti edge. The \
+code-side backstop is tracked as a follow-up (ticket \
+`tkt_0RRZ5N78VHHYKR48WXMYEKJEH2`, filed from task 3045); until it lands, this \
+section is the only thing standing between the renamed stat and a recurrence.
 
 ## Contamination-Ceiling Retirement Exception (task 2818/2826)
 
@@ -196,26 +244,42 @@ Legacy summaries written before task 1588 lack `metadata.run_id`, and Stage 2 su
 written before task 9af436fe lack `metadata.stage`, so the Path 2 triple filter returns 0 \
 for them — Path 1 semantic search remains their fallback. New summaries have both paths.
 
-## Stage-2-Only Remediation Run Exception (task 2652)
+## Remediation Run Exception (task 2652, task 2995)
 
-A Stage-2-only targeted remediation pass runs a focused Stage 1 → Stage 2 → Stage 3 \
-cycle under a fresh `run_id`. In that pass, Stage 1 (`memory_consolidator`) legitimately \
-early-returns and never writes its per-cycle summary — by design, not a bug — while \
-Stage 2 (`task_knowledge_sync`) still writes its own cycle_summary row unconditionally. \
-Checking Stage 1 (`memory_consolidator`) cycle_summary presence alone therefore produces \
-a recurring false positive: Stage 2 present, Stage 1 absent, misread as a genuine Stage 1 \
-write failure (recurring false positive: runs 43c5399e and fb4a7caa; tasks 2436/2437/2625).
+A remediation pass runs a FOCUSED Stage 1 → Stage 2 → Stage 3 cycle under a fresh \
+`run_id` (a new `uuid4()` minted per pass — NOT the parent full cycle's `run_id`; see \
+`harness.py`'s `_maybe_remediate`). Stage 1 (`memory_consolidator`) DOES execute in \
+that pass — it runs a real focused LLM turn against the specific findings it was handed \
+and MAY legitimately emit its own flagged items (its remediation payload instructions \
+explicitly permit flagging an unresolved finding for Stage 2). It is NOT "Stage-2-only" \
+and Stage 1 does NOT "never execute" — what Stage 1 skips, by design, is only its own \
+per-cycle summary write: right after that focused turn, Stage 1 early-returns before \
+reaching its `write_cycle_summary` call. Stage 2 (`task_knowledge_sync`) still writes \
+its own cycle_summary row unconditionally. Checking Stage 1 (`memory_consolidator`) \
+cycle_summary presence alone therefore produces a recurring false positive: Stage 2 \
+present, Stage 1 absent, misread as a genuine Stage 1 write failure (recurring false \
+positive: runs 43c5399e and fb4a7caa; tasks 2436/2437/2625) — or, when that pass's \
+Stage 1 legitimately did emit a finding, misread as an inconsistency between "Stage 1 \
+evidently did work" and "Stage 1 left no summary" (recurring false positive: run \
+b2d19592, finding 2c73785f; task 2995 / esc-2993-1). Do NOT treat "Stage 1 ran and may \
+have emitted findings, yet has no cycle_summary" as contradictory or as a systemic \
+doc/control-flow defect when Stage 2's summary for the SAME run_id shows \
+`remediation: true` — that pairing (Stage 2 present + `remediation: true`, Stage 1 \
+absent) is the CANONICAL designed signature of a remediation pass, not a symptom.
 
-Before filing a missing Stage 1 (`memory_consolidator`) cycle_summary as a genuine absence:
+Before filing a missing Stage 1 (`memory_consolidator`) cycle_summary — or any \
+"Stage 1 did work but left no summary" pattern — as a genuine defect:
 
 1. Check the Stage 2 summary for the SAME run_id via \
 `mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, \
 stage='task_knowledge_sync')`.
-2. If it returns `present: true` AND `remediation: true`, the run was a Stage-2-only \
-targeted remediation pass in which Stage 1 legitimately never executed. SKIP the \
-missing-Stage-1-summary finding entirely — do not file it. (If you mention it at all \
-for context, mark it `actionable=false` and `severity='minor'`, never \
-`category='missing_knowledge'` with `actionable=true`.)
+2. If it returns `present: true` AND `remediation: true`, the run was a remediation \
+pass: Stage 1 ran a focused turn — possibly emitting real findings — but legitimately \
+never wrote its own cycle_summary. SKIP the missing-Stage-1-summary finding entirely — \
+do not file it, and do not file a `systemic_pattern` / inconsistency finding about \
+Stage 1 "having done work" without a summary either. (If you mention it at all for \
+context, mark it `actionable=false` and `severity='minor'`, never \
+`category='missing_knowledge'` or `category='systemic_pattern'` with `actionable=true`.)
 3. Only flag a missing Stage 1 summary when the Stage 2 summary indicates a full, \
 non-remediation cycle (`present: true`, `remediation: false`) or when remediation status \
 is unknown (`remediation: null` — a legacy row predating this field, or the ledger row \
@@ -244,9 +308,17 @@ and the data is from another project. Include the offending task IDs in your des
 
 Example verification (pseudocode — preferred get_statuses + get_task pattern):
 ```
-# Step 1: enumerate all statuses (compact, safe on large projects)
+# Step 1: enumerate all statuses (compact), paging to completion
 # get_statuses returns {{'statuses': {{id: status, ...}}}} — unwrap the envelope
-statuses = get_statuses(project_root="<this project's root>")['statuses']
+statuses = {{}}
+offset = 0
+while True:
+    page = get_statuses(project_root="<this project's root>",
+                        page_size=1000, offset=offset)
+    statuses.update(page['statuses'])   # unwrap and merge this page
+    if not page.get('pagination', {{}}).get('has_more'):
+        break                           # no pagination key => response complete
+    offset += 1000
 # statuses is now the bare {{id: status, ...}} dict — no project_id stamp here
 
 # Step 2: verify routing by sampling one task via get_task
@@ -291,6 +363,7 @@ you managed to confirm yourself.
 
 ## Report Channel — recon_report MCP Tools (PRD γ §9)
 {get_recon_report_tool_guidance()}
+{DUPLICATE_FINDING_SALVAGE_GUIDANCE}
 
 **NOTE — Stage 3 is read-only.** The `mcp__recon-report__*` tools write only to in-process \
 state (not Graphiti / Mem0 / Taskmaster) and are intentionally permitted in Stage 3. \

@@ -38,22 +38,67 @@ _LEGACY_CONFIG_NAMES: Final = (
 def _read_escalation_url(yaml_path: Path) -> str | None:
     """Parse *yaml_path* and return its escalation MCP URL, or None.
 
-    Returns None when the file doesn't exist, is malformed (logged at
-    warning level), or has no ``escalation.port``. Callers decide what
+    Returns None when the file doesn't exist, is unreadable/unparseable,
+    its top-level YAML is not a mapping (a falsy non-mapping document,
+    e.g. ``[]``/``false``/``0``, counts too — only a genuinely empty file,
+    which parses to ``None``, is treated as an absent mapping), its
+    ``escalation:`` value is present but not a mapping, its
+    ``escalation.host``/``escalation.port`` leaves are present but not the
+    expected type, or it has no ``escalation.port`` — all logged at
+    warning level except the last (a config with no escalation section
+    configured is not malformed). This function runs once per known
+    project root at process startup (via
+    ``DashboardConfig.__post_init__``), so a single operator typo in one
+    project's config must degrade to "no URL for this root" rather than
+    raising and aborting the whole dashboard, and must never silently
+    format a wrong-typed leaf into a bogus URL that only fails later, at
+    request time, with an opaque connection error. Callers decide what
     "no URL" means for logging purposes.
     """
     if not yaml_path.is_file():
         return None
     try:
         with yaml_path.open() as f:
-            data: Any = yaml.safe_load(f) or {}
+            data: Any = yaml.safe_load(f)
     except (OSError, yaml.YAMLError) as exc:
         logger.warning('Failed to read %s: %s', yaml_path, exc)
         return None
-    esc = (data.get('escalation') or {}) if isinstance(data, dict) else {}
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        logger.warning(
+            'Ignoring %s: top-level YAML is a %s, not a mapping',
+            yaml_path,
+            type(data).__name__,
+        )
+        return None
+    esc: Any = data.get('escalation')
+    if esc is None:
+        esc = {}
+    if not isinstance(esc, dict):
+        logger.warning(
+            "Ignoring %s: 'escalation:' is a %s, not a mapping",
+            yaml_path,
+            type(esc).__name__,
+        )
+        return None
     host = esc.get('host', '127.0.0.1')
     port = esc.get('port')
     if not port:
+        return None
+    if not isinstance(host, str):
+        logger.warning(
+            "Ignoring %s: 'escalation.host' is a %s, not a string",
+            yaml_path,
+            type(host).__name__,
+        )
+        return None
+    if not isinstance(port, (int, str)):
+        logger.warning(
+            "Ignoring %s: 'escalation.port' is a %s, not an int or string",
+            yaml_path,
+            type(port).__name__,
+        )
         return None
     return f'http://{host}:{port}/mcp'
 
@@ -128,7 +173,27 @@ class DashboardConfig:
 
     host: str = '127.0.0.1'
     port: int = 8080
-    project_root: Path = field(default_factory=lambda: Path('/home/leo/src/dark-factory'))
+    # Derived from cwd, never a hardcoded absolute path (task 3503): a literal
+    # silently pointed every un-configured consumer on every other host at one
+    # developer's checkout.  That reason still stands, and this default stays.
+    #
+    # The canonical deployment no longer RELIES on it, though: both
+    # dashboard/dark-factory-dashboard.service and scripts/dashboard.service.template
+    # now set Environment=DASHBOARD_PROJECT_ROOT=<repo root> explicitly (task 3572),
+    # so from_env() takes the env branch there and the data root is DECLARED rather
+    # than inferred from those units' WorkingDirectory= pinning.  Why, and what
+    # keeps the two in step, is recorded once — on that Environment= line in the
+    # units, and on UnitSpec.env_matches_directive in
+    # scripts/check_dashboard_unit_parity.py.
+    #
+    # This fallback is what still applies to NON-systemd invocations — a bare
+    # `python -m dashboard` from a checkout, a test, a container without the unit —
+    # and what would apply again if that Environment= line were ever dropped.
+    # WorkingDirectory= is retained too and load-bearing in its own right (ExecStart's
+    # relative `--project dashboard` resolves against the cwd systemd sets from it);
+    # it is pinned by tests/scripts/test_dashboard_service_template.py::
+    # test_working_directory_is_pinned_in_both_unit_files.
+    project_root: Path = field(default_factory=Path.cwd)
     fused_memory_urls: list[str] = field(default_factory=lambda: list(DEFAULT_FUSED_MEMORY_URLS))
     known_project_roots: list[Path] = field(default_factory=list)
     escalation_urls: dict[str, str] = field(default_factory=dict)
@@ -208,6 +273,23 @@ class DashboardConfig:
         return self._runtime_data_dir('RECONCILIATION_DATA_DIR', 'reconciliation') / 'escalations'
 
     @property
+    def memory_evals_dir(self) -> Path:
+        """Memory-eval artifact root — ``<project_root>/fused-memory/data/memory-evals``.
+
+        Deliberately a PLAIN property (like ``escalations_dir``), NOT routed
+        through :meth:`_runtime_data_dir`.  The distinction is real, not
+        stylistic: ``QUEUE_DATA_DIR`` / ``RECONCILIATION_DATA_DIR`` relocate the
+        *managed* fused-memory runtime dirs to an XDG-rooted path outside the
+        watched project's tracked tree, and the memory-eval artifacts are not
+        among the things they relocate.  The M1 artifact path is contract-fixed
+        by ``docs/prds/memory-eval-program.md`` §3 and by
+        ``shared.memory_eval_metrics.metrics_artifact_path``; fused-memory
+        writes it relative to the repo.  Honouring a runtime-dir override here
+        would point the dashboard at a directory nothing ever writes.
+        """
+        return self.project_root / 'fused-memory' / 'data' / 'memory-evals'
+
+    @property
     def burndown_db(self) -> Path:
         return self.project_root / 'data' / 'burndown' / 'burndown.db'
 
@@ -221,7 +303,29 @@ class DashboardConfig:
 
     @classmethod
     def from_env(cls) -> DashboardConfig:
-        """Create config with DASHBOARD_-prefixed env var overrides."""
+        """Create config with DASHBOARD_-prefixed env var overrides.
+
+        When ``DASHBOARD_PROJECT_ROOT`` is unset, the cwd-derived fallback root
+        (see the ``project_root`` field) is logged at INFO — read off the
+        CONSTRUCTED config, so the journal always names the root the databases
+        actually hang off — instead of being an invisible default.
+
+        Since task 3572 the canonical deployment SETS the variable, so this line
+        no longer fires there at all; when it does fire it marks a genuinely
+        un-configured invocation — a bare ``python -m dashboard`` from a
+        checkout, a test, a container without the unit.
+
+        The level stays INFO all the same, and that is a considered choice
+        rather than an oversight: changing it is outside task 3572's scope, and
+        an un-configured invocation is a normal, supported way to run the
+        dashboard, not a degraded state like the ``_discover_escalation_urls``
+        WARNINGs in this same module.  INFO still surfaces the root in
+        ``journalctl`` at uvicorn's default log level.
+
+        ``from_env()`` is called once per process (app.py's ``lifespan``,
+        ``__main__.py``), so this is one line per process lifetime — never per
+        request.
+        """
         kwargs: dict = {}
         if (host := os.environ.get('DASHBOARD_HOST')) is not None:
             kwargs['host'] = host
@@ -233,4 +337,20 @@ class DashboardConfig:
             kwargs['fused_memory_urls'] = [u.strip() for u in urls.split(',') if u.strip()]
         if (roots := os.environ.get('DASHBOARD_KNOWN_PROJECT_ROOTS')) is not None:
             kwargs['known_project_roots'] = [Path(p.strip()) for p in roots.split(',') if p.strip()]
-        return cls(**kwargs)
+
+        config = cls(**kwargs)
+        if root is None:
+            # Log the CONSTRUCTED project_root, never a re-derivation of it.
+            # The fallback is `default_factory=Path.cwd` plus __post_init__'s
+            # .resolve(); re-computing `Path.cwd().resolve()` here would be a
+            # second copy of that derivation, and any future change to how the
+            # fallback root is computed (walking up to the repo root, honouring
+            # a different var) would silently make this line name a path the
+            # process is not actually using — in a message whose entire job is
+            # to be the one observable record of a silently-relocated data root.
+            logger.info(
+                'DASHBOARD_PROJECT_ROOT unset — using cwd-derived project_root %s '
+                '(all database paths are derived from it)',
+                config.project_root,
+            )
+        return config

@@ -23,6 +23,7 @@ here are EVIDENCE reads — a separate concern from record reads.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,7 @@ from fused_memory.reconciliation.standing_decision_constants import (
     RECORD_KIND_ENTITY_STANDING_DECISION,
     STANDING_DECISION_TTL_DAYS,
     STATE_ACTIVE,
+    STATE_EXPIRED,
 )
 
 logger = logging.getLogger(__name__)
@@ -448,3 +450,46 @@ async def write_entity_standing_decision(
         'expires_at': expires_at,
         'decided_at': decided_at,
     }
+
+
+# ---------------------------------------------------------------------------
+# Flip primitive (ζ, task 2899)
+# ---------------------------------------------------------------------------
+
+
+async def expire_entity_standing_decision(
+    ledger: Any,
+    record: Any,
+    *,
+    reason: str,
+) -> None:
+    """Flip one ACTIVE ``entity_standing_decision`` row to ``state=expired``.
+
+    The SINGLE-SOURCE flip primitive shared by ζ's two staleness mechanisms —
+    the Stage-2-tail growth sweep (``reason='growth'``) and the ``merge_entities``
+    invalidation hook (``reason='merge'``) — so the reconstruct-and-re-upsert
+    logic lives in exactly one place (INV-5, no lockstep-duplicated flip logic
+    across ``task_knowledge_sync`` and ``memory_service``).
+
+    Reconstructs the row's identity/fingerprint fields from *record* (α exposed
+    ``upsert_entity_standing_decision(state=, expiry_reason=)`` as the
+    last-write-wins flip primitive precisely so ζ flips a row by re-upserting it)
+    and re-writes it as ``state=STATE_EXPIRED`` stamped with *reason*. Every other
+    field — ``grounds``, ``decided_at`` (the row's ``created_at``),
+    ``edge_count_at_decision``, ``evidence``, and ``expires_at`` — is preserved
+    unchanged, so only ``state`` + ``expiry_reason`` transition. *record* is a
+    :class:`~fused_memory.reconciliation.recon_ledger.ReconLedgerRecord`
+    (duck-typed to avoid an import cycle).
+    """
+    payload = json.loads(record.payload_json)
+    await ledger.upsert_entity_standing_decision(
+        project_id=record.project_id,
+        entity_uuid=record.entity_uuid,
+        grounds=record.flag_type,
+        decided_at=record.created_at,
+        expires_at=record.expires_at,
+        edge_count_at_decision=payload['edge_count_at_decision'],
+        evidence=payload.get('evidence'),
+        state=STATE_EXPIRED,
+        expiry_reason=reason,
+    )

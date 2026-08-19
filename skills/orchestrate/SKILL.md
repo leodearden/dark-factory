@@ -167,6 +167,11 @@ if resolve["status"] == "created":
     task_id = resolve["task_id"]           # new task
 elif resolve["status"] == "combined":
     task_id = resolve["task_id"]           # merged into existing task — normal, not an error
+elif resolve["status"] == "refused":
+    # A deterministic guard rejected the candidate: no task was created and there
+    # is no task_id. Intended outcome — record resolve["reason"] and move on.
+    # Do NOT retry and do NOT record a task id.
+    note_refused(resolve["reason"])
 elif resolve["status"] == "failed":
     # On `failed`: surface the reason to the user and skip this task (user can
     # resubmit manually after investigating).
@@ -566,7 +571,7 @@ YAML values in the loaded config support `${VAR_NAME}` and `${VAR_NAME:default}`
 | `max_execute_iterations` | 10 | Implementer retries before blocking |
 | `max_verify_attempts` | 5 | Debug-fix cycles before blocking |
 | `max_review_cycles` | 2 | Review-replan loops before blocking |
-| `lock_depth` | 4 | Module path depth for lock normalization |
+| `lock_depth` | 4 | Module path depth for lock normalization (projects commonly override; lower = coarser locks) |
 | `test_command` | pytest | Verification test runner |
 | `lint_command` | ruff check ... | Verification linter |
 | `type_check_command` | pyright (per-package) | Verification type checker |

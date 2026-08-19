@@ -1,0 +1,1029 @@
+{
+  "task": "3324",
+  "prd": "plans/server-side-api-error-handling-prd.md",
+  "consumer": "task 3326 \u2014 watchdog two-regime startup grace (contract C5)",
+  "report": "docs/startup-completion-artifact-matrix.md",
+  "schema": "shared/tests/fixtures/startup_completion/README.md",
+  "raw_capture": "startup_completion_probe_raw.jsonl",
+  "regime": "healthy",
+  "rows": [
+    {
+      "id": "healthy_t0_4_no_transcript",
+      "regime": "healthy",
+      "wedge_shape": null,
+      "sample_offset_secs": 0.416,
+      "session_id": "d448eb11-eebf-41fb-b682-138b057baccd",
+      "config_dir_tree": [
+        {
+          "kind": "file",
+          "mtime_delta_secs": -0.005,
+          "relpath": ".credentials.json",
+          "size": 146
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.006,
+          "relpath": "settings.json",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.006,
+          "relpath": "settings.local.json",
+          "size": null
+        }
+      ],
+      "transcript_relpath": null,
+      "transcript_records": null,
+      "proc": {
+        "alive": true,
+        "children": [],
+        "cmdline": [
+          "claude",
+          "--print",
+          "--output-format",
+          "json",
+          "--model",
+          "haiku",
+          "--system-prompt-file",
+          "/tmp/startup_probe_sysprompt_m1weira_.txt",
+          "--session-id",
+          "d448eb11-eebf-41fb-b682-138b057baccd",
+          "--permission-mode",
+          "bypassPermissions",
+          "--max-turns",
+          "1",
+          "--disallowed-tools",
+          "*",
+          "-p",
+          "ok"
+        ],
+        "comm": "claude",
+        "pid": 1167391,
+        "state": "R"
+      },
+      "expected_startup_complete": null,
+      "substrate_returns": {
+        "count_transcript_turns": null,
+        "read_transcript_records_is_none": true,
+        "record_count": null,
+        "transcript_exists": false
+      },
+      "provenance": {
+        "probe_run_id": "healthy-171d92bec337",
+        "mode": "healthy",
+        "sample_kind": "scheduled",
+        "sample_index": 2,
+        "cli_version": "2.1.220 (Claude Code)",
+        "capture_method": "live_spawn",
+        "captured_at": "2026-07-31T01:33:35.831257+00:00",
+        "run_exit": {
+          "exit_code": 1,
+          "killed_by_probe": false,
+          "mode": "healthy",
+          "stderr_len": 0,
+          "stderr_tail": "",
+          "stdout_envelope": {
+            "duration_api_ms": 0,
+            "duration_ms": 2576,
+            "is_error": true,
+            "num_turns": 1,
+            "subtype": "success"
+          }
+        },
+        "note": "Sub-second sample: TaskConfigDir has laid down .credentials.json and the two settings symlinks, but the CLI has not created projects/ at all."
+      }
+    },
+    {
+      "id": "healthy_t2_0_no_transcript",
+      "regime": "healthy",
+      "wedge_shape": null,
+      "sample_offset_secs": 2.053,
+      "session_id": "d448eb11-eebf-41fb-b682-138b057baccd",
+      "config_dir_tree": [
+        {
+          "kind": "file",
+          "mtime_delta_secs": 1.949,
+          "relpath": ".claude.json",
+          "size": 29678
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": -0.005,
+          "relpath": ".credentials.json",
+          "size": 146
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 0.958,
+          "pruned_descendants": 1,
+          "relpath": "backups",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.949,
+          "relpath": "plugins",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 1.949,
+          "relpath": "plugins/installed_plugins.json",
+          "size": 35
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.765,
+          "relpath": "session-env",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.765,
+          "relpath": "session-env/d448eb11-eebf-41fb-b682-138b057baccd",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.914,
+          "relpath": "sessions",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 1.914,
+          "relpath": "sessions/1167391.json",
+          "size": 288
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.006,
+          "relpath": "settings.json",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.006,
+          "relpath": "settings.local.json",
+          "size": null
+        }
+      ],
+      "transcript_relpath": null,
+      "transcript_records": null,
+      "proc": {
+        "alive": true,
+        "children": [
+          {
+            "comm": "npm exec @playw",
+            "pid": 1169174
+          },
+          {
+            "comm": "sh",
+            "pid": 1169348
+          },
+          {
+            "comm": "sh",
+            "pid": 1169387
+          }
+        ],
+        "cmdline": [
+          "claude",
+          "--print",
+          "--output-format",
+          "json",
+          "--model",
+          "haiku",
+          "--system-prompt-file",
+          "/tmp/startup_probe_sysprompt_m1weira_.txt",
+          "--session-id",
+          "d448eb11-eebf-41fb-b682-138b057baccd",
+          "--permission-mode",
+          "bypassPermissions",
+          "--max-turns",
+          "1",
+          "--disallowed-tools",
+          "*",
+          "-p",
+          "ok"
+        ],
+        "comm": "claude",
+        "pid": 1167391,
+        "state": "R"
+      },
+      "expected_startup_complete": null,
+      "substrate_returns": {
+        "count_transcript_turns": null,
+        "read_transcript_records_is_none": true,
+        "record_count": null,
+        "transcript_exists": false
+      },
+      "provenance": {
+        "probe_run_id": "healthy-171d92bec337",
+        "mode": "healthy",
+        "sample_kind": "scheduled",
+        "sample_index": 12,
+        "cli_version": "2.1.220 (Claude Code)",
+        "capture_method": "live_spawn",
+        "captured_at": "2026-07-31T01:33:37.471270+00:00",
+        "run_exit": {
+          "exit_code": 1,
+          "killed_by_probe": false,
+          "mode": "healthy",
+          "stderr_len": 0,
+          "stderr_tail": "",
+          "stdout_envelope": {
+            "duration_api_ms": 0,
+            "duration_ms": 2576,
+            "is_error": true,
+            "num_turns": 1,
+            "subtype": "success"
+          }
+        },
+        "note": "CLI has begun populating the config dir (.claude.json, plugins/) but the session transcript still does not resolve."
+      }
+    },
+    {
+      "id": "healthy_pre_first_token_5rec",
+      "regime": "healthy",
+      "wedge_shape": null,
+      "sample_offset_secs": 4.559,
+      "session_id": "d448eb11-eebf-41fb-b682-138b057baccd",
+      "config_dir_tree": [
+        {
+          "kind": "file",
+          "mtime_delta_secs": 2.374,
+          "relpath": ".claude.json",
+          "size": 30114
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": -0.005,
+          "relpath": ".credentials.json",
+          "size": 146
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 0.958,
+          "pruned_descendants": 1,
+          "relpath": "backups",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 4.172,
+          "relpath": "plugins",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 1.949,
+          "relpath": "plugins/installed_plugins.json",
+          "size": 35
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 4.172,
+          "relpath": "plugins/known_marketplaces.json",
+          "size": 564
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 4.168,
+          "pruned_descendants": 709,
+          "relpath": "plugins/marketplaces",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 2.78,
+          "relpath": "projects",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 2.819,
+          "relpath": "projects/-home-leo-src-dark-factory--worktrees-3324",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 2.819,
+          "relpath": "projects/-home-leo-src-dark-factory--worktrees-3324/d448eb11-eebf-41fb-b682-138b057baccd.jsonl",
+          "size": 4158
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.765,
+          "relpath": "session-env",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.765,
+          "relpath": "session-env/d448eb11-eebf-41fb-b682-138b057baccd",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.914,
+          "relpath": "sessions",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 1.914,
+          "relpath": "sessions/1167391.json",
+          "size": 288
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.006,
+          "relpath": "settings.json",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.006,
+          "relpath": "settings.local.json",
+          "size": null
+        }
+      ],
+      "transcript_relpath": "projects/-home-leo-src-dark-factory--worktrees-3324/d448eb11-eebf-41fb-b682-138b057baccd.jsonl",
+      "transcript_records": [
+        {
+          "operation": "enqueue",
+          "type": "queue-operation"
+        },
+        {
+          "operation": "dequeue",
+          "type": "queue-operation"
+        },
+        {
+          "attachment": {
+            "hookName": "SessionStart:startup",
+            "type": "hook_success"
+          },
+          "isSidechain": false,
+          "type": "attachment"
+        },
+        {
+          "isSidechain": false,
+          "message": {
+            "role": "user"
+          },
+          "type": "user"
+        },
+        {
+          "attachment": {
+            "type": "mcp_instructions_delta"
+          },
+          "isSidechain": false,
+          "type": "attachment"
+        }
+      ],
+      "proc": {
+        "alive": true,
+        "children": [
+          {
+            "comm": "ssh",
+            "pid": 1174027
+          }
+        ],
+        "cmdline": [
+          "claude",
+          "--print",
+          "--output-format",
+          "json",
+          "--model",
+          "haiku",
+          "--system-prompt-file",
+          "/tmp/startup_probe_sysprompt_m1weira_.txt",
+          "--session-id",
+          "d448eb11-eebf-41fb-b682-138b057baccd",
+          "--permission-mode",
+          "bypassPermissions",
+          "--max-turns",
+          "1",
+          "--disallowed-tools",
+          "*",
+          "-p",
+          "ok"
+        ],
+        "comm": "claude",
+        "pid": 1167391,
+        "state": "S"
+      },
+      "expected_startup_complete": true,
+      "substrate_returns": {
+        "count_transcript_turns": 0,
+        "read_transcript_records_is_none": false,
+        "record_count": 5,
+        "transcript_exists": true
+      },
+      "provenance": {
+        "probe_run_id": "healthy-171d92bec337",
+        "mode": "healthy",
+        "sample_kind": "pre_first_token",
+        "sample_index": 24,
+        "cli_version": "2.1.220 (Claude Code)",
+        "capture_method": "live_spawn",
+        "captured_at": "2026-07-31T01:33:39.974059+00:00",
+        "run_exit": {
+          "exit_code": 1,
+          "killed_by_probe": false,
+          "mode": "healthy",
+          "stderr_len": 0,
+          "stderr_tail": "",
+          "stdout_envelope": {
+            "duration_api_ms": 0,
+            "duration_ms": 2576,
+            "is_error": true,
+            "num_turns": 1,
+            "subtype": "success"
+          }
+        },
+        "note": "THE incident-shape sample: startup complete, turn 1 not yet landed. Transcript resolves with 5 records and count_transcript_turns == 0."
+      }
+    },
+    {
+      "id": "healthy_pre_first_token_4rec",
+      "regime": "healthy",
+      "wedge_shape": null,
+      "sample_offset_secs": 5.292,
+      "session_id": "018f021f-4075-4c9f-8b02-5cb8084ea6f6",
+      "config_dir_tree": [
+        {
+          "kind": "file",
+          "mtime_delta_secs": 2.895,
+          "relpath": ".claude.json",
+          "size": 30114
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": -0.0,
+          "relpath": ".credentials.json",
+          "size": 146
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.083,
+          "pruned_descendants": 1,
+          "relpath": "backups",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 5.271,
+          "relpath": "plugins",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 2.401,
+          "relpath": "plugins/installed_plugins.json",
+          "size": 35
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 5.271,
+          "relpath": "plugins/known_marketplaces.json",
+          "size": 564
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 5.244,
+          "pruned_descendants": 709,
+          "relpath": "plugins/marketplaces",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 3.399,
+          "relpath": "projects",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 3.401,
+          "relpath": "projects/-home-leo-src-dark-factory--worktrees-3324",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 3.401,
+          "relpath": "projects/-home-leo-src-dark-factory--worktrees-3324/018f021f-4075-4c9f-8b02-5cb8084ea6f6.jsonl",
+          "size": 1543
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 2.101,
+          "relpath": "session-env",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 2.101,
+          "relpath": "session-env/018f021f-4075-4c9f-8b02-5cb8084ea6f6",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 2.372,
+          "relpath": "sessions",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 2.372,
+          "relpath": "sessions/1181538.json",
+          "size": 288
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.002,
+          "relpath": "settings.json",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.002,
+          "relpath": "settings.local.json",
+          "size": null
+        }
+      ],
+      "transcript_relpath": "projects/-home-leo-src-dark-factory--worktrees-3324/018f021f-4075-4c9f-8b02-5cb8084ea6f6.jsonl",
+      "transcript_records": [
+        {
+          "operation": "enqueue",
+          "type": "queue-operation"
+        },
+        {
+          "operation": "dequeue",
+          "type": "queue-operation"
+        },
+        {
+          "attachment": {
+            "hookName": "SessionStart:startup",
+            "type": "hook_success"
+          },
+          "isSidechain": false,
+          "type": "attachment"
+        },
+        {
+          "isSidechain": false,
+          "message": {
+            "role": "user"
+          },
+          "type": "user"
+        }
+      ],
+      "proc": {
+        "alive": true,
+        "children": [
+          {
+            "comm": "ssh",
+            "pid": 1188334
+          }
+        ],
+        "cmdline": [
+          "claude",
+          "--print",
+          "--output-format",
+          "json",
+          "--model",
+          "haiku",
+          "--system-prompt-file",
+          "/tmp/startup_probe_sysprompt_f7wp8n9u.txt",
+          "--session-id",
+          "018f021f-4075-4c9f-8b02-5cb8084ea6f6",
+          "--permission-mode",
+          "bypassPermissions",
+          "--max-turns",
+          "1",
+          "--disallowed-tools",
+          "*",
+          "-p",
+          "ok"
+        ],
+        "comm": "claude",
+        "pid": 1181538,
+        "state": "S"
+      },
+      "expected_startup_complete": true,
+      "substrate_returns": {
+        "count_transcript_turns": 0,
+        "read_transcript_records_is_none": false,
+        "record_count": 4,
+        "transcript_exists": true
+      },
+      "provenance": {
+        "probe_run_id": "healthy-e52685462d20",
+        "mode": "healthy",
+        "sample_kind": "pre_first_token",
+        "sample_index": 29,
+        "cli_version": "2.1.220 (Claude Code)",
+        "capture_method": "live_spawn",
+        "captured_at": "2026-07-31T01:33:48.031613+00:00",
+        "run_exit": {
+          "exit_code": 1,
+          "killed_by_probe": false,
+          "mode": "healthy",
+          "stderr_len": 0,
+          "stderr_tail": "",
+          "stdout_envelope": {
+            "duration_api_ms": 0,
+            "duration_ms": 2655,
+            "is_error": true,
+            "num_turns": 1,
+            "subtype": "success"
+          }
+        },
+        "note": "Second independent run at the same boundary \u2014 4 records, turns == 0. Confirms the leading record-type prefix is stable across runs."
+      }
+    },
+    {
+      "id": "healthy_first_token",
+      "regime": "healthy",
+      "wedge_shape": null,
+      "sample_offset_secs": 5.819,
+      "session_id": "018f021f-4075-4c9f-8b02-5cb8084ea6f6",
+      "config_dir_tree": [
+        {
+          "kind": "file",
+          "mtime_delta_secs": 2.895,
+          "relpath": ".claude.json",
+          "size": 30114
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": -0.0,
+          "relpath": ".credentials.json",
+          "size": 146
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.083,
+          "pruned_descendants": 1,
+          "relpath": "backups",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 5.271,
+          "relpath": "plugins",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 2.401,
+          "relpath": "plugins/installed_plugins.json",
+          "size": 35
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 5.271,
+          "relpath": "plugins/known_marketplaces.json",
+          "size": 564
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 5.244,
+          "pruned_descendants": 709,
+          "relpath": "plugins/marketplaces",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 3.399,
+          "relpath": "projects",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 3.401,
+          "relpath": "projects/-home-leo-src-dark-factory--worktrees-3324",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 5.602,
+          "relpath": "projects/-home-leo-src-dark-factory--worktrees-3324/018f021f-4075-4c9f-8b02-5cb8084ea6f6.jsonl",
+          "size": 2794
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 2.101,
+          "relpath": "session-env",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 2.101,
+          "relpath": "session-env/018f021f-4075-4c9f-8b02-5cb8084ea6f6",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 5.6,
+          "relpath": "sessions",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.002,
+          "relpath": "settings.json",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.002,
+          "relpath": "settings.local.json",
+          "size": null
+        }
+      ],
+      "transcript_relpath": "projects/-home-leo-src-dark-factory--worktrees-3324/018f021f-4075-4c9f-8b02-5cb8084ea6f6.jsonl",
+      "transcript_records": [
+        {
+          "operation": "enqueue",
+          "type": "queue-operation"
+        },
+        {
+          "operation": "dequeue",
+          "type": "queue-operation"
+        },
+        {
+          "attachment": {
+            "hookName": "SessionStart:startup",
+            "type": "hook_success"
+          },
+          "isSidechain": false,
+          "type": "attachment"
+        },
+        {
+          "isSidechain": false,
+          "message": {
+            "role": "user"
+          },
+          "type": "user"
+        },
+        {
+          "isSidechain": false,
+          "message": {
+            "role": "assistant"
+          },
+          "type": "assistant"
+        },
+        {
+          "type": "last-prompt"
+        }
+      ],
+      "proc": {
+        "alive": true,
+        "children": [
+          {
+            "comm": "ssh",
+            "pid": 1188334
+          }
+        ],
+        "cmdline": [
+          "claude",
+          "--print",
+          "--output-format",
+          "json",
+          "--model",
+          "haiku",
+          "--system-prompt-file",
+          "/tmp/startup_probe_sysprompt_f7wp8n9u.txt",
+          "--session-id",
+          "018f021f-4075-4c9f-8b02-5cb8084ea6f6",
+          "--permission-mode",
+          "bypassPermissions",
+          "--max-turns",
+          "1",
+          "--disallowed-tools",
+          "*",
+          "-p",
+          "ok"
+        ],
+        "comm": "claude",
+        "pid": 1181538,
+        "state": "S"
+      },
+      "expected_startup_complete": true,
+      "substrate_returns": {
+        "count_transcript_turns": 1,
+        "read_transcript_records_is_none": false,
+        "record_count": 6,
+        "transcript_exists": true
+      },
+      "provenance": {
+        "probe_run_id": "healthy-e52685462d20",
+        "mode": "healthy",
+        "sample_kind": "first_token",
+        "sample_index": 31,
+        "cli_version": "2.1.220 (Claude Code)",
+        "capture_method": "live_spawn",
+        "captured_at": "2026-07-31T01:33:48.559150+00:00",
+        "run_exit": {
+          "exit_code": 1,
+          "killed_by_probe": false,
+          "mode": "healthy",
+          "stderr_len": 0,
+          "stderr_tail": "",
+          "stdout_envelope": {
+            "duration_api_ms": 0,
+            "duration_ms": 2655,
+            "is_error": true,
+            "num_turns": 1,
+            "subtype": "success"
+          }
+        },
+        "note": "Turn 1 landed. Included so the predicate is pinned across the boundary it does NOT gate on."
+      }
+    },
+    {
+      "id": "healthy_after_exit",
+      "regime": "healthy",
+      "wedge_shape": null,
+      "sample_offset_secs": 5.703,
+      "session_id": "d448eb11-eebf-41fb-b682-138b057baccd",
+      "config_dir_tree": [
+        {
+          "kind": "file",
+          "mtime_delta_secs": 2.374,
+          "relpath": ".claude.json",
+          "size": 30114
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": -0.005,
+          "relpath": ".credentials.json",
+          "size": 146
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 0.958,
+          "pruned_descendants": 1,
+          "relpath": "backups",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 4.172,
+          "relpath": "plugins",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 1.949,
+          "relpath": "plugins/installed_plugins.json",
+          "size": 35
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 4.172,
+          "relpath": "plugins/known_marketplaces.json",
+          "size": 564
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 5.504,
+          "pruned_descendants": 709,
+          "relpath": "plugins/marketplaces",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 2.78,
+          "relpath": "projects",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 2.819,
+          "relpath": "projects/-home-leo-src-dark-factory--worktrees-3324",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 4.955,
+          "relpath": "projects/-home-leo-src-dark-factory--worktrees-3324/d448eb11-eebf-41fb-b682-138b057baccd.jsonl",
+          "size": 5409
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.765,
+          "relpath": "session-env",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.765,
+          "relpath": "session-env/d448eb11-eebf-41fb-b682-138b057baccd",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 4.949,
+          "relpath": "sessions",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.006,
+          "relpath": "settings.json",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.006,
+          "relpath": "settings.local.json",
+          "size": null
+        }
+      ],
+      "transcript_relpath": "projects/-home-leo-src-dark-factory--worktrees-3324/d448eb11-eebf-41fb-b682-138b057baccd.jsonl",
+      "transcript_records": [
+        {
+          "operation": "enqueue",
+          "type": "queue-operation"
+        },
+        {
+          "operation": "dequeue",
+          "type": "queue-operation"
+        },
+        {
+          "attachment": {
+            "hookName": "SessionStart:startup",
+            "type": "hook_success"
+          },
+          "isSidechain": false,
+          "type": "attachment"
+        },
+        {
+          "isSidechain": false,
+          "message": {
+            "role": "user"
+          },
+          "type": "user"
+        },
+        {
+          "attachment": {
+            "type": "mcp_instructions_delta"
+          },
+          "isSidechain": false,
+          "type": "attachment"
+        },
+        {
+          "isSidechain": false,
+          "message": {
+            "role": "assistant"
+          },
+          "type": "assistant"
+        },
+        {
+          "type": "last-prompt"
+        }
+      ],
+      "proc": {
+        "alive": false,
+        "children": [],
+        "cmdline": null,
+        "comm": null,
+        "pid": 1167391,
+        "state": null
+      },
+      "expected_startup_complete": true,
+      "substrate_returns": {
+        "count_transcript_turns": 1,
+        "read_transcript_records_is_none": false,
+        "record_count": 7,
+        "transcript_exists": true
+      },
+      "provenance": {
+        "probe_run_id": "healthy-171d92bec337",
+        "mode": "healthy",
+        "sample_kind": "after_exit",
+        "sample_index": 28,
+        "cli_version": "2.1.220 (Claude Code)",
+        "capture_method": "live_spawn",
+        "captured_at": "2026-07-31T01:33:41.118762+00:00",
+        "run_exit": {
+          "exit_code": 1,
+          "killed_by_probe": false,
+          "mode": "healthy",
+          "stderr_len": 0,
+          "stderr_tail": "",
+          "stdout_envelope": {
+            "duration_api_ms": 0,
+            "duration_ms": 2576,
+            "is_error": true,
+            "num_turns": 1,
+            "subtype": "success"
+          }
+        },
+        "note": "Post-exit steady state."
+      }
+    }
+  ]
+}

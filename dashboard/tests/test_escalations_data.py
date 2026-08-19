@@ -1,14 +1,21 @@
 """Tests for dashboard.data.escalations module.
 
-Tests use tmp_path to materialise fake escalation dirs (root + archive subdirs)
-and synthesise minimal escalation-shaped dicts.  No async / MCP traffic.
+Most tests use tmp_path to materialise fake escalation dirs (root + archive
+subdirs) and synthesise minimal escalation-shaped dicts — no async / MCP
+traffic.  The exception is :class:`TestFetchPinsRecovery` at the bottom, which
+drives the ``fetch_pins_recovery`` escalation-URL fan-out over an
+``httpx.MockTransport`` (same idiom as tests/test_merge_halt.py).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
+
+import httpx
+import pytest
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -148,6 +155,111 @@ class TestLoadQueueEscalations:
         assert loaded['status'] == 'dismissed'
         assert loaded['worktree'] == '/home/leo/src/proj/.worktrees/3'
         assert loaded['extra_field'] == 'should-survive'
+
+    # -- the opt-in ``skipped`` out-parameter -------------------------------
+    #
+    # Skipping an unparseable file is correct — one corrupt escalation must not
+    # crash a queue scan.  Doing it with no channel back to the caller is not:
+    # the reader holds both the path and the exception at the failure point and
+    # threw both away into a log line no payload consumer can read (INV-2,
+    # ``structured-facts-at-failure``).  ``skipped`` is that channel.
+
+    def test_skipped_out_parameter_records_unparseable_files(self, tmp_path):
+        """An opted-in caller learns WHICH file was dropped and WHY."""
+        from dashboard.data.escalations import load_queue_escalations
+
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+        _write_esc(esc_dir, 'esc-good-1.json', _esc('esc-good-1', task_id='1'))
+        bad = esc_dir / 'esc-bad-1.json'
+        bad.write_text('this is not json {{{')
+
+        skipped: list = []
+        result = load_queue_escalations(esc_dir, skipped=skipped)
+
+        # The return value is untouched — this is a second channel, not a
+        # change to what the reader yields.
+        assert len(result) == 1
+        assert result[0]['id'] == 'esc-good-1'
+        assert len(skipped) == 1
+        assert skipped[0]['path'] == bad
+        assert isinstance(skipped[0]['error'], str) and skipped[0]['error']
+
+    def test_skipped_records_os_errors_not_just_decode_errors(self, tmp_path):
+        """BOTH arms of ``except (JSONDecodeError, OSError)`` report, not just JSON.
+
+        ``Path.glob('*.json')`` yields directories too, so a directory named
+        ``weird.json`` makes ``read_text()`` raise ``IsADirectoryError`` — a
+        deterministic OSError needing no permission games or monkeypatching.
+        A reader that only reported the decode arm would still lose every
+        unreadable/permission-denied file silently, which is the more likely
+        production failure of the two.
+        """
+        from dashboard.data.escalations import load_queue_escalations
+
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+        _write_esc(esc_dir, 'esc-good-1.json', _esc('esc-good-1', task_id='1'))
+        weird = esc_dir / 'weird.json'
+        weird.mkdir()
+
+        skipped: list = []
+        result = load_queue_escalations(esc_dir, skipped=skipped)
+
+        assert [r['id'] for r in result] == ['esc-good-1']
+        assert len(skipped) == 1
+        assert skipped[0]['path'] == weird
+        assert isinstance(skipped[0]['error'], str) and skipped[0]['error']
+
+    def test_skipped_accumulator_is_appended_not_replaced(self, tmp_path):
+        """Entries are APPENDED, so one list can span several queue dirs.
+
+        ``build_escalation_queues`` calls this reader once per orchestrator
+        root; a caller that wants the whole fleet's skips in one list must be
+        able to reuse the accumulator rather than merge N of them.
+        """
+        from dashboard.data.escalations import load_queue_escalations
+
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+        bad = esc_dir / 'esc-bad-1.json'
+        bad.write_text('this is not json {{{')
+
+        sentinel = {'path': tmp_path / 'from-an-earlier-dir.json', 'error': 'earlier'}
+        skipped: list = [sentinel]
+        load_queue_escalations(esc_dir, skipped=skipped)
+
+        assert len(skipped) == 2
+        assert skipped[0] is sentinel
+        assert skipped[1]['path'] == bad
+
+    def test_omitting_skipped_leaves_behaviour_unchanged(self, tmp_path, caplog):
+        """The default path is byte-identical to today — the back-compat pin.
+
+        Neither of the two ``build_escalation_queues`` call sites opts in, so
+        for the escalation views the WARNING log stays the only signal.  (Named
+        by function, not by line: a line-number citation in this file is stale
+        the moment anything above it moves — the diff that added this test
+        pushed those very calls down ~28 lines.)
+
+        This asserts the un-opted-in call still returns only the valid record,
+        still does not raise, and still logs — i.e. that the new keyword is
+        additive and no existing caller had to change.
+        """
+        from dashboard.data.escalations import load_queue_escalations
+
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+        _write_esc(esc_dir, 'esc-good-1.json', _esc('esc-good-1', task_id='1'))
+        (esc_dir / 'esc-bad-1.json').write_text('this is not json {{{')
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.escalations'):
+            result = load_queue_escalations(esc_dir)
+
+        assert len(result) == 1
+        assert result[0]['id'] == 'esc-good-1'
+        assert any('esc-bad-1' in rec.message for rec in caplog.records), \
+            'the WARNING must survive for callers that do not opt in'
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +563,215 @@ class TestBuildEscalationQueuesSubsections:
             assert 'escalations' in sub
             assert isinstance(sub['escalations'], list)
 
+    def test_orchestrator_subsection_reports_skipped_files(self, tmp_path):
+        """A corrupt queue file is reported in the subsection's ``skipped`` list.
+
+        INV-2 (``structured-facts-at-failure``): a queue that reports fewer
+        escalations than it holds must say so in the payload, not only in a
+        WARNING line a human tailing stderr may never see.
+        """
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        primary.mkdir()
+        esc_dir = primary / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        _write_esc(esc_dir, 'esc-good.json', _esc('esc-good'))
+        (esc_dir / 'esc-bad.json').write_text('{not json')
+        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
+
+        config = self._make_config(tmp_path, primary)
+        result = build_escalation_queues(config)
+
+        primary_sub = next(s for s in result['subsections'] if s['id'] == str(primary.resolve()))
+
+        assert 'skipped' in primary_sub, (
+            'each subsection must carry a `skipped` list — pass a fresh accumulator '
+            'to load_queue_escalations and stringify its records into the subsection'
+        )
+        assert isinstance(primary_sub['skipped'], list)
+        assert len(primary_sub['skipped']) == 1, (
+            f"expected exactly one skip record, got {primary_sub['skipped']!r}"
+        )
+
+        entry = primary_sub['skipped'][0]
+        assert set(entry.keys()) == {'path', 'error'}, (
+            "skip records keep the reader's own {'path', 'error'} shape — no "
+            'renamed or extra fields'
+        )
+        assert isinstance(entry['path'], str), (
+            '`path` must be stringified at this payload boundary — a Path reaching '
+            'JSONResponse would 500 the endpoint'
+        )
+        assert entry['path'].endswith('esc-bad.json'), (
+            'the record must name the FILE that was dropped, not its directory'
+        )
+        assert isinstance(entry['error'], str) and entry['error'], (
+            '`error` must be a non-empty str naming why the file could not be read'
+        )
+
+        # A skip must not drop readable records.
+        assert [e['id'] for e in primary_sub['escalations']] == ['esc-good'], (
+            'the good escalation must still be returned alongside the skip report'
+        )
+
+    def test_skipped_is_per_subsection_not_shared(self, tmp_path):
+        """Each subsection gets its OWN skipped list — no shared accumulator.
+
+        ``load_queue_escalations`` **appends** to the accumulator it is handed,
+        so one list shared across every call site would attribute every queue's
+        skips to every subsection: a single corrupt file in one orchestrator's
+        queue would render as N badges across N unrelated projects.  That is a
+        worse lie than the current silence.
+        """
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        reify = tmp_path / 'reify'
+        primary.mkdir()
+        reify.mkdir()
+
+        primary_esc = primary / 'data' / 'escalations'
+        primary_esc.mkdir(parents=True)
+        _write_esc(primary_esc, 'esc-p1.json', _esc('esc-p1'))
+        (primary_esc / 'esc-bad.json').write_text('{not json')
+
+        reify_esc = reify / 'data' / 'escalations'
+        reify_esc.mkdir(parents=True)
+        _write_esc(reify_esc, 'esc-r1.json', _esc('esc-r1'))
+
+        recon_dir = primary / 'data' / 'reconciliation' / 'escalations'
+        recon_dir.mkdir(parents=True)
+        _write_esc(recon_dir, 'esc-rc1.json', _esc('esc-rc1'))
+
+        config = self._make_config(tmp_path, primary, [reify])
+        result = build_escalation_queues(config)
+
+        primary_id = str(primary.resolve())
+        primary_sub = next(s for s in result['subsections'] if s['id'] == primary_id)
+        others = [s for s in result['subsections'] if s['id'] != primary_id]
+
+        assert len(others) == 2, 'expected the reify + reconciliation subsections'
+        assert len(primary_sub['skipped']) == 1
+        assert primary_sub['skipped'][0]['path'].endswith('esc-bad.json')
+        for sub in others:
+            assert sub['skipped'] == [], (
+                f"subsection {sub['id']!r} must not inherit another queue's skips — "
+                'pass a FRESH list per load_queue_escalations call site'
+            )
+
+    def test_reconciliation_subsection_reports_skipped_files(self, tmp_path):
+        """The reconciliation queue reports its own skips, one entry per file."""
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        primary.mkdir()
+        esc_dir = primary / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        _write_esc(esc_dir, 'esc-p1.json', _esc('esc-p1'))
+
+        recon_dir = primary / 'data' / 'reconciliation' / 'escalations'
+        recon_dir.mkdir(parents=True)
+        (recon_dir / 'esc-bad-1.json').write_text('{not json')
+        (recon_dir / 'esc-bad-2.json').write_text('also not json')
+
+        config = self._make_config(tmp_path, primary)
+        result = build_escalation_queues(config)
+
+        recon_sub = next(s for s in result['subsections'] if s['id'] == 'reconciliation')
+        orch_subs = [s for s in result['subsections'] if s['kind'] == 'orchestrator']
+
+        assert len(recon_sub['skipped']) == 2, (
+            'one skip record per unreadable file, not one per queue'
+        )
+        assert {Path(e['path']).name for e in recon_sub['skipped']} == {
+            'esc-bad-1.json', 'esc-bad-2.json',
+        }
+        for sub in orch_subs:
+            assert sub['skipped'] == [], (
+                "an orchestrator subsection must not inherit the reconciliation queue's skips"
+            )
+
+    def test_skipped_reports_os_errors_end_to_end(self, tmp_path):
+        """The ``OSError`` arm reaches the payload too, not just ``JSONDecodeError``.
+
+        Every other test here corrupts a file's *content*, exercising only the
+        decode arm of the reader's ``except (JSONDecodeError, OSError)``.  The
+        OSError arm is the one likelier to hit a whole directory at once
+        (permission fault, a file vanishing mid-scan, a truncated mount), so if
+        only the decode arm reached the payload the worst real failure would
+        still be silent.
+
+        A directory named ``weird.json`` makes ``read_text()`` raise
+        ``IsADirectoryError`` — a deterministic OSError needing no chmod games
+        (which no-op under root) or monkeypatching.  Same device as
+        ``TestLoadQueueEscalations::test_skipped_records_os_errors_not_just_decode_errors``,
+        here driven end-to-end through ``build_escalation_queues``.
+        """
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        primary.mkdir()
+        esc_dir = primary / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        _write_esc(esc_dir, 'esc-p1.json', _esc('esc-p1'))
+        (esc_dir / 'weird.json').mkdir()
+        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
+
+        config = self._make_config(tmp_path, primary)
+        result = build_escalation_queues(config)
+
+        primary_sub = result['subsections'][0]
+        assert [e['id'] for e in primary_sub['escalations']] == ['esc-p1'], (
+            'an unreadable entry must not drop the readable records beside it'
+        )
+        assert len(primary_sub['skipped']) == 1
+        entry = primary_sub['skipped'][0]
+        assert Path(entry['path']).name == 'weird.json'
+        assert isinstance(entry['error'], str) and entry['error'], (
+            'an OSError skip must carry a non-empty cause, same as a decode skip'
+        )
+        assert primary_sub['summary']['skipped_count'] == 1
+
+    def test_payload_with_skips_is_json_serializable(self, tmp_path):
+        """The built payload survives ``json.dumps`` — the stringify claim, pinned.
+
+        Three docstrings justify stringifying ``path`` at this boundary with "a
+        ``Path`` reaching ``JSONResponse`` would 500 the endpoint".  That claim
+        was asserted only indirectly (``isinstance(path, str)``); this pins it
+        directly, through the shaper the API layer actually calls, so a future
+        refactor that lets a ``Path`` back into the payload fails here rather
+        than at runtime on the one poll where a queue file is corrupt.
+        """
+        import json as _json
+
+        from dashboard.data.escalations import build_escalation_queues
+        from dashboard.data.redux_api import shape_escalations
+
+        primary = tmp_path / 'primary'
+        primary.mkdir()
+        esc_dir = primary / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        _write_esc(esc_dir, 'esc-p1.json', _esc('esc-p1'))
+        (esc_dir / 'esc-bad-1.json').write_text('{not json')
+        recon_dir = primary / 'data' / 'reconciliation' / 'escalations'
+        recon_dir.mkdir(parents=True)
+        (recon_dir / 'esc-bad-2.json').write_text('also not json')
+
+        config = self._make_config(tmp_path, primary)
+        queues = build_escalation_queues(config)
+
+        # Raw builder output serializes...
+        _json.dumps(queues)
+        # ...and so does what the API layer actually hands JSONResponse.
+        shaped = shape_escalations(queues, {})
+        encoded = _json.dumps(shaped)
+
+        assert 'esc-bad-1.json' in encoded and 'esc-bad-2.json' in encoded, (
+            'the serialized payload must still name the unreadable files'
+        )
+        assert shaped['ESCALATIONS']['summary']['skipped_count'] == 2
+
 
 # ---------------------------------------------------------------------------
 # Tests for build_escalation_queues — summary counts (step 9)
@@ -590,6 +911,95 @@ class TestBuildEscalationQueuesSummary:
         assert primary_sub['summary']['by_status']['pending'] == 1
         assert sum(primary_sub['summary']['by_status'].values()) == 1
 
+    def test_per_subsection_summary_carries_skipped_count(self, tmp_path):
+        """``skipped_count`` sits beside the counts it explains, and does not inflate them.
+
+        The summary dict is precisely "the per-level/per-status counts that may
+        be quietly low"; the skip count is the honest annotation on those counts,
+        read by the same consumers at the same nesting.
+        """
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        primary.mkdir()
+        esc_dir = primary / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        _write_esc(esc_dir, 'esc-good.json', _esc('esc-good', level=1, status='pending'))
+        (esc_dir / 'esc-bad.json').write_text('{not json')
+        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
+
+        config = self._make_config(tmp_path, primary)
+        result = build_escalation_queues(config)
+
+        primary_sub = next(s for s in result['subsections'] if s['id'] == str(primary.resolve()))
+        recon_sub = next(s for s in result['subsections'] if s['id'] == 'reconciliation')
+
+        assert primary_sub['summary']['skipped_count'] == 1, (
+            'the summary must report how many files this queue could not read'
+        )
+        assert recon_sub['summary']['skipped_count'] == 0, (
+            "a clean queue's skipped_count is 0, not another queue's count"
+        )
+
+        # The skip must NOT inflate the level/status counts it qualifies.
+        assert sum(primary_sub['summary']['by_level'].values()) == 1
+        assert primary_sub['summary']['by_level'][1] == 1
+        assert sum(primary_sub['summary']['by_status'].values()) == 1
+        assert primary_sub['summary']['by_status']['pending'] == 1
+
+    def test_top_level_summary_aggregates_skipped_count(self, tmp_path):
+        """The top-level rollup sums every subsection's skips."""
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        primary.mkdir()
+        esc_dir = primary / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        _write_esc(esc_dir, 'esc-good.json', _esc('esc-good'))
+        (esc_dir / 'esc-bad.json').write_text('{not json')
+
+        recon_dir = primary / 'data' / 'reconciliation' / 'escalations'
+        recon_dir.mkdir(parents=True)
+        (recon_dir / 'esc-bad-rc.json').write_text('also not json')
+
+        config = self._make_config(tmp_path, primary)
+        result = build_escalation_queues(config)
+
+        assert result['summary']['skipped_count'] == 2, (
+            'the top-level summary must aggregate skipped_count across every '
+            'subsection, through the same _merge_summaries path the level/status '
+            'counts already take'
+        )
+
+    def test_skipped_count_zero_when_all_files_readable(self, tmp_path):
+        """``skipped_count`` is always present — never conditionally absent.
+
+        A missing key reads as "unknown" and forces every consumer into a
+        ``.get(..., 0)`` guess; an explicit 0 states the fact.
+        """
+        from dashboard.data.escalations import build_escalation_queues
+
+        primary = tmp_path / 'primary'
+        reify = tmp_path / 'reify'
+        primary.mkdir()
+        reify.mkdir()
+
+        esc_dir = primary / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        _write_esc(esc_dir, 'esc-good.json', _esc('esc-good'))
+        (reify / 'data' / 'escalations').mkdir(parents=True)
+        (primary / 'data' / 'reconciliation' / 'escalations').mkdir(parents=True)
+
+        config = self._make_config(tmp_path, primary, [reify])
+        result = build_escalation_queues(config)
+
+        for sub in result['subsections']:
+            assert sub['summary']['skipped_count'] == 0, (
+                f"subsection {sub['id']!r} has no unreadable files — skipped_count "
+                'must be present and 0'
+            )
+        assert result['summary']['skipped_count'] == 0
+
 
 # ---------------------------------------------------------------------------
 # Regression tests for resolve_owning_project — worktree false-positive
@@ -684,3 +1094,382 @@ class TestResolveOwningProjectPrefixRegression:
             f"Expected None but got {result!r} — "
             ".worktrees-archive false-matched .worktrees root via string prefix"
         )
+
+
+# ---------------------------------------------------------------------------
+# fetch_pins_recovery — escalation-URL fan-out (task 3543 step-23, spec S8)
+# ---------------------------------------------------------------------------
+#
+# `get_pending_escalations` now computes a per-record `pins_recovery` list
+# (escalation/src/escalation/server.py) and deliberately OMITS the key when it
+# could not be computed.  These tests pin the dashboard-side fan-out that reads
+# it, and in particular its THREE-state discipline, which mirrors
+# `escalation.pins.PinReport.store_unavailable`:
+#
+#   None  — this project could not be read (transport error, timeout, error
+#           envelope).  UNKNOWN.  The UI must render nothing.
+#   {}    — read succeeded; no record carried an annotation.
+#   {id: [task_ids]} — read succeeded and these records are annotated.
+#
+# Collapsing the first into the second is the exact esc-3163 defect: an empty
+# map reads as "nothing pins this", which routes a genuinely-pinned strand down
+# the wrong branch.  The same discipline applies per RECORD: an id absent from
+# a non-None map is unknown, never "does not pin".
+
+
+def _init_response(request_id: int = 1) -> httpx.Response:
+    """Minimal MCP `initialize` reply so McpSession completes its handshake."""
+    return httpx.Response(
+        200,
+        json={
+            'jsonrpc': '2.0',
+            'id': request_id,
+            'result': {
+                'protocolVersion': '2025-03-26',
+                'capabilities': {'tools': {}},
+                'serverInfo': {'name': 'test', 'version': '0.1'},
+            },
+        },
+        headers={'mcp-session-id': 'test-session-id'},
+    )
+
+
+def _tool_response(inner, request_id: int = 1) -> httpx.Response:
+    """Encode *inner* the way FastMCP encodes a list-returning tool's result.
+
+    Verified against the installed fastmcp 3.2.2
+    (``fastmcp/tools/base.py::_convert_to_content``): a non-empty ``list`` of
+    plain dicts is aggregated into a SINGLE TextContent block holding the
+    JSON-serialised list, while an EMPTY list short-circuits to an empty
+    ``content`` array (the ``all(isinstance(...))`` guard is vacuously true for
+    ``[]``, so the list itself is returned as the content blocks).
+
+    That asymmetry is load-bearing for this fan-out: the dashboard's
+    ``_extract_tool_result`` maps empty content to ``{}``, so an authoritative
+    "no pending escalations" arrives as a dict, not as a list.  A fixture that
+    always emitted a text block would test a wire shape the real server never
+    produces and would leave that branch unexercised.
+    """
+    if isinstance(inner, list) and not inner:
+        content = []
+    else:
+        content = [{'type': 'text', 'text': json.dumps(inner)}]
+    return httpx.Response(
+        200,
+        json={'jsonrpc': '2.0', 'id': request_id, 'result': {'content': content}},
+        headers={'mcp-session-id': 'test-session-id'},
+    )
+
+
+class _PinsHandler:
+    """MockTransport handler dispatching per-port `get_pending_escalations`.
+
+    ``responses`` maps port → the value that port's escalation server returns
+    (normally a ``list[dict]``).  ``fail_ports`` raise ``httpx.ConnectError``;
+    ``slow_ports`` sleep first so the per-call timeout path can be driven.
+    Every tools/call is recorded in ``tool_calls`` as ``(port, name, args)``.
+    """
+
+    def __init__(
+        self,
+        responses: dict[int, object] | None = None,
+        *,
+        fail_ports: set[int] | None = None,
+        slow_ports: dict[int, float] | None = None,
+    ):
+        self.responses: dict[int, object] = responses or {}
+        self.fail_ports = fail_ports or set()
+        self.slow_ports = slow_ports or {}
+        self.tool_calls: list[tuple[int, str, dict]] = []
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        port = request.url.port
+        assert port is not None
+        if port in self.fail_ports:
+            raise httpx.ConnectError('refused')
+        if port in self.slow_ports:
+            await asyncio.sleep(self.slow_ports[port])
+        body = json.loads(request.content)
+        method = body.get('method', '')
+        request_id = body.get('id', 1)
+        if method == 'initialize':
+            return _init_response(request_id)
+        if method.startswith('notifications/'):
+            return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
+        params = body.get('params') or {}
+        self.tool_calls.append(
+            (port, params.get('name', ''), params.get('arguments') or {}),
+        )
+        return _tool_response(self.responses.get(port, []), request_id)
+
+
+class _ExplodingHandler:
+    """Handler that fails the test if any HTTP request is issued at all."""
+
+    def __init__(self):
+        self.called = False
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.called = True
+        raise AssertionError(f'unexpected HTTP request to {request.url}')
+
+
+def _pins_urls(*ports: int) -> dict[str, str]:
+    return {f'proj{p}': f'http://127.0.0.1:{p}/mcp' for p in ports}
+
+
+def _rec(esc_id: str, **extra) -> dict:
+    """A compact pending-escalation record as the escalation server returns it."""
+    d = {'id': esc_id, 'task_id': '3543', 'level': 1, 'status': 'pending'}
+    d.update(extra)
+    return d
+
+
+class TestFetchPinsRecovery:
+    """`fetch_pins_recovery(client, escalation_urls)` fan-out contract."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_sessions(self):
+        from dashboard.data.memory import reset_sessions
+        reset_sessions()
+        yield
+        reset_sessions()
+
+    async def test_empty_urls_short_circuits_without_any_http_call(self):
+        """No configured escalation URLs → `{}` and not a single request."""
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _ExplodingHandler()
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, {})
+        assert result == {}
+        assert handler.called is False
+
+    async def test_annotated_records_map_id_to_task_ids(self):
+        """A successful read returns `{esc_id: pins_recovery}` per project."""
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({
+            8100: [
+                _rec('esc-a', pins_recovery=['3543']),
+                _rec('esc-b', pins_recovery=[]),
+            ],
+            8105: [_rec('esc-c', task_id='99', pins_recovery=['99'])],
+        })
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100, 8105))
+
+        assert set(result) == {'proj8100', 'proj8105'}
+        assert result['proj8100'] == {'esc-a': ['3543'], 'esc-b': []}
+        assert result['proj8105'] == {'esc-c': ['99']}
+
+    async def test_requests_compact_pending_records(self):
+        """The fan-out asks for `get_pending_escalations(compact=True)`.
+
+        `_COMPACT_PENDING_FIELDS` (escalation/server.py) exists precisely
+        because the dashboard reads compact records — it re-adds
+        `pins_recovery` on top of the shared compact projection.  Requesting
+        the full record would haul detail/members/options across the wire on
+        every poll for a field this caller never reads.
+        """
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({8100: [_rec('esc-a', pins_recovery=['3543'])]})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await fetch_pins_recovery(client, _pins_urls(8100))
+
+        assert len(handler.tool_calls) == 1, handler.tool_calls
+        _port, name, args = handler.tool_calls[0]
+        assert name == 'get_pending_escalations'
+        assert args.get('compact') is True
+
+    async def test_record_without_the_key_is_omitted_not_defaulted(self):
+        """An older escalation server omits `pins_recovery` → omit the id.
+
+        Defaulting the missing key to `[]` would manufacture a confident
+        "this record pins nothing" out of a server that never computed the
+        annotation — the same false-negative the escalation side refuses to
+        emit.  The id must simply be absent from the map so downstream renders
+        UNKNOWN.
+        """
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({
+            8100: [
+                _rec('esc-old'),                            # pre-3543 server
+                _rec('esc-new', pins_recovery=['3543']),
+            ],
+        })
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100))
+
+        annotated = result['proj8100']
+        assert annotated is not None  # a successful read, not the UNKNOWN state
+        assert annotated == {'esc-new': ['3543']}
+        assert 'esc-old' not in annotated
+
+    async def test_non_list_annotation_is_omitted(self):
+        """A malformed `pins_recovery` (not a list) is dropped, not coerced."""
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({
+            8100: [
+                _rec('esc-bad', pins_recovery='3543'),
+                _rec('esc-null', pins_recovery=None),
+                _rec('esc-ok', pins_recovery=['3543']),
+            ],
+        })
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100))
+
+        assert result['proj8100'] == {'esc-ok': ['3543']}
+
+    async def test_authoritative_empty_queue_maps_to_empty_dict(self):
+        """Zero pending escalations is a SUCCESSFUL read → `{}`, never None.
+
+        FastMCP encodes an empty list as empty `content`, which the shared
+        `_extract_tool_result` collapses to `{}` — so this arrives as a dict
+        even though the tool returns a list.  It must still be distinguishable
+        from an unreachable project.
+        """
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({8100: []})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100))
+
+        assert result['proj8100'] is not None
+        assert result['proj8100'] == {}
+
+    async def test_connect_error_maps_to_none_not_empty(self):
+        """An unreachable project is UNKNOWN (None), not "nothing pins" (`{}`)."""
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler(fail_ports={8102})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8102))
+
+        assert 'proj8102' in result
+        assert result['proj8102'] is None
+
+    async def test_timeout_maps_to_none(self):
+        """A project that does not answer inside per_call_timeout is UNKNOWN."""
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler(
+            {8100: [_rec('esc-a', pins_recovery=['3543'])], 8105: []},
+            slow_ports={8105: 0.5},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(
+                client, _pins_urls(8100, 8105), per_call_timeout=0.05,
+            )
+
+        assert result['proj8100'] == {'esc-a': ['3543']}
+        assert result['proj8105'] is None
+
+    async def test_error_envelope_maps_to_none(self):
+        """A tool result that is a dict (error envelope) is UNKNOWN, not empty.
+
+        The tool's contract is `list[dict]`; anything else means the call did
+        not deliver the annotation.  The one exception — an EMPTY dict, which
+        is how FastMCP+`_extract_tool_result` render an authoritative empty
+        list — is covered by its own test above.
+        """
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({8100: {'error': 'no escalation queue wired'}})
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100))
+
+        assert result['proj8100'] is None
+
+    async def test_one_project_failure_never_sinks_the_others(self):
+        """Per-project isolation: every configured label is always present."""
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler(
+            {
+                8100: [_rec('esc-a', pins_recovery=['3543'])],
+                8107: [],
+            },
+            fail_ports={8102},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100, 8102, 8107))
+
+        assert set(result) == {'proj8100', 'proj8102', 'proj8107'}
+        assert result['proj8100'] == {'esc-a': ['3543']}
+        assert result['proj8102'] is None
+        assert result['proj8107'] == {}
+
+    async def test_unanticipated_exception_sinks_only_its_own_project(self):
+        """An exception class the probe does NOT catch degrades one project.
+
+        ``_fetch_pins_one`` catches the transport family it can anticipate
+        ((TimeoutError, httpx.HTTPError, OSError, ValueError)), but
+        ``mcp_tool_call`` reaches ``McpSession.call_tool``, whose failure modes
+        are not contractually narrowed to those.  If such an escape propagated
+        out of the gather, app.py's outer ``except Exception`` would blank the
+        annotation for EVERY project at once — the fleet-wide collapse this
+        per-project fan-out exists to prevent.  A RuntimeError stands in for
+        the whole unanticipated class.
+        """
+        from unittest.mock import patch
+
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        async def _mcp(_client, base_url, _tool, _args):
+            if '8102' in base_url:
+                raise RuntimeError('session state went sideways')
+            return [_rec('esc-a', pins_recovery=['3543'])]
+
+        handler = _ExplodingHandler()  # every call is intercepted below
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with patch(
+                'dashboard.data.escalations.mcp_tool_call', side_effect=_mcp,
+            ):
+                result = await fetch_pins_recovery(
+                    client, _pins_urls(8100, 8102, 8107),
+                )
+
+        assert set(result) == {'proj8100', 'proj8102', 'proj8107'}, (
+            'every configured label must still be present; got '
+            f'{sorted(result)!r}'
+        )
+        assert result['proj8102'] is None, (
+            'the raising project degrades to UNKNOWN, not to an empty map'
+        )
+        assert result['proj8100'] == {'esc-a': ['3543']}, (
+            "a sibling's unanticipated exception must not blank this "
+            f"project's annotation; got {result['proj8100']!r}"
+        )
+        assert result['proj8107'] == {'esc-a': ['3543']}
+
+    async def test_records_that_are_not_dicts_do_not_raise(self):
+        """A ragged list (strings/None mixed in) degrades instead of raising.
+
+        This runs inside a dashboard poll cycle; a TypeError here would 500 the
+        endpoint on account of one malformed record.
+        """
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        handler = _PinsHandler({
+            8100: ['not-a-record', None, _rec('esc-ok', pins_recovery=['3543']), {}],
+        })
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(client, _pins_urls(8100))
+
+        assert result['proj8100'] == {'esc-ok': ['3543']}

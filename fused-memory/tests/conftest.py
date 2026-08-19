@@ -4,11 +4,22 @@ Non-fixture helpers (MockEdge, make_rebuild_detail, extract_cypher, …)
 live in `_fm_helpers.py` — a uniquely-named sibling module — so they can
 be imported from test files without conflicting with sibling subprojects'
 conftests under `sys.modules['conftest']`.
+
+Testing a `scripts/` script? `scripts/` is not a package and is not on
+PYTHONPATH, so import it with `from _fm_helpers import
+load_script_module` rather than writing another local
+`spec_from_file_location` loader: the shared one reuses an already-loaded
+module for the same file instead of re-executing it under the same
+`sys.modules` key, and refuses to shadow a module it did not install.
+Many older test modules still carry their own copy (task 3895 migrates
+them); don't add one (task 3738).
 """
 
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -43,7 +54,23 @@ _escalation_src = os.path.join(
 if _escalation_src not in sys.path:
     sys.path.insert(0, _escalation_src)
 
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd fused-memory && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
+# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
+# at sys.path[0] it would make the subproject directories resolve as namespace
+# packages pointing at the project folder instead of src/<pkg>/, beating the
+# inserts above.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
 from _fm_helpers import pydantic_spec, reap_leaked_ticket_workers  # noqa: E402
+from df_pytest_isolation import (  # noqa: E402
+    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
+    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    reject_unsafe_basetemp,
+)
 
 from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402
@@ -56,6 +83,11 @@ from fused_memory.config.schema import (  # noqa: E402
     QueueConfig,
     RoutingConfig,
 )
+
+
+def pytest_configure(config):
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
+    reject_unsafe_basetemp(config)
 
 
 @pytest.fixture(autouse=True)
@@ -128,29 +160,99 @@ def make_backend():
 
 @pytest.fixture
 def make_graph_mock():
-    """Factory fixture: returns a callable(rows, *, ro_rows, q_rows) -> MagicMock graph.
+    """Factory fixture: returns a callable(rows, *, ro_rows, q_rows, header) -> MagicMock graph.
 
     The returned mock has both .query and .ro_query as AsyncMocks.
+
+    ``header`` sets ``result.header`` on every returned result object, and
+    defaults to ``[]`` rather than to the auto-``MagicMock`` attribute a bare
+    ``MagicMock()`` would otherwise supply.  Code that resolves FalkorDB result
+    columns BY NAME (``GraphitiBackend.list_indices``, and
+    ``_fm_helpers.await_index_operational`` before it) iterates
+    ``result.header``, and an auto-``MagicMock`` is not iterable — every mocked
+    call would raise ``TypeError`` instead of exercising the code under test.
+    The ``[]`` default is safe because no existing consumer of this fixture
+    reads ``.header``; a by-name consumer must pass one explicitly.
+
+    Header values are the measured live 2-tuples, e.g. (task 3706, measured
+    2026-08-06 via ``GRAPH.RO_QUERY dark_factory "CALL db.indexes()"``)::
+
+        [[1, 'label'], [1, 'properties'], [1, 'types'], [1, 'options'],
+         [1, 'language'], [1, 'stopwords'], [1, 'entitytype'], [1, 'status'],
+         [1, 'info']]
+
+    CYPHER DISPATCH (task 4340).  Both mocks answer per the cypher they are
+    given, rather than returning one static result for everything:
+
+      - a cypher containing ``count(``      -> ``[[len(rows)]]``, a single row
+      - a cypher containing ``SKIP n LIMIT m`` -> ``rows[n : n + m]``
+      - anything else                       -> ``rows``, exactly as before
+
+    This exists because two whole-graph reads are now paginated, and a
+    paginated read issues a single-row ``count(*)`` census probe before its
+    SKIP/LIMIT pages.  A static fixture would answer that census with a page
+    of edge rows, whose first column is a uuid string — ``int('node-1')``
+    raises, the count is unusable, and every caller would silently flip to
+    ``complete=False`` plus a WARNING.  A shared fixture that lies about the
+    read shape it stands in for is worse than a per-test patch: the next
+    person to paginate something rediscovers the same trap.
+
+    This fixture deliberately does NOT simulate the server's
+    ``RESULTSET_SIZE`` truncation.  ONE double owns that behaviour —
+    ``test_graph_read_pagination.FakeCappedGraph``, which also carries the
+    stateful query log the truncation tests need — because two doubles that
+    both claim to stand in for the same server drift, and the drift shows up
+    as a test that passes against a fake nothing else agrees with.  A test
+    that needs the cap should use that one.
     """
+    skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
+    # Deliberately NARROW: only a query whose entire projection is a bare row
+    # count is a census probe. A loose `'count(' in cypher` test also captures
+    # ordinary queries that return a count as one column among several — e.g.
+    # find_duplicate_entity_nodes' `RETURN n.uuid, ..., count(e)` — and would
+    # hand them a single-column [[n]] row, raising IndexError deep inside the
+    # method under test rather than anywhere near the fixture.
+    census_re = re.compile(r'RETURN\s+count\(\*\)\s*$', re.IGNORECASE)
+
     def _factory(
         rows: list[list] | None = None,
         *,
         ro_rows: list[list] | None = None,
         q_rows: list[list] | None = None,
+        header: list | None = None,
     ) -> MagicMock:
+        header_value = header if header is not None else []
         if ro_rows is not None or q_rows is not None:
-            ro_result = MagicMock()
-            ro_result.result_set = ro_rows if ro_rows is not None else (rows or [])
-            q_result = MagicMock()
-            q_result.result_set = q_rows if q_rows is not None else (rows or [])
+            ro_row_data = ro_rows if ro_rows is not None else (rows or [])
+            q_row_data = q_rows if q_rows is not None else (rows or [])
         else:
-            ro_result = MagicMock()
-            ro_result.result_set = rows if rows is not None else []
-            q_result = ro_result
+            ro_row_data = rows if rows is not None else []
+            q_row_data = ro_row_data
+
+        def _make_side_effect(row_data: list[list]):
+            def _respond(cypher='', params=None, *args, **kwargs) -> MagicMock:
+                text = cypher if isinstance(cypher, str) else ''
+                if census_re.search(text.strip()):
+                    # A single-row aggregate: never truncated by the row cap,
+                    # and it agrees with the pages by construction.
+                    result_set = [[len(row_data)]]
+                else:
+                    match = skip_limit_re.search(text)
+                    if match:
+                        skip, limit = int(match.group(1)), int(match.group(2))
+                        result_set = row_data[skip: skip + limit]
+                    else:
+                        result_set = row_data
+                result = MagicMock()
+                result.result_set = result_set
+                result.header = header_value
+                return result
+
+            return _respond
 
         graph_mock = MagicMock()
-        graph_mock.query = AsyncMock(return_value=q_result)
-        graph_mock.ro_query = AsyncMock(return_value=ro_result)
+        graph_mock.query = AsyncMock(side_effect=_make_side_effect(q_row_data))
+        graph_mock.ro_query = AsyncMock(side_effect=_make_side_effect(ro_row_data))
         return graph_mock
 
     return _factory

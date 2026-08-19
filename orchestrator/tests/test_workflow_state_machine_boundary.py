@@ -87,7 +87,6 @@ from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
 from orchestrator.landed_outbox import MergeProvenance
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.steward import TaskSteward
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
@@ -856,42 +855,6 @@ def _make_workflow(
     return wf
 
 
-def _make_steward(*, worktree: Path) -> TaskSteward:
-    """Minimal ``TaskSteward`` harness for row 9's producer-side coverage —
-    trims ``test_steward.py``'s ``steward``/``mock_config``/``mock_queue``/
-    ``mock_mcp``/``mock_briefing`` fixture graph down to a single factory
-    (this module's file lock does not cover that sibling either).
-    """
-    worktree.mkdir(parents=True, exist_ok=True)
-    (worktree / '.task').mkdir(exist_ok=True)
-
-    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    config.steward_max_attempts = 1
-    config.steward_lifetime_budget = 12.0
-    config.steward_max_timeouts_per_escalation = 3
-    config.steward_max_empty_outputs_per_escalation = 2
-
-    queue = MagicMock()
-    queue.get_by_task.return_value = []
-    queue.get.return_value = None
-    queue.make_id.return_value = 'esc-42-99'
-
-    mcp = MagicMock()
-    mcp.mcp_config_json.return_value = {'mcpServers': {}}
-
-    briefing = AsyncMock()
-
-    return TaskSteward(
-        task_id='42',
-        task={'id': '42', 'title': 'Test Task', 'description': 'A test'},
-        worktree=worktree,
-        config=config,
-        mcp=mcp,
-        escalation_queue=queue,
-        briefing=briefing,
-    )
-
-
 def _make_escalation(**overrides) -> Escalation:
     defaults: dict = dict(
         id='esc-42-1',
@@ -1043,6 +1006,119 @@ class TestStewardOutcomeRouting:
         )
         wf._ensure_l1_escalation_for_blocked.assert_not_awaited()
 
+    # -- Row 9 (task 3236): the sweep's LEVEL SCOPE and its observability ----
+
+    @staticmethod
+    def _level_scoped_get_by_task(by_level: dict[int, list]):
+        """A ``get_by_task`` stub that actually HONOURS its ``level`` kwarg.
+
+        The real ``EscalationQueue.get_by_task`` filters on ``level``; the
+        plain MagicMock used by the row-9 anchor above returns the same list
+        for ANY kwargs, which would make a level-scoped assertion vacuous.
+        """
+
+        def _stub(
+            task_id: str,
+            status: str | None = None,
+            level: int | None = None,
+            **kwargs: Any,
+        ) -> list:
+            if level is None:
+                # The real method's level-less query spans every level.
+                return [esc for recs in by_level.values() for esc in recs]
+            return list(by_level.get(level, []))
+
+        return _stub
+
+    async def test_row9_wip_sweep_is_level0_scoped_so_an_l1_survives(
+        self, tmp_path: Path,
+    ):
+        """Task 3236: a steward's level-1 re-escalation is outside this sweep.
+
+        The task-2060 dismissal is scoped to ``level=0``, so a re-escalation
+        filed at level 1 — now possible via ``escalate_blocker(level=1)`` —
+        survives it BY CONSTRUCTION, with no ``agent_role`` predicate to
+        defeat.  This pins that structural property against a future widening
+        of the sweep's scope.
+        """
+        wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
+        wf._steward = MagicMock()
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardInterrupted('timeout', wip_commits_present=True),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        l0 = _make_escalation(id='esc-42-1', level=0, agent_role='orchestrator')
+        l1 = _make_escalation(
+            id='esc-42-2', level=1, agent_role='steward',
+            category='infra_issue', summary='steward re-escalation',
+        )
+        wf.escalation_queue.get_by_task.side_effect = (  # type: ignore[union-attr]
+            self._level_scoped_get_by_task({0: [l0], 1: [l1]})
+        )
+        wf._ensure_l1_escalation_for_blocked = AsyncMock()
+
+        outcome = await wf._mark_blocked('steward timed out with WIP present')
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        resolved_ids = [
+            c.args[0] for c in wf.escalation_queue.resolve.call_args_list  # type: ignore[union-attr]
+        ]
+        assert 'esc-42-1' in resolved_ids, f'L0 should be swept: {resolved_ids}'
+        assert 'esc-42-2' not in resolved_ids, (
+            f'The level-1 re-escalation was swallowed: {resolved_ids}'
+        )
+        wf._ensure_l1_escalation_for_blocked.assert_not_awaited()
+
+    async def test_row9_wip_sweep_logs_each_dismissal_loudly(
+        self, tmp_path: Path, caplog,
+    ):
+        """Every swept record is named in a WARNING — no silent swallow.
+
+        The sweep used to log a single aggregate INFO naming only a COUNT, so
+        a dismissed steward filing left no trace of WHICH record went and who
+        filed it.  Per the repo's loud-over-silent-degradation norm and the
+        no-silent-fail-soft design invariant, each dismissal is logged at
+        WARNING naming the escalation id and its ``agent_role``.
+        """
+        import logging
+
+        wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
+        wf._steward = MagicMock()
+        wf._steward_outcome_channel = asyncio.Queue()
+        wf._steward_outcome_channel.put_nowait(
+            StewardInterrupted('timeout', wip_commits_present=True),
+        )
+        wf.scheduler.get_status = AsyncMock(return_value='blocked')
+        swept = [
+            _make_escalation(id='esc-42-1', level=0, agent_role='orchestrator'),
+            _make_escalation(
+                id='esc-42-2', level=0, agent_role='steward',
+                category='infra_issue', summary='steward chained follow-on',
+            ),
+        ]
+        wf.escalation_queue.get_by_task.side_effect = (  # type: ignore[union-attr]
+            self._level_scoped_get_by_task({0: swept})
+        )
+        wf._ensure_l1_escalation_for_blocked = AsyncMock()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            outcome = await wf._mark_blocked('steward timed out with WIP present')
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        for esc in swept:
+            assert any(esc.id in msg for msg in warnings), (
+                f'No WARNING named dismissed escalation {esc.id}: {warnings}'
+            )
+            assert any(esc.id in msg and esc.agent_role in msg for msg in warnings), (
+                f'No WARNING named the filer of {esc.id} '
+                f'(agent_role={esc.agent_role!r}): {warnings}'
+            )
+        wf._ensure_l1_escalation_for_blocked.assert_not_awaited()
+
     # -- Row 9 producer: _ensure_steward_started wiring ----------------------
 
     async def test_row9_ensure_steward_started_wires_outcome_channel_and_wip_probe(
@@ -1077,13 +1153,13 @@ class TestStewardOutcomeRouting:
     # -- Row 9 producer: steward attempt-cap branch, wip=True ---------------
 
     async def test_row9_steward_attempt_cap_wip_true_publishes_directly_skips_l1(
-        self, tmp_path: Path,
+        self, make_steward,
     ):
         """When the per-escalation retry cap fires with WIP present, the
         steward publishes the wip-gated ``StewardInterrupted`` DIRECTLY —
         ``_auto_escalate_to_human`` (and therefore any L1 filing) is skipped
         entirely (task-2060 fix)."""
-        steward = _make_steward(worktree=tmp_path / 'wt')
+        steward = make_steward(config_overrides={'steward_max_attempts': 1})
         channel = asyncio.Queue()
         steward.set_outcome_channel(channel)
         steward.set_wip_probe(AsyncMock(return_value=True))
@@ -1224,17 +1300,17 @@ class TestBlockDispositionOneClassifierAndCompleteness:
     # literal match; reuses each sibling seam's own exposed helper factories,
     # imported function-locally — a local `from X import Y` binds Y only in
     # this function's namespace, so it does not collide with this module's
-    # own rows-8-9 `_make_steward`/`_make_escalation` module-level names.)
+    # own row-8 `_make_escalation` module-level name.)
 
     @pytest.mark.asyncio
-    async def test_row10_steward_pre_triage_consults_shared_classifier(self, caplog):
+    async def test_row10_steward_pre_triage_consults_shared_classifier(self, caplog, make_steward):
         import json
         import logging
 
         from shared.cli_invoke import AllAccountsCappedException
-        from test_suggestion_triage import _make_escalation, _make_steward, _make_suggestions
+        from test_suggestion_triage import _make_escalation, _make_suggestions
 
-        steward = _make_steward()
+        steward = make_steward()
         suggestions = _make_suggestions(15)
         escalation = _make_escalation(detail=json.dumps(suggestions))
         cap_exc = AllAccountsCappedException(
@@ -1394,7 +1470,7 @@ class TestBlockDispositionOneClassifierAndCompleteness:
 async def _invoke_probe(
     role: AgentRole, config: OrchestratorConfig, git_ops: GitOps,
     task_assignment: TaskAssignment,
-) -> tuple[Mapping[str, Any], TaskWorkflow]:
+) -> tuple[Mapping[str, Any], TaskWorkflow, Path]:
     """Build a TaskWorkflow, patch invoke_with_cap_retry, invoke ``_invoke``.
 
     Duplicated (not imported) from test_agent_capability_wiring.py's helper
@@ -1404,9 +1480,10 @@ async def _invoke_probe(
     module's rows 5-6 duplicated git_repo/config/git_ops/task_assignment
     fixtures — same rationale, see their docstring above).
 
-    Returns (call_kwargs, workflow) — the kwargs invoke_with_cap_retry was
-    awaited with, and the workflow instance (so callers can assert against
-    workflow.modules).
+    Returns (call_kwargs, workflow, cwd) — the kwargs invoke_with_cap_retry
+    was awaited with, the workflow instance (so callers can assert against
+    workflow.modules), and the worktree path (a real linked worktree, so the
+    row-12 write-set assertion can check the worktree root is carved in).
     """
     wt_info = await git_ops.create_worktree(task_assignment.task_id)
     cwd = wt_info.path
@@ -1432,7 +1509,7 @@ async def _invoke_probe(
 
     assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
     assert mock_cap_retry.await_args is not None
-    return mock_cap_retry.await_args.kwargs, workflow
+    return mock_cap_retry.await_args.kwargs, workflow, cwd
 
 
 class TestCapabilityWiringImportAssert:
@@ -1506,12 +1583,25 @@ class TestCapabilityWiringImportAssert:
         role = AgentRole(
             name='probe_sbx', system_prompt='x', allowed_tools=[], sandboxed=True,
         )
-        call_kwargs, workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
-        assert call_kwargs.get('sandbox_modules') == workflow.modules, (
-            f"Expected sandbox_modules == {workflow.modules!r} (role.sandboxed=True) "
-            f"but got {call_kwargs.get('sandbox_modules')!r}. _invoke must gate "
-            "sandboxing off role.sandboxed, not a role.name string check."
+        # Whole-worktree wiring (PRD os-sandbox D1): sandbox_modules=[] is the
+        # empty-list sandbox-on gate; the write set (worktree root + carve-outs)
+        # rides on sandbox_extras. Independent re-derivation of the α3 seam —
+        # assert the worktree root is carved in without recomputing the full set.
+        assert call_kwargs.get('sandbox_modules') == [], (
+            'Expected sandbox_modules == [] (role.sandboxed=True; whole-worktree '
+            f"gate) but got {call_kwargs.get('sandbox_modules')!r}. _invoke must "
+            'gate sandboxing off role.sandboxed, not a role.name string check.'
+        )
+        sandbox_extras = call_kwargs.get('sandbox_extras')
+        assert sandbox_extras is not None, (
+            'Expected sandbox_extras to carry the contract write set for a '
+            f'sandboxed role, but got {sandbox_extras!r}.'
+        )
+        assert str(cwd.resolve()) in sandbox_extras, (
+            f'Expected the worktree root {str(cwd.resolve())!r} carved into '
+            f'sandbox_extras, but got {sandbox_extras!r}.'
         )
 
     @pytest.mark.asyncio
@@ -1522,7 +1612,7 @@ class TestCapabilityWiringImportAssert:
             name='probe_plan', system_prompt='x', allowed_tools=[],
             mcp_families=frozenset({'plan_tools'}),
         )
-        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
         mcp_config = call_kwargs.get('mcp_config')
         servers = (mcp_config or {}).get('mcpServers', {})
@@ -1541,7 +1631,7 @@ class TestCapabilityWiringImportAssert:
             name='probe_orch', system_prompt='x', allowed_tools=[],
             mcp_families=frozenset({'orchestrator'}),
         )
-        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
         assert call_kwargs.get('mcp_config') is not None, (
             "Expected mcp_config to be built (role.mcp_families={'orchestrator'}) "
@@ -1557,7 +1647,7 @@ class TestCapabilityWiringImportAssert:
         """Negative control: a role declaring neither family and unsandboxed
         gets no sandbox modules and no plan-tools server wired."""
         role = AgentRole(name='probe_bare', system_prompt='x', allowed_tools=[])
-        call_kwargs, _workflow = await _invoke_probe(role, config, git_ops, task_assignment)
+        call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
         assert call_kwargs.get('sandbox_modules') is None, (
             f"Expected sandbox_modules is None (role.sandboxed=False) but got "

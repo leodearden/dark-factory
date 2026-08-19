@@ -19,8 +19,10 @@ from fused_memory.reconciliation.stage_stats import (
     _OP_TO_STAT,
     _count_add_memory,
     _count_graphiti_queued,
+    _landed,
     derive_stage_stats,
 )
+from fused_memory.services.durable_queue import POST_EXECUTE_DEAD_PREFIX
 from fused_memory.services.write_journal import WriteJournal
 
 _STAGE_AGENT_ID = 'recon-stage-memory_consolidator'
@@ -112,9 +114,16 @@ async def _log_write(
     agent_id: str = _STAGE_AGENT_ID,
     result_summary: dict | str | None = None,
     success: bool = True,
-) -> None:
+) -> str:
+    """Journal one Layer-1 write_op and return its ``write_op_id``.
+
+    The id is returned (rather than discarded inline) so a test can hand it to
+    :func:`_stamp_terminal` afterwards. Keyword-only signature and defaults are
+    unchanged, so existing call sites that ignore the return value still work.
+    """
+    write_op_id = str(uuid.uuid4())
     await journal.log_write_op(
-        write_op_id=str(uuid.uuid4()),
+        write_op_id=write_op_id,
         causation_id=causation_id,
         source='mcp_tool',
         operation=operation,
@@ -122,6 +131,31 @@ async def _log_write(
         agent_id=agent_id,
         result_summary=result_summary,
         success=success,
+    )
+    return write_op_id
+
+
+async def _stamp_terminal(
+    journal: WriteJournal,
+    write_op_id: str,
+    *,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """Stamp a durable-queue terminal outcome onto an already-journalled op.
+
+    ORDER IS LOAD-BEARING: ``_log_write`` must be awaited for ``write_op_id``
+    BEFORE this call. The row then already carries ``causation_id`` /
+    ``agent_id`` / ``operation``, so ``record_terminal_outcome``'s UPSERT takes
+    its ``ON CONFLICT(id) DO UPDATE`` path — which deliberately touches only
+    the three terminal columns. Stamping first would instead INSERT a
+    ``source='durable_queue'`` row with a NULL ``causation_id``, which
+    ``get_ops_by_causation`` never returns.
+    """
+    await journal.record_terminal_outcome(
+        write_op_id=write_op_id,
+        terminal_status=status,
+        terminal_error=error,
     )
 
 
@@ -195,6 +229,392 @@ async def test_derive_stage_stats_excludes_other_stage_agent_id(journal):
     observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
 
     assert observed['memories_added'] == 0
+
+
+# ── _landed ─────────────────────────────────────────────────────────────
+
+
+def test_landed_false_for_dead_terminal_status():
+    """The durable queue gave up on this write — it did not land."""
+    assert _landed({'terminal_status': 'dead'}) is False
+
+
+def test_landed_true_for_completed_terminal_status():
+    assert _landed({'terminal_status': 'completed'}) is True
+
+
+def test_landed_true_for_null_terminal_status():
+    """NULL is the state of every pre-3582 row and of every operation that
+    never touches the durable queue — it must keep counting as it does today."""
+    assert _landed({'terminal_status': None}) is True
+
+
+def test_landed_true_when_terminal_status_key_absent():
+    """A denylist on the single literal 'dead': anything else keeps its
+    current counting behaviour, so a schema surprise can never silently zero
+    a stage's real counters."""
+    assert _landed({}) is True
+
+
+def test_landed_true_for_post_execute_dead_letter():
+    """The ONE case where 'dead' still counts: the backend write LANDED and
+    only the callback / completion-commit kept failing, which the durable
+    queue marks by prefixing terminal_error with POST_EXECUTE_DEAD_PREFIX.
+
+    Excluding these would UNDERCOUNT writes that genuinely happened — the
+    opposite error from the over-counting this task fixes.
+    """
+    op = {
+        'terminal_status': 'dead',
+        'terminal_error': POST_EXECUTE_DEAD_PREFIX + 'callback blew up',
+    }
+    assert _landed(op) is True
+
+
+def test_landed_false_for_dead_with_ordinary_error():
+    """A dead-letter whose error carries no post-execute prefix never reached
+    the backend."""
+    assert _landed({'terminal_status': 'dead', 'terminal_error': 'boom'}) is False
+
+
+def test_landed_false_for_dead_with_null_error():
+    """record_terminal_outcome's terminal_error is `str | None = None`, so a
+    dead-letter carrying no error string is reachable. It is NOT assumed to
+    have landed — and the isinstance guard means it does not raise."""
+    assert _landed({'terminal_status': 'dead', 'terminal_error': None}) is False
+
+
+# ── derive_stage_stats: dead-lettered writes must not count as landed ────
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_dead_graphiti_enqueue_not_counted(journal):
+    """THE HEADLINE CASE: a graphiti-only enqueue that the durable queue later
+    dead-lettered never landed, so graphiti_writes_queued must be 0.
+
+    Before this fix, `success=1` (the enqueue was ACCEPTED) was the only gate,
+    so an operation with a 0% landing rate reported as fully green.
+    """
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+    await _stamp_terminal(journal, op_id, status='dead', error='backend refused')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    # Every LANDED counter is 0; the death itself is reported separately.
+    assert observed == _expected(writes_dead_lettered=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_dead_add_episode_not_counted(journal):
+    """The generic-counter branch also inherits the landed gate."""
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_episode',
+        result_summary={'status': 'added'},
+    )
+    await _stamp_terminal(journal, op_id, status='dead', error='boom')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(writes_dead_lettered=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_dead_add_memory_with_ids_still_counts(journal):
+    """The _count_add_memory branch is EXEMPT from the landed gate.
+
+    ``terminal_status`` speaks only for the op's queued (Graphiti) leg:
+    ``MemoryService.add_memory`` mints ONE ``write_op_id``, enqueues the
+    Graphiti leg under it, and journals a SINGLE Layer-1 row under that same id
+    carrying ``memory_ids`` from the SYNCHRONOUS Mem0 call. A non-empty
+    ``memory_ids`` can only have come back inline from that completed call —
+    the queue worker has no path back to the caller for server-assigned ids —
+    so it is standalone proof the Mem0 write persisted. A dead queue leg must
+    not veto it, or the gate UNDERCOUNTS a memory that provably landed.
+    """
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+    await _stamp_terminal(journal, op_id, status='dead', error='boom')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(memories_added=1, writes_dead_lettered=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_dead_dual_write_still_counts_mem0_leg(journal):
+    """A dual-store add_memory whose Graphiti leg died still counted its Mem0 leg.
+
+    This is the reachable shape (``dual_write=True`` is a live MCP parameter):
+    one row, two legs, one shared ``write_op_id``. The queue's terminal hook is
+    keyed on that shared id, so a dead Graphiti leg stamps ``'dead'`` on the row
+    that also holds Mem0's proof of persistence. The landed gate must therefore
+    be applied PER LEG — a counter may be suppressed by ``terminal_status`` only
+    when the queue item is the very thing that counter counts.
+
+    Both facts are reported: the Mem0 memory landed AND a write of this op
+    really did reach the dead-letter queue, so it is a PARTIAL landing.
+    """
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['graphiti', 'mem0']},
+    )
+    await _stamp_terminal(journal, op_id, status='dead', error='graphiti refused')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(memories_added=1, writes_dead_lettered=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_post_execute_dead_dual_write_counts_the_same(journal):
+    """The post-execute prefix does not change the Mem0 leg's answer.
+
+    That leg was already counted on its own inline evidence, so the prefix —
+    which only ever speaks about the QUEUED leg's fate — is irrelevant here.
+    The result is identical to the ordinary-error dual-write case above.
+    """
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['graphiti', 'mem0']},
+    )
+    await _stamp_terminal(
+        journal, op_id, status='dead',
+        error=POST_EXECUTE_DEAD_PREFIX + 'callback blew up',
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(memories_added=1, writes_dead_lettered=1)
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_post_execute_dead_graphiti_enqueue_still_counts(journal):
+    """A post-execute dead-letter DID land: the backend write succeeded and
+    only the callback kept failing. It must still count toward its landed
+    counter, or the fix trades over-counting for under-counting."""
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+    await _stamp_terminal(
+        journal, op_id, status='dead',
+        error=POST_EXECUTE_DEAD_PREFIX + 'callback blew up',
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed['graphiti_writes_queued'] == 1
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_post_execute_dead_episode_still_counts(journal):
+    """The generic-counter branch honours the post-execute exception too."""
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_episode',
+        result_summary={'status': 'added'},
+    )
+    await _stamp_terminal(
+        journal, op_id, status='dead',
+        error=POST_EXECUTE_DEAD_PREFIX + 'completion commit failed',
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed['episodes_added'] == 1
+
+
+# ── writes_dead_lettered ────────────────────────────────────────────────
+
+
+def test_writes_dead_lettered_is_a_canonical_computed_key():
+    """Exclusion alone makes the numbers truthful but SILENT: a stage whose
+    every write died reports graphiti_writes_queued: 0, indistinguishable from
+    a stage that wrote nothing. This counter is what makes it diagnosable, and
+    membership in the frozenset is what propagates it to the judge."""
+    assert 'writes_dead_lettered' in _COMPUTED_STAT_KEYS
+
+
+@pytest.mark.asyncio
+async def test_writes_dead_lettered_present_at_zero_with_no_ops(journal):
+    run_id = str(uuid.uuid4())
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed['writes_dead_lettered'] == 0
+
+
+@pytest.mark.asyncio
+async def test_dead_graphiti_enqueue_counts_as_dead_lettered_not_queued(journal):
+    """The pair that makes the meaning change legible rather than silent:
+    graphiti_writes_queued == 0 AND writes_dead_lettered == 1."""
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+    await _stamp_terminal(journal, op_id, status='dead', error='backend refused')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(writes_dead_lettered=1)
+
+
+@pytest.mark.asyncio
+async def test_post_execute_dead_counts_in_both_keys(journal):
+    """The DELIBERATE overlap: a post-execute dead-letter both landed (the
+    backend write succeeded) and dead-lettered (it still needs operator
+    attention and must not be blind-replayed). The two keys answer different
+    questions, and this op is honestly BOTH."""
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+    await _stamp_terminal(
+        journal, op_id, status='dead',
+        error=POST_EXECUTE_DEAD_PREFIX + 'callback blew up',
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(graphiti_writes_queued=1, writes_dead_lettered=1)
+
+
+@pytest.mark.asyncio
+async def test_writes_dead_lettered_zero_for_completed_and_null_ops(journal):
+    """Only a dead-letter counts — a confirmed-landed write and an unstamped
+    one (NULL) must not inflate the counter."""
+    run_id = str(uuid.uuid4())
+
+    completed_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+    await _stamp_terminal(journal, completed_id, status='completed')
+    await _log_write(
+        journal, causation_id=run_id, operation='add_episode',
+        result_summary={'status': 'added'},
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(memories_added=1, episodes_added=1)
+
+
+@pytest.mark.asyncio
+async def test_writes_dead_lettered_respects_stage_scoping(journal):
+    """A dead op belonging to a sibling stage must not be tallied here —
+    the counter sits behind the same agent_id filter as every other."""
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        agent_id=_OTHER_STAGE_AGENT_ID,
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+    await _stamp_terminal(journal, op_id, status='dead', error='boom')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected()
+
+
+@pytest.mark.asyncio
+async def test_writes_dead_lettered_scoped_to_mapped_operations(journal):
+    """A dead op whose operation is not in _OP_TO_STAT is not counted — the
+    counter stays scoped to operations this module actually knows about."""
+    run_id = str(uuid.uuid4())
+    assert 'get_status' not in _OP_TO_STAT
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='get_status',
+        result_summary={'status': 'ok'},
+    )
+    await _stamp_terminal(journal, op_id, status='dead', error='boom')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected()
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_completed_ops_still_count(journal):
+    """NON-REGRESSION: terminal_status='completed' is the durable queue
+    confirming the write landed — all three shapes count normally."""
+    run_id = str(uuid.uuid4())
+
+    graphiti_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+    episode_id = await _log_write(
+        journal, causation_id=run_id, operation='add_episode',
+        result_summary={'status': 'added'},
+    )
+    memory_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+    for op_id in (graphiti_id, episode_id, memory_id):
+        await _stamp_terminal(journal, op_id, status='completed')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(
+        graphiti_writes_queued=1, episodes_added=1, memories_added=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_unstamped_ops_still_count(journal):
+    """NON-REGRESSION: terminal_status IS NULL — the state of every pre-3582
+    row and of every operation that never touches the durable queue (e.g.
+    delete_memory, update_edge). These must keep counting exactly as today."""
+    run_id = str(uuid.uuid4())
+
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+    await _log_write(
+        journal, causation_id=run_id, operation='add_episode',
+        result_summary={'status': 'added'},
+    )
+    await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(
+        graphiti_writes_queued=1, episodes_added=1, memories_added=1,
+    )
 
 
 @pytest.mark.asyncio

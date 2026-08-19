@@ -3,9 +3,14 @@
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
+    AMEND_AND_EPISODE_TOOLS_BLOCK,
+    DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
+    render_escalation_boundary_note,
 )
 from fused_memory.reconciliation.recon_self_model import (
+    render_entity_standing_decision_schema_section,
     render_marker_lifecycle_section,
     render_source_completion_section,
     render_suppression_schema_section,
@@ -35,6 +40,7 @@ You have access to fused-memory MCP tools for reading and writing memories:
 - `mcp__fused-memory__add_memory` — write a classified memory
 - `mcp__fused-memory__delete_memory` — delete a specific memory
 - `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
+{AMEND_AND_EPISODE_TOOLS_BLOCK}
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
 from its remaining valid edges (call after deleting edges from an entity)
 - `mcp__fused-memory__get_cycle_summary_presence` — **AUTHORITATIVE** presence check \
@@ -49,6 +55,8 @@ presence check (see ## Pre-Check: Already-Reconstructed Stage 2 Summaries below)
 You do not have access to task *write* tools — task reconciliation is Stage 2's job. \
 `mcp__fused-memory__get_task` is permitted as a read-only verification call (see \
 ## Terminal-State Pre-Check Discipline below).
+
+{render_escalation_boundary_note(can_escalate=False)}
 
 ## Your Consolidation Tasks
 1. **Within Mem0**: Identify duplicates, contradictions, and stale entries. Merge or delete.
@@ -92,6 +100,8 @@ weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary
 (including cross-project scope mismatches flagged to Stage 2): \
 {get_recon_report_tool_guidance()}
 
+{STALE_KNOWLEDGE_ANNOTATION_NORM}
+
 ## UUID Resolution Discipline
 Before calling `delete_memory` for any Graphiti edge or Mem0 vector entry, follow this \
 mandatory two-step verification:
@@ -103,10 +113,35 @@ mandatory two-step verification:
 
 **Never construct IDs from truncated sources.** 8-char hex prefixes (e.g. `'2531b4d8'`) \
 appear in search-result snippets and edge reference text but are NOT valid `delete_memory` \
-IDs — Graphiti returns `{{status: deleted}}` and silently no-ops, providing no error signal. \
-This is a recurrent failure that reinforcement memories alone have not prevented; \
-this section is the canonical enforcement point for UUID resolution. \
+IDs. `delete_memory` now REJECTS any id that is not a full 36-character UUID, returning a \
+structured `ValidationError` that names the malformed id and tells you how to resolve the \
+real one — so a truncated prefix fails loudly instead of reporting success. The steps above \
+are still the procedure; the tool error is the backstop, not a substitute for them. \
 (Regression-pinned in fused-memory/tests/test_delete_memory_truncated_uuid.py.)
+
+**Consolidation deletes MUST name the survivor.** When you delete a duplicate in favour \
+of a surviving entry, pass `replacement_memory_id=<the surviving entry's full 36-char UUID>` \
+to `delete_memory`. Task metadata that still cites the doomed entry is repointed to that \
+survivor BEFORE the delete runs — and the delete is REFUSED outright if any live \
+(non-terminal) task still cites it and you supplied no concrete replacement. Terminal \
+(done/cancelled) citers are reported back to you on the result, never rewritten.
+
+**COPY the survivor's UUID from the search result — never reconstruct it.** The value must \
+also (a) RESOLVE in the store and (b) differ from the id you are deleting. A well-formed \
+but nonexistent id is refused (`CitationReplacementNotFound`) rather than written into \
+every citation — repointing to a phantom strands those pointers exactly as the delete \
+itself would, and by then the original is gone. Passing the doomed id as its own \
+replacement is refused too (`CitationReplacementInvalid`): a self-repoint reports success \
+while every citation still addresses the entry you just destroyed. Same discipline as \
+step 2 above — read the full 36 characters out of the result's `id` field verbatim.
+
+**A `search(...)` instruction is never an acceptable replacement value.** Do not pass — or \
+write into any task's metadata — a value like `'re-derive the current canonical entry via \
+search(query=...)'`. It is rejected mechanically (`CitationReplacementInvalid`), because \
+re-deriving at read time resolves back to the superseded cluster members the consolidation \
+was collapsing, routing dispatch into exactly the contradictory advice you just removed. \
+Only a concrete UUID forwards. \
+(Regression-pinned in fused-memory/tests/test_delete_memory_citation_guard.py.)
 
 ## Terminal-State Pre-Check Discipline
 Before writing a `temporal_fact` whose content states or implies that a task reached a \
@@ -142,6 +177,12 @@ must carry the same count and both count only writes where `memory_ids` was non-
 
 {_STAGE1_GRAPHITI_QUEUED_GUIDANCE}
 
+Note that the stats verifier may report a LOWER final count than you did, because a write \
+you correctly counted can later be dead-lettered by the durable queue after this stage has \
+already finished — the verifier counts only writes that LANDED. That specific divergence is \
+expected and is not a self-reporting error on your part. Report what the responses actually \
+returned to you; do not try to anticipate or adjust for later write failures.
+
 ## Verifying update_edge writes (Task 1145 Guard 2)
 Every `mcp__fused-memory__update_edge` MCP response now includes a `verified: bool` field \
 driven by a server-side fact-text readback. After persisting the edge, the server calls \
@@ -173,10 +214,7 @@ in hand.
 
 A response containing an `error` key is NOT a new successful filing — do not invent or \
 count a `finding_id` for it:
-- `duplicate_finding` — an earlier stage of this run already filed the same \
-  (task_id, flag_type) pair. The response includes `existing_finding_id`: attach your \
-  citations to that `existing_finding_id` (the canonical id for this finding) rather \
-  than fabricating a new one.
+{DUPLICATE_FINDING_SALVAGE_GUIDANCE}
 - `run_id_unknown` / `report_already_completed` — nothing was filed. Do not fabricate a \
   `finding_id` or claim the finding was recorded.
 
@@ -544,6 +582,8 @@ carrying a non-empty `flag_types`). \
 The contamination cycle motivating this gate: Stage 1 writes a violating flag → Stage 3 \
 detects it → remediation deletes it → next cycle Stage 1 writes it again. \
 `flag_dedup.filter_suppressed` breaks this cycle deterministically in code.
+
+{render_entity_standing_decision_schema_section()}
 
 ## Flag Deduplication
 You do NOT need to manually search for or skip duplicate flags — emit findings naturally and \

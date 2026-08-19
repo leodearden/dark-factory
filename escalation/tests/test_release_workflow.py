@@ -12,9 +12,15 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+# TEST-TIME only import: dark-factory-shared is already a declared workspace
+# dependency of escalation/pyproject.toml, so this resolves without adding a new
+# production dependency.  Used to DERIVE the park-trigger guard's parameter list
+# from the canonical status vocabulary rather than hand-copying it.
+from shared.task_statuses import TaskStatus
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -27,6 +33,12 @@ class _FakeScheduler:
         # Default None → no park unless a test sets a status.
         self.get_status = AsyncMock(return_value=status)
         self.set_task_status = AsyncMock()
+        # Reconcile-grace stamp.  MagicMock, NOT AsyncMock: the real
+        # ``Scheduler.note_workflow_cancelled`` is a plain sync ``def`` and
+        # callers invoke it without ``await``.  ``_FakeScheduler`` is a
+        # hand-written class (no auto-attribute magic), so without this
+        # attribute any path that stamps raises AttributeError.
+        self.note_workflow_cancelled = MagicMock()
 
 
 class _FakeHarness:
@@ -35,21 +47,52 @@ class _FakeHarness:
     def __init__(self, status: str | None = None) -> None:
         self.events: dict[str, asyncio.Event] = {}
         self.scheduler = _FakeScheduler(status)
+        # How many ``note_workflow_cancelled`` calls THIS double produced.
+        # Lets a test subtract our own stamps from the shared mock's total and
+        # attribute the remainder to the tool under test.
+        self.cancel_workflow_stamps = 0
 
     def is_workflow_active(self, task_id: str) -> bool:
         return task_id in self.events
 
     def cancel_workflow(self, task_id: str) -> bool:
+        """Mirrors the real ``Harness.cancel_workflow``, stamping included.
+
+        The stamping asymmetry is the whole reason ``release_workflow`` needs a
+        ``not released`` guard, so the double has to reproduce it or the
+        no-restamp test passes for the wrong reason:
+
+        - ``event is None`` (no slot) → return False WITHOUT stamping.  The
+          real method bails on that arm before it reaches
+          ``self.scheduler.note_workflow_cancelled``, which is exactly why an
+          orphan park would otherwise land with zero grace.
+        - slot present → set the event, stamp, return True.  The real method
+          stamps here before returning, so the tool must not stamp again.
+        """
         ev = self.events.get(task_id)
         if ev is None:
             return False
         ev.set()
+        self.scheduler.note_workflow_cancelled(task_id)
+        self.cancel_workflow_stamps += 1
         return True
 
 
 async def _call_release(server, **kwargs: Any) -> dict[str, Any]:
     tool = await server.get_tool('release_workflow')
     return await tool.fn(**kwargs)
+
+
+# DERIVED from the canonical vocabulary, not hand-copied: the whole point of the
+# parametrized guard below is that a future TaskStatus member cannot silently
+# slip through ``release_workflow``'s park trigger, and a hardcoded literal list
+# would fail exactly that promise the day someone adds one.  ``None`` is
+# appended as the read-failure sentinel — ``Scheduler.get_status`` returns None
+# on ANY MCP failure, so it is a reachable value of ``cur`` that no enum member
+# covers.
+_NON_IN_PROGRESS_STATUSES: list[str | None] = [
+    s.value for s in TaskStatus if s is not TaskStatus.IN_PROGRESS
+] + [None]
 
 
 @pytest.fixture
@@ -64,6 +107,12 @@ async def test_no_harness_reports_standalone(queue):
     assert result['was_active'] is False
     assert result['released'] is False
     assert 'error' in result
+    # Every return path must satisfy the documented ``{released, was_active,
+    # slot_cleared, parked}`` shape.  Both /unblock skills now tell callers to
+    # CONFIRM the park by reading ``parked``; against a standalone server that
+    # must yield an explicit None, not a KeyError.
+    assert result['parked'] is None
+    assert result['slot_cleared'] is False
 
 
 @pytest.mark.asyncio
@@ -141,6 +190,224 @@ async def test_in_progress_task_parked_as_blocked(queue):
     assert result['slot_cleared'] is True
     assert result['parked'] == 'blocked'
     harness.scheduler.set_task_status.assert_awaited_once_with('42', 'blocked')
+
+
+@pytest.mark.asyncio
+async def test_no_slot_in_progress_task_parked_as_blocked(queue):
+    """No live slot + task still 'in-progress' → parked as 'blocked'.
+
+    The ORPHANED shape (reify 5858 / 5069): the orchestrator lane was already
+    reaped, so no workflow slot is registered, but the task row is still stuck
+    at 'in-progress'.  Left unparked, the scheduler re-dispatched it out from
+    under a human mid manual-merge.  ``was_active`` being False is precisely
+    the case MOST in need of the reaper-immune hold, not a reason to skip it.
+    """
+    harness = _FakeHarness(status='in-progress')
+    # No slot registered — harness.events stays empty.
+    server = create_server(queue, harness=harness)
+    result = await _call_release(server, task_id='42', timeout_secs=1)
+
+    assert result['released'] is False
+    assert result['was_active'] is False
+    assert result['slot_cleared'] is True
+    assert result['parked'] == 'blocked'
+    harness.scheduler.set_task_status.assert_awaited_once_with('42', 'blocked')
+
+
+@pytest.mark.asyncio
+async def test_no_slot_park_stamps_reaper_grace(queue):
+    """The orphan park must open the reconcile grace window itself.
+
+    On the no-slot arm ``Harness.cancel_workflow`` bails on its
+    ``event is None`` branch and returns False WITHOUT reaching its
+    ``scheduler.note_workflow_cancelled`` call — so a park landed here gets
+    ZERO grace, and ``Scheduler._phase_redispatch_stranded_blocked`` (guarded
+    by ``workflow_cancel_recent``) flips it straight back to 'pending' within
+    one idle tick.  The park would be undone before the human noticed.
+
+    Ordering matters as much as the call: the scheduler tick can observe the
+    'blocked' row the instant it is persisted, so the stamp must land BEFORE
+    the status write, never after.
+    """
+    harness = _FakeHarness(status='in-progress')
+    # No slot registered — the orphaned arm.
+    manager = MagicMock()
+    manager.attach_mock(harness.scheduler.note_workflow_cancelled, 'stamp')
+    manager.attach_mock(harness.scheduler.set_task_status, 'set_status')
+
+    server = create_server(queue, harness=harness)
+    result = await _call_release(server, task_id='42', timeout_secs=1)
+
+    assert result['parked'] == 'blocked'
+    # Sync call, NOT awaited — the real Scheduler.note_workflow_cancelled is
+    # a plain `def`.
+    harness.scheduler.note_workflow_cancelled.assert_called_once_with('42')
+    # Attribution: the double stamps on its slot arm (mirroring the real
+    # Harness.cancel_workflow) but there is no slot here, so the single stamp
+    # above can only have come from the tool itself.
+    assert harness.cancel_workflow_stamps == 0
+    # Stamp strictly precedes the status write.
+    ordering = [c[0] for c in manager.mock_calls]
+    assert ordering.index('stamp') < ordering.index('set_status'), (
+        f'grace stamp must precede the blocked write, got {ordering!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_slot_park_does_not_restamp_grace(queue):
+    """The slot-cancel arm must NOT be re-stamped — explicit non-goal.
+
+    When a slot was live, ``Harness.cancel_workflow`` already stamped the
+    grace window before returning True.  Re-stamping after the wait loop would
+    re-anchor that window to a later moment, silently extending it by however
+    long the caller waited — a real behaviour change to the slot-cancel path
+    that task 3724 puts out of scope.  Hence the ``not released`` guard.
+
+    This is the test that fails if the stamp is made unconditional.
+    """
+    harness = _FakeHarness(status='in-progress')
+    ev = asyncio.Event()
+    harness.events['42'] = ev
+
+    async def _watcher():
+        await ev.wait()
+        await asyncio.sleep(0.05)
+        harness.events.pop('42', None)
+
+    server = create_server(queue, harness=harness)
+    asyncio.create_task(_watcher())
+    result = await _call_release(server, task_id='42', timeout_secs=2)
+
+    assert result['was_active'] is True
+    assert result['released'] is True
+    assert result['parked'] == 'blocked'
+    # Exactly one stamp on this arm, and it is ATTRIBUTABLE to cancel_workflow
+    # rather than to the tool.  _FakeHarness.cancel_workflow mirrors the real
+    # Harness.cancel_workflow — it DOES stamp on the slot arm — and counts its
+    # own stamps, so total == self-produced proves the tool contributed zero.
+    # Asserting a bare `assert_not_called()` against a non-stamping double
+    # would pass for the wrong reason: it would stay green even if the real
+    # harness stopped stamping, and the guard's correctness rests entirely on
+    # that cross-module contract.
+    assert harness.cancel_workflow_stamps == 1, (
+        'the double must reproduce the real cancel_workflow slot-arm stamp'
+    )
+    assert harness.scheduler.note_workflow_cancelled.call_count == 1, (
+        'the tool must not re-stamp a window cancel_workflow already anchored'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', _NON_IN_PROGRESS_STATUSES)
+async def test_no_slot_non_in_progress_status_not_parked(queue, status):
+    """The park trigger stays narrow: ONLY 'in-progress' is ever parked.
+
+    Regression guard against widening the guard in ``release_workflow`` from a
+    positive ``cur == 'in-progress'`` equality test into anything negative
+    (``cur not in TERMINAL_STATUSES`` and friends).  Three statuses in this
+    list would be actively harmful to park, and the fourth reason is fail-safe:
+
+    - ``merge-deferred``: derails atomic merge trains.  The group-merge status
+      pre-check rejects a train whose members are not all merge-deferred (see
+      ``TRAIN_INCOMPLETE_REASON_PREFIX`` in ``orchestrator/merge_queue.py``,
+      "Train merge rejected: not all members are merge-deferred"), and
+      ``Scheduler._deps_satisfied`` keys its intra-train dependency allowance
+      on the literal ``'merge-deferred'``.  Worse, both
+      ``_RECONCILE_SWEEP_STATUSES`` and
+      ``_WARM_LANE_RECLAIM_PROTECTED_STATUSES`` in ``orchestrator/harness.py``
+      protect ``merge-deferred`` while deliberately EXCLUDING ``blocked``, so
+      the park would strip the intact worktree the merge worker is promised.
+    - ``infra-hold``: the hold has no separate metadata flag — as the
+      infra-held resume branch in ``orchestrator/harness.py`` puts it, "the
+      status IS the hold".  Parking to ``blocked`` erases it and reproduces
+      the 3465 footprint starvation.
+    - ``done`` / ``cancelled``: terminal by decision; never drag them back.
+    - ``None``: ``Scheduler.get_status`` returns ``None`` on ANY MCP read
+      failure (its docstring says "or None on failure").  The positive
+      equality test is exactly what makes a failed read fail SAFE — a
+      negative test would park on every transient MCP hiccup.
+
+    The parameter list is DERIVED from ``shared.task_statuses.TaskStatus``
+    (see ``_NON_IN_PROGRESS_STATUSES``), so the exhaustiveness claim is
+    self-enforcing: adding a 10th member to the closed vocabulary extends this
+    guard automatically instead of leaving the new status silently uncovered.
+
+    Cross-file anchors above are cited by SYMBOL, not line number: those files
+    drift by 60-115 lines between plan and merge.
+    """
+    harness = _FakeHarness(status=status)
+    # No slot registered — the no-slot arm, same as the orphaned-park test.
+    server = create_server(queue, harness=harness)
+    result = await _call_release(server, task_id='42', timeout_secs=1)
+
+    assert result['parked'] is None
+    harness.scheduler.set_task_status.assert_not_awaited()
+    harness.scheduler.note_workflow_cancelled.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_live_slot_in_progress_not_parked(queue):
+    """A still-live slot is never parked, even at 'in-progress'.
+
+    Pins the ``if not harness.is_workflow_active(task_id):`` guard that fences
+    the park block: parking a task whose workflow is still running would race
+    that workflow's own status writes.
+
+    Strictly stronger than ``test_active_task_times_out_when_slot_does_not_clear``
+    above, which builds ``_FakeHarness()`` with the default ``status=None`` and
+    so has its ``parked is None`` satisfied by the get_status-returned-None
+    path regardless — it would stay green with the guard deleted.  Seeding
+    ``status='in-progress'`` here makes this the first test that genuinely
+    fails if the guard is removed.
+    """
+    harness = _FakeHarness(status='in-progress')
+    harness.events['42'] = asyncio.Event()  # registered and NEVER popped
+
+    server = create_server(queue, harness=harness)
+    result = await _call_release(server, task_id='42', timeout_secs=1)
+
+    assert result['slot_cleared'] is False
+    assert result['parked'] is None
+    harness.scheduler.set_task_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slot_dispatched_during_status_read_not_parked(queue):
+    """A slot that appears WHILE get_status is awaited must abort the park.
+
+    ``harness.scheduler.get_status`` is an MCP round-trip that yields the event
+    loop, and the Harness runs on that same loop, so the scheduler can dispatch
+    ``task_id`` in the gap between the liveness guard and the status write —
+    ``_run_slot`` registers the cancel event (and calls
+    ``scheduler.clear_workflow_cancel``, which would wipe the grace stamp we
+    just wrote).  Without a re-check the tool writes 'blocked' out from under a
+    now-live agent and still reports ``slot_cleared: True, parked: 'blocked'``,
+    which both /unblock skills read as "you now own the task".
+
+    The no-slot arm makes this materially more likely than before: a task with
+    no slot is precisely the one the scheduler is free to dispatch on its next
+    tick, and before this change that arm returned early and never wrote.
+    """
+    harness = _FakeHarness(status='in-progress')
+    # No slot at call time — the orphaned arm.
+
+    async def _dispatch_mid_read(_task_id: str) -> str:
+        # The scheduler wins the race: a slot is registered while the tool is
+        # awaiting the status read.
+        harness.events['42'] = asyncio.Event()
+        return 'in-progress'
+
+    harness.scheduler.get_status = AsyncMock(side_effect=_dispatch_mid_read)
+
+    server = create_server(queue, harness=harness)
+    result = await _call_release(server, task_id='42', timeout_secs=1)
+
+    assert result['parked'] is None, 'must not park under a freshly dispatched workflow'
+    # A slot IS live at the end of the call, so the caller must be told so
+    # rather than being handed a stale True from before the status read.
+    assert result['slot_cleared'] is False
+    harness.scheduler.set_task_status.assert_not_awaited()
+    harness.scheduler.note_workflow_cancelled.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -343,4 +610,71 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     # And the slot is truly cleared from the harness registry.
     assert not h.is_workflow_active(tid), (
         'Slot must be cleared from _workflow_cancel_events by _run_slot finally'
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_park_lands_inside_real_scheduler_grace_window(
+    queue: EscalationQueue,
+) -> None:
+    """End-to-end: the orphan park is genuinely inside the reaper grace window.
+
+    The unit tests above assert the tool CALLS ``note_workflow_cancelled``, but
+    that is a proxy for the property that actually matters — that
+    ``Scheduler._phase_redispatch_stranded_blocked`` will grace-skip the task it
+    just parked, via ``if self.workflow_cancel_recent(tid): continue``.  A
+    mocked stamp can never observe that; it would stay green if
+    ``note_workflow_cancelled`` stopped writing ``_workflow_cancel_at``, or if
+    ``workflow_cancel_recent`` stopped reading it.
+
+    So wire the REAL ``Harness.cancel_workflow`` (which must take its
+    ``event is None`` bail-out, returning False WITHOUT stamping — the zero-grace
+    condition this task fixes) to the REAL ``Scheduler.note_workflow_cancelled``
+    / ``workflow_cancel_recent`` pair over the real ``_workflow_cancel_at``
+    dict, and assert the reader answers True immediately after the park.
+
+    Only the two MCP round-trips (``get_status`` / ``set_task_status``) are
+    stubbed; the grace mechanism under test is entirely real.
+    """
+    from orchestrator.harness import Harness  # type: ignore[reportMissingImports]
+    from orchestrator.scheduler import Scheduler  # type: ignore[reportMissingImports]
+
+    tid = '42'
+
+    # ── Real Scheduler, bypass __init__, with only the grace state wired ──
+    sched: Scheduler = Scheduler.__new__(Scheduler)
+    sched._workflow_cancel_at = {}  # type: ignore[assignment]
+    # Mirrors Scheduler.__init__.  The value is not what this test pins — any
+    # positive window makes a just-written stamp "recent"; what it pins is that
+    # note_workflow_cancelled writes where workflow_cancel_recent reads.  A
+    # rename of either attribute fails this test loudly (AttributeError).
+    sched._RECONCILE_CANCEL_GRACE_S = 30.0  # type: ignore[assignment]
+    # The two MCP round-trips are the only stubs.
+    sched.get_status = AsyncMock(return_value='in-progress')  # type: ignore[method-assign]
+    sched.set_task_status = AsyncMock()  # type: ignore[method-assign]
+
+    # ── Real Harness, bypass __init__, with NO slot registered (orphaned) ──
+    h: Harness = Harness.__new__(Harness)
+    h.scheduler = sched
+    h._workflow_cancel_events = {}  # type: ignore[assignment]
+
+    # Precondition: nothing has stamped yet, so the reaper would re-dispatch.
+    assert sched.workflow_cancel_recent(tid) is False
+    # Precondition: the real cancel_workflow takes its no-stamp bail-out here.
+    assert h.is_workflow_active(tid) is False
+
+    server = create_server(queue, harness=h)
+    result = await _call_release(server, task_id=tid, timeout_secs=1)
+
+    assert result['was_active'] is False
+    assert result['released'] is False, (
+        'real cancel_workflow must return False on its `event is None` arm'
+    )
+    assert result['parked'] == 'blocked'
+    sched.set_task_status.assert_awaited_once_with(tid, 'blocked')
+    # THE POINT: the park the tool just wrote is inside the real grace window,
+    # so _phase_redispatch_stranded_blocked's `workflow_cancel_recent` guard
+    # skips it instead of flipping it back to 'pending' on the next idle tick.
+    assert sched.workflow_cancel_recent(tid) is True, (
+        'orphan park landed with ZERO grace — the reaper will undo it'
     )

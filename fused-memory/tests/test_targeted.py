@@ -2,7 +2,7 @@
 
 import logging
 import re
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -16,6 +16,7 @@ from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.backlog_policy import BacklogVerdict
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.targeted import TargetedReconciler
+from fused_memory.reconciliation.verify import CodebaseVerifier
 
 
 @pytest_asyncio.fixture
@@ -2445,6 +2446,18 @@ class TestShouldWithholdProposedResolutionAcceptsScope:
         ),
         pytest.param({}, False, id='empty_metadata'),
         pytest.param({'supersedes': ''}, False, id='falsy_supersedes_no_other_marker'),
+        pytest.param({'supersedes': ['959b8497']}, True, id='list_shaped_supersedes'),
+        pytest.param(
+            {'supersedes': ['959b8497', 'cd09e261']}, True, id='multi_member_supersedes',
+        ),
+        pytest.param({'supersedes': []}, False, id='empty_list_supersedes'),
+        pytest.param(
+            {'supersedes': ['']}, False, id='list_of_empty_member_not_authoritative',
+        ),
+        pytest.param(
+            {'supersedes': [None]}, False, id='list_of_none_member_not_authoritative',
+        ),
+        pytest.param({'supersedes': None}, False, id='explicit_none_supersedes'),
     ],
 )
 def test_is_authoritative_resolution_truth_table(metadata, expected):
@@ -2478,10 +2491,59 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
     self-echo must stay non-authoritative to this pre-check — otherwise a
     task's own prior echo would suppress its next completion description,
     regressing the task-1984 invariant above.
+
+    The `supersedes` discriminator is MEMBER-level truthiness of the normalized
+    list, and both the canonical list and the legacy scalar are accepted on
+    read (PRD D2 / task 3196). The rationale for both lives once, in
+    `_is_authoritative_resolution`'s docstring — not restated here. The param
+    ids encode the contract more durably than prose would:
+    `list_of_empty_member_not_authoritative` and
+    `list_of_none_member_not_authoritative` are the RED signal a
+    `bool(normalize_supersedes(...))` implementation trips, and
+    `truthy_supersedes` / `falsy_supersedes_no_other_marker` are the legacy
+    scalar read-tolerance contract, kept verbatim.
     """
     from fused_memory.reconciliation.targeted import _is_authoritative_resolution
 
     assert _is_authoritative_resolution(metadata) is expected
+
+
+def test_targeted_uses_the_shared_supersedes_parser(monkeypatch):
+    """INV-5 single-home lock: there is never a SECOND supersedes parser.
+
+    Deliverable (3) of task 3196 — the export contract task 3112's closure
+    predicate and the eval-program E4 sweep hard-depend on — pinned from the
+    CONSUMER side rather than by restating 3195's `TestNormalizeSupersedes`
+    unit tests.
+
+    BEHAVIORAL, not an identity assertion. `targeted.normalize_supersedes is
+    memory_metadata.normalize_supersedes` is near-tautological — a plain `from
+    ... import` always yields object identity, so it only restates the import
+    line and still passes on the realistic INV-5 violation: inlining
+    `isinstance(v, str)` shape logic directly inside
+    `_is_authoritative_resolution` while leaving the now-unused import in
+    place. Swapping the module-level name for a sentinel and asserting the
+    predicate OBSERVES it fails on that inlining, and equally on a rename, a
+    re-home, or a function-local re-import.
+    """
+    from fused_memory import memory_metadata
+    from fused_memory.reconciliation import targeted
+
+    seen = []
+
+    def _sentinel_parser(value):
+        seen.append(value)
+        return ['sentinel-uuid']
+
+    monkeypatch.setattr(targeted, 'normalize_supersedes', _sentinel_parser)
+
+    # `[]` is NON-authoritative under the real parser (`empty_list_supersedes`
+    # in the truth table above), so a True verdict here can only come from the
+    # patched shared name actually being called by the predicate.
+    assert targeted._is_authoritative_resolution({'supersedes': []}) is True
+    assert seen == [[]], 'the raw metadata value must reach the shared parser'
+
+    assert 'normalize_supersedes' in memory_metadata.__all__
 
 
 # ---------------------------------------------------------------------------
@@ -2722,15 +2784,31 @@ def test_format_outcome_echo_no_mid_number_splice_regression():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'supersedes_value', ['cd09e261', ['cd09e261']], ids=['legacy_scalar', 'canonical_list'],
+)
 async def test_on_task_done_suppresses_stale_description_when_authoritative_memory_exists(
-    reconciler, mock_memory_service,
+    reconciler, mock_memory_service, supersedes_value,
 ):
     """When an authoritative resolution/superseding memory already exists for the
     task, the fast-path completion echo must NOT re-append the (possibly stale,
     re-scoped) raw description/details — only the title-only completion fact —
-    and the write must be flagged so operators can query suppressed echoes."""
+    and the write must be flagged so operators can query suppressed echoes.
+
+    Parametrized over both `supersedes` shapes (PRD D2 / task 3196) so the
+    production write shape emitted by
+    `ReconciliationHarness._reconcile_status_correction` is exercised end-to-end
+    through `reconcile_task`, not only through the pure classifier. Every
+    assertion below must hold for BOTH ids. `canonical_list` passes even before
+    the reader migration (a one-element non-empty list is already truthy) — its
+    value is as a durable regression guard for the post-3196 corpus, failing
+    loudly if a later change narrows the reader back to a string-only test.
+    """
     mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
-        {'id': '959b8497', 'metadata': {'task_id': '361', 'supersedes': 'cd09e261'}},
+        {
+            'id': '959b8497',
+            'metadata': {'task_id': '361', 'supersedes': supersedes_value},
+        },
     ])
 
     result = await reconciler.reconcile_task(
@@ -3926,3 +4004,390 @@ async def test_reopen_then_redone_cites_fresh_provenance(
 
     metadata = first_call.kwargs.get('metadata') or {}
     assert metadata.get('echo_used_provenance') is True
+
+
+# ── Task 4343: verification-failure audit rows ──────────────────────────
+#
+# The defect: reconciliation's codebase-verification branch recorded a
+# durable row ONLY for confirmed/contradicted.  A verifier whose agent never
+# produced a parseable verdict returned the caller-supplied default
+# ('inconclusive') and fell straight through the gate, leaving nothing behind
+# — byte-identical to a healthy "I looked and found nothing either way".
+# The raised-failure path only logged.  Across 20,490 runs the task measured
+# ZERO rows matching '%no_tool_calls%', '%agent-failed%' or '%Claude CLI
+# agent%'.
+#
+# These tests assert through the REAL ReconciliationJournal fixture
+# (get_recent_runs -> get_run_actions), so they exercise the actual SQLite
+# run_actions table whose emptiness was measured — not a mock call.
+
+
+def _verify_rows(actions: list[dict]) -> list[dict]:
+    """The verify/codebase audit rows from a run's action list.
+
+    Includes the non-outcome ``post_verify_error`` row, which the operator
+    census excludes (``operation != 'post_verify_error'``) — see the row
+    contract comment in targeted.py.
+    """
+    return [
+        a for a in actions
+        if a['action_type'] == 'verify' and a['target'] == 'codebase'
+    ]
+
+
+async def _run_done_transition(reconciler, task_id: str = '1') -> dict:
+    """Drive a done-transition through the sparse-knowledge verify branch.
+
+    mock_memory_service.search defaults to [], so len(related) < 2 and the
+    verification branch opens with no extra setup.
+    """
+    return await reconciler.reconcile_task(
+        task_id=task_id, transition='done', project_id='test-project',
+        project_root='/tmp/test',
+        task_before={'id': task_id, 'title': 'Test', 'status': 'in-progress'},
+    )
+
+
+class TestVerificationFailureAudit:
+    """A failed verifier must leave a durable, distinguishable record."""
+
+    @pytest.mark.asyncio
+    async def test_agent_failure_records_durable_run_action(
+        self, reconciler, journal, mock_memory_service, caplog
+    ):
+        """An agent failure lands a verify/codebase/agent_failed row.
+
+        The row is what an operator can query months later; the WARNING alone
+        is not, which is why 20,490 runs of evidence turned up nothing.
+        """
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=VerificationVerdict.inconclusive,
+            confidence=0.0,
+            evidence=[],
+            summary='agent-failed:no_tool_calls',
+            agent_failed=True,
+            failure_token='cli_output_empty',
+        ))
+
+        with caplog.at_level(logging.WARNING):
+            result = await _run_done_transition(reconciler)
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        assert len(runs) == 1
+        actions = await journal.get_run_actions(runs[0].id)
+
+        rows = [a for a in _verify_rows(actions) if a['operation'] == 'agent_failed']
+        assert len(rows) == 1, (
+            f'Expected exactly one verify/codebase/agent_failed row, got '
+            f'{[(a["action_type"], a["target"], a["operation"]) for a in actions]}'
+        )
+        assert rows[0]['detail'].get('failure_token') == 'cli_output_empty', (
+            f'Expected the specific token in detail, got {rows[0]["detail"]!r}'
+        )
+        assert rows[0]['detail'].get('task_id') == '1', (
+            f'Expected task_id in detail, got {rows[0]["detail"]!r}'
+        )
+
+        assert any(a['type'] == 'verification_agent_failed' for a in result.get('actions', [])), (
+            f'Expected a verification_agent_failed action, got {result.get("actions")}'
+        )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        # Match the actual formatted fragment from the
+        # 'verification_agent_failed task=%s token=%s ...' format string: a bare
+        # `'1' in message` substring check is satisfied by any stray digit
+        # (a timestamp, a future token) and would pin nothing about identity.
+        assert any('cli_output_empty' in r.getMessage() and 'task=1' in r.getMessage()
+                   for r in warnings), (
+            f'Expected a WARNING naming the token and the task, got '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+        # A failed verifier must NOT write a completion claim.
+        assert not [a for a in result.get('actions', [])
+                    if a['type'] in ('knowledge_captured', 'knowledge_deferred')], (
+            f'A failed verifier must not capture knowledge, got {result.get("actions")}'
+        )
+        verification_writes = [
+            a for a in actions
+            if a['operation'] == 'add_memory' and a['detail'].get('type') == 'verification'
+        ]
+        assert not verification_writes, (
+            f'A failed verifier must not write a verification memory, got '
+            f'{verification_writes!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_agent_failure_is_distinguishable_from_honest_inconclusive(
+        self, reconciler, journal, caplog
+    ):
+        """The test that names the bug: the two records must NOT be identical.
+
+        Both runs carry verdict='inconclusive' — on the failure path that
+        value is merely the caller-supplied default_verdict, which collides
+        with the legitimate healthy verdict.  Only a separate signal can tell
+        "the agent never answered" from "the agent answered: unclear".
+        """
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=VerificationVerdict.inconclusive, confidence=0.0, evidence=[],
+            summary='agent-failed:no_tool_calls',
+            agent_failed=True, failure_token='no_tool_calls',
+        ))
+        with caplog.at_level(logging.WARNING):
+            await _run_done_transition(reconciler, task_id='failed-1')
+        failed_warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        failed_ops = {a['operation'] for a in _verify_rows(await journal.get_run_actions(runs[0].id))}
+
+        caplog.clear()
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=VerificationVerdict.inconclusive, confidence=0.4, evidence=[],
+            summary='no evidence either way',
+            agent_failed=False, failure_token='',
+        ))
+        with caplog.at_level(logging.WARNING):
+            await _run_done_transition(reconciler, task_id='honest-1')
+        honest_warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        honest_ops = {a['operation'] for a in _verify_rows(await journal.get_run_actions(runs[0].id))}
+
+        assert 'agent_failed' in failed_ops, (
+            f'Expected an agent_failed verify row for the failed run, got {failed_ops!r}'
+        )
+        assert failed_ops != honest_ops, (
+            f'The two runs recorded identical verify rows ({failed_ops!r}) — that '
+            f'indistinguishability IS the defect'
+        )
+        assert any('no_tool_calls' in r.getMessage() for r in failed_warnings), (
+            f'Expected a WARNING on the failure run, got {[r.getMessage() for r in failed_warnings]}'
+        )
+        assert not any('agent-failed' in r.getMessage() or 'agent_failed' in r.getMessage()
+                       for r in honest_warnings), (
+            f'An honest inconclusive is not an error and must not warn, got '
+            f'{[r.getMessage() for r in honest_warnings]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_verify_exception_records_durable_run_action(
+        self, reconciler, journal, caplog
+    ):
+        """The RAISED failure path must also leave a row.
+
+        This path is the live one: agent_llm_provider defaults to 'claude_cli'
+        and _call_llm_cli raises RuntimeError(build_failure_message(...)) when
+        the CLI reports failure.  Today it only logs, which is why the task's
+        sweep found zero rows matching '%Claude CLI agent%'.
+        """
+        reconciler.verifier.verify = AsyncMock(
+            side_effect=RuntimeError('Claude CLI agent failed: error_max_turns')
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await _run_done_transition(reconciler)
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        actions = await journal.get_run_actions(runs[0].id)
+        rows = [a for a in _verify_rows(actions) if a['operation'] == 'error']
+        assert len(rows) == 1, (
+            f'Expected exactly one verify/codebase/error row, got '
+            f'{[(a["action_type"], a["target"], a["operation"]) for a in actions]}'
+        )
+        assert 'error_max_turns' in rows[0]['detail'].get('error', ''), (
+            f'Expected the raised message in detail, got {rows[0]["detail"]!r}'
+        )
+
+        assert any('Verification failed for task' in r.getMessage()
+                   for r in caplog.records if r.levelno == logging.WARNING), (
+            'The pre-existing Verification-failed WARNING must still fire'
+        )
+        # Containment preserved: the exception does not propagate.
+        assert 'task_id' in result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('verdict', 'expected_operation'),
+        [
+            (VerificationVerdict.confirmed, 'confirmed'),
+            (VerificationVerdict.contradicted, 'contradicted'),
+            (VerificationVerdict.inconclusive, 'inconclusive'),
+        ],
+    )
+    async def test_every_verification_outcome_records_a_row(
+        self, reconciler, journal, caplog, verdict, expected_operation
+    ):
+        """Every verify invocation records exactly one row — including healthy ones.
+
+        Without a row on the healthy paths, "agent failed" vs "genuinely
+        inconclusive" is distinguished only by a row being PRESENT vs ABSENT —
+        and absence is exactly what the 20,371-of-20,490 runs that never opened
+        this branch also look like.  That conflates "healthy inconclusive" with
+        "never ran": a fresh silent-degradation mode replacing the one being
+        fixed.  One uniform row per invocation is what makes
+        `SELECT operation, COUNT(*) FROM run_actions WHERE action_type='verify'`
+        a truthful census by construction.
+        """
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=verdict,
+            confidence=0.8,
+            evidence=[{'file_path': 'test.py', 'snippet': 'def test()'}],
+            summary='checked the codebase',
+            agent_failed=False,
+            failure_token='',
+        ))
+
+        with caplog.at_level(logging.WARNING):
+            result = await _run_done_transition(reconciler)
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        actions = await journal.get_run_actions(runs[0].id)
+
+        rows = _verify_rows(actions)
+        assert len(rows) == 1, (
+            f'Expected exactly one verify/codebase row, got '
+            f'{[(a["action_type"], a["target"], a["operation"]) for a in actions]}'
+        )
+        assert rows[0]['operation'] == expected_operation, (
+            f'Expected operation={expected_operation!r} but got {rows[0]["operation"]!r}'
+        )
+        assert rows[0]['detail'].get('task_id') == '1', (
+            f'Expected task_id in detail, got {rows[0]["detail"]!r}'
+        )
+
+        if expected_operation in ('confirmed', 'contradicted'):
+            # The new row is ADDITIVE: it records "the verifier produced
+            # outcome X", a different fact from "a memory write happened",
+            # so the pre-existing write row must survive untouched.
+            writes = [
+                a for a in actions
+                if (a['action_type'], a['target'], a['operation']) == ('write', 'memory', 'add_memory')
+                and a['detail'].get('type') == 'verification'
+            ]
+            assert len(writes) == 1, (
+                f'Expected the pre-existing verification add_memory row to survive, got '
+                f'{[(a["action_type"], a["target"], a["operation"], a["detail"]) for a in actions]}'
+            )
+        else:
+            assert any(a['type'] == 'verification_inconclusive' for a in result.get('actions', [])), (
+                f'Expected a verification_inconclusive action, got {result.get("actions")}'
+            )
+            verification_warnings = [
+                r for r in caplog.records
+                if r.levelno == logging.WARNING and 'verif' in r.getMessage().lower()
+            ]
+            assert not verification_warnings, (
+                f'An honest inconclusive is not an error and must not warn, got '
+                f'{[r.getMessage() for r in verification_warnings]}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_cli_failure_token_survives_end_to_end_into_the_journal(
+        self, reconciler, journal, config
+    ):
+        """Anti-regression for the WHOLE chain, with no VerificationResult hand-built.
+
+        Uses a REAL CodebaseVerifier and patches only AgentLoop, so the token
+        must survive agent_loop -> extract_agent_verdict -> verify.py ->
+        targeted.py -> SQLite.  A future refactor that drops the signal at any
+        one of those joints fails loudly here instead of silently restoring the
+        outage this task closed.
+        """
+        reconciler.verifier = CodebaseVerifier(config.reconciliation)
+
+        with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
+            agent = AsyncMock()
+            agent.run = AsyncMock(return_value=(
+                {'warning': 'no_tool_calls', 'warning_origin': 'cli_output_unparseable', 'text': ''},
+                [],
+            ))
+            MockAgentLoop.return_value = agent
+
+            await _run_done_transition(reconciler)
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        actions = await journal.get_run_actions(runs[0].id)
+        rows = _verify_rows(actions)
+
+        assert len(rows) == 1, (
+            f'Expected exactly one verify/codebase row, got '
+            f'{[(a["action_type"], a["target"], a["operation"]) for a in actions]}'
+        )
+        assert rows[0]['operation'] == 'agent_failed', (
+            f'Expected operation=agent_failed but got {rows[0]["operation"]!r}'
+        )
+        assert rows[0]['detail'].get('failure_token') == 'cli_output_unparseable', (
+            f'Expected the specific CLI origin to survive into the journal, got '
+            f'{rows[0]["detail"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_post_verify_write_failure_is_not_attributed_to_the_verifier(
+        self, reconciler, journal, mock_memory_service, caplog
+    ):
+        """A memory-write failure AFTER a good verdict must not read as a verify failure.
+
+        ``_fenced_add_memory`` lives inside the same try as the audit row and
+        genuinely can raise (unguarded memory.add_memory / buffer.defer_write
+        network calls), so the except arm is reachable with the outcome row
+        already written.  Emitting a second ``'error'`` row there would
+        double-count `WHERE action_type='verify'` — breaking the one-outcome-row
+        -per-invocation contract — and attribute a store outage to the verifier,
+        misleading exactly the operator this task exists for.  The outcome row
+        must stay 'confirmed'; the write failure gets its own distinct,
+        stage-naming operation.
+        """
+        async def _add_memory(**kwargs):
+            # Only the verification write carries verification_verdict; the
+            # fast-path completion echo must still succeed so the run reaches
+            # the verify branch normally.
+            if 'verification_verdict' in (kwargs.get('metadata') or {}):
+                raise RuntimeError('qdrant unavailable')
+            return {'id': 'mem-1'}
+
+        mock_memory_service.add_memory = AsyncMock(side_effect=_add_memory)
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=VerificationVerdict.confirmed,
+            confidence=0.9,
+            evidence=[{'file_path': 'test.py', 'snippet': 'def test()'}],
+            summary='Confirmed via test.py',
+        ))
+
+        with caplog.at_level(logging.WARNING):
+            result = await _run_done_transition(reconciler)
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        actions = await journal.get_run_actions(runs[0].id)
+        rows = _verify_rows(actions)
+
+        outcome_rows = [a for a in rows if a['operation'] != 'post_verify_error']
+        assert len(outcome_rows) == 1, (
+            f'Expected exactly one verify/codebase OUTCOME row, got '
+            f'{[(a["operation"], a["detail"]) for a in rows]}'
+        )
+        assert outcome_rows[0]['operation'] == 'confirmed', (
+            f"The verifier answered 'confirmed'; a downstream write failure must "
+            f'not relabel it, got {outcome_rows[0]["operation"]!r}'
+        )
+        assert not [a for a in rows if a['operation'] == 'error'], (
+            f'A post-verify write failure must not emit a verifier-error row, got '
+            f'{[(a["operation"], a["detail"]) for a in rows]}'
+        )
+
+        post = [a for a in rows if a['operation'] == 'post_verify_error']
+        assert len(post) == 1, (
+            f'Expected one post_verify_error row naming the failed stage, got '
+            f'{[(a["operation"], a["detail"]) for a in rows]}'
+        )
+        assert post[0]['detail'].get('stage') == 'post_verify_write', (
+            f'Expected the stage named in detail, got {post[0]["detail"]!r}'
+        )
+        assert 'qdrant unavailable' in post[0]['detail'].get('error', ''), (
+            f'Expected the raised message in detail, got {post[0]["detail"]!r}'
+        )
+        assert any(a['type'] == 'post_verification_error'
+                   for a in result.get('actions', [])), (
+            f'Expected a post_verification_error action, got {result.get("actions")}'
+        )
+        # Containment preserved: the exception does not propagate.
+        assert 'task_id' in result

@@ -17,8 +17,12 @@ Test coverage:
   step-13: BD-1 four-cap-site-identity test (boundary row 10)
 
 step-09 note: the ``counts_against_requeue_cap`` policy per warm-lane
-subclass (EXHAUSTED=True, DISK_PRESSURE/HARD_DOWN=False) is already pinned
+subclass (EXHAUSTED=False, DISK_PRESSURE/HARD_DOWN=False) is already pinned
 by step-03's ``TestClassifyFailureKnownRows`` rows above — not repeated here.
+Task 2988 (PRD ε / W3) flipped EXHAUSTED True->False: pool exhaustion is a
+shared-resource / capacity-leak signal, so it no longer burns the per-task
+requeue cap; a pool-level structural-exhaustion L2 is the loud signal instead
+(WarmLaneReseedContaminated stays =True — data-integrity, per-task).
 """
 
 from __future__ import annotations
@@ -182,13 +186,21 @@ class TestClassifyFailureKnownRows:
         assert disp.escalate_to_human is False
         assert disp.category is FailureCategory.NONE
 
-    def test_warm_lane_pool_exhausted_requeues_and_counts_against_cap(self):
+    def test_warm_lane_pool_exhausted_requeues_and_does_not_count_against_cap(self):
+        """Task 2988 (PRD ε / W3) flipped EXHAUSTED counts_against_requeue_cap
+        True->False: pool exhaustion is a shared-resource / capacity-leak
+        signal, so it no longer burns the per-task requeue cap (the 2026-07-22
+        incident's L2 storm). EXHAUSTED now joins DISK_PRESSURE/HARD_DOWN/
+        SOFT_PRESSURE as non-counting; a pool-level structural-exhaustion L2 is
+        the sole loud signal. requeue_kind / reason_prefix / category unchanged.
+        """
         from orchestrator.git_ops import WarmLanePoolExhausted
         from orchestrator.verify_categories import FailureCategory
         from orchestrator.workflow_types import RequeueKind, classify_failure
         disp = classify_failure(WarmLanePoolExhausted('all lanes assigned'))
         assert disp.requeue_kind is RequeueKind.REQUEUE
-        assert disp.counts_against_requeue_cap is True
+        assert disp.counts_against_requeue_cap is False
+        assert disp.reason_prefix == 'warm_lane_pool_exhausted'
         assert disp.category is FailureCategory.NONE
 
     def test_warm_lane_disk_pressure_requeues_without_counting_against_cap(self):
@@ -386,6 +398,71 @@ class TestBD2Completeness:
         assert disp.counts_against_requeue_cap is False
         assert disp.escalate_to_human is False
         assert disp.category is FailureCategory.NONE
+
+    def test_lane_lock_self_owned_leak_requeues_loudly_without_counting_against_cap(
+        self,
+    ):
+        """LaneLockSelfOwnedLeak (task 3081, D8/B13) needs its OWN row, and that
+        row must diverge from the parent it inherits from on exactly one axis:
+        ``escalate_to_human``.
+
+        Same REQUEUE / no-cap-burn treatment as the parent, because a leaked
+        lane lock is an infra fault the task must not be charged for.  But
+        unlike ordinary contention it must be LOUD: nothing will release the fd
+        before process exit, so deferring can never succeed.  In reify
+        esc-5548-5 three tasks blocked behind one identical
+        ``merge_outcome_signature 3173b64436423738`` and nothing surfaced until
+        an unattended restart roughly three hours later.
+
+        The OWN-KEY assertion is the substance.  ``_lookup_disposition`` walks
+        the MRO, so a subclass with no row of its own silently resolves to the
+        parent's — inheriting ``escalate_to_human=False`` and staying exactly as
+        quiet as the case it exists to distinguish.  The table's convention is
+        an explicit row per subclass (cf. MergeParkContentionError IS-A
+        MergeParkError), and this pins that rather than relying on BD-2
+        completeness, which the MRO fallback already satisfies.
+        """
+        from orchestrator.git_ops import (
+            LaneLockSelfOwnedLeak,
+            MergeVerifyLeaseContended,
+        )
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import (
+            RequeueKind,
+            _disposition_table,
+            _lookup_disposition,
+        )
+
+        disp = _lookup_disposition(LaneLockSelfOwnedLeak)
+        assert disp is not None, (
+            'LaneLockSelfOwnedLeak must have a disposition row'
+        )
+        assert LaneLockSelfOwnedLeak in _disposition_table(), (
+            'the row must be keyed on LaneLockSelfOwnedLeak ITSELF — resolving '
+            'through the MRO to MergeVerifyLeaseContended would inherit '
+            'escalate_to_human=False, leaving the leak exactly as quiet as the '
+            'ordinary contention it exists to be distinguished from'
+        )
+
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.counts_against_requeue_cap is False, (
+            'a leaked lane lock is an infra fault — the task must not be '
+            'charged for it'
+        )
+        assert disp.category is FailureCategory.NONE
+        assert disp.escalate_to_human is True, (
+            'the one axis on which this MUST diverge from its parent: a '
+            'permanent-until-process-exit hold can never be resolved by '
+            'waiting, so it has to reach a human'
+        )
+
+        parent = _lookup_disposition(MergeVerifyLeaseContended)
+        assert parent is not None
+        assert disp.reason_prefix != parent.reason_prefix, (
+            'a distinct reason_prefix is what makes the leak legible in a '
+            'block reason and in merge_outcome_signature — sharing the '
+            "parent's would erase the distinction downstream"
+        )
 
     def test_a_brand_new_exception_type_has_no_row_but_still_classifies(self):
         # A synthetic type with no table row proves the completeness check
@@ -836,17 +913,17 @@ class TestBD1StewardConsultsSharedClassifier:
     step-14.
     """
 
-    async def test_pre_triage_warning_is_single_sourced_from_table(self, caplog):
+    async def test_pre_triage_warning_is_single_sourced_from_table(self, caplog, make_steward):
         import json
         import logging
 
         from shared.cli_invoke import AllAccountsCappedException
-        from test_suggestion_triage import _make_escalation, _make_steward, _make_suggestions
+        from test_suggestion_triage import _make_escalation, _make_suggestions
 
         from orchestrator.unblock_types import BlockClass
         from orchestrator.workflow_types import BlockDisposition, RequeueKind
 
-        steward = _make_steward()
+        steward = make_steward()
         suggestions = _make_suggestions(15)
         escalation = _make_escalation(detail=json.dumps(suggestions))
         cap_exc = AllAccountsCappedException(

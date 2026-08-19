@@ -342,6 +342,31 @@ def status(config_path: Path | None):
     asyncio.run(_show())
 
 
+@main.command('flake-ledger')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to orchestrator config YAML (REQUIRED unless ORCH_CONFIG_PATH '
+                   'is set). Selects the target project — sets project_root and '
+                   'fused_memory.project_id.')
+def flake_ledger_cmd(config_path: Path | None):
+    """Print the flake ledger report: open debt, recurrence chains, health counters.
+
+    READ ONLY. This command opens no debt, files no task, resolves nothing and
+    escalates nothing, and it will NOT create a ledger DB for a project that has
+    none — it reports the absence instead.
+    """
+    # Named flake_ledger_cmd so the function does not shadow the flake_ledger module.
+    from orchestrator.flake_ledger import ledger_db_path
+    from orchestrator.flake_report import build_report, render_report
+
+    try:
+        config = load_config(config_path)
+    except ConfigRequiredError as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+    click.echo(render_report(build_report(ledger_db_path(Path(config.project_root)))))
+
+
 @main.command('probe-models')
 @click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
               default=None,
@@ -391,6 +416,85 @@ def probe_models(config_path: Path | None, models_csv: str | None, output_path: 
     out_path.write_text(artifact)
 
     click.echo(f'Wrote model availability artifact to {out_path}')
+
+
+@main.command('check-config')
+@click.option('--config', 'config_path', type=click.Path(exists=True, path_type=Path),
+              default=None,
+              help='Path to the project orchestrator config YAML to lint (REQUIRED '
+                   'unless ORCH_CONFIG_PATH is set).')
+def check_config(config_path: Path | None):
+    """Lint a project config YAML for unknown keys that pydantic silently drops.
+
+    OrchestratorConfig uses ``extra='ignore'``, so any key with no matching model
+    field is DISCARDED before validation with no error — the 2026-07-22 incident
+    where a top-level ``spare_warm_lanes: 8`` (the field lives on ``git.``) was
+    dropped for weeks.  This offline gate walks the RAW project YAML against the
+    schema via ``census_config_keys`` DIRECTLY (not a full validated load), so it
+    still reports phantom keys even when the config has an unrelated value-level
+    validation error.
+
+    A key deliberately present for NON-OrchestratorConfig consumers (e.g. one the
+    project's own scripts read) can be excused two ways, and is then listed in an
+    INFORMATIONAL section that never affects the exit code:
+
+    \b
+      * name it with the reserved ``x_``/``x-`` prefix (works at any depth, no
+        config ceremony) — the preferred form for a NEW knob;
+      * add its dotted path to ``config_key_census.ignore`` in the same YAML
+        (fnmatch globs, so ``cpu_governance.*`` opts out a whole namespace) —
+        for existing names other tooling already greps for.
+
+    Exits 1 if any GENUINELY-unknown key is found, else 0.
+    """
+    from orchestrator.config import census_config_keys
+
+    # Resolve the config path (arg wins, then ORCH_CONFIG_PATH) without
+    # constructing a validated config — census only needs the raw YAML path.
+    if config_path is None:
+        env_path = os.environ.get('ORCH_CONFIG_PATH')
+        if not env_path:
+            click.echo(
+                'Error: --config is required (or set ORCH_CONFIG_PATH).', err=True
+            )
+            sys.exit(1)
+        config_path = Path(env_path)
+        if not config_path.exists():
+            click.echo(f'Error: Config file not found: {config_path}', err=True)
+            sys.exit(1)
+
+    census = census_config_keys(config_path)
+
+    # Informational FIRST, and explicitly marked as such: these keys were
+    # deliberately excused, so listing them keeps an over-broad glob auditable
+    # without ever reading as a failure or touching the exit code.
+    if census.ignored:
+        _REASONS = {
+            'reserved_prefix': 'ignored: reserved prefix',
+            'allowlist': 'ignored: config_key_census.ignore',
+        }
+        click.echo(
+            f'{len(census.ignored)} key(s) excused from the census '
+            '(informational — does not affect the exit code):'
+        )
+        for ik in census.ignored:
+            click.echo(f'  {ik.path}  ({_REASONS.get(ik.reason, f"ignored: {ik.reason}")})')
+        click.echo('')
+
+    if not census.unknown:
+        click.echo(f'OK: {config_path} has no unknown config keys.')
+        sys.exit(0)
+
+    click.echo(f'Found {len(census.unknown)} unknown config key(s) in {config_path}:')
+    for uk in census.unknown:
+        if uk.shadow_hint:
+            # Advisory ONLY: a shadow hint is a NAME match against the model
+            # tree and may be a coincidental collision, so it stays phrased as a
+            # question rather than an instruction to move the key.
+            click.echo(f'  {uk.path}  → did you mean {uk.shadow_hint}?')
+        else:
+            click.echo(f'  {uk.path}')
+    sys.exit(1)
 
 
 @main.command('verify-merge')
@@ -1095,9 +1199,30 @@ def _run_single_eval(
                 )
                 architect_results.append(result)
                 plan_quality = result.metrics.get('plan_quality')
+                # A cap-tainted cell names its infra failure inline, so an
+                # operator watching the run sees it LIVE rather than a bare
+                # `plan_quality=None` that reads like a scoring quirk. Healthy
+                # cells echo exactly as before.
+                #
+                # 'unmeasurable', not 'cap-tainted': the flag covers every cause
+                # that left no model content (cap hit, auth failure,
+                # model-not-found, wedge, harness error), and a PERMANENT config
+                # error must not read to the operator as a transient cap window.
+                # The marker that follows always names the actual cause.
+                taint = (
+                    f' unmeasurable: {result.metrics.get("invocation_error")}'
+                    if result.metrics.get('cap_tainted') else ''
+                )
+                # `steps=` is echoed BESIDE the score (task 3302) because it is
+                # the plan-production predicate the whole pipeline now keys on:
+                # `steps=0` beside any plan_quality means the architect produced
+                # nothing, which the final table floors to 0.0. Showing it live
+                # is what stops a no-plan candidate from looking healthy for the
+                # length of a campaign.
                 click.echo(
                     f'{result.task_id} × {result.config_name}: '
                     f'{result.outcome} plan_quality={plan_quality} '
+                    f'steps={result.metrics.get("plan_steps")}{taint} '
                     f'({result.wall_clock_ms / 1000:.1f}s)'
                 )
             else:
@@ -1185,14 +1310,31 @@ def _emit_composite_report(results, price_table) -> None:
     composite/cost/latency/CI95/judge report and prints
     :func:`format_composite_table`. The quality figure is single-sourced in λ's
     ``compute_composite`` — the driver never re-derives a score.
+
+    When *results* contain any PLAN-ONLY architect run, the θ plan-quality table
+    is emitted after it (task 3099), mirroring the precedent already in
+    :func:`_run_single_eval` rather than inventing a second rendering path. The
+    two tables are complementary, not redundant: the composite row reports the
+    cap-exclusion as a COUNT, while only the plan-quality table breaks it out BY
+    CAUSE — and that is what tells an operator reading an OFAT run whether a
+    missing architect cell is a transient cap window (rerun it) or a permanent
+    model-not-found (that candidate can never run at all). A result set with no
+    architect rows emits the composite table alone, so the existing
+    ``eval-matrix`` / ``eval-confirm`` end-to-end surfaces are unchanged.
     """
     from orchestrator.evals.report import (
         build_composite_report,
+        build_plan_quality_report,
         format_composite_table,
+        format_plan_quality_table,
     )
 
     report = build_composite_report(results, price_table=price_table)
     click.echo(format_composite_table(report))
+
+    if any(r.metrics.get('role_under_test') == 'architect' for r in results):
+        click.echo('')
+        click.echo(format_plan_quality_table(build_plan_quality_report(results)))
 
 
 def _run_ofat_driver(

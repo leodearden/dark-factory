@@ -29,11 +29,131 @@ CREATE TABLE IF NOT EXISTS write_ops (
     result_summary TEXT,
     success INTEGER DEFAULT 1,
     error TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    -- terminal_* (task 3582): the durable queue's TERMINAL outcome for this
+    -- write, written back by DurableWriteQueue's on_terminal hook.
+    --
+    -- TWO DIFFERENT FACTS, both kept. `success` above means "the enqueue was
+    -- ACCEPTED" — it is stamped the instant durable_queue.enqueue() commits,
+    -- which is genuinely useful for a caller that got a 200 back. These
+    -- columns mean "the write LANDED". Before they existed, a row for a write
+    -- with a 0% landing rate was byte-for-byte indistinguishable from a row
+    -- for a write that landed. `success`'s existing readers
+    -- (reconciliation/stage_stats.py, which gates on op.get('success', 1)) are
+    -- deliberately unchanged rather than silently redefined under them.
+    --
+    -- terminal_status domain:
+    --   NULL        no terminal outcome recorded — either still in flight, or
+    --               an operation that never goes through the durable queue at
+    --               all (search / delete_memory / task writes).
+    --   'completed' the queue executed the write successfully.
+    --   'dead'      the queue item EXHAUSTED ITS ATTEMPTS. Read this as "the
+    --               queue gave up", NOT as "the backend write never happened":
+    --               DurableWriteQueue._process_item runs the registered
+    --               callback (dual_write_episode / refresh_entity_summaries)
+    --               AFTER _execute_write has already returned, and a callback
+    --               that keeps failing dead-letters an item whose Graphiti
+    --               write DID land. Blind-replaying such an item duplicates
+    --               the write. That case is separable: the queue prefixes
+    --               terminal_error with POST_EXECUTE_DEAD_PREFIX
+    --               ('post-execute failure (the backend write LANDED; ...)')
+    --               when the failure happened after the backend call
+    --               succeeded. Absent that prefix, terminal_error is the
+    --               queue's own f'{type(exc).__name__}: {exc}' from a failed
+    --               execute. When in doubt, check backend_ops (joined on
+    --               write_op_id) before replaying.
+    --
+    -- LAST-WRITE-WINS: replay_dead resets a dead item to pending, so a
+    -- dead-letter that is later replayed and lands correctly re-stamps
+    -- 'completed' and clears terminal_error. A sticky-dead rule would leave a
+    -- permanently stale 'dead' on a write that did land.
+    --
+    -- NO WRITE-BACK RACE. Both queue producers INSERT their Layer-1 row AFTER
+    -- the enqueue commits (MemoryService.add_episode in a `finally`;
+    -- add_memory only after the synchronous Mem0 leg, a network/LLM round trip
+    -- of unbounded width), so a worker can legitimately reach a terminal state
+    -- BEFORE the row it wants to stamp exists. record_terminal_outcome
+    -- therefore UPSERTs rather than UPDATEs: it creates the row carrying the
+    -- terminal fact alone (operation NULL — stage_stats skips non-str
+    -- operations, and the dashboard's GROUP BY tolerates the bucket), and
+    -- log_write_op is itself an upsert whose DO UPDATE deliberately omits the
+    -- terminal_* columns, so the producer's late row fills in AROUND an
+    -- already-recorded outcome instead of clobbering it. There is no retry
+    -- ladder and no bounded window to outrun — a time-boxed retry would drop
+    -- the outcome exactly when the producer was slowest, which is exactly when
+    -- an operator most needs it.
+    --
+    -- HISTORICAL ROWS STAY NULL. _migrate() deliberately does NOT backfill
+    -- (unlike `kind`): a pre-change row's terminal outcome is genuinely
+    -- unknown, and inventing one would repeat the original sin of an audit
+    -- trail asserting more than it knows.
+    --
+    -- NO INDEX. The write-back is `WHERE id = ?`, a PRIMARY KEY seek. Adding
+    -- an index here is not free: see the idx_wo_created deployment note below,
+    -- where one measured ~47 s of one-time startup DDL on the live 16.6M-row
+    -- journal against a ~120 s watchdog startup grace.
+    --
+    -- OPERATOR AUDIT QUERY, now a single-row read with no join:
+    --   SELECT terminal_status, terminal_error FROM write_ops WHERE id = ?
+    -- (WriteJournal.get_write_op). Keep the standing caveat that any
+    -- JOIN-based query must go through write_op_id, NOT backend_ops.operation:
+    -- _execute_graphiti_write journals the literal 'add_episode' for BOTH the
+    -- add_episode and add_memory_graphiti paths, which is what reports ~8547
+    -- spurious add_episode "successes" when that column is filtered directly.
+    terminal_status TEXT,
+    terminal_at TEXT,
+    terminal_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_wo_causation ON write_ops(causation_id);
 CREATE INDEX IF NOT EXISTS idx_wo_project_time ON write_ops(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_wo_operation ON write_ops(operation);
+-- idx_wo_created (task 3304): the dashboard filters a BARE `WHERE created_at >= ?`
+-- in get_memory_timeseries / get_operations_breakdown / get_agent_breakdown
+-- (dashboard/src/dashboard/data/write_journal.py — cited by function name, not
+-- line number, so the reference survives edits to that file). Every other
+-- write_ops index has created_at in SECOND position, so none of them can
+-- range-seek that predicate — the queries full-scanned all 16.6M rows.
+-- Lives here rather than in _migrate() because initialize() runs
+-- executescript(SCHEMA_SQL) unconditionally on every start and the DDL is
+-- IF NOT EXISTS: this block alone builds the index once on an existing DB and is
+-- free thereafter. _migrate() is for ALTER TABLE column additions plus indexes
+-- that depend on those new columns; duplicating the DDL there would be lock-step
+-- duplication. Same shape as idx_bo_created on backend_ops below.
+--
+-- One-time build cost, measured 2026-07-31 on a page-for-page copy of the live
+-- journal (16,635,866 rows / 7.07 GB): 47.1 s wall, +696,004,608 bytes on disk
+-- (+9.9%, 7.069 -> 7.765 GB).
+--
+-- DEPLOYMENT — that 47.1 s is NOT 73 s of headroom under the ~120 s watchdog
+-- grace; the grace covers the WHOLE start-to-listening path, not just this DDL.
+-- initialize() is awaited at server/main.py:545, well before uvicorn accepts
+-- traffic, and the baseline it adds to (FalkorDB + Qdrant cold-start handshake
+-- plus event-buffer replay) "routinely runs 30-60s" per
+-- scripts/fused-memory.service.template. So the first start after this lands is
+-- ~77-107 s against STARTUP_GRACE_SECS = 120 in scripts/orchestrator-watchdog.py
+-- — roughly 13-43 s of real margin. Blow it and fused_memory_liveness_pass()
+-- sees port 8002 down past the grace and issues stop->start, SIGTERMing the
+-- in-progress CREATE INDEX; SQLite rolls the build back and the next start pays
+-- the full 47 s again — a restart loop that never converges, on the one restart
+-- that is supposed to deliver the index. The same restart can also blow the
+-- orchestrator's FM_RESTART_RETRY_WINDOW_SECS (120 s, sized against a "~15s
+-- observed fm start") and any deterministic deploy hook left at
+-- DeterministicRunner's default timeout_secs = 60.
+-- PREFERRED, therefore: build it out-of-band with fused-memory STOPPED, before
+-- the deploy restart --
+--   sqlite3 write_journal.db 'CREATE INDEX IF NOT EXISTS idx_wo_created ON write_ops(created_at);'
+-- -- after which initialize() finds it present and IF NOT EXISTS costs nothing.
+-- The alternative is to widen STARTUP_GRACE_SECS (and the deploy hook's
+-- timeout_secs) for that one restart. Either way, NEVER build it against a
+-- SERVING instance: busy_timeout is 5000 ms and log_write_op swallows its
+-- errors, so a multi-minute write-lock hold silently drops journal rows.
+--
+-- Steady state: created_at is monotonically increasing, so every insert is a
+-- right-most B-tree append — write amplification on the hot log_write_op path is
+-- negligible. The +9.9% is permanent and grows with the table, though: write_ops
+-- has no prune path (unlike prune_mem0_intents / prune_idempotent_ops), which is
+-- what sibling task ζ (journal growth alarm) exists to watch.
+CREATE INDEX IF NOT EXISTS idx_wo_created ON write_ops(created_at);
 
 CREATE TABLE IF NOT EXISTS backend_ops (
     id TEXT PRIMARY KEY,
@@ -165,6 +285,26 @@ class WriteJournal:
                 )
                 logger.info('Migration: added kind column to write_ops, backfilled reads')
 
+            # terminal_* (task 3582): the durable queue's eventual outcome,
+            # written back onto the write_op row. NULLable with no
+            # `NOT NULL DEFAULT`, which keeps SQLite's ADD COLUMN O(1) on the
+            # 16.6M-row live journal (no table rewrite, no startup stall — see
+            # the idx_wo_created deployment note in SCHEMA_SQL above).
+            # Deliberately NOT backfilled (unlike `kind`): a pre-change row's
+            # terminal outcome is genuinely unknown and must stay NULL rather
+            # than be guessed.
+            if 'terminal_status' not in existing:
+                await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_status TEXT')
+                logger.info('Migration: added terminal_status column to write_ops')
+
+            if 'terminal_at' not in existing:
+                await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_at TEXT')
+                logger.info('Migration: added terminal_at column to write_ops')
+
+            if 'terminal_error' not in existing:
+                await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_error TEXT')
+                logger.info('Migration: added terminal_error column to write_ops')
+
             # Indexes on new columns (safe after migration ensures columns exist)
             await db.execute(
                 'CREATE INDEX IF NOT EXISTS idx_wo_kind_time ON write_ops(kind, created_at)'
@@ -190,7 +330,19 @@ class WriteJournal:
         success: bool = True,
         error: str | None = None,
     ) -> None:
-        """Log a Layer 1 operation. Fire-and-forget — never raises."""
+        """Log a Layer 1 operation. Fire-and-forget — never raises.
+
+        An UPSERT rather than a plain INSERT (task 3582): the durable queue's
+        terminal write-back can legitimately reach this ``write_op_id`` before
+        its producer gets here — ``add_memory`` enqueues the Graphiti leg and
+        only journals this row after the synchronous Mem0 leg, an unbounded
+        network/LLM round trip — in which case ``record_terminal_outcome`` has
+        already created the row carrying the terminal fact alone. The
+        ``DO UPDATE`` therefore fills in every Layer-1 column and DELIBERATELY
+        OMITS ``terminal_status`` / ``terminal_at`` / ``terminal_error``, so the
+        late producer completes that row instead of clobbering the outcome it
+        was racing.
+        """
         try:
             async with self._txn() as db:
                 await db.execute(
@@ -198,7 +350,21 @@ class WriteJournal:
                        (id, causation_id, source, provenance, operation,
                         project_id, agent_id, session_id, kind,
                         params, result_summary, success, error, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           causation_id = excluded.causation_id,
+                           source = excluded.source,
+                           provenance = excluded.provenance,
+                           operation = excluded.operation,
+                           project_id = excluded.project_id,
+                           agent_id = excluded.agent_id,
+                           session_id = excluded.session_id,
+                           kind = excluded.kind,
+                           params = excluded.params,
+                           result_summary = excluded.result_summary,
+                           success = excluded.success,
+                           error = excluded.error,
+                           created_at = excluded.created_at""",
                     (
                         write_op_id,
                         causation_id,
@@ -290,6 +456,25 @@ class WriteJournal:
             params = (since, limit)
         async with db.execute(sql, params) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_write_op(self, write_op_id: str) -> dict | None:
+        """Return a single ``write_ops`` row by id, or ``None`` on a miss.
+
+        The no-join audit read. ``success`` answers "was the write ACCEPTED"
+        (the enqueue committed); ``terminal_status`` answers "did the write
+        LAND" (the durable queue reached ``completed`` / ``dead``). Reading
+        this row alone is now sufficient to tell those two facts apart — no
+        ``backend_ops`` join required, which matters because
+        ``backend_ops.operation`` is the literal ``'add_episode'`` for BOTH
+        the ``add_episode`` and ``add_memory_graphiti`` paths.
+        """
+        db = self._require_db()
+        async with db.execute(
+            'SELECT * FROM write_ops WHERE id = ?',
+            (write_op_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row is not None else None
 
     async def get_backend_ops_for_write_op(self, write_op_id: str) -> list[dict]:
         """Return all backend_ops linked to a write_op."""
@@ -464,6 +649,77 @@ class WriteJournal:
             logger.error(
                 f'Failed to resolve mem0_intent {intent_id} -> {status}: {e}'
             )
+
+    async def record_terminal_outcome(
+        self,
+        *,
+        write_op_id: str,
+        terminal_status: str,
+        terminal_error: str | None = None,
+    ) -> bool:
+        """Stamp the durable queue's terminal outcome back onto a write_op.
+
+        ``terminal_status`` is ``'completed'`` or ``'dead'``. Returns whether
+        the outcome was durably recorded.
+
+        ``success`` is deliberately LEFT UNTOUCHED: it means "the enqueue was
+        accepted", and its readers (``reconciliation/stage_stats.py``, which
+        gates on ``op.get('success', 1)``) keep their current meaning. This
+        method records a second, different fact — "the write landed" — rather
+        than redefining the first one under readers who never asked.
+
+        All three terminal fields are always written, so a replayed dead-letter
+        that later lands clears its stale ``terminal_error`` (last-write-wins).
+
+        UPSERT, NOT UPDATE. Both queue producers journal their Layer-1 row
+        AFTER the enqueue commits — ``add_episode`` in a ``finally``,
+        ``add_memory`` only after the synchronous Mem0 leg, a network/LLM round
+        trip of unbounded width — so a worker can reach a terminal state before
+        the row exists. A plain ``UPDATE`` would match 0 rows and drop the
+        outcome; a *time-boxed retry* would drop it precisely when the producer
+        was slowest, which is exactly when an operator most needs it, while
+        stalling the queue worker that awaits this call. Creating the row
+        instead makes the record unconditional: it carries the terminal fact
+        alone (``operation`` NULL — ``stage_stats`` skips non-``str``
+        operations), and the producer's later :meth:`log_write_op` upsert fills
+        in the Layer-1 columns without touching ``terminal_*``.
+
+        ``ON CONFLICT(id)`` is a PRIMARY KEY seek and needs no new index —
+        which matters, because building one on the live 16.6M-row journal costs
+        ~47 s of startup DDL (see the ``idx_wo_created`` note in
+        ``SCHEMA_SQL``).
+
+        Fire-and-forget per the journal's never-block discipline: logs loudly
+        and returns ``False`` on failure, never raises — a journaling hiccup
+        must not propagate into the queue worker that calls it.
+        """
+        try:
+            now = datetime.now(UTC).isoformat()
+            async with self._txn() as db:
+                await db.execute(
+                    """INSERT INTO write_ops
+                       (id, source, kind, created_at,
+                        terminal_status, terminal_at, terminal_error)
+                       VALUES (?, 'durable_queue', 'write', ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                           terminal_status = excluded.terminal_status,
+                           terminal_at = excluded.terminal_at,
+                           terminal_error = excluded.terminal_error""",
+                    (
+                        write_op_id,
+                        now,
+                        terminal_status,
+                        now,
+                        terminal_error,
+                    ),
+                )
+            return True
+        except Exception as e:
+            logger.error(
+                f'Failed to record terminal outcome {terminal_status} '
+                f'for write_op {write_op_id}: {e}'
+            )
+            return False
 
     async def get_incomplete_mem0_intents(self) -> list[dict]:
         """Return mem0_intents still ``pending``.

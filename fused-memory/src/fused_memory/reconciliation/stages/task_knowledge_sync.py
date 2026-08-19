@@ -16,8 +16,10 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+    from fused_memory.services.memory_service import MemoryService
 
 from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
@@ -40,6 +42,10 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
 )
+from fused_memory.reconciliation.mem0_tombstone import (
+    is_protected_mirror_record,
+    record_mem0_deletion_tombstones,
+)
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
@@ -50,6 +56,13 @@ from fused_memory.reconciliation.recon_pool_map import (
     STAGE2_CYCLE_SUMMARY_RECON_POOL as _STAGE2_CYCLE_SUMMARY_RECON_POOL,
 )
 from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.standing_decision_constants import (
+    EXPIRY_REASON_GROWTH,
+    STATE_ACTIVE,
+)
+from fused_memory.reconciliation.standing_decision_writer import (
+    expire_entity_standing_decision,
+)
 from fused_memory.reconciliation.summary_pool import (
     write_cycle_summary,
 )
@@ -58,6 +71,7 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY,
     SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY,
     SNAPSHOT_PRUNED_STAT_KEY,
+    SNAPSHOT_WRITTEN_STAT_KEY,
     TASK_COUNT_SNAPSHOT_CATEGORY,
     TASK_COUNT_SNAPSHOT_KIND,
     build_task_count_snapshot_content,
@@ -72,9 +86,21 @@ from fused_memory.reconciliation.task_filter import (
     render_active_section,
     select_done_since_boundary,
 )
-from fused_memory.services.live_workflow_detector import detect_live_workflow
-from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
+from fused_memory.services.live_workflow_detector import (
+    corroboration_for_task,
+    detect_live_workflow,
+    is_pure_gate_metadata,
+)
+from fused_memory.services.orchestrator_detector import (
+    is_orchestrator_live_for,
+    orchestrator_started_at,
+)
 from fused_memory.utils.async_utils import gather_collect
+
+try:
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover - escalation package is optional
+    Escalation = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +285,127 @@ async def _acknowledge_resolved_stage1_markers(
         return 0
 
 
+#: resolve_ticket statuses that constitute a confirmed task creation (task 3046).
+_TASK_CREATED_SUCCESS_STATUSES: frozenset[str] = frozenset({'created', 'combined'})
+
+
+def _count_valid_task_created_records(
+    records: object,
+    default_project_id: str | None = None,
+) -> int:
+    """Return the deduped count of confirmed task creations in *records* (task 3046).
+
+    *records* is ``report.stats['task_created_records']`` — the action-shaped
+    ground truth the '## Task-Creation Accounting' prompt section mandates
+    Stage 2 append to at the moment each ``resolve_ticket`` call confirms a
+    creation, modeled directly on ``flag_deleted_records``. A record counts
+    only when its ``status`` (case/whitespace-insensitive) is ``created`` or
+    ``combined`` AND it carries a non-empty ``task_id``; ``failed`` is NEVER
+    counted regardless of whether a ``task_id`` is present.
+
+    This is the ``resolve_ticket``-confirmed SUBSET of the '## Verifying Task
+    Operations' confirmation rule, not the whole of it: that section also lets
+    an agent count a creation via a ``get_task`` fallback when
+    ``resolve_ticket``'s ``status`` is neither ``created``/``combined``/
+    ``failed`` but a ``task_id`` is present and a follow-up ``get_task`` call
+    verifies it. That fallback path has no dedicated ``task_created_records``
+    status value and is intentionally NOT counted here — it still
+    contributes to the agent's own self-reported ``tasks_created``, and this
+    helper's result is only ever used to raise that self-report, never lower
+    it, so a ``get_task``-verified creation is never double-counted and never
+    suppressed by this helper (task-3046 amendment: '## Verifying Task
+    Operations' intentionally covers a strictly larger set of countable
+    creations than this Python subset does — the two are not claimed to be
+    equivalent).
+
+    Deduplication is keyed on ``(project_id, str(task_id))``, NOT on
+    ``task_id`` alone: Cross-Project Routing means the same numeric id can
+    legitimately be filed under two different projects in the same cycle
+    (Taskmaster ids are per-project), and that is two distinct tasks, not a
+    duplicate report of one. ``project_id`` is normalised the same way as
+    ``task_id`` — ``str(...).strip()`` — so ``' dark_factory'`` and
+    ``'dark_factory'`` collapse to one key instead of inflating the count
+    (task-3046 amendment). A record with no ``project_id`` (or one that is
+    blank after stripping) falls back to *default_project_id* — typically
+    the caller's own ``self.project_id`` — so an omitted field cannot
+    masquerade as a second, distinct cross-project filing of the same task.
+
+    Best-effort and non-raising throughout, mirroring
+    ``_acknowledge_resolved_stage1_markers`` above: *records* must be a
+    non-empty ``list`` or this returns ``0``; non-``dict`` entries and
+    entries that raise while being inspected are silently skipped rather
+    than aborting the count — a malformed record degrades to "not counted",
+    never to an exception that would corrupt an otherwise-good stage report.
+    """
+    if not isinstance(records, list) or not records:
+        return 0
+
+    seen: set[tuple[str | None, str]] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        try:
+            status = record.get('status')
+            if (
+                not isinstance(status, str)
+                or status.strip().lower() not in _TASK_CREATED_SUCCESS_STATUSES
+            ):
+                continue
+            task_id = record.get('task_id')
+            if task_id is None:
+                continue
+            task_id_str = str(task_id).strip()
+            if not task_id_str:
+                continue
+            project_id = record.get('project_id')
+            if project_id is None:
+                project_id_str = default_project_id
+            else:
+                project_id_str = str(project_id).strip() or default_project_id
+        except Exception:
+            continue
+        seen.add((project_id_str, task_id_str))
+
+    return len(seen)
+
+
+def _coerce_tasks_created_count(value: object) -> int:
+    """Best-effort int coercion for a self-reported ``tasks_created`` value (task 3046).
+
+    Stage 2 self-reports ``tasks_created`` as free-form LLM JSON, so it can
+    plausibly arrive as a clean ``int``, a numeric ``str`` (``"3"``), or a
+    ``float`` (``3.0``) instead. This coerces all three to ``int``. A
+    ``bool`` is explicitly rejected — never trusted as a count, even though
+    ``isinstance(True, int)`` holds in Python — and anything that fails
+    coercion (``None``, a non-numeric string, a list, ...) falls back to
+    ``0``, exactly like an absent value.
+
+    Without this, a non-``int`` self-report would collapse to ``0`` under a
+    bare ``isinstance(x, int)`` check, and a smaller record-derived
+    ``observed`` count could then look like an UNDERCOUNT and overwrite a
+    legitimately larger self-report — a silent downward move the
+    upward-only repair is explicitly designed never to make (task 2230 /
+    W5-mu).
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        try:
+            return int(stripped)
+        except ValueError:
+            pass
+        try:
+            return int(float(stripped))
+        except ValueError:
+            return 0
+    return 0
+
+
 def _marker_is_within_run_window(created_at: object, run_window_start: object) -> bool:
     """Return True iff *created_at* falls within the current run window.
 
@@ -394,9 +541,16 @@ async def _query_stage2_flags(
       count (task-1381).
 
     Both stale buckets are excluded from what is rendered to the Stage 2 LLM;
-    residue is reaped by the recon_ledger's TTL/terminal-task GC pass
-    (:func:`_gc_recon_markers`, task 2228 W5-κ) rather than an immediate
-    per-cycle delete by the caller.
+    residue is reaped by the in-cycle Mem0 age-GC sweep
+    (:func:`_sweep_stale_mem0_flag_for_stage2_markers`, task 2966) rather
+    than an immediate per-cycle delete by the caller. (Prior to task 2966
+    this docstring pointed at the recon_ledger's TTL/terminal-task GC pass,
+    :func:`_gc_recon_markers` — that pass STRUCTURALLY cannot reach these
+    markers: ``flag_for_stage2`` is written ONLY to Mem0 and is never
+    upserted into the recon_ledger, so ``ReconLedgerStore.gc()``'s
+    ``record_kind IN (...)`` clause never matches it.  See
+    ``recon_self_model.py``'s ``flag_for_stage2`` ``MARKER_LIFECYCLE`` entry
+    for the full declared-vs-actual explanation.)
 
     The *run_window_start* parameter is optional and defaults to ``None``
     (backward-compatible: window guard dormant, pure run_id partition applies).
@@ -631,6 +785,61 @@ _STAGE2_ESCALATION_MARKER_SOURCE = 'stage2_escalation_marker'
 STAGE2_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE = 'stage2_cycle_summary_trim'
 
+
+async def write_stage2_cycle_summary(
+    memory_service: MemoryService,
+    project_id: str,
+    report: StageReport,
+    run_id: str,
+    *,
+    remediation: bool = False,
+) -> bool:
+    """Write Stage 2's authoritative per-cycle ``cycle_summary`` ledger row.
+
+    Thin Stage-2-parametrized wrapper around
+    :func:`~fused_memory.reconciliation.summary_pool.write_cycle_summary`,
+    binding the four Stage-2-specific values (``stage='task_knowledge_sync'``,
+    ``recon_pool``, ``trim_source``, ``cap``) in exactly one place. Extracted
+    from the call formerly inlined in :meth:`TaskKnowledgeSync.run` (task
+    3732) so both the in-stage fast-path write (``run()`` below) and the
+    harness-level backstop
+    (``ReconciliationHarness._ensure_stage2_cycle_summary``) share the
+    identical binding — a future change to any of the four constants can
+    never silently diverge between the two call sites. This mirrors
+    :func:`~fused_memory.reconciliation.stages.memory_consolidator.write_stage1_cycle_summary`,
+    extracted for exactly that reason by task 2440.
+
+    Args:
+        remediation: Forwarded verbatim into the row's
+            ``payload['remediation']``. This is the one keyword Stage 1's
+            wrapper does not need: Stage 1 skips its own summary write on a
+            remediation pass, whereas Stage 2's write is unconditional and
+            fires on remediation passes too (see the cross-reference comment
+            at the ``run()`` call site — "Do not 'fix' this to mirror Stage
+            1's full-cycle-only gating"). ``get_cycle_summary_presence``
+            reads this flag to disambiguate an expected-missing row from a
+            genuine write failure, so both call sites must stamp the value
+            the pass actually had.
+
+    Returns:
+        ``True`` when the authoritative ledger upsert succeeded, ``False``
+        otherwise — see :func:`~fused_memory.reconciliation.summary_pool.write_cycle_summary`'s
+        "Returns" section for the full contract (the Mem0 mirror and pool-cap
+        trim run unconditionally regardless of this return value).
+    """
+    return await write_cycle_summary(
+        memory_service,
+        project_id,
+        report,
+        run_id,
+        stage='task_knowledge_sync',
+        recon_pool=_STAGE2_CYCLE_SUMMARY_RECON_POOL,
+        trim_source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+        cap=STAGE2_CYCLE_SUMMARY_POOL_CAP,
+        remediation=remediation,
+    )
+
+
 # Audit tag for _write_task_count_snapshot's deterministic write (task 2325)
 # — makes the Mem0 task_count_snapshot write structural (a plain Python
 # add_memory call at the end of run()) instead of depending on the Stage-2
@@ -673,6 +882,84 @@ _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE = 'stage2_persistence_marker_gc_sweep
 _STAGE1_FLAG_MARKER_MEM0_SOURCE = 'stage1_flag_marker'
 STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS: int = 14
 _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
+
+# Age-based GC for the Mem0-only flag_for_stage2 Stage-1 -> Stage-2 relay pool
+# (task 2966). flag_for_stage2 markers are written ONLY to Mem0 by the
+# Stage-1 flag_dedup/LLM add_memory path (metadata.flag_for_stage2=true); no
+# code path upserts a flag_for_stage2 row into recon_ledger, so
+# ReconLedgerStore.gc()'s record_kind IN (...) clause never matches it — the
+# same declared-vs-actual gap already documented above for
+# stage2_persistence_marker (task 2228 W5-κ). Unlike stage1_flag_marker /
+# stage2_persistence_marker, these markers carry NO ``source`` metadata field
+# at all (live verification, task 2966), so the pool cannot be identified by
+# a {'source': ...} filter — it is enumerated by the boolean payload key
+# {'flag_for_stage2': True} instead (Qdrant payload filters are
+# type-sensitive; the stored value is boolean True, not the string 'true').
+# A marker Stage 2 hasn't consumed in 14+ days can never be "current" per
+# _query_stage2_flags' run_id/run-window semantics (run_ids are per-cycle;
+# Stage 2 runs many times/day) — so it is definitionally unconsumed dead
+# signal past that point; 14 days reuses the task-1944
+# STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS convention for operator consistency.
+_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS: int = 14
+_FLAG_FOR_STAGE2_GC_SWEEP_SOURCE = 'flag_for_stage2_gc_sweep'
+_FLAG_FOR_STAGE2_ENUM_FILTERS: dict = {'flag_for_stage2': True}
+
+# Boolean/string type-drift probe (task 2966 amendment, reviewer finding).
+# _query_stage2_flags' consumer-side check (``meta.get('flag_for_stage2')``,
+# ~line 489) is a plain truthy check — it accepts BOTH the boolean True and
+# the string 'true'. The GC filter above is type-EXACT (boolean True only),
+# because Qdrant payload filters are type-sensitive. Nothing at the
+# add_memory write boundary normalizes this key's type (it is an LLM
+# tool-call argument, and only ``_normalize_task_id_metadata`` runs
+# server-side) — so a producer writing the string 'true' instead of the
+# boolean is not structurally prevented. Such a marker would be rendered
+# and consumed normally by _query_stage2_flags but INVISIBLE to the GC
+# filter above, and would accumulate forever, silently. This filter is used
+# by _warn_on_flag_for_stage2_type_drift to probe for that condition and
+# log loudly rather than let it grow unbounded and silent.
+_FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS: dict = {'flag_for_stage2': 'true'}
+
+# --- Entity-standing-decision growth-freshness sweep (task 2899 ζ) -----------
+# PRD plans/stage1-entity-standing-decision-prd.md §Staleness: a standing
+# decision's decision-time edge-count snapshot (``edge_count_at_decision``) is
+# corroborated against the LIVE graph at each Stage-2 tail. An ACTIVE row is
+# flipped to expired/growth when the entity has grown materially since the
+# decision:
+#     live > edge_count_at_decision * FACTOR
+#     OR live >= edge_count_at_decision + ABS_DELTA
+# (whichever trips first). The two-armed rule keeps a small entity from expiring
+# on a single-edge wobble (the ABS_DELTA floor) while still catching proportional
+# growth on a large entity (the FACTOR). These are the PRD contract defaults; each
+# is overridable PER RECORD via optional payload keys ``growth_factor`` /
+# ``growth_abs_delta`` (α's row-schema override path) — a local sweep constant
+# mirrors the file's existing convention (STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS).
+STANDING_DECISION_GROWTH_FACTOR: float = 1.25
+STANDING_DECISION_GROWTH_ABS_DELTA: int = 15
+
+# Per-cycle Stage-2 stats recorded by the growth sweep (explicit-zero, like the
+# marker-sweep stats): whether >=1 active row could not be verified this cycle
+# (fail-safe: the row is left ACTIVE) and how many rows were flipped to
+# expired/growth.
+ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY = (
+    'entity_standing_decision_growth_sweep_failed'
+)
+ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY = (
+    'entity_standing_decision_growth_expired'
+)
+
+# Consecutive-failure streak (in full+completed cycles) at which the growth
+# sweep files a recon escalation (INV-4). Mirrors the task-count-snapshot
+# miss-streak threshold; recomputed from the journal each cycle (no stored
+# counter), so any successful sweep resets it.
+GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD: int = 3
+
+# Escalation category for the growth-sweep failure streak (INV-4). Free-form str
+# on ``Escalation.category``; kept distinct from the Stage-1/Stage-2 recon
+# categories (reconciliation_stale_human_operator / reconciliation_stale_flag /
+# recon_stale_task_count_snapshot) so it can be filtered independently.
+ENTITY_STANDING_DECISION_GROWTH_SWEEP_ESCALATION_CATEGORY = (
+    'reconciliation_growth_sweep_failure'
+)
 
 
 async def _resolve_terminal_task_ids(
@@ -795,9 +1082,12 @@ async def _gc_recon_markers(
             Defaults to ``datetime.now(UTC)``; tests inject a fixed value.
             Normalized via :func:`_assume_utc` and rendered with
             ``.isoformat()`` to match the writer format used by
-            ``flag_dedup._persist_flag_marker``, so the ledger's
-            lexicographic TEXT comparison against stored ``expires_at``
-            values is correct.
+            ``flag_dedup.dedup_flags``, which writes
+            ``expires_at=(now + timedelta(days=14)).isoformat()`` from a
+            ``datetime.now(UTC)`` inline in the ledger upsert (no separate
+            helper — the marker write is not factored out), so the
+            ledger's lexicographic TEXT comparison against stored
+            ``expires_at`` values is correct.
 
     Returns:
         Number of rows deleted by the ``gc()`` pass (``0`` on any failure or
@@ -846,6 +1136,7 @@ async def _sweep_stale_mem0_pool(
     now: datetime | None = None,
     scroll_limit: int = 1000,
     count_short_circuit: bool = False,
+    enum_filters: dict | None = None,
 ) -> int:
     """Shared age-GC skeleton for a single-source Mem0 marker pool.
 
@@ -865,9 +1156,37 @@ async def _sweep_stale_mem0_pool(
     a fail-safe KEEP-on-uncertainty posture shared with every other marker
     sweep in this module.
 
+    **Protected-mirror invariant (task 3041): this skeleton NEVER deletes a
+    ``kind='cycle_summary'`` / ``record_type='ledger_stamp'`` record**, no
+    matter which pool filter selected it. Every enumerated member is tested
+    against
+    :func:`~fused_memory.reconciliation.mem0_tombstone.is_protected_mirror_record`
+    BEFORE the age check; a match is skipped with a WARNING naming the
+    memory_id, its kind/record_type and *log_name*, and is excluded from the
+    returned count. An over-broad payload filter therefore degrades to a LOUD
+    skip rather than collateral mirror loss.
+
+    The guard lives HERE rather than in each caller's payload filter because
+    filter-tightening cannot guarantee precision:
+    :data:`_FLAG_FOR_STAGE2_ENUM_FILTERS` is ``{'flag_for_stage2': True}``
+    with no ``kind``/``source``/``record_type`` discriminator at all, and
+    ``flag_for_stage2`` is an LLM-supplied metadata key that nothing at the
+    ``add_memory`` boundary stops a cycle_summary write from also carrying.
+    Enforcing at this single choke point also means every future caller
+    inherits the guard for free — the same reuse the task-2853 reviewer
+    created this factoring for.
+
     Deletes are issued best-effort in parallel via ``gather_collect``:
     individual failures log WARNING and are excluded from the returned
     count.
+
+    Every CONFIRMED-successful delete leaves a queryable tombstone via
+    :func:`~fused_memory.reconciliation.mem0_tombstone.record_mem0_deletion_tombstones`
+    (task 3041), naming *gc_sweep_source* as the deleter and *run_id* as the
+    deleting run — so an auditor holding only the memory uuid can find out who
+    reaped it and why. Written from the success branch ONLY: a tombstone must
+    never claim a record that is still alive, and written for the whole sweep
+    in ONE ledger transaction rather than one commit (one fsync) per victim.
 
     Args:
         memory_service: Service with ``get_memories_by_metadata`` and
@@ -876,7 +1195,11 @@ async def _sweep_stale_mem0_pool(
         project_id: Project scope for enumeration and delete calls.
         run_id: Current reconciliation run identifier used as
             ``causation_id`` in the audit journal.
-        source: The ``metadata.source`` value identifying this pool.
+        source: The ``metadata.source`` value identifying this pool. Also
+            used as the default enumeration/count filter (``{'source':
+            source}``) when ``enum_filters`` is not given, and always used
+            as the human-readable log label (e.g. in the scroll-cap
+            WARNING) regardless of which filter is actually applied.
         gc_sweep_source: The delete ``_source`` audit tag for this pool.
         max_age_days: Staleness cutoff in days.
         log_name: Public caller name, interpolated into log messages so
@@ -896,16 +1219,26 @@ async def _sweep_stale_mem0_pool(
             already-empty pool; deliberately NOT used for a still-active
             pool, where the count is almost never zero and the extra
             round-trip would be pure overhead.
+        enum_filters: Overrides the enumeration/count filter dict when the
+            pool cannot be identified by a ``{'source': source}`` payload
+            filter (e.g. a marker with no ``source`` field at all). Defaults
+            to ``None``, which preserves the ``{'source': source}`` filter
+            used by every caller before task 2966. When given, it is applied
+            verbatim to BOTH the ``count_short_circuit`` probe and the
+            enumeration scroll — ``source`` itself still supplies the
+            human-readable log label regardless.
 
     Returns:
         Number of memories successfully deleted (0 if nothing is stale, on
         enumeration failure, or on a confirmed-empty count short-circuit).
     """
+    filters = enum_filters if enum_filters is not None else {'source': source}
+
     if count_short_circuit:
         try:
             count = await memory_service.count_memories_by_metadata(
                 project_id=project_id,
-                filters={'source': source},
+                filters=filters,
             )
         except Exception:
             count = None
@@ -915,7 +1248,7 @@ async def _sweep_stale_mem0_pool(
     try:
         members = await memory_service.get_memories_by_metadata(
             project_id=project_id,
-            filters={'source': source},
+            filters=filters,
             limit=scroll_limit,
         )
     except Exception:
@@ -940,11 +1273,38 @@ async def _sweep_stale_mem0_pool(
 
     cutoff = _assume_utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
 
-    stale_ids: list[str] = []
+    # Full member dicts, not bare ids: the tombstone write below needs the
+    # victim's metadata/created_at at classification time (task 3041). Kept
+    # as one list so the zip(..., strict=True) delete/result pairing below is
+    # structurally unchanged.
+    stale_members: list[dict] = []
     for member in members:
         mid = member.get('id')
         if not mid:
             continue
+
+        # Protected-mirror exclusion (task 3041), checked BEFORE the age test
+        # so an over-broad payload filter degrades to a loud skip rather than
+        # collateral mirror loss. See this function's docstring for why the
+        # guard lives here instead of in each caller's filter.
+        member_metadata = member.get('metadata')
+        if is_protected_mirror_record(member_metadata):
+            metadata = member_metadata if isinstance(member_metadata, dict) else {}
+            logger.warning(
+                'reconciliation.%s: SKIPPING protected cycle_summary mirror '
+                'memory_id=%s (kind=%s record_type=%s) — this pool filter matched a '
+                'record it must never delete; the enumeration filter is over-broad '
+                'for this pool and should be tightened (task 3041).',
+                log_name, mid, metadata.get('kind'), metadata.get('record_type'),
+                extra={
+                    'project_id': project_id,
+                    'memory_id': mid,
+                    'run_id': run_id,
+                    'log_name': log_name,
+                },
+            )
+            continue
+
         raw = member.get('created_at')
         if raw is None:
             continue
@@ -954,9 +1314,9 @@ async def _sweep_stale_mem0_pool(
             continue
 
         if created_at < cutoff:
-            stale_ids.append(mid)
+            stale_members.append(member)
 
-    if not stale_ids:
+    if not stale_members:
         return 0
 
     # Two-tier check via gather_collect (fused_memory.utils.async_utils).
@@ -967,17 +1327,19 @@ async def _sweep_stale_mem0_pool(
     # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
     results = await gather_collect(
         memory_service.delete_memory(
-            memory_id=mid,
+            memory_id=member['id'],
             store='mem0',
             project_id=project_id,
             causation_id=run_id,
             _source=gc_sweep_source,
         )
-        for mid in stale_ids
+        for member in stale_members
     )
 
     success_count = 0
-    for mid, result in zip(stale_ids, results, strict=True):
+    tombstone_victims = []
+    for member, result in zip(stale_members, results, strict=True):
+        mid = member['id']
         if isinstance(result, Exception):
             logger.warning(
                 'reconciliation.%s: delete failed for memory_id=%s; not counted',
@@ -986,6 +1348,40 @@ async def _sweep_stale_mem0_pool(
             )
         else:
             success_count += 1
+            # Success branch ONLY (task 3041): a tombstone must never claim a
+            # record that is still alive, so the failed-delete branch above is
+            # deliberately left untouched.
+            tombstone_victims.append(member)
+
+    if tombstone_victims:
+        # ONE ledger transaction for the whole sweep, not one per victim: each
+        # upsert is its own commit — hence its own fsync, serialized on the
+        # single aiosqlite worker thread the rest of the cycle shares — so a
+        # per-victim loop made a backlog sweep cost N sequential fsyncs on the
+        # cycle's critical path (reviewer finding efficiency, task 3041
+        # amendment pass).
+        #
+        # record_mem0_deletion_tombstones is internally fail-safe (returns 0,
+        # never raises); this try/except is a second belt so even a helper that
+        # is patched/broken cannot raise out of, or alter the count of, this
+        # sweep — while still saying so out loud.
+        try:
+            await record_mem0_deletion_tombstones(
+                memory_service,
+                project_id,
+                tombstone_victims,
+                deleter=gc_sweep_source,
+                deleting_run_id=run_id,
+            )
+        except Exception:
+            logger.warning(
+                'reconciliation.%s: tombstone batch raised for %d deleted record(s); '
+                'the deletes themselves succeeded and are counted',
+                log_name, len(tombstone_victims),
+                exc_info=True,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
+
     return success_count
 
 
@@ -1016,7 +1412,10 @@ async def _sweep_stale_persistence_markers(
 
     Delegates to :func:`_sweep_stale_mem0_pool` (task 2853 amendment) for the
     shared enumerate -> age-filter -> gather_collect-delete -> count
-    skeleton — see that function's docstring for the fail-safe posture.
+    skeleton — see that function's docstring for the fail-safe posture and
+    for its protected-mirror invariant (task 3041): a ``kind='cycle_summary'``
+    / ``record_type='ledger_stamp'`` record is never deleted by this sweep,
+    whatever this pool's filter matches.
     ``count_short_circuit`` is deliberately left off here: unlike
     ``stage1_flag_marker`` (below), this pool's writer
     (:func:`_track_flag_persistence`) is still active, so a zero count would
@@ -1080,7 +1479,10 @@ async def _sweep_stale_mem0_flag_markers(
     shared enumerate -> age-filter -> gather_collect-delete -> count
     skeleton, with a distinct source filter, delete ``_source`` tag, and
     max-age constant from :func:`_sweep_stale_persistence_markers` — see
-    that function's docstring for the fail-safe posture.
+    that function's docstring for the fail-safe posture and for its
+    protected-mirror invariant (task 3041): a ``kind='cycle_summary'`` /
+    ``record_type='ledger_stamp'`` record is never deleted by this sweep,
+    whatever this pool's filter matches.
 
     Passes ``count_short_circuit=True`` (task 2853 review, efficiency
     finding): this pool's write path is fully retired, so once the legacy
@@ -1118,6 +1520,454 @@ async def _sweep_stale_mem0_flag_markers(
         scroll_limit=scroll_limit,
         count_short_circuit=True,
     )
+
+
+async def _warn_on_flag_for_stage2_type_drift(
+    memory_service,
+    project_id: str,
+    run_id: str,
+) -> None:
+    """Best-effort probe for the boolean/string type-drift gap (task 2966 review).
+
+    :func:`_sweep_stale_mem0_flag_for_stage2_markers`'s GC filter
+    (``_FLAG_FOR_STAGE2_ENUM_FILTERS`` == ``{'flag_for_stage2': True}``) is a
+    type-exact Qdrant payload match, but ``_query_stage2_flags``' consumer-side
+    check (``meta.get('flag_for_stage2')``) is a plain truthy check that also
+    accepts the string ``'true'``. Nothing at the ``add_memory`` write
+    boundary normalizes this key's type, so a producer writing the string
+    instead of the boolean would create a marker that Stage 2 renders and
+    consumes normally but that the GC filter can never see — an unbounded,
+    silent leak of exactly the shape this sweep exists to prevent.
+
+    Issues one supplementary ``count_memories_by_metadata`` call for the
+    string-typed variant (``_FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS``) and
+    logs a WARNING when it is a positive integer, so drift surfaces loudly
+    instead of accumulating quietly (reviewer's stated minimum floor: "at
+    minimum add a log/metric when ... a type drift surfaces loudly rather
+    than growing unbounded and silent").
+
+    Purely diagnostic and fail-safe: any exception, or any non-``int``/
+    non-positive result (e.g. a falsy probe or an unexpected return shape),
+    is treated as "nothing to report" — this must never raise and must never
+    affect the caller's sweep count.
+    """
+    try:
+        string_variant_count = await memory_service.count_memories_by_metadata(
+            project_id=project_id,
+            filters=_FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS,
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation._sweep_stale_mem0_flag_for_stage2_markers: '
+            'flag_for_stage2 string-variant type-drift probe raised; skipping '
+            'this diagnostic (fail-safe, does not affect the sweep count).',
+            exc_info=True,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+        return
+    if not isinstance(string_variant_count, int) or string_variant_count <= 0:
+        return
+    logger.warning(
+        'reconciliation._sweep_stale_mem0_flag_for_stage2_markers: found %d '
+        "flag_for_stage2 marker(s) stored as the string 'true' rather than "
+        'boolean True — _query_stage2_flags renders/consumes these normally '
+        "(truthy check) but this sweep's type-exact GC filter "
+        '(%r) can never match them, so they will accumulate forever; '
+        'investigate the producer (task 2966 review finding).',
+        string_variant_count,
+        _FLAG_FOR_STAGE2_ENUM_FILTERS,
+        extra={'project_id': project_id, 'run_id': run_id},
+    )
+
+
+async def _sweep_stale_mem0_flag_for_stage2_markers(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    max_age_days: int = _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
+    now: datetime | None = None,
+    scroll_limit: int = 1000,
+) -> int:
+    """Age-GC the Mem0-only ``flag_for_stage2`` relay pool (task 2966).
+
+    ``flag_for_stage2`` markers are the Stage-1 -> Stage-2 relay channel:
+    written ONLY to Mem0 by the Stage-1 flag_dedup/LLM ``add_memory`` path
+    (``metadata.flag_for_stage2=true``), with no code path that ever upserts
+    a ``flag_for_stage2`` row into the ``recon_ledger`` SQLite table. This
+    means :meth:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore.gc`
+    STRUCTURALLY cannot reap it — its ``record_kind IN (...)`` clause never
+    matches — even though ``recon_self_model.MARKER_LIFECYCLE`` classifies
+    ``flag_for_stage2`` as ``deleter=DELETER_GC`` (see that module for the
+    declared-vs-actual explanation, mirroring the identical
+    ``stage2_persistence_marker`` gap from task 2228 W5-κ). Absent this
+    sweep, the pool accumulates forever. This is the live in-cycle collector.
+
+    Delegates to :func:`_sweep_stale_mem0_pool` (task 2853 amendment) for the
+    shared enumerate -> age-filter -> gather_collect-delete -> count
+    skeleton, passing ``enum_filters=_FLAG_FOR_STAGE2_ENUM_FILTERS`` — the
+    DISTINCT boolean payload filter ``{'flag_for_stage2': True}`` — because
+    these markers carry no ``source`` metadata field to filter on (unlike
+    ``stage1_flag_marker`` / ``stage2_persistence_marker`` above), and
+    because the stored value is a boolean ``True``, not the string ``'true'``
+    (Qdrant payload filters are type-sensitive; live verification against
+    dark_factory Mem0 confirmed this shape). See
+    :func:`_sweep_stale_mem0_pool`'s docstring for the fail-safe posture.
+
+    That boolean-only filter has NO ``kind``/``source``/``record_type``
+    discriminator, so on its own it matches any record an LLM writer happened
+    to stamp ``flag_for_stage2=True`` on — including a cycle_summary mirror.
+    This sweep is therefore the concrete motivating case for the skeleton's
+    protected-mirror invariant (task 3041), which makes that over-breadth
+    degrade to a loud skip instead of collateral mirror loss.
+
+    Passes ``count_short_circuit=True``: unlike ``stage2_persistence_marker``
+    (written nearly every cycle that has surviving flags), Stage-1 writes a
+    ``flag_for_stage2`` marker only intermittently — whenever Stage 1 flags
+    an item for Stage 2 — so an empty pool is a plausible steady state,
+    especially on the many non-dark_factory projects this per-project
+    every-cycle sweep also runs on. A cheap
+    ``count_memories_by_metadata`` probe short-circuits that steady state;
+    it fails OPEN (see :func:`_sweep_stale_mem0_pool`'s docstring), so this
+    can only ever skip a scroll that would itself have found nothing.
+
+    After the primary sweep, also runs
+    :func:`_warn_on_flag_for_stage2_type_drift` (task 2966 amendment,
+    reviewer finding) — a supplementary best-effort probe for markers stored
+    with the string ``'true'`` instead of boolean ``True``, which the
+    type-exact GC filter above can never see even though such markers are
+    consumed normally by ``_query_stage2_flags``'s truthy check. Purely
+    diagnostic: never affects this function's return value.
+
+    Args:
+        memory_service: Service with ``get_memories_by_metadata``,
+            ``delete_memory``, and ``count_memories_by_metadata``.
+        project_id: Project scope for enumeration and delete calls.
+        run_id: Current reconciliation run identifier used as ``causation_id``
+            in the audit journal.
+        max_age_days: Staleness cutoff in days (default
+            ``_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS`` == 14).
+        now: Reference "current time" for the cutoff calculation. Defaults to
+            ``datetime.now(UTC)``; tests inject a fixed value.
+        scroll_limit: Max records to enumerate in one scroll (default 1000).
+
+    Returns:
+        Number of memories successfully deleted (0 if nothing is stale, on
+        enumeration failure, or on a confirmed-empty count short-circuit).
+    """
+    swept = await _sweep_stale_mem0_pool(
+        memory_service,
+        project_id,
+        run_id,
+        source='flag_for_stage2',
+        gc_sweep_source=_FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
+        max_age_days=max_age_days,
+        log_name='_sweep_stale_mem0_flag_for_stage2_markers',
+        now=now,
+        scroll_limit=scroll_limit,
+        count_short_circuit=True,
+        enum_filters=_FLAG_FOR_STAGE2_ENUM_FILTERS,
+    )
+    # Diagnostic-only; never affects the returned sweep count (task 2966
+    # amendment, reviewer finding — see _warn_on_flag_for_stage2_type_drift).
+    await _warn_on_flag_for_stage2_type_drift(memory_service, project_id, run_id)
+    return swept
+
+
+async def _sweep_entity_standing_decision_growth(
+    memory_service,
+    project_id: str,
+    run_id: str,
+) -> dict:
+    """Corroborate each ACTIVE entity_standing_decision against the live graph (ζ).
+
+    The growth-freshness sweep (task 2899), a sibling of the Stage-2-tail marker
+    sweeps. For each ACTIVE ``entity_standing_decision`` row it fetches the
+    entity's LIVE edge count via graphiti and EXPIRES the row (reason='growth',
+    through the single-source :func:`expire_entity_standing_decision` flip helper)
+    when the entity has grown materially past its decision-time snapshot:
+
+        live > edge_count_at_decision * factor
+        OR live >= edge_count_at_decision + abs_delta
+
+    ``factor`` / ``abs_delta`` default to :data:`STANDING_DECISION_GROWTH_FACTOR`
+    / :data:`STANDING_DECISION_GROWTH_ABS_DELTA` and are overridable per row via
+    optional payload keys ``growth_factor`` / ``growth_abs_delta`` (a non-numeric
+    override is ignored in favour of the default).
+
+    **Fail-safe (never raises):**
+
+    * Unwired ledger (``memory_service.recon_ledger`` is ``None``) ⇒
+      ``{'checked': 0, 'expired': 0, 'failed': False}`` — the sweep did not run,
+      which is NOT a failure (mirrors the writer's ledger-None convention).
+    * A failure LISTING the active rows ⇒ ``failed=True`` (nothing checked).
+    * A per-row error (unparseable/incomplete payload, live-edge fetch failure,
+      or flip failure) ⇒ that row is LEFT ACTIVE (TTL-bounded; re-verified next
+      cycle) and ``failed=True``; the sweep continues to the next row. Leaving a
+      row active on unverified information is strictly safer than expiring it —
+      the marker sweeps' uncertain⇒keep direction.
+
+    ``failed=True`` is the signal the Stage-2 tail feeds to the consecutive-
+    failure streak escalation (:func:`_maybe_escalate_growth_sweep_failures`).
+
+    Returns ``{'checked': int, 'expired': int, 'failed': bool}``.
+    """
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
+        return {'checked': 0, 'expired': 0, 'failed': False}
+
+    log_extra = {'project_id': project_id, 'run_id': run_id}
+    try:
+        rows = await ledger.list_entity_standing_decisions(project_id, state=STATE_ACTIVE)
+    except Exception:
+        logger.warning(
+            '_sweep_entity_standing_decision_growth: listing active standing '
+            'decisions failed for project_id=%s (sweep did not run)',
+            project_id, extra=log_extra, exc_info=True,
+        )
+        return {'checked': 0, 'expired': 0, 'failed': True}
+
+    checked = 0
+    expired = 0
+    failed = False
+    for row in rows:
+        checked += 1
+
+        # Reconstruct the decision-time snapshot + optional per-record overrides.
+        try:
+            payload = json.loads(row.payload_json)
+            decision_count = payload['edge_count_at_decision']
+        except Exception:
+            failed = True
+            logger.warning(
+                '_sweep_entity_standing_decision_growth: unreadable payload/snapshot '
+                'for entity_uuid=%s project_id=%s (left active)',
+                row.entity_uuid, project_id, extra=log_extra, exc_info=True,
+            )
+            continue
+        if not isinstance(decision_count, (int, float)):
+            failed = True
+            logger.warning(
+                '_sweep_entity_standing_decision_growth: non-numeric '
+                'edge_count_at_decision=%r for entity_uuid=%s project_id=%s (left active)',
+                decision_count, row.entity_uuid, project_id, extra=log_extra,
+            )
+            continue
+        factor = payload.get('growth_factor')
+        if not isinstance(factor, (int, float)):
+            factor = STANDING_DECISION_GROWTH_FACTOR
+        abs_delta = payload.get('growth_abs_delta')
+        if not isinstance(abs_delta, (int, float)):
+            abs_delta = STANDING_DECISION_GROWTH_ABS_DELTA
+
+        # Sample the live edge count — a fetch failure leaves the row ACTIVE.
+        try:
+            edges = await memory_service.graphiti.get_valid_edges_for_node(
+                row.entity_uuid, group_id=project_id
+            )
+            live = len(edges)
+        except Exception:
+            failed = True
+            logger.warning(
+                '_sweep_entity_standing_decision_growth: live edge fetch failed for '
+                'entity_uuid=%s project_id=%s (left active, TTL-bounded)',
+                row.entity_uuid, project_id, extra=log_extra, exc_info=True,
+            )
+            continue
+
+        if live > decision_count * factor or live >= decision_count + abs_delta:
+            try:
+                await expire_entity_standing_decision(
+                    ledger, row, reason=EXPIRY_REASON_GROWTH
+                )
+                expired += 1
+            except Exception:
+                failed = True
+                logger.warning(
+                    '_sweep_entity_standing_decision_growth: flip to expired/growth '
+                    'failed for entity_uuid=%s project_id=%s (left active)',
+                    row.entity_uuid, project_id, extra=log_extra, exc_info=True,
+                )
+
+    return {'checked': checked, 'expired': expired, 'failed': failed}
+
+
+# ── Growth-sweep failure-streak escalation (task 2899 ζ, INV-4) ──────────────
+# Pure helpers mirroring task_count_snapshot_cadence's streak-on-miss shape,
+# INVERTED to streak-on-failure: the counted flag is True=sweep-failed (a
+# Graphiti error left >=1 active row unverified this cycle), not False=miss. The
+# streak is recomputed from journalled prior-run stats each cycle (no persisted
+# counter), so any successful sweep resets it and it survives a restart.
+
+
+def _extract_growth_sweep_failed(stage_report: object) -> bool | None:
+    """Read the growth-sweep failed flag off a Stage-2 report.
+
+    Accepts a real ``StageReport`` (attribute access), a raw dict shape (a
+    journal-reconstructed report or test double), or ``None``.
+
+    Returns ``True`` when
+    ``stats[ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY] == 1``,
+    ``False`` when ``== 0``, and ``None`` when the report is ``None``, its
+    ``stats`` is absent, or the key itself is absent — "unknown", never
+    miscounted as a confirmed failure or a confirmed success.
+    """
+    if stage_report is None:
+        return None
+    if isinstance(stage_report, dict):
+        stats = stage_report.get('stats') or {}
+    else:
+        stats = getattr(stage_report, 'stats', None) or {}
+    value = stats.get(ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY)
+    if value == 1:
+        return True
+    if value == 0:
+        return False
+    return None
+
+
+def _compute_growth_sweep_failure_streak(recent_flags: list[bool | None]) -> int:
+    """Count the leading run of consecutive failures in *recent_flags*.
+
+    *recent_flags* is most-recent-first. Counts consecutive ``True`` entries
+    from the start, stopping at the first ``False`` (a successful sweep resets
+    the streak) or ``None`` (unknown — stop, fail-safe: an inconclusive cycle
+    must never be counted as either a failure or a reset).
+    """
+    streak = 0
+    for flag in recent_flags:
+        if flag is True:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _evaluate_growth_sweep_escalation(
+    current_failed: bool | None,
+    prior_flags: list[bool | None],
+    *,
+    threshold: int = GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD,
+) -> dict:
+    """Decide whether the current cycle's sweep failure should escalate.
+
+    Fail-safe short-circuit (checked before the streak is computed): when
+    *current_failed* is not ``True`` (i.e. ``False`` — the sweep succeeded this
+    cycle — or ``None`` — it did not run / was inconclusive) the streak is ``0``
+    and there is no escalation. Only a CONFIRMED current failure can trigger.
+
+    Otherwise the streak is ``_compute_growth_sweep_failure_streak(prior_flags)
+    + 1`` (the "+1" is the current confirmed failure) and ``escalate`` is
+    ``streak >= threshold``.
+
+    Returns ``{'streak': int, 'escalate': bool}``.
+    """
+    if current_failed is not True:
+        return {'streak': 0, 'escalate': False}
+    streak = _compute_growth_sweep_failure_streak(prior_flags) + 1
+    return {'streak': streak, 'escalate': streak >= threshold}
+
+
+async def _maybe_escalate_growth_sweep_failures(
+    escalation_queue,
+    journal,
+    project_id: str,
+    run_id: str,
+    current_failed: bool | None,
+    *,
+    threshold: int = GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD,
+) -> bool:
+    """File a level-1 recon escalation on a sustained growth-sweep failure streak.
+
+    Mirrors ``stage1_stall_detector.maybe_escalate_stalled_tasks`` (a Stage may
+    file a recon escalation directly via ``self._escalation_queue``) and the
+    harness's ``_maybe_escalate_stale_task_count_snapshot`` journal-recompute:
+    the consecutive-failure streak is recomputed each cycle from
+    ``journal.get_recent_runs`` rather than a stored counter, so it resets on any
+    successful sweep and survives a restart with no new schema.
+
+    * Fail-safe short-circuit: only a CONFIRMED current failure
+      (*current_failed* is ``True``) is eligible — a successful or inconclusive
+      cycle returns ``False`` WITHOUT a journal read (cheap steady state).
+    * Prior runs are filtered to full-cycle COMPLETED runs only, EXCLUDING the
+      current *run_id* (a remediation/targeted or still-running run neither
+      counts toward nor resets the streak — matching the snapshot cadence).
+    * On reaching *threshold*, a single ``Escalation`` (level=1) is filed under
+      a STABLE per-project synthetic key ``recon-esd-growth-sweep:<project_id>``
+      and deduped via ``escalation_queue.has_open_l1`` so a persistent streak
+      folds into one open escalation rather than re-filing every cycle.
+
+    Fails open — never raises (the journal read is wrapped too), so a journal
+    hiccup never aborts the Stage-2 tail. Returns whether a NEW escalation was
+    filed. No-op (``False``) when the ``escalation`` package is unavailable or
+    *escalation_queue* is ``None``.
+    """
+    if Escalation is None or escalation_queue is None:
+        return False
+    if current_failed is not True:
+        return False
+    try:
+        recent = await journal.get_recent_runs(project_id, limit=max(20, threshold * 4))
+        prior_runs = [
+            r for r in recent
+            if getattr(r, 'id', None) != run_id
+            and str(getattr(r, 'run_type', '')) == 'full'
+            and str(getattr(r, 'status', '')) == 'completed'
+        ]
+        # Defensive re-sort most-recent-first: get_recent_runs already orders by
+        # started_at DESC, but _compute_growth_sweep_failure_streak depends on it.
+        prior_runs.sort(
+            key=lambda r: getattr(r, 'started_at', None) or datetime.min.replace(tzinfo=UTC),
+            reverse=True,
+        )
+        prior_flags: list[bool | None] = []
+        for r in prior_runs:
+            stage_reports = getattr(r, 'stage_reports', None)
+            report = stage_reports.get('task_knowledge_sync') if isinstance(stage_reports, dict) else None
+            prior_flags.append(_extract_growth_sweep_failed(report))
+
+        result = _evaluate_growth_sweep_escalation(current_failed, prior_flags, threshold=threshold)
+        if not result['escalate']:
+            return False
+
+        key = f'recon-esd-growth-sweep:{project_id}'
+        if escalation_queue.has_open_l1(key):
+            logger.info(
+                'reconciliation.growth_sweep_failure_escalation_suppressed: '
+                'project_id=%s already has an open level-1 escalation',
+                project_id, extra={'project_id': project_id, 'run_id': run_id},
+            )
+            return False
+
+        streak = result['streak']
+        esc = Escalation(
+            id=escalation_queue.make_id(key),
+            task_id=key,
+            agent_role='reconciliation-stage2',
+            severity='blocking',
+            category=ENTITY_STANDING_DECISION_GROWTH_SWEEP_ESCALATION_CATEGORY,
+            summary=(
+                f'entity_standing_decision growth sweep failed for {streak} '
+                f'consecutive full cycles (project {project_id})'
+            ),
+            detail=(
+                'The reconciliation Stage-2 entity_standing_decision '
+                'growth-freshness sweep left >=1 ACTIVE row unverified (a Graphiti '
+                f'error) for {streak} consecutive completed full reconciliation '
+                f'cycles for project {project_id!r} (latest run_id={run_id}). '
+                'Active standing decisions may be growing stale without '
+                'corroboration; investigate Graphiti reachability for this project.'
+            ),
+            level=1,
+        )
+        escalation_queue.submit(esc)
+        return True
+    except Exception as e:
+        logger.warning(
+            'reconciliation.growth_sweep_failure_escalation_failed',
+            extra={'project_id': project_id, 'run_id': run_id, 'error': str(e)},
+        )
+        return False
 
 
 async def _verify_task_count_snapshot_written(
@@ -1849,12 +2699,48 @@ def _render_live_workflow_section(
     orchestrator lock also has the signal dropped (task 2409 — closes the
     repeated re-deferral loop this caused for tasks 2335/2196).
 
+    A PENDING deterministic PURE GATE — ``always_escalates`` truthy with no
+    ``before_done``, classified by :func:`is_pure_gate_metadata` and forwarded
+    as ``pure_gate`` — likewise has the project-wide signal dropped (task
+    3751).  Its entire ``DeterministicRunner`` run is "file one born-at-L2
+    escalation, stamp ``gate_escalated_at``, set status blocked": no script, no
+    systemd, no ``git_ops``, and (like every deterministic task) no
+    worktree/branch, so the bare lock can never be task-specific evidence for
+    it.  A pending deterministic task carrying a ``before_done`` KEEPS the
+    signal: that path runs a blocking deploy/predicate script while the status
+    is still ``'pending'`` (``Harness._run_deterministic_slot`` never flips it
+    to ``'in-progress'``) with no git evidence to reveal it.  Confirmed
+    incident: task 3845 was listed here with ONLY the bare ``orchestrator``
+    signal for 3+ consecutive reconciliation cycles, blocking its disposition.
+
+    **In-progress corroboration gate (task 2963).** For an ``in-progress`` task
+    whose only live signals are a lingering registered worktree and/or the
+    project-wide orchestrator lock (no ``recent_commit``), a fleet redeploy that
+    KILLED the workflow leaves both those signals falsely asserting liveness.
+    This renderer therefore computes an explicit per-task corroboration verdict
+    (:func:`corroboration_for_task`) for every in-progress task and passes it to
+    the detector as ``corroborated``.  Corroboration requires at least one FRESH
+    per-task signal, ANY sufficient: (1) a live claimant/heartbeat, (2) the
+    task_id present in the scheduler's ``current_holders``/``parks`` snapshot, or
+    (3) a ``routing.latest.decided_at`` newer than the orchestrator's start time
+    (parsed from the lock).  When none corroborates, the detector downgrades the
+    task to ``indeterminate`` (``is_live=False``) and the
+    ``if not liveness.is_live: continue`` below drops it from the section — so a
+    stranded post-redeploy task is no longer reported live, unblocking recon's
+    stranded-remediation path.  The scheduler-state snapshot and the
+    orchestrator start-time are hoisted once per render (like the orchestrator
+    hoist); both are fail-safe → ``None``.  Non-in-progress tasks pass
+    ``corroborated=None`` so the gate stays inert (behavior unchanged).
+
     Args:
         tasks: Task dicts from the active/proactive-sample pool.  Only tasks
             with a parseable ``id`` are inspected (non-int ids are skipped).
         project_root: Absolute path to the project root, forwarded to the
-            detector.
-        now: Injectable reference time for deterministic tests.
+            detector and used to read the orchestrator lock + scheduler-state
+            snapshot for the in-progress corroboration gate.
+        now: Injectable reference time for deterministic tests.  Also the
+            reference used for the claimant-heartbeat freshness check in the
+            in-progress corroboration gate.
 
     Returns:
         A Markdown section string (e.g. ``'### Live-Workflow Signals\\n...\\n'``),
@@ -1875,6 +2761,24 @@ def _render_live_workflow_section(
     kwargs: dict = {} if now is None else {'now': now}
     if project_orch_live is not None:
         kwargs['_orchestrator_live'] = project_orch_live
+
+    # Hoist the per-render corroboration inputs (task 2963), mirroring the
+    # orchestrator hoist above: both the scheduler-state snapshot and the
+    # orchestrator restart-boundary timestamp are constant for this
+    # project_root, so read each once. Both are wrapped fail-safe → None on any
+    # error (corroboration_for_task tolerates None inputs; a None simply means
+    # that corroboration signal cannot fire — never a raise). now_eff is the
+    # reference time threaded into the claimant-freshness check.
+    now_eff = now or datetime.now(UTC)
+    try:
+        scheduler_state: dict | None = read_scheduler_state(Path(project_root))
+    except Exception:
+        scheduler_state = None
+    try:
+        orch_started: datetime | None = orchestrator_started_at(project_root)
+    except Exception:
+        orch_started = None
+
     live_lines: list[str] = []
 
     for task in tasks:
@@ -1885,10 +2789,39 @@ def _render_live_workflow_section(
         raw_metadata = task.get('metadata')
         metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         task_kind = metadata.get('task_kind')
+        # `metadata` is already the isinstance-guarded dict above, so a task
+        # with absent/non-dict metadata yields pure_gate=False — fail-safe
+        # toward live. See the docstring's pending-pure-gate paragraph.
+        pure_gate = is_pure_gate_metadata(metadata)
+
+        # Per-task corroboration gate (task 2963). For an IN-PROGRESS task,
+        # compute an explicit corroboration verdict so the detector can downgrade
+        # a killed-but-lingering task — whose only live signals are a stale
+        # registered worktree and/or the project-wide orchestrator lock (no
+        # recent_commit) — to indeterminate (is_live=False), which the
+        # `if not liveness.is_live: continue` below then drops from the section.
+        # A fresh per-task signal (live claimant/heartbeat, scheduler
+        # holder/park, or a post-restart routing decision) keeps corroborated
+        # True and the task listed. Non-in-progress tasks pass corroborated=None
+        # so the gate stays inert (behavior unchanged). Fail-safe TOWARD live:
+        # any assembler error leaves corroborated=None.
+        corroborated: bool | None = None
+        if task.get('status') == 'in-progress':
+            try:
+                corroborated = corroboration_for_task(
+                    task, task_id, now=now_eff,
+                    scheduler_state=scheduler_state,
+                    orchestrator_started_at=orch_started,
+                )
+            except Exception:
+                corroborated = None
+
         try:
             liveness = detect_live_workflow(
                 task_id, project_root,
-                status=task.get('status'), task_kind=task_kind, **kwargs
+                status=task.get('status'), task_kind=task_kind,
+                pure_gate=pure_gate,
+                corroborated=corroborated, **kwargs
             )
         except Exception:
             logger.warning(
@@ -2105,43 +3038,39 @@ class TaskKnowledgeSync(BaseStage):
         # Stage 1's remediation payload never asked for one. Do not "fix" this
         # to mirror Stage 1's full-cycle-only gating.
         #
-        # Data-fidelity consequence, confirmed intentional (reviewer finding
-        # robustness-data-fidelity, task 2229 amendment pass round 2): the
-        # ledger upsert's primary key is (project_id, 'cycle_summary',
-        # flag_type=stage, run_id) — it does not distinguish a full cycle
-        # from its own remediation pass(es), which share that one run_id. So
-        # a remediation pass's write REPLACES the ledger row's payload
-        # (items_flagged_count, stats, llm_calls, tokens_used) with that
-        # pass's own — typically smaller — numbers; the full cycle's numbers
-        # are not retained in the ledger once a remediation pass has run.
-        # This is intentional, not a bug: the ledger row is a single
-        # current-state control-plane record for (stage, run_id), not a
-        # per-pass audit log, so "last write wins" (see
-        # ReconLedgerStore.upsert's own docstring) is the correct semantics
-        # here. A downstream consumer that needs the full cycle's own
-        # numbers specifically — not "whatever the latest pass produced" —
-        # must not rely on the ledger row alone: the best-effort Mem0 mirror
-        # (`add_system_record` is a fresh unkeyed insert per call, unlike the
-        # ledger's upsert) retains a short per-pass history up to
-        # STAGE2_CYCLE_SUMMARY_POOL_CAP entries, oldest evicted first — but
-        # that pool is itself best-effort and bounded, not a durable audit
-        # trail either. See test_remediation_pass_overwrites_full_cycle_ledger_payload
-        # (tests/test_stages.py) for the behavior this confirms.
+        # Data-fidelity note, run_id claim corrected (task 2995): the ledger
+        # upsert's primary key is (project_id, 'cycle_summary', flag_type=stage,
+        # run_id). Each remediation pass runs under its OWN fresh run_id — a
+        # new uuid4() minted per pass in harness.py's _maybe_remediate (see
+        # `run_id = str(uuid4())` there) — NOT the parent full cycle's run_id.
+        # So in normal operation a remediation pass's Stage 2 write does not
+        # collide with, and cannot overwrite, the parent full cycle's ledger
+        # row: it upserts a brand-new row keyed on its own distinct run_id.
+        # test_remediation_pass_overwrites_full_cycle_ledger_payload
+        # (tests/test_stages.py) exercises write_cycle_summary's "last write
+        # wins" upsert semantics for two calls that are deliberately made to
+        # share one run_id (see ReconLedgerStore.upsert's own docstring for
+        # the general semantics) — it documents what the upsert does WHEN a
+        # run_id collides, not a claim that a remediation pass and its parent
+        # cycle actually share a run_id in production; they don't.
         # remediation=self.remediation_mode (task 2652): lets Stage 3
-        # distinguish a Stage-2-only remediation run's expected missing
-        # Stage 1 (memory_consolidator) cycle_summary — Stage 1 early-returns
-        # before its own write on a remediation pass, by design — from a
-        # genuine Stage 1 write failure on a full cycle. See
-        # prompts/stage3.py's Stage-2-only remediation run exception.
-        ledger_written = await write_cycle_summary(
+        # distinguish a remediation pass's expected missing Stage 1
+        # (memory_consolidator) cycle_summary — Stage 1 still runs a focused
+        # turn and may emit findings on such a pass, but early-returns before
+        # reaching its own summary write, by design — from a genuine Stage 1
+        # write failure on a full cycle. See prompts/stage3.py's Remediation
+        # Run Exception.
+        # Routed through write_stage2_cycle_summary (task 3732) rather than
+        # calling write_cycle_summary inline: the harness-level backstop
+        # (ReconciliationHarness._ensure_stage2_cycle_summary) is a second
+        # call site, and the wrapper binds the four Stage-2 constants in
+        # exactly one place so they can never silently diverge between the
+        # two — the same drift task 2440 eliminated for Stage 1.
+        ledger_written = await write_stage2_cycle_summary(
             self.memory,
             self.project_id,
             report,
             run_id,
-            stage='task_knowledge_sync',
-            recon_pool=_STAGE2_CYCLE_SUMMARY_RECON_POOL,
-            trim_source=_STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
-            cap=STAGE2_CYCLE_SUMMARY_POOL_CAP,
             remediation=self.remediation_mode,
         )
         # Named "..._ledger_written", not "..._written" (reviewer finding
@@ -2236,7 +3165,7 @@ class TaskKnowledgeSync(BaseStage):
                 self.memory, self.project_id, run_window_start,
             )
         if task_count_snapshot_written is not None:
-            report.stats['task_count_snapshot_written'] = (
+            report.stats[SNAPSHOT_WRITTEN_STAT_KEY] = (
                 1 if task_count_snapshot_written else 0
             )
 
@@ -2280,7 +3209,65 @@ class TaskKnowledgeSync(BaseStage):
             self.memory, self.project_id, run_id,
         )
 
+        # Mem0-only flag_for_stage2 relay pool (task 2966): its only writer is
+        # the Stage-1 flag_dedup/LLM add_memory path, which writes solely to
+        # Mem0 (metadata.flag_for_stage2=true) — no code path upserts a
+        # flag_for_stage2 row into the recon_ledger, so ReconLedgerStore.gc()
+        # structurally cannot reach this pool (the same declared-vs-actual
+        # gap as stage2_persistence_marker above). Runs unconditionally every
+        # cycle, per-project, alongside the three sibling GC passes; explicit
+        # value so downstream consumers never need a .get(..., 0) fallback.
+        report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] = (
+            await _sweep_stale_mem0_flag_for_stage2_markers(
+                self.memory, self.project_id, run_id,
+            )
+        )
+
+        # Entity-standing-decision growth-freshness sweep (task 2899 ζ) — a
+        # sibling of the marker sweeps above, run at the Stage-2 TAIL (Stage 3 is
+        # read-only by design; PRD decision 9). Corroborates each ACTIVE standing
+        # decision's decision-time edge-count snapshot against the live graph and
+        # expires grown rows (reason='growth'); records explicit-zero stats and,
+        # on a full non-remediation cycle, evaluates the failure-streak escalation.
+        await self._run_entity_standing_decision_growth_sweep(report, run_id)
+
         return report
+
+    async def _run_entity_standing_decision_growth_sweep(
+        self,
+        report: StageReport,
+        run_id: str,
+    ) -> None:
+        """Run the ζ growth-freshness sweep and record its per-cycle stats (task 2899).
+
+        Delegates the row work to :func:`_sweep_entity_standing_decision_growth`
+        (best-effort, never raises), then records explicit-zero stats — the
+        ``failed`` flag (``1``/``0``) that the streak escalation reads next cycle
+        and the count of rows flipped to expired/growth — so downstream consumers
+        never need a ``.get(..., default)`` fallback.
+
+        The consecutive-failure streak escalation is evaluated ONLY on a full,
+        non-remediation cycle with a wired escalation queue: a remediation/targeted
+        pass must not inflate or reset the streak (mirroring the task-count-snapshot
+        cadence), and an unwired queue has nothing to file to. The filer itself is
+        journal-recompute + ``has_open_l1``-deduped and never raises.
+        """
+        result = await _sweep_entity_standing_decision_growth(
+            self.memory, self.project_id, run_id,
+        )
+        report.stats[ENTITY_STANDING_DECISION_GROWTH_SWEEP_FAILED_STAT_KEY] = (
+            1 if result['failed'] else 0
+        )
+        report.stats[ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY] = result['expired']
+
+        if not self.remediation_mode and self._escalation_queue is not None:
+            await _maybe_escalate_growth_sweep_failures(
+                self._escalation_queue,
+                self.journal,
+                self.project_id,
+                run_id,
+                result['failed'],
+            )
 
     async def _apply_post_flight_guards(
         self,
@@ -2292,15 +3279,47 @@ class TaskKnowledgeSync(BaseStage):
 
         ``report.stats['stage1_analytical_findings_processed']`` and
         ``report.stats['stage1_mem0_flags_processed']`` are Stage 2's
-        self-reported flag-processing counters. They are no longer clamped
-        against ground truth here: that reconciliation now happens via
-        ``derive_stage_stats`` + ``stats_verifier`` (task 2229), which
-        recompute canonical counters from the write journal.
+        self-reported flag-processing counters. The clamps that used to
+        check them against ground truth here were removed by task 2230
+        (W5-mu) and not replaced: neither counter is in
+        ``_COMPUTED_STAT_KEYS`` (stage_stats.py), so ``derive_stage_stats``
+        cannot recompute either from the write journal and
+        ``stats_verifier`` leaves both untouched. They remain purely
+        self-reported with no computed ground truth; this method only
+        normalizes their presence via ``setdefault(..., 0)`` below so
+        Stage 3's audit always sees a deterministic pair.
 
         Terminal-state, stall-guard-freshness, post-action-mismatch, and
         live-workflow writes are also no longer reclassified here: that write
         class is now rejected pre-write, server-side, by ``ReconWritePolicy``
         (task 2224), so post-hoc detection is redundant.
+
+        ``report.stats['tasks_created']`` (task 3046) is also normalized here,
+        plus repaired — UPWARD ONLY — against ``report.stats['task_created_records']``,
+        the action-shaped ground truth the '## Task-Creation Accounting' prompt
+        section mandates Stage 2 append to at the moment each ``resolve_ticket``
+        call confirms a creation. ``submit_task``/``resolve_ticket`` are not
+        journaled, so unlike the flag counters above, ``tasks_created`` has no
+        write-journal-derived ground truth to fall back on; a self-reported
+        undercount (e.g. a task filed mid-cycle via the Proactive Task Sample or
+        Cross-Project Routing, as in run 507bc25b) would otherwise stand
+        uncorrected. The self-reported value is coerced to ``int`` via
+        :func:`_coerce_tasks_created_count` (a numeric-``str``/``float`` self-report
+        normalizes in place; a ``bool`` or anything else uncoercible normalizes to
+        ``0``) *before* comparison, so a legitimately larger non-``int`` self-report
+        (e.g. ``"3"``) can never look like an undercount and get overwritten
+        downward — the coerced value is always what ends up in
+        ``report.stats['tasks_created']``, so normalization is real even when no
+        repair fires. The deduped valid-record count (project-scoped via
+        :func:`_count_valid_task_created_records`'s ``default_project_id``, so a
+        record with an omitted ``project_id`` collapses onto this stage's own
+        ``self.project_id`` rather than masquerading as a second cross-project
+        filing) is always published as ``report.stats['task_created_records_valid']``;
+        when it exceeds the coerced self-reported ``tasks_created``, the pre-repair
+        raw value is stashed under ``report.stats['tasks_created_reported']``,
+        ``tasks_created`` is overwritten, and a WARNING is logged. Never clamped
+        downward — task 2230 (W5-mu) deliberately removed symmetric clamping of
+        Stage 2's self-reported counters from this method.
 
         Args:
             report: The ``StageReport`` returned by ``super().run()``.
@@ -2333,6 +3352,41 @@ class TaskKnowledgeSync(BaseStage):
         # value.
         report.stats.setdefault('stage1_analytical_findings_processed', 0)
         report.stats.setdefault('stage1_mem0_flags_processed', 0)
+
+        # ── tasks_created accounting repair (task 3046) ─────────────────────
+        # tasks_created is a purely SELF-REPORTED counter: submit_task/resolve_ticket
+        # are not journaled (TaskInterceptor._journal_around covers only
+        # set_task_status/update_task/remove_tasks/add_dependency/remove_dependency),
+        # so derive_stage_stats cannot recompute it and stats_verifier leaves it
+        # untouched (not in _COMPUTED_STAT_KEYS).  task_created_records is the
+        # action-shaped ground truth the prompt now mandates — mirroring
+        # flag_deleted_records — so an increment missed on a mid-cycle
+        # proactive/cross-project filing is recovered here instead of lost
+        # (run 507bc25b reported tasks_created=0 while filing task 3045).
+        report.stats.setdefault('tasks_created', 0)
+        observed = _count_valid_task_created_records(
+            report.stats.get('task_created_records'),
+            default_project_id=self.project_id,
+        )
+        report.stats['task_created_records_valid'] = observed
+        reported = report.stats.get('tasks_created')
+        # Coerce before comparing (task-3046 amendment): a non-int self-report
+        # (e.g. "3" or 3.0) must not collapse to 0 and look like an undercount
+        # relative to `observed` — that would silently move a legitimately
+        # larger self-report DOWN, which the upward-only contract forbids.
+        # The coerced value is written back unconditionally so the "normalize"
+        # half of this block is real even when no repair fires.
+        reported_int = _coerce_tasks_created_count(reported)
+        report.stats['tasks_created'] = reported_int
+        if observed > reported_int:
+            report.stats['tasks_created_reported'] = reported
+            report.stats['tasks_created'] = observed
+            logger.warning(
+                'reconciliation.stage2_tasks_created_undercount: run_id=%s project_id=%s '
+                'self-reported tasks_created=%r but %d confirmed task_created_records were '
+                'emitted — repairing upward to %d.',
+                run_id, self.project_id, reported, observed, observed,
+            )
 
     async def _maybe_queue_briefing_refresh_tasks(self, run_id: str = '') -> None:
         """Best-effort: queue 'Refresh briefing' tasks for each briefing-known-gaps mismatch.
@@ -2762,6 +3816,11 @@ class TaskKnowledgeSync(BaseStage):
                     'flag_type': finding.get('flag_type'),
                     'finding_id': finding.get('finding_id'),
                     'content': finding.get('description'),
+                    # Hook B (task 2897 δ): carry the standing-decision
+                    # annotation through this re-projection so it renders into
+                    # the Stage 2 payload (_format_flagged json.dumps verbatim);
+                    # None when the finding was not adjudicated.
+                    'standing_decision_id': finding.get('standing_decision_id'),
                 }
             )
             if sig is not None:

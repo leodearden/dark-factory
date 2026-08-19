@@ -35,8 +35,13 @@ _ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
 if str(_ORCH_SRC) not in sys.path:
     sys.path.insert(0, str(_ORCH_SRC))
 
-from orchestrator import session_hooks  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]
-from orchestrator import session_registry  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]
+# noqa must sit on the STATEMENT's first line: E402 is reported at the start of
+# the import, so the per-name noqas ruff's I001 fix left on lines below suppress
+# nothing. The pyright ignores stay per-name, where each attribute is flagged.
+from orchestrator import (  # noqa: E402
+    session_hooks,  # pyright: ignore[reportAttributeAccessIssue]
+    session_registry,  # pyright: ignore[reportAttributeAccessIssue]
+)
 
 # Branch routing: the script dispatches on the first word of $CLAUDE_TERMINAL_CMD.
 FOREGROUND_NAMES = ["gnome-terminal", "xterm", "kitty"]
@@ -240,7 +245,12 @@ def _write_fake_claude_capturing_prompt_and_writing_result(
 
 
 def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
-    """Poll until *path* exists, raising ``AssertionError`` on timeout."""
+    """Poll until *path* exists, raising ``AssertionError`` on timeout.
+
+    Low-level primitive only -- direct callers should prefer
+    _wait_for_path_scaled (below) for a load-adaptive budget instead of a
+    fixed timeout; this function remains only as its poll implementation.
+    """
     deadline = time.monotonic() + timeout
     while not path.exists():
         if time.monotonic() >= deadline:
@@ -248,6 +258,75 @@ def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
                 f"Timed out after {timeout}s waiting for {path} to appear"
             )
         time.sleep(0.05)
+
+
+# _READINESS_WAIT_CAP_SECS: measured, not guessed -- on this host (nproc 32,
+# /proc/loadavg 100.32 => load-per-core 3.14), whole-test wall for every
+# _wait_for_path-gated test was <= 3.15s (konsole 2.46s, custom-term 1.72s,
+# sibling lanes 0.94-1.16s), and whole-test wall upper-bounds any single gate
+# inside it -- so a 30s ceiling is ~12x the worst observed gate.
+#
+# Deliberately NOT raised to 60 the way _NOT_FLAGGED_GRACE_BASE_SECS (below)
+# uses cap_secs=60: a started-grace is an upper bound the watchdog polls to
+# and the happy path never pays (see the comment above
+# _NOT_FLAGGED_GRACE_BASE_SECS), whereas a readiness-wait cap IS paid in full
+# on the failure path, so it stays tight rather than inheriting that raise.
+#
+# Headroom against the real per-test ceiling: `pytest --collect-only` reports
+# configfile: pyproject.toml (the repo root, which sets no `timeout`); the
+# value that actually governs this file is the --timeout=300 passed by
+# scripts/orchestrator.yaml:17. Worst case in the busiest rewired test
+# (test_window_close_129_robust_to_delayed_trap_install, whose readyfile
+# gate overrides cap_secs to 60 -- see _wait_for_path_scaled) is
+# 30 (pidfile) + 60 + 1.0 DELAY (readyfile) + 30 (proc.wait) = 121s,
+# comfortably inside 300s.
+_READINESS_WAIT_CAP_SECS = 30
+
+
+def _wait_for_path_scaled(
+    path: pathlib.Path,
+    base_secs: int,
+    *,
+    extra_secs: float = 0.0,
+    cap_secs: int = _READINESS_WAIT_CAP_SECS,
+) -> float:
+    """Wait for *path* with a load-scaled budget, and return the budget used.
+
+    A fixed _wait_for_path timeout races a host-load-dependent subprocess
+    startup chain -- observed once as
+    test_window_close_yields_129_not_hang[konsole] failing at
+    _wait_for_path(pidfile, timeout=5.0) during task 3451's step-7
+    full-suite verify, passing in isolation and on immediate rerun.
+
+    Returning the budget makes the policy assertable on an already-existing
+    path with zero sleeping -- the direct analogue of _set_started_grace
+    returning the int it wrote into env (see below), and the reason no
+    forbidden source-grepping meta-test is needed to pin the fix.
+
+    Floored at base_secs: an idle host (load-per-core <= 1) returns
+    base_secs unchanged, so every rewired call site stays byte-identical to
+    its old fixed pin on an unloaded host.
+
+    extra_secs exists for gates that sit behind a DELIBERATELY INJECTED,
+    wall-clock-fixed sleep (today only
+    test_window_close_129_robust_to_delayed_trap_install's DELAY = 1.0,
+    injected by _STRESS_DETACHING_TERM_TEMPLATE before $inner runs). Such a
+    sleep does not stretch with host load, so it is added UNSCALED and is
+    NOT subject to cap_secs -- only the load-dependent startup chain around
+    it is scaled.
+
+    cap_secs overrides _READINESS_WAIT_CAP_SECS for a call site whose
+    pre-existing budget already exceeded it -- mirroring
+    _NOT_FLAGGED_GRACE_BASE_SECS's own cap raise (30 -> 60) below. Today
+    only test_window_close_129_robust_to_delayed_trap_install's readyfile
+    gate needs this: its old inline form summed two INDEPENDENTLY-capped
+    _load_scaled_grace(5) halves (up to 2*30=60s under load), so collapsing
+    it onto the default single 30s cap would nearly halve its loaded-host
+    protection.
+    """
+    budget = _load_scaled_grace(base_secs, cap_secs=cap_secs) + extra_secs
+    _wait_for_path(path, timeout=budget)
+    return budget
 
 
 def _write_foreground_terminal(bin_dir: pathlib.Path, name: str) -> None:
@@ -265,16 +344,37 @@ def _write_detaching_terminal(
     p.chmod(0o755)
 
 
-def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
+def _hermetic_environ() -> dict[str, str]:
+    """Return a copy of the process environment with every known ambient
+    leak scrubbed -- the shared base for every env-construction site in
+    this file.
+    """
     env = dict(os.environ)
-    env["PATH"] = str(bin_dir) + ":" + env.get("PATH", "")
-    env["CLAUDE_TERMINAL_CMD"] = terminal_name
     env.pop("ESCALATION_TERMINAL_CMD", None)
     # The host's ~/.claude/settings.json env block (belt-and-braces layer of
     # the transcript-persistence fix) injects this into every Bash subprocess
     # -- including this pytest run. Drop it so the persistence-export tests
     # assert spawn-claude.sh's OWN unconditional export, not an ambient leak.
     env.pop("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", None)
+    # skills/spawn/spawn-claude.sh exports CLAUDE_SPAWN_SESSION_ID/PARENT_ID/
+    # WM_TITLE/RESULT_FILE into every session it launches (orchestrator adds
+    # ROLE/PROJECT/TASK_ID on top), so a suite run from INSIDE a spawned
+    # session -- e.g. an L2 escalation-watcher /unblock session running this
+    # suite before submitting a merge -- inherits them, while the merge
+    # worker's clean systemd unit never does, hiding the leak from CI.
+    # Prefix-generic by design (3rd point-fix of this class; the set keeps
+    # growing) -- sibling mechanism for the orchestrator suite:
+    # orchestrator/tests/test_session_hooks.py::_clear_claude_spawn_env
+    # (task 2643).
+    for key in [k for k in env if k.startswith("CLAUDE_SPAWN_")]:
+        env.pop(key, None)
+    return env
+
+
+def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
+    env = _hermetic_environ()
+    env["PATH"] = str(bin_dir) + ":" + env.get("PATH", "")
+    env["CLAUDE_TERMINAL_CMD"] = terminal_name
     # Keep the genuine-launcher-failure grace short so tests don't hang.
     env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
     # Isolate the session-registry writes spawn-claude.sh now performs
@@ -289,18 +389,240 @@ def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
     return env
 
 
+# _SPAWN_RUN_CAP_SECS: derived, not tuned. Worst-case single-test
+# composition on this channel is one _run_spawn/proc.wait budget plus at
+# most one _wait_for_path_scaled readiness gate (verified across every
+# _run_spawn call site that is followed by a _wait_for_path_scaled call:
+# _run_sibling_capture_spawn, test_sibling_mode_is_fire_and_forget, and
+# test_sibling_mode_foreground_emulator_is_fire_and_forget -- named by
+# function rather than line number, since line numbers rot as the file
+# shifts), so 120 + _READINESS_WAIT_CAP_SECS (30) = 150s, 2x headroom
+# inside the governing --timeout=300 (scripts/orchestrator.yaml's
+# test_command key -- the repo-root pyproject.toml sets no timeout and
+# shared/pyproject.toml's timeout=60 does not govern this file). Measured
+# happy path for the flaking test: 1.36-2.19s per param (n=6) at
+# load-per-core 2.2, so 120 is ~55x.
+#
+# Deliberately LARGER than _READINESS_WAIT_CAP_SECS (30): a readiness-wait
+# cap is paid in full on the failure path, whereas a subprocess wall-clock
+# bound is paid only when the child genuinely hangs -- the happy path
+# returns the instant the child exits. At the load-per-core 6.6 task 3451
+# documented for this host, base 30 scales to ceil(30*6.6)=198, so a cap of
+# 30 or 60 would discard most of the headroom this change exists to buy.
+_SPAWN_RUN_CAP_SECS = 120
+
+
+def _spawn_run_budget(base_secs: int) -> int:
+    """Load-scale a whole-invocation must-not-hang bound, floored and capped.
+
+    This is a must-not-hang guard, NOT a latency SLA -- every _run_spawn
+    caller's real contract is an exit code, not a wall-clock duration.
+
+    Returns the budget so the policy is assertable with zero sleeping,
+    which is why no source-grepping meta-test is needed to pin the fix
+    (same rationale as _wait_for_path_scaled above and _set_started_grace
+    below).
+
+    Delegates entirely to _load_scaled_grace, which floors at base_secs: an
+    idle host is byte-identical to the pre-existing fixed pins at every
+    _run_spawn call site, so this change can only lengthen a budget under
+    contention, never shorten one.
+    """
+    return _load_scaled_grace(base_secs, cap_secs=_SPAWN_RUN_CAP_SECS)
+
+
 def _run_spawn(
     env: dict[str, str],
     cwd: pathlib.Path,
     *,
     timeout: int = 30,
     title: str = "",
+    scale_timeout: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
+    """Invoke spawn-claude.sh and return its completed process.
+
+    `timeout` is a load-scaled BASE, not a fixed ceiling: it is a
+    must-not-hang guard, not a latency SLA -- every caller's real contract
+    is an exit code, not a wall-clock duration. Routed through
+    _spawn_run_budget by default, whose _load_scaled_grace floor makes an
+    idle host byte-identical to today's fixed pins at all ~25 call sites,
+    so this can only lengthen the bound under contention, never shorten
+    one.
+
+    scale_timeout=False is the documented opt-out for call sites whose
+    verdict is load-INSENSITIVE (the no-emulator/no-tmux 126 sites, per
+    task 3486's audit) -- there, scaling would only make a genuine
+    regression take longer to report.
+
+    `timeout` must be passed as an UNSCALED base. A caller that already
+    computed a load-adaptive value (e.g. via _set_started_grace or
+    _load_scaled_grace) and adds fixed margin on top -- as the
+    "must-not-be-flagged" family below does (grace + sleep + margin) --
+    must also pass scale_timeout=False, or _spawn_run_budget scales an
+    already-scaled number a second time, discarding that site's own
+    derivation under load instead of honoring it.
+    """
+    budget = _spawn_run_budget(timeout) if scale_timeout else timeout
     return subprocess.run(
         [str(SPAWN_SCRIPT), str(cwd), "false", title, "test prompt"],
         env=env,
         capture_output=True,
-        timeout=timeout,
+        timeout=budget,
+    )
+
+
+# ===========================================================================
+# task-3062: hermetic environment scrub for CLAUDE_SPAWN_* ambient leakage
+# ===========================================================================
+# Every test in this file that builds a child env from `dict(os.environ)`
+# inherits whatever CLAUDE_SPAWN_* vars happen to be set in the *runner's*
+# own environment -- real inside any spawned session (every L2
+# escalation-watcher /unblock session runs this suite before submitting a
+# merge) but invisible on the merge worker's systemd unit, which starts
+# clean. That asymmetry already produced two point-fixes in `_base_env`
+# (ESCALATION_TERMINAL_CMD, CLAUDE_CODE_FORCE_SESSION_PERSISTENCE) plus a
+# latent, still-passing false-negative below (test_no_emulator_found_yields_126
+# silently takes the tmux branch under an ambient CLAUDE_SPAWN_BACKEND=tmux).
+# The tests here pin the fix deterministically, by setting the leaking
+# variable themselves rather than depending on the runner's ambient state.
+
+
+def test_base_env_scrubs_every_claude_spawn_var(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_base_env` must drop every CLAUDE_SPAWN_*-prefixed var from the
+    inherited environment -- not just the vars this file happens to name
+    today.
+
+    Sets the four vars spawn-claude.sh itself splices into a spawned
+    session (SESSION_ID, PARENT_ID, WM_TITLE, RESULT_FILE), the three the
+    orchestrator adds on top (ROLE, PROJECT, TASK_ID -- see task 2940's
+    extension to
+    orchestrator/tests/test_session_hooks.py::_clear_claude_spawn_env), and
+    a synthetic CLAUDE_SPAWN_FUTURE_KNOB that exists nowhere in the
+    codebase. The synthetic one is the whole point: it is the only
+    assertion that can distinguish a prefix-generic scrub from a fourth
+    named enumeration.
+    """
+    for var in (
+        "CLAUDE_SPAWN_SESSION_ID",
+        "CLAUDE_SPAWN_PARENT_ID",
+        "CLAUDE_SPAWN_WM_TITLE",
+        "CLAUDE_SPAWN_RESULT_FILE",
+        "CLAUDE_SPAWN_ROLE",
+        "CLAUDE_SPAWN_PROJECT",
+        "CLAUDE_SPAWN_TASK_ID",
+        "CLAUDE_SPAWN_FUTURE_KNOB",
+    ):
+        monkeypatch.setenv(var, "leak")
+    monkeypatch.setenv("ESCALATION_TERMINAL_CMD", "leak")
+    monkeypatch.setenv("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "leak")
+
+    bin_dir = _make_bin_dir(tmp_path)
+    env = _base_env(bin_dir, "xterm")
+
+    leaked = [k for k in env if k.startswith("CLAUDE_SPAWN_")]
+    assert leaked == [], f"expected no CLAUDE_SPAWN_* vars to survive, found {leaked}"
+    assert "ESCALATION_TERMINAL_CMD" not in env
+    assert "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE" not in env
+
+    # The scrub must not be over-broad: the positive setup still survives.
+    assert env["CLAUDE_TERMINAL_CMD"] == "xterm"
+    assert env["SPAWN_LAUNCH_GRACE_SECS"] == "2"
+    assert "CLAUDE_FLEET_ROOT" in env
+    assert "CLAUDE_PROJECTS_DIR" in env
+    assert env["PATH"].startswith(str(bin_dir) + ":")
+
+
+def test_spawn_omits_wm_title_export_when_ambient_wm_title_leaks(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end reproduction of the reported false-red, made deterministic.
+
+    The sibling test below (test_spawn_omits_wm_title_export_when_title_empty)
+    only fails when the *runner's* own environment happens to carry
+    CLAUDE_SPAWN_WM_TITLE -- true inside a spawned session but never true on
+    the merge worker's clean systemd unit. This test sets the leak itself
+    via monkeypatch, so it fails on the merge worker too.
+    """
+    monkeypatch.setenv("CLAUDE_SPAWN_WM_TITLE", "ambient-leak-sentinel")
+
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.txt"
+    _write_fake_claude_capturing_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    result = _run_spawn(env, tmp_path, title="")
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _parse_captured_env(capture_file)
+    assert captured.get("CLAUDE_SPAWN_WM_TITLE", "") == "", (
+        f"expected no wm-title export for an empty title, got {captured!r}"
+    )
+
+
+@pytest.mark.skipif(
+    __import__("platform").system() == "Darwin",
+    reason="exit-126 path requires non-Darwin host",
+)
+def test_no_emulator_found_yields_126_ignores_ambient_spawn_backend(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Proves the OTHER `dict(os.environ)` sites in this file are hermetic
+    too, not just `_base_env`: an ambient CLAUDE_SPAWN_BACKEND=tmux must not
+    reroute this no-emulator scenario down the tmux lane.
+
+    Both leak paths exit 126 (spawn-claude.sh's "tmux not found" branch vs.
+    its "no terminal emulator found" branch), so an exit-code-only assertion
+    can't discriminate between them -- confirmed empirically that
+    `CLAUDE_SPAWN_BACKEND=tmux pytest ...::test_no_emulator_found_yields_126`
+    passes today despite taking the wrong branch. This test asserts on
+    stderr content instead.
+
+    RED before this file's own _hermetic_environ() fix: a raw
+    `dict(os.environ)` (this test's own construction, mirroring
+    test_no_emulator_found_yields_126 and test_tmux_backend_missing_tmux_
+    yields_126 below) passes the ambient CLAUDE_SPAWN_BACKEND straight
+    through, so the run takes the tmux branch and stderr says "tmux not
+    found" instead of "no terminal emulator found".
+    """
+    import shutil as _shutil
+
+    monkeypatch.setenv("CLAUDE_SPAWN_BACKEND", "tmux")
+
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+
+    # Minimal system-bin with only the utilities the script needs -- NO
+    # tmux, NO terminal emulator (mirrors test_no_emulator_found_yields_126's
+    # sys_bin exactly).
+    sys_bin = tmp_path / "sys_bin"
+    sys_bin.mkdir()
+    for util in ["bash", "mktemp", "sleep", "cat", "rm", "uname"]:
+        src = _shutil.which(util)
+        if src:
+            (sys_bin / util).symlink_to(src)
+
+    env = _hermetic_environ()
+    env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
+    env.pop("CLAUDE_TERMINAL_CMD", None)
+
+    # Task 3599 audit: same no-emulator availability-guard shape as
+    # test_no_emulator_found_yields_126 below -- rc==126 is load-INSENSITIVE
+    # (task 3486), so this stays unscaled rather than inheriting the new
+    # load-scaled default.
+    result = _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
+    stderr = result.stderr.decode()
+    assert result.returncode == 126, (
+        f"expected 126, got {result.returncode}\nstderr: {stderr}"
+    )
+    assert "no terminal emulator found" in stderr, (
+        f"expected the no-emulator branch (ambient CLAUDE_SPAWN_BACKEND must "
+        f"not leak through), got:\n{stderr}"
+    )
+    assert "tmux" not in stderr.lower(), (
+        f"expected the tmux branch NOT to run, got:\n{stderr}"
     )
 
 
@@ -369,7 +691,7 @@ def test_window_close_yields_129_not_hang(
     blind pre-signal sleep, making SIGHUP-after-trap-install deterministic
     under full-suite xdist load.
 
-    Synchronization contract (load-independent):
+    Synchronization contract -- the ORDERING below is load-independent:
       1. _DETACHING_TERM_TEMPLATE publishes the leader pid IMMEDIATELY after
          setsid (no blind sleep).
       2. The fake claude writes a readiness marker file before exec sleep 300.
@@ -378,6 +700,11 @@ def test_window_close_yields_129_not_hang(
          is installed.
       4. The test waits for BOTH the pidfile AND the readiness marker before
          sending SIGHUP — SIGHUP is always delivered after trap installation.
+
+    The WAIT BUDGETS around that ordering are a separate matter and are NOT
+    load-independent -- they are load-scaled via _wait_for_path_scaled (task
+    3486), after a burst-load excursion past a fixed 5.0s pidfile timeout was
+    observed here in test_window_close_yields_129_not_hang[konsole].
     """
     bin_dir = _make_bin_dir(tmp_path)
 
@@ -415,8 +742,11 @@ def test_window_close_yields_129_not_hang(
     # The pidfile appears first (published immediately by the terminal);
     # the readyfile appears only after spawn-claude.sh has armed its traps and
     # invoked the fake claude — proof that SIGHUP will land on a live HUP trap.
-    _wait_for_path(pidfile, timeout=5.0)
-    _wait_for_path(readyfile, timeout=10.0)
+    # Budgets are load-scaled (task 3486's _wait_for_path_scaled) rather than
+    # fixed, since a burst-load excursion past a fixed 5.0s pidfile timeout is
+    # exactly the flake that was observed here (this test, konsole lane).
+    _wait_for_path_scaled(pidfile, 5)
+    _wait_for_path_scaled(readyfile, 10)
 
     leader_pid = int(pidfile.read_text().strip())
     # Send SIGHUP to the entire process group of the session leader.
@@ -425,12 +755,25 @@ def test_window_close_yields_129_not_hang(
 
     # Must-not-hang guard — NOT a latency SLA.
     # The success path takes ~2-4s (await_sentinel 2s poll + pidfile handshake).
-    # A genuine hang is infinite (no sentinel ever written), so 15s cleanly
-    # separates pass from hang while staying well under the global 60s
-    # pytest-timeout (shared/pyproject.toml, timeout_method=signal), so this
-    # descriptive pytest.fail still fires before the blunt signal-kill.
+    # A genuine hang is infinite (no sentinel ever written), so a load-scaled
+    # budget (base 15s, capped at _READINESS_WAIT_CAP_SECS -- named
+    # explicitly rather than relying on _load_scaled_grace's own matching
+    # default) cleanly separates pass from hang while staying well under the
+    # governing 300s pytest-timeout: this file's rootdir/configfile is the
+    # repo-root pyproject.toml (verified via `pytest --collect-only`), whose
+    # [tool.pytest.ini_options] sets no `timeout` of its own -- so
+    # shared/pyproject.toml's timeout=60 does NOT govern this file, and the
+    # real ceiling is the --timeout=300 scripts/orchestrator.yaml:17 passes.
+    # This descriptive pytest.fail still fires well before that blunt kill.
+    #
+    # Deliberately NOT routed through _spawn_run_budget/_SPAWN_RUN_CAP_SECS
+    # (task 3599): this readiness-adjacent policy (cap 30) is a separate
+    # policy owner from that whole-invocation channel (cap 120) -- see the
+    # explicit divergence note in
+    # test_failed_to_start_detected_on_detached_exit0, the one Popen+wait
+    # site in this file that DOES use _spawn_run_budget.
     try:
-        rc = proc.wait(timeout=15)
+        rc = proc.wait(timeout=_load_scaled_grace(15, cap_secs=_READINESS_WAIT_CAP_SECS))
     except subprocess.TimeoutExpired:
         proc.kill()
         pytest.fail(
@@ -471,7 +814,16 @@ def test_genuine_launcher_failure_yields_127(
     fail_term.chmod(0o755)
 
     env = _base_env(bin_dir, terminal_name)
-    result = _run_spawn(env, tmp_path, timeout=15)
+    # Task 3599: dropped the fixed timeout=15 pin -- measured happy path
+    # 1.36-2.19s per param (n=6) at load-per-core 2.2 in this worktree, yet
+    # the old 15s bound was exceeded under merge-verify contention
+    # (escalation esc-3495-1, log
+    # data/verify-logs/3495/attempt-1.scripts.test-20260803T151949_260976Z.log).
+    # This was the only _run_spawn call in the file that LOWERED the bound
+    # below the default for a load-SENSITIVE assertion, and gained nothing
+    # by doing so: the contract is returncode == 127, not a latency SLA.
+    # Now inherits _run_spawn's load-scaled 30s default.
+    result = _run_spawn(env, tmp_path)
     assert result.returncode == 127, (
         f"[{terminal_name}] Genuine launcher failure must yield 127, "
         f"got {result.returncode}\nstderr: {result.stderr.decode()}"
@@ -500,12 +852,15 @@ def test_no_emulator_found_yields_126(tmp_path: pathlib.Path) -> None:
         if src:
             (sys_bin / util).symlink_to(src)
 
-    env = dict(os.environ)
+    env = _hermetic_environ()
     env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
     env.pop("CLAUDE_TERMINAL_CMD", None)
-    env.pop("ESCALATION_TERMINAL_CMD", None)
 
-    result = _run_spawn(env, tmp_path, timeout=10)
+    # Task 3599 audit: rc==126 is load-INSENSITIVE (no emulator on PATH
+    # fails the availability guard immediately; task 3486 measured 0.05s),
+    # so this stays unscaled rather than inheriting the new load-scaled
+    # default.
+    result = _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
     assert result.returncode == 126, (
         f"No emulator must yield 126, got {result.returncode}\n"
         f"stderr: {result.stderr.decode()}"
@@ -517,7 +872,7 @@ def test_bad_usage_yields_2(tmp_path: pathlib.Path) -> None:
     result = subprocess.run(
         [str(SPAWN_SCRIPT), "only-one-arg"],
         capture_output=True,
-        timeout=5,
+        timeout=_spawn_run_budget(5),
     )
     assert result.returncode == 2, (
         f"Bad usage must yield 2, got {result.returncode}"
@@ -587,19 +942,35 @@ def test_window_close_129_robust_to_delayed_trap_install(
 
     # Gate on BOTH the leader pid AND the readiness marker (post-trap proof).
     # The pid is published immediately; the readiness file appears only after
-    # the DELAY + $inner trap-install sequence completes. Budgets are
-    # load-scaled (task 2733's _load_scaled_grace, mirrored from the sibling
-    # transcript tests below) rather than fixed, so a load-slowed-but-correct
-    # run doesn't spuriously time out.
-    _wait_for_path(pidfile, timeout=_load_scaled_grace(5))
-    _wait_for_path(readyfile, timeout=_load_scaled_grace(5) + DELAY + _load_scaled_grace(5))
+    # the DELAY + $inner trap-install sequence completes. Both gates route
+    # through _wait_for_path_scaled (task 3486) -- the single policy owner
+    # for every readiness gate in this file, rather than hand-rolling the
+    # load scaling inline -- so a load-slowed-but-correct run doesn't
+    # spuriously time out. DELAY is a wall-clock-fixed injected sleep, not
+    # load-dependent, so it is passed as extra_secs and added unscaled on
+    # top of the scaled base.
+    #
+    # readyfile passes cap_secs=60 (not the default 30): the old inline form
+    # summed two INDEPENDENTLY-capped _load_scaled_grace(5) halves, up to
+    # 2*30=60s under load. A bare _wait_for_path_scaled(readyfile, 10) --
+    # single 30s cap -- would nearly halve that loaded-host budget (e.g.
+    # 61s -> 31s at the load-per-core 6.6 recorded near
+    # _NOT_FLAGGED_GRACE_BASE_SECS below); cap_secs=60 mirrors that same
+    # constant's own cap raise and keeps this gate's loaded-host protection
+    # >= what it replaces. The idle-host floor is unaffected by the cap
+    # either way: 5 + DELAY + 5 == _load_scaled_grace(10) + DELAY == 11.0s.
+    _wait_for_path_scaled(pidfile, 5)
+    _wait_for_path_scaled(readyfile, 10, extra_secs=DELAY, cap_secs=60)
 
     leader_pid = int(pidfile.read_text().strip())
     # SIGHUP arrives after the HUP trap is armed — must yield exit 129.
     os.killpg(leader_pid, signal.SIGHUP)
 
+    # Deliberately NOT routed through _spawn_run_budget/_SPAWN_RUN_CAP_SECS
+    # (task 3599) -- same readiness-adjacent policy (cap 30), left untouched
+    # for the same reason as test_window_close_yields_129_not_hang above.
     try:
-        rc = proc.wait(timeout=_load_scaled_grace(15))
+        rc = proc.wait(timeout=_load_scaled_grace(15, cap_secs=_READINESS_WAIT_CAP_SECS))
     except subprocess.TimeoutExpired:
         proc.kill()
         pytest.fail(
@@ -823,7 +1194,8 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
 
     RED today: resolve_detached's launch_rc==0 (no sentinel) branch calls the
     unbounded await_sentinel, which loops forever since the sentinel is never
-    written -> proc.wait(timeout=20) raises TimeoutExpired -> pytest.fail.
+    written -> proc.wait(timeout=_spawn_run_budget(20)) raises
+    TimeoutExpired -> pytest.fail.
     """
     bin_dir = _make_bin_dir(tmp_path)
 
@@ -837,6 +1209,13 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
     term.chmod(0o755)
 
     env = _base_env(bin_dir, "custom-term")
+    # Task 3451 audit: deliberately NOT routed through _set_started_grace.
+    # This test asserts the flag MUST fire, and its launcher exits 0
+    # without ever running the payload, so no evidence (sentinel,
+    # transcript, or claude descendant) can EVER appear -- the watchdog
+    # fires regardless of grace, and the verdict is load-insensitive. The
+    # short pin only bounds how long the test waits for that inevitable
+    # flag; _set_started_grace would merely make it slower.
     env["SPAWN_STARTED_GRACE_SECS"] = "2"
 
     proc = subprocess.Popen(
@@ -847,12 +1226,29 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
         start_new_session=True,
     )
 
-    # Must-not-hang guard, not a latency SLA -- mirrors
-    # test_window_close_yields_129_not_hang's Popen+wait(timeout) pattern.
-    # Pre-impl this hangs forever (unbounded await_sentinel), so a bounded
-    # wait cleanly separates pass/fail from an infinite hang.
+    # Must-not-hang guard, not a latency SLA. Pre-impl this hangs forever
+    # (unbounded await_sentinel), so a bounded wait cleanly separates
+    # pass/fail from an infinite hang. Task 3599: the bound is now
+    # load-scaled via _spawn_run_budget -- the same whole-invocation
+    # wall-clock policy _run_spawn itself uses, reached here via Popen+wait
+    # instead of subprocess.run. The rc==144 verdict IS load-sensitive (it
+    # needs the watchdog to flag AND the parent to exit), unlike the
+    # SPAWN_STARTED_GRACE_SECS pin above, which stays fixed on its own,
+    # different channel.
+    #
+    # Deliberate divergence, stated explicitly rather than left implicit:
+    # this file has two OTHER Popen+wait must-not-hang sites
+    # (test_window_close_yields_129_not_hang and
+    # test_window_close_129_robust_to_delayed_trap_install), both of which
+    # stay on _load_scaled_grace(15, cap_secs=_READINESS_WAIT_CAP_SECS)
+    # (cap 30) -- task 3486's readiness-gate policy, which this task's plan
+    # explicitly left untouched as outside its defect. This site does NOT
+    # mirror that pattern; it shares _spawn_run_budget's larger cap (120)
+    # instead, because it is the same whole-invocation wall-clock channel
+    # _run_spawn covers, just reached via Popen+wait rather than
+    # subprocess.run.
     try:
-        rc = proc.wait(timeout=20)
+        rc = proc.wait(timeout=_spawn_run_budget(20))
     except subprocess.TimeoutExpired:
         proc.kill()
         pytest.fail(
@@ -911,6 +1307,50 @@ def _load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
     return max(base_secs, min(cap_secs, math.ceil(base_secs * factor)))
 
 
+# _NOT_FLAGGED_GRACE_BASE_SECS: raised from 2 to 8 (task 3451). Derived, not
+# tuned -- on this host (nproc 32, /proc/loadavg 212 => load-per-core 6.6),
+# n=3 runs of the normal fast spawn shape (delay=0, grace=2, foreground
+# xterm, fake claude exiting 0) took 2.13s / 3.10s / 4.71s wall. The old 2s
+# pin sat BELOW that entire observed range -- the complete explanation of
+# the flake. 8 > 4.71 gives 1.7x margin from the floor alone, before load
+# scaling multiplies on top: at that same load the full policy yields
+# min(60, ceil(8 * 6.6)) = 53s, ~11x the worst measured happy path.
+#
+# The larger grace is free: measured wall-clock is NOT proportional to
+# grace (grace=2 -> 2.13-4.71s vs grace=90 (unpinned) -> 2.54-7.28s,
+# overlapping ranges) because _cleanup (skills/spawn/spawn-claude.sh:107)
+# kills the backgrounded watchdog at parent exit, so the grace is only an
+# upper bound the watchdog polls to, never a wait the happy path pays.
+#
+# cap_secs=60 (below) is RAISED by this change from _load_scaled_grace's
+# own default cap of 30 -- not unchanged. The raise is load-bearing, not
+# cosmetic: at load-per-core 6.6, ceil(8*6.6)=53 would otherwise be
+# clamped down to 30, discarding most of the load headroom the base bump
+# from 2 to 8 was meant to buy. 60 stays strictly below the 90s production
+# default (skills/spawn/spawn-claude.sh:89), so this pin never tests an
+# unreachable configuration.
+_NOT_FLAGGED_GRACE_BASE_SECS = 8
+
+
+def _set_started_grace(env: dict[str, str]) -> int:
+    """Compute and write the load-adaptive started-grace for tests that
+    assert the failed-to-start flag must NOT fire.
+
+    Delegates entirely to _load_scaled_grace so such tests inherit the
+    load-adaptive policy by default instead of each hand-picking a fixed
+    number (the third recurrence of a started-grace flake in this file:
+    task 2367 bumped 1s/2s -> 3s/8s, task 2733 added _load_scaled_grace, and
+    2733 missed this site). Writing the env var is part of the contract, not
+    a side effect a caller must remember to do -- it is what makes the
+    policy deterministically unit-testable (assert the returned int and the
+    string that landed in env) without a source-grepping meta-test to prove
+    call sites were rewired.
+    """
+    grace = _load_scaled_grace(_NOT_FLAGGED_GRACE_BASE_SECS, cap_secs=60)
+    env["SPAWN_STARTED_GRACE_SECS"] = str(grace)
+    return grace
+
+
 def test_load_scaled_grace_idle_host_returns_base_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -957,24 +1397,375 @@ def test_load_scaled_grace_getloadavg_error_returns_base(
     assert _load_scaled_grace(3, cap_secs=30) == 3
 
 
+# ===========================================================================
+# Task 3486: _wait_for_path_scaled -- load-scaled readiness-gate policy
+# ===========================================================================
+# FOURTH recurrence of the fixed-timeout-vs-load-dependent-startup flake
+# class in this file: task 2367 bumped a fixed started-grace 1s/2s -> 3s/8s;
+# task 2733 added _load_scaled_grace above; task 3451 added _set_started_grace
+# for the started-grace family; task 3486 (here) covers the _wait_for_path
+# readiness-gate family. Observed instance:
+# test_window_close_yields_129_not_hang[konsole] timing out at
+# _wait_for_path(pidfile, timeout=5.0) during task 3451's step-7 full-suite
+# verify -- passing in isolation and on immediate rerun (a burst-load
+# excursion past a fixed pin, not a genuine hang).
+
+
+def test_wait_for_path_scaled_returns_load_scaled_budget_on_loaded_host(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a loaded host, the returned budget matches _load_scaled_grace's own
+    output -- used as the oracle for arg-forwarding (cap_secs in
+    particular), so a change to how arguments reach _load_scaled_grace is
+    pinned here without duplicating its floor/scale/clamp/error-safe
+    arithmetic, already pinned once by the test_load_scaled_grace_* family
+    above. That oracle alone can't catch a bug shared by both functions, so
+    a literal expected value is also pinned below (96.0 loadavg / 32 cores
+    => load-per-core 3.0, base 5 => ceil(5 * 3.0) = 15).
+
+    The path already exists, so the call returns immediately: this is what
+    makes the policy assertable without ever sleeping.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    existing = tmp_path / "already-there"
+    existing.touch()
+
+    budget = _wait_for_path_scaled(existing, 5)
+    assert budget == 15
+    assert budget == _load_scaled_grace(5, cap_secs=_READINESS_WAIT_CAP_SECS)
+
+
+def test_wait_for_path_scaled_idle_host_floors_at_base(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle host (load-per-core < 1) floors at base_secs unchanged --
+    pinning the no-regression property that every rewired call site stays
+    byte-identical to the fixed pin it replaces on an unloaded host.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    existing = tmp_path / "already-there"
+    existing.touch()
+
+    assert _wait_for_path_scaled(existing, 5) == 5
+
+
+def test_wait_for_path_scaled_enforces_the_scaled_budget_not_the_base(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Propagation test -- the one property the return value alone cannot
+    prove: a buggy implementation could return the scaled number but still
+    pass the raw, unscaled base (or, for the second case below, a budget
+    without extra_secs) through to _wait_for_path. Points at a path that
+    never appears so the real enforced timeout is observable both via the
+    raised message and via measured wall-clock.
+
+    Deliberately sized at ~2s/~3s of real wall-clock (base_secs=1 x
+    load-per-core 2.0 => scaled budget 2; plus extra_secs=1.0 => 3); a
+    larger base would only make the suite slower without pinning anything
+    further.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    missing = tmp_path / "never-appears"
+
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match=r"Timed out after 2"):
+        _wait_for_path_scaled(missing, 1)
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 2.0, (
+        f"expected the SCALED budget (2s), not the 1s base, to be enforced; "
+        f"only waited {elapsed:.2f}s"
+    )
+
+    # extra_secs must reach _wait_for_path too, not just the return value --
+    # a buggy impl could compute `scaled + extra_secs` for the return but
+    # pass only `scaled` through to _wait_for_path, which the assertion
+    # above alone (extra_secs defaults to 0.0 there) would not catch.
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match=r"Timed out after 3"):
+        _wait_for_path_scaled(missing, 1, extra_secs=1.0)
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 3.0, (
+        f"expected the SCALED budget + extra_secs (3s) to be enforced; "
+        f"only waited {elapsed:.2f}s"
+    )
+
+
+def test_wait_for_path_scaled_adds_extra_secs_unscaled(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """extra_secs is added ON TOP of the scaled base, unscaled by load and
+    exempt from the cap -- the one gate shape a bare (path, base_secs)
+    signature cannot express:
+    test_window_close_129_robust_to_delayed_trap_install's readyfile gate,
+    which waits out a deliberately injected, wall-clock-fixed sleep (DELAY)
+    on top of the load-dependent subprocess-startup chain. A `sleep 1.0` in
+    a shell script takes 1.0s regardless of host load, so scaling it would
+    inflate the budget for a component that provably does not stretch; and
+    clamping it would silently eat a delay the test deliberately injected.
+
+    Both cases use an already-existing path so the call returns instantly.
+    """
+    existing = tmp_path / "already-there"
+    existing.touch()
+
+    # Loaded host (load-per-core 2.0): extra_secs is added on top of the
+    # scaled base, not folded into the scaling itself.
+    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+    assert _wait_for_path_scaled(
+        existing, 10, extra_secs=1.0
+    ) == _load_scaled_grace(10, cap_secs=_READINESS_WAIT_CAP_SECS) + 1.0
+
+    # Pathological host: the cap clamps only the scaled part; extra_secs
+    # survives the clamp untouched. Mirrors test_load_scaled_grace_clamps_to_cap
+    # one layer up.
+    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+    assert (
+        _wait_for_path_scaled(existing, 10, extra_secs=1.0)
+        == _READINESS_WAIT_CAP_SECS + 1.0
+    )
+
+
+def test_wait_for_path_scaled_cap_secs_override_widens_the_clamp(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cap_secs overrides _READINESS_WAIT_CAP_SECS per call site -- the knob
+    test_window_close_129_robust_to_delayed_trap_install's readyfile gate
+    relies on (cap_secs=60) to keep its loaded-host budget >= the two
+    independently-capped _load_scaled_grace(5) halves it replaced. Pinned
+    here at the policy layer so the override itself is tested once, rather
+    than only implicitly through that call site. Mirrors
+    test_load_scaled_grace_clamps_to_cap one layer up.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    existing = tmp_path / "already-there"
+    existing.touch()
+
+    # Default cap_secs still clamps at _READINESS_WAIT_CAP_SECS...
+    assert _wait_for_path_scaled(existing, 10) == _READINESS_WAIT_CAP_SECS
+    # ...but an explicit wider cap_secs clamps there instead.
+    assert _wait_for_path_scaled(existing, 10, cap_secs=60) == 60
+
+
+# ===========================================================================
+# Task 3599: _spawn_run_budget -- load-scaled must-not-hang guard for _run_spawn
+# ===========================================================================
+# FIFTH recurrence of the fixed-timeout-vs-load-dependent-startup flake class
+# in this file: task 2367 fixed-bumped a started-grace 1s/2s -> 3s/8s; task
+# 2733 added _load_scaled_grace; task 3451 added _set_started_grace; task 3486
+# added _wait_for_path_scaled for the readiness-gate family; task 3599 (here)
+# covers the whole-invocation wall-clock channel -- the `timeout` _run_spawn
+# hands to subprocess.run. Observed instance:
+# test_genuine_launcher_failure_yields_127[xterm] raising
+# subprocess.TimeoutExpired after a fixed 15s in merge worktree
+# _merge-dd5a8aa6 (escalation esc-3495-1, archived log
+# data/verify-logs/3495/attempt-1.scripts.test-20260803T151949_260976Z.log)
+# while passing in isolation.
+
+
+def test_spawn_run_cap_leaves_headroom_inside_governing_timeout() -> None:
+    """_SPAWN_RUN_CAP_SECS must leave headroom inside the governing
+    --timeout=300 (scripts/orchestrator.yaml's test_command key) even
+    stacked with one _wait_for_path_scaled readiness gate -- the worst-case
+    single-test composition _run_sibling_capture_spawn,
+    test_sibling_mode_is_fire_and_forget, and
+    test_sibling_mode_foreground_emulator_is_fire_and_forget each exercise
+    (a _run_spawn call followed by a _wait_for_path_scaled call).
+
+    Deliberately just this one static invariant between the two module-
+    level constants, no monkeypatching: the scale/floor/clamp arithmetic
+    _spawn_run_budget delegates to is already pinned by the
+    test_load_scaled_grace_* family above, and _spawn_run_budget's own
+    forwarding of it is pinned against real subprocess.run calls by the
+    test_run_spawn_* family below -- re-deriving that arithmetic a third
+    time here would be pure duplication (task 3599 amendment; a prior
+    revision of this test file had three test_spawn_run_budget_* tests
+    doing exactly that).
+    """
+    assert _SPAWN_RUN_CAP_SECS + _READINESS_WAIT_CAP_SECS < 300
+
+
+def _capture_spawn_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, **kwargs
+) -> float:
+    """Invoke _run_spawn with subprocess.run monkeypatched to a no-op stub
+    that records the `timeout` kwarg it was handed, so the load-scaling
+    policy is pinned as runtime behaviour (the actual argument
+    subprocess.run receives) without ever launching a real subprocess or
+    sleeping.
+    """
+    captured: dict[str, float] = {}
+
+    def _fake_run(argv, **kw):
+        captured["timeout"] = kw["timeout"]
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    _run_spawn({}, tmp_path, **kwargs)
+    return captured["timeout"]
+
+
+def test_run_spawn_scales_its_timeout_under_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A fixed wall-clock bound races a host-load-dependent startup chain --
+    observed as test_genuine_launcher_failure_yields_127[xterm] timing out
+    at a fixed 15s under merge-verify contention. The default `timeout=30`
+    _run_spawn hands to subprocess.run must itself be load-adaptive, not a
+    fixed 30, so every one of the ~20 call sites on the bare default is
+    covered by a single fix.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    timeout = _capture_spawn_timeout(monkeypatch, tmp_path)
+    assert timeout == _spawn_run_budget(30) == 90
+
+
+def test_run_spawn_explicit_timeout_is_a_scaled_base_not_a_fixed_pin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """An explicit `timeout=` argument is treated as a BASE routed through
+    _spawn_run_budget, not a ceiling -- so a caller that dialed down its
+    bound (e.g. the old timeout=15 at the reported flake site) still gets
+    load protection instead of racing the same fixed pin under contention.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    timeout = _capture_spawn_timeout(monkeypatch, tmp_path, timeout=20)
+    assert timeout == _spawn_run_budget(20) == 60
+
+
+def test_run_spawn_idle_host_timeout_is_byte_identical(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The no-regression guarantee for every existing call site: on an idle
+    host (load-per-core < 1), both the default and an explicit timeout
+    reach subprocess.run completely unchanged. Passes both before and
+    after step-4 -- intentionally; this is the no-regression guard, not a
+    RED test.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    assert _capture_spawn_timeout(monkeypatch, tmp_path) == 30
+    assert _capture_spawn_timeout(monkeypatch, tmp_path, timeout=10) == 10
+
+
+def test_run_spawn_scale_timeout_false_forwards_base_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """scale_timeout=False is the documented opt-out that preserves task
+    3486's audited decision for the load-INSENSITIVE 126/no-emulator sites
+    (rc==126 is decided by an immediate availability-guard failure; load-
+    scaling would only make a genuine regression take longer to report).
+    Pinned as a contract here rather than left as an undocumented
+    convention, so a future edit to _run_spawn cannot silently drop it.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (96.0, 96.0, 96.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    timeout = _capture_spawn_timeout(
+        monkeypatch, tmp_path, scale_timeout=False, timeout=10
+    )
+    assert timeout == 10
+
+
+# ===========================================================================
+# Task 3451: _set_started_grace -- shared started-grace policy for the
+# "must NOT be flagged failed-to-start" test family
+# ===========================================================================
+# Third recurrence of a started-grace flake in this file (task 2367 bumped a
+# fixed 1s/2s -> 3s/8s; task 2733 added _load_scaled_grace above but missed
+# wiring test_normal_spawn_exit0_not_flagged to it, leaving it pinned at a
+# fixed "2" against a 90s production default -- skills/spawn/spawn-claude.sh:89).
+# _set_started_grace both computes the load-scaled grace via
+# _load_scaled_grace AND writes it into env["SPAWN_STARTED_GRACE_SECS"], so
+# the fix is deterministically unit-testable here -- assert the returned int
+# and the string that landed in env -- instead of requiring a forbidden
+# source-grepping meta-test to prove call sites were rewired.
+
+
+def test_set_started_grace_writes_env_matching_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_set_started_grace delegates to _load_scaled_grace and writes the
+    identical value into env["SPAWN_STARTED_GRACE_SECS"] as a string.
+
+    The floor/scale/cap arithmetic itself is already pinned three ways by
+    the test_load_scaled_grace_* tests above (idle/scale/clamp/error-safe);
+    re-deriving that same arithmetic here through _set_started_grace would
+    just be duplicate coverage of task 2733's tests. The only contract that
+    is genuinely new at this layer is that _set_started_grace's return
+    value and the string it writes into env agree -- so this test uses
+    _load_scaled_grace itself as the oracle rather than hardcoding an
+    expected number, on an IDLE host (load-per-core < 1) where
+    _load_scaled_grace floors at the bare base unchanged.
+
+    That idle-host floor is also where _NOT_FLAGGED_GRACE_BASE_SECS's own
+    value must clear the parent script's measured happy-path startup
+    latency -- not just be a low fixed number. MEASURED, not guessed: on
+    this host (nproc 32, /proc/loadavg 212 => load-per-core 6.6) three runs
+    of the normal fast spawn shape (delay=0, grace=2, foreground xterm,
+    fake claude exiting 0) took 2.13s / 3.10s / 4.71s wall -- the whole
+    observed range sits ABOVE the old 2s pin, which is the complete
+    explanation of the reported flake in test_normal_spawn_exit0_not_flagged
+    (registry status intermittently failed-to-start instead of exited). A
+    floor of 8s clears the 4.71s worst case with a 1.7x margin, before any
+    load scaling multiplies on top of it.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    env: dict[str, str] = {}
+    grace = _set_started_grace(env)
+
+    assert grace == _load_scaled_grace(_NOT_FLAGGED_GRACE_BASE_SECS, cap_secs=60)
+    assert env["SPAWN_STARTED_GRACE_SECS"] == str(grace)
+    assert _NOT_FLAGGED_GRACE_BASE_SECS >= 8, (
+        "must-not-be-flagged started-grace floor must clear the measured "
+        f"worst-case happy-path spawn latency (4.71s at load-per-core 6.6); "
+        f"got {_NOT_FLAGGED_GRACE_BASE_SECS}"
+    )
+
+
 def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     """A fresh transcript file must suppress the failed-to-start flag.
 
     Proves the transcript detector is load-bearing. Uses a DETACHING launcher
     (custom-term, routing through resolve_detached's launch_rc==0 branch --
     the incident path) whose fake claude writes a transcript file under
-    $CLAUDE_PROJECTS_DIR/<enc>/ the moment it starts, then sleeps well past
-    the shrunk started-grace before exiting and letting $inner write the
-    sentinel. <enc> mirrors session_registry.transcript_path_for_cwd's
-    encoding: cwd with every '/' and '.' replaced by '-'.
+    $CLAUDE_PROJECTS_DIR/<enc>/ the moment it starts, then sleeps a fixed 8s
+    before exiting and letting $inner write the sentinel -- so the
+    transcript evidence is available from t~0, long before the sentinel can
+    possibly exist, and _started_watchdog (which polls continuously and
+    returns on first evidence) observes only the transcript. <enc> is COMPUTED
+    by session_registry.encode_cwd (the canonical: every '/', '.' and '_' maps
+    to '-', case preserved) rather than restated in prose or hand-copied here
+    -- see the comment at the assignment below for why.
 
-    Grace is load-adaptive (task 2733): SPAWN_STARTED_GRACE_SECS is
-    _load_scaled_grace(3), not a fixed 3s. Under merge-verify xdist
-    contention the fake launcher->claude->transcript startup chain can take
-    longer than any fixed margin -- this is the SECOND recurrence of this
-    exact flake (task 2367 already bumped the fixed value 1s/2s -> 3s/8s six
-    days before this one). Load-per-core headroom tracks the actual
-    contention instead of chasing a moving target with another fixed bump.
+    Grace is load-adaptive via _set_started_grace (task 3451), which shares
+    one policy across all three must-not-be-flagged sites in this file.
+    Originally task 2733's bare _load_scaled_grace(3) -- but a base of 3s
+    was ALSO below the measured 4.71s worst-case happy-path chain latency
+    (load-per-core 6.6), leaving residual exposure at low-but-nonzero load.
+    Under merge-verify xdist contention the fake launcher->claude->transcript
+    startup chain can take longer than any fixed margin -- this is the THIRD
+    recurrence of this exact flake (task 2367 already bumped the fixed value
+    1s/2s -> 3s/8s six days before task 2733's fix, which task 3451 now
+    supersedes here).
 
     The fake-claude sleep stays FIXED at 8s, decoupled from the now-larger
     grace: the only validity requirement is that the exit sentinel lands
@@ -988,12 +1779,21 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     """
     bin_dir = _make_bin_dir(tmp_path)
 
-    enc = str(tmp_path).replace("/", "-").replace(".", "-")
+    # THE canonical encoder, not a hand-copied expression. A local
+    # str.replace chain here is a mirror of the code under test, so it moves in
+    # lockstep with a bug in that code and can never detect one -- exactly how
+    # the missing '_' -> '-' rule survived a fully green suite (task 3272).
+    # encode_cwd is itself pinned to hard-coded real on-disk dir names by
+    # test_legibility_inventory.py's TestEncoderLockstep, so calling it gives
+    # this fixture a real oracle transitively. (A hard-coded literal, the
+    # strongest option, is not available: tmp_path is generated per run.)
+    enc = session_registry.encode_cwd(str(tmp_path))
 
     # Fake claude: write the transcript file immediately (mirroring a real
     # Claude Code session creating ~/.claude/projects/<enc>/*.jsonl the moment
-    # it starts), then outlast the shrunk started-grace before exiting -- so
-    # only the transcript probe (not the sentinel) can suppress the flag.
+    # it starts), then sleep a fixed 8s before exiting -- the transcript
+    # lands at t~0, long before the sentinel can exist, so only the
+    # transcript probe (not the sentinel) can suppress the flag.
     claude = bin_dir / "claude"
     claude.write_text(
         "#!/usr/bin/env bash\n"
@@ -1008,10 +1808,15 @@ def test_transcript_appearance_suppresses_flag(tmp_path: pathlib.Path) -> None:
     _write_detaching_terminal(bin_dir, "custom-term", pidfile)
 
     env = _base_env(bin_dir, "custom-term")
-    grace = _load_scaled_grace(3)
-    env["SPAWN_STARTED_GRACE_SECS"] = str(grace)
+    grace = _set_started_grace(env)
 
-    result = _run_spawn(env, tmp_path, timeout=grace + 8 + 6)
+    # scale_timeout=False (task 3599 amendment): `grace` is already
+    # load-scaled (_set_started_grace delegates to _load_scaled_grace), so
+    # routing grace + 8 + 6 through _spawn_run_budget would scale an
+    # already-scaled number a second time -- e.g. at load-per-core 3.0,
+    # grace=24 and the sum 38 would become ceil(38*3)=114, discarding this
+    # margin's own derivation instead of honoring it.
+    result = _run_spawn(env, tmp_path, timeout=grace + 8 + 6, scale_timeout=False)
 
     stderr = result.stderr.decode()
     assert result.returncode == 0, (
@@ -1042,17 +1847,20 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     evidence (the only positive signal available on this path).
 
     Uses a FOREGROUND launcher (xterm) whose fake claude writes no transcript
-    at all under $CLAUDE_PROJECTS_DIR, but stays alive (sleeping) well past
-    the shrunk started-grace before exiting. Since xterm's fake terminal
+    at all under $CLAUDE_PROJECTS_DIR, but stays alive (sleeping) for a fixed
+    6s before exiting -- so the watchdog observes it as a live descendant
+    long before it exits, regardless of grace. Since xterm's fake terminal
     `exec`s into the payload bash (see _FOREGROUND_TERM_SCRIPT), claude runs
     as a direct descendant of spawn-claude.sh's own $$ -- unlike a detached
     launcher (setsid + background job, reparented once the launcher process
     exits), where this probe is correctly always empty.
 
-    Grace is load-adaptive (task 2733) like
-    test_transcript_appearance_suppresses_flag: SPAWN_STARTED_GRACE_SECS is
-    _load_scaled_grace(2), not a fixed 2s, so the margin tracks host
-    contention instead of chasing a moving target with another fixed bump.
+    Grace is load-adaptive via _set_started_grace (task 3451), the same
+    policy as test_transcript_appearance_suppresses_flag. Originally task
+    2733's bare _load_scaled_grace(2) -- but a base of 2s was ALSO below
+    the measured 4.71s worst-case happy-path chain latency (load-per-core
+    6.6), leaving residual exposure at low-but-nonzero load. All three
+    must-not-be-flagged sites in this file now share one policy.
 
     The fake-claude sleep stays FIXED at 6s, decoupled from the now-larger
     grace: the only validity requirement is that the exit sentinel lands
@@ -1067,18 +1875,21 @@ def test_foreground_claude_descendant_suppresses_flag_without_transcript(
     bin_dir = _make_bin_dir(tmp_path)
     _write_foreground_terminal(bin_dir, "xterm")
 
-    # Fake claude: writes NO transcript anywhere, just outlasts the shrunk
-    # started-grace before exiting -- so only _claude_descendant_alive (not
+    # Fake claude: writes NO transcript anywhere, just stays alive (sleeping)
+    # for a fixed 6s before exiting -- so only _claude_descendant_alive (not
     # the transcript probe) can suppress the flag.
     claude = bin_dir / "claude"
     claude.write_text("#!/usr/bin/env bash\nsleep 6\nexit 0\n")
     claude.chmod(0o755)
 
     env = _base_env(bin_dir, "xterm")
-    grace = _load_scaled_grace(2)
-    env["SPAWN_STARTED_GRACE_SECS"] = str(grace)
+    grace = _set_started_grace(env)
 
-    result = _run_spawn(env, tmp_path, timeout=grace + 6 + 6)
+    # scale_timeout=False (task 3599 amendment): `grace` is already
+    # load-scaled (_set_started_grace delegates to _load_scaled_grace), so
+    # a second pass through _spawn_run_budget would double-count contention
+    # -- see the identical rationale on the transcript-evidence test above.
+    result = _run_spawn(env, tmp_path, timeout=grace + 6 + 6, scale_timeout=False)
 
     stderr = result.stderr.decode()
     assert result.returncode == 0, (
@@ -1137,6 +1948,14 @@ def test_foreground_launcher_failure_prefers_127_over_started_grace_race(
 
     env = _base_env(bin_dir, "xterm")
     env["SPAWN_LAUNCH_GRACE_SECS"] = "5"
+    # Task 3451 audit: deliberately NOT routed through _set_started_grace.
+    # Here the SHORT grace IS the premise -- it must stay well below the
+    # SPAWN_LAUNCH_GRACE_SECS="5" set on the line above, and load-scaling a
+    # base of 1 (via _set_started_grace or _load_scaled_grace) could exceed
+    # 5 under contention, inverting the exact 127-vs-144 ordering this test
+    # exists to pin. This is the opposite family from _set_started_grace's
+    # must-not-fire tests: here the flag firing fast is fine, so long as
+    # resolve_foreground's 127 verdict still wins the race.
     env["SPAWN_STARTED_GRACE_SECS"] = "1"
 
     result = _run_spawn(env, tmp_path, timeout=20)
@@ -1156,14 +1975,35 @@ def test_normal_spawn_exit0_not_flagged(tmp_path: pathlib.Path) -> None:
     watchdog is running concurrently in the background. Already green after
     step-2 (the sentinel check alone satisfies it) -- this pins the contract
     before step-4 adds more evidence probes.
+
+    Task 3451: fixes a load-sensitive flake from pinning
+    SPAWN_STARTED_GRACE_SECS to a fixed "2" against a 90s production
+    default. Under merge-verify contention the parent's own
+    launcher->claude->sentinel chain outran the fixed 2s window while all
+    three watchdog probes (sentinel, transcript, live claude descendant)
+    were still empty, so the watchdog overwrote the registry record with
+    failed-to-start AFTER the parent had already written exited, and
+    _cleanup (skills/spawn/spawn-claude.sh:107) then killed the watchdog
+    before its stderr echo -- which is exactly why the reported failure
+    showed registry=failed-to-start with a CLEAN stderr: it passed the
+    "failed-to-start" not in stderr assertion below and failed only the
+    final registry-status assertion. Now uses _set_started_grace, the same
+    load-adaptive policy as the sibling must-not-be-flagged tests, with a
+    grace-relative _run_spawn timeout so the same load that enlarges the
+    grace cannot convert this into a subprocess.TimeoutExpired flake
+    instead.
     """
     bin_dir = _make_bin_dir(tmp_path)
     _write_fake_claude(bin_dir, exit_code=0)
     _write_foreground_terminal(bin_dir, "xterm")
     env = _base_env(bin_dir, "xterm")
-    env["SPAWN_STARTED_GRACE_SECS"] = "2"
+    grace = _set_started_grace(env)
 
-    result = _run_spawn(env, tmp_path)
+    # scale_timeout=False (task 3599 amendment): `grace` is already
+    # load-scaled (_set_started_grace delegates to _load_scaled_grace) --
+    # see the identical double-scaling rationale on the two must-not-be-
+    # flagged tests above.
+    result = _run_spawn(env, tmp_path, timeout=grace + 20, scale_timeout=False)
 
     stderr = result.stderr.decode()
     assert result.returncode == 0, (
@@ -1346,6 +2186,19 @@ def test_spawn_fail_soft_skips_result_handback_when_registry_faults(
 # existing caller byte-identical.
 
 
+def _fake_claude_argv_capture_line(capture_file: pathlib.Path) -> str:
+    """The single shell line that dumps a fake ``claude``'s argv, NUL-delimited,
+    to *capture_file*.
+
+    Factored out so the argv-only writer below and the full-environment writer
+    used by the task-4015 tests (which captures argv *alongside* the
+    environment, and so cannot simply call the argv-only writer -- both write
+    the same ``bin_dir/claude`` path, and the second would overwrite the
+    first) stay byte-identical in what they record.
+    """
+    return f'printf "%s\\0" "$@" > {capture_file!s}\n'
+
+
 def _write_fake_claude_capturing_argv(
     bin_dir: pathlib.Path, capture_file: pathlib.Path
 ) -> None:
@@ -1364,8 +2217,8 @@ def _write_fake_claude_capturing_argv(
     p = bin_dir / "claude"
     p.write_text(
         "#!/usr/bin/env bash\n"
-        f'printf "%s\\0" "$@" > {capture_file!s}\n'
-        "exit 0\n"
+        + _fake_claude_argv_capture_line(capture_file)
+        + "exit 0\n"
     )
     p.chmod(0o755)
 
@@ -1861,16 +2714,11 @@ def test_tmux_backend_stamps_display_record(tmp_path: pathlib.Path) -> None:
     env["CLAUDE_SPAWN_BACKEND"] = "tmux"
     env["CLAUDE_SPAWN_PROJECT"] = "proj"
 
-    # Use a distinctive, non-empty title (unlike _run_spawn's hardcoded "")
-    # so the wm_title assertion below actually exercises the wiring instead
-    # of trivially matching an empty default.
+    # Use a distinctive, non-empty title so the wm_title assertion below
+    # actually exercises the wiring instead of trivially matching an empty
+    # default.
     title = "tmux-lane-display-test"
-    result = subprocess.run(
-        [str(SPAWN_SCRIPT), str(tmp_path), "false", title, "test prompt"],
-        env=env,
-        capture_output=True,
-        timeout=30,
-    )
+    result = _run_spawn(env, tmp_path, title=title)
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
@@ -1923,14 +2771,20 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
         if src:
             (sys_bin / util).symlink_to(src)
 
-    env = dict(os.environ)
+    env = _hermetic_environ()
     env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
     env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    # Task 3486 audit: SPAWN_LAUNCH_GRACE_SECS="2" and timeout=10 below stay
+    # FIXED on purpose -- rc==126 is load-INSENSITIVE (no tmux/emulator on
+    # PATH fails the availability guard immediately; load-scaling would only
+    # make a genuine regression take longer to report). Measured: 0.05s.
+    # Task 3599 audit: _run_spawn's timeout now load-scales by default, so
+    # the explicit scale_timeout=False below is what keeps this pin FIXED --
+    # both audits are one decision, not a reversal.
     env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
     env.pop("CLAUDE_TERMINAL_CMD", None)
-    env.pop("ESCALATION_TERMINAL_CMD", None)
 
-    result = _run_spawn(env, tmp_path, timeout=10)
+    result = _run_spawn(env, tmp_path, timeout=10, scale_timeout=False)
     assert result.returncode == 126, (
         f"missing tmux in tmux-backend mode must yield 126, got "
         f"{result.returncode}\nstderr: {result.stderr.decode()}"
@@ -1989,7 +2843,7 @@ def _run_sibling_capture_spawn(
         env["CLAUDE_SPAWN_PARENT_ID"] = spawner_parent_id
 
     result = _run_spawn(env, tmp_path)
-    _wait_for_path(capture_file, timeout=5.0)
+    _wait_for_path_scaled(capture_file, 5)
     captured = _parse_captured_env(capture_file)
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     return result, captured, fleet_root
@@ -2165,7 +3019,12 @@ def test_sibling_mode_is_fire_and_forget(tmp_path: pathlib.Path) -> None:
         "spawn-claude.sh returns"
     )
 
-    _wait_for_path(started, timeout=5.0)
+    # Safe to lengthen under load: the done-marker snapshot carrying the
+    # actual fire-and-forget assertion was already taken above, and in
+    # fire-and-forget mode nothing rewrites the registry record after
+    # launch, so the record.status == RUNNING assertion below has no
+    # upper-bound dependency on how long this wait took (task 3486 audit).
+    _wait_for_path_scaled(started, 5)
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
@@ -2232,11 +3091,389 @@ def test_sibling_mode_foreground_emulator_is_fire_and_forget(tmp_path: pathlib.P
         "undetached child"
     )
 
-    _wait_for_path(started, timeout=5.0)
+    _wait_for_path_scaled(started, 5)
 
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     record_path = _find_one_record(fleet_root)
     record = session_registry.SessionRecord.from_json(record_path.read_text())
     assert record.status == session_registry.Status.RUNNING, (
         f"expected a best-effort refresh to RUNNING, got {record.status}"
+    )
+
+
+# ===========================================================================
+# task-4015: CLAUDE_SPAWN_* launch inputs are consumed, then REMOVED from the
+# spawned session's own environment
+# ===========================================================================
+# spawn-claude.sh's inputs (CLAUDE_SPAWN_CLAUDE_ARGS / MODE / MODEL / BACKEND /
+# TMUX_SESSION / ...) reach it by ordinary environment inheritance, and until
+# task 4015 nothing removed them from the environment the payload then exec'd
+# `claude` with. A spawned session therefore carried its OWN launch parameters
+# forward, and its Bash tool handed them straight back to the next
+# spawn-claude.sh it ran -- so an inherited value was re-served as apparent
+# caller intent one level down.
+#
+# The 2026-08-11 incident: a fleet crash-recovery launch sets
+# CLAUDE_SPAWN_CLAUDE_ARGS="--resume <that session's own id>". The recovered
+# session inherited it, and its next /spawn -- meant to be a FRESH sibling --
+# came up as a live resume of the spawner instead.
+#
+# Every test below poisons the namespace EXPLICITLY on top of _base_env's
+# prefix scrub (see test_base_env_scrubs_every_claude_spawn_var), rather than
+# depending on the runner's ambient state, so they fail on the merge worker's
+# clean systemd unit too -- same rationale as the task-3062 tests above.
+
+
+def _write_fake_claude_dumping_full_env(
+    bin_dir: pathlib.Path,
+    capture_file: pathlib.Path,
+    argv_file: pathlib.Path | None = None,
+) -> None:
+    """Write a fake ``claude`` that dumps its ENTIRE environment (NUL-delimited,
+    via ``env -0``) to *capture_file* -- and, when *argv_file* is given, its
+    own argv alongside -- then exits 0.
+
+    The full environment, not just the ``CLAUDE_SPAWN_*`` slice, and it is the
+    ONLY env capture these tests use. Two reasons it is worth capturing more
+    than is asserted:
+
+    - It is exactly what the spawned session's Bash tool would hand to the
+      next spawn-claude.sh it runs, so it can be fed straight back in as a
+      second invocation's environment (see the two-level test below).
+    - NUL delimiting is the only unambiguous framing. An environment value may
+      itself contain newlines -- the same reason
+      ``_write_fake_claude_capturing_argv`` is NUL-delimited -- so a line-wise
+      ``env`` capture would split such a value across "lines", and a parser
+      partitioning each on its first ``=`` would record a bogus key from the
+      continuation. A ``not in captured`` assertion could then pass for
+      entirely the wrong reason, which is precisely what the task-4015 tests
+      must not do.
+
+    Read back with ``_read_env0`` (everything) or ``_read_spawn_namespace``
+    (just the launch namespace) / ``_read_argv``.
+    """
+    p = bin_dir / "claude"
+    body = f"env -0 > {capture_file!s}\n"
+    if argv_file is not None:
+        body += _fake_claude_argv_capture_line(argv_file)
+    p.write_text("#!/usr/bin/env bash\n" + body + "exit 0\n")
+    p.chmod(0o755)
+
+
+def _read_env0(capture_file: pathlib.Path) -> dict[str, str]:
+    """Read a NUL-delimited ``env -0`` capture into a dict.
+
+    Partitions each entry on its FIRST ``=`` (a value may contain further
+    ``=`` characters) and drops the trailing empty element left by the final
+    NUL terminator -- the env-shaped counterpart of ``_read_argv``.
+    """
+    parsed: dict[str, str] = {}
+    for entry in capture_file.read_bytes().decode().split("\0"):
+        if not entry:
+            continue
+        key, _, value = entry.partition("=")
+        parsed[key] = value
+    return parsed
+
+
+def _read_spawn_namespace(capture_file: pathlib.Path) -> dict[str, str]:
+    """The ``CLAUDE_SPAWN_*`` slice of a full ``env -0`` capture.
+
+    Filtering by prefix here rather than with ``env | grep`` inside the fake
+    claude keeps the capture NUL-delimited end to end (see above), and keeps
+    the filter prefix-generic: the whole point of the tests below is that a
+    var this file never names -- a future launch knob -- must not survive into
+    the child either, so neither the capture nor the read may be an
+    enumeration.
+    """
+    return {
+        k: v
+        for k, v in _read_env0(capture_file).items()
+        if k.startswith("CLAUDE_SPAWN_")
+    }
+
+
+def test_spawn_unsets_inherited_launch_inputs_from_child_env(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The four pure-input launch knobs must NOT be visible in the spawned
+    session's own environment, however they reached this invocation.
+
+    The poison values are chosen so neither reroutes the launcher away from
+    the foreground-xterm path under test: ``MODE=child`` is the default, and
+    a ``BACKEND`` of anything other than ``tmux`` falls through to normal
+    emulator discovery. What is asserted is purely what the CHILD can see.
+
+    The positive half matters just as much: the scrub must not be
+    over-broad, so the child must still see its own freshly-computed
+    CLAUDE_SPAWN_SESSION_ID and CLAUDE_SPAWN_RESULT_FILE -- the values THIS
+    spawn computed for THAT child, not inherited ones.
+
+    RED today: nothing in the payload unsets the namespace, so all four
+    inherited vars reach the child by plain environment inheritance.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_CLAUDE_ARGS"] = "--resume poisoned-parent-session"
+    env["CLAUDE_SPAWN_MODE"] = "child"
+    env["CLAUDE_SPAWN_MODEL"] = "haiku"
+    env["CLAUDE_SPAWN_BACKEND"] = "leak-not-tmux"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _read_spawn_namespace(capture_file)
+    for var in (
+        "CLAUDE_SPAWN_CLAUDE_ARGS",
+        "CLAUDE_SPAWN_MODE",
+        "CLAUDE_SPAWN_MODEL",
+        "CLAUDE_SPAWN_BACKEND",
+    ):
+        assert var not in captured, (
+            f"{var} is a per-launch INPUT: consumed by this invocation, then "
+            f"removed from the child's environment so it cannot be re-served "
+            f"to a grandchild. Child saw: {captured!r}"
+        )
+
+    # Not over-broad: this child's OWN computed values must survive.
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert captured.get("CLAUDE_SPAWN_SESSION_ID") == record.session_slug, (
+        f"the child must still see its own new session slug "
+        f"{record.session_slug!r}, got {captured!r}"
+    )
+    assert captured.get("CLAUDE_SPAWN_RESULT_FILE") == record.result_file, (
+        f"the child must still see the result file allocated for THIS spawn "
+        f"({record.result_file!r}), got {captured!r}"
+    )
+
+
+def test_spawn_unset_is_prefix_generic_not_an_enumerated_list(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The scrub must cover the whole ``CLAUDE_SPAWN_*`` namespace, not a
+    hand-maintained list of the names known today.
+
+    CLAUDE_SPAWN_FUTURE_KNOB exists nowhere in the codebase, which is the
+    entire point: it is the only assertion that can distinguish a
+    prefix-generic ``${!CLAUDE_SPAWN_@}`` sweep from a fourth named
+    enumeration that a future launch knob would silently fall outside of.
+    Same idiom this file already applies to its OWN scrub in
+    test_base_env_scrubs_every_claude_spawn_var -- kept deliberately
+    identical so the harness-side and script-side scrubs read the same.
+
+    A real input var is poisoned alongside it so a regression that drops the
+    sweep entirely fails here too, not only in the test above.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_FUTURE_KNOB"] = "leak"
+    env["CLAUDE_SPAWN_CLAUDE_ARGS"] = "--resume poisoned-parent-session"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _read_spawn_namespace(capture_file)
+    assert "CLAUDE_SPAWN_FUTURE_KNOB" not in captured, (
+        "the unset must be prefix-generic (${!CLAUDE_SPAWN_@}), so a var "
+        "that exists nowhere in the codebase is stripped too -- an "
+        "enumerated name list would leak every knob added after it was "
+        f"written. Child saw: {captured!r}"
+    )
+    assert "CLAUDE_SPAWN_CLAUDE_ARGS" not in captured, (
+        f"the known input var must be stripped as well, got {captured!r}"
+    )
+
+
+def test_spawn_registry_fault_unsets_parent_result_file_rather_than_inheriting_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """On a session-registry fault the child must see NO
+    CLAUDE_SPAWN_RESULT_FILE at all -- never the SPAWNER's inherited one.
+
+    This case gets its own test rather than an assertion folded into the
+    prefix-genericity one above because it is the only one that silently
+    corrupts a PARENT session's outcome record: with the registry faulted,
+    SESSION_RECORD_DIR is empty, so ``result_export`` is the empty string
+    and nothing is exported -- and before task 4015 the parent's inherited
+    value simply survived into the child, which would then dutifully write
+    its own outcome over its spawner's result.md.
+
+    Uses the same deterministic fault injection as
+    test_spawn_fail_soft_skips_result_handback_when_registry_faults: a
+    CLAUDE_FLEET_ROOT nested under a pre-existing regular file, so the
+    registry's mkdir raises NotADirectoryError rather than depending on
+    permission semantics that vary across CI users and containers.
+
+    RED if the unset were nested inside the ``if [ -n
+    "$CLAUDE_SPAWN_RESULT_FILE" ]`` / ``if [ -n "$SESSION_RECORD_DIR" ]``
+    guards, whose bodies are skipped on exactly this path: the skip path
+    must UNSET, not merely decline to set. Fail-soft must also stay
+    fail-soft -- the exit-code contract is asserted unchanged.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    parent_result = "/parent/session/result.md"
+    env["CLAUDE_SPAWN_RESULT_FILE"] = parent_result
+
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("i am a regular file, not a directory\n")
+    env["CLAUDE_FLEET_ROOT"] = str(blocker / "fleet")
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, (
+        f"a registry fault must never change the exit-code contract: "
+        f"expected 0, got {result.returncode}\nstderr: {result.stderr.decode()}"
+    )
+
+    captured = _read_spawn_namespace(capture_file)
+    assert captured.get("CLAUDE_SPAWN_RESULT_FILE") != parent_result, (
+        "a child must never inherit its SPAWNER's result file -- it would "
+        f"overwrite the parent's outcome record. Child saw: {captured!r}"
+    )
+    assert "CLAUDE_SPAWN_RESULT_FILE" not in captured, (
+        "with no record dir of its own the child must see NO result file at "
+        f"all, not a stale inherited one. Child saw: {captured!r}"
+    )
+
+
+def test_spawned_session_cannot_reserve_its_own_launch_args_to_a_grandchild(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The 2026-08-11 incident, reproduced end-to-end across TWO real spawns.
+
+    Level 1 is a fleet crash-recovery launch:
+    CLAUDE_SPAWN_CLAUDE_ARGS="--resume <a session id>". That is a DELIBERATE
+    input and the direct child must honour it -- asserted below on the
+    level-1 child's own argv. Requirement (4): inputs are consumed before
+    the unset, and from inside the script a deliberate command-prefix
+    assignment is indistinguishable from an inherited one, so the direct
+    child's argv is NOT where this is fixed. Do not "fix" that path -- it
+    would delete the documented CLAUDE_SPAWN_CLAUDE_ARGS passthrough and
+    break test_spawn_model_env_precedes_raw_claude_args.
+
+    Level 2 is where the fix bites. The recovered session's own environment
+    -- captured verbatim at level 1, exactly what its Bash tool would hand
+    to the next spawn-claude.sh it runs -- is fed back in as a second
+    invocation's environment. That grandchild is meant to be FRESH, and
+    before task 4015 it came up as a live resume of its spawner because the
+    inherited CLAUDE_SPAWN_CLAUDE_ARGS was re-served as apparent caller
+    intent.
+
+    Two real script invocations rather than a fake claude that spawns
+    recursively: the level-1 run has fully completed before level 2 starts,
+    so the fake ``claude`` can simply be rewritten in between and nothing
+    races.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    child_env_file = tmp_path / "child_env.bin"
+    child_argv_file = tmp_path / "child_argv.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, child_env_file, child_argv_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_CLAUDE_ARGS"] = "--resume poisoned-parent-session"
+
+    # --- level 1: the crash-recovery launch -------------------------------
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    child_argv = _read_argv(child_argv_file)
+    assert "--resume" in child_argv and "poisoned-parent-session" in child_argv, (
+        f"the DIRECT child must still receive args deliberately passed on "
+        f"this invocation (requirement 4) -- got: {child_argv!r}"
+    )
+
+    # The FULL environment here, not just the launch namespace -- level 2 feeds
+    # it back in verbatim as the next invocation's environment, PATH and all.
+    child_env = _read_env0(child_env_file)
+    assert "CLAUDE_SPAWN_CLAUDE_ARGS" not in child_env, (
+        f"the recovered session must not carry its own launch args forward "
+        f"in its environment, got: {_read_spawn_namespace(child_env_file)!r}"
+    )
+
+    # --- level 2: what that session's next /spawn would actually run ------
+    grandchild_argv_file = tmp_path / "grandchild_argv.bin"
+    _write_fake_claude_capturing_argv(bin_dir, grandchild_argv_file)
+
+    result2 = _run_spawn(child_env, tmp_path)
+    assert result2.returncode == 0, f"stderr: {result2.stderr.decode()}"
+
+    grandchild_argv = _read_argv(grandchild_argv_file)
+    assert "--resume" not in grandchild_argv, (
+        f"a session spawned from within the recovered session must be FRESH, "
+        f"not a resume of its spawner -- got: {grandchild_argv!r}"
+    )
+    assert not any("poisoned-parent-session" in tok for tok in grandchild_argv), (
+        f"the spawner's own resume target must not reach the grandchild's "
+        f"argv anywhere, got: {grandchild_argv!r}"
+    )
+
+
+def test_sanitization_preserves_launcher_stamped_record_identity(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The not-over-broad lock, in the two-way style of
+    test_sibling_parentage_two_way_into_hook_record: identity must survive
+    on the session-registry RECORD even though it no longer travels in the
+    child's environment.
+
+    CLAUDE_SPAWN_ROLE / TASK_ID are launcher-side inputs. They are stamped
+    by the ``python3 ... launching`` write, which runs in its own subprocess
+    BEFORE and OUTSIDE $inner -- so a payload-level unset cannot reach it.
+    The child itself has no consumer for them: session_hooks.run_session_start
+    reads identity from the environment only in its ``except
+    FileNotFoundError`` branch, and a spawn-claude.sh child provably has a
+    record at its slug already (CLAUDE_SPAWN_SESSION_ID is exported only
+    when SESSION_RECORD_DIR is non-empty), so that branch is unreachable
+    here.
+
+    Stripping them is in fact corrective: a leaked inherited identity used
+    to resolve as ``implementer:<project>#<id>`` on an unrelated session --
+    the same leak orchestrator/tests/test_session_hooks.py::_clear_claude_
+    spawn_env exists to defend against.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_ROLE"] = "implementer"
+    env["CLAUDE_SPAWN_TASK_ID"] = "9999"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.role == "implementer", (
+        f"the launching write runs before/outside $inner, so the payload's "
+        f"unset must not disturb the stamped role, got {record.role!r}"
+    )
+    assert record.task_id == "9999", (
+        f"same for the stamped task_id, got {record.task_id!r}"
+    )
+
+    captured = _read_spawn_namespace(capture_file)
+    assert "CLAUDE_SPAWN_ROLE" not in captured, (
+        f"identity belongs on the record, not in the child's environment "
+        f"where it would be re-served to the next spawn: {captured!r}"
+    )
+    assert "CLAUDE_SPAWN_TASK_ID" not in captured, (
+        f"same for the task id: {captured!r}"
     )

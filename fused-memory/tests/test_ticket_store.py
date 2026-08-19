@@ -374,6 +374,47 @@ async def test_fetch_unescalated_failures_returns_only_failed_null_escalated(sto
 
 
 @pytest.mark.asyncio
+async def test_fetch_unescalated_failures_never_returns_refused(store):
+    """task 3126: a refusal must NEVER reach the janitor's failure sweep.
+
+    A ``refused`` ticket is a successful, intended outcome of an
+    operator-authored policy (the cancelled-premise blocklist / recon premise
+    registry) — not an error. It is terminal with ``escalated_at IS NULL``
+    forever, so it looks exactly like an un-swept failure to any predicate
+    broader than ``status = 'failed'``. Sweeping refusals in would page a
+    steward every time the blocklist did its job, training operators to ignore
+    the signal. Today the exclusion holds only because the SQL hardcodes
+    ``status = 'failed'``; this test pins it so a future 'all terminal
+    non-created statuses' broadening fails here instead of in production.
+    """
+    refused_id = await store.submit(project_id='p', candidate_json='{}')
+    assert await store.mark_resolved(
+        refused_id,
+        status='refused',
+        task_id=None,
+        reason='cancelled-premise-blocklist: dead-premise: superseded',
+    )
+    failed_id = await store.submit(project_id='p', candidate_json='{}')
+    await _force_failed(store, failed_id, reason='curator_failed')
+
+    # Precondition: the refused row IS an unescalated terminal row — its
+    # absence below is the status filter doing the work, not a stale stamp.
+    row = await store.get(refused_id)
+    assert row is not None
+    assert row['status'] == 'refused'
+    assert row['escalated_at'] is None
+    assert row['task_id'] is None
+
+    rows = await store.fetch_unescalated_failures()
+    ids = {r['ticket_id'] for r in rows}
+    assert failed_id in ids, 'a genuine failure must still be swept'
+    assert refused_id not in ids, (
+        'a refusal is a policy verdict, not a failure — sweeping it in would '
+        'page a steward every time the blocklist did its job'
+    )
+
+
+@pytest.mark.asyncio
 async def test_fetch_unescalated_failures_filters_by_project(store):
     a_id = await store.submit(project_id='proj-a', candidate_json='{}')
     b_id = await store.submit(project_id='proj-b', candidate_json='{}')

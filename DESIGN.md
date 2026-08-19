@@ -175,13 +175,34 @@ MemoryResult {
   content:         str          # the fact, preference, or summary
   category:        enum         # taxonomy category
   source_store:    str          # "graphiti" | "mem0"
-  relevance_score: float        # normalized 0-1 across stores
+  relevance_score: float        # ordinal RRF fusion score (K=60); NOT a similarity
   provenance:      list[str]    # episode IDs (Graphiti results only)
   temporal:        {valid_at, invalid_at}  # (Graphiti results only)
   entities:        list[str]    # related entity names (Graphiti results only)
-  metadata:        object
+  metadata:        object       # carries store_rank + store_score (below)
 }
 ```
+
+**Cross-store ordering is Reciprocal Rank Fusion** (task 3658, PRD D4). Each
+responding store ranks its own results — Mem0 by cosine descending, Graphiti
+by its backend rank — and the merged list is ordered by
+`1 / (60 + store_rank)`, ties broken by the router's primary store and then by
+store-internal rank. The primary store is a **tiebreak, not precedence**: it
+formerly ordered results wholesale, which let one store fill `limit` and made
+the other structurally unreachable.
+
+Consequences for consumers:
+
+- `relevance_score` is **ordinal, never a similarity**. Rank-1 scores
+  1/61 ≈ 0.0164 however good the match is, so it must not be thresholded,
+  compared against a cosine, or compared across API versions.
+- Per-store truth lives in `metadata`:
+  - `store_rank` — int, 1-based rank within the store that returned the
+    result (over that store's surviving results).
+  - `store_score` — float, the Mem0 cosine, verbatim; `null` for Graphiti,
+    whose search exposes no scores at all. That absence is why RRF was chosen
+    over score calibration, and why Graphiti no longer emits a synthesized
+    score.
 
 
 #### `get_entity`

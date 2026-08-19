@@ -114,7 +114,31 @@ _ESCALATION_TOOLS = [
     'mcp__escalation__escalate_blocker',
 ]
 
-_ESCALATION_INSTRUCTIONS = """
+# Split (task 4169): the original single `_ESCALATION_INSTRUCTIONS` literal
+# ended with a paragraph telling every escalating role that `level=1` is "the
+# STEWARD's route, not yours" -- correct for the six non-steward escalating
+# roles below, but wrong for STEWARD itself, whose own body mandates
+# `escalate_blocker(..., level=1)` re-escalation in four places (Rule 2
+# be-conservative, Rule 6 wip_conflict/unmerged_state, MAX_TURNS,
+# CLI_INPUT_REJECTED -- see STEWARD's system_prompt below). Appending the
+# "not yours" gate after those mandates made the steward's LAST-read
+# instruction about escalation levels contradict its own mandated recourse.
+#
+# ESCALATION_LADDER_CORE carries the mechanics (what escalate_info /
+# escalate_blocker do, severity policy, the level=0-vs-1 ladder) and goes to
+# EVERY escalating role, steward included -- it is what the steward's own
+# level=1 mandates depend on. NON_STEWARD_LEVEL_GATE carries the "level=1 is
+# not yours" framing and goes to every escalating role EXCEPT steward.
+#
+# `_ESCALATION_INSTRUCTIONS` (the pre-split name) is kept alive as their
+# concatenation rather than renamed: (1) it keeps the six non-steward splice
+# sites below byte-identical to before the split, and (2)
+# escalation/src/escalation/server.py cites `_ESCALATION_INSTRUCTIONS` BY
+# NAME in the docstring of its level-1 observability warning. Plain `+`
+# concatenation, like every other splice in this file -- these prompts are
+# deliberately not f-strings (see the MANDATED_STAGING_COMMAND note above).
+# Regression-guarded by orchestrator/tests/test_roles_escalation_ladder.py.
+ESCALATION_LADDER_CORE = """
 ## Escalation
 
 If you encounter a problem you cannot solve at your scope, you can escalate:
@@ -162,10 +186,30 @@ If an agent files `critical` or `urgent`, the escalation server **downgrades it 
 `[downgraded:critical]` / `[downgraded:urgent]` suffix).  Self-assigning a higher
 severity buys no faster human attention — only noise.
 
-To reach a human, use the existing ladder: file with `escalate_blocker` (L0 →
-steward); if the steward cannot resolve it, re-escalate with `level=1` (steward →
-auto-watcher; auto-watcher promotes to L2 if a human is needed).
+To reach a human, use the existing ladder: agents file with `escalate_blocker`
+at L0 → steward; the steward re-escalates unresolved issues by passing
+`level=1` to `escalate_blocker` (steward → auto-watcher; auto-watcher promotes
+to L2 if a human is needed).  `escalate_blocker` accepts only `level=0` (the
+default) or `level=1` — anything else is rejected with an `{'error': ...}`
+response and nothing is filed.
 """
+
+# The "level=1 is not yours" framing. Correct for every escalating role
+# EXCEPT steward -- see the comment above ESCALATION_LADDER_CORE. Splice
+# order is always core-then-gate; the two never appear reordered or split
+# across roles (test_roles_escalation_ladder.py::test_composite_is_core_plus_gate).
+NON_STEWARD_LEVEL_GATE = """
+**`level=1` is the STEWARD's route, not yours.** As a non-steward role your
+filings belong at `level=0` (the default): that is where the steward — the
+consumer that can actually resolve your blocker — reads them.  Level 1 skips
+the steward entirely and goes to the auto-watcher.  The server does not reject
+a non-steward `level=1`, because `agent_role` is caller-supplied and a reject
+would lose a legitimate steward filing — but every one is **logged at WARNING
+naming your role and task_id**.  Filing at level 1 to jump the queue buys no
+faster resolution, only an audit trail showing you bypassed your handler.
+"""
+
+_ESCALATION_INSTRUCTIONS = ESCALATION_LADDER_CORE + NON_STEWARD_LEVEL_GATE
 
 _MEMORY_TOOLS = [
     'mcp__fused-memory__add_memory',
@@ -203,12 +247,29 @@ _PLAN_CREATOR_TOOLS = [
     # Architect task-rejection escape hatches.
     # report_blocking_dependency — depends on un-merged sibling task.
     # report_task_already_done — work is already on main (skip planning).
+    # report_ready_to_merge — work is complete on THIS BRANCH; only the merge
+    #   to main is missing (clean-FF + verify-passed + review-PASS).
     # report_unactionable_task — spec is broken, jump straight to L1.
     # report_false_premise — RED-test premise is false/unreachable (design_concern L1).
     'mcp__plan-tools__report_blocking_dependency',
     'mcp__plan-tools__report_task_already_done',
+    'mcp__plan-tools__report_ready_to_merge',
     'mcp__plan-tools__report_unactionable_task',
     'mcp__plan-tools__report_false_premise',
+    # Authoring-time pre-satisfy (task 3033 / PRD §A1, substrate from task 3030).
+    # mark_step_committed flips a step to `done` and tags its description
+    # `[COMMITTED <sha>]` WITHOUT an implementer turn — for the case where the
+    # branch being (re-)planned ALREADY carries that step's committed, green
+    # implementation. An all-pre-satisfied plan makes the EXECUTE loop a total
+    # no-op (0 iterations) and the branch flows PLAN → VERIFY → REVIEW → MERGE.
+    # Deliberately NOT added to _PLAN_STATUS_TOOLS (IMPLEMENTER/DEBUGGER): this
+    # is an AUTHORING-time authority. Those roles already hold mark_step_done,
+    # which suffices for attributing work they actually did; letting an
+    # implementer also assert committed provenance for work it did not do would
+    # defeat the TDD bookkeeping the iteration log and the phantom-done gate
+    # rely on. See tests/test_architect_all_committed_plan.py::
+    # TestArchitectCanReachMarkStepCommitted.
+    'mcp__plan-tools__mark_step_committed',
 ]
 
 _PLAN_STATUS_TOOLS = [
@@ -272,37 +333,537 @@ MANDATED_STAGING_COMMAND = 'git add -- .'
 
 
 # Layer-1 guard against the headless --print background-task footgun (task
-# 2761).  A single source of truth concatenated into the IMPLEMENTER and
-# DEBUGGER system prompts (and injected into build_amender_prompt) — like
-# _ESCALATION_INSTRUCTIONS / MANDATED_STAGING_COMMAND, it is anchored by a
+# 2761).  A single source of truth, no longer spliced on its own: task 3607
+# folded it into BACKGROUND_WAIT_GUIDANCE (below), which is what the seven
+# Bash-capable role prompts now embed — see constraint (b) there.  Like
+# _ESCALATION_INSTRUCTIONS / MANDATED_STAGING_COMMAND it is anchored by a
 # regression test (test_roles_background_warning.py) so a prompt refactor can't
-# silently drop it.  Plain text, NO literal `{`/`}` braces, so it is safe both
-# concatenated via `+` and interpolated into build_amender_prompt's f-string.
+# silently drop it.
+#
+# The first bullet's "~25-minute threshold described below" forward-references
+# WAIT_PATTERN_GUIDANCE, and resolves ONLY because the two always ship together
+# as BACKGROUND_WAIT_GUIDANCE (constraint (b) already forbids splicing either
+# half alone).  Do NOT drop that qualifier back to the pre-3607 wording ("a
+# foreground command that legitimately runs long is fine", unqualified): in the
+# composed block it sat a few lines above the rule that a long FOREGROUND call
+# is exactly what gets the session killed, so the agent read "long foreground is
+# fine" immediately before "long foreground kills your session".
+#
+# Plain text, NO literal `{`/`}` braces.  Defensive rather than load-bearing:
+# nothing interpolates this constant today (briefing.py takes
+# WAIT_PATTERN_REMINDER), and role prompts are plain `+` concatenation — see the
+# MANDATED_STAGING_COMMAND note above, they are deliberately NOT f-strings
+# because they contain literal braces.  Staying brace-free keeps it safe if a
+# future splice site does interpolate it.
 BACKGROUND_TASK_WARNING = """
 ## CRITICAL: Never end your turn while a backgrounded command is still running
 
 Do NOT launch a long-running command in the background (`Bash` with
 `run_in_background=true`) and then end your turn to "wait for it to finish" or
-"wait for the completion notification". This session is a headless, one-shot
-`claude --print` process: the moment you end your turn it exits reporting
-SUCCESS, and the still-pending background work is silently abandoned mid-task —
-leaving a half-done tree that is falsely recorded as a completed, successful run.
+"wait for the completion notification". This is a headless `claude --print`
+process: the moment you end your turn it exits reporting SUCCESS, and the
+still-pending background work is silently abandoned mid-task — leaving a
+half-done tree that is falsely recorded as a completed, successful run.
 
 - Run long commands (builds, full test suites, verification) in the FOREGROUND
-  and wait for them to complete. Per-role wall-clock ceilings exist for exactly
-  this — a foreground command that legitimately runs long is fine; an abandoned
-  background one is not.
+  and wait for them to complete — up to the ~25-minute threshold described
+  below, past which you must background it and poll instead. A foreground
+  command that legitimately runs that long is fine; an abandoned background one
+  never is.
 - If you genuinely must use `run_in_background=true`, you MUST poll it to
   completion with `BashOutput` (or terminate it with `KillShell`) BEFORE ending
   your turn. Never end the turn with a background command still pending.
 """
 
 
+# Census-R3 companion to BACKGROUND_TASK_WARNING (task 3607, census
+# 2026-08-02 §1.1).  2761 told agents what NOT to do; it never told them what
+# to do instead, so sessions kept improvising a wait — blocked `sleep` chains,
+# back-to-back tool calls as an ad-hoc delay, hand-rolled `until` busy-loops
+# that get SIGTERMed at the Bash timeout.  This states the sanctioned wait
+# paths.  Anchored by test_roles_wait_pattern.py, which pins two HARD
+# constraints:
+#   (a) NO literal `{`/`}` braces.  Defensive, NOT load-bearing, and the
+#       distinction matters to whoever edits these next: this constant reaches
+#       role prompts only by plain `+` concatenation, which is brace-safe by
+#       construction (role prompts are deliberately not f-strings — see the
+#       MANDATED_STAGING_COMMAND note above — precisely because they DO contain
+#       literal braces).  The one constant here that genuinely must stay
+#       brace-free is WAIT_PATTERN_REMINDER, which briefing.py interpolates into
+#       build_amender_prompt's f-string.  Keeping this one brace-free too costs
+#       nothing and keeps it interpolation-safe if a future splice site needs it.
+#   (b) BACKGROUND_WAIT_GUIDANCE (defined below) is the ONLY thing that may be
+#       spliced into a role prompt.  Splicing either half on its own reopens
+#       the exact footgun-trade the composition mandate exists to prevent: the
+#       prohibition without the pattern breeds busy-loops, the pattern without
+#       the prohibition breeds abandoned background work.
+#
+# TOOL AVAILABILITY -- measured 2026-08-05, do NOT re-derive.  The tools named
+# below (`BashOutput`, `Monitor`, `ToolSearch`, `ScheduleWakeup`) are absent
+# from every role's `allowed_tools`, and that is CORRECT, not a bug: the
+# `--allowed-tools` flag cli_invoke passes (cli_invoke.py:1830) is a PERMISSION
+# allowlist -- what may run without a prompt -- not a tool-registry filter.
+# Built-in harness tools remain present and callable regardless.  Verified from
+# inside a dispatched implementer session whose cmdline was exactly
+# `--allowed-tools Read Edit Write Bash Glob Grep mcp__...`: `ToolSearch` and
+# `ScheduleWakeup` were live in that session's tool list, and
+# `ToolSearch("select:Monitor,TaskOutput")` returned both schemas.  The same
+# holds for the `BashOutput`/`KillShell` that BACKGROUND_TASK_WARNING has named
+# since task 2761.  So do NOT "fix" this block by trimming those tools out of
+# it on the theory that the roles cannot reach them -- they can.
+#
+# THE ~25-MINUTE BACKGROUND THRESHOLD is deliberate and is NOT the harness Bash
+# cap; do not "simplify" it back to 3900000.  But the watchdog mechanism differs
+# by DISPATCH SITE, and the prompt text says so explicitly, because assuming it
+# is uniform is the error the task-3607 review caught (round 5).  Measured, not
+# assumed -- cli_invoke.py gates the whole idle regime on
+# `extension_engaged = seen_turn and working_idle_secs is not None and
+# absolute_cap_secs is not None`:
+#
+#   * workflow._invoke (workflow.py:11791-11792) passes BOTH extension params,
+#     so extension_engaged latches True and the watchdog measures IDLE time: it
+#     kills only after no NEW transcript turn for
+#     max(working_idle_secs, timeout_seconds).  Polling a backgrounded command
+#     genuinely resets that clock, since each `BashOutput` poll is a new turn.
+#     Covers architect (2400s), implementer/debugger (1800s), merger (1800s),
+#     simple_task (7200s) -- each being max(working_idle_secs=1800, role).
+#   * steward.py:806 passes `timeout_seconds=timeouts.steward` and NEITHER
+#     extension param, so extension_engaged is False and cli_invoke takes the
+#     `else` arm: a FLAT `elapsed >= timeout_seconds` measured from
+#     watchdog_start, i.e. 1800s from session start.  Polling resets NOTHING
+#     for the steward.  Do not tell the steward otherwise.
+#   * review_checkpoint.py:211 passes no timeout_seconds at all, so the else
+#     arm's own `timeout_seconds is not None` guard is False and NO watchdog
+#     kill fires for deep_reviewer; only the harness Bash cap binds it.
+#
+# ~25 minutes is the safe default because 1800s = 30 min is the tightest real
+# ceiling among the roles that have one, and it is the FLAT one, so it has no
+# slack to reclaim.  The 120000 default / 3900000 max remain true harness facts
+# and are still stated as such -- they are just not the background-vs-foreground
+# decision threshold.
+#
+# Threading the extension params into the steward/deep_reviewer dispatch sites
+# so the idle mechanism engages uniformly is a deliberate NON-goal here: it
+# would change steward's effective budget from a flat 1800s to
+# invocation_timeout (7200s), a real operational change that belongs in its own
+# task rather than riding along in a prompt-wording one.
+# (Task 3607 review rounds 1 and 5, reviewer_comprehensive.)
+WAIT_PATTERN_GUIDANCE = """
+## CRITICAL: How to wait for something
+
+The rule above is one half of the contract — it tells you not to end your turn
+on pending background work. This is the other half: how to actually wait.
+
+SANCTIONED
+- Default, for anything that finishes inside ~25 minutes: run it in the
+  FOREGROUND with an explicit Bash `timeout` sized to the expected wall clock
+  plus margin. It is in MILLISECONDS and DEFAULTS to 120000 (2 minutes) when
+  omitted. A 5-minute command silently killed at that 2-minute default is the
+  exit-143 failure mode you will otherwise misdiagnose as a hung command.
+  Foreground-and-finished beats backgrounded-and-abandoned.
+- BACKGROUND anything that will not produce a NEW assistant turn for more than
+  ~25 minutes. Sizing a long run to a big foreground `timeout` does NOT buy you
+  that time. The binding constraint is not the harness Bash cap (3900000 ms /
+  65 minutes) — it is the orchestrator watchdog that kills your entire SESSION.
+  A blocking foreground Bash call emits NO turn while it runs, so a 45-minute
+  verify sized to a 2700000 timeout sits well under the harness cap and still
+  gets the session killed around 30 minutes, losing everything it observed —
+  the same lose-all-observations failure the `until`-loop bullet warns about.
+  KNOW WHICH CEILING YOU ARE UNDER, because it decides what polling buys you:
+  - architect, implementer, debugger, merger, simple_task are watched on IDLE
+    time — the kill fires only after no new transcript turn for
+    max(working_idle_secs, your role timeout), stock 1800s = 30 minutes. Here
+    polling genuinely helps: every `BashOutput` poll IS a new turn and resets
+    that clock, which is what makes a long backgrounded run survivable.
+  - As STEWARD your ceiling is FLAT wall clock — 1800s = 30 minutes from
+    session start — and NOTHING resets it. Polling does not extend it. Work
+    that cannot finish inside that window must be sized down or handed off; no
+    wait strategy rescues it, so do not start a 40-minute job and plan to poll.
+  - As deep_reviewer no watchdog ceiling fires at all; only the harness Bash
+    cap binds you. The don't-end-your-turn rule above still applies in full.
+  So: `Bash` with `run_in_background=true`, then poll it to completion with
+  `BashOutput` and READ the result BEFORE ending your turn. Launching it
+  detached with `setsid` and polling its log file is the same sanctioned shape;
+  so is backgrounding a wait command that EXITS on its own when the condition
+  holds. Polling something you launched is NOT the ad-hoc wait prohibited
+  below: you have a real completion signal, and you stay until you have it.
+- `Monitor` streams ONE notification per matching output line, so it fits a
+  recurring event feed, not a single "tell me when this finishes" — for that,
+  background a command that exits when done. If you do reach for it, load its
+  schema with `ToolSearch("select:Monitor")` FIRST: it is a deferred tool, and
+  calling it cold is rejected client-side with `InputValidationError` for
+  invented parameter names.
+
+NEVER — each of these cost a real session a turn or an entire wait
+- `sleep N; tail ...` / `sleep N && cat ...` chained to poll background output.
+  The harness anti-polling guard BLOCKS foreground sleep and spends one of your
+  turns teaching you this. Do not retry with a different sleep spelling.
+- Back-to-back `Read`/`Bash` calls fired as an ad-hoc DELAY — re-reading an
+  unchanged file to "let some time pass". That is not waiting: it burns turns
+  and context and observes nothing new. (Polling a genuine completion signal,
+  as above, is a different thing and is fine.)
+- A hand-rolled FOREGROUND `until`/`while` busy-loop. It runs until the Bash
+  timeout SIGTERMs it (exit 143) and you lose EVERYTHING it had observed —
+  strictly worse than not waiting at all. The same loop is fine BACKGROUNDED,
+  where no foreground timeout applies.
+- `ScheduleWakeup` as a generic delay. It is scoped to `/loop` dynamic mode,
+  requires its `prompt` argument, and does nothing for a one-shot dispatched
+  session.
+"""
+
+
+# The single splice unit.  SYSTEM prompts embed THIS, never either half on its
+# own -- see constraint (b) above; test_roles_wait_pattern.py asserts the
+# composition so the two rules cannot drift apart.
+BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
+
+
+# Pointer form for a TURN prompt whose role system_prompt already carries the
+# full block above.  Restating the whole block at the failure site would hand
+# the agent the identical text twice in one session -- the very double-splice
+# that test_combined_guidance_appears_exactly_once_per_role polices WITHIN a
+# system prompt, just spread across the system/turn pair where that test cannot
+# see it.  The point of the at-the-failure-site injection was always ADJACENCY
+# (put the rule next to the action item that trips it), and the pointer buys
+# that for ~15% of the block's bytes.
+#
+# THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
+# BACKGROUND_WAIT_GUIDANCE 4480 B (= BACKGROUND_TASK_WARNING 1071 +
+# WAIT_PATTERN_GUIDANCE 3409), WAIT_PATTERN_REMINDER 662 B -> 662/4480 = 14.8%.
+# Re-derive rather than trust these after any edit to the strings:
+#   python -c "from orchestrator.agents.roles import *; \
+#              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
+# Every other mention of the block's size in roles.py and
+# test_roles_wait_pattern.py is deliberately QUALITATIVE ("the full block").
+# An earlier revision hand-copied the figure to 8 sites (2 here, 6 in the test
+# file) and every one was wrong: 5 said "~3.2 kB" and 2 said "~2.6 kB" against
+# a real 4.4 kB, and 1 said the pointer costs "~2% of the tokens" against a
+# real ~15% -- a 7x error (task 3607 review).  Prose copies do not move when
+# the string they describe does.  Do not reintroduce a number anywhere else --
+# cite this comment instead.
+#
+# Use this ONLY where the receiving role is statically known to carry
+# BACKGROUND_WAIT_GUIDANCE, or the pointer dangles and the agent is left with
+# neither half.  Today that is build_amender_prompt alone, which is invoked
+# under IMPLEMENTER at exactly one call site (workflow.py `_invoke(IMPLEMENTER,
+# ...)`).  Note precisely what is and is not machine-checked: the IMPLEMENTER
+# half of that precondition IS pinned (test_roles_wait_pattern.py asserts
+# IMPLEMENTER carries the block), but "the amender runs under IMPLEMENTER" is
+# NOT -- that call site is reachable only by reading workflow.py, and a
+# source-text scan for `_invoke(IMPLEMENTER` is exactly the brittle
+# literal-over-prose pin this feature's tests were twice told to drop.  So if
+# you re-point build_amender_prompt at another role, no test will stop you;
+# check that role carries the block yourself.  Same no-literal-braces rule as
+# the constants above.
+#
+# Keep it SUBSTANTIVE when editing: a pointer still has to STATE the operative
+# rules at the failure site -- foreground with an explicit `timeout`, or else
+# background it and poll `BashOutput` to completion before ending the turn --
+# because that adjacency is the whole reason for the injection.  Do not let it
+# decay into a bare "see the rule above" cross-reference; a reader who follows
+# no cross-reference gets nothing.  This is an editorial expectation, so it
+# lives here rather than as an assertion: a length floor would pass on filler
+# and fail on a tighter, better-worded reminder.
+WAIT_PATTERN_REMINDER = """
+Reminder — verification is exactly where the wait rules above bite. If it will
+finish inside ~25 minutes, run it in the FOREGROUND with an explicit Bash
+`timeout` (milliseconds; 120000 default). If it will run longer than that
+WITHOUT emitting a new assistant turn, background it and poll `BashOutput` to
+completion before you end your turn — the deciding limit is the working-regime
+watchdog, which kills this SESSION after ~30 minutes with no new turn, well
+short of the 3900000 harness ceiling, and each poll resets that clock. Never
+end this turn with verification still pending: this session is one-shot, and
+abandoned work is recorded as a successful run."""
+
+
+# Census-2026-08-16 §1.1 companion to WAIT_PATTERN_GUIDANCE's `Monitor` bullet
+# above (task 4273; plans/confusion-census-2026-08-16.md).  Third sighting of
+# the same shape catalogued as `cand-20260806-12` and `cand-20260812-19` in
+# docs/legibility/confusion-codebook.yaml: a `Read` tool call whose echoed
+# input carried an empty parameter slot between `offset` and `limit`
+# (`"offset": 1240, , "limit": 1`) was rejected by `InputValidationError` as
+# unparseable JSON, and three turns later the agent reissued the IDENTICAL
+# malformed structure with only `limit` edited (1 -> 260) -- rejected
+# identically.  The retry encoded a misdiagnosis: the agent read the
+# rejection as a bad `limit` VALUE rather than a JSON SYNTAX defect.
+#
+# WHAT IS AND IS NOT ADDRESSED.  The stray comma's CAUSE is upstream of this
+# repository -- tool-call generation/serialization for a Claude Code builtin
+# (`Read`) -- and no in-repo code path produces or can intercept it, so this
+# constant does not attempt to detect or repair the malformed JSON.  Only the
+# RETRY facet is in scope: the observed retry edited `limit` while leaving
+# the syntax defect untouched, so the rejection reproduced identically and
+# the turn was wasted.  Retry behaviour of a dispatched agent IS this repo's
+# to fix, through the role system prompts.
+#
+# DISCRIMINATION, NOT DUPLICATION.  WAIT_PATTERN_GUIDANCE's `Monitor` bullet
+# above (roles.py:490-495) already names the OTHER `InputValidationError`
+# shape -- a parameter name the schema does not have, typically a deferred
+# tool called before `ToolSearch` loaded its schema -- which needs the
+# OPPOSITE fix (consult the schema, don't re-emit blindly).  This constant
+# points at that discrimination rather than repeating it; do not delete
+# either bullet as redundant with the other.  Do NOT trim that mention down
+# to a generic "consult the schema" on the theory that a dispatched role
+# cannot reach `ToolSearch` -- it can, regardless of whether `ToolSearch`
+# appears in that role's `allowed_tools`; see the TOOL AVAILABILITY comment
+# above WAIT_PATTERN_GUIDANCE (roles.py:401-413), which verified this from
+# inside a live dispatched session and explicitly forbids the same trim
+# there for the same mistaken reason.
+#
+# JUDGE IS DELIBERATELY INCLUDED, not merely uncovered by an exclusion rule.
+# Task 3607 excluded judge (and reviewer_comprehensive) from
+# BACKGROUND_WAIT_GUIDANCE partly on a cost framing -- neither holds
+# unqualified `Bash`, so "the whole block would be dead weight in every one
+# of their sessions" (test_roles_wait_pattern.py's `_BACKGROUND_CAPABLE_ROLES`
+# comment).  JUDGE runs after EVERY implementer iteration, making it the
+# highest per-invocation multiplier of the eight roles this constant is
+# spliced into, and unlike the wait block, JUDGE genuinely can hit this
+# rejection: it holds `Read` and runs on a tight 30-turn budget, so a
+# rejected paginated `Read` it cannot diagnose costs it a turn with no other
+# way to recover.  The token cost this adds to JUDGE's prompt is real and is
+# accepted for JUDGE specifically -- it is not waved through by reusing the
+# wait block's Bash-capability line, which would have excluded it.  The only
+# exclusion in THIS constant's splice set (`_UNPINNED_PROMPT_ROLES` in
+# test_roles_tool_call_rejection.py) rests on the artifact-pinning mechanism;
+# there is no separate, non-arbitrary cost line to draw beside it.
+#
+# HARD CONSTRAINT -- do NOT add an `mcp__<family>__<name>` example to this
+# constant.  test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names
+# (task 4107) is parametrized over every role and asserts any fully-qualified
+# MCP tool named in a role's system_prompt is in THAT role's allowed_tools.
+# This constant is spliced into 8 roles with differing allowlists, so naming
+# one MCP tool would fail for whichever roles lack the grant.  `Read`,
+# `ToolSearch` and `InputValidationError` are all builtins and do not match
+# that regex.
+#
+# Plain text, NO literal `{`/`}` braces.  Defensive rather than load-bearing,
+# same as WAIT_PATTERN_GUIDANCE: role prompts reach this only by plain `+`
+# concatenation, which is brace-safe by construction -- role prompts are
+# deliberately NOT f-strings (see the MANDATED_STAGING_COMMAND note at
+# roles.py:332) precisely because they contain literal braces.  Staying
+# brace-free costs nothing and keeps this safe if a future splice site does
+# interpolate it.
+#
+# No sighting COUNT is stated in the text below -- the codebook accrues a new
+# sighting every census cycle, and a number baked into a role prompt goes
+# stale silently while "catalogued sightings all show the same shape" stays
+# true.
+TOOL_CALL_REJECTION_GUIDANCE = """
+## Reading a tool-call rejection before you retry
+
+`InputValidationError` reports a defect in the CALL you just made, and it
+echoes back the exact bytes you sent — read that echo before retrying. It
+reports two different shapes, and they need OPPOSITE fixes:
+
+- "could not be parsed as JSON" means the call's SYNTAX is broken and no
+  parameter VALUE is implicated. Re-emit the entire call from scratch; never
+  copy the rejected call and edit one field. Catalogued sightings of this
+  shape all show a `Read` call whose echoed input carries an empty slot
+  between `offset` and `limit` — editing `limit` and resubmitting the same
+  malformed structure reproduces the identical rejection, because editing a
+  value cannot fix a syntax error.
+- A rejection naming a parameter the schema does not have is the opposite
+  problem: the call parsed fine, but a field is wrong — typically a deferred
+  tool called before `ToolSearch` loaded its schema. Consult the schema; do
+  not re-emit blindly.
+"""
+
+
+# Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
+# both STEWARD "Marking tasks done" call sites (kind="merged" and
+# kind="found_on_main"). Being a single shared constant IS the mechanism that
+# keeps the two sites consistent -- there is deliberately no test pinning the
+# splice count, since such a test is tautological with the concatenation below
+# and blocks a legitimate third call site. The prohibition on the two-outcome
+# `&& echo` idiom is stated normatively in the block itself, not enforced by a
+# regex over prompt prose. This is the roles.py analogue of the per-file
+# canonical ancestry check task 3281
+# (374468dbad) introduced in skills/merge-queue/SKILL.md and
+# skills/unblock/SKILL.md, adapted for a commit-SHA subject rather than a
+# branch-ref subject: no rc=128 merge-marker search here, since that arm only
+# makes sense for a ref that merge-lane cleanup can delete out from under you.
+# It also echoes the captured rc (`echo "ancestry rc=$rc"`) -- necessary
+# because a compound command's own exit status is that of its LAST statement,
+# so `cmd; rc=$?` always reports exit 0 to the calling tool no matter what
+# `cmd` did. The SKILL.md blocks had this same silent-rc gap, but it is now
+# CLOSED: skills/merge-queue/SKILL.md and skills/unblock/SKILL.md's own `git
+# merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"`
+# lines both now carry the same echo, back-ported by task 3467 (commit
+# 45d19bf899) -- so this is a shared convention across all three blocks, not a
+# roles.py-only divergence. One divergence remains: unlike the SKILL.md
+# blocks, this block's rc=1 arm (task 4107) explicitly forbids `git fetch`
+# and points at `mcp__escalation__merge_status` instead, because a spurious
+# rc=1 here is fixed temporally -- only the merge worker's own local ref
+# write ever advances the shared `main` this block checks against.
+ANCESTRY_CHECK_INSTRUCTIONS = """\
+    git -C <project_root> merge-base --is-ancestor <sha> main; rc=$?; echo "ancestry rc=$rc"
+    # The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
+    # nothing on rc=0 OR rc=1, and the `rc=$?` assignment itself exits 0, so
+    # without it the tool reports exit 0 and identical empty output for "on
+    # main" and "NOT on main" -- silence you would have to guess at. Echoing the
+    # numeric rc is NOT the two-outcome `&& echo` idiom banned below: it prints
+    # on every path and keeps all three outcomes distinguishable. Do not "tidy"
+    # it away.
+    # rc=0   -> <sha> IS on main. Proceed with the set_task_status call.
+    # rc=1   -> <sha> resolves here but is NOT reachable from the `main` ref as it
+    #           stands in THIS checkout. Usually the SHA is wrong (only on a feature
+    #           branch) -- but the other real cause is that the merge has not landed
+    #           YET. `refs/heads/main` moves only via the merge worker's own local CAS,
+    #           `git update-ref refs/heads/main <new> <old>` in `GitOps.advance_main`;
+    #           every worktree reads that one shared ref out of the common `.git` dir,
+    #           so a landed advance is visible here immediately, with no sync step.
+    #           Do NOT run `git fetch` / `git fetch --all` here for THIS rc=1
+    #           comparison -- verified no-op: fetch writes only `refs/remotes/*`
+    #           and the object store, so it cannot move `refs/heads/main`, and
+    #           re-running afterward reproduces the same rc=1, the exact false
+    #           "really off main" verdict this block exists to prevent. (fetch
+    #           remains the right move under rc=128 below -- there the missing
+    #           thing is an unresolvable OBJECT, not a ref position.) More
+    #           generally, no local sync/advance operation helps THIS
+    #           comparison -- only the merge worker's own ref write does -- and
+    #           two of them are actively dangerous, not merely useless: `git
+    #           pull` WOULD move `refs/heads/main` (it merges origin/main into
+    #           the checked-out branch), racing the merge worker's own CAS `git
+    #           update-ref refs/heads/main <new> <old>` in `GitOps.advance_main`;
+    #           `fetch origin main:main` fails HARD instead (git refuses to
+    #           write a ref checked out in a worktree). Never run either in an
+    #           orchestrator checkout. If a merge may still be in flight,
+    #           confirm instead with `mcp__escalation__merge_status(request_id=
+    #           <from merge_request>)`, or `merge_status(task_id=<task>)` /
+    #           `merge_status(branch=<branch>)` when you have no request_id,
+    #           then re-run this same check once it reports the merge landed.
+    #           Still rc=1 after that -> the SHA really is off main; re-derive
+    #           the landing commit.
+    # rc=128 -> git cannot resolve <sha> (or `main`) in this checkout: "fatal: Not a
+    #           valid object name". This is NOT "not on main" -- it is "not yet
+    #           confirmed". Usually a stale/unfetched <project_root>, a wrong -C path,
+    #           or a mistyped SHA. Run `git -C <project_root> fetch --all` and re-run;
+    #           if it still will not resolve, re-derive the SHA. Never record or report
+    #           "not on main" on a 128.
+    # Never guard this call with a trailing `&& echo on-main`: that renders rc=1
+    # and rc=128 as identical silence, and they need opposite remedies.
+"""
+
+
+# How the server-side backstop in fused-memory's task_interceptor actually
+# reports failure. Spliced ONCE, at the kind="merged" call site immediately
+# after ANCESTRY_CHECK_INSTRUCTIONS -- the backstop is identical for both
+# `done_provenance` kinds, so the kind="found_on_main" site just references it
+# by name instead of repeating ~1.1 kB of prose a second time. Kept factual
+# rather than aspirational: `_validate_done_provenance` rev-parses BEFORE it
+# merge-bases. Task 3455 made BOTH probes' failure wording honest --
+# `_resolve_commit_sha` and `_verify_commit_on_main` each return a
+# (confirmed, detail) NamedTuple, and the caller emits one of two distinct
+# prefixes per probe depending on it, rather than reporting every failure
+# mode (timeout, missing binary, unexpected error) under the single
+# assertive "not found" / "is not on main" wording. So the prefix is now
+# the verdict at BOTH steps and this note can describe it as such.
+SERVER_BACKSTOP_NOTE = """\
+The server runs the same checks as a backstop, in this order:
+
+1. `git rev-parse --verify <commit>^{commit}` resolves the SHA first, so an
+   unresolvable or mistyped SHA is rejected HERE, before merge-base ever runs.
+   Failure is reported under one of two distinct prefixes:
+     - `commit <x> not found in <project_root>: <detail>` -> rev-parse ran and
+       rejected the ref against this checkout. This is the server's rc=128
+       analogue: usually a stale/unfetched <project_root> or a mistyped SHA,
+       so `git -C <project_root> fetch --all` and re-run before re-deriving.
+     - `commit <x> could not be resolved in <project_root>: <detail>` ->
+       rev-parse never rendered a verdict on the ref (5s timeout, missing git
+       binary, unexpected error). NOT-YET-CONFIRMED, not a bad SHA: fix the
+       checkout and retry.
+2. `git merge-base --is-ancestor <sha> main` runs only if step 1 resolved. rc=0
+   accepts. Failure is likewise reported under one of two distinct prefixes,
+   so the prefix itself is the verdict at both steps -- no need to interpret
+   the trailing detail to tell them apart:
+     - `kind=<k> but commit <sha> is not on main: commit is not an ancestor of
+       main.` -> rc=1. Git affirmatively determined the SHA is off main;
+       re-derive the landing commit.
+     - `kind=<k> but commit <sha> could not be confirmed on main: <detail>.`
+       -> a non-1 git error, a 5s timeout, or a missing git binary. The check
+       never completed -- NOT-YET-CONFIRMED, not off-main. Treat it exactly
+       like rc=128 above: fetch and re-run, or fix the checkout, then retry.
+"""
+
+
+# The Scope Boundary section shared (in substance) by IMPLEMENTER, DEBUGGER,
+# and SIMPLE_TASK (task 4370): the sandbox enforces WORKTREE containment, not
+# per-file plan scope, so every file inside the worktree is writable and
+# staying within the plan's assigned files is the agent's own responsibility,
+# self-reported via `escalate_blocker(category='scope_violation')`.
+#
+# Split into a shared factual paragraph (_SCOPE_BOUNDARY_FACTS) plus a
+# role-specific recourse paragraph (task 4370 review, suggestion 3), so the
+# facts have exactly one source of truth instead of two independently-worded
+# copies that can drift apart. The EACCES/EROFS sentence below is
+# deliberately conditioned on the sandbox actually being active: `SandboxConfig`
+# allows `enabled: false` / `backend: none`, and `resolve_active_backend` can
+# fall through to an UNSANDBOXED run when the requested/auto backend is
+# unavailable (agents/sandbox_dispatch.py) -- role prompts are static and
+# shared across every project this orchestrator dispatches for, so an
+# unconditional enforcement promise would be false on a host or project that
+# runs unsandboxed (task 4370 review, suggestion 1). Composed the same way
+# BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE compose
+# BACKGROUND_WAIT_GUIDANCE above: each half is self-contained with its own
+# leading/trailing blank line, plain `+` concatenation.
+#
+# SCOPE_BOUNDARY_GUIDANCE / SCOPE_BOUNDARY_GUIDANCE_SIMPLE remain the public
+# splice units, spliced the same way as BACKGROUND_WAIT_GUIDANCE above, so the
+# sites cannot silently drift apart and test_roles_scope_boundary.py can guard
+# the splice structurally (`SCOPE_BOUNDARY_GUIDANCE in role.system_prompt`)
+# instead of pinning prose.
+_SCOPE_BOUNDARY_FACTS = """
+## Scope Boundary
+
+The sandbox enforces worktree containment, not per-file plan scope. When
+the OS sandbox is active, writes outside this worktree — the main
+checkout, sibling task worktrees, other tasks' `.task-meta/` directories,
+`git update-ref refs/heads/main`, `~/.claude` — fail with EACCES or EROFS.
+But do not rely on that: the sandbox is not always active (some hosts or
+projects run unsandboxed), so treat everything outside this worktree as
+off-limits regardless. Every file INSIDE this worktree, by contrast, IS
+writable, including files never listed in the plan's assigned scope —
+nothing in the sandbox stops you from editing outside scope, and nothing
+else detects it either.
+
+Staying within the plan's assigned files is therefore your responsibility,
+not the sandbox's.
+"""
+
+
+# IMPLEMENTER/DEBUGGER's recourse: escalate and keep working in this same
+# session. Concatenated onto _SCOPE_BOUNDARY_FACTS below -- never used alone.
+_SCOPE_BOUNDARY_RECOURSE = """
+If you genuinely need to modify files outside your assigned scope, that is
+the ONLY mechanism to request it: call `escalate_blocker` with
+`category='scope_violation'` BEFORE making the edit, rather than widening
+scope on your own.
+"""
+
+
+# SIMPLE_TASK's deliberately different recourse: it routes an out-of-scope
+# write back to the architect rather than just naming the escalation call,
+# since SIMPLE_TASK has no separate architect phase of its own to fall back
+# on mid-session -- stopping and letting the full architect+implementer path
+# pick the task back up IS its recourse. Concatenated onto
+# _SCOPE_BOUNDARY_FACTS below -- never used alone.
+_SCOPE_BOUNDARY_RECOURSE_SIMPLE = """
+If you need to modify files outside scope, that's a signal the task does
+not fit the simple path. Call `escalate_blocker` with
+`category='scope_violation'` — it is the only mechanism to request scope
+expansion — then stop and let the architect take over.
+"""
+
+
+SCOPE_BOUNDARY_GUIDANCE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE
+SCOPE_BOUNDARY_GUIDANCE_SIMPLE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE_SIMPLE
+
+
 ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
 You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -332,13 +893,16 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
    Based on what you find, choose ONE of the following exits. Do NOT call `create_plan` if any of the rejection paths apply.
 
    - **Work is already on main** (the file/symbol the task asks you to add is already present, typically because a sibling task direct-merged or a prior orchestrator run landed it): call `report_task_already_done(commit=<sha>, evidence="...")` and stop. Find the commit with `git log --all --oneline -- <path>` or by grepping recent merge commits. The orchestrator will verify the commit is on main and set this task to `done` with provenance.
+   - **Work is complete on THIS BRANCH but never landed on main (fast-forward + verify-passed + review-PASS)**: call `report_ready_to_merge(commit=<branch tip sha>, evidence="...")` and stop. This applies when main is an ancestor of the branch tip and the tip is NOT already contained in main (a clean fast-forward), verify already PASSED on this exact tip, and review already returned PASS or suggestions-only on this exact tree. Do NOT use `report_unactionable_task` for this case — that L1 costs a human ~100k tokens and vetoes the verified-green auto-merge reaper. Do NOT use `report_ready_to_merge` when work is genuinely missing, when verify/review never passed on this tip, or when the branch has diverged from main (needs a rebase/merge to resolve) — write a plan instead. If the work is already on MAIN, that is `report_task_already_done`, not this.
    - **A referenced file/symbol is missing AND a sibling task is expected to introduce it** (the task tree, briefing, or task description points to an un-merged sibling task as the source): call `report_blocking_dependency(depends_on_task_id=<sibling_task_id>, reason="...")` and stop. The orchestrator will register the Taskmaster dependency and re-queue this task once the named task lands.
    - **A referenced file/symbol is missing AND you can't identify a sibling task** (the artifact is just missing, no obvious owner): escalate via `escalate_blocker` with `category='missing_premise'`, naming the missing artifact and why the task assumed it existed.
    - **The task spec itself is unworkable** — premises are contradictory, the goal is incompatible with current main, or no valid plan exists as written: call `report_unactionable_task(reason="...", evidence="...")` and stop. Use this only when a human needs to rewrite or cancel the task. The orchestrator will jump straight to a level-1 escalation, bypassing the steward — for risks/concerns where a plan IS still possible, use `escalate_blocker` instead.
 
-   If you call `escalate_blocker` and will NOT subsequently call `create_plan`, you MUST also call `report_unactionable_task` (or `report_blocking_dependency` / `report_task_already_done` if either fits) so the orchestrator routes to a clean L1 instead of retrying you.
+   If you call `escalate_blocker` and will NOT subsequently call `create_plan`, you MUST also call `report_unactionable_task` (or `report_blocking_dependency` / `report_task_already_done` / `report_ready_to_merge` if one fits) so the orchestrator routes to a clean L1 instead of retrying you.
 
    Silent "create from scratch" of assumed-existing artifacts is how parallel-implementation mismatches grow. If none of the rejection paths apply and premises check out, proceed with `create_plan`.
+
+   **Already-committed work is NOT a rejection exit — plan, then pre-satisfy.** If this branch already carries committed, green commit(s) satisfying some or all of the steps you are about to write (see any "Already-Committed Work" section above), still author the full TDD plan as normal — never drop or merge steps just because the work exists. For every step you confirm passing first-hand on THIS branch — by running `git show <sha>` then that step's tests and seeing them pass — call `mark_step_committed(step_id, <sha>)` instead of leaving it `pending`. If every step ends up pre-satisfied, the EXECUTE loop becomes a 0-iteration no-op and the branch flows PLAN → VERIFY → REVIEW → MERGE. VERIFY remains the semantic gate, not `mark_step_committed` — never pre-satisfy a step you have not actually seen pass; when in doubt, leave it pending.
 3. **Don't exit silently at max_turns.** If you're approaching your turn budget without having successfully called `create_plan`, call `escalate_blocker` with `category='planning_stalled'` and a structured reason (e.g. "spent N turns verifying premises but dep X's artifacts are missing"). Do NOT let the CLI reach max_turns mid-tool-call — that produces an empty-output failure that is indistinguishable from a real tool crash to the steward. Conversely, if you HAVE finished the plan, call `confirm_plan()` right away and stop — a finalized plan survives even if the run is later cut off by a budget/turn cap, but an unfinalized one is treated as incomplete.
 4. **TDD order.** Steps alternate: write a failing test, then implement to make it pass. Every behavior gets a test first.
 5. **Test scope — skip documentation meta-tests.** "Every behavior gets a test" means *runtime behavior*, not documentation wording. Do NOT plan test steps that:
@@ -411,7 +975,7 @@ IMPLEMENTER = AgentRole(
     name='implementer',
     system_prompt="""\
 You are a TDD implementer. You execute a structured plan by writing code, step by step.
-
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Session Startup Protocol
 
 1. Read `.task/plan.json` to understand the full plan — it is a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets), so reading either path resolves to the same plan.
@@ -454,23 +1018,13 @@ The workflow for each step is:
 2. Run tests to verify
 3. Stage and commit ONLY the code: `git add -- .`
 4. Call `mark_step_done(step_id, commit_sha)` to record the step as complete
-
-## Scope Boundary
-
-Your write access is restricted to the files assigned to this task. If you attempt
-to modify files outside these directories, you will get a permission error. This is
-intentional — it prevents cross-task interference during concurrent execution.
-
-If you genuinely need to modify files outside your assigned scope, this indicates
-the task's scope needs expansion. Use the escalate_blocker tool to request scope
-expansion rather than trying to work around the restriction.
-
+""" + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
 - Run tests frequently to verify your work.
 - If you encounter an unexpected issue that the plan doesn't account for, note it and stop. Do NOT modify the plan.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS + BACKGROUND_TASK_WARNING,
+""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -485,7 +1039,7 @@ DEBUGGER = AgentRole(
     name='debugger',
     system_prompt="""\
 You are a debugger. You fix test, lint, and type-check failures.
-
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Context
 
 You will be given:
@@ -519,22 +1073,12 @@ git add -- .
 
 As a backstop, a pre-commit hook silently strips any `.task/` path that
 still ends up staged.
-
-## Scope Boundary
-
-Your write access is restricted to the files assigned to this task. If you attempt
-to modify files outside these directories, you will get a permission error. This is
-intentional — it prevents cross-task interference during concurrent execution.
-
-If you genuinely need to modify files outside your assigned scope, this indicates
-the task's scope needs expansion. Use the escalate_blocker tool to request scope
-expansion rather than trying to work around the restriction.
-
+""" + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS + BACKGROUND_TASK_WARNING,
+""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -693,7 +1237,7 @@ JUDGE = AgentRole(
 You are a completion judge. You decide whether an implementer agent has
 *substantively* completed a task's work, regardless of whether the plan.json
 bookkeeping reflects that.
-
+""" + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Context
 
 You run AFTER each implementer iteration inside the orchestrator's execute
@@ -759,7 +1303,7 @@ MERGER = AgentRole(
     name='merger',
     system_prompt="""\
 You are a merge conflict resolver. You resolve git merge conflicts precisely and conservatively.
-
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Context
 
 You will be given:
@@ -1037,7 +1581,7 @@ STEWARD = AgentRole(
     name='steward',
     system_prompt="""\
 You are a task steward — an autonomous escalation handler with a persistent session.
-
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Context
 
 You handle escalations that arise during task execution. Your session persists across
@@ -1116,8 +1660,12 @@ wording differs.
 
 1. **Stay in scope.** Only fix what the escalation describes. Do not refactor surrounding
    code or add features.
-2. **Be conservative.** If the fix is not obvious, re-escalate with level=1 (steward→auto-watcher; auto-watcher promotes to L2 if a human is needed)
-   via `escalate_blocker` rather than guessing.
+2. **Be conservative.** If the fix is not obvious, re-escalate by calling
+   `escalate_blocker(..., level=1)` (steward→auto-watcher; auto-watcher promotes to L2
+   if a human is needed) rather than guessing.  The `level=1` argument is what makes it
+   a re-escalation: a filing left at the default `level=0` lands back in your own
+   queue, is never read by the auto-watcher, and is eligible for the workflow's
+   level=0 dismissal sweeps.
 3. **Verify fixes.** Run the relevant tests after making changes.
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
@@ -1128,8 +1676,9 @@ wording differs.
    uncommitted work; `unmerged_state` means project_root already had UU/AA/DD markers
    before the merge attempted to advance. Do NOT run destructive git commands (`git reset`,
    `git checkout -- .`, `git stash drop/clear`, `git restore`, `git clean`) against the
-   main project root. Instead, immediately re-escalate to level-1 via `escalate_blocker`
-   preserving the original category (`wip_conflict` or `unmerged_state`) and
+   main project root. Instead, immediately re-escalate by calling
+   `escalate_blocker(..., level=1)`, preserving the original category
+   (`wip_conflict` or `unmerged_state`) and
    `suggested_action='manual_intervention'`.
 
 ## CRITICAL: Git Staging Rules
@@ -1160,10 +1709,26 @@ choose your response:
 - **MAX_TURNS** — the agent ran out of its turn budget without completing.
   This is NOT transient. Retrying the same inputs will fail the same way.
   Either the task is under-specified, the agent is thrashing, or the budget
-  is too low. Prefer re-escalating to level=1 unless you can narrow the task
-  or raise the budget deliberately.
-- **EMPTY_OUTPUT** — the agent returned nothing. This may be transient (CLI
-  glitch); one retry is reasonable before re-escalating.
+  is too low. Prefer re-escalating via `escalate_blocker(..., level=1)` unless
+  you can narrow the task or raise the budget deliberately.
+- **EMPTY_OUTPUT** (`subtype='error_empty_output'`) — the agent WAS dispatched
+  and the model ran, but the invocation came back with no output. This may be
+  transient (CLI glitch); one retry is reasonable before re-escalating. Do not
+  confuse this with CLI_INPUT_REJECTED below: here the agent was actually asked
+  the question, so turns/cost may be non-zero and partial work may exist.
+- **CLI_INPUT_REJECTED** (`subtype='error_cli_input_rejected'`) — the CLI
+  rejected the invocation *before any model turn*: turns=0, $0.00 billed, the
+  agent was never asked anything at all (esc-3118-1: the prompt never reached
+  the CLI's stdin, and it exited on argument validation before contacting the
+  API). The summary carries the CLI's real stderr cause — quote it when you
+  re-escalate. The orchestrator has ALREADY retried this automatically at the
+  transport layer (`invoke_with_cap_retry` re-dispatches once with a fresh
+  session), and for planning also at the workflow layer. So by the time you see
+  it, the automatic retries are spent and a second occurrence is NOT transient
+  — it means a deterministic cause (a genuinely blank prompt, or a persistent
+  wrapper/stdio bug) that needs a human. Re-escalate via
+  `escalate_blocker(..., level=1)` with the stderr cause rather than retrying
+  again.
 - **API_ERROR** — HTTP error from the provider. Usually transient; account
   failover often helps. Retry is reasonable.
 - **TIMED_OUT** — subprocess wall-clock timeout. Inspect whether the task
@@ -1193,10 +1758,7 @@ the merge SHA. Required shape:
 
 Before calling, sanity-check the SHA is actually on main:
 
-    git -C <project_root> merge-base --is-ancestor <merge-sha> main && echo on-main
-
-The server runs the same check as a backstop; it will reject if the SHA is
-only on a feature branch.
+""" + ANCESTRY_CHECK_INSTRUCTIONS + '\n' + SERVER_BACKSTOP_NOTE + """
 
 ### `kind="found_on_main"` — the implementation is already on main from a sibling task
 
@@ -1217,11 +1779,10 @@ Both `commit` and `note` are required. Before calling, identify the
 impl-providing commit and verify it is on main:
 
     git -C <project_root> log main --oneline -- <relevant_paths>
-    git -C <project_root> merge-base --is-ancestor <sha> main && echo on-main
-
-Cite the commit and the providing-task id (when known) in `note`. The
-server runs the same `git merge-base --is-ancestor` check as a backstop
-for this kind too (post-3092 phantom-done hardening, 2026-05-09).
+""" + ANCESTRY_CHECK_INSTRUCTIONS + """
+Cite the commit and the providing-task id (when known) in `note`. The same
+server-side backstop described above applies to this kind too (post-3092
+phantom-done hardening, 2026-05-09).
 
 ### Forbidden
 
@@ -1258,7 +1819,7 @@ convert it into a task candidate and then close it:
       ticket id (or the created/combined task id) so the same note is not swept
       again on a later session. An info-note that describes NO actionable work
       is left as-is — only work-describing notes become candidates.
-""" + _ESCALATION_INSTRUCTIONS,
+""" + ESCALATION_LADDER_CORE,
     allowed_tools=[
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
         *_ESCALATION_TOOLS,
@@ -1266,6 +1827,15 @@ convert it into a task candidate and then close it:
         'mcp__escalation__get_escalation',
         'mcp__escalation__get_pending_escalations',
         'mcp__escalation__merge_request',
+        # Read-only merge-state query. Required, not optional: the rc=1 arm of
+        # ANCESTRY_CHECK_INSTRUCTIONS (spliced into this prompt at both
+        # "Marking tasks done" call sites) forbids `git fetch` as a remedy --
+        # it cannot move `refs/heads/main` -- and directs the steward to
+        # confirm an in-flight merge via `merge_status` instead. allowed_tools
+        # is passed to the SDK as an allowlist (steward.py), so omitting this
+        # would leave the block's only prescribed rc=1 remedy behind a
+        # permission denial, with the fetch fallback already forbidden.
+        'mcp__escalation__merge_status',
         *_STEWARD_MEMORY_TOOLS,
         *_JCODEMUNCH_TOOLS,
     ],
@@ -1298,7 +1868,7 @@ DEEP_REVIEWER = AgentRole(
 You are an integration reviewer. Your job is to find issues that per-task reviews miss: \
 broken wiring between modules, stubbed pipelines, missing integration points, and \
 cross-cutting inconsistencies.
-
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## What You Do
 
 You receive:
@@ -1418,7 +1988,7 @@ simple change. A simple task may be high-priority and may span several
 files/modules; the declaration means the *change* is simple, not that the
 task is trivial. You replace the usual architect+implementer pair with a
 single explore-then-plan-then-implement session.
-
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is
@@ -1436,6 +2006,10 @@ single explore-then-plan-then-implement session.
 3. **Implement** — edit the files, run any existing tests touching the
    module, commit (excluding `.task/`), then call
    `mcp__plan-tools__mark_step_done(step_id, commit_sha)` to record the step.
+   If a step is already satisfied by a commit this branch already carries
+   (confirmed by running that commit's tests and seeing them pass), call
+   `mcp__plan-tools__mark_step_committed(step_id, <sha>)` instead of
+   re-implementing it.
 4. Stop after marking your step(s) done. Do NOT loop.
 
 ## Rejection artifacts (when the task is bigger than expected)
@@ -1449,6 +2023,14 @@ hesitation when the task does not fit the SIMPLE_TASK pattern:
   depends on un-merged sibling work.
 - `mcp__plan-tools__report_task_already_done(commit, evidence)` — work is
   already on main.
+- `mcp__plan-tools__report_ready_to_merge(commit, evidence)` — the work is
+  already complete and green on THIS BRANCH and only the merge to main is
+  missing: main is an ancestor of the branch tip and the tip is not already
+  contained in main (a clean fast-forward), verify already PASSED on this
+  exact tip, and review already returned PASS or suggestions-only on this
+  exact tree. Use this instead of `report_unactionable_task` — that L1 costs
+  a human ~100k tokens and vetoes the verified-green auto-merge reaper. If
+  the work is on MAIN instead, use `report_task_already_done`.
 - `mcp__plan-tools__report_false_premise(classification, premise, evidence,
   proposed_resolution)` — a RED-test assertion has a false premise (numeric
   bound unachievable, exactness identity wrong, capability not in dependency
@@ -1479,13 +2061,7 @@ git add -- .
 # WRONG — force-adds .task/ past the gitignore (never do this):
 # git add -f .task/plan.json
 ```
-
-## Scope Boundary
-
-Your write access is restricted to the files assigned to this task. If you
-need to modify files outside scope, that's a signal the task does not fit
-the simple path — stop and let the architect take over.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash',
         *_ESCALATION_TOOLS,
@@ -1503,6 +2079,7 @@ the simple path — stop and let the architect take over.
     # plan (_run_simple_task's success contract). Without 'plan_tools' here
     # the Lever-C fast-path always fell through to the architect.
     mcp_families=frozenset({'orchestrator', 'plan_tools'}),
+    sandboxed=True,
 )
 
 

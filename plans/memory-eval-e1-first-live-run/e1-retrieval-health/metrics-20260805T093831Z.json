@@ -1,0 +1,208 @@
+{
+  "corpus": {
+    "counts": {
+      "claim_queries_unscorable": 0,
+      "contamination_scored_results": 490,
+      "contamination_untopiced_results": 489,
+      "decisions_and_rationale": 17,
+      "degraded_queries": 0,
+      "entities_and_relations": 45,
+      "observations_and_summaries": 41569,
+      "observations_served_by_graphiti_at_k10": 87,
+      "observations_served_by_graphiti_at_k5": 87,
+      "observations_served_by_mem0_at_k10": 19,
+      "observations_served_by_mem0_at_k5": 11,
+      "preferences_and_norms": 2773,
+      "procedural_knowledge": 7341,
+      "temporal_facts": 18
+    },
+    "project_id": "dark_factory+reify"
+  },
+  "eval_id": "e1-retrieval-health",
+  "metrics": [
+    {
+      "details_path": "report-20260805T093831Z.txt",
+      "items": [
+        {
+          "item_key": "t-architect-plan-files-write-set",
+          "passed": false
+        },
+        {
+          "item_key": "t-architect-report-task-already-done-main-reachability",
+          "passed": false
+        },
+        {
+          "item_key": "t-background-task-reaping-and-wake-mechanisms",
+          "passed": false
+        },
+        {
+          "item_key": "t-boolean-operand-consumption-edges",
+          "passed": false
+        },
+        {
+          "item_key": "t-cargo-fmt-no-gate",
+          "passed": false
+        },
+        {
+          "item_key": "t-cargo-rerun-if-changed-warm-lane-mtime",
+          "passed": false
+        },
+        {
+          "item_key": "t-compiled-module-functions-user-source-only",
+          "passed": false
+        },
+        {
+          "item_key": "t-docs-prd-landing",
+          "passed": false
+        },
+        {
+          "item_key": "t-escalation-store-ambiguity",
+          "passed": false
+        },
+        {
+          "item_key": "t-eval-worktree-plan-tools-missing",
+          "passed": false
+        },
+        {
+          "item_key": "t-eval-worktree-venv-shadowing",
+          "passed": false
+        },
+        {
+          "item_key": "t-g7-design-invariants",
+          "passed": false
+        },
+        {
+          "item_key": "t-git-conventions",
+          "passed": false
+        },
+        {
+          "item_key": "t-harness-layout-gate-decision-rule",
+          "passed": false
+        },
+        {
+          "item_key": "t-harness-layout-gate-move-gotchas",
+          "passed": false
+        },
+        {
+          "item_key": "t-inv-geo-1-mesh-contract-mock",
+          "passed": false
+        },
+        {
+          "item_key": "t-memory-hygiene",
+          "passed": false
+        },
+        {
+          "item_key": "t-nextest-less-host-simulation",
+          "passed": false
+        },
+        {
+          "item_key": "t-patch_import_site_testing",
+          "passed": false
+        },
+        {
+          "item_key": "t-pkill-pgrep-self-match",
+          "passed": false
+        },
+        {
+          "item_key": "t-prd-gates",
+          "passed": false
+        },
+        {
+          "item_key": "t-pytest-xdist-serial-override",
+          "passed": false
+        },
+        {
+          "item_key": "t-pytest_importlib_relative_import_gotcha",
+          "passed": false
+        },
+        {
+          "item_key": "t-recon-project-root-misroute-retired",
+          "passed": false
+        },
+        {
+          "item_key": "t-reconciliation_cost_model",
+          "passed": false
+        },
+        {
+          "item_key": "t-reify-audit-ptodo-from-worktree",
+          "passed": false
+        },
+        {
+          "item_key": "t-reify-debug-mcp-driving",
+          "passed": false
+        },
+        {
+          "item_key": "t-reify-debug-mcp-gotchas",
+          "passed": false
+        },
+        {
+          "item_key": "t-reify-debug-mcp-tool-addition",
+          "passed": false
+        },
+        {
+          "item_key": "t-task-5422-fabrication-episode-disposition",
+          "passed": false
+        },
+        {
+          "item_key": "t-tracing-interest-cache-poisoning",
+          "passed": false
+        },
+        {
+          "item_key": "t-warm-lane-plan-json-loss-reconstruction",
+          "passed": false
+        }
+      ],
+      "kind": "tripwire",
+      "metric_id": "topic-canonical-present",
+      "n": 32,
+      "value": 32.0
+    },
+    {
+      "denominator": 98,
+      "details_path": "report-20260805T093831Z.txt",
+      "direction": "lower_is_worse",
+      "kind": "proportion",
+      "metric_id": "canonical-in-top-5",
+      "n": 98,
+      "value": 0.02040816326530612
+    },
+    {
+      "denominator": 98,
+      "details_path": "report-20260805T093831Z.txt",
+      "direction": "lower_is_worse",
+      "kind": "proportion",
+      "metric_id": "canonical-in-top-10",
+      "n": 98,
+      "value": 0.030612244897959183
+    },
+    {
+      "denominator": 32,
+      "details_path": "report-20260805T093831Z.txt",
+      "direction": "lower_is_worse",
+      "kind": "proportion",
+      "metric_id": "canonical-in-top-5-held-out",
+      "n": 32,
+      "value": 0.0
+    },
+    {
+      "denominator": 32,
+      "details_path": "report-20260805T093831Z.txt",
+      "direction": "lower_is_worse",
+      "kind": "proportion",
+      "metric_id": "claim-recall",
+      "n": 32,
+      "value": 0.0625
+    },
+    {
+      "denominator": 490,
+      "details_path": "report-20260805T093831Z.txt",
+      "direction": "higher_is_worse",
+      "kind": "proportion",
+      "metric_id": "contamination-share",
+      "n": 490,
+      "value": 0.0
+    }
+  ],
+  "run_stamp": "20260805T093831Z",
+  "schema_version": 1
+}

@@ -160,8 +160,7 @@ def _translate_messages_response(body: dict) -> dict:
     # ── detect pad-token (NULL byte) responses ──────────────────────────────
     if _is_pad_token_response(result):
         logger.warning(
-            'vLLM returned pad tokens (\\x00) instead of content — '
-            'converting to error response'
+            'vLLM returned pad tokens (\\x00) instead of content — converting to error response'
         )
         return {
             'type': 'error',
@@ -180,10 +179,19 @@ def _translate_messages_response(body: dict) -> dict:
 # ── VllmBridge server ────────────────────────────────────────────────────────
 
 # Hop-by-hop headers that must not be forwarded
-_HOP_BY_HOP = frozenset({
-    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-    'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length',
-})
+_HOP_BY_HOP = frozenset(
+    {
+        'connection',
+        'keep-alive',
+        'proxy-authenticate',
+        'proxy-authorization',
+        'te',
+        'trailer',
+        'transfer-encoding',
+        'upgrade',
+        'content-length',
+    }
+)
 
 
 class VllmBridge:
@@ -307,7 +315,9 @@ class VllmBridge:
         if isinstance(current, int) and current > cap:
             logger.info(
                 'Clamping max_tokens from %d to %d (max_model_len=%s)',
-                current, cap, self._max_model_len,
+                current,
+                cap,
+                self._max_model_len,
             )
             body['max_tokens'] = cap
 
@@ -326,10 +336,7 @@ class VllmBridge:
         # Clamp max_tokens to avoid context-length overflow
         self._clamp_max_tokens(body)
 
-        headers = {
-            k: v for k, v in request.headers.items()
-            if k.lower() not in _HOP_BY_HOP
-        }
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
         assert self._session is not None, 'bridge not started'
         async with self._session.post(
             self.upstream_url + '/v1/messages',
@@ -361,10 +368,7 @@ class VllmBridge:
         if query:
             upstream_url += '?' + query
 
-        headers = {
-            k: v for k, v in request.headers.items()
-            if k.lower() not in _HOP_BY_HOP
-        }
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
         data = await request.read()
 
         assert self._session is not None, 'bridge not started'

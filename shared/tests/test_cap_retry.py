@@ -10,13 +10,14 @@ import inspect
 import itertools
 import json
 import logging
-import os
 import re
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
+from _usage_gate_test_helpers import make_gate as _shared_make_gate
 
 import shared.cli_invoke as cli_invoke_module
 from shared.cli_invoke import (
@@ -28,7 +29,7 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
 )
-from shared.config_models import AccountConfig, UsageCapConfig
+from shared.config_dir import TaskConfigDir
 from shared.invocation_outcome import (
     OK,
     AuthFailed,
@@ -38,6 +39,7 @@ from shared.invocation_outcome import (
     NearCap,
     ZeroOutputWedge,
 )
+from shared.testing import make_gate_mock
 from shared.usage_gate import (
     AccountLease,
     AccountPhase,
@@ -52,18 +54,18 @@ from shared.usage_gate import (
 # ---------------------------------------------------------------------------
 
 def make_gate(account_names: list[str], **kwargs) -> UsageGate:
-    """Create a UsageGate with fake accounts, probe disabled."""
-    acct_cfgs = []
-    env_vars = {}
-    for name in account_names:
-        env_key = f'TEST_TOKEN_{name.upper().replace("-", "_")}'
-        env_vars[env_key] = f'fake-token-{name}'
-        acct_cfgs.append(AccountConfig(name=name, oauth_token_env=env_key))
-    config = UsageCapConfig(accounts=acct_cfgs, **kwargs)
-    with patch.dict(os.environ, env_vars):
-        gate = UsageGate(config)
-    gate._run_probe = AsyncMock(return_value=True)
-    return gate
+    """Create a UsageGate with fake accounts, probe disabled.
+
+    Thin wrapper over the shared ``_usage_gate_test_helpers.make_gate`` that
+    pins cap_retry's historical default: ``UsageCapConfig.wait_for_reset``
+    stays ``True`` here (every cap_retry call site omits the kwarg), whereas
+    the scope suites force it ``False``. Construction is otherwise identical
+    -- the shared helper's ``UsageGate(config, cost_store=None)`` matches the
+    old local ``UsageGate(config)`` -- so every existing call site is
+    byte-preserved.
+    """
+    kwargs.setdefault('wait_for_reset', True)
+    return _shared_make_gate(account_names, **kwargs)
 
 
 def make_result(
@@ -85,128 +87,36 @@ def make_result(
 
 
 def _mock_gate(**overrides) -> MagicMock:
-    """Build a MagicMock UsageGate with sensible defaults.
+    """Build a mock ``UsageGate`` wired for ``invoke_slot()`` — see
+    :func:`shared.testing.make_gate_mock`, which this now simply delegates to.
 
-    Since commit 065e95a4c9 the cap-retry path in ``invoke_with_cap_retry``
-    goes through ``async with usage_gate.invoke_slot() as slot:``, where
-    ``slot`` is an :class:`~shared.usage_gate.InvokeSlot` instance that
-    proxies to the gate.  This helper wires ``gate.invoke_slot()`` to an
-    async-context-manager mock whose ``__aenter__`` yields a slot whose
-    ``detect_cap_hit`` / ``confirm`` / ``settle`` / ``report`` methods proxy
-    to the corresponding gate attributes — so tests can still assert on
-    ``gate.detect_cap_hit.call_args``, ``gate.confirm_account_ok``, etc.
-    ``report(outcome)`` (task W4-ε, PRD §7.4) mirrors the production
-    dispatch-then-settle contract of :meth:`InvokeSlot.report`.
+    Was a ~110-line near-verbatim copy of that shipped helper: same defaults,
+    same ``invoke_slot()`` async-CM wiring, same ``detect_cap_hit`` / ``confirm``
+    / ``settle`` / ``report`` proxies. Keeping two copies in step by hand failed
+    three times in the task-4096 series alone (both copies modelled the pre-fix
+    CapHit and detect_cap_hit arms), so the copy is retired and only the name
+    survives — the ~90 call sites below read better as ``_mock_gate(...)`` and
+    an alias keeps this file's diff honest about what changed.
 
-    ``__aexit__`` calls ``gate.release_probe_slot(slot.token)`` unless the
-    slot was settled by ``detect_cap_hit(...)==True``, ``confirm(...)``,
-    or ``settle()``.  This matches the production ``UsageGate.invoke_slot``
-    asynccontextmanager behaviour and keeps the ``release_probe_slot``
-    assertions in ``TestReleaseProbeSlotOnException`` /
-    ``TestCancelledErrorReleaseProbeSlot`` meaningful.
+    ``make_gate_mock`` differs from the retired copy in two deliberate ways,
+    both strictly better: the outer mock carries ``spec=UsageGate`` (so
+    attribute-name drift such as ``gate.active_account`` for
+    ``active_account_name`` raises instead of silently auto-creating), and the
+    yielded slot coerces ``account_name`` ``None`` -> ``''`` exactly as
+    production ``InvokeSlot`` does.
 
     Sister helper: ``orchestrator/tests/_orch_helpers.py::make_mock_gate`` —
     same shape but without the ``invoke_slot()`` async-CM wiring (orchestrator
-    tests use ``_attach_invoke_slot`` separately for that layer).  Cannot be
-    unified here: ``shared`` cannot import from ``orchestrator/tests``
+    tests use ``_attach_invoke_slot`` separately for that layer). Cannot be
+    unified with this one: ``shared`` cannot import from ``orchestrator/tests``
     (that would invert the package layering direction).
     """
-    gate = MagicMock()
-    gate.account_count = overrides.pop('account_count', 1)
-    gate.before_invoke = overrides.pop('before_invoke', AsyncMock(return_value='tok'))
-    gate.detect_cap_hit = overrides.pop('detect_cap_hit', MagicMock(return_value=False))
-    gate.active_account_name = overrides.pop('active_account_name', 'acct')
-    gate.on_agent_complete = overrides.pop('on_agent_complete', MagicMock())
-    gate.confirm_account_ok = overrides.pop('confirm_account_ok', MagicMock())
-    gate.release_probe_slot = overrides.pop('release_probe_slot', MagicMock())
-    gate.soonest_resets_at = overrides.pop('soonest_resets_at', None)
-    for k, v in overrides.items():
-        setattr(gate, k, v)
-
-    # Wire gate.invoke_slot() to yield an InvokeSlot-shaped proxy.
-    # A fresh slot is built on each call to invoke_slot() so that
-    # per-iteration side_effects on before_invoke / detect_cap_hit /
-    # active_account_name PropertyMock fire in the expected order.
-    def _make_invoke_slot_cm(*_a, **_kw):
-        holder: dict = {'slot': None}
-        # Prod now calls invoke_slot(scope=...) (PRD task β); accept and ignore
-        # the kwarg — additive, behavior unchanged.
-        _scope = _kw.get('scope')
-
-        async def _aenter_impl(*_args, **_akw):
-            token = await gate.before_invoke()
-            slot = MagicMock()
-            slot.token = token
-            slot.account_name = gate.active_account_name
-            slot.scope = _scope
-            slot._settled = False
-
-            def _slot_detect_cap_hit(stderr, output, backend='claude'):
-                hit = gate.detect_cap_hit(
-                    stderr, output, backend, oauth_token=slot.token,
-                )
-                if hit:
-                    slot._settled = True
-                return hit
-
-            def _slot_confirm(cost_usd=0.0):
-                gate.confirm_account_ok(slot.token)
-                gate.on_agent_complete(cost_usd)
-                slot._settled = True
-
-            def _slot_settle():
-                slot._settled = True
-
-            def _slot_report(outcome):
-                """Mirrors production InvokeSlot.report(outcome) (task W4-ε,
-                PRD §7.4): dispatches to the gate's existing handlers by
-                outcome variant, then settles in a ``finally`` so every path
-                leaves the slot settled exactly once."""
-                token = slot.token
-                try:
-                    if isinstance(outcome, OK):
-                        gate.confirm_account_ok(token)
-                    elif isinstance(outcome, CapHit):
-                        gate._handle_cap_detected(outcome.reason, outcome.resets_at, token)
-                    elif isinstance(outcome, AuthFailed):
-                        gate._handle_auth_failure(f'HTTP {outcome.status}', token)
-                    elif isinstance(outcome, NearCap):
-                        gate._handle_near_cap_warning(outcome.reason, token)
-                        gate.release_probe_slot(token)
-                    else:
-                        gate.release_probe_slot(token)
-                finally:
-                    slot._settled = True
-
-            # Plain synchronous MagicMocks — InvokeSlot.detect_cap_hit /
-            # confirm / settle / report are plain methods, not coroutines.
-            # Using MagicMock (not AsyncMock) is load-bearing: prod does
-            # ``if slot.detect_cap_hit(...):`` / ``slot.report(outcome)``
-            # without ``await``.
-            slot.detect_cap_hit = MagicMock(side_effect=_slot_detect_cap_hit)
-            slot.confirm = MagicMock(side_effect=_slot_confirm)
-            slot.settle = MagicMock(side_effect=_slot_settle)
-            slot.report = MagicMock(side_effect=_slot_report)
-            holder['slot'] = slot
-            return slot
-
-        async def _aexit_impl(*_args, **_kw):
-            slot = holder['slot']
-            if slot is not None and not slot._settled:
-                gate.release_probe_slot(slot.token)
-            return None
-
-        cm = MagicMock()
-        cm.__aenter__ = AsyncMock(side_effect=_aenter_impl)
-        cm.__aexit__ = AsyncMock(side_effect=_aexit_impl)
-        return cm
-
-    gate.invoke_slot = MagicMock(side_effect=_make_invoke_slot_cm)
-    return gate
+    return make_gate_mock(**overrides)
 
 
 def test_mock_gate_defaults_include_release_probe_slot():
-    """_mock_gate() should explicitly set release_probe_slot in its defaults.
+    """_mock_gate() (now make_gate_mock) must explicitly set
+    release_probe_slot in its defaults.
 
     Checks vars(gate) rather than hasattr(gate, ...) so that MagicMock's
     silent auto-attribute creation doesn't produce a false positive.
@@ -214,8 +124,93 @@ def test_mock_gate_defaults_include_release_probe_slot():
     gate = _mock_gate()
     assert 'release_probe_slot' in vars(gate), (
         "_mock_gate() must explicitly set release_probe_slot so the "
-        "exception-cleanup contract is self-documented in the helper."
+        "probe-release contract is self-documented in the helper."
     )
+
+
+# ---------------------------------------------------------------------------
+# Probe-release fidelity: production InvokeSlot vs. the MagicMock double
+# ---------------------------------------------------------------------------
+#
+# ``shared.testing.make_gate_mock`` hand-reimplements ``InvokeSlot``'s
+# dispatch, so it can silently drift from production — exactly what task 4096
+# found (it modelled the pre-fix CapHit and detect_cap_hit arms, which stranded
+# the PROBE_IN_FLIGHT claim on a scoped cap). A test that restates the double's
+# body can only fail when someone edits the double, i.e. at the moment they'd
+# edit the test too. So instead: drive a REAL ``UsageGate``-backed
+# ``InvokeSlot`` and the double through the SAME outcome script and assert
+# their ``release_probe_slot`` call counts agree. A production-side change that
+# no one mirrors into the double fails this.
+
+_FIDELITY_CAP_STDERR = "You've hit your usage limit resets in 3h"
+
+# (id, drive(slot), expected release_probe_slot calls) — one entry per arm
+# that InvokeSlot dispatches, covering BOTH entry points (report /
+# detect_cap_hit). Counts are whole-``async with`` totals, so they also pin
+# that the ``__aexit__`` safety net does not double-release a settled slot.
+_PROBE_RELEASE_SCRIPT = [
+    ('report_ok', lambda slot: slot.report(OK()), 0),
+    ('report_cap_hit', lambda slot: slot.report(CapHit(resets_at=None, reason='cap')), 1),
+    ('report_near_cap', lambda slot: slot.report(NearCap(reason='close to limit')), 1),
+    ('report_auth_failed', lambda slot: slot.report(AuthFailed(status=401)), 0),
+    ('report_failure', lambda slot: slot.report(Failure(kind='boom')), 1),
+    ('detect_cap_hit', lambda slot: slot.detect_cap_hit(_FIDELITY_CAP_STDERR, ''), 1),
+]
+
+
+def _release_calls(mock, token) -> tuple[int, bool]:
+    """(call count, every call passed *token*) for a release_probe_slot mock."""
+    calls = mock.call_args_list
+    return len(calls), all(c == call(token) for c in calls)
+
+
+async def _production_releases(drive) -> tuple[int, bool]:
+    """Run *drive* against a production InvokeSlot over a real UsageGate."""
+    # wait_for_reset=False so the CAPPED arm does not spawn a resume-probe
+    # background task; shutdown() below drains the auth-reprobe one anyway.
+    gate = make_gate(['a'], wait_for_reset=False)
+    try:
+        with patch.object(
+            gate, 'release_probe_slot', wraps=gate.release_probe_slot,
+        ) as spy:
+            async with gate.invoke_slot() as slot:
+                token = slot.token
+                drive(slot)
+        return _release_calls(spy, token)
+    finally:
+        await gate.shutdown()
+
+
+async def _double_releases(drive) -> tuple[int, bool]:
+    """Run *drive* against the MagicMock gate double.
+
+    ``detect_cap_hit=True`` makes the double return the same verdict the real
+    classifier returns for ``_FIDELITY_CAP_STDERR``, so both parties run the
+    same script; it is inert for the ``report`` steps.
+    """
+    gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=True))
+    async with gate.invoke_slot() as slot:
+        drive(slot)
+    return _release_calls(gate.release_probe_slot, 'tok')
+
+
+@pytest.mark.parametrize(
+    ('drive', 'expected'),
+    [(drive, expected) for _id, drive, expected in _PROBE_RELEASE_SCRIPT],
+    ids=[_id for _id, _drive, _expected in _PROBE_RELEASE_SCRIPT],
+)
+async def test_gate_double_matches_production_probe_release(drive, expected):
+    """The double must release the probe claim exactly when production does.
+
+    Comparing against a real gate (not against the double's own source) is what
+    makes this detect drift rather than restate it. The bool in each tuple
+    asserts every release carried that party's own slot token.
+    """
+    parties = {
+        'production': await _production_releases(drive),
+        'make_gate_mock': await _double_releases(drive),
+    }
+    assert parties == dict.fromkeys(parties, (expected, True))
 
 
 # Shared patch targets
@@ -671,6 +666,222 @@ class TestCapRetryResume:
         assert new_sid != 'sess-orig', 'session_id must be regenerated, not reused'
         # Must be a valid UUID (str(uuid.uuid4()) round-trips through UUID()).
         assert str(uuid.UUID(new_sid)) == new_sid
+
+
+# ===================================================================
+# TestCapRetryTranscriptReachability
+# ===================================================================
+
+
+def _write_transcript(base: Path, session_id: str, slug: str = 'myproject') -> Path:
+    """Materialise ``<base>/projects/<slug>/<session_id>.jsonl``.
+
+    Mirrors the fixture idiom in ``test_cli_invoke.py::TestReadTranscriptRecords``
+    — the layout ``_resolve_transcript_path`` globs for.
+    """
+    slug_dir = base / 'projects' / slug
+    slug_dir.mkdir(parents=True, exist_ok=True)
+    transcript = slug_dir / f'{session_id}.jsonl'
+    transcript.write_text(json.dumps({'type': 'user', 'content': 'hi'}) + '\n')
+    return transcript
+
+
+@pytest.mark.asyncio
+class TestCapRetryTranscriptReachability:
+    """The cap-hit resume branch must only resume a session it can REACH.
+
+    Claude CLI sessions are local JSONL transcripts at
+    ``<config_dir>/projects/*/<session_id>.jsonl`` — not server-side objects —
+    so ``--resume`` replays that file.  Resuming a session whose transcript is
+    not on disk yields an effectively EMPTY session: the agent restarts with
+    CAP_HIT_RESUME_PROMPT ("continue where you left off") and no context to
+    continue from, losing work silently.  These tests pin that the branch
+    checks reachability instead of assuming it.
+    """
+
+    async def test_unreachable_transcript_falls_back_to_fresh(self, tmp_path):
+        """config_dir given but NO transcript on disk -> fresh, not a blind resume."""
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('3454-reach-missing', base_dir=tmp_path)
+        # Deliberately write NO transcript: projects/ stays absent.
+        assert not (config_dir.path / 'projects').exists()
+
+        capped = make_result(session_id='sess-42')
+        ok = make_result()
+        rebuild = AsyncMock(return_value='FRESH REBUILT PROMPT')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir,
+                prompt='do stuff', rebuild_prompt=rebuild,
+            )
+
+        second = mock_inv.call_args_list[1]
+        assert 'resume_session_id' not in second.kwargs, (
+            'must NOT resume a session whose transcript is not on disk'
+        )
+        # The fresh path must rebuild the prompt — CAP_HIT_RESUME_PROMPT is
+        # meaningless to a brand-new session with no history to continue.
+        rebuild.assert_awaited_once_with(True)
+        assert second.kwargs.get('prompt') == 'FRESH REBUILT PROMPT'
+
+    async def test_unreachable_transcript_without_rebuild_uses_original_prompt(self, tmp_path):
+        """No rebuild_prompt hook -> fresh retry replays the ORIGINAL prompt."""
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('3454-reach-missing-norebuild', base_dir=tmp_path)
+        capped = make_result(session_id='sess-42')
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir, prompt='do stuff',
+            )
+
+        second = mock_inv.call_args_list[1]
+        assert 'resume_session_id' not in second.kwargs
+        assert second.kwargs.get('prompt') == 'do stuff'
+
+    async def test_reachable_transcript_still_resumes(self, tmp_path):
+        """Regression pin: transcript ON disk -> resume exactly as before.
+
+        Proves the guard does not over-fire and silently disable cross-account
+        session resume on the happy path.
+        """
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('3454-reach-present', base_dir=tmp_path)
+        _write_transcript(config_dir.path, 'sess-42')
+
+        capped = make_result(session_id='sess-42')
+        ok = make_result()
+        rebuild = AsyncMock(return_value='SHOULD NOT BE USED')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir,
+                prompt='do stuff', rebuild_prompt=rebuild,
+            )
+
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('resume_session_id') == 'sess-42'
+        assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
+        rebuild.assert_not_awaited()
+
+    async def test_log_states_reason_resumed_transcript_present(self, tmp_path, caplog):
+        """The cap-hit line must say WHY it resumed, not just 'resuming'."""
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('3454-reason-present', base_dir=tmp_path)
+        _write_transcript(config_dir.path, 'sess-42')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[make_result(session_id='sess-42'), make_result()]),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir, prompt='do stuff',
+            )
+        assert any('transcript present' in r.message for r in caplog.records), (
+            'cap-hit log must name the reason it resumed, so a lost-context '
+            f'incident is diagnosable from logs alone. Got: {caplog.text!r}'
+        )
+
+    async def test_log_states_reason_fresh_no_session_id(self, caplog):
+        """Fresh because there was no session_id at all -> say so."""
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[make_result(session_id=''), make_result()]),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='do stuff')
+        assert any('no session_id' in r.message for r in caplog.records), (
+            f'Got: {caplog.text!r}'
+        )
+
+    async def test_log_states_reason_fresh_transcript_unreachable(self, tmp_path, caplog):
+        """Fresh because the guard vetoed an unreachable session -> say so.
+
+        This is the case an operator most needs to distinguish: context WAS
+        dropped, unlike the no-session_id case where there was none to keep.
+        """
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('3454-reason-unreachable', base_dir=tmp_path)
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[make_result(session_id='sess-42'), make_result()]),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir, prompt='do stuff',
+            )
+        assert any('transcript unreachable' in r.message for r in caplog.records), (
+            f'Got: {caplog.text!r}'
+        )
+
+    async def test_no_config_dir_resumes_unconditionally(self):
+        """Regression pin: config_dir=None -> resume as today.
+
+        Without a concrete config dir there is no correct directory to glob:
+        the process default ``~/.claude`` would be wrong for any caller running
+        under an isolated CLAUDE_CONFIG_DIR.  Scoping the veto to "we have a
+        directory and the transcript is provably not in it" keeps the new
+        failure mode strictly narrower than the bug it fixes.
+        """
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        capped = make_result(session_id='sess-42')
+        ok = make_result()
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, side_effect=[capped, ok]) as mock_inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='do stuff')
+
+        second = mock_inv.call_args_list[1]
+        assert second.kwargs.get('resume_session_id') == 'sess-42'
+        assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
 
 # ===================================================================

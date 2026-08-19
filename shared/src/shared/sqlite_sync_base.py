@@ -56,9 +56,7 @@ def apply_full_durability_pragmas_sync(
     row = conn.execute('PRAGMA journal_mode=WAL').fetchone()
     if row is None or row[0] != 'wal':
         got = row[0] if row is not None else None
-        raise RuntimeError(
-            f'Failed to enable WAL journal mode (got {got!r})'
-        )
+        raise RuntimeError(f'Failed to enable WAL journal mode (got {got!r})')
     conn.execute(f'PRAGMA busy_timeout={busy_timeout_ms}')
     # synchronous=FULL: per-commit fsync. Cost is ~1-5ms/commit; the
     # win is crash durability without relying on WAL checkpoints. See

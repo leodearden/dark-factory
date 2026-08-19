@@ -54,6 +54,13 @@ def _flatten_tasks(tasks_payload: Any) -> list[dict]:
 class FusedMemoryClient:
     """Minimal HTTP/JSON-RPC client for the fused-memory MCP server."""
 
+    #: clientInfo.name sent at handshake. LOAD-BEARING, not cosmetic:
+    #: fused_memory/server/tools.py `_resolve_identity` derives a write's
+    #: agent_id from ctx.session.client_params.clientInfo.name, so a subclass
+    #: that does not set this files its writes under THIS migration's identity.
+    #: Override it in a subclass — do NOT restate `_initialize` to change it.
+    _client_name: str = 'migrate-metadata'
+
     def __init__(self, server_url: str):
         self._url = server_url.rstrip('/')
         self._client: httpx.AsyncClient | None = None
@@ -96,7 +103,7 @@ class FusedMemoryClient:
             'method': 'initialize',
             'params': {
                 'protocolVersion': '2024-11-05',
-                'clientInfo': {'name': 'migrate-metadata', 'version': '1.0'},
+                'clientInfo': {'name': self._client_name, 'version': '1.0'},
                 'capabilities': {},
             },
         })

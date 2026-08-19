@@ -7,10 +7,16 @@ import json
 import logging
 import os
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _orch_helpers import (
+    NonIsolatedGitRepoError,
+    assert_isolated_git_repo,
+    git_env_with_ceiling,
+)
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
@@ -83,10 +89,32 @@ async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
 
     *tag* is interpolated into the blob content so that multiple calls in the
     same repository produce distinct shas even for different paths.
+
+    ISOLATION INVARIANT (esc-3072-3): *cwd* must BE a git repository root, so
+    this helper can only ever mutate the repo rooted exactly there.  Git's
+    repository discovery walks UP the directory tree, so a *cwd* that is merely
+    *inside* some repo silently retargets whatever encloses it — and when
+    pytest's basetemp lives inside a live task worktree
+    (``.worktrees/<task>/.pytest-tmp/``) that is production state.  This helper
+    once wrote three blobs into a live worktree's object store and staged
+    ``foo.py`` at stages 1/2/3, leaving a real task's index unmerged.
+
+    Two layers enforce that invariant, and neither is redundant:
+
+    * :func:`assert_isolated_git_repo` runs FIRST, before any subprocess, so a
+      rejected call writes nothing anywhere.  Nothing weaker suffices —
+      ``git hash-object -w`` below writes its blobs before ``git update-index``
+      can fail, so a guard that only makes git error out mid-sequence still
+      leaves objects behind in the victim.
+    * :func:`git_env_with_ceiling` caps git's upward walk at *cwd*, so escape is
+      impossible at the git level even if the pre-flight is ever refactored away.
     """
+    assert_isolated_git_repo(cwd)
+    env = git_env_with_ceiling(cwd)
+
     def _run_sync(cmd, **kwargs):
         return subprocess.run(
-            cmd, cwd=str(cwd), capture_output=True, check=True, **kwargs,
+            cmd, cwd=str(cwd), capture_output=True, check=True, env=env, **kwargs,
         )
 
     h1 = _run_sync(
@@ -257,6 +285,37 @@ def test_git_config_rejects_bypass_command_without_clear():
     with pytest.raises((pydantic.ValidationError, ValueError)) as excinfo:
         GitConfig(main_gate_bypass_command='git config reify.mainGate.bypass true')
     assert 'main_gate_bypass_clear_command' in str(excinfo.value)
+
+
+async def _build_cold_orphan_branch(
+    git_ops: GitOps,
+    task_id: str,
+    *,
+    wip_name: str = 'orphan_work.py',
+    wip_content: str = 'value = 42\n',
+) -> str:
+    """Build the reaped-but-retained cold shape for *task_id*.
+
+    Build ``task/<task_id>`` in a throwaway worktree OUTSIDE
+    ``worktree_base``, commit a foreign WIP file onto it, then force-remove
+    the worktree — leaving the branch as a dangling ref carrying a real
+    commit beyond main, with ``worktree_base/<task_id>`` never having
+    existed. Returns the full branch name (``task/<task_id>``).
+    """
+    full_branch = f'task/{task_id}'
+    tmp_wt = git_ops.project_root.parent / f'tmp-{task_id}'
+    rc, _, err = await _run(
+        ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
+        cwd=git_ops.project_root,
+    )
+    assert rc == 0, err
+    (tmp_wt / wip_name).write_text(wip_content)
+    await _run(['git', 'add', '-A'], cwd=tmp_wt)
+    await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
+    await _run(
+        ['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root,
+    )
+    return full_branch
 
 
 @pytest.mark.asyncio
@@ -465,21 +524,7 @@ class TestWorktreeLifecycle:
         """A leftover branch carrying a commit beyond main, whose worktree dir
         is gone (the reaped-but-retained shape), must be RE-ATTACHED and
         RESUMED — not destroyed via the old raise-on-leftover-branch path."""
-        full_branch = 'task/lo-commit'
-        # Build the branch with a real commit beyond main via a throwaway
-        # worktree, then remove the worktree so the branch is a dangling ref
-        # (worktree_base/'lo-commit' never existed — the reaped-but-retained
-        # shape: dir gone, branch survives).
-        tmp_wt = git_ops.project_root.parent / 'tmp-lo-commit'
-        rc, _, err = await _run(
-            ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0, err
-        (tmp_wt / 'orphan_work.py').write_text('value = 42\n')
-        await _run(['git', 'add', '-A'], cwd=tmp_wt)
-        await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
-        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root)
+        full_branch = await _build_cold_orphan_branch(git_ops, 'lo-commit')
 
         info = await git_ops.create_worktree('lo-commit')
 
@@ -507,6 +552,10 @@ class TestWorktreeLifecycle:
         helper must raise rather than fall through to any destructive
         cleanup.  The branch, its commit, and the holding worktree's content
         all survive intact."""
+        # Deliberately does not use _build_cold_orphan_branch: that helper
+        # force-removes its throwaway worktree at the end (producing the
+        # dir-gone cold shape), but this test needs the OPPOSITE — the
+        # worktree left checked out and live — so it keeps its own setup.
         full_branch = 'task/lo-live'
         holding = git_ops.project_root.parent / 'holding-lo-live'
         rc, _, err = await _run(
@@ -3397,15 +3446,101 @@ class TestUnmergedDetection:
     async def test_inject_uu_state_raises_on_non_git_cwd(
         self, tmp_path: Path,
     ):
-        """_inject_uu_state raises CalledProcessError when cwd is not a git repo.
+        """_inject_uu_state refuses a cwd that is not a git repository root.
 
-        git hash-object exits with rc != 0 in a non-git directory; without
-        check=True the helper silently builds an invalid payload.  With
-        check=True it raises immediately, turning silent corruption into an
-        actionable CalledProcessError that includes stderr.
+        This expectation used to be ``pytest.raises(CalledProcessError)``, on
+        the premise that "git fails in a non-git directory".  That premise was
+        CONDITIONAL, and the condition was invisible: it holds only while
+        pytest's basetemp is not itself nested inside a git repo.  Under a
+        basetemp inside a live task worktree the bare ``tmp_path`` below IS
+        inside a repo, git's upward walk resolves it, the injection SUCCEEDS,
+        and the test then reports a puzzling "DID NOT RAISE" — long after the
+        blobs have already landed in the victim's object store (esc-3072-3).
+
+        ``NonIsolatedGitRepoError`` holds unconditionally, because the guard
+        decides from the filesystem shape of *cwd* alone rather than from
+        whatever git happens to find above it.  It is also unambiguous: a bare
+        ``CalledProcessError`` can arise from any incidental git failure,
+        whereas this type proves the isolation guard specifically fired.
         """
-        with pytest.raises(subprocess.CalledProcessError):
+        with pytest.raises(NonIsolatedGitRepoError):
             await _inject_uu_state(tmp_path, 'foo.py')
+
+    async def test_inject_uu_state_cannot_mutate_an_enclosing_repo(
+        self, tmp_path: Path,
+    ):
+        """esc-3072-3 regression: a nested non-repo cwd must not reach its parent.
+
+        Reconstructs the incident layout — a live task worktree with a pytest
+        basetemp nested inside it (``.worktrees/3072/.pytest-tmp/``).  git's
+        repository discovery walks UP, so ``_inject_uu_state`` handed that bare
+        nested directory resolved the enclosing worktree and injected stages
+        1/2/3 into a REAL task's index, leaving ``UU foo.py`` behind.
+
+        Both halves are asserted, and the second is the load-bearing one.
+        "The helper raised" is exactly what
+        ``test_inject_uu_state_raises_on_non_git_cwd`` already claimed, and it
+        did not prevent the incident: ``git hash-object -w`` writes its blobs
+        BEFORE ``git update-index`` runs, so the corruption was complete before
+        ``pytest.raises`` could report anything.  The property that actually
+        matters — and the only assertion that would have caught this — is that
+        no bytes reached the enclosing repo at all.
+        """
+        # Sentinel standing in for the live task worktree that was corrupted.
+        sentinel = tmp_path / 'live-worktree'
+        sentinel.mkdir()
+        await _setup_repo(sentinel)
+
+        # Stand-in for a pytest basetemp nested INSIDE that worktree.
+        nested = sentinel / '.pytest-tmp' / 'test_x0'
+        nested.mkdir(parents=True)
+
+        # Pre-compute the three payload blob shas WITHOUT -w, so this probe
+        # cannot itself write the very objects it is about to look for.
+        payload_shas: list[str] = []
+        for content in ('version base\n', 'version ours\n', 'version theirs\n'):
+            rc, out, err = await _run(
+                ['git', 'hash-object', '--stdin'], cwd=sentinel, input_text=content,
+            )
+            assert rc == 0, f'sha probe failed: {err}'
+            payload_shas.append(out.strip())
+
+        # Baseline: the untracked .pytest-tmp/ is expected to show up here, so
+        # compare before/after rather than asserting a bare-clean tree.
+        rc, status_before, err = await _run(
+            ['git', 'status', '--porcelain'], cwd=sentinel,
+        )
+        assert rc == 0, err
+
+        with pytest.raises(NonIsolatedGitRepoError):
+            await _inject_uu_state(nested, 'foo.py')
+
+        rc, unmerged, err = await _run(['git', 'ls-files', '-u'], cwd=sentinel)
+        assert rc == 0, err
+        assert unmerged.strip() == '', (
+            f'esc-3072-3 recurrence: unmerged entries injected into the '
+            f'enclosing repo: {unmerged!r}'
+        )
+
+        rc, status_after, err = await _run(
+            ['git', 'status', '--porcelain'], cwd=sentinel,
+        )
+        assert rc == 0, err
+        assert status_after == status_before, (
+            f'enclosing repo state changed: {status_before!r} -> {status_after!r}'
+        )
+
+        assert not (sentinel / 'foo.py').exists(), (
+            'the injected path materialised in the enclosing worktree'
+        )
+
+        for sha in payload_shas:
+            rc, _, _ = await _run(['git', 'cat-file', '-e', sha], cwd=sentinel)
+            assert rc != 0, (
+                f'payload blob {sha} leaked into the enclosing object store — '
+                f'a guard that only makes git fail mid-sequence is not enough; '
+                f'the refusal must happen before the first subprocess'
+            )
 
 
 @pytest.mark.asyncio
@@ -4964,6 +5099,48 @@ class TestRunWorktreeMissing:
         assert not isinstance(exc.value, WorktreeMissing)
 
 
+async def _wait_for_child_pid(
+    pid_file: Path, *, timeout: float = 5.0, interval: float = 0.1,
+) -> int:
+    """Poll for *pid_file* to appear and return its pid.
+
+    The child writes its pid to a sibling ``<path>.tmp`` file and
+    ``os.replace()``s it into place, so the *moment* ``pid_file.exists()``
+    the file is guaranteed to hold complete, parseable content — no window
+    where the parent can observe a just-created-but-empty file (the old
+    ``open(path, 'w').write(...)`` pattern raced ``open``'s truncate against
+    the buffered ``write``) nor a torn/partial read of an in-progress write
+    (task 3851). Mirrors the monotonic-deadline + ``timeout``/``interval``
+    convention used by ``wait_for_pgid_file`` in
+    test_laptop_warm_verify_boundary.py.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pid_file.exists():
+            with contextlib.suppress(ValueError):
+                return int(pid_file.read_text().strip())
+        await asyncio.sleep(interval)
+    pytest.fail(
+        f'child never wrote its pid to {pid_file} within {timeout}s (it may '
+        'never have started, or was killed before it could flush the pid '
+        'write)'
+    )
+
+
+async def _assert_child_reaped(
+    child_pid: int, *, timeout: float = 5.0, interval: float = 0.1,
+) -> None:
+    """Poll until *child_pid* is gone; fail if it outlives *timeout*."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            return
+        await asyncio.sleep(interval)
+    pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
+
+
 @pytest.mark.asyncio
 class TestRunCancellationReapsChild:
     """``_run`` kills+reaps the spawned child on cancellation (task 2608).
@@ -4981,62 +5158,52 @@ class TestRunCancellationReapsChild:
         pid_file = tmp_path / 'child.pid'
         # A child that records its own pid then sleeps far longer than the
         # wait_for timeout below — simulates a persistently-hung script.
+        # The pid is written to a sibling .tmp file and atomically renamed
+        # into place so `pid_file` only ever appears fully written (task
+        # 3851) — see _wait_for_child_pid.
         script = (
             'import os, time, sys\n'
-            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            f"tmp = {str(pid_file)!r} + '.tmp'\n"
+            "open(tmp, 'w').write(str(os.getpid()))\n"
+            f"os.replace(tmp, {str(pid_file)!r})\n"
             'time.sleep(60)\n'
         )
+        # The deadline must outlast the child's interpreter startup, or the
+        # child is cancelled before it ever publishes its pid and the poll
+        # below fails as 'child never started'. Measured on a loaded box:
+        # 1.0s missed the pid in 39/40 trials, 3.0s in 12/40, 5.0s in 0/40.
+        # The child sleeps 60s, so a 5.0s deadline still cancels _run with the
+        # child very much alive — which is what this test is about.
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(
-                _run(['python3', '-c', script]), timeout=1.0
+                _run(['python3', '-c', script]), timeout=5.0
             )
 
         # Wait for the child to have written its pid (should be near-instant).
-        for _ in range(50):
-            if pid_file.exists():
-                break
-            await asyncio.sleep(0.1)
-        assert pid_file.exists(), 'child never started'
-        child_pid = int(pid_file.read_text())
+        child_pid = await _wait_for_child_pid(pid_file)
 
         # The cancelled _run must have killed + reaped the child by now — no
         # zombie, no orphan still sleeping.
-        for _ in range(50):
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            await asyncio.sleep(0.1)
-        else:
-            pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
+        await _assert_child_reaped(child_pid)
 
     async def test_cancelled_error_kills_and_reaps_child(self, tmp_path: Path) -> None:
         pid_file = tmp_path / 'child.pid'
+        # Atomic tmp-write + rename — see _wait_for_child_pid (task 3851).
         script = (
             'import os, time\n'
-            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            f"tmp = {str(pid_file)!r} + '.tmp'\n"
+            "open(tmp, 'w').write(str(os.getpid()))\n"
+            f"os.replace(tmp, {str(pid_file)!r})\n"
             'time.sleep(60)\n'
         )
         task = asyncio.ensure_future(_run(['python3', '-c', script]))
-        for _ in range(50):
-            if pid_file.exists():
-                break
-            await asyncio.sleep(0.1)
-        assert pid_file.exists(), 'child never started'
-        child_pid = int(pid_file.read_text())
+        child_pid = await _wait_for_child_pid(pid_file)
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        for _ in range(50):
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            await asyncio.sleep(0.1)
-        else:
-            pytest.fail(f'child pid {child_pid} was not reaped after cancellation')
+        await _assert_child_reaped(child_pid)
 
 
 def _write_stored_title(worktree: Path, title: str) -> None:
@@ -5045,6 +5212,23 @@ def _write_stored_title(worktree: Path, title: str) -> None:
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / 'metadata.json').write_text(
         json.dumps({'title': title, 'task_id': worktree.name})
+    )
+
+
+def _write_sibling_stored_title(worktree_base: Path, name: str, title: str) -> None:
+    """Write a sibling ``.task-meta/<name>/metadata.json`` carrying *title*.
+
+    Cold-path analogue of :func:`_write_stored_title`: on the cold path the
+    worktree directory does not exist (only the branch survives), so
+    :func:`~orchestrator.worktree_identity.read_worktree_title` can only read
+    the SIBLING ``<worktree_base>/.task-meta/<name>`` root (which survives
+    ``cleanup_worktree``'s removal of the worktree dir), not an in-worktree
+    ``.task`` sidecar.
+    """
+    meta_root = TaskArtifacts.meta_root_for(worktree_base, name)
+    meta_root.mkdir(parents=True, exist_ok=True)
+    (meta_root / 'metadata.json').write_text(
+        json.dumps({'title': title, 'task_id': name})
     )
 
 
@@ -5094,6 +5278,299 @@ class TestWorktreeReuseIdentityGuard:
         info2 = await git_ops.create_worktree('reuse-noguard')
         assert info2.path == info.path
         assert not git_ops.quarantine_base.exists()
+
+    async def test_mismatch_relocates_foreign_meta_root_to_quarantine(
+        self, git_ops: GitOps,
+    ):
+        """Mirrors TestColdReattachIdentityGuard's
+        test_cold_reattach_mismatch_clears_foreign_meta_root: a confirmed
+        identity mismatch on the REUSE path must also relocate the foreign
+        sibling .task-meta/<id> root alongside the quarantined worktree —
+        not just quarantine the branch. Otherwise the deleted task's
+        plan.json survives at the old path and workflow.py's plan-resume
+        adopts it onto the NEW task; and if it were merely deleted instead
+        of relocated, an operator inspecting the quarantined worktree later
+        would have no record of which task it belonged to."""
+        task_id = 'reuse-clears-meta'
+        info = await git_ops.create_worktree(task_id)
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
+        _write_sibling_stored_title(
+            git_ops.worktree_base, task_id, 'Trajectory beta: spline solver',
+        )
+        (meta / 'plan.json').write_text(json.dumps({
+            'task_id': task_id,
+            'title': 'Trajectory beta: spline solver',
+            'steps': [],
+            'confirmed': True,
+        }))
+        (info.path / 'spline.rs').write_text('fn solve() {}\n')
+        await git_ops.commit(info.path, 'trajectory WIP')
+
+        await git_ops.create_worktree(
+            task_id, expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        assert not (meta / 'plan.json').exists(), (
+            "the deleted task's plan.json must not survive at the old path"
+        )
+        quarantined = list(git_ops.quarantine_base.glob(f'{task_id}-*'))
+        assert len(quarantined) == 1
+        relocated_meta = TaskArtifacts.meta_root_for(
+            git_ops.quarantine_base, quarantined[0].name,
+        )
+        assert (relocated_meta / 'plan.json').exists(), (
+            'the sidecar must be relocated alongside the quarantined '
+            'worktree, not deleted'
+        )
+
+    async def test_match_preserves_meta_root(self, git_ops: GitOps):
+        """A same-task resume (matching title) must keep its own
+        .task-meta artifacts in place — _relocate_foreign_meta_root must
+        never be invoked on a same-task reuse route."""
+        task_id = 'reuse-preserves-meta'
+        await git_ops.create_worktree(task_id)
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
+        _write_sibling_stored_title(
+            git_ops.worktree_base, task_id, 'Build the frobnicator',
+        )
+        (meta / 'plan.json').write_text(json.dumps({
+            'task_id': task_id,
+            'title': 'Build the frobnicator',
+            'steps': [],
+            'confirmed': True,
+        }))
+
+        await git_ops.create_worktree(
+            task_id, expected_title='Build the frobnicator',
+        )
+
+        assert (meta / 'plan.json').exists(), (
+            'a same-task resume must preserve its own plan.json in place'
+        )
+
+
+@pytest.mark.asyncio
+class TestColdReattachIdentityGuard:
+    """create_worktree(expected_title=...)'s cold-path γ reattach guard —
+    mirrors TestWorktreeReuseIdentityGuard above, but for the
+    reaped-but-retained shape (worktree dir gone, only the branch survives)
+    instead of a registered worktree."""
+
+    async def test_cold_reattach_quarantines_on_identity_mismatch(
+        self, git_ops: GitOps, caplog,
+    ):
+        """A recycled task id whose surviving orphan branch belongs to a
+        DIFFERENT (deleted) task must be quarantined — not silently resumed
+        onto the new task."""
+        await _build_cold_orphan_branch(git_ops, 'cold-recycled')
+        _write_sibling_stored_title(
+            git_ops.worktree_base, 'cold-recycled', 'Trajectory beta: spline solver',
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            info = await git_ops.create_worktree(
+                'cold-recycled', expected_title='Cycle-breaker beta: dedup edges',
+            )
+
+        assert info.path == git_ops.worktree_base / 'cold-recycled'
+        assert info.path.exists()
+        assert (info.path / 'README.md').exists(), 'must carry fresh main content'
+        assert not (info.path / 'orphan_work.py').exists(), (
+            "the foreign orphan's WIP must NOT be resumed onto the new task"
+        )
+
+        # The orphan (dir + branch) was relocated to quarantine, file intact.
+        assert git_ops.quarantine_base.exists()
+        quarantined = list(git_ops.quarantine_base.glob('cold-recycled-*'))
+        assert len(quarantined) == 1
+        assert (quarantined[0] / 'orphan_work.py').exists()
+
+        # The new branch is fresh — no trace of the orphan's commit.
+        rc, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/cold-recycled'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert int(count_out.strip()) == 0
+
+        # Nothing was destroyed — the quarantined branch still exists.
+        rc, branch_out, _ = await _run(
+            ['git', 'branch', '--list', 'task/cold-recycled-*'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert branch_out.strip(), 'quarantined branch must survive — nothing destroyed'
+
+        assert any(
+            'mismatch' in r.message.lower() for r in caplog.records
+        ), 'a WARNING naming the identity mismatch must be logged (loud-over-silent)'
+
+    async def test_cold_reattach_mismatch_raises_when_quarantine_fails(
+        self, git_ops: GitOps,
+    ):
+        """If quarantine_worktree cannot relocate the mismatched orphan, the
+        caller must raise an actionable error — never fall through to the
+        opaque `git worktree add -b` collision with the still-present
+        branch and now-attached directory (the exact regression
+        _cleanup_leftover_branch's raise-not-destroy contract eliminated)."""
+        from unittest.mock import AsyncMock
+
+        full_branch = await _build_cold_orphan_branch(git_ops, 'cold-quarantine-fails')
+        _write_sibling_stored_title(
+            git_ops.worktree_base,
+            'cold-quarantine-fails',
+            'Trajectory beta: spline solver',
+        )
+        _, sha_before, _ = await _run(
+            ['git', 'rev-parse', full_branch], cwd=git_ops.project_root,
+        )
+        sha_before = sha_before.strip()
+
+        # quarantine_worktree never raises by contract — it returns None when
+        # it could not relocate. Force that outcome.
+        git_ops.quarantine_worktree = AsyncMock(return_value=None)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await git_ops.create_worktree(
+                'cold-quarantine-fails',
+                expected_title='Cycle-breaker beta: dedup edges',
+            )
+
+        message = str(excinfo.value)
+        assert 'refus' in message.lower()
+        assert full_branch in message
+        # Must NOT be the opaque fresh-create collision error a blind
+        # fall-through would produce.
+        assert 'Failed to create worktree' not in message
+        assert 'already exists' not in message
+
+        # Nothing was destroyed: the branch and its commit(s) survive intact.
+        rc, sha_after, _ = await _run(
+            ['git', 'rev-parse', full_branch], cwd=git_ops.project_root,
+        )
+        assert rc == 0, 'branch must still exist'
+        assert sha_after.strip() == sha_before, 'commit must be preserved'
+
+        rc, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..{full_branch}'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert int(count_out.strip()) > 0, 'branch must still carry commits beyond main'
+
+    async def test_cold_reattach_resumes_on_title_match(self, git_ops: GitOps):
+        """A matching stored title must resume the orphan's WIP, not
+        quarantine it."""
+        await _build_cold_orphan_branch(git_ops, 'cold-match')
+        _write_sibling_stored_title(
+            git_ops.worktree_base, 'cold-match', 'Cycle-breaker beta: dedup edges',
+        )
+
+        info = await git_ops.create_worktree(
+            'cold-match', expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        assert (info.path / 'orphan_work.py').exists(), 'matching WIP must be resumed'
+        assert not git_ops.quarantine_base.exists()
+
+    async def test_cold_reattach_fails_open_on_titleless_orphan(self, git_ops: GitOps):
+        """A legacy orphan with no readable stored title must never be
+        quarantined — identities_match fails open."""
+        await _build_cold_orphan_branch(git_ops, 'cold-titleless')
+        # No .task-meta root written at all.
+
+        info = await git_ops.create_worktree(
+            'cold-titleless', expected_title='Some live task',
+        )
+
+        assert (info.path / 'orphan_work.py').exists(), 'title-less orphan must resume'
+        assert not git_ops.quarantine_base.exists()
+
+    async def test_cold_reattach_guard_skipped_when_expected_title_none(
+        self, git_ops: GitOps,
+    ):
+        """expected_title=None (the default) must skip the guard entirely,
+        exactly like the REUSE path's equivalent test."""
+        await _build_cold_orphan_branch(git_ops, 'cold-noguard')
+        _write_sibling_stored_title(
+            git_ops.worktree_base, 'cold-noguard', 'Some unrelated foreign task',
+        )
+
+        info = await git_ops.create_worktree('cold-noguard')
+
+        assert (info.path / 'orphan_work.py').exists(), 'guard opt-in only — must resume'
+        assert not git_ops.quarantine_base.exists()
+
+    async def test_cold_reattach_mismatch_clears_foreign_meta_root(
+        self, git_ops: GitOps,
+    ):
+        """A confirmed identity mismatch must also clear the foreign sibling
+        .task-meta/<id> root at its ORIGINAL path — otherwise the deleted
+        task's plan.json survives there and workflow.py's plan-resume adopts
+        it onto the NEW task (the cited reify task 3770 misattribution).
+        Quarantining only the branch leaves this half of the hole open. The
+        sidecar itself must not be destroyed, though — it is relocated
+        alongside the quarantined worktree, not deleted (it is the only
+        record tying the quarantined branch back to its original task)."""
+        task_id = 'cold-clears-meta'
+        await _build_cold_orphan_branch(git_ops, task_id)
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
+        _write_sibling_stored_title(
+            git_ops.worktree_base, task_id, 'Trajectory beta: spline solver',
+        )
+        (meta / 'plan.json').write_text(json.dumps({
+            'task_id': task_id,
+            'title': 'Trajectory beta: spline solver',
+            'steps': [],
+            'confirmed': True,
+        }))
+
+        await git_ops.create_worktree(
+            task_id, expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        assert not (meta / 'plan.json').exists(), (
+            "the deleted task's plan.json must not survive at the old path"
+        )
+
+        # ...and must reappear alongside the quarantined worktree, not be
+        # destroyed outright.
+        quarantined = list(git_ops.quarantine_base.glob(f'{task_id}-*'))
+        assert len(quarantined) == 1
+        relocated_meta = TaskArtifacts.meta_root_for(
+            git_ops.quarantine_base, quarantined[0].name,
+        )
+        assert (relocated_meta / 'plan.json').exists(), (
+            'the sidecar must be relocated alongside the quarantined '
+            'worktree, not deleted'
+        )
+
+    async def test_cold_reattach_match_preserves_meta_root(self, git_ops: GitOps):
+        """A same-task resume (matching title) must keep its own
+        .task-meta artifacts intact IN PLACE — _relocate_foreign_meta_root
+        (like _clear_foreign_meta_root before it) must never be invoked on
+        a same-task reuse route, which owns and must preserve its own
+        artifacts."""
+        task_id = 'cold-preserves-meta'
+        await _build_cold_orphan_branch(git_ops, task_id)
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
+        _write_sibling_stored_title(
+            git_ops.worktree_base, task_id, 'Cycle-breaker beta: dedup edges',
+        )
+        (meta / 'plan.json').write_text(json.dumps({
+            'task_id': task_id,
+            'title': 'Cycle-breaker beta: dedup edges',
+            'steps': [],
+            'confirmed': True,
+        }))
+
+        await git_ops.create_worktree(
+            task_id, expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        assert (meta / 'plan.json').exists(), (
+            'a same-task resume must preserve its own plan.json'
+        )
 
 
 @pytest.mark.asyncio
@@ -5909,6 +6386,66 @@ class TestPersistentMergeWorktree:
         assert not await git_ops._is_registered_worktree(merge_wt), (
             'ephemeral _merge-<uuid> must be unregistered after cleanup'
         )
+
+    async def test_cleanup_merge_worktree_crash_safe_shape1_leak(
+        self, git_ops: GitOps,
+    ):
+        """cleanup_merge_worktree crash-safely removes a shape-1 leak (task 2922).
+
+        Shape-1: an interrupted teardown (SIGTERM/restart mid-merge) leaves a
+        full ``_merge-<uuid>`` checkout on disk while its
+        ``.git/worktrees/<name>`` admin dir is already gone, so
+        ``git worktree remove --force`` errors ('not a working tree') and the
+        guarded primitive returns 'failed', leaving the tree. cleanup must
+        inspect that outcome and crash-safely rmtree the on-disk tree + unlink
+        the sibling ``.lock``, leaving NO ``_merge-*`` leak — and a re-call
+        must be an idempotent clean no-op.
+
+        RED on base: cleanup_merge_worktree fires-and-forgets the primitive's
+        'failed' outcome, so the tree (and its orphan ``.lock``) survive.
+        """
+        import shutil
+
+        merge_wt, _ = await git_ops._create_merge_worktree()
+        assert merge_wt.exists()
+
+        # Simulate shape-1: remove the .git/worktrees/<name> admin dir the
+        # lane's .git pointer names — registration is gone while the on-disk
+        # tree survives, exactly the interrupted-teardown on-disk shape.
+        shutil.rmtree(_lane_admin_dir(merge_wt))
+
+        await git_ops.cleanup_merge_worktree(merge_wt)
+
+        # The on-disk tree is gone...
+        assert not merge_wt.exists(), (
+            'shape-1 leak tree must be removed by crash-safe cleanup'
+        )
+        # ...absent from git worktree list...
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        registered = [
+            line[len('worktree '):].strip()
+            for line in out.splitlines()
+            if line.startswith('worktree ')
+        ]
+        assert str(merge_wt) not in registered, (
+            f'shape-1 leak must be gone from git worktree list: {registered}'
+        )
+        # ...and NO _merge-* directory OR sibling .lock orphan survives under
+        # worktree_base (task 2924's strict no-leak glob).
+        leaks = list(git_ops.worktree_base.glob('_merge-*'))
+        assert not leaks, (
+            f'no _merge-* dir OR lock-file orphan may survive crash-safe '
+            f'cleanup: {leaks}'
+        )
+
+        # Idempotent: a SECOND cleanup is a clean no-op that never raises
+        # (primitive → 'not_present' → wrapper early-return).
+        await git_ops.cleanup_merge_worktree(merge_wt)
+        assert not merge_wt.exists()
 
     # ------------------------------------------------------------------
     # Step 9 — _iter_merge_worktrees exempts _merge-verify
@@ -7869,6 +8406,13 @@ class TestRecoverRedMain:
 
 async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
     """Commit stub seed-warm-lane.sh + setup-worktree-debug-port.sh into repo."""
+    # esc-3072-3: git discovery walks UP, so a *repo* that is not itself a
+    # repository root sends the `git add -A` + `git commit` below into whatever
+    # repo encloses it — a real COMMIT into a live task worktree, sweeping up
+    # whatever uncommitted work it was holding. FIRST statement deliberately:
+    # ahead of the mkdir and write_text calls too, so a rejected call leaves no
+    # stub-script litter in the wrong directory either.
+    assert_isolated_git_repo(repo)
     scripts_dir = repo / 'scripts'
     scripts_dir.mkdir(parents=True, exist_ok=True)
     seed_script = scripts_dir / 'seed-warm-lane.sh'
@@ -7881,6 +8425,60 @@ async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
     debug_script.chmod(0o755)
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'add warm-lane scripts'], cwd=repo)
+
+
+@pytest.mark.asyncio
+class TestWarmLaneScriptsHelperIsolation:
+    """_add_warm_lane_scripts cannot commit into a repo it was not handed.
+
+    Same defect class as esc-3072-3 and the more dangerous shape of the two:
+    ``_inject_uu_state`` leaked index entries, whereas this helper runs
+    ``git add -A`` + ``git commit``, so an escaping call would write a real
+    COMMIT into a live task worktree — sweeping up whatever uncommitted work
+    that worktree happened to be holding.  Before this guard it was safe only
+    by call-site discipline across ~33 callers.
+    """
+
+    async def test_cannot_commit_into_an_enclosing_repo(self, tmp_path: Path):
+        sentinel = tmp_path / 'live-worktree'
+        sentinel.mkdir()
+        await _setup_repo(sentinel)
+
+        # Stand-in for a pytest basetemp nested inside that live worktree.
+        nested = sentinel / '.pytest-tmp' / 'test_x0'
+        nested.mkdir(parents=True)
+
+        rc, head_before, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=sentinel)
+        assert rc == 0, err
+        rc, status_before, err = await _run(
+            ['git', 'status', '--porcelain'], cwd=sentinel,
+        )
+        assert rc == 0, err
+
+        with pytest.raises(NonIsolatedGitRepoError):
+            await _add_warm_lane_scripts(nested)
+
+        rc, head_after, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=sentinel)
+        assert rc == 0, err
+        assert head_after == head_before, (
+            f'a commit landed in the enclosing repo: {head_before.strip()} -> '
+            f'{head_after.strip()}'
+        )
+
+        rc, status_after, err = await _run(
+            ['git', 'status', '--porcelain'], cwd=sentinel,
+        )
+        assert rc == 0, err
+        assert status_after == status_before, (
+            f'enclosing repo state changed: {status_before!r} -> {status_after!r}'
+        )
+
+        # No filesystem litter either: the guard must run BEFORE the mkdir and
+        # the two write_text calls, not merely before the git commands.
+        assert not (nested / 'scripts').exists(), (
+            'stub scripts were written into the rejected directory; the guard '
+            'must be the first statement in the helper'
+        )
 
 
 @pytest.mark.asyncio
@@ -11528,11 +12126,40 @@ class TestGetHeadTreeHash:
         assert after  # non-empty
 
     async def test_non_git_dir_returns_none(
-        self, git_ops: GitOps, tmp_path: Path
+        self, git_ops: GitOps, git_repo: Path, monkeypatch
     ):
-        not_a_repo = tmp_path / 'not-a-repo'
+        """Fail-safe: a non-git directory yields None, never raises.
+
+        The non-repo directory is placed INSIDE a live repo on purpose.  The
+        old version used a bare ``tmp_path / 'not-a-repo'``, whose "this is not
+        a git directory" premise was only ever true by accident of where
+        pytest's basetemp happened to live: under a basetemp nested inside a
+        git checkout, ``git rev-parse HEAD^{tree}`` walks UP, resolves the
+        enclosing repo and returns a real tree hash, so the ``is None``
+        assertion silently stops testing what it claims (esc-3072-3, same
+        defect class as ``_inject_uu_state``).
+
+        Nesting it makes the hazard the DEFAULT case rather than an
+        environmental accident, so the contract is asserted where it is hard
+        rather than where it is easy.
+        """
+        not_a_repo = git_repo / 'not-a-repo'
         not_a_repo.mkdir()
-        # Fail-safe: a non-git directory yields None, never raises.
+
+        # Cap git's upward walk at not_a_repo so the fail-soft contract holds by
+        # construction rather than by luck of directory layout.  ``_run`` spawns
+        # its child with ``{**os.environ, ...}``, so setenv is the right seam
+        # here (the git call is made by production code, not by a subprocess
+        # this test spawns).  Same pattern as test_warm_base_coherence.py:409,
+        # test_session_hooks.py:1491 and _orch_helpers.git_env_with_ceiling.
+        #
+        # NOTE: this pins the TEST's hermeticity ONLY.  Whether production
+        # get_head_tree_hash should itself refuse to fail-soft into an enclosing
+        # repo when handed a non-repo path is a separate production-behaviour
+        # question, with its own callers and blast radius, tracked as a
+        # follow-up — do not read this ceiling as a production guarantee.
+        monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(not_a_repo.resolve().parent))
+
         assert await git_ops.get_head_tree_hash(not_a_repo) is None
 
 
@@ -11561,3 +12188,104 @@ class TestRunInputText:
         rc, out, _ = await _run(['git', '--version'])
         assert rc == 0
         assert out.startswith('git version')
+
+
+@pytest.mark.asyncio
+class TestDisableSharedRepoAutoMaintenance:
+    """PRD plans/os-sandbox-worktree-containment-prd.md task α5 (D2 corollary).
+
+    Orchestrator-managed shared repos must have ``gc.auto=0`` +
+    ``maintenance.auto=false`` set idempotently so background
+    auto-gc/maintenance never fires under the narrow shared-.git write-set
+    (α2: .git root + packed-refs are RO), where it would fail
+    benignly-but-noisily.
+    """
+
+    async def test_disable_shared_repo_auto_maintenance_sets_and_is_idempotent(
+        self, git_ops: GitOps,
+    ):
+        """Both keys are set repo-locally, and a second call is a no-op-in-effect
+        (git config overwrites in place → naturally idempotent)."""
+        await git_ops.disable_shared_repo_auto_maintenance()
+
+        rc_gc, gc_val, _ = await _run(
+            ['git', 'config', '--get', 'gc.auto'], cwd=git_ops.project_root,
+        )
+        rc_mt, mt_val, _ = await _run(
+            ['git', 'config', '--get', 'maintenance.auto'], cwd=git_ops.project_root,
+        )
+        assert rc_gc == 0
+        assert gc_val.strip() == '0'
+        assert rc_mt == 0
+        assert mt_val.strip() == 'false'
+
+        # Idempotency: a second call overwrites in place, leaving identical values.
+        await git_ops.disable_shared_repo_auto_maintenance()
+        rc_gc2, gc_val2, _ = await _run(
+            ['git', 'config', '--get', 'gc.auto'], cwd=git_ops.project_root,
+        )
+        rc_mt2, mt_val2, _ = await _run(
+            ['git', 'config', '--get', 'maintenance.auto'], cwd=git_ops.project_root,
+        )
+        assert rc_gc2 == 0
+        assert gc_val2.strip() == '0'
+        assert rc_mt2 == 0
+        assert mt_val2.strip() == 'false'
+
+    async def test_disable_shared_repo_auto_maintenance_degrades_loudly_on_rc(
+        self, git_ops: GitOps, caplog,
+    ):
+        """A non-zero git rc degrades loudly, not fatally: the method returns
+        normally (never raises) and emits a WARNING naming each failed key + rc.
+
+        This is the core of the best-effort/loud contract (loud-over-silent
+        degradation) the docstring and PRD α5 emphasise: failing to set the key
+        merely leaves auto-gc enabled (itself only benign-but-noisy) and must
+        not block orchestrator startup or a task dispatch. A regression that
+        turned the WARNING into a raise, or dropped the rc!=0 check, is caught
+        here.
+        """
+        async def fake_run(cmd, cwd=None):
+            # Both `git config <key> <val>` writes fail with a non-zero rc.
+            return (1, '', 'fatal: could not write config')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'), \
+                patch('orchestrator.git_ops._run', side_effect=fake_run):
+            # Returns normally — a config-set failure must never raise.
+            result = await git_ops.disable_shared_repo_auto_maintenance()
+        assert result is None
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'disable_shared_repo_auto_maintenance' in r.getMessage()
+        ]
+        # Both keys hit the rc!=0 branch → one loud WARNING each (naming key,
+        # rc, and stderr). Asserting BOTH keys guards against a regression that
+        # drops the rc check for either write.
+        messages = ' '.join(r.getMessage() for r in warnings)
+        assert 'gc.auto' in messages
+        assert 'maintenance.auto' in messages
+        assert 'rc=1' in messages, (
+            f'expected the non-zero rc surfaced loudly; got: {messages!r}'
+        )
+
+    async def test_create_worktree_disables_auto_maintenance(
+        self, git_ops: GitOps,
+    ):
+        """The worktree-create path applies the config to the shared repo, so a
+        dispatch (and any config drift/re-clone) reasserts gc.auto=0 /
+        maintenance.auto=false — mirrors the create_worktree reify-debug-port
+        tests' 'call create_worktree, then assert a side effect' shape."""
+        await git_ops.create_worktree('gc-1')
+
+        rc_gc, gc_val, _ = await _run(
+            ['git', 'config', '--get', 'gc.auto'], cwd=git_ops.project_root,
+        )
+        rc_mt, mt_val, _ = await _run(
+            ['git', 'config', '--get', 'maintenance.auto'], cwd=git_ops.project_root,
+        )
+        assert rc_gc == 0
+        assert gc_val.strip() == '0'
+        assert rc_mt == 0
+        assert mt_val.strip() == 'false'

@@ -1,11 +1,47 @@
 """Tests for dashboard scaffold: config, app, and fixtures."""
 
 import dataclasses
+import logging
 from pathlib import Path
 
 import pytest
 
 from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
+
+# The stable identifying substring of from_env()'s cwd-fallback INFO record
+# (dashboard/src/dashboard/config.py, task 3503).
+_FALLBACK_MARKER = 'DASHBOARD_PROJECT_ROOT unset'
+
+
+def _fallback_records(caplog):
+    """The ``from_env()`` cwd-fallback records in *caplog*, matched precisely.
+
+    Matches logger + level + marker rather than "any record from
+    ``dashboard.config``" or "any INFO from ``dashboard.config``", so that:
+
+    * the pre-existing ``_discover_escalation_urls`` WARNINGs in the same
+      module — which also name the project root — can neither satisfy the
+      positive assertion nor break it with a second match; and
+    * an unrelated INFO line added to ``config.py`` later cannot fail the
+      negative assertion with a misleading message.
+
+    Requiring INFO specifically is what pins the level choice: a future
+    "upgrade" to WARNING yields zero matches and fails the positive test.  INFO
+    and not WARNING is deliberate — an un-configured invocation is a normal,
+    supported way to run the dashboard (a bare ``python -m dashboard`` from a
+    checkout, a test, a container without the unit), not a degraded state.  It
+    is no longer the canonical deployment's own path: since task 3572 both
+    systemd units set the variable explicitly.  The tests below are unaffected
+    either way — each sets or unsets it itself rather than depending on what the
+    units declare.
+    """
+    return [
+        r
+        for r in caplog.records
+        if r.name == 'dashboard.config'
+        and r.levelno == logging.INFO
+        and _FALLBACK_MARKER in r.getMessage()
+    ]
 
 
 @pytest.fixture
@@ -31,11 +67,30 @@ class TestConfigDefaults:
         assert DEFAULT_FUSED_MEMORY_URLS == ('http://localhost:8002',)
 
     def test_config_defaults(self):
+        # project_root is deliberately NOT asserted here: `cfg.project_root ==
+        # Path.cwd().resolve()` merely restates default_factory=Path.cwd plus
+        # __post_init__'s .resolve() against themselves and cannot fail for any
+        # cwd.  test_default_project_root_tracks_cwd below owns that contract
+        # non-tautologically (task 3503).
         cfg = DashboardConfig()
         assert cfg.host == '127.0.0.1'
         assert cfg.port == 8080
-        assert cfg.project_root == Path('/home/leo/src/dark-factory')
         assert cfg.fused_memory_urls == list(DEFAULT_FUSED_MEMORY_URLS)
+
+    def test_default_project_root_tracks_cwd(self, monkeypatch, tmp_path):
+        """The default must be *derived* from cwd, not frozen at import time.
+
+        Constructing from two different working directories must yield two
+        different project_roots.  A hardcoded absolute literal — the shape this
+        replaced — would return the same path from both and fail here.
+        """
+        before = DashboardConfig().project_root
+
+        monkeypatch.chdir(tmp_path)
+        after = DashboardConfig().project_root
+
+        assert after == tmp_path.resolve()
+        assert after != before
 
     def test_known_project_roots_default_empty_list(self):
         cfg = DashboardConfig()
@@ -137,6 +192,46 @@ class TestConfigEnvOverrides:
         cfg = DashboardConfig.from_env()
         assert cfg.reconciliation_db == Path('/tmp/test/data/reconciliation/reconciliation.db')
         assert cfg.worktrees_dir == Path('/tmp/test/.worktrees')
+
+    def test_unset_project_root_logs_the_cwd_fallback_at_info(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """An un-configured root must be observable, not an invisible fallback."""
+        monkeypatch.delenv('DASHBOARD_PROJECT_ROOT', raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='dashboard.config'):
+            cfg = DashboardConfig.from_env()
+
+        records = _fallback_records(caplog)
+        assert len(records) == 1, (
+            f'expected exactly one fallback record, got '
+            f'{[(r.levelname, r.getMessage()) for r in caplog.records]}'
+        )
+        # The record must name the root the config ACTUALLY ended up with — a
+        # re-derived path that drifts from cfg.project_root would make the
+        # journal line point at a root the process is not using.
+        assert str(cfg.project_root) in records[0].getMessage(), (
+            f'fallback record does not name the resolved root '
+            f'{cfg.project_root}: {records[0].getMessage()}'
+        )
+
+    def test_set_project_root_logs_no_fallback(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.setenv('DASHBOARD_PROJECT_ROOT', str(tmp_path))
+
+        with caplog.at_level(logging.INFO, logger='dashboard.config'):
+            DashboardConfig.from_env()
+
+        # Matched on the fallback record specifically, NOT on "any INFO from
+        # dashboard.config": an unrelated INFO line added to config.py later
+        # would otherwise fail this test with a misleading message.  Note the
+        # marker cannot be paired with the root here the way the positive test
+        # pairs them — a spuriously-emitted fallback record would name the
+        # cwd-derived root, not tmp_path, so a root-matching filter would miss
+        # exactly the regression this test exists to catch.
+        assert not _fallback_records(caplog), (
+            'an explicitly-configured root must not emit a fallback record'
+        )
 
 
 class TestManagedRuntimeEnvOverrides:

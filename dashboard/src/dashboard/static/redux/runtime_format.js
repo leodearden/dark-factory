@@ -40,15 +40,11 @@ function rtAge(m) {
   return m == null ? '—' : `${Math.round(m)}m`;
 }
 
-// Named RUNTIME_FORMAT_API (not the graph_layout.js boilerplate's plain
-// `API`): graph_layout.js, prd_grouping.js, and this file are all loaded as
-// separate classic (non-module) <script> tags on the same page (index.html),
-// and top-level `const` bindings in classic scripts share one global lexical
-// scope across ALL of them — a second top-level `const API` here would
-// collide with graph_layout.js's, throwing "Identifier 'API' has already
-// been declared" and aborting this entire script (see prd_grouping.js's
-// identical note/precedent), silently leaving window.DF_RUNTIME_FMT undefined
-// and breaking tabs.jsx's / tab_tasks.jsx's top-level destructure of it.
+// Module-unique export const, never a bare `API` — see the
+// shared-classic-script-scope note in graph_layout.js's header, enforced by
+// dashboard/tests/js/classic_script_scope.test.mjs. A collision here would
+// leave window.DF_RUNTIME_FMT undefined and break tabs.jsx's / tab_tasks.jsx's
+// top-level destructure of it.
 const RUNTIME_FORMAT_API = { rtCell, rtAge };
 
 if (typeof module !== 'undefined' && module.exports) {

@@ -380,6 +380,208 @@ class TestClassifyAndMergeSpeculativeWorker:
         assert result.merge_result.success
         assert 'already_merged' not in _merge_attempt_subtypes(es.db_path)
 
+    async def test_rebased_landing_patch_id_contained_returns_already_merged(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """task 2945: a branch whose content landed on main as a REBASED /
+        cherry-picked commit (same patch-id, different SHA) is NOT an ancestor
+        of main, so the is_ancestor guard misses — but the patch-id backstop
+        must still recognise it as already-merged and skip the no-op merge.
+
+        Repro of the rebased-landing blind spot (RCA 2026-07-22): advance_main's
+        rebased_pending_reverify path lands a branch's content as a new commit
+        on main; the branch tip diverges, is_ancestor misses, and a duplicate/
+        late resubmission burns a head-of-line verify on a guaranteed no-op.
+        """
+        from orchestrator.merge_queue import classify_and_merge, patch_content_contained
+
+        # Branch with one commit adding reb.py.
+        worktree = await _make_branch_with_file(git_ops, 'rebased-2945', 'reb.py', 'x = 1\n')
+        branch_sha = await git_ops.resolve_branch_sha('task/rebased-2945')
+        assert branch_sha is not None
+
+        # Advance main with an UNRELATED commit first, so the cherry-picked
+        # commit necessarily lands on a different parent than branch_sha (hence
+        # a different SHA) even if wall-clock commit timestamps collide within
+        # the same second — guaranteeing the rebased-landing shape (same
+        # patch-id, different SHA, NOT an ancestor).  Mirrors the stale-ancestor
+        # test's "Unrelated main advance" idiom.
+        (git_ops.project_root / 'other.py').write_text('other = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Unrelated main advance'], cwd=git_ops.project_root)
+
+        # Land the branch's commit on main as a REBASED/cherry-picked commit:
+        # same patch-id, different SHA (the dominant landing mode under long verifies).
+        await _run(['git', 'cherry-pick', branch_sha], cwd=git_ops.project_root)
+        main_reb = await git_ops.get_main_sha()
+
+        # Sanity: the branch tip is NOT an ancestor of main (rebased landing),
+        # yet its content IS fully patch-id-contained in main.
+        assert not await git_ops.is_ancestor(branch_sha, main_reb)
+        assert await patch_content_contained(branch_sha, main_reb, git_ops) is True
+
+        es = _make_event_store(tmp_path)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
+        req = _make_request('rebased-2945', 'rebased-2945', worktree, config)
+
+        result = await classify_and_merge(
+            worker, req, main_reb, speculative=False, started_monotonic=time.monotonic(),
+        )
+
+        # RED before impl: is_ancestor(effective_tip=branch_head, main_reb) misses
+        # and there is no patch-id backstop, so the guard falls through to a real
+        # --no-ff merge → MergedOk (not already_merged).
+        assert isinstance(result, Decided), (
+            f'expected a terminal already_merged Decided via the patch-id '
+            f'backstop, got {result!r}'
+        )
+        assert result.outcome.status == 'already_merged'
+        assert _merge_attempt_subtypes(es.db_path) == ['already_merged']
+
+    async def test_novel_commit_on_contained_base_merges(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Safety arm (task 2945, signal 2): a branch whose FIRST commit landed
+        on main (patch-id contained) but which has since gained a SECOND novel
+        commit must NOT be skipped — patch_content_contained sees the novel
+        commit as a `+` line → False → the guard falls through and merges.
+
+        Locks against an over-triggering impl that would skip on partial
+        containment and eject the task with its novel commit unmerged.  Green
+        both pre- and post-impl (pre-impl there is no backstop); it pins the
+        safety arm against a future over-trigger.
+        """
+        from orchestrator.merge_queue import classify_and_merge, patch_content_contained
+
+        # R1 adds reb.py on the branch.
+        worktree = await _make_branch_with_file(git_ops, 'novel-2945', 'reb.py', 'x = 1\n')
+        r1_sha = await git_ops.resolve_branch_sha('task/novel-2945')
+        assert r1_sha is not None
+
+        # Land R1 on main as a rebased/cherry-picked commit (contained), via an
+        # unrelated advance so the cherry-pick lands on a different parent.
+        (git_ops.project_root / 'other.py').write_text('other = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Unrelated main advance'], cwd=git_ops.project_root)
+        await _run(['git', 'cherry-pick', r1_sha], cwd=git_ops.project_root)
+        main_reb = await git_ops.get_main_sha()
+
+        # Branch gains a SECOND, novel commit R2 (reb2.py) NOT present on main.
+        (worktree / 'reb2.py').write_text('y = 2\n')
+        await git_ops.commit(worktree, 'R2 novel')
+        branch_tip = await git_ops.resolve_branch_sha('task/novel-2945')
+        assert branch_tip is not None
+
+        # Sanity: tip not an ancestor; NOT fully patch-id-contained (R2 novel).
+        assert not await git_ops.is_ancestor(branch_tip, main_reb)
+        assert await patch_content_contained(branch_tip, main_reb, git_ops) is False
+
+        es = _make_event_store(tmp_path)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
+        req = _make_request('novel-2945', 'novel-2945', worktree, config)
+
+        result = await classify_and_merge(
+            worker, req, main_reb, speculative=False, started_monotonic=time.monotonic(),
+        )
+
+        assert isinstance(result, MergedOk), (
+            f'a branch with a novel commit must merge, not skip; got {result!r}'
+        )
+        assert result.merge_result.success
+        assert 'already_merged' not in _merge_attempt_subtypes(es.db_path)
+
+    async def test_uncommitted_work_vetoes_patch_id_skip(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Safety arm (task 2945, signal 3): a dirty worktree vetoes the
+        patch-id skip even when the branch content is fully contained on main.
+
+        has_uncommitted_work sits in the elif CONDITION; an agent may have
+        committed/staged new work since the content landed, so the skip must be
+        vetoed and the merge proceed.  Locks against a veto-less impl (which
+        would skip → already_merged and eject the task).
+        """
+        from orchestrator.merge_queue import classify_and_merge, patch_content_contained
+
+        # Rebased-landing contained setup (branch content fully on main).
+        worktree = await _make_branch_with_file(git_ops, 'veto-2945', 'reb.py', 'x = 1\n')
+        branch_sha = await git_ops.resolve_branch_sha('task/veto-2945')
+        assert branch_sha is not None
+        (git_ops.project_root / 'other.py').write_text('other = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Unrelated main advance'], cwd=git_ops.project_root)
+        await _run(['git', 'cherry-pick', branch_sha], cwd=git_ops.project_root)
+        main_reb = await git_ops.get_main_sha()
+
+        # Sanity: contained but not an ancestor.
+        assert not await git_ops.is_ancestor(branch_sha, main_reb)
+        assert await patch_content_contained(branch_sha, main_reb, git_ops) is True
+
+        # Dirty the worktree with an uncommitted (untracked) file → the veto
+        # must fire (git status --porcelain reports `??`).
+        (worktree / 'dirty.py').write_text('dirty = 1\n')
+        assert await git_ops.has_uncommitted_work(worktree) is True
+
+        es = _make_event_store(tmp_path)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
+        req = _make_request('veto-2945', 'veto-2945', worktree, config)
+
+        result = await classify_and_merge(
+            worker, req, main_reb, speculative=False, started_monotonic=time.monotonic(),
+        )
+
+        assert isinstance(result, MergedOk), (
+            f'a dirty worktree must veto the patch-id skip and merge; got {result!r}'
+        )
+        assert 'already_merged' not in _merge_attempt_subtypes(es.db_path)
+
+    async def test_patch_id_fail_open_falls_through_to_merge(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Safety arm (task 2945, signal 4): the guard honors a False return
+        from patch_content_contained even when the content is genuinely on main
+        — the helper's fail-open (git cherry rc!=0 → False) must fall through to
+        a normal merge, never a spurious skip.  Locks the fail-open contract.
+        """
+        import orchestrator.merge_queue as mq_mod
+        from orchestrator.merge_queue import classify_and_merge
+
+        # Rebased-landing contained setup (content genuinely on main).
+        worktree = await _make_branch_with_file(git_ops, 'failopen-2945', 'reb.py', 'x = 1\n')
+        branch_sha = await git_ops.resolve_branch_sha('task/failopen-2945')
+        assert branch_sha is not None
+        (git_ops.project_root / 'other.py').write_text('other = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Unrelated main advance'], cwd=git_ops.project_root)
+        await _run(['git', 'cherry-pick', branch_sha], cwd=git_ops.project_root)
+        main_reb = await git_ops.get_main_sha()
+        assert not await git_ops.is_ancestor(branch_sha, main_reb)
+
+        # Simulate the helper's fail-open (git cherry rc!=0 → False) even though
+        # the content IS genuinely patch-id-contained on main.
+        async def _fail_open(head, upstream, git_ops):
+            return False
+
+        monkeypatch.setattr(mq_mod, 'patch_content_contained', _fail_open)
+
+        es = _make_event_store(tmp_path)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
+        req = _make_request('failopen-2945', 'failopen-2945', worktree, config)
+
+        result = await classify_and_merge(
+            worker, req, main_reb, speculative=False, started_monotonic=time.monotonic(),
+        )
+
+        assert isinstance(result, MergedOk), (
+            f'fail-open (False) must fall through to a normal merge; got {result!r}'
+        )
+        assert 'already_merged' not in _merge_attempt_subtypes(es.db_path)
+
     async def test_real_conflict_returns_decided_conflict_and_records_drift_sample(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):

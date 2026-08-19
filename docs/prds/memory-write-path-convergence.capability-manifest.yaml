@@ -1,0 +1,256 @@
+prd: docs/prds/memory-write-path-convergence.md
+schema_version: 1
+tasks:
+- label: alpha
+  task_id: 3130
+  title: 'Write-triage calibration: labeled curator dataset fixture + calibrate_write_triage.py'
+  capabilities:
+  - name: calibration-script-derives-thresholds
+    binding: capability→producer — built by alpha; T_high/T_low are contract-fixed config names (PRD C1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: T_high
+      paths:
+      - fused-memory/scripts/
+      expect: present
+  - name: labeled-dataset-fidelity
+    binding: capability→producer — 89-entry ground truth from curator transcript incl. genuinely-distinct and pseudo-contradiction labels
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: dataset fidelity is a content property judged against the transcript, not mechanically greppable
+- label: beta
+  task_id: 3127
+  title: 'add_memory write-triage skeleton: bands, flag, ack, storm counter'
+  capabilities:
+  - name: triage-behind-contract-fixed-flag
+    binding: capability→producer — write_triage_enabled name contract-fixed (PRD C1/D10)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: write_triage_enabled
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: fail-open-plus-storm-escape
+    binding: rejection-mechanism (INV-4) — fail-open never blocks a write AND increments an escalating counter
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: counter naming implementation-chosen; behavior pinned by beta's boundary tests
+- label: gamma
+  task_id: 3128
+  title: 'Write-triage judge: closed 4-way judgment + accuracy eval'
+  capabilities:
+  - name: closed-output-routing-vocabulary
+    binding: capability→producer — outcome vocabulary (stored/restated/amended/contested) contract-fixed (PRD C1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: contested
+      paths:
+      - fused-memory/src/fused_memory/server/
+      expect: present
+  - name: judge-accuracy-eval-vs-labels
+    binding: capability→producer — report is the flip-on arbiter (D10); no pre-asserted floor (G6)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: eval quality judged by operator before flag flip; a floor grep would assert an uncalibrated number
+- label: delta
+  task_id: 3129
+  title: 'Amendment/sighting child records + server-side grouped reads'
+  capabilities:
+  - name: add-only-child-representation
+    binding: capability→producer — parent_id metadata key contract-fixed (PRD C1/D4); no 3055 dependency
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: parent_id
+      paths:
+      - fused-memory/src/fused_memory/server/
+      expect: present
+  - name: grouped-read-single-document
+    binding: capability→consumer (wired) — search/get_memory_by_id present canonical+digests+count as one document
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: read-shape is a test property (grouped-document assertion in delta's tests)
+- label: epsilon
+  task_id: 3131
+  title: 'Writer-instruction inversion in roles.py'
+  capabilities:
+  - name: inverted-instruction-rendered
+    binding: capability→consumer (wired) — every role briefing carries the new sentence; render test pins it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: the server deduplicates
+      paths:
+      - orchestrator/src/orchestrator/agents/
+      expect: present
+- label: zeta
+  task_id: 3135
+  title: 'Topic-cluster auto-seed from consolidate_memories + runtime store'
+  capabilities:
+  - name: runtime-cluster-store-merged-with-seeds
+    binding: capability→producer — kills the manual seeding hop (schema.py:415-431 admission)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: TopicCluster
+      paths:
+      - fused-memory/src/fused_memory/server/
+      expect: present
+- label: eta
+  task_id: 3132
+  title: 'delete_memory hard-error on non-full-UUID ids'
+  capabilities:
+  - name: truncated-id-hard-error
+    binding: rejection-mechanism — API-level enforcement where prompt-level DF 1144 failed (stage1.py:113 admission)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing test file makes filename greps uninformative; behavior pinned by extended regression test
+- label: theta
+  task_id: 3133
+  title: 'Transactional consolidate_memories op with closure proof'
+  capabilities:
+  - name: consolidate-op-exists
+    binding: capability→producer — tool name contract-fixed (PRD C2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: consolidate_memories
+      paths:
+      - fused-memory/src/fused_memory/server/
+      expect: present
+  - name: closure-proof-survivors
+    binding: rejection-mechanism (INV-2/INV-3) — post-delete re-query returns survivors; never a claimed closure
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: survivors
+      paths:
+      - fused-memory/src/fused_memory/server/
+      expect: present
+- label: iota
+  task_id: 3134
+  title: 'Stage-1 rewire onto consolidate_memories + exemption retirement'
+  capabilities:
+  - name: stage1-uses-op
+    binding: capability→consumer (wired) — Stage-1 prompt/stage reference the op instead of freehand choreography
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: consolidate_memories
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/
+      expect: present
+  - name: recon-stage-exemption-retired
+    binding: rejection-mechanism — blanket exemption removed; recon writes triage like any writer
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: absence-grep is brittle against comments/changelog mentions; pinned by iota's guard-path test
+- label: kappa
+  task_id: 3136
+  title: 'Scheduled deterministic dedup report feeding gate filing'
+  capabilities:
+  - name: timer-unit-committed
+    binding: capability→producer — systemd user timer per flag-marker-sweep precedent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: OnCalendar
+      paths:
+      - fused-memory/
+      expect: present
+  - name: gate-filing-consumes-report
+    binding: capability→consumer (wired) — gates cite deterministically enumerated clusters (6/19 reify gates had wrong narrative enumerations)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: integration-fixture property (gate detail cites report clusters)
+- label: lambda
+  task_id: 3137
+  title: 'Full provenance in search results'
+  capabilities:
+  - name: search-hits-carry-provenance
+    binding: capability→consumer (wired) — agent_id/task_id/created_at on hits; ends writer-attribution blindness
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: result-shaping test property; field names pre-exist in codebase so greps are uninformative
+- label: mu
+  task_id: 3138
+  title: 'Injection-flag heuristic checks agent_id provenance first'
+  capabilities:
+  - name: own-authorship-not-flaggable-on-style
+    binding: rejection-mechanism — provenance check precedes style heuristic (esc-5564-1 false positive)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: heuristic lives partly in prompt text; behavior pinned by mu's two-fixture test
+- label: nu
+  task_id: 3139
+  title: 'reexamine_when metadata schema'
+  capabilities:
+  - name: schema-validated-at-submit-boundary
+    binding: rejection-mechanism (INV-1) — reexamine_when key contract-fixed; malformed rejects with hint
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: reexamine_when
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+- label: xi
+  task_id: 3140
+  title: 'Task-terminal invalidation hook'
+  capabilities:
+  - name: terminal-transition-flags-citing-memories
+    binding: capability→consumer (wired) — joins machine-visible falsifying events against the corpus; flags, never deletes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: reexamine_when
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/
+      expect: present
+- label: omicron
+  task_id: 3141
+  title: 'MCP-markup write tripwire + storm counter'
+  capabilities:
+  - name: markup-rejection-with-named-pattern
+    binding: rejection-mechanism — literal pattern list contract-fixed (PRD C3); single site (INV-5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: </invoke>
+      paths:
+      - fused-memory/src/fused_memory/server/
+      expect: present
+  - name: rejection-storm-escalates
+    binding: rejection-mechanism (INV-4) — burst = active leak; escalation hint names DF 3083
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '3083'
+      paths:
+      - fused-memory/src/fused_memory/server/
+      expect: present
+- label: pi
+  task_id: 3142
+  title: 'Completion-claim verification gate on episode ingestion'
+  capabilities:
+  - name: false-claims-tagged-not-dropped
+    binding: rejection-mechanism — unverified_claim tag contract-fixed; false narrative kept as labeled evidence
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: unverified_claim
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present

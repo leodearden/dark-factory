@@ -61,6 +61,10 @@ def _make_workflow(*, event_store: _RecordingEventStore) -> TaskWorkflow:
     cfg.steward_completion_timeout = 300.0
     cfg.timeouts.working_idle_secs = _WORKING_IDLE_SECS_SENTINEL
     cfg.invocation_timeout = _INVOCATION_TIMEOUT_SENTINEL
+    # These tests pass a plain tmp_path as cwd (not a real linked worktree) and
+    # do not assert on sandbox wiring; disable the sandbox block so _invoke does
+    # not call compute_write_set(cwd) on a non-worktree path (task 2905 α3).
+    cfg.sandbox.enabled = False
 
     return TaskWorkflow(
         assignment=assignment,

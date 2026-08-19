@@ -45,6 +45,7 @@ from typing import Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _verify_config_corpus import ROOT_LINT_COMMAND, ROOT_TYPE_CHECK_COMMAND
 from test_verify import _canned_passing_result, _real_worktree_reader, _write_guard_script
 from test_verify_plan import (  # noqa: F401 — reused by this module's byte-identical goldens (steps 3/7/9)
     DATA_MODULE_DIFF,
@@ -111,27 +112,35 @@ MIXED_ROOT_SUBPROJECT_DIFF: list[str] = [*FALLBACK_SUBPROJECT_DIFF, 'conftest.py
 # ruff-check clause — well-formed/never-OPAQUE even parsed whole — so a
 # second, genuinely multi-clause OPAQUE lint variant
 # (_FLEET_LINT_COMMAND_OPAQUE) is defined separately below for golden (f).
+#
+# The two constants immediately below are INTENTIONALLY HISTORICAL: neither is
+# the live YAML value, both are deliberately NOT drift-checked, and neither may
+# be migrated into `_verify_config_corpus.py`. _FLEET_TEST_COMMAND is the
+# 5-module chain as it stood at test_verify.py:4929 when tasks 2344/2355/2368
+# were fixed (today's live test_command adds --timeout=300 and sampler/cockpit/
+# tests-scripts segments); _FLEET_LINT_COMMAND is the deliberately single-clause
+# variant described above. Hoisting either would break this module's
+# byte-identical goldens, or leave test_verify_config_corpus.py permanently RED.
 _FLEET_TEST_COMMAND: str = (
     'cd shared && uv run pytest tests/ && cd ../escalation && uv run pytest tests/ '
     '&& cd ../orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/ '
     '&& cd ../dashboard && uv run pytest tests/'
 )
 _FLEET_LINT_COMMAND: str = 'uv run ruff check shared escalation fused-memory orchestrator dashboard'
-_FLEET_TYPE_COMMAND: str = (
-    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright '
-    '&& cd ../dashboard && npx pyright'
-)
 
-# The real dark_factory lint_command verbatim (orchestrator/config.yaml) — a
-# genuine multi-clause OPAQUE chain (unlike _FLEET_LINT_COMMAND above). Reused
-# from TestBuildFallbackConfigWithNonDefaultCommands
+# The remaining two ARE the live values (byte-identical, and now drift-checked
+# at their definition site), so they alias the corpus rather than re-declaring
+# it. The _FLEET_* names are kept because they carry κ-specific meaning this
+# module's header documents — which shape is OPAQUE, which is single-clause —
+# that ROOT_* does not convey.
+_FLEET_TYPE_COMMAND: str = ROOT_TYPE_CHECK_COMMAND
+
+# The real dark_factory lint_command verbatim — a genuine multi-clause OPAQUE
+# chain (unlike _FLEET_LINT_COMMAND above). Reused from
+# TestBuildFallbackConfigWithNonDefaultCommands
 # .test_fallback_lint_reprojects_repo_root_file_to_ruff_bearing_context
 # (test_verify.py) for the OPAQUE-fleet-chain golden (f) below.
-_FLEET_LINT_COMMAND_OPAQUE: str = (
-    'uv run ruff check shared escalation fused-memory orchestrator dashboard '
-    '&& python3 fused-memory/scripts/check_bare_magicmock_config.py '
-    'shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-)
+_FLEET_LINT_COMMAND_OPAQUE: str = ROOT_LINT_COMMAND
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +218,16 @@ class TestModuleConfigPlanAuthority:
 
     @pytest.mark.asyncio
     async def test_executed_commands_are_driven_by_the_plan(self, tmp_path: Path):
-        """A touched test file + a plain source file under one registered module."""
+        """A touched test file + a plain source file under one registered module.
+
+        Since task 3294 this MIXED shape full-suites pytest at the default
+        role='task' (any touched SOURCE/STRUCTURAL file under the prefix runs
+        the owning module's whole test_command), so this pins the FULL_SUITE
+        arm of the plan→ModuleConfig mapping alongside lint/pyright's
+        FILE_SCOPED arms. The class's contract — executed == planned, with no
+        hand-mirrored decision tree in between — is unchanged; only which arm
+        the pytest slot exercises moved.
+        """
         (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
         (tmp_path / 'mymod' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
         (tmp_path / 'mymod' / 'helpers.py').write_text('def helper():\n    return 1\n')
@@ -252,9 +270,16 @@ class TestModuleConfigPlanAuthority:
         by_tool = {run.cmd.tool: run for run in expected_plan.runs if run.cmd is not None}
 
         pytest_run = by_tool[ToolKind.PYTEST]
-        assert pytest_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
+        # Task 3294: this MIXED shape (production file + co-committed test)
+        # full-suites pytest at role='task', so this now pins the FULL_SUITE
+        # arm of the plan→ModuleConfig mapping. The expectation is the
+        # VERBATIM configured command, not render(cmd): a FULL_SUITE slot is
+        # rendered by _executed_module_configs_from_plan as `getattr(mc, attr)`,
+        # while render() normalises `--directory` into a leading `cd` — so the
+        # render-based form would fail on a correct mapping.
+        assert pytest_run.scope_kind is verify_plan.ScopeKind.FULL_SUITE
         assert pytest_run.cmd is not None
-        assert executed_mc.test_command == render(pytest_run.cmd)
+        assert executed_mc.test_command == module_configs[0].test_command
 
         ruff_run = by_tool[ToolKind.RUFF]
         assert ruff_run.scope_kind is verify_plan.ScopeKind.FILE_SCOPED
@@ -951,14 +976,27 @@ class TestFallbackPlanAuthorityGoldens:
     @pytest.mark.asyncio
     async def test_opaque_fleet_chain_lint_type_scoped_to_first_clause(self, tmp_path: Path):
         """(f) UNREGISTERED_PATH_DIFF against the REAL OPAQUE fleet lint/type chains ->
-        LINT/TYPE scope to their first clause (``_scope_to_keyword``, dropping the
-        rest); the OPAQUE TEST chain runs verbatim (P1).
+        LINT/TYPE scope to their first clause (``_scope_to_keyword``); the
+        OPAQUE TEST chain runs verbatim (P1).
 
         RED today for LINT/TYPE: the fallback plan records the WHOLE
         untouched multi-clause chain (parses OPAQUE at the full-string
         level), while execution truncates-then-parses the first clause only,
         producing a completely different, file-scoped string. TEST is
         already GREEN today — P1 means neither layer scopes it.
+
+        The two chains diverge on what happens to the TAIL (task 3061). LINT
+        is a SIBLING-CHECKER chain, so its trailing
+        ``check_bare_magicmock_config.py`` clause is preserved unscoped and
+        verbatim. TYPE is a ``cd``-sequenced SAME-TOOL FAN-OUT, so its tail
+        is still dropped — preserving it would run two more subprojects
+        unscoped and leave a ``cd ../orchestrator`` that misresolves once
+        ``strip_cwd`` has removed the leading ``cd``.
+
+        LINT also exercises the fallback path's reprojection end-to-end: the
+        scoped head is a bare ``uv run``, and ``_reproject_str`` must still
+        inject ``--project shared`` into it despite the appended tail (task
+        2036 — the depless workspace-root project cannot spawn ruff).
         """
         test_path = UNREGISTERED_PATH_DIFF[0]
         full = tmp_path / test_path
@@ -984,9 +1022,16 @@ class TestFallbackPlanAuthorityGoldens:
         assert executed[0].prefix == '__fallback__'
         # P1: the OPAQUE fleet TEST chain is never scoped/mutated — verbatim.
         assert executed[0].test_command == _FLEET_TEST_COMMAND
-        # LINT/TYPE scope to the first clause, dropping the rest of the chain.
-        assert executed[0].lint_command == f'uv run --project shared ruff check {test_path}'
-        assert 'check_bare_magicmock_config' not in (executed[0].lint_command or '')
+        # LINT: ruff is file-scoped AND reprojected into the fallback uv
+        # project, while the trailing sibling-checker clause survives verbatim.
+        assert executed[0].lint_command == (
+            f'uv run --project shared ruff check {test_path}'
+            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py '
+            'shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+            ' sampler/tests cockpit/tests'
+        )
+        assert 'check_bare_magicmock_config' in (executed[0].lint_command or '')
+        # TYPE: a cd-sequenced same-tool fan-out still truncates at the keyword.
         assert executed[0].type_check_command == f'npx pyright {test_path}'
         assert 'orchestrator' not in (executed[0].type_check_command or '')
         assert 'dashboard' not in (executed[0].type_check_command or '')
@@ -1416,17 +1461,27 @@ class TestModuleConfigOpaqueChainScoping:
     unchanged (``strip_cwd(scope_to(parse_config_command(x), files))``
     no-ops on an OPAQUE/raw-retained command — see ``verify_cmd.scope_to``'s
     P1 guard) and ``_executed_module_configs_from_plan`` renders it verbatim
-    (``render()==raw``), so the whole unscoped chain — plus any trailing
-    ``&&``-chained clause — executes instead of a file-scoped first clause.
+    (``render()==raw``), so the whole unscoped chain executes instead of a
+    file-scoped first clause.
+
+    Task 3061 refined what "first-clause scoped" means for the TAIL. A
+    SIBLING-CHECKER clause (a different tool, no ``cd`` sequencing — the
+    ``python3 .../check_*.py <dir>`` gates every subproject chains after
+    ``ruff check``) is now PRESERVED unscoped and verbatim: it asserts a
+    whole-directory invariant, so dropping it made the gate invisible to
+    scoped pre-merge verify. A SAME-TOOL FAN-OUT (the root config's ``cd X
+    && npx pyright`` chain) keeps being truncated — see
+    ``verify_cmd.split_chain_tail``'s gate.
     """
 
     @pytest.mark.asyncio
     async def test_lint_real_subproject_chain_scopes_to_first_clause(self, tmp_path: Path):
         """(1) LINT — the real subproject shape (config.yaml-style): an
-        OPAQUE ``ruff check`` clause followed by an unrelated
-        ``check_bare_magicmock_config.py`` clause -> first-clause scoped,
-        the trailing clause and the unscoped ``src/ tests/`` targets both
-        dropped.
+        OPAQUE ``ruff check`` clause followed by a
+        ``check_bare_magicmock_config.py`` sibling-checker clause -> the ruff
+        clause is file-scoped (its unscoped ``src/ tests/`` targets dropped)
+        while the trailing checker is PRESERVED unscoped and verbatim
+        (task 3061).
         """
         (tmp_path / 'escalation' / 'src').mkdir(parents=True)
         touched = 'escalation/src/thing.py'
@@ -1453,14 +1508,65 @@ class TestModuleConfigOpaqueChainScoping:
             f'expected the first-clause-scoped string {expected!r}, got '
             f'{executed[0].lint_command!r}'
         )
-        assert 'check_bare_magicmock_config' not in (executed[0].lint_command or ''), (
-            f'the trailing (unrelated) clause must be dropped, not re-enabled: '
-            f'{executed[0].lint_command!r}'
+        assert 'check_bare_magicmock_config' in (executed[0].lint_command or ''), (
+            f'the trailing sibling-checker clause must be PRESERVED (unscoped and '
+            f'verbatim — it asserts a whole-directory invariant) while the ruff '
+            f'clause is file-scoped: {executed[0].lint_command!r}'
         )
         assert 'src/ tests/' not in (executed[0].lint_command or ''), (
             f'the unscoped src/ tests/ targets must not survive scoping: '
             f'{executed[0].lint_command!r}'
         )
+
+        assert result.plan is not None
+        _assert_plan_run_matches_executed(
+            result.plan, 'lint:', executed[0].lint_command, executed[0].prefix,
+        )
+
+    @pytest.mark.asyncio
+    async def test_fused_memory_real_lint_chain_runs_asyncmock_checker(self, tmp_path: Path):
+        """(1b) TASK-2920 REPRODUCTION — the checker that caught it post-merge now runs.
+
+        Task 2920's asyncmock-assertion violation landed on main and was only
+        caught by the post-merge full-config run, because the scoped
+        pre-merge lint silently truncated fused-memory's REAL 3-segment
+        ``lint_command`` at ``ruff check`` and dropped both sibling gates.
+        With the trailing clauses preserved, ``check_asyncmock_assertion_style.py``
+        executes on the pre-merge scoped path — i.e. the same violation would
+        now be caught before the merge, not after.
+        """
+        (tmp_path / 'fused-memory' / 'tests').mkdir(parents=True)
+        touched = 'fused-memory/tests/test_harness.py'
+        (tmp_path / touched).write_text('def test_harness(): pass\n')
+
+        # Verbatim fused-memory/orchestrator.yaml:11.
+        lint_command = (
+            'uv run --project fused-memory --directory fused-memory ruff check src/ tests/ '
+            '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests '
+            '&& python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
+        )
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [ModuleConfig(prefix='fused-memory', lint_command=lint_command)]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=[touched],
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        assert 'check_asyncmock_assertion_style.py' in (executed[0].lint_command or ''), (
+            f'task 2920 acceptance: the asyncmock-assertion gate must run on the '
+            f'scoped pre-merge path, not only post-merge: {executed[0].lint_command!r}'
+        )
+        assert 'check_bare_magicmock_config.py' in (executed[0].lint_command or '')
+        assert 'src/ tests/' not in (executed[0].lint_command or ''), (
+            f'the ruff clause itself must still be file-scoped: '
+            f'{executed[0].lint_command!r}'
+        )
+        assert touched in (executed[0].lint_command or '')
 
         assert result.plan is not None
         _assert_plan_run_matches_executed(

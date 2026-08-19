@@ -54,13 +54,17 @@ emergency hotfix) it's fine to edit directly:
    ```bash
    git worktree add ../dark-factory.<short-name> -b task/<short-slug>
    ```
-2. Branch from `main` as **`task/<short-slug>` with a non-numeric slug**
-   (e.g. `task/docs-user-docs`) — the same convention `/do` and `/warm`
-   produce, and the shape `/merge-queue` expects (`merge_request` prepends
-   the configured `task/` prefix to whatever you submit). Never use a bare
-   number as the slug: numeric `task/<id>` branches are orchestrator task
-   ids, and reusing a real task's id can corrupt that task's merge
-   bookkeeping.
+2. Branch from `main`. The merge queue accepts **any** branch name — the
+   worker resolves the prefixed form (`task/<what-you-submitted>`) first
+   and falls back to the literal name — but prefer **`task/<short-slug>`
+   with a non-numeric slug** (e.g. `task/docs-user-docs`), the same
+   convention `/do` and `/warm` produce: a couple of ancillary paths (the
+   submit-time already-merged fast path, and `merge_status`'s
+   git-authority recovery tier after an orchestrator restart) derive the
+   ref by blindly prepending `task/`, so only prefixed branches get their
+   full benefit. Never use a bare number as the slug: numeric `task/<id>`
+   branches are orchestrator task ids, and reusing a real task's id can
+   corrupt that task's merge bookkeeping.
 3. Make your change, run the quality gates (§4), then merge via
    `/merge-queue` (§5) — not a direct `git merge --no-ff` into `main`
    whenever the orchestrator might be running.
@@ -97,7 +101,7 @@ Other top-level dirs:
   `<prd-stem>.capability-manifest.yaml` sidecar — schema in
   `shared/src/shared/capability_manifest.py`). This is the durable record;
   `plans/` is not.
-- **`docs/legibility/`** — `design-invariants.md` (INV-1..INV-5, gates
+- **`docs/legibility/`** — `design-invariants.md` (gates
   `/prd` decompose and `/review` phase 2 — see §6) plus its calibration
   fixtures and the confusion-codebook incident taxonomy.
 - **`dashboard/`** — web UI for task/escalation state.
@@ -130,7 +134,40 @@ Other top-level dirs:
   repo-root `pytest` instead collects everything into one process against
   only the root `pyproject.toml`, which is slower and less isolated. Mirror
   the fan-out when running the full suite yourself.
-- **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard`
+<!-- lint-command-mirror:begin
+     Mirrors the `ruff check` leg of `lint_command` in
+     dark-factory-orchestrator.yaml. Pinned by
+     tests/scripts/test_contributing_lint_command_drift.py — widen the yaml
+     head and this line goes red until it is updated to match. -->
+- **Lint**: `uv run ruff check shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills`
+<!-- lint-command-mirror:end -->
+  That bullet mirrors the `ruff check` leg only; `lint_command` chains one
+  more leg the merge gate also runs —
+  `fused-memory/scripts/check_bare_magicmock_config.py` over each package's
+  `tests/` — so see `lint_command` in `dark-factory-orchestrator.yaml` for
+  the full chain.
+- **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
+  of the toolchain** and is not enforced anywhere — not in `hooks/pre-commit`,
+  not in any `orchestrator.yaml` `lint_command`, not in verify. There is no CI.
+
+  As of task 3441, 1125 of 1357 first-party package `.py` files (83%) are not
+  `ruff format`-clean. **That is the expected steady state, not debt.** A task
+  proposing to "fix formatting" over some subset of files is correctly closable
+  as won't-fix. A repo-wide sweep was considered and declined for three
+  reasons: it reverses the deliberate `ignore = ["E501"]` that every package
+  sets, which tolerates long lines on purpose while the formatter exists to
+  rewrap them; a 1125-file diff conflicts with every in-flight branch in a repo
+  whose normal mode is many concurrent agent branches against a
+  continuously-draining merge queue; and it rewrites the blame history that
+  this repo's incident forensics and reconciliation lean on.
+
+  The `[tool.ruff.format]` block in each package's `pyproject.toml` is **style
+  config, not a gate**. It is retained so that an ad-hoc or editor-on-save
+  `ruff format` produces a single-quoted, repo-consistent diff — measured
+  ~4.5x smaller than the same run under ruff's own defaults.
+
+  Reversing this decision means updating this section, `CLAUDE.md` and
+  `tests/scripts/test_ruff_format_policy.py` together.
 - **Type-check** (pyright, run from each configured package directory so it
   picks up that package's `[tool.pyright]` block):
   ```bash
@@ -180,10 +217,14 @@ the main checkout").
 
 ## 5. Git workflow
 
-- Branch from `main`. Anything you'll land via `/merge-queue` sits on a
-  `task/<short-slug>` branch with a **non-numeric** slug
-  (`task/docs-user-docs`, `task/fix-merge-liveness`, …). Numeric
-  `task/<id>` names are orchestrator task ids — treat those as reserved.
+- Branch from `main`. The merge queue merges **any** branch name (the
+  worker tries `task/<submitted>` first, then the literal name), but
+  prefer a `task/<short-slug>` branch with a **non-numeric** slug
+  (`task/docs-user-docs`, `task/fix-merge-liveness`, …) so the
+  already-merged fast path and post-restart status recovery — which
+  derive the ref by prepending `task/` — work for your branch too.
+  Numeric `task/<id>` names are orchestrator task ids — treat those as
+  reserved.
 - **Never `git stash` in the main checkout** (`/home/leo/src/dark-factory`
   or wherever `project_root` points). The merge worker's advance path
   consumes the stash stack as part of its own bookkeeping — a stash you
@@ -225,11 +266,10 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
   boundary-test sketch) vs. a bare vertical slice.
 - **G6** premise validity — numeric bounds, exactness claims, and rejection
   assertions must be substantiated, not guessed.
-- **G7** design invariants — re-checked against
-  `docs/legibility/design-invariants.md` (**INV-1..INV-5**:
-  `contracts-machine-checked`, `structured-facts-at-failure`,
-  `corroborate-before-acting`, `storm-escape-required`,
-  `no-lockstep-duplication`). An unresolved, unwaived hit blocks the batch;
+- **G7** design invariants — every task in a batch is re-checked against the
+  named, checkable invariants in `docs/legibility/design-invariants.md` (the
+  single normative list; slugs are stable ids, so read it rather than a copy).
+  An unresolved, unwaived hit blocks the batch;
   a deliberate exception is a `G7 waiver: <slug> — <rationale>` line in the
   PRD plus `metadata.g7_waivers` on the filed task.
 - **Capability manifest** — mechanizes G3/G6 per leaf task, committed
@@ -238,10 +278,12 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
   oversight, produce a complete, coherent, good design?"
 
 `design-invariants.md` also gates `/review` phase 2's cross-module audit —
-it's the single normative copy of the five invariants; don't restate them
-elsewhere. If you're hand-writing a task (not going through `/prd`) for a
-nontrivial design change, walk it against the same checklist yourself
-before filing.
+it's the single normative copy; don't restate them elsewhere (a restatement
+here went stale once already — task 3802, and
+`scripts/tests/test_design_invariants_consistency.py` now fails if a copy
+comes back; citing one invariant by name is still fine). If you're hand-writing a task (not going through
+`/prd`) for a nontrivial design change, walk it against the same checklist
+yourself before filing.
 
 ---
 
@@ -297,4 +339,4 @@ chore: <housekeeping>
 - **Don't use a bare task number as a branch slug**, or reuse a
   blocked/in-flight task's id for unrelated work — either can corrupt that
   task's merge bookkeeping (non-numeric `task/<slug>` branches are the
-  sanctioned interactive form — §5).
+  preferred interactive form — §5).
