@@ -1895,9 +1895,15 @@ class CuratorConfig(BaseModel):
     # snapshot via ``effective_lock_depth``; this scalar is used only when no
     # snapshot exists (a freshly onboarded project whose orchestrator has never
     # run) or it is unreadable. Deliberately COARSE rather than a guess at the
-    # fleet's usual value: for a dedup tool a too-coarse key over-matches and
-    # costs one LLM look at an irrelevant pool entry, while a too-fine key
-    # under-matches and costs a DUPLICATE TASK.
+    # fleet's usual value: a too-fine key under-matches, missing the
+    # overlapping task every time, and costs a DUPLICATE TASK. A too-coarse
+    # key over-matches, which is usually just one LLM look at an irrelevant
+    # pool entry — but not always free: the module stream is ordered by status
+    # and priority, NOT by relevance, then truncated at pool_module_cap, so a
+    # very coarse key against a deep project can push the genuinely
+    # overlapping task past the cap and produce the same duplicate. Coarse
+    # degrades only past the cap where fine fails always, hence the direction;
+    # the fallback is still a fallback, not a good operating point.
     lock_depth: int = Field(default=2)
 
     # Idempotency cache: skip re-invoking the LLM for the same candidate payload

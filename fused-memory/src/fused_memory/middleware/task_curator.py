@@ -2242,8 +2242,17 @@ class TaskCurator:
         # red-tier (changes only at orchestrator restart), so an hours-old
         # snapshot still carries the correct depth. Absent/unreadable snapshot
         # falls back COARSE (the config scalar) — see effective_lock_depth.
-        lock_depth = effective_lock_depth(
-            project_root, self._config.curator.lock_depth,
+        #
+        # Dispatched via to_thread because the underlying snapshot read is
+        # blocking, matching recon_write_policy's handling of the same file.
+        # Unlike that call site there is no existing thread hop to ride here
+        # (_build_corpus is awaited straight off the event loop), so this adds
+        # its own. It stays cheap because effective_lock_depth memoises per
+        # project — this runs once per candidate but only reaches the disk
+        # once per project per TTL, and the hop is noise next to the taskmaster
+        # and embedding round-trips below.
+        lock_depth = await asyncio.to_thread(
+            effective_lock_depth, project_root, self._config.curator.lock_depth,
         )
         pool: list[_PoolEntry] = []
         seen_ids: set[str] = set()
