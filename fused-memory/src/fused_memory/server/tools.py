@@ -4668,7 +4668,11 @@ def create_mcp_server(
                 (see ``fused_memory.topic_slug``).
             project_id: Project scope (required).
             supersedes: Ids to FOLD AND DELETE. Each is reparented, deleted
-                and then re-read to confirm it is actually gone.
+                and then re-read to confirm it is actually gone. LIST EACH ID
+                ONCE: a repeat within either arm is refused by name (both
+                slots), never de-duplicated for you, because a repeat would
+                be deleted twice, claimed twice by the canonical, and counted
+                twice against a ledger that stores it once.
             retain: Ids to TAG IN PLACE — stamped with the cluster's topic
                 and never deleted. The ratified default arm (gate 3200).
                 They become PEERS of the canonical, not children: they get
@@ -5192,10 +5196,19 @@ def create_mcp_server(
             # precisely this — "reparenting records whose own parent is still
             # alive — a pointer rewrite nothing asked for".
             #
-            # Same refusal, same `error_type`, same wording as the blocker it
-            # replaces below: only the COST changed, never the report. "at
-            # least" stays load-bearing — the scan was capped, so the count is
-            # a FLOOR, and reporting it bare would read as exhaustive.
+            # Same refusal and same `error_type` as the blocker it replaces
+            # below, and — WHEN TRUNCATION IS THE ONLY BLOCKER — byte-identical
+            # wording. That qualifier is not pedantry. Previously a victim
+            # could be BOTH truncated and stranded, and the joined message
+            # carried both clauses while `reparented`/`reparent_failures`
+            # named the children the loop had moved and failed to move. Those
+            # mutations no longer happen, so the report no longer describes
+            # them: the stranded clause is now unreachable under truncation by
+            # construction. Reporting moves that were never made would be the
+            # overclaim; losing the clause is the point, not a regression.
+            #
+            # "at least" stays load-bearing — the scan was capped, so the count
+            # is a FLOOR, and reporting it bare would read as exhaustive.
             if scan.truncated:
                 failed_deletes.append({
                     'id': supersede_id,

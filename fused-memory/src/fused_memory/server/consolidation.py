@@ -130,18 +130,27 @@ def _repeated_id_members(values: list[Any], field: str) -> list[str]:
     :func:`_bad_id_members`, and comparing it here would raise inside the one
     step whose entire job is to refuse without raising.
     """
-    first_seen: dict[Any, int] = {}
+    # Keyed on (TYPE, value), not value alone. `True == 1` and
+    # `hash(True) == hash(1)` in Python, as do `1` and `1.0`, so a bare dict
+    # would report `[1, True]` as a repeat — naming two members that render
+    # DIFFERENTLY under `_safe_repr` and so contradicting this function's own
+    # reason for reporting by index. Harmless in practice (neither member is a
+    # str, so `_bad_id_members` already refuses the call) but the line would
+    # be untrue, and an untrue problem line is exactly what a caller cannot
+    # act on.
+    first_seen: dict[tuple[type, Any], int] = {}
     problems: list[str] = []
     for i, value in enumerate(values):
         if not isinstance(value, (str, bytes, int, float)):
             continue
-        if value in first_seen:
+        key = (type(value), value)
+        if key in first_seen:
             problems.append(
-                f'{field}[{i}] repeats {field}[{first_seen[value]}]: '
+                f'{field}[{i}] repeats {field}[{first_seen[key]}]: '
                 f'{_safe_repr(value)}'
             )
         else:
-            first_seen[value] = i
+            first_seen[key] = i
     return problems
 
 
@@ -257,11 +266,21 @@ def validate_consolidate_args(
     #       while `ReconLedgerStore.upsert_many` collapses the two identical
     #       five-part identities to ONE row (last-write-wins, per its own
     #       docstring), so the pair the envelope advertises as its audit-trail
-    #       proof overstates the ledger by one.
+    #       proof overstates the ledger by one;
+    #   and the ONE row that does survive is DEGRADED. `victims_by_id` is
+    #       keyed by id and reassigned each pass, so the repeat's pre-delete
+    #       capture — which runs AFTER the first pass already deleted the
+    #       record — misses, overwriting the good capture with
+    #       `metadata=None, created_at=None`. Both rows are then built from
+    #       that empty capture, and last-write-wins keeps one of them. The
+    #       surviving tombstone is stripped of the victim's identifying
+    #       metadata and `created_at`: precisely the fields that make a dead
+    #       id answerable, in the op that exists to make it answerable.
     #
-    # That third one is why this is refused rather than tolerated: it is an
-    # INFERRED count, in the op whose whole deliverable is corroborated ones
-    # (INV-2 structured-facts, INV-3 corroborate-before-acting).
+    # The last two are why this is refused rather than tolerated: an INFERRED
+    # count, and a silently gutted audit row, in the op whose whole deliverable
+    # is corroborated facts (INV-2 structured-facts, INV-3
+    # corroborate-before-acting).
     #
     # REFUSED, not silently de-duplicated, for the reason the overlap check
     # above refuses rather than picking an arm, and the reason

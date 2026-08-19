@@ -50,11 +50,16 @@ retained peers tagged, then per supersede read → re-home children → corrobor
   `memory_deleted` event and a second WriteJournal row for a record already gone); the
   canonical's durable `metadata.supersedes` KEEPS the repeat, because the step (7)
   narrowing compares SETS and so never fires on a list differing only by duplication;
-  and `tombstones_written`/`tombstones_expected` BOTH count it while the recon ledger's
+  `tombstones_written`/`tombstones_expected` BOTH count it while the recon ledger's
   five-part identity collapses the two rows into one, so the pair the envelope advertises
-  as its audit-trail proof would overstate the ledger by one. That last one is why this
-  is refused rather than tolerated — an INFERRED count, in the op whose whole deliverable
-  is corroborated ones.
+  as its audit-trail proof would overstate the ledger by one; and the single row that
+  DOES survive is gutted — `victims_by_id` is keyed by id and reassigned per pass, so the
+  repeat's pre-delete capture (running after the first pass already deleted the record)
+  misses and overwrites the good capture with `metadata=None, created_at=None`, leaving
+  the surviving tombstone stripped of exactly the victim-identity fields that make a dead
+  id answerable. The last two are why this is refused rather than tolerated — an INFERRED
+  count and a silently gutted audit row, in the op whose whole deliverable is corroborated
+  facts.
 - **`survivors` is the deliverable.** Computed only from a post-delete `get_memory_by_id`
   per id, so an id whose delete reported success but which still resolves is reported as
   a survivor, and an id whose delete raised but which is genuinely gone is not. Partial

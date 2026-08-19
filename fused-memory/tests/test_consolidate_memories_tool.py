@@ -1517,6 +1517,14 @@ class TestAnIncompleteReparentRefusesTheDelete:
         )
         assert result['reparented'] == []
 
+        # The count must read as a FLOOR. Two code comments call "at least"
+        # load-bearing ("reporting it bare would read as exhaustive — the
+        # overclaim this op exists to eliminate") and nothing asserted it, so
+        # the literal could have been re-typed wrong without the suite
+        # noticing. This is the guard those comments claim.
+        assert 'at least 1 child(ren) in' in failure['error']
+        assert 'truncated' in failure['error']
+
     @pytest.mark.asyncio
     async def test_a_patch_that_reported_success_is_still_corroborated(self):
         """CORROBORATE AFTER ACTING, the same discipline 3197's cascade

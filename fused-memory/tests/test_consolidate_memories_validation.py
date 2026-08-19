@@ -248,6 +248,29 @@ class TestIntraArmDuplicates:
         assert 'supersedes[1]' in err['error']
         assert 'retain[1]' in err['error']
 
+    def test_values_that_merely_HASH_alike_are_not_a_repeat(self):
+        """`True == 1` and `hash(True) == hash(1)` in Python, as do `1` and
+        `1.0`, so a value-keyed dict would call these a repeat — naming two
+        members that render DIFFERENTLY, which contradicts the whole reason
+        this check reports by index. Neither is a valid id, so the call is
+        refused either way; what must not happen is an UNTRUE problem line,
+        because that is the one thing a caller cannot act on."""
+        err, _, _ = _call(supersedes=[1, True])
+
+        assert err is not None
+        assert 'repeats' not in err['error']
+        # ...but they ARE both named as malformed, which is the true report.
+        assert 'supersedes[0]' in err['error']
+        assert 'supersedes[1]' in err['error']
+
+    def test_an_unhashable_member_does_not_raise(self):
+        """The validator's entire job is to refuse WITHOUT raising: a raise
+        is flattened by `@mcp_tool_errors` and loses the hint."""
+        err, _, _ = _call(supersedes=[{'a': 1}, {'a': 1}, ['x'], ['x']])
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+
     def test_distinct_ids_are_untouched_by_the_check(self):
         """The discriminator: a clean call must not acquire a duplicate
         problem, and its arms must come back exactly as supplied."""
