@@ -1682,6 +1682,11 @@ def test_forget_is_still_all_or_nothing_when_only_some_holds_are_stale():
 # answers, and an all-stale drop that refuses — must be distinguishable here.
 
 
+def _warnings(caplog):
+    """The records this module emitted, never another logger's."""
+    return [r for r in caplog.records if r.name == 'orchestrator.hold_history']
+
+
 def test_the_stale_warning_names_only_the_holds_it_dropped(caplog):
     history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
     history.observe_acquired('T1', ['ghost/src'], at=_at(0))
@@ -1690,23 +1695,28 @@ def test_the_stale_warning_names_only_the_holds_it_dropped(caplog):
     with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
         assert history.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
 
-    records = [r for r in caplog.records if r.name == 'orchestrator.hold_history']
+    records = _warnings(caplog)
     assert len(records) == 1
-    message = records[0].getMessage()
-    assert 'ghost/src' in message          # the hold actually consumed
-    assert 'fresh/src' not in message      # still live — not the backstop's doing
-    assert 'no prediction' not in message  # the call returned 60.0
+    # The facts, off the %-args rather than the rendered prose — the wording is
+    # the operator's to reword, the args are the contract.
+    assert records[0].args[0] == 'T1'
+    assert records[0].args[1] == 1                  # one hold consumed
+    assert records[0].args[3] == ['ghost/src']      # and it names exactly that one
+    # The one property only the whole rendered line can carry: a live hold must
+    # not appear anywhere in it, however the message is phrased.
+    assert 'fresh/src' not in records[0].getMessage()
 
 
 def test_the_stale_warning_reports_the_surviving_hold_count(caplog):
-    """The partial drop and the total drop must read differently."""
+    """The partial drop and the total drop must be distinguishable."""
     partial = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
     partial.observe_acquired('T1', ['ghost/src'], at=_at(0))
     partial.observe_acquired('T1', ['fresh/src'], at=_at(1500))
 
     with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
         assert partial.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
-    assert '1 open hold(s) remain' in caplog.records[-1].getMessage()
+    assert _warnings(caplog)[-1].args[1] == 1  # dropped
+    assert _warnings(caplog)[-1].args[4] == 1  # survived
 
     caplog.clear()
     all_stale = _history_of({'a/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
@@ -1715,4 +1725,35 @@ def test_the_stale_warning_reports_the_surviving_hold_count(caplog):
 
     with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
         assert all_stale.predicted_remaining('T1', now=_at(2000)) is None
-    assert '0 open hold(s) remain' in caplog.records[-1].getMessage()
+    assert _warnings(caplog)[-1].args[1] == 2  # dropped
+    assert _warnings(caplog)[-1].args[4] == 0  # nothing survived
+
+
+def test_the_sweep_warns_once_per_missed_release_not_once_per_call(caplog):
+    """The sweep must DELETE, not just report — this method runs per scan.
+
+    ``predicted_remaining`` is called once per blocking holder per park owner
+    per scored scan (``_compute_provable_assembly_delay``), so a sweep that
+    computed ``dropped`` without removing the keys would keep every other
+    assertion here green while logging a WARNING per holder per tick forever.
+    """
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
+        assert history.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
+        assert history.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
+
+    assert len(_warnings(caplog)) == 1
+
+
+def test_a_task_holding_only_fresh_locks_says_nothing(caplog):
+    """The quiet happy path — the overwhelmingly common one."""
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.hold_history'):
+        assert history.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
+
+    assert _warnings(caplog) == []
