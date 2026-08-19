@@ -646,6 +646,19 @@ _WARM_LANE_PYPROJECT = _pyproject(f'"{_REAL_ADDOPTS}"')
 _MARKED_SOURCE = 'import pytest\npytestmark = pytest.mark.warm_lane_bash\n\n\ndef test_x():\n    pass\n'  # noqa: E501
 _UNMARKED_SOURCE = 'import pytest\n\n\ndef test_y():\n    pass\n'
 
+#: The repo ROOT's real addopts, verbatim from pyproject.toml:66 — the config
+#: `_marker_deselecting_expression` actually reads for `tests/scripts` (no
+#: `--directory`, so the effective rootdir is the repo root, not the prefix).
+_ROOT_ADDOPTS = "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'"
+_ROOT_PYPROJECT = _pyproject(f'"{_ROOT_ADDOPTS}"')
+
+#: `_ALL_DECORATED_SOURCE` (defined above, next to `TestPerItemMarkerNames`)
+#: plus a top-level test class — pins that the enumeration guarantee reaches
+#: this composed entry point, not just `per_item_marker_names` in isolation.
+_ALL_DECORATED_SOURCE_WITH_CLASS = _ALL_DECORATED_SOURCE + (
+    '\n\nclass TestThing:\n    def test_method(self):\n        pass\n'
+)
+
 
 class _RecordingReader:
     """A dict-backed ``read_source`` that RECORDS every path it is asked for.
@@ -733,6 +746,61 @@ class TestDeselectingExpressionForTargets:
             'uv run pytest tests/ -m warm_lane_bash',
             read,
         ) is None
+
+    # -- the second (per-item) proof tier, consulted as a fallback -----------
+
+    def test_all_decorated_target_widens_under_the_real_root_addopts(self):
+        """THE ACCEPTANCE CASE — the shape that returns rc=5 today (task 4459)."""
+        read = _RecordingReader({'a/test_a.py': _ALL_DECORATED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _ROOT_PYPROJECT, None, read,
+        ) == 'not smoke and not integration and not warm_lane_bash'
+
+    def test_mixed_decorated_target_is_refused(self):
+        """One undecorated sibling is enough to refuse — the know_live property survives."""
+        read = _RecordingReader({'a/test_a.py': _MIXED_DECORATED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _ROOT_PYPROJECT, None, read,
+        ) is None
+
+    def test_one_mixed_target_among_all_decorated_targets_is_refused(self):
+        """ALL, not ANY — across targets, not only within a single one."""
+        read = _RecordingReader({
+            'a/test_a.py': _ALL_DECORATED_SOURCE,
+            'a/test_b.py': _MIXED_DECORATED_SOURCE,
+        })
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py', 'a/test_b.py'], _ROOT_PYPROJECT, None, read,
+        ) is None
+
+    def test_all_decorated_source_with_a_test_class_is_refused(self):
+        """The enumeration guarantee reaches this composed entry point, not just the collector."""
+        read = _RecordingReader({'a/test_a.py': _ALL_DECORATED_SOURCE_WITH_CLASS})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _ROOT_PYPROJECT, None, read,
+        ) is None
+
+    def test_module_level_tier_still_decides_on_its_own(self):
+        """UNCHANGED CONTROL: the primary tier is untouched by the new fallback tier."""
+        read_marked = _RecordingReader({'a/test_a.py': _MARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py'], _WARM_LANE_PYPROJECT, None, read_marked,
+        ) == 'not warm_lane_bash'
+        read_unmarked = _RecordingReader({'a/test_b.py': _UNMARKED_SOURCE})
+        assert deselecting_expression_for_targets(
+            ['a/test_b.py'], _WARM_LANE_PYPROJECT, None, read_unmarked,
+        ) is None
+
+    def test_second_tier_does_not_double_the_per_target_reads(self):
+        """THE COST BOUND — adding a second proof tier must not double per-target reads."""
+        read = _RecordingReader({
+            'a/test_a.py': _ALL_DECORATED_SOURCE,
+            'a/test_b.py': _ALL_DECORATED_SOURCE,
+        })
+        assert deselecting_expression_for_targets(
+            ['a/test_a.py', 'a/test_b.py'], _ROOT_PYPROJECT, None, read,
+        ) == 'not smoke and not integration and not warm_lane_bash'
+        assert read.paths == ['a/test_a.py', 'a/test_b.py']
 
 
 # ---------------------------------------------------------------------------
@@ -1683,3 +1751,66 @@ class TestRunScopedVerificationWidensTheFallback:
         assert run is not None
         assert run.scope_kind is ScopeKind.FILE_SCOPED
         assert run.scoped_targets == ('tests/test_smoke.py',)
+
+
+class TestTestsScriptsAllIntegrationDecoratedRealConfigRegression:
+    """The task-4459 incident golden, driven against the REAL repo files.
+
+    Never hand-seeded: the root addopts, the target file's per-function
+    decorators and the ModuleConfig's commands are all read from disk, same
+    discipline as ``TestWarmLaneBashRealConfigRegression`` above.  Before this
+    task, ``uv run --project shared pytest
+    tests/scripts/test_pump_web_ui_installed_unit_parity.py`` collected 2
+    items / 2 deselected / 0 selected and exited rc=5 — a false RED on a diff
+    that touched only that (real, passing) file, because every item there is
+    marked by its own ``@pytest.mark.integration`` decorator rather than a
+    module-level ``pytestmark``.
+    """
+
+    _TARGET = 'tests/scripts/test_pump_web_ui_installed_unit_parity.py'
+
+    #: Non-vacuity guards run FIRST: the golden below must never be able to
+    #: pass because its premise evaporated (the deselection moved, or the
+    #: target file stopped being fully per-function-decorated).
+    def test_real_root_addopts_still_deselect_integration(self):
+        expr = resolve_marker_expression((REPO_ROOT / 'pyproject.toml').read_text(), None)
+        assert expr is not None, 'root addopts no longer carry a -m expression'
+        assert 'integration' in expr
+
+    def test_real_target_file_is_still_fully_decorated_with_integration(self):
+        source = (REPO_ROOT / self._TARGET).read_text()
+        items = per_item_marker_names(source)
+        assert items is not None, 'the file grew a shape this tier can no longer enumerate'
+        assert items, 'the file lost its top-level test functions'
+        assert all('integration' in item for item in items)
+
+    @staticmethod
+    def _real_module_config() -> ModuleConfig:
+        """A ModuleConfig whose commands come VERBATIM from tests/scripts/orchestrator.yaml."""
+        loaded = yaml.safe_load((REPO_ROOT / 'tests/scripts/orchestrator.yaml').read_text())
+        return ModuleConfig(
+            prefix='tests/scripts',
+            test_command=loaded['test_command'],
+            lint_command=loaded['lint_command'],
+            type_check_command=loaded['type_check_command'],
+        )
+
+    @staticmethod
+    def _read(path: str) -> str | None:
+        try:
+            return (REPO_ROOT / path).read_text()
+        except OSError:
+            return None
+
+    @pytest.mark.parametrize('role', ['task', 'merge'])
+    def test_touching_only_the_all_decorated_file_widens_to_the_full_suite(self, role):
+        """Before this task, BOTH roles planned a zero-collecting FILE_SCOPED run (rc=5)."""
+        mc = self._real_module_config()
+        plan = derive_verify_plan([self._TARGET], [mc], None, self._read, role=role)
+        run = _run_for(plan, 'tests/scripts', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.scoped_targets == ()
+        assert mc.test_command is not None
+        assert run.cmd == parse_config_command(mc.test_command)
+        assert 'not smoke and not integration and not warm_lane_bash' in run.reason
