@@ -595,6 +595,35 @@ class TaskGroundTruth:
         # below anyway. Pinned by
         # ``TestPlanLockIsReadFromTheMetaRoot::test_lock_at_the_legacy_root_is_ignored``.
         #
+        # ATTRIBUTION IS BY ADDRESS, NOT BY SESSION IDENTITY: any fresh,
+        # live-pid lock at this task's resolved meta root is taken to be
+        # *tid*'s, WITHOUT checking that ``session_id`` carries the
+        # ``'{tid}-'`` prefix ``clear_stale_plan_lock`` keys on.  Deliberate,
+        # and deliberately not symmetric with that method:
+        #   * The dominant stale-lock case is a crashed PRIOR incarnation of
+        #     the SAME task (a same-task lane reuse preserves the meta root
+        #     precisely because those artifacts are the task's own), and it
+        #     carries a MATCHING prefix — so a prefix gate would not catch
+        #     the case that actually happens.
+        #   * The cross-task case a gate WOULD catch — a warm lane's meta
+        #     root outliving its previous occupant, since it is a sibling of
+        #     the worktree and survives cleanup — is already cleared on every
+        #     different-task acquisition route by
+        #     ``GitOps._clear_foreign_meta_root`` (RECYCLE /
+        #     RESET_IN_PLACE_REATTACH / CREATE_ONCE_FRESH /
+        #     CREATE_ONCE_REATTACH).
+        #   * A gate would fail DANGEROUS. Rejecting a lock this resolver
+        #     cannot positively attribute makes a LIVE task read as
+        #     unclaimed, which is the task-2588 un-claim incident class.
+        #     Mis-attributing the other way only DELAYS recovery.
+        # What bounds that delay is ``_lock_fresh`` alone, not ``_pid_alive``:
+        # ``owner_pid`` is the ORCHESTRATOR's pid, which outlives any single
+        # task, so the liveness half is nearly always true. Freshness caps the
+        # exposure at ``heartbeat_ttl`` — a window in which the harness's R3
+        # ``plan_lock_mid_run_exception`` already forces fall-through to
+        # recovery mid-run. Pinned (both the attribution and its freshness
+        # bound) by test_task_ground_truth.py::TestPlanLockAttributionIsByAddress.
+        #
         # Derived OUTSIDE the try: this is pure path algebra with no I/O, and
         # must not be swallowed by the degradation arm below, which exists for
         # a corrupt lock FILE — not for a mis-derived root.
@@ -623,9 +652,12 @@ class TaskGroundTruth:
         # 2243, W10-θ2 wiring; caught by test_task_ground_truth.py::
         # TestDeriveTruthLiveClaimant::
         # test_non_dict_plan_lock_json_returns_none_not_raise — repointed
-        # from test_reconcile_lock_format_variants[non-dict-json], whose
-        # fixture stages the lock at the legacy worktree address this leg
-        # deliberately no longer reads, task 4028).
+        # from the sweep-level lock-format parametrization in
+        # test_reconcile_stranded.py, whose fixtures stage the lock at the
+        # legacy worktree address this leg deliberately no longer reads; that
+        # parametrization has since collapsed into
+        # test_vestigial_worktree_lock_is_inert_and_unlinked, which is what it
+        # always actually pinned, task 4028).
         if isinstance(lock_data, dict):
             owner_pid = lock_data.get('owner_pid')
             # Retain the PARSED pid: the composed identity below must embed the

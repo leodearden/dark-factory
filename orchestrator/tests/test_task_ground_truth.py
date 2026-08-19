@@ -972,12 +972,14 @@ class TestDeriveTruthLiveClaimant:
         # plan-lock claimant" instead, same intent as the corrupt-JSON and
         # non-UTF-8 cases above.
         #
-        # This is the guard's ONLY live coverage. It previously cited
-        # test_reconcile_stranded.py::test_reconcile_lock_format_variants
-        # [non-dict-json], but that sweep-level fixture stages its lock at the
-        # LEGACY <worktree>/.task address on purpose (it pins the applier's
-        # defensive unlink, not the resolver), so the resolver never sees the
-        # non-dict payload there and the citation was vacuous (task 4028).
+        # This is the guard's ONLY live coverage. It previously cited a
+        # [non-dict-json] case in test_reconcile_stranded.py's sweep-level
+        # lock-format parametrization, but those fixtures stage their lock at
+        # the LEGACY <worktree>/.task address on purpose (they pin the
+        # applier's defensive unlink, not the resolver), so the resolver never
+        # saw the non-dict payload there and the citation was vacuous. That
+        # parametrization has since collapsed into
+        # test_vestigial_worktree_lock_is_inert_and_unlinked (task 4028).
         artifacts = _plan_lock_artifacts(tmp_path)
         artifacts.root.mkdir(parents=True)
         lock_path = artifacts.root / 'plan.lock'
@@ -1061,6 +1063,96 @@ class TestPlanLockIsReadFromTheMetaRoot:
         assert not _plan_lock_artifacts(worktree).root.exists()
 
         assert await self._resolve(worktree) is None
+
+
+@pytest.mark.asyncio
+class TestPlanLockAttributionIsByAddress:
+    """A lock at the task's resolved meta root is ITS lock — no session check.
+
+    ``_resolve_live_claimant`` attributes any fresh, live-pid lock found at
+    ``<base>/.task-meta/<worktree_name>/plan.lock`` to the task being
+    resolved, WITHOUT requiring ``session_id`` to carry the ``'{tid}-'``
+    prefix that ``TaskArtifacts.clear_stale_plan_lock`` keys on.  That
+    asymmetry is deliberate; these tests exist so it is a pinned decision
+    rather than an unexamined one (task 4028).
+
+    Why no gate:
+
+    * A warm lane's meta root is keyed by LANE name and, unlike the legacy
+      ``<worktree>/.task``, survives worktree cleanup — so a previous
+      occupant's lock genuinely can outlive it.  Every DIFFERENT-task
+      acquisition route clears it first (``GitOps._clear_foreign_meta_root``);
+      the same-task reuse routes preserve it precisely because those
+      artifacts belong to the task being resolved.
+    * The dominant real stale lock is a crashed PRIOR incarnation of the SAME
+      task, whose session id DOES match the prefix — a gate would not catch
+      the case that actually happens.
+    * A gate fails DANGEROUS: rejecting a lock that cannot be positively
+      attributed makes a LIVE task read as unclaimed, which is the task-2588
+      un-claim incident class.  Mis-attributing the other way only delays
+      recovery, and only until ``_lock_fresh`` expires.
+
+    So the exposure is real but BOUNDED, and the bound is freshness — not pid
+    liveness, since ``owner_pid`` is the orchestrator's own pid and outlives
+    any single task.  Both halves are asserted below.
+    """
+
+    @staticmethod
+    def _unclaimed_task() -> dict:
+        return {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+
+    async def _resolve(self, worktree: Path, tid: str) -> Claimant | None:
+        scheduler = _fake_scheduler(is_actively_held=False, task=self._unclaimed_task())
+        resolver = _make_ground_truth(
+            scheduler=scheduler, worktree_resolver=lambda _tid: worktree,
+        )
+        return (await resolver.derive_truth(tid)).live_claimant
+
+    async def test_fresh_foreign_session_lock_is_attributed_to_this_task(
+        self, tmp_path: Path,
+    ) -> None:
+        """A lane's leftover lock from task 999 resolves as task 42's claimant.
+
+        Pins the CURRENT behaviour, with eyes open: the lock is driven through
+        a real ``lock_plan`` (so ``owner_pid`` is this live process, exactly as
+        production stamps it) and its session id belongs to a different task.
+        The resolver still returns it — address, not identity, decides.
+        """
+        lane = tmp_path / '_lane-0'
+        lane.mkdir()
+        artifacts = _plan_lock_artifacts(lane)
+        artifacts.root.mkdir(parents=True)
+        assert artifacts.lock_plan('999-aaaaaaaa', run_id='run-999')
+
+        claimant = await self._resolve(lane, tid='42')
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        # Verbatim — the resolver does not reinterpret or reject it.
+        assert claimant.session_id == '999-aaaaaaaa'
+
+    async def test_the_exposure_is_bounded_by_freshness_not_pid_liveness(
+        self, tmp_path: Path,
+    ) -> None:
+        """The same foreign lock, aged past heartbeat_ttl, resolves to None.
+
+        ``owner_pid`` is deliberately THIS process (alive, as production's
+        orchestrator pid always is), so ``_pid_alive`` cannot be what rejects
+        it — only ``_lock_fresh`` can.  That is what caps how long a leftover
+        lane lock can suppress another task's recovery.
+        """
+        lane = tmp_path / '_lane-0'
+        lane.mkdir()
+        artifacts = _plan_lock_artifacts(lane)
+        artifacts.root.mkdir(parents=True)
+        (artifacts.root / 'plan.lock').write_text(json.dumps({
+            'session_id': '999-aaaaaaaa',
+            'run_id': 'run-999',
+            'owner_pid': os.getpid(),
+            'locked_at': (datetime.now(UTC) - timedelta(hours=3)).isoformat(),
+        }))
+
+        assert await self._resolve(lane, tid='42') is None
 
 
 # ---------------------------------------------------------------------------
