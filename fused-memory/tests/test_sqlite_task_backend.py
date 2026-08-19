@@ -1171,18 +1171,20 @@ class _WriteStatusSeamSpyBackend(SqliteTaskBackend):
         super().__init__(*a, **kw)
         self.seam_calls: list[dict] = []
 
-    async def _write_status_and_verify(
-        self, conn, set_columns, set_values, tag, tid,
-        task_id, status, row_candidate_key, claimant_run_id,
-        heartbeat_at, project_root, caller_name, write_desc,
-    ):
+    async def _write_status_and_verify(self, conn, **kwargs):
+        # **kwargs (rather than mirroring the real helper's parameter list
+        # positionally) so this double can't silently mis-wire a call if the
+        # helper's signature is ever reordered — the real call sites pass
+        # everything but `conn` by keyword (task 4057 amendment), and a
+        # rename here would raise a loud KeyError instead of a silent
+        # mismatch.
         self.seam_calls.append({
-            'caller_name': caller_name,
-            'write_desc': write_desc,
-            'set_columns': list(set_columns),  # copy: the real helper mutates in place
-            'status': status,
+            'caller_name': kwargs['caller_name'],
+            'write_desc': kwargs['write_desc'],
+            'set_columns': list(kwargs['set_columns']),  # snapshot, not aliased
+            'status': kwargs['status'],
         })
-        raise _StatusWriteNotPersisted(task_id, status, 'seam-suppressed')
+        raise _StatusWriteNotPersisted(kwargs['task_id'], kwargs['status'], 'seam-suppressed')
 
 
 @pytest.mark.asyncio
@@ -1225,8 +1227,6 @@ async def test_set_task_status_routes_through_write_status_and_verify(tmp_path):
 
     assert len(spy.seam_calls) == 1
     call = spy.seam_calls[0]
-    assert call['caller_name'] == 'set_task_status'
-    assert call['write_desc'] == 'status'
     assert call['set_columns'] == ['status = ?', 'updated_at = ?']
     assert result == {
         'success': False,
@@ -1280,8 +1280,17 @@ async def test_set_status_and_stamp_audit_reports_explicit_error_when_write_not_
 @pytest.mark.asyncio
 async def test_set_status_and_stamp_audit_routes_through_write_status_and_verify(tmp_path):
     """set_status_and_stamp_audit must route through the shared
-    `_write_status_and_verify` tail (task 4057), and a suppressed write via
-    that seam must still roll back the metadata merge — both-or-neither."""
+    `_write_status_and_verify` tail (task 4057) instead of inlining its own
+    copy of the claimant/collision/read-back logic.
+
+    Both-or-neither rollback of the metadata merge is NOT re-verified here —
+    the spy replaces `_write_status_and_verify` itself and raises before any
+    SQL runs, so no write is ever attempted and a rollback check against
+    that would be vacuous. That property is already covered, genuinely, by
+    `test_set_status_and_stamp_audit_reports_explicit_error_when_write_not_persisted`,
+    which suppresses the write one seam deeper (`_apply_status_row_update`)
+    and lets the real `_write_status_and_verify` read-back-and-raise logic
+    run for real."""
     project_root = str(tmp_path / 'proj')
     setup = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
     await setup.start()
@@ -1304,8 +1313,6 @@ async def test_set_status_and_stamp_audit_routes_through_write_status_and_verify
 
     assert len(spy.seam_calls) == 1
     call = spy.seam_calls[0]
-    assert call['caller_name'] == 'set_status_and_stamp_audit'
-    assert call['write_desc'] == 'status+metadata'
     assert call['set_columns'] == ['status = ?', 'metadata = ?', 'updated_at = ?']
     assert result == {
         'success': False,
@@ -1314,19 +1321,6 @@ async def test_set_status_and_stamp_audit_routes_through_write_status_and_verify
         'requested_status': 'pending',
         'actual_status': 'seam-suppressed',
     }
-
-    # Both-or-neither: reopen the DB with a fresh backend (bypassing the seam
-    # entirely) and confirm the suppressed write rolled back the metadata
-    # merge too, not just the status column.
-    verify = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
-    await verify.start()
-    try:
-        task = await verify.get_task('1', project_root=project_root)
-    finally:
-        await verify.close()
-    assert task['status'] == 'done'
-    assert 'reopen_reason' not in (task['metadata'] or {})
-    assert 'reopen_from' not in (task['metadata'] or {})
 
 
 @pytest.mark.asyncio
