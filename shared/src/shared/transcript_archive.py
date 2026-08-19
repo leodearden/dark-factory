@@ -830,16 +830,40 @@ def restore_archived_transcript(
             dest = dest.with_name(dest.name[: -len('.gz')])
         dest.parent.mkdir(parents=True, exist_ok=True)
         st = archived.stat()
-        if gzipped:
-            # STREAMED, not read()-then-write: agent-session JSONL runs to many MB
-            # and only grows on resume, so peak RSS stays flat regardless of
-            # transcript size — the same bound _archive_one's comment records for
-            # shutil.copyfile's platform fast-copy path.
-            with gzip.open(archived, 'rb') as src_fh, dest.open('wb') as dest_fh:
-                shutil.copyfileobj(src_fh, dest_fh)
-        else:
-            shutil.copyfile(archived, dest)
-        os.utime(dest, (st.st_atime, st.st_mtime))
+        # ATOMIC PUBLISH, the mirror image of _archive_one's protocol and
+        # reusing its two helpers rather than growing a second spelling: write
+        # to a staging sibling, stamp it, then os.replace onto the canonical
+        # name — a same-directory rename, hence atomic on one filesystem.
+        #
+        # Writing `dest` directly would publish a TRUNCATED transcript whenever
+        # a copy is interrupted (a hard kill, ENOSPC part-way, a corrupt gzip
+        # member). That is not a degraded resume but a silent NON-resume that
+        # still costs an invocation: the CLI parses the transcript rather than
+        # stat-ing it, so a torn file yields `No conversation found with
+        # session ID` exactly as a zero-byte one does (measured, CLI 2.1.236).
+        # The mtime mirror goes onto the STAGING file so the published copy is
+        # correctly stamped from the instant it appears.
+        staging = dest.with_name(dest.name + _STAGING_SUFFIX)
+        try:
+            if gzipped:
+                # STREAMED, not read()-then-write: agent-session JSONL runs to
+                # many MB and only grows on resume, so peak RSS stays flat
+                # regardless of transcript size — the same bound _archive_one's
+                # comment records for shutil.copyfile's platform fast-copy path.
+                with gzip.open(archived, 'rb') as src_fh, staging.open('wb') as dest_fh:
+                    shutil.copyfileobj(src_fh, dest_fh)
+            else:
+                shutil.copyfile(archived, staging)
+            os.utime(staging, (st.st_atime, st.st_mtime))
+            os.replace(staging, dest)
+        except Exception:
+            # Only the staging file is ever touched before the replace, so a
+            # transcript already at `dest` (there is none — the no-clobber
+            # guard above returned early — but the invariant is the same one
+            # _archive_one relies on) is untouched. Drop the partial and
+            # re-raise into the blanket handler below, which logs it.
+            _discard_staging(staging)
+            raise
         return dest
     except Exception as exc:
         # One blanket swallow, copying durable_archive_path's I-A rationale
