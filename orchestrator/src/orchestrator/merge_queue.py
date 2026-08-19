@@ -13424,6 +13424,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         cleanup (``finally``) preserve the original semantics.  The ``finally`` also
         cancels any still-live loop task on the terminal-halt path (so the healthy
         sibling of a cap-exceeded loop does not leak).
+
+        Both arms' raw ``cancel()`` + ``gather()`` shutdown is safe against a
+        ``_verifier_loop`` parked on its reused persistent getter as of task 4306:
+        that branch's recovery clause now re-raises a cancellation aimed at the
+        loop task instead of absorbing it and re-parking on a fresh get().
         """
         # Reset supervisor state for this invocation.
         self._live_loops = {'merger', 'verifier'}
@@ -15047,8 +15052,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Exception handling: unexpected exceptions from _dispatch_item (e.g. a
         _remerge failure) are caught, logged, the request resolved with 'blocked',
         and the loop continues so a single bad item does not crash the queue.
-        CancelledError is NOT caught; it propagates to stop() which cancels
-        _verifier_task.
+
+        CancelledError is never absorbed: this loop always terminates when its
+        own task is cancelled.  The loop's sole `except asyncio.CancelledError`
+        — the FINALIZE-HEAD getter-reuse recovery clause, which re-fetches via a
+        fresh get() so no queue item is lost when only `_pending_verifier_get`
+        was cancelled — re-raises when `asyncio.current_task().cancelling() > 0`,
+        i.e. whenever the cancellation is aimed at THIS task rather than at the
+        getter alone (task 4306).  So both stop()'s protocol (cancel the getter,
+        then push a None sentinel) AND a bare `task.cancel()` from any other
+        caller — run()'s shutdown arms, a TaskGroup teardown, an enclosing
+        wait_for timeout — terminate the loop.  Fenced by
+        orchestrator/tests/test_merge_queue_verifier_raw_cancel.py.
         """
         while True:
             # ── (a) DISPATCH-FILL ──────────────────────────────────────────────
@@ -15562,8 +15577,29 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     try:
                         item = await _pvg
                     except asyncio.CancelledError:
-                        # Getter was cancelled (stop() ordering race); re-fetch
-                        # via a fresh get so no queue item is lost.
+                        # Getter was cancelled; re-fetch via a fresh get so no
+                        # queue item is lost — but ONLY if the cancellation was
+                        # aimed at `_pvg` alone.  Discriminate WHOSE cancellation
+                        # this is (task 4306).  `Task.cancelling()` counts cancel
+                        # REQUESTS against the OUTER task and is NOT decremented
+                        # by catching, so it reads:
+                        #   0  -> only `_pvg` was cancelled (stop()'s getter-only
+                        #         protocol) -> recover with a fresh get(), the
+                        #         original intent of this clause;
+                        #   >0 -> `_verifier_loop`'s OWN task was cancelled and
+                        #         the CancelledError merely arrived through the
+                        #         transitively-cancelled getter.  Swallowing it
+                        #         here would consume the single cancel request
+                        #         and re-park the loop on a fresh, uncancelled
+                        #         get(), so run()'s `cancel()` + `gather()`
+                        #         shutdown would never return.
+                        # Nothing is lost by re-raising: asyncio.Queue.get()
+                        # calls get_nowait() only AFTER its await returns, so a
+                        # cancelled `_pvg` never consumed an item — it stays in
+                        # the queue for stop()'s drain or a restarted loop.
+                        _ct = asyncio.current_task()
+                        if _ct is not None and _ct.cancelling() > 0:
+                            raise
                         item = await self._verifier_queue.get()
                 else:
                     item = await self._verifier_queue.get()

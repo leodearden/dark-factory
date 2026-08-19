@@ -171,22 +171,26 @@ async def _teardown_fill_drive(
     internally bounded (its ``asyncio.wait(..., timeout=...)``), so it cannot
     hang this helper.
 
-    A bare ``task.cancel()`` is NOT sufficient there, for a reason that is
-    **pre-existing and unrelated to task 3276**: that branch's recovery clause
-    (``except asyncio.CancelledError: item = await self._verifier_queue.get()``
-    in ``merge_queue.py``) was written for ``stop()``'s ordering and cannot
-    distinguish "only ``_pending_verifier_get`` was cancelled" from "the whole
-    ``_verifier_loop`` task is being cancelled".  It absorbs the single
-    cancellation request delivered through the transitively-cancelled getter
-    and re-parks on a fresh, uncancelled ``get()``, so ``await task`` never
-    returns.  This reproduces on the pre-task-3276 baseline for a purely
-    queue-sourced dispatch (a shape the DISPATCH-FILL guard never gated), and
-    is reachable in production from ``SpeculativeMergeWorker.run()``'s own raw
-    ``cancel()``/``gather()`` shutdown path; it is filed as its own follow-up,
-    task 4306.
-    These tests fence the DISPATCH-FILL predicate, not cancellation semantics,
-    so they must not depend on that path being clean -- the loop's own
-    docstring already flags raw external cancellation as an accepted edge case.
+    A bare ``task.cancel()`` used to be insufficient there, for a reason that
+    was **pre-existing and unrelated to task 3276**: that branch's recovery
+    clause (``except asyncio.CancelledError: item = await
+    self._verifier_queue.get()`` in ``merge_queue.py``) was written for
+    ``stop()``'s ordering and could not distinguish "only
+    ``_pending_verifier_get`` was cancelled" from "the whole ``_verifier_loop``
+    task is being cancelled".  It absorbed the single cancellation request
+    delivered through the transitively-cancelled getter and re-parked on a
+    fresh, uncancelled ``get()``, so ``await task`` never returned.  **Task
+    4306 fixed that**: the clause now re-raises when
+    ``asyncio.current_task().cancelling() > 0``, so a bare ``task.cancel()``
+    DOES terminate the loop, and ``orchestrator/tests/
+    test_merge_queue_verifier_raw_cancel.py`` fences that path.
+
+    This helper nonetheless keeps ``stop()`` as its protocol -- a deliberate
+    choice, not a workaround.  ``stop()`` is a strictly more complete teardown
+    than a bare cancel: it additionally resolves in-flight request Futures,
+    drains the queues, cleans merge worktrees and releases leases/permits, and
+    it is internally bounded by its own ``asyncio.wait(..., timeout=...)`` so
+    it cannot hang this helper.
     """
     drive.gate.set()
     # Exception, not BaseException: this must not swallow a CancelledError
