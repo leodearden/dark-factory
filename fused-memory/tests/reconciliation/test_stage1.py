@@ -3316,6 +3316,234 @@ class TestDedupFlagsCrossProjectWiring:
         )
 
 
+# ---------------------------------------------------------------------------
+# Task 4381 (amendment pass — code-review fix): integration coverage for the
+# acknowledge carve-out memory_consolidator.run() documents but nothing tested.
+# TestDedupFlagsCrossProjectWiring above patches dedup_flags out entirely, so a
+# cross-project drop never flowed through the _pre_dedup_flags /
+# _post_dedup_signatures diff.  This class runs the REAL dedup_flags against a
+# REAL ReconLedgerStore instead.
+# ---------------------------------------------------------------------------
+
+
+class TestCrossProjectSuppressedFlagIsNotAcknowledged:
+    """A flag dropped by dedup_flags' cross-project fix-task gate must NOT be
+    handed to acknowledge_resolved_flags (task 4381).
+
+    ``run()`` folds every drop made INSIDE dedup_flags into
+    ``suppressed_signatures`` and subtracts that set from ``dropped_flags``, so
+    the flag's ``stage1_flag_marker`` keeps its recurrence history for the day
+    the cross-project fix task is cancelled or closed without landing — a FILED
+    fix task is not a LANDED one.
+
+    Exercised end-to-end: no dedup_flags patch, a real ledger-backed marker
+    (the gate is HIT-only, so the signature must have been seen in a prior
+    run), and a live non-cancelled FOREIGN fix task resolved through the real
+    ``taskmaster.get_task``.  Fails if a future refactor moves the gate before
+    the ``_pre_dedup_flags`` snapshot or moves the drop out of ``dedup_flags``:
+    either way the drop stops being classified as suppression and the
+    signature reaches ``acknowledge_resolved_flags``.
+
+    A second, genuinely-moot flag (``stale_metadata`` on a done task, dropped
+    by filter_terminal_metadata_flags BEFORE the snapshot) rides along as the
+    positive control, so the carve-out assertion cannot pass merely because
+    ``resolved_flags`` was empty.
+    """
+
+    PROJECT_ID = 'test_project'
+    PROJECT_ROOT = '/tmp/reify'
+    FOREIGN_PROJECT = 'dark_factory'
+    FOREIGN_ROOT = '/df'
+    FIX_TASK_ID = '3839'
+    FIX_TASK_TITLE = 'Feed live workflow signals into the remediation payload'
+    SUPPRESSED_FLAG_TYPE = 'remediation_payload_live_workflow_signals_gap'
+    SUPPRESSED_TASK_ID = '598'
+    MOOT_TASK_ID = '777'
+    MOOT_FLAG_TYPE = 'stale_metadata'
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    async def _seed_prior_marker(self, ledger_store) -> None:
+        """Seed the prior-cycle stage1_flag_marker the HIT-only gate needs.
+
+        Mirrors tests/test_flag_dedup.py::_seed_marker: dedup identity is
+        (project_id, 'stage1_flag_marker', task_id, flag_type, run_id='') —
+        the originating run_id rides in payload_json, not the PK.  The
+        identity's task component is the flag's SIGNATURE component, not its
+        top-level task_id: compute_flag_signature unions the top-level id with
+        every cited_tasks id, so this flag keys on '3839,598'.  Derived from
+        compute_flag_signature rather than hardcoded so a future change to the
+        union rule cannot silently turn this seed into a MISS (which would
+        make the whole test pass vacuously — the gate is HIT-only).
+        """
+        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+
+        signature = compute_flag_signature(self._suppressed_flag())
+        assert signature is not None, 'the suppressed flag must have a signature'
+        sig_task_id, sig_flag_type = signature
+
+        await ledger_store.upsert(ReconLedgerRecord(
+            project_id=self.PROJECT_ID,
+            record_kind='stage1_flag_marker',
+            payload_json=json.dumps({
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': sig_task_id,
+                'flag_type': sig_flag_type,
+                'run_id': 'run-4381-prior',
+                'last_seen_run_id': 'run-4381-prior',
+            }),
+            state='active',
+            created_at='2026-08-01T00:00:00+00:00',
+            task_id=sig_task_id,
+            flag_type=sig_flag_type,
+            run_id='',
+            expires_at='2099-01-01T00:00:00+00:00',
+        ))
+
+    def _suppressed_flag(self) -> dict:
+        """The recurring finding whose fix task was filed in a FOREIGN project.
+
+        Cites its own subject task first — the shape the live e3527208 repro
+        had — to prove the FOREIGN-ONLY skip in
+        _resolve_live_cross_project_fix_task does not swallow the real
+        cross-project citation behind it.
+        """
+        return {
+            'task_id': self.SUPPRESSED_TASK_ID,
+            'flag_type': self.SUPPRESSED_FLAG_TYPE,
+            'description': 'the remediation payload omits live workflow signals',
+            'cited_tasks': [
+                {
+                    'project_id': self.PROJECT_ID,
+                    'task_id': self.SUPPRESSED_TASK_ID,
+                    'title': 'the finding subject itself',
+                },
+                {
+                    'project_id': self.FOREIGN_PROJECT,
+                    'task_id': self.FIX_TASK_ID,
+                    'title': self.FIX_TASK_TITLE,
+                },
+            ],
+        }
+
+    def _moot_flag(self) -> dict:
+        """Positive control: dropped by filter_terminal_metadata_flags (a done
+        task), i.e. genuinely moot, so its signature MUST be acknowledged."""
+        return {
+            'task_id': self.MOOT_TASK_ID,
+            'flag_type': self.MOOT_FLAG_TYPE,
+            'description': 'metadata blob references a retired field',
+        }
+
+    async def _run(self, ledger_store, *, fix_task_status: str) -> tuple[StageReport, AsyncMock]:
+        """Run the full Stage-1 filter chain with the REAL dedup_flags.
+
+        Only acknowledge_resolved_flags is patched — it is the observation
+        point, and leaving it real would exercise the ledger reclaim path
+        instead of the carve-out under test.
+        """
+        stage = _make_consolidator(project_root=self.PROJECT_ROOT)
+        assert stage.memory is not None  # AsyncMock() from _make_consolidator
+        assert stage.taskmaster is not None
+        stage.memory.recon_ledger = ledger_store
+        stage.known_projects = {self.FOREIGN_PROJECT: self.FOREIGN_ROOT}
+
+        async def _get_task(task_id, project_root):
+            if str(task_id) == self.FIX_TASK_ID and project_root == self.FOREIGN_ROOT:
+                return {
+                    'id': self.FIX_TASK_ID,
+                    'title': self.FIX_TASK_TITLE,
+                    'status': fix_task_status,
+                }
+            if str(task_id) == self.MOOT_TASK_ID and project_root == self.PROJECT_ROOT:
+                return {'id': self.MOOT_TASK_ID, 'title': 'a finished task', 'status': 'done'}
+            return {
+                'error': f'No tasks found for ID(s): {task_id}',
+                'error_type': 'TaskmasterError',
+            }
+
+        stage.taskmaster.get_task = AsyncMock(side_effect=_get_task)
+        ack_mock = AsyncMock(return_value=1)
+        base_report = StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[self._suppressed_flag(), self._moot_flag()],
+            stats={},
+        )
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.'
+                'acknowledge_resolved_flags',
+                new=ack_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id=self.PROJECT_ID),
+                prior_reports=[],
+                run_id='run-4381-ack-carveout',
+            )
+        return report, ack_mock
+
+    @pytest.mark.asyncio
+    async def test_cross_project_drop_is_excluded_from_acknowledge(self, ledger_store):
+        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+
+        await self._seed_prior_marker(ledger_store)
+
+        report, ack_mock = await self._run(ledger_store, fix_task_status='pending')
+
+        suppressed_sig = compute_flag_signature(self._suppressed_flag())
+        moot_sig = compute_flag_signature(self._moot_flag())
+
+        # Non-vacuity: the real gate actually fired this cycle.
+        surviving_sigs = [compute_flag_signature(f) for f in report.items_flagged]
+        assert suppressed_sig not in surviving_sigs, (
+            'the cross-project fix-task gate must DROP the flag, otherwise the '
+            f'carve-out below is never exercised; got {report.items_flagged!r}'
+        )
+
+        assert ack_mock.await_args is not None, 'acknowledge_resolved_flags must be awaited'
+        resolved = ack_mock.await_args.kwargs['resolved_flags']
+        resolved_sigs = [compute_flag_signature(f) for f in resolved]
+        # Positive control: a genuinely-moot drop IS acknowledged, so the
+        # assertion below cannot pass on an empty resolved_flags list.
+        assert moot_sig in resolved_sigs, (
+            'the terminal-metadata drop is moot and must still be acknowledged; '
+            f'got {resolved!r}'
+        )
+        assert suppressed_sig not in resolved_sigs, (
+            'a cross-project fix-task drop is a SUPPRESSION, not a resolution: '
+            'its stage1_flag_marker must keep its recurrence history for the day '
+            'the filed fix task is cancelled without landing. A signature reaching '
+            'acknowledge_resolved_flags means the drop escaped suppressed_signatures '
+            '(gate moved before the _pre_dedup_flags snapshot, or out of '
+            f'dedup_flags entirely); got {resolved!r}'
+        )
+
+        # Ledger-level restatement: the marker row itself survives the cycle,
+        # re-upserted active by dedup_flags BEFORE the gate ran.
+        assert suppressed_sig is not None
+        marker = await ledger_store.get_by_identity(
+            self.PROJECT_ID, 'stage1_flag_marker', suppressed_sig[0], suppressed_sig[1], '',
+        )
+        assert marker is not None and marker.state == 'active', (
+            'the suppressed flag\'s marker must survive un-reclaimed; '
+            f'got {marker!r}'
+        )
+
+
 class TestMemoryConsolidatorCitationVerificationWiring:
     """MemoryConsolidator.run() must re-verify each flagged finding's cited
     Mem0 memories (verify_cited_memories) AFTER super().run() and BEFORE the

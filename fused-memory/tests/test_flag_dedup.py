@@ -5,6 +5,7 @@ Tests cover compute_flag_signature, dedup_flags, and error-handling behavior.
 from __future__ import annotations
 
 import json
+import logging
 import uuid as _uuid_mod
 from typing import Any
 from unittest.mock import AsyncMock
@@ -4607,38 +4608,6 @@ class TestPersistableCitedTasks:
             'the projection must return a NEW list, not the caller\'s'
         )
 
-    def test_max_persisted_cited_tasks_is_a_sane_ceiling(self):
-        """(g) SANITY FLOOR: realistic cited_tasks lists are 1-5 entries, so the
-        cap must never bite in normal operation — it exists only to bound the
-        cross-cycle feedback loop."""
-        from fused_memory.reconciliation.flag_dedup import _MAX_PERSISTED_CITED_TASKS
-
-        assert isinstance(_MAX_PERSISTED_CITED_TASKS, int), (
-            f'the cap must be an int; got {_MAX_PERSISTED_CITED_TASKS!r}'
-        )
-        assert not isinstance(_MAX_PERSISTED_CITED_TASKS, bool), (
-            f'the cap must be an int, not a bool; got {_MAX_PERSISTED_CITED_TASKS!r}'
-        )
-        assert _MAX_PERSISTED_CITED_TASKS >= 8, (
-            'the cap must sit well above realistic 1-5 entry citation lists; '
-            f'got {_MAX_PERSISTED_CITED_TASKS!r}'
-        )
-
-    def test_union_still_keeps_identity_less_entries_in_memory(self):
-        """The projection is PERSISTENCE-ONLY: ``_union_cited_tasks`` keeps
-        identity-less entries in the in-memory resolution list it returns, and
-        this step must not change that (they cost nothing — the resolver skips
-        them — and narrowing the union would be an unrelated behaviour change).
-        """
-        from fused_memory.reconciliation.flag_dedup import _union_cited_tasks
-
-        result = _union_cited_tasks([{'title': 'identity-less'}, {'project_id': 'p', 'task_id': '1'}], None)
-        assert result == [
-            {'title': 'identity-less'},
-            {'project_id': 'p', 'task_id': '1'},
-        ], f'_union_cited_tasks must still pass identity-less entries through; got {result!r}'
-
-
 # ---------------------------------------------------------------------------
 # ---- task 4381 step-18 (review fix) ----
 # RED: the persisted anchor is ERASED by the very cycle it does its job.
@@ -8357,6 +8326,27 @@ class TestModuleSurfaceCompensationsRemoved:
 
 # ---------------------------------------------------------------------------
 # filter_already_tracked_systemic_patterns pure-helper tests (task 2416, step-1)
+def _make_never_tracked_flag() -> dict:
+    """A systemic_pattern finding asserting an idea was never tracked.
+
+    Module-level (task 4381 amendment): this factory had been copy-pasted
+    identically into every class that needed it.
+    """
+    return {
+        'task_id': None,
+        'category': 'systemic_pattern',
+        'flag_type': 'systemic_pattern',
+        'description': (
+            'This systemic pattern was never converted to a tracked task: diff '
+            'the project_status_correction cache against live get_statuses every '
+            'cycle to catch drift.'
+        ),
+        'suggested_action': (
+            'File a task to diff the cache against live status each cycle.'
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -8478,21 +8468,6 @@ class TestFilterAlreadyTrackedSystemicPatterns:
     flag_dedup.py.
     """
 
-    def _make_never_tracked_flag(self) -> dict:
-        return {
-            'task_id': None,
-            'category': 'systemic_pattern',
-            'flag_type': 'systemic_pattern',
-            'description': (
-                'This systemic pattern was never converted to a tracked task: diff '
-                'the project_status_correction cache against live get_statuses every '
-                'cycle to catch drift.'
-            ),
-            'suggested_action': (
-                'File a task to diff the cache against live status each cycle.'
-            ),
-        }
-
     @pytest.mark.asyncio
     async def test_drop_when_done_task_already_implements_the_idea(self):
         """Core e61b38f9/1938 scenario: DROP when a done task covers the idea."""
@@ -8500,7 +8475,7 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={
             'tasks': [
@@ -8539,7 +8514,7 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={
             'tasks': [
@@ -8679,11 +8654,10 @@ class TestFilterAlreadyTrackedSystemicPatterns:
         Only ``cancelled`` stays excluded.
         """
         from fused_memory.reconciliation.flag_dedup import (
-            _NON_CANCELLED_TASK_STATUSES,
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
 
@@ -8691,8 +8665,17 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             taskmaster, {'dark_factory': '/df'}, [flag],
         )
 
+        # The vocabulary is pinned LITERALLY, not against the production
+        # constant (task 4381 amendment): comparing the call against the
+        # constant it was built from proves only "the same object was
+        # forwarded", so a regression of that constant back to ['done'] — the
+        # very pin this task exists to supersede — would keep the test green.
+        expected_statuses = sorted([
+            'pending', 'in-progress', 'blocked', 'deferred', 'review',
+            'merge-deferred', 'infra-hold', 'done',
+        ])
         taskmaster.get_tasks.assert_called_once_with(
-            '/df', statuses=_NON_CANCELLED_TASK_STATUSES,
+            '/df', statuses=expected_statuses,
         )
 
     @pytest.mark.asyncio
@@ -8702,7 +8685,7 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
 
         result = await filter_already_tracked_systemic_patterns(
             None, {'dark_factory': '/df'}, [flag],
@@ -8719,7 +8702,7 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
 
@@ -8739,7 +8722,7 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
 
@@ -8759,7 +8742,7 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(side_effect=RuntimeError('backend down'))
 
@@ -8780,7 +8763,7 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value=[])
 
@@ -8799,7 +8782,7 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={})
 
@@ -8818,7 +8801,7 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': None})
 
@@ -8928,7 +8911,7 @@ class TestFilterAlreadyTrackedSystemicPatterns:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={
             'tasks': [
@@ -8984,7 +8967,7 @@ class TestFilterAlreadyTrackedSystemicPatterns:
                    'description': 'Unrelated benign flag two.'}
         benign3 = {'task_id': '3', 'category': 'stale_metadata', 'flag_type': 'stale_metadata',
                    'description': 'Unrelated benign flag three.'}
-        candidate_a = self._make_never_tracked_flag()
+        candidate_a = _make_never_tracked_flag()
         candidate_b = {
             'task_id': None,
             'category': 'systemic_pattern',
@@ -9056,21 +9039,6 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
     RED until step-14 rewrites the filter and migrates every call site.
     """
 
-    def _make_never_tracked_flag(self) -> dict:
-        return {
-            'task_id': None,
-            'category': 'systemic_pattern',
-            'flag_type': 'systemic_pattern',
-            'description': (
-                'This systemic pattern was never converted to a tracked task: diff '
-                'the project_status_correction cache against live get_statuses every '
-                'cycle to catch drift.'
-            ),
-            'suggested_action': (
-                'File a task to diff the cache against live status each cycle.'
-            ),
-        }
-
     def _make_covering_task(self, task_id: str = '3839', status: str = 'pending') -> dict:
         """A task whose title+description covers the never-tracked finding's terms."""
         return {
@@ -9093,11 +9061,10 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
     async def test_get_tasks_requests_all_non_cancelled_statuses(self):
         """(a) The done-only pin is gone: every call requests _NON_CANCELLED_TASK_STATUSES."""
         from fused_memory.reconciliation.flag_dedup import (
-            _NON_CANCELLED_TASK_STATUSES,
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
 
@@ -9105,32 +9072,30 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
             taskmaster, {'dark_factory': '/df'}, [flag],
         )
 
+        # LITERAL vocabulary pin (task 4381 amendment) — asserting against the
+        # production constant would survive a regression of that constant back
+        # to the superseded ['done'].
+        expected_statuses = sorted([
+            'pending', 'in-progress', 'blocked', 'deferred', 'review',
+            'merge-deferred', 'infra-hold', 'done',
+        ])
         calls = taskmaster.get_tasks.call_args_list
         assert calls, 'get_tasks must be called for a registered project'
         for call in calls:
             statuses = call.kwargs.get('statuses')
-            assert statuses == _NON_CANCELLED_TASK_STATUSES, (
-                'get_tasks must request _NON_CANCELLED_TASK_STATUSES (the done-only '
+            assert statuses == expected_statuses, (
+                'get_tasks must request every non-cancelled status (the done-only '
                 f'pin is superseded by task 4381); got {statuses!r}'
-            )
-            assert 'cancelled' not in statuses, (
-                'A cancelled task must never be able to suppress a finding '
-                f'permanently; got statuses={statuses!r}'
-            )
-            assert 'pending' in statuses, (
-                'A pending fix task now counts as filed (Leo 2026-08-17 ruling); '
-                f'got statuses={statuses!r}'
-            )
-            assert 'blocked' in statuses, (
-                'A blocked fix task now counts as filed (Leo 2026-08-17 ruling); '
-                f'got statuses={statuses!r}'
             )
 
     # ---- (b) pending task suppresses --------------------------------------
 
     @pytest.mark.asyncio
-    async def test_pending_task_in_dark_factory_drops_the_flag(self):
-        """(b) The ruled widening: a PENDING covering task now DROPS the finding.
+    @pytest.mark.parametrize(
+        ('task_id', 'status'), [('3839', 'pending'), ('3833', 'blocked')],
+    )
+    async def test_filed_but_unfinished_task_drops_the_flag(self, task_id, status):
+        """(b) The ruled widening: a merely-FILED covering task DROPS the finding.
 
         dark_factory 3833/3839 were blocked/pending, which is exactly why the
         observed flag survived the done-only filter.
@@ -9139,10 +9104,10 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={
-            'tasks': [self._make_covering_task(task_id='3839', status='pending')],
+            'tasks': [self._make_covering_task(task_id=task_id, status=status)],
         })
 
         result = await filter_already_tracked_systemic_patterns(
@@ -9150,30 +9115,8 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
         )
 
         assert result == [], (
-            'A PENDING covering task must DROP the never-tracked finding under the '
-            f'"filed and not cancelled" policy; got {result!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_blocked_task_in_dark_factory_drops_the_flag(self):
-        """(b') A BLOCKED covering task drops the finding too."""
-        from fused_memory.reconciliation.flag_dedup import (
-            filter_already_tracked_systemic_patterns,
-        )
-
-        flag = self._make_never_tracked_flag()
-        taskmaster = AsyncMock()
-        taskmaster.get_tasks = AsyncMock(return_value={
-            'tasks': [self._make_covering_task(task_id='3833', status='blocked')],
-        })
-
-        result = await filter_already_tracked_systemic_patterns(
-            taskmaster, {'dark_factory': '/df'}, [flag],
-        )
-
-        assert result == [], (
-            'A BLOCKED covering task must DROP the never-tracked finding; '
-            f'got {result!r}'
+            f'A {status.upper()} covering task must DROP the never-tracked finding '
+            f'under the "filed and not cancelled" policy; got {result!r}'
         )
 
     # ---- (c) foreign-project coverage --------------------------------------
@@ -9185,7 +9128,7 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
 
         def _by_root(root, **kwargs):
             if root == '/kl':
@@ -9218,7 +9161,7 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={
             'tasks': [self._make_covering_task(task_id='3839', status='cancelled')],
@@ -9243,7 +9186,7 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
 
@@ -9269,7 +9212,7 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
 
         def _by_root(root, **kwargs):
             if root == '/kl':
@@ -9297,7 +9240,7 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(side_effect=RuntimeError('backend down'))
 
@@ -9311,61 +9254,37 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
         )
 
     # ---- (h) degradation ---------------------------------------------------
+    #
+    # The taskmaster=None / known_projects=None / known_projects={} cases are
+    # NOT repeated here (task 4381 amendment): they were verbatim copies of the
+    # migrated originals in TestFilterAlreadyTrackedSystemicPatterns, which
+    # exercise the very same guard through the very same signature — and two
+    # identically-named tests in one module make `pytest -k <name>` ambiguous.
+    # What IS unique to the cross-project shape is a known_projects map whose
+    # ROOT is falsy, which build_known_projects_map can produce for a project
+    # whose root cannot be resolved.
 
     @pytest.mark.asyncio
-    async def test_empty_known_projects_keeps_all_flags_and_get_tasks_not_called(self):
-        """(h) known_projects={} → no-op KEEP-all, no I/O."""
+    async def test_falsy_project_root_keeps_all_flags_and_get_tasks_not_called(self):
+        """(h) known_projects={'dark_factory': ''} → the project is unusable, so
+        lookup_projects is empty and the filter degrades to KEEP-all with no I/O."""
         from fused_memory.reconciliation.flag_dedup import (
             filter_already_tracked_systemic_patterns,
         )
 
-        flag = self._make_never_tracked_flag()
+        flag = _make_never_tracked_flag()
         taskmaster = AsyncMock()
         taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
 
         result = await filter_already_tracked_systemic_patterns(
-            taskmaster, known_projects={}, flags=[flag],
+            taskmaster, {'dark_factory': ''}, [flag],
         )
 
         assert result == [flag], (
-            f'An empty known_projects must degrade to a no-op KEEP-all; got {result!r}'
+            'A falsy project root must degrade to a no-op KEEP-all rather than '
+            f'querying an empty path; got {result!r}'
         )
         taskmaster.get_tasks.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_none_known_projects_keeps_all_flags_and_get_tasks_not_called(self):
-        """(h) known_projects=None → no-op KEEP-all, no I/O."""
-        from fused_memory.reconciliation.flag_dedup import (
-            filter_already_tracked_systemic_patterns,
-        )
-
-        flag = self._make_never_tracked_flag()
-        taskmaster = AsyncMock()
-        taskmaster.get_tasks = AsyncMock(return_value={'tasks': []})
-
-        result = await filter_already_tracked_systemic_patterns(taskmaster, None, [flag])
-
-        assert result == [flag], (
-            f'A None known_projects must degrade to a no-op KEEP-all; got {result!r}'
-        )
-        taskmaster.get_tasks.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_none_taskmaster_keeps_all_flags(self):
-        """(h) taskmaster=None → no-op KEEP-all."""
-        from fused_memory.reconciliation.flag_dedup import (
-            filter_already_tracked_systemic_patterns,
-        )
-
-        flag = self._make_never_tracked_flag()
-
-        result = await filter_already_tracked_systemic_patterns(
-            None, {'dark_factory': '/df'}, [flag],
-        )
-
-        assert result == [flag], (
-            f'A None taskmaster must degrade to a no-op KEEP-all; got {result!r}'
-        )
 
     # ---- (i) scope guard preserved ----------------------------------------
 
@@ -9400,3 +9319,387 @@ class TestFilterAlreadyTrackedSystemicPatternsCrossProject:
             f'A non-candidate flag must pass through unchanged; got {result!r}'
         )
         taskmaster.get_tasks.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# task 4381 amendment pass (review fixes) — the bounded, batched and
+# instrumented cross-project fix-task gate
+# ---------------------------------------------------------------------------
+
+
+class TestCrossProjectGateAmendments:
+    """Behaviour added by the task 4381 review-amendment pass.
+
+    Covers: multi-flag batch semantics (a suppressed flag must not disturb its
+    neighbours), the batch-wide get_task memo, the BOUNDED done-fix-task
+    suppression window, the ``stats`` out-dict, and the observability the gate
+    advertises (near-miss INFO, matched_project_id on a systemic drop).
+    """
+
+    PROJECT = 'know_live'
+    FLAG_TYPE = 'remediation_payload_live_workflow_signals_gap'
+    FIX_CITE = {'project_id': 'dark_factory', 'task_id': '3839', 'title': 'Fix'}
+    KNOWN = {'dark_factory': '/df'}
+    LOGGER = 'fused_memory.reconciliation.flag_dedup'
+
+    @classmethod
+    def _flag(cls, task_id=598, cited=None):
+        flag = {
+            'task_id': task_id,
+            'flag_type': cls.FLAG_TYPE,
+            'description': 'the remediation payload omits live workflow signals',
+        }
+        if cited is not None:
+            flag['cited_tasks'] = cited
+        return flag
+
+    @staticmethod
+    def _sig(flag):
+        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+
+        sig = compute_flag_signature(flag)
+        assert sig is not None, f'the flag must have a signature; got {flag!r}'
+        return sig
+
+    @staticmethod
+    def _taskmaster(status='pending', title='Fix'):
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': 3839, 'title': title, 'status': status}
+        )
+        return taskmaster
+
+    async def _seed(self, ledger, flag, **extra_payload):
+        """Seed the prior-cycle marker for *flag* (the gate is HIT-only).
+
+        The identity is DERIVED from compute_flag_signature, which unions the
+        top-level task_id with every cited_tasks id — hardcoding the top-level
+        id would seed a row the gate never reads, and the test would pass
+        vacuously.
+        """
+        tid, ftype = self._sig(flag)
+        await _seed_marker(
+            ledger, self.PROJECT, tid, ftype, run_id='r1',
+            extra_payload=extra_payload or None,
+        )
+        return tid, ftype
+
+    async def _payload(self, ledger, tid, ftype):
+        row = await _get_marker(ledger, self.PROJECT, tid, ftype)
+        assert row is not None, 'the marker row must survive the cycle'
+        return json.loads(row.payload_json)
+
+    # ---- batch semantics ---------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_batch_drops_only_the_suppressed_flag_and_preserves_order(
+        self, ledger_memory_service
+    ):
+        """A suppressed flag must not disturb its neighbours: the gate's drop is
+        a bare `continue` mid-loop, so a regression could truncate the batch or
+        drop the wrong element and every single-flag test would still pass."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag_a = self._flag(task_id=601)
+        flag_b = self._flag(task_id=598, cited=[self.FIX_CITE])
+        flag_c = self._flag(task_id=602)
+        await self._seed(ledger_memory_service.recon_ledger, flag_b,
+                         cited_tasks=[self.FIX_CITE])
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag_a, flag_b, flag_c],
+            taskmaster=self._taskmaster(),
+            known_projects=self.KNOWN,
+        )
+
+        assert [f['task_id'] for f in result] == [601, 602], (
+            'only the suppressed flag may be dropped, and the survivors must keep '
+            f'their input order; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_one_fix_task_cited_by_two_flags_is_looked_up_once(
+        self, ledger_memory_service
+    ):
+        """The batch-wide memo: a family of findings citing the same remediation
+        task must cost ONE round trip, not one per flag."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flags = [self._flag(task_id=598, cited=[self.FIX_CITE]),
+                 self._flag(task_id=599, cited=[self.FIX_CITE])]
+        for flag in flags:
+            await self._seed(ledger_memory_service.recon_ledger, flag,
+                             cited_tasks=[self.FIX_CITE])
+        taskmaster = self._taskmaster()
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=flags,
+            taskmaster=taskmaster,
+            known_projects=self.KNOWN,
+        )
+
+        assert result == [], f'both carried-forward flags must be dropped; got {result!r}'
+        assert taskmaster.get_task.call_count == 1, (
+            'the shared (project_id, task_id) memo must collapse the duplicate '
+            f'citation to ONE lookup; got {taskmaster.get_task.call_count}'
+        )
+
+    # ---- the bounded done-fix-task window ----------------------------------
+
+    @pytest.mark.asyncio
+    async def test_done_fix_task_suppresses_and_counts_the_cycle(
+        self, ledger_memory_service
+    ):
+        """A done fix task still suppresses — and the cycle is COUNTED, which is
+        what makes the suppression bounded rather than permanent."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._flag(cited=[self.FIX_CITE])
+        tid, ftype = await self._seed(
+            ledger_memory_service.recon_ledger, flag, cited_tasks=[self.FIX_CITE],
+        )
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(status='done'),
+            known_projects=self.KNOWN,
+        )
+
+        assert result == [], f'a done fix task still suppresses; got {result!r}'
+        payload = await self._payload(ledger_memory_service.recon_ledger, tid, ftype)
+        assert payload.get('cross_project_done_suppressions') == 1, (
+            f'the done-suppression cycle must be counted; got {payload!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_done_suppression_expires_at_the_ceiling_and_warns(
+        self, ledger_memory_service, caplog
+    ):
+        """THE headline amendment: once a done fix task has suppressed a still-
+        recurring finding for the whole window, the finding is surfaced again
+        and the expiry is LOUD — the fix demonstrably did not work."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES,
+            dedup_flags,
+        )
+
+        flag = self._flag(cited=[self.FIX_CITE])
+        tid, ftype = await self._seed(
+            ledger_memory_service.recon_ledger, flag,
+            cited_tasks=[self.FIX_CITE],
+            cross_project_done_suppressions=_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES,
+        )
+        stats: dict = {}
+
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            result = await dedup_flags(
+                memory_service=ledger_memory_service,
+                project_id=self.PROJECT,
+                run_id='r2',
+                flags=[flag],
+                taskmaster=self._taskmaster(status='done'),
+                known_projects=self.KNOWN,
+                stats=stats,
+            )
+
+        assert len(result) == 1, (
+            'past the ceiling the finding must be surfaced again, not silenced '
+            f'forever behind a TTL refreshed every cycle; got {result!r}'
+        )
+        assert 'cross_project_fix_task_suppression_exhausted' in caplog.text, (
+            f'the expiry must be loud, not an INFO trace; got {caplog.text!r}'
+        )
+        assert stats.get('cross_project_fix_task_suppression_exhausted') == 1, (
+            f'the expiry must be counted for report.stats; got {stats!r}'
+        )
+        payload = await self._payload(ledger_memory_service.recon_ledger, tid, ftype)
+        assert (
+            payload.get('cross_project_done_suppressions')
+            == _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES
+        ), (
+            'the count must FREEZE at the ceiling so the finding stays surfaced '
+            f'instead of oscillating; got {payload!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unfinished_fix_task_suppresses_past_the_ceiling_and_resets(
+        self, ledger_memory_service
+    ):
+        """The ceiling is scoped to DONE fix tasks: a filed-but-outstanding one
+        answers "no fix task has been filed" for as long as it stays that way."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES,
+            dedup_flags,
+        )
+
+        flag = self._flag(cited=[self.FIX_CITE])
+        tid, ftype = await self._seed(
+            ledger_memory_service.recon_ledger, flag,
+            cited_tasks=[self.FIX_CITE],
+            cross_project_done_suppressions=_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES,
+        )
+
+        result = await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(status='pending'),
+            known_projects=self.KNOWN,
+        )
+
+        assert result == [], (
+            'an outstanding fix task suppresses regardless of how many done '
+            f'cycles were previously burned; got {result!r}'
+        )
+        payload = await self._payload(ledger_memory_service.recon_ledger, tid, ftype)
+        assert 'cross_project_done_suppressions' not in payload, (
+            'a non-done suppression must RESET the done-grace window (and keep '
+            f'the historical payload shape); got {payload!r}'
+        )
+
+    # ---- observability ------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_stats_out_dict_counts_the_cross_project_drop(
+        self, ledger_memory_service
+    ):
+        """Without this counter a cross-project drop is indistinguishable from a
+        stage1_flag_suppression drop in a cycle report."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._flag(cited=[self.FIX_CITE])
+        await self._seed(ledger_memory_service.recon_ledger, flag,
+                         cited_tasks=[self.FIX_CITE])
+        stats: dict = {}
+
+        await dedup_flags(
+            memory_service=ledger_memory_service,
+            project_id=self.PROJECT,
+            run_id='r2',
+            flags=[flag],
+            taskmaster=self._taskmaster(),
+            known_projects=self.KNOWN,
+            stats=stats,
+        )
+
+        assert stats == {'cross_project_fix_task_suppressed': 1}, (
+            f'the drop must be counted for report.stats; got {stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_present_but_uncorroborated_citation_logs_the_near_miss(
+        self, ledger_memory_service, caplog
+    ):
+        """The near-miss log the docstring sells: a renamed fix task fails OPEN,
+        and that non-suppression must be observable rather than silent."""
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        flag = self._flag(cited=[self.FIX_CITE])
+        await self._seed(ledger_memory_service.recon_ledger, flag,
+                         cited_tasks=[self.FIX_CITE])
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await dedup_flags(
+                memory_service=ledger_memory_service,
+                project_id=self.PROJECT,
+                run_id='r2',
+                flags=[flag],
+                taskmaster=self._taskmaster(title='Renamed fix'),
+                known_projects=self.KNOWN,
+            )
+
+        assert len(result) == 1, (
+            f'a title mismatch must fail OPEN (no suppression); got {result!r}'
+        )
+        assert 'cross_project_fix_task_present_but_uncorroborated' in caplog.text, (
+            f'the near-miss must be logged; got {caplog.text!r}'
+        )
+        assert 'cited_task_id=3839' in caplog.text, (
+            f'the near-miss must name the citation; got {caplog.text!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_falsy_project_root_issues_no_cross_project_lookup(self):
+        """Mirror of the systemic filter's falsy-root case: build_known_projects_map
+        can emit an empty root, which must resolve to "unusable", not a lookup."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _resolve_live_cross_project_fix_task,
+        )
+
+        taskmaster = self._taskmaster()
+
+        result = await _resolve_live_cross_project_fix_task(
+            taskmaster, {'dark_factory': ''}, self.PROJECT, [self.FIX_CITE],
+        )
+
+        assert result is None, (
+            f'a falsy project root must not corroborate anything; got {result!r}'
+        )
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_systemic_pattern_drop_log_names_the_matching_project(self, caplog):
+        """matched_project_id is the whole reason project_id is threaded through
+        the matcher — an operator must be able to see WHICH project covered it."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_tracked_systemic_patterns,
+        )
+
+        flag = _make_never_tracked_flag()
+        covering = {
+            'id': '4242',
+            'title': 'Diff the project_status_correction cache against live get_statuses',
+            'description': flag['description'],
+            'status': 'pending',
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_tasks = AsyncMock(return_value={'tasks': [covering]})
+
+        with caplog.at_level(logging.INFO, logger=self.LOGGER):
+            result = await filter_already_tracked_systemic_patterns(
+                taskmaster, {'know_live': '/kl'}, [flag],
+            )
+
+        assert result == [], f'the covered finding must be dropped; got {result!r}'
+        assert 'matched_project_id=know_live' in caplog.text, (
+            f'the drop log must name the covering project; got {caplog.text!r}'
+        )
+        assert 'matched_task_id=4242' in caplog.text, (
+            f'the drop log must name the covering task; got {caplog.text!r}'
+        )
+
+    # ---- byte bound on the persisted anchor --------------------------------
+
+    def test_long_cited_title_is_truncated_for_the_payload(self):
+        """The persisted anchor round-trips every cycle, so it must be bounded in
+        BYTES as well as in entry count."""
+        from fused_memory.reconciliation.flag_dedup import (
+            _MAX_CITED_TASK_STR_CHARS,
+            _sanitize_cited_tasks,
+        )
+
+        long_title = 'x' * (_MAX_CITED_TASK_STR_CHARS + 500)
+        result = _sanitize_cited_tasks({
+            'cited_tasks': [{'project_id': 'p', 'task_id': '1', 'title': long_title}],
+        })
+
+        assert result is not None and len(result) == 1, (
+            f'the entry must survive, truncated rather than dropped; got {result!r}'
+        )
+        assert result[0]['title'] == 'x' * _MAX_CITED_TASK_STR_CHARS, (
+            'a pathologically long title must be truncated to the ceiling; got '
+            f'{len(result[0]["title"])} chars'
+        )
+        assert result[0]['task_id'] == '1', (
+            f'a short scalar must pass through untouched; got {result!r}'
+        )
