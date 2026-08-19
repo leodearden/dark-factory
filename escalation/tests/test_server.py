@@ -7151,3 +7151,183 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
         assert result.get('level') == 1, (
             f'The auto-resolve branch must echo the level too, got: {result}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteToL2CanonicalFold: near-duplicate root causes fold (task 3998)
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2CanonicalFold:
+    """A re-promote spelled differently folds into the existing L2, end-to-end.
+
+    This is the user-observable signal of task 3998: `promote_to_l2` used to
+    match root causes on stripped EXACT-string equality, so 'Watcher lease
+    stolen.' and 'watcher  lease STOLEN' minted TWO L2 decision points for one
+    incident and a human triaged the same cause twice.
+    """
+
+    @pytest.mark.asyncio
+    async def test_case_whitespace_and_punctuation_variant_folds(self, tmp_path: Path):
+        """PRD boundary row B4, in full, through the MCP tool the watcher calls."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        created = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-1'],
+            'root_cause': 'Watcher lease stolen.',
+        })
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+
+        folded = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-2'],
+            'root_cause': 'watcher  lease STOLEN',
+        })
+
+        assert folded['status'] == 'updated', (
+            f'the near-duplicate spelling must FOLD, not mint: {folded}'
+        )
+        assert folded['id'] == created['id']
+        assert set(folded['members']) == {'esc-l1-1', 'esc-l1-2'}
+
+        pending_l2 = [e for e in queue.get_pending() if e.level == 2]
+        assert len(pending_l2) == 1, (
+            f'Expected exactly 1 pending L2, got {len(pending_l2)}: '
+            f'{[(e.id, e.root_cause) for e in pending_l2]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fold_never_rewrites_the_records_own_root_cause(self, tmp_path: Path):
+        """The surviving record keeps its ORIGINAL, pre-canonical framing.
+
+        The canonical form is a COMPARE-TIME value, never a stored one: replacing
+        a human-readable key with a lossy machine one on the very record a human
+        triages would invert task 3997's immutable-framing ethos, and persisting
+        both would be a derived value that can silently desynchronise from the
+        function that derives it.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        created = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-1'],
+            'root_cause': 'Watcher lease stolen.',
+        })
+        await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-2'],
+            'root_cause': 'watcher  lease STOLEN',
+        })
+
+        record = await _get_escalation(server, escalation_id=created['id'])
+        assert record['root_cause'] == 'Watcher lease stolen.', (
+            f"the fold must not rewrite the record's own framing: {record['root_cause']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fold_preserves_the_pre_canonical_incoming_spelling(
+        self, tmp_path: Path,
+    ):
+        """The over-fold evidence trail: the incoming spelling lands in `amendments`.
+
+        This is also what proves ``_framing_view`` was NOT canonicalised — if it
+        had been, a spelling-only difference would read as a REPEAT and be
+        suppressed, emptying the slot task 3997 built for exactly this.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        created = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-1'],
+            'root_cause': 'Watcher lease stolen.',
+        })
+        folded = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-2'],
+            'root_cause': 'watcher  lease STOLEN',
+        })
+
+        assert folded['amendment_recorded'] is True, (
+            f'a re-spelling IS new framing and must be recorded: {folded}'
+        )
+        record = await _get_escalation(server, escalation_id=created['id'])
+        assert record['amendments'], f'expected an amendment, got: {record}'
+        assert record['amendments'][-1]['root_cause'] == 'watcher  lease STOLEN', (
+            'the PRE-canonical incoming spelling is the evidence an over-fold '
+            f'happened and must be kept verbatim: {record["amendments"][-1]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_canonically_distinct_causes_still_mint_two_l2s(self, tmp_path: Path):
+        """The conservative direction, end-to-end.
+
+        Under DELETION semantics these two keys collapse and two distinct
+        incidents are silently absorbed into one L2 — the failure canonicalisation
+        must not introduce.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        first = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': 'risk:3184',
+        })
+        second = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS, 'member_ids': ['esc-l1-2'], 'root_cause': 'risk:318:4',
+        })
+
+        assert first['status'] == 'created'
+        assert second['status'] == 'created', (
+            f'distinct identity segments must NOT glue into one L2: {second}'
+        )
+        assert second['id'] != first['id']
+        pending_l2 = [e for e in queue.get_pending() if e.level == 2]
+        assert len(pending_l2) == 2, (
+            f'Expected 2 distinct L2s, got: {[(e.id, e.root_cause) for e in pending_l2]}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('root_cause', ['::', '--', '  :  ', '!!! ???'])
+    async def test_root_cause_with_empty_canonical_form_is_rejected(
+        self, tmp_path: Path, root_cause: str,
+    ):
+        """Minting an unfoldable L2 is refused LOUDLY at the boundary.
+
+        These keys survive `.strip()` but canonicalise to nothing, so after
+        canonicalisation such an L2 can never be found by the dedup scan — every
+        subsequent promote would mint another one, a silent self-perpetuating
+        duplicate source, which is the exact defect class this task reduces.
+        Measured safe: 0 of the 398 distinct live root_cause keys canonicalise to
+        empty, and Unicode word characters (CJK etc.) are unaffected.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': root_cause,
+        })
+
+        assert 'error' in result, f'Expected a typed error, got: {result}'
+        assert 'root_cause' in result['error'], (
+            f'the error must name the offending field: {result["error"]!r}'
+        )
+        assert not [e for e in queue.get_pending() if e.level == 2], (
+            'a rejected promote must mint nothing'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unicode_root_cause_is_still_accepted(self, tmp_path: Path):
+        """CONTROL for the rejection above: only punctuation-only keys are refused."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': 'ロック競合:2370',
+        })
+
+        assert result.get('status') == 'created', (
+            f'a non-Latin root_cause carries real identity and must mint: {result}'
+        )
