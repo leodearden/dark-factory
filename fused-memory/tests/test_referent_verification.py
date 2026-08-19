@@ -445,3 +445,158 @@ class TestSetMembershipCheck:
 
         assert stats.edges_scanned == 3
         assert stats.findings == []
+
+
+class TestPerEdgePairingCheck:
+    """Does THIS edge's fact talk about the node THIS edge landed on?
+
+    Resolved decision 7: neither check alone is sufficient. Membership misses
+    mode (iii) — both numbers legitimately declared, the edge still on the wrong
+    one — which is exactly what pairing catches.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mode_iii_fires_where_set_membership_cannot(self, service):
+        """The motivating live case: episode 8562760e minted Task 3074 and
+        Task 3075 60us apart, and a fact about one landed on the other."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3075 blocks the merge lane',
+                         source='n-3074', target='n-lane')],
+            nodes=[MockNode(name='Task 3074', uuid='n-3074'),
+                   MockNode(name='merge lane', uuid='n-lane')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory',
+            referents=(Referent(number='3074'), Referent(number='3075')),
+        )
+
+        assert len(stats.findings) == 1
+        finding = stats.findings[0]
+        assert finding.check == 'per-edge-pairing'
+        assert finding.which_end == 'source'
+        assert finding.endpoint_referent == Referent(number='3074')
+        # 3074 IS legitimately declared, which is precisely why membership
+        # alone misses this mode — the row that makes both checks required.
+        assert stats.set_membership_findings == 0
+        assert stats.pairing_findings == 1
+        assert_never_repaired(service)
+
+    @pytest.mark.asyncio
+    async def test_the_membership_only_shape_of_that_episode_is_clean(self, service):
+        """Complementarity as a test: the same episode shape with the fact
+        citing the endpoint it landed on yields nothing. One shape, two
+        verdicts, decided by the check membership cannot make."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3074 blocks the merge lane',
+                         source='n-3074', target='n-lane')],
+            nodes=[MockNode(name='Task 3074', uuid='n-3074'),
+                   MockNode(name='merge lane', uuid='n-lane')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory',
+            referents=(Referent(number='3074'), Referent(number='3075')),
+        )
+
+        assert stats.findings == []
+
+    @pytest.mark.asyncio
+    async def test_a_binary_fact_citing_both_endpoints_is_clean(self, service):
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3074 depends on Task 3075',
+                         source='n-3074', target='n-3075')],
+            nodes=[MockNode(name='Task 3074', uuid='n-3074'),
+                   MockNode(name='Task 3075', uuid='n-3075')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory',
+            referents=(Referent(number='3074'), Referent(number='3075')),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_checked == 2
+
+    @pytest.mark.asyncio
+    async def test_an_empty_scan_is_uninformative_never_contradictory(self, service):
+        """gamma's `_conflicting_referents` choice-4 rule one level down: a fact
+        citing no number says NOTHING about which node its edge belongs on. A
+        scanner blind spot must never manufacture evidence for destructive edge
+        surgery."""
+        result = _episode(
+            edges=[_edge('e1', fact='The merge lane hardening work landed',
+                         source='n-3074', target='n-lane')],
+            nodes=[MockNode(name='Task 3074', uuid='n-3074'),
+                   MockNode(name='merge lane', uuid='n-lane')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3074'),),
+        )
+
+        assert stats.findings == []
+        assert stats.endpoints_checked == 1
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_scan_results_are_never_promoted_into_the_cited_set(
+        self, service,
+    ):
+        """'task 2500 tracked as reify:2500' claims 2500 BOTH bare and
+        foreign-qualified, so the scan routes both to `.ambiguous` and `.refs`
+        is empty. Were ambiguity promoted, the in-set endpoint below would look
+        uncited and fire. Ambiguity is recorded, not guessed."""
+        result = _episode(
+            edges=[_edge('e1', fact='task 2500 tracked as reify:2500',
+                         source='n-3074', target='n-lane')],
+            nodes=[MockNode(name='Task 3074', uuid='n-3074'),
+                   MockNode(name='merge lane', uuid='n-lane')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3074'),),
+        )
+
+        assert stats.findings == []
+
+    @pytest.mark.asyncio
+    async def test_a_non_canonical_fact_spelling_is_still_seen(self, service):
+        """The fact is read through `scan_content` — the vocabulary leaf beta
+        exists to single-source — and NOT through a second regex, which is what
+        makes 'task #3075' visible at all."""
+        result = _episode(
+            edges=[_edge('e1', fact='task #3075 blocks the merge lane',
+                         source='n-3074', target='n-lane')],
+            nodes=[MockNode(name='Task 3074', uuid='n-3074'),
+                   MockNode(name='merge lane', uuid='n-lane')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory',
+            referents=(Referent(number='3074'), Referent(number='3075')),
+        )
+
+        assert stats.pairing_findings == 1
+
+    @pytest.mark.asyncio
+    async def test_an_endpoint_failing_both_checks_reports_exactly_one_finding(
+        self, service,
+    ):
+        """Ordered, not additive. Membership is the stronger, more specific
+        signal, so it wins the label — two findings naming the same
+        (edge_uuid, which_end) would hand eta two repair instructions for one
+        edge end and double-count in iota's rate."""
+        result = _episode(
+            edges=[_edge('e1', fact='Task 3127 was completed',
+                         source='n-3129', target='n-lane')],
+            nodes=[MockNode(name='Task 3129', uuid='n-3129'),
+                   MockNode(name='merge lane', uuid='n-lane')],
+        )
+
+        stats = await service._verify_episode_referents(
+            result, group_id='dark_factory', referents=(Referent(number='3127'),),
+        )
+
+        assert len(stats.findings) == 1
+        assert stats.findings[0].check == 'set-membership'
+        assert stats.pairing_findings == 0
