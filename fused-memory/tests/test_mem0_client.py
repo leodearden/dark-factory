@@ -1686,6 +1686,66 @@ class TestMem0BackendScanPayloadText:
             assert cond.match.text == needle
 
     @pytest.mark.asyncio
+    async def test_scan_filter_equals_the_count_filter_for_the_same_filters(self, backend):
+        """ANTI-DRIFT (INV-5): scan's scroll_filter == count's count_filter.
+
+        The fourth entry point onto ``_build_payload_filter``.  The same
+        reconciliation hazard the other three are pinned against applies here
+        with a sharper edge: ``scan_payload_text``'s whole purpose is a TRUE
+        incidence rate, and an incidence rate is a ratio of a scan against a
+        count.  If the two filter constructions ever selected different point
+        sets the ratio would be wrong with no error surface at all.
+
+        Exhaustive mode is the one that matters: it is the mode used to
+        establish the true rate, and it is the one where scan previously
+        emitted an empty ``should`` arm that made this equality false.
+        """
+        filters = {'category': 'procedural_knowledge', 'recon_pool': 'stage2_cycle_summary'}
+        scope = Scope(project_id='dark_factory')
+
+        count_client = AsyncMock()
+        count_client.count = AsyncMock(return_value=MagicMock(count=0))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=count_client)):
+            await backend.count_by_metadata(scope=scope, filters=filters)
+
+        scan_client = AsyncMock()
+        scan_client.scroll = AsyncMock(return_value=([], None))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=scan_client)):
+            await backend.scan_payload_text(scope=scope, filters=filters, exhaustive=True)
+
+        count_filter = count_client.count.call_args.kwargs.get('count_filter')
+        scan_filter = scan_client.scroll.call_args.kwargs.get('scroll_filter')
+        built = backend._build_payload_filter(filters)
+
+        assert scan_filter == built, (
+            f'scan_payload_text built {scan_filter!r}, _build_payload_filter built {built!r}'
+        )
+        assert scan_filter == count_filter, (
+            'an exhaustive scan and the count it is divided by must select the same '
+            f'point set; got scan_filter={scan_filter!r} count_filter={count_filter!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_prefilter_scan_filter_comes_from_the_shared_builder(self, backend):
+        """The prefilter mode routes through the same home, needles and all."""
+        filters = {'category': 'procedural_knowledge'}
+        needles = [_SCAN_CLOSE_CONTENT, _SCAN_CLOSE_INVOKE]
+
+        scan_client = AsyncMock()
+        scan_client.scroll = AsyncMock(return_value=([], None))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=scan_client)):
+            await backend.scan_payload_text(
+                scope=Scope(project_id='p'), needles=needles, filters=filters
+            )
+
+        scan_filter = scan_client.scroll.call_args.kwargs.get('scroll_filter')
+        built = backend._build_payload_filter(filters, text_needles=needles)
+
+        assert scan_filter == built, (
+            f'scan_payload_text built {scan_filter!r}, _build_payload_filter built {built!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_metadata_filters_are_anded_in_via_must(self, backend):
         """An optional `filters` dict narrows the scan, using the same `must`
         key-equality list count_by_metadata builds."""
