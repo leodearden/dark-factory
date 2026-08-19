@@ -2846,6 +2846,23 @@ class DriftDetector:
         escalated = False
         if self._escalation_queue is not None and not self._escalation_queue.has_open_l1(_DRIFT_SENTINEL):
             from escalation.models import Escalation
+            # Explain the suppression sentinel ONLY when an arm actually carries it.
+            # The structured local_category=/remote_category= echo below stays
+            # unconditional (that is the task's always-populated contract); it is
+            # just this ~40-word operator footnote that would otherwise dilute
+            # every divergence escalation with hypothetical guidance.
+            # The literal is matched, not imported: the only cycle-safe home for a
+            # shared constant is verify.py, which this task does not own.  A rename
+            # there degrades to "footnote not shown" -- never to a lost signal, since
+            # the raw category is still echoed verbatim in the structured fields.
+            suppression_note = ''
+            if 'merge_flake_suppressed' in (local_category, remote_category):
+                suppression_note = (
+                    ' A category of "merge_flake_suppressed" on either arm means that '
+                    "arm's green came from an isolated flake-suppression rerun "
+                    '(verify.apply_merge_flake_suppression), not a clean first-pass '
+                    'run -- weigh that when deciding which host is wrong.'
+                )
             esc = Escalation(
                 id=self._escalation_queue.make_id(_DRIFT_SENTINEL),
                 task_id=_DRIFT_SENTINEL,
@@ -2862,11 +2879,8 @@ class DriftDetector:
                     f'({local_passed}, local_category={local_category!r}) '
                     f'remote_runner={remote.name!r} '
                     f'({remote_passed}, remote_category={remote_category!r}). '
-                    f'A remote PASS / local FAIL split can land unverified code on main. '
-                    f'A category of "merge_flake_suppressed" on either arm means that '
-                    f"arm's green came from an isolated flake-suppression rerun "
-                    f'(verify.apply_merge_flake_suppression), not a clean first-pass '
-                    f'run -- weigh that when deciding which host is wrong.'
+                    f'A remote PASS / local FAIL split can land unverified code on main.'
+                    f'{suppression_note}'
                 ),
                 suggested_action='Re-prove laptop env via run_verdict_parity; call pool.clear_quarantine after parity is restored.',
             )

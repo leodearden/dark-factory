@@ -4392,99 +4392,51 @@ class TestDriftDetectorAgree:
         await detector.check('sha1', _make_spec())
         assert pool.is_quarantined('laptop') is False
 
-    # -- task 4188: verify categories surfaced in the verdict_parity_ok payload --
+    # -- task 4188: verify categories surfaced on the AGREE result AND event --
 
-    async def test_agree_event_data_contains_suppression_category(self):
-        """A suppression-implicated arm is named in the emitted parity payload."""
-        from orchestrator.verify_runner import DriftDetector
-        pool, _, _ = _make_drift_pool(
-            local_result=_make_pass_result(category='merge_flake_suppressed'),
-            remote_result=_make_pass_result(),
-        )
-        event_store = MagicMock()
-        detector = DriftDetector(pool, event_store=event_store)
-        await detector.check('sha1', _make_spec())
-        data = event_store.emit.call_args[1]['data']
-        assert data['local_category'] == 'merge_flake_suppressed'
-        assert data['remote_category'] == ''
+    @pytest.mark.parametrize(
+        'local_result, remote_result, expected_local, expected_remote',
+        [
+            # A suppression-implicated LOCAL arm is named on both artifacts.
+            (_make_pass_result(category='merge_flake_suppressed'),
+             _make_pass_result(), 'merge_flake_suppressed', ''),
+            # The mirror case -- the REMOTE arm's category is threaded too, in
+            # its own slot, not just whichever arm happens to be suppressed.
+            (_make_pass_result(),
+             _make_pass_result(category='merge_flake_suppressed'), '', 'merge_flake_suppressed'),
+            # Always-populated, not only-on-divergence.  A NON-EMPTY category on
+            # BOTH arms, so this cannot pass vacuously against the '' default.
+            (_make_fail_result(category='test_failure'),
+             _make_fail_result(category='test_failure'), 'test_failure', 'test_failure'),
+            # Uniform shape: a clean, category-less pass still carries both keys.
+            (_make_pass_result(), _make_pass_result(), '', ''),
+        ],
+        ids=['local-suppressed', 'remote-suppressed', 'both-test-failure', 'clean-pass'],
+    )
+    async def test_agree_carries_both_categories_on_result_and_event(
+        self, local_result, remote_result, expected_local, expected_remote
+    ):
+        """Both arms' categories reach the AGREE result AND the parity payload.
 
-    async def test_agree_event_data_contains_both_categories_on_plain_agreement(self):
-        """Always-populated at the event layer, pinned with a non-empty value on both arms."""
-        from orchestrator.verify_runner import DriftDetector
-        pool, _, _ = _make_drift_pool(
-            local_result=_make_fail_result(category='test_failure'),
-            remote_result=_make_fail_result(category='test_failure'),
-        )
-        event_store = MagicMock()
-        detector = DriftDetector(pool, event_store=event_store)
-        await detector.check('sha1', _make_spec())
-        data = event_store.emit.call_args[1]['data']
-        assert data['local_category'] == 'test_failure'
-        assert data['remote_category'] == 'test_failure'
-
-    async def test_agree_event_data_keys_always_present_for_clean_pass(self):
-        """Uniform payload shape: both keys present even for a clean, category-less pass.
-
-        A consumer reads the same two keys on every drift parity event and never
-        has to distinguish an absent key from a clean result.
+        The two ``*_category`` keys are emitted UNCONDITIONALLY, so a consumer
+        reads the same two keys on every drift parity event and never has to
+        distinguish an absent key from a clean, sentinel-free result.
         """
-        from orchestrator.verify_runner import DriftDetector
-        pool, _, _ = _make_drift_pool(
-            local_result=_make_pass_result(), remote_result=_make_pass_result()
-        )
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(local_result=local_result, remote_result=remote_result)
         event_store = MagicMock()
         detector = DriftDetector(pool, event_store=event_store)
-        await detector.check('sha1', _make_spec())
+        result = await detector.check('sha1', _make_spec())
+
+        assert result.verdict == DriftVerdict.AGREE
+        assert result.local_category == expected_local
+        assert result.remote_category == expected_remote
+
         data = event_store.emit.call_args[1]['data']
         assert 'local_category' in data
         assert 'remote_category' in data
-        assert data['local_category'] == ''
-        assert data['remote_category'] == ''
-
-    # -- task 4188: verify categories surfaced on the AGREE result --
-
-    async def test_agree_result_carries_suppression_category_from_local_arm(self):
-        """A local arm whose green came from flake suppression is named on the result."""
-        from orchestrator.verify_runner import DriftDetector, DriftVerdict
-        pool, _, _ = _make_drift_pool(
-            local_result=_make_pass_result(category='merge_flake_suppressed'),
-            remote_result=_make_pass_result(),
-        )
-        detector = DriftDetector(pool)
-        result = await detector.check('sha1', _make_spec())
-        assert result.verdict == DriftVerdict.AGREE
-        assert result.local_category == 'merge_flake_suppressed'
-        assert result.remote_category == ''
-
-    async def test_agree_result_carries_suppression_category_from_remote_arm(self):
-        """The mirror case: the REMOTE arm's category is threaded too, not just the local one."""
-        from orchestrator.verify_runner import DriftDetector, DriftVerdict
-        pool, _, _ = _make_drift_pool(
-            local_result=_make_pass_result(),
-            remote_result=_make_pass_result(category='merge_flake_suppressed'),
-        )
-        detector = DriftDetector(pool)
-        result = await detector.check('sha1', _make_spec())
-        assert result.verdict == DriftVerdict.AGREE
-        assert result.local_category == ''
-        assert result.remote_category == 'merge_flake_suppressed'
-
-    async def test_plain_agreement_carries_both_categories(self):
-        """Categories are ALWAYS populated, not only on divergence.
-
-        Both arms carry a NON-EMPTY category so this cannot pass vacuously
-        against the ``''`` dataclass default.
-        """
-        from orchestrator.verify_runner import DriftDetector, DriftVerdict
-        pool, _, _ = _make_drift_pool(
-            local_result=_make_fail_result(category='test_failure'),
-            remote_result=_make_fail_result(category='test_failure'),
-        )
-        detector = DriftDetector(pool)
-        result = await detector.check('sha1', _make_spec())
-        assert result.verdict == DriftVerdict.AGREE
-        assert result.local_category == 'test_failure'
-        assert result.remote_category == 'test_failure'
+        assert data['local_category'] == expected_local
+        assert data['remote_category'] == expected_remote
 
 
 # ---------------------------------------------------------------------------
@@ -4639,8 +4591,8 @@ class TestDriftDetectorDivergence:
         """The suppressed arm is named in the artifact an operator actually rules on.
 
         Asserts the STRUCTURED, !r-quoted spelling rather than the bare word, so
-        it cannot be satisfied vacuously by the static explanatory sentence that
-        also names the category.  Also guards that the rewrite stayed ADDITIVE.
+        it cannot be satisfied vacuously by the operator footnote that also names
+        the category.  Also guards that the rewrite stayed ADDITIVE.
         """
         from orchestrator.verify_runner import DriftDetector
         pool, _, _ = _make_drift_pool(
@@ -4656,7 +4608,9 @@ class TestDriftDetectorDivergence:
         assert "merge_sha='mydivergesha'" in esc.detail
         assert "local_runner='local'" in esc.detail
         assert "remote_runner='laptop'" in esc.detail
-        assert 'A remote PASS / local FAIL split can land unverified code on main.' in esc.detail
+        # The operator footnote fires when an arm IS suppressed.  Pinned by the
+        # stable function identifier it names, not by its prose wording.
+        assert 'apply_merge_flake_suppression' in esc.detail
 
     async def test_diverge_escalation_detail_names_local_category(self):
         """The mirror case: both arms are threaded, into the right slots."""
@@ -4685,6 +4639,9 @@ class TestDriftDetectorDivergence:
         esc = escalation_queue.submit.call_args[0][0]
         assert "local_category='test_failure'" in esc.detail
         assert "remote_category=''" in esc.detail
+        # ...and the suppression footnote is omitted entirely, so it never
+        # dilutes the artifact with guidance irrelevant to this divergence.
+        assert 'apply_merge_flake_suppression' not in esc.detail
 
 
 # ---------------------------------------------------------------------------
@@ -4872,25 +4829,6 @@ class TestDriftDetectorInconclusive:
         assert pool.is_quarantined('laptop') is False
 
     # -- task 4188: categories stay empty when nothing was compared --
-
-    async def test_drift_check_result_category_fields_default_empty(self):
-        """Both category fields default to '' — the INCONCLUSIVE contract, made explicit."""
-        from orchestrator.verify_runner import DriftCheckResult, DriftVerdict
-        result = DriftCheckResult(merge_sha='x', verdict=DriftVerdict.INCONCLUSIVE)
-        assert result.local_category == ''
-        assert result.remote_category == ''
-
-    async def test_inconclusive_no_eligible_remote_leaves_categories_empty(self):
-        """No eligible remote → nothing compared → both categories stay ''."""
-        from orchestrator.verify_runner import DriftDetector, DriftVerdict
-        pool, _, _ = _make_drift_pool()
-        pool.quarantine('laptop')
-        assert pool.eligible_remote() is None
-        detector = DriftDetector(pool)
-        result = await detector.check('sha1', _make_spec())
-        assert result.verdict == DriftVerdict.INCONCLUSIVE
-        assert result.local_category == ''
-        assert result.remote_category == ''
 
     async def test_inconclusive_remote_unavailable_leaves_categories_empty(self):
         """Remote transport failure → categories stay ''.
