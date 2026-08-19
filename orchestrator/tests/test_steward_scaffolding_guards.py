@@ -34,7 +34,10 @@ from __future__ import annotations
 
 import ast
 import functools
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
+from typing import NamedTuple
 from unittest.mock import MagicMock
 
 import pytest
@@ -224,9 +227,23 @@ _HELPER_NAME = 'assert_sandboxed_project_root'
 _CANONICAL_OWNER = '_orch_helpers.py'
 
 # A sweep that silently parses nothing reads as "zero recurrences".  The tests
-# tree currently holds ~530 modules (~138 `_orch_helpers` importers alone), so
-# a floor of 100 catches a broken glob without being a churn magnet.
-_MIN_MODULES_SWEPT = 100
+# tree holds 532 parseable modules as of task 3647, so this floor sits ~25%
+# below the real count: close enough that dropping a meaningful fraction of the
+# tree trips it, far enough that ordinary growth and pruning does not.  A floor
+# several times below the real size (this was 100) is nearly as blind as no
+# floor at all — it would have let a glob regression discard 80% of the tree
+# while both liveness tests stayed green.  The tree only grows, so raise this
+# when it drifts; do NOT lower it to silence a failure.
+_MIN_MODULES_SWEPT = 400
+
+# Co-locating the two sweeping tests on one xdist worker was MEASURED and
+# REJECTED, recorded here so it is not re-tried.  `_scan_tests_tree` is a
+# per-PROCESS cache, so an `xdist_group` tag would let the second guard read the
+# first one's parse and halve this module's CPU.  It also SERIALISES the two
+# heaviest tests onto one worker: measured 66s wall for the module grouped vs
+# 44s ungrouped.  The suite runs `-n auto` on a many-core host where the binding
+# constraint is the critical path, not CPU, so the two guards are left free to
+# run in parallel and each pay their own scan.
 
 
 def _mentions(node: ast.AST, name: str) -> bool:
@@ -334,9 +351,22 @@ def _inline_sandbox_asserts(tree: ast.Module) -> list[str]:
     return offenders
 
 
+class _TreeScan(NamedTuple):
+    """The parsed tests tree, plus what the scan could NOT parse.
+
+    ``unparseable`` exists so a module can never vanish from both guards
+    silently: a swallowed ``SyntaxError`` shrinks the swept set, and a shrunken
+    swept set is indistinguishable from "found nothing wrong".  The liveness
+    assertions check it is empty rather than trusting the count alone.
+    """
+
+    modules: tuple[tuple[Path, ast.Module], ...]
+    unparseable: tuple[str, ...]
+
+
 @functools.cache
-def _parsed_modules() -> tuple[tuple[Path, ast.Module], ...]:
-    """``(path, tree)`` for EVERY ``*.py`` under this tests tree, parsed once.
+def _scan_tests_tree() -> _TreeScan:
+    """Read and ``ast.parse`` EVERY ``*.py`` under this tests tree, once.
 
     Deliberately unfiltered: both AST guards in this file sweep from here, and
     each applies its own exclusions at use time.  The recurrence guard drops the
@@ -344,23 +374,35 @@ def _parsed_modules() -> tuple[tuple[Path, ast.Module], ...]:
     helper module could never be silently sanctioned by a shared exclusion it
     was not the subject of.
 
-    Reading and parsing the ~530-module tree costs ~25s, so it is cached for the
-    session.  Modules that will not parse are skipped rather than reported — a
-    syntax error is already its own loud failure everywhere else in the suite,
-    and swallowing it here would misattribute it to a scaffolding guard.
+    COST, and why the consumers are shaped the way they are.  Reading and
+    parsing the 532-module tree is by far the most expensive thing in this file,
+    and it is paid PER PROCESS: under ``pytest-xdist`` a ``functools.cache``
+    buys nothing across workers, so every test that triggers a fresh full-tree
+    scan lands on some worker and pays for it again.  With six sweeping tests
+    that cost the suite ~80s of CPU to compute the same two answers.  Hence:
+    every derived sweep is cached (``_recurrence_swept_modules``,
+    ``_census_by_module``), and each guard exposes ONE test that asserts its
+    offender list, its liveness floor and its exclusions together.  Splitting
+    those assertions back into a test apiece is not free and not more rigorous —
+    it re-triggers the scan on a fresh worker for each one.  Add a case to the
+    detector self-tests (synthetic sources, no scan) instead.
     """
     parsed: list[tuple[Path, ast.Module]] = []
+    unparseable: list[str] = []
     for path in sorted(_TESTS_DIR.rglob('*.py')):
         try:
             parsed.append((path, ast.parse(path.read_text(encoding='utf-8'))))
-        except SyntaxError:  # pragma: no cover - a broken module is its own failure
-            continue
-    return tuple(parsed)
+        except SyntaxError as exc:  # pragma: no cover - asserted on, not swallowed
+            unparseable.append(f'{path.relative_to(_TESTS_DIR)}: {exc}')
+    return _TreeScan(tuple(parsed), tuple(unparseable))
 
 
-def _recurrence_swept_modules() -> list[tuple[Path, ast.Module]]:
+@functools.cache
+def _recurrence_swept_modules() -> tuple[tuple[Path, ast.Module], ...]:
     """Everything the RECURRENCE guard scans: all modules bar the canonical owner."""
-    return [(p, t) for p, t in _parsed_modules() if p.name != _CANONICAL_OWNER]
+    return tuple(
+        (p, t) for p, t in _scan_tests_tree().modules if p.name != _CANONICAL_OWNER
+    )
 
 
 class TestNoInlineSandboxedProjectRootAsserts:
@@ -373,8 +415,38 @@ class TestNoInlineSandboxedProjectRootAsserts:
     """
 
     def test_no_module_reimplements_the_block(self) -> None:
+        """The whole recurrence guard, in ONE full-tree scan.
+
+        Liveness, the canonical-owner exclusion and the offender list are
+        asserted together and IN THAT ORDER, so a broken sweep reports itself as
+        a broken sweep rather than as "zero recurrences".  They are not split
+        into a test apiece on purpose — see ``_scan_tests_tree`` for the cost.
+        """
+        swept = _recurrence_swept_modules()
+
+        # -- liveness first: a sweep that inspects nothing reads as coverage.
+        assert not _scan_tests_tree().unparseable, (
+            f'modules under {_TESTS_DIR} failed to parse and so were silently '
+            f'absent from this sweep — fix them or this guard is blind to them: '
+            f'{list(_scan_tests_tree().unparseable)}'
+        )
+        assert len(swept) >= _MIN_MODULES_SWEPT, (
+            f'the recurrence sweep found only {len(swept)} modules under '
+            f'{_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A guard '
+            f'that parses nothing reports zero recurrences and reads as coverage.'
+        )
+
+        # -- the canonical owner is where the block is SUPPOSED to live.
+        assert (_TESTS_DIR / _CANONICAL_OWNER).is_file(), (
+            f'{_CANONICAL_OWNER} must exist — it owns {_HELPER_NAME}'
+        )
+        assert all(p.name != _CANONICAL_OWNER for p, _ in swept), (
+            f'{_CANONICAL_OWNER} must be excluded: it is the canonical owner of '
+            f'the pattern, so flagging it there would be the guard flagging the fix'
+        )
+
         offenders: list[str] = []
-        for path, tree in _recurrence_swept_modules():
+        for path, tree in swept:
             offenders.extend(
                 f'{path.relative_to(_TESTS_DIR)}::{hit}'
                 for hit in _inline_sandbox_asserts(tree)
@@ -392,31 +464,6 @@ class TestNoInlineSandboxedProjectRootAsserts:
             'is genuinely a different invariant, it should not be matching all '
             "three of this guard's signals — see _inline_sandbox_asserts.\n"
             f'Offenders: {offenders}'
-        )
-
-    def test_the_sweep_is_live(self) -> None:
-        """A broken glob must not pass as "zero recurrences".
-
-        Same failure mode ``test_git_repo_isolation_guard.py`` guards with its
-        session-ceiling liveness assertion: a structural check that silently
-        inspects nothing reads as coverage.
-        """
-        swept = _recurrence_swept_modules()
-
-        assert len(swept) >= _MIN_MODULES_SWEPT, (
-            f'the recurrence sweep found only {len(swept)} modules under '
-            f'{_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A guard '
-            f'that parses nothing reports zero recurrences and reads as coverage.'
-        )
-
-    def test_the_canonical_owner_is_excluded_from_the_sweep(self) -> None:
-        """``_orch_helpers.py`` is where the block is SUPPOSED to live."""
-        assert (_TESTS_DIR / _CANONICAL_OWNER).is_file(), (
-            f'{_CANONICAL_OWNER} must exist — it owns {_HELPER_NAME}'
-        )
-        assert all(p.name != _CANONICAL_OWNER for p, _ in _recurrence_swept_modules()), (
-            f'{_CANONICAL_OWNER} must be excluded: it is the canonical owner of '
-            f'the pattern, so flagging it there would be the guard flagging the fix'
         )
 
     # -- detector self-tests: synthetic sources, so this module never self-trips --
@@ -491,49 +538,85 @@ class TestNoInlineSandboxedProjectRootAsserts:
 # Census guard: DECISION 1 — the steward-construction split is PERMANENT
 # ===========================================================================
 
+class _Sanctioned(NamedTuple):
+    """One adjudicated steward-construction module: how many sites, and why.
+
+    *sites* is deliberately a COUNT, not just a flag.  Sanctioning a module
+    wholesale would pre-approve every FUTURE construction it grows — someone
+    could add a fourth idiom inside an already-listed module and the census
+    would stay green, which is the exact silent appearance this guard exists to
+    stop.  Pinning the count means a new construction in a sanctioned module
+    still trips, and still forces its own adjudication.  Line numbers are
+    deliberately NOT pinned: they churn on every unrelated edit above the site,
+    and the count already carries the signal.
+
+    *reason* is a POINTER, not a restatement.  The ruling itself is owned by
+    ``conftest.make_steward.__doc__`` — the same rationale living in three
+    copies is the drift task 3647 exists to end, and re-stating it here would
+    just re-create it at a fourth address with nothing asserting the copies
+    agree.
+    """
+
+    sites: int
+    reason: str
+
+
 # Every module allowed to construct a steward outside conftest's `make_steward`
-# factory, mapped to the RECORDED REASON it is sanctioned.  This mapping IS the
-# adjudication record: task 3647 ruled the split permanent, and the census below
-# is what makes that ruling checkable rather than one more prose restatement the
-# next consolidation task re-litigates (3461, 3514 and 3551 each wrote it down;
-# each successor re-derived it from scratch anyway).
+# factory, keyed by path RELATIVE TO the tests tree (not basename: the sweep is
+# a full rglob, so basename keys would let a same-named module in a `fixtures/`
+# subdir inherit a sanction it was never adjudicated for).
+#
+# This mapping IS the adjudication record: task 3647 ruled the split permanent,
+# and the census below is what makes that ruling checkable rather than one more
+# prose restatement the next consolidation task re-litigates (3461, 3514 and
+# 3551 each wrote it down; each successor re-derived it from scratch anyway).
 #
 # Adding an entry is a DECISION, not a formality — see the failure message.
-_SANCTIONED_STEWARD_CONSTRUCTION: dict[str, str] = {
-    'conftest.py': (
-        'the canonical `make_steward` fixture-factory itself — the suite\'s one '
-        'steward factory, and the thing every other site should be using'
+_SANCTIONED_STEWARD_CONSTRUCTION: dict[str, _Sanctioned] = {
+    'conftest.py': _Sanctioned(
+        sites=1,
+        reason=(
+            "the canonical `make_steward` fixture-factory itself — the suite's "
+            'one steward factory, and the thing every other site should be using'
+        ),
     ),
-    'test_workflow_escalated_steward_stall.py': (
-        '`_CapFiringSteward`, the PERMANENT exception (examined by task 3551, '
-        'ruled permanent by 3647). Three structural reasons, none removable: it '
-        'is a `TaskSteward` SUBCLASS declared inside `_make_real_steward_factory`, '
-        'whereas `make_steward` returns a constructed `TaskSteward`; its '
-        'construction passes `config_dir=`, which the fixture does not accept; '
-        'and `_make_real_steward_factory` returns a CALLBACK the workflow invokes '
-        'later with a worktree the WORKFLOW chooses, so it cannot request '
-        '`tmp_path` at construction time. It does share the fixture\'s sandboxed '
-        '`project_root` recipe (task 3551), so the invariant is common even '
-        'though the construction is not'
+    'test_workflow_escalated_steward_stall.py': _Sanctioned(
+        # Two sites: the `_CapFiringSteward` subclass declaration, and its
+        # construction inside `_make_real_steward_factory`.
+        sites=2,
+        reason=(
+            '`_CapFiringSteward`: the PERMANENT exception, examined by task 3551 '
+            'and ruled permanent by 3647. Its three structural reasons '
+            '(SUBCLASS / `config_dir=` / late-bound worktree callback) are owned '
+            'by `conftest.make_steward.__doc__` — read them there, do not '
+            'restate them here'
+        ),
     ),
-    'test_verdict_servers_integration_gate.py': (
-        '`_build_steward_for_triage` (:358). It builds a real `TaskSteward` '
-        'against a REAL `OrchestratorConfig` — the module\'s `config` fixture '
-        '(:111), an actual config rooted on the `git_repo` fixture, not a mock — '
-        'and a REAL on-disk meta-root pre-initialized via '
-        '`_artifacts_for(worktree).init(...)` so `_pre_triage_suggestions`\'s '
-        '"meta-root missing" diagnostic branch never fires. `make_steward` '
-        'instead builds `MagicMock(spec_set=pydantic_spec(OrchestratorConfig))` '
-        'and exposes no `config=` passthrough, only a `config_overrides` dict '
-        'applied to that mock. Folding would mean growing the fixture a '
-        'real-config channel serving exactly one consumer — the same shape of '
-        'argument task 3551 used to leave `_make_steward_config` standing. '
-        'This site was added by task 2488, AFTER the 3514 consolidation, and was '
-        'never examined by the 3461→3514→3551 lineage; this census is what '
-        'surfaced it. Whether `make_steward` should grow that `config=` '
-        'passthrough is deliberately left open, and is filed as a follow-up '
-        '(ticket tkt_0RSMX59FSJ27QWSS9VKBYRFMFG, from task 3647) rather than '
-        'decided here — task 3647 owned the ADJUDICATION, not the redesign'
+    'test_verdict_servers_integration_gate.py': _Sanctioned(
+        sites=1,
+        reason=(
+            '`_build_steward_for_triage`: builds a real `TaskSteward` against a '
+            'REAL `OrchestratorConfig` and a real on-disk meta-root, which '
+            "`make_steward`'s `spec_set` MagicMock cannot supply. Rationale and "
+            'the 2488-postdates-3514 history are owned by '
+            '`conftest.make_steward.__doc__`; whether `make_steward` should grow '
+            'a `config=` passthrough is left open and filed as ticket '
+            'tkt_0RSMX59FSJ27QWSS9VKBYRFMFG (task 3647 owned the ADJUDICATION, '
+            'not the redesign)'
+        ),
+    ),
+    'test_workflow_e2e.py': _Sanctioned(
+        sites=1,
+        reason=(
+            'a known FALSE POSITIVE of the suffix rule, and the worked example '
+            'of its cost. `_SpyStewardFactory.Steward()` is a nested STUB class '
+            'that merely ends in `Steward`; it subclasses nothing and is not a '
+            '`TaskSteward` at all, so there is no factory to fold it onto. It is '
+            'adjudicated here rather than special-cased in the detector because '
+            'the rule matches by NAME and any type-aware exclusion would have to '
+            'resolve imports — see `_steward_construction_sites` for why that '
+            'trade is deliberate'
+        ),
     ),
 }
 
@@ -541,28 +624,50 @@ _SANCTIONED_STEWARD_CONSTRUCTION: dict[str, str] = {
 def _steward_construction_sites(tree: ast.Module) -> list[str]:
     """Steward constructions in *tree*: ``<lineno> (<what>)`` for each.
 
-    Two shapes, both structural:
+    Three shapes, all structural:
 
     * an ``ast.Call`` whose func is an ``ast.Name`` ending in ``Steward``
       (``TaskSteward(...)``, ``_CapFiringSteward(...)``);
+    * an ``ast.Call`` whose func is an ``ast.Attribute`` whose ``.attr`` ends in
+      ``Steward`` (``harness.TaskSteward(...)``, ``_SpyStewardFactory.Steward()``).
+      Matching only the Name form would leave the attribute form invisible, so a
+      fourth idiom could appear silently through a module-qualified or nested
+      name — exactly what this census exists to prevent;
     * an ``ast.ClassDef`` with a base ending in ``Steward`` — a subclass is a
       second steward SHAPE even before it is instantiated, and the standing
-      exception is exactly that.
+      exception is exactly that.  Both the Name and Attribute base forms count,
+      which is why the Call branch has to handle both too: the asymmetry would
+      be an oversight, not a decision.
 
-    The suffix rule is what keeps this cheap and stable: ``make_steward``
-    (lowercase ``s``) does NOT match, so the canonical factory's ~250 call sites
-    are correctly not swept in, and neither are ``isinstance(x, TaskSteward)``
-    or a ``-> TaskSteward`` annotation (a Name outside any call).  Only genuine
-    constructions and subclass declarations land here.
+    The rule matches by NAME, and that cuts BOTH ways.  Recording both
+    directions, because a reader who knows only one will "simplify" the other
+    away:
+
+    * FALSE NEGATIVES, all deliberate — ``make_steward`` (lowercase ``s``) does
+      not match, so the canonical factory's ~250 call sites are correctly not
+      swept in, which is what keeps this rule cheap and stable; nor does
+      ``isinstance(x, TaskSteward)`` or a ``-> TaskSteward`` annotation, since a
+      bare Name outside a call is not a construction.  A steward built through
+      an alias (``S = TaskSteward; S(...)``) or a factory-returned class would
+      also slip through; nothing in the tree does that today.
+    * FALSE POSITIVES — any identifier ending in ``Steward``, called anywhere,
+      matches even when it is not a ``TaskSteward``. ``test_workflow_e2e.py``'s
+      ``_SpyStewardFactory.Steward()`` is a live instance: a nested stub class
+      that subclasses nothing.  Discriminating by TYPE rather than name would
+      mean resolving imports across the tree, which is a far more fragile rule
+      than an allowlist entry; so the trade is to accept the false positive and
+      adjudicate it, which costs one line and leaves a record.
     """
     sites: list[str] = []
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id.endswith('Steward')
-        ):
-            sites.append(f'{node.lineno} (constructs {node.func.id})')
+        if isinstance(node, ast.Call):
+            called = (
+                node.func.id if isinstance(node.func, ast.Name)
+                else node.func.attr if isinstance(node.func, ast.Attribute)
+                else None
+            )
+            if called is not None and called.endswith('Steward'):
+                sites.append(f'{node.lineno} (constructs {called})')
         if isinstance(node, ast.ClassDef):
             for base in node.bases:
                 name = (
@@ -575,40 +680,72 @@ def _steward_construction_sites(tree: ast.Module) -> list[str]:
     return sites
 
 
-def _census_by_module() -> dict[str, list[str]]:
-    """``{module basename: [site, ...]}`` for every module that builds a steward."""
-    census: dict[str, list[str]] = {}
-    for path, tree in _parsed_modules():
+@functools.cache
+def _census_by_module() -> Mapping[str, tuple[str, ...]]:
+    """``{module path relative to the tests tree: (site, ...)}``, computed once.
+
+    Cached, and returned read-only, because the full-tree walk is the expensive
+    half of this module: see ``_scan_tests_tree`` for the cost and for why the
+    tests that consume this are collapsed rather than split.
+    """
+    census: dict[str, tuple[str, ...]] = {}
+    for path, tree in _scan_tests_tree().modules:
         sites = _steward_construction_sites(tree)
         if sites:
-            census[path.name] = sites
-    return census
+            census[str(path.relative_to(_TESTS_DIR))] = tuple(sites)
+    return MappingProxyType(census)
 
 
 class TestStewardConstructionSitesAreCensused:
     """Every steward built outside ``make_steward`` is sanctioned, with a reason.
 
-    DECISION 1 of task 3647: the steward-construction split is PERMANENT, not
-    something a future task should fold.  Nothing remains to fold — task 3514
-    already absorbed ``test_steward.py``'s five-fixture graph and
-    ``test_out_of_band_routing.py``'s builder — and the one standing exception
-    cannot fold for three structural reasons.
+    This is the ENFORCEMENT of DECISION 1 — the ruling that the
+    steward-construction split is permanent.  The ruling itself, and every
+    structural reason behind it, is owned by ``conftest.make_steward.__doc__``
+    and is deliberately not restated here or in the allowlist below; the module
+    docstring above records why the lineage's prose kept failing.
 
-    Recording that in prose is what 3461, 3514 and 3551 each already did, and it
-    was re-litigated every time; that is the evidence prose alone does not hold.
-    A census turns it into an invariant with teeth in BOTH directions: a fourth
-    idiom cannot appear silently, and its author must either use the factory or
-    write down why they cannot — which is the adjudication this lineage kept
-    having to redo from scratch.
+    What the census adds is teeth in BOTH directions: a new construction cannot
+    appear silently, and its author must either use the factory or write down
+    why they cannot — the adjudication 3461, 3514 and 3551 each had to redo from
+    scratch.
     """
 
     def test_every_steward_construction_site_is_sanctioned(self) -> None:
+        """The whole census, in ONE full-tree scan.
+
+        Liveness, the unsanctioned-module check, the per-module site COUNT and
+        allowlist staleness are asserted together and in that order: a census
+        that read nothing sanctions everything, so it must report itself as
+        broken before it reports "all clear".  Not split into a test apiece on
+        purpose — see ``_scan_tests_tree`` for the cost.
+        """
+        census = _census_by_module()
+
+        # -- liveness first, in both directions: did we read the tree, and does
+        #    the detector still match anything at all?
+        assert not _scan_tests_tree().unparseable, (
+            f'modules under {_TESTS_DIR} failed to parse and so were silently '
+            f'absent from this census — a module that cannot be read cannot be '
+            f'censused: {list(_scan_tests_tree().unparseable)}'
+        )
+        assert len(_scan_tests_tree().modules) >= _MIN_MODULES_SWEPT, (
+            f'the census parsed only {len(_scan_tests_tree().modules)} modules '
+            f'under {_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A '
+            f'census that reads nothing sanctions everything.'
+        )
+        assert census, (
+            'the census found NO steward construction anywhere, not even '
+            "conftest.py's `make_steward` — the detector has stopped matching, "
+            'so this guard is vacuously green'
+        )
+
+        # -- a module nobody has adjudicated at all.
         unsanctioned = {
             module: sites
-            for module, sites in _census_by_module().items()
+            for module, sites in census.items()
             if module not in _SANCTIONED_STEWARD_CONSTRUCTION
         }
-
         assert not unsanctioned, (
             'Unsanctioned steward-construction site(s).\n'
             'This suite has ONE steward factory: the `make_steward` fixture in '
@@ -620,26 +757,46 @@ class TestStewardConstructionSitesAreCensused:
             'rather than adding a factory beside it; or\n'
             '  (b) if it structurally cannot fold, add the module to '
             '_SANCTIONED_STEWARD_CONSTRUCTION in this file with the REASON '
-            'recorded, the way the standing exception is recorded there. That '
+            'recorded, the way the standing exceptions are recorded there. That '
             'adjudication is this guard\'s whole purpose — an entry with no '
             'reason defeats it.\n'
-            f'Unsanctioned: {unsanctioned}'
+            f'Unsanctioned: {dict(unsanctioned)}'
         )
 
-    def test_the_census_is_live(self) -> None:
-        """A broken glob must not pass as "every site is sanctioned"."""
-        assert len(_parsed_modules()) >= _MIN_MODULES_SWEPT, (
-            f'the census parsed only {len(_parsed_modules())} modules under '
-            f'{_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A census '
-            f'that reads nothing sanctions everything.'
-        )
-        assert _census_by_module(), (
-            'the census found NO steward construction anywhere, not even '
-            "conftest.py's `make_steward` — the detector has stopped matching, "
-            'so this guard is vacuously green'
+        # -- a NEW site inside an already-sanctioned module. Sanctioning a
+        #    module wholesale would pre-approve it, which is the same silent
+        #    appearance one directory over.
+        miscounted = {
+            module: (sites, _SANCTIONED_STEWARD_CONSTRUCTION[module].sites)
+            for module, sites in census.items()
+            if len(sites) != _SANCTIONED_STEWARD_CONSTRUCTION[module].sites
+        }
+        assert not miscounted, (
+            'Steward-construction site COUNT changed in an already-sanctioned '
+            'module.\n'
+            'The allowlist sanctions a fixed number of sites per module, not the '
+            'module wholesale, precisely so a new construction added beside a '
+            'sanctioned one still has to be adjudicated rather than inheriting '
+            "its neighbour's sanction.\n"
+            'Fix: fold the new site onto `make_steward`, or bump the module\'s '
+            '`sites=` count and extend its `reason` to cover what you added. If '
+            'the count went DOWN, a site was folded or removed — lower the count '
+            'to match, so the entry keeps its teeth.\n'
+            f'{{module: (found, sanctioned)}}: {miscounted}'
         )
 
-    def test_the_detector_matches_both_construction_shapes(self) -> None:
+        # -- an entry naming a module that no longer builds a steward is rot: it
+        #    silently pre-sanctions whatever that module does next. Same shape as
+        #    `test_git_repo_isolation_guard.py`'s check that every
+        #    `_SELF_INITIALISING_HELPERS` entry still names a live helper.
+        stale = sorted(set(_SANCTIONED_STEWARD_CONSTRUCTION) - set(census))
+        assert not stale, (
+            f'_SANCTIONED_STEWARD_CONSTRUCTION names {stale}, which no longer '
+            f'construct a steward. Remove the entries — a stale sanction '
+            f'pre-approves whatever that module builds next, unexamined.'
+        )
+
+    def test_the_detector_matches_all_three_construction_shapes(self) -> None:
         """Self-test over synthetic source: a detector that silently stops
         matching reads as coverage.  Kept in string literals so the census
         scanning this module does not self-trip."""
@@ -657,6 +814,23 @@ class TestStewardConstructionSitesAreCensused:
         assert any('subclasses TaskSteward' in site for site in sites), sites
         assert any('constructs TaskSteward' in site for site in sites), sites
 
+    def test_the_detector_matches_an_attribute_form_construction(self) -> None:
+        """The third shape, and the reason it is not optional: matching only the
+        bare-Name call would let a module-qualified or nested construction —
+        ``harness.TaskSteward(...)``, ``_Factory.Steward()`` — appear silently,
+        which is exactly what this census exists to prevent.  A live instance
+        exists in the tree (``test_workflow_e2e.py``), so this is not
+        hypothetical."""
+        tree = ast.parse(
+            'def _build(worktree):\n'
+            '    return harness.TaskSteward(task_id="1", worktree=worktree)\n'
+        )
+
+        sites = _steward_construction_sites(tree)
+
+        assert len(sites) == 1, sites
+        assert 'constructs TaskSteward' in sites[0], sites
+
     def test_the_detector_ignores_the_canonical_factory_and_non_constructions(self) -> None:
         """Negative self-test: ``make_steward`` is lowercase and must not match,
         nor must a type annotation or an ``isinstance`` check that merely NAMES
@@ -670,17 +844,21 @@ class TestStewardConstructionSitesAreCensused:
 
         assert _steward_construction_sites(tree) == []
 
-    def test_no_allowlist_entry_is_stale(self) -> None:
-        """An entry naming a module that no longer builds a steward is rot: it
-        silently pre-sanctions whatever that module does next.  Same shape as
-        ``test_git_repo_isolation_guard.py``'s check that every
-        ``_SELF_INITIALISING_HELPERS`` entry still names a live helper.
-        """
-        census = _census_by_module()
-        stale = sorted(set(_SANCTIONED_STEWARD_CONSTRUCTION) - set(census))
+    def test_every_allowlist_entry_records_a_reason(self) -> None:
+        """An entry with no reason is a rubber stamp, and defeats the guard.
 
-        assert not stale, (
-            f'_SANCTIONED_STEWARD_CONSTRUCTION names {stale}, which no longer '
-            f'construct a steward. Remove the entries — a stale sanction '
-            f'pre-approves whatever that module builds next, unexamined.'
+        Cheap enough to keep separate — it reads the allowlist literal, not the
+        tree.
+        """
+        reasonless = sorted(
+            module
+            for module, entry in _SANCTIONED_STEWARD_CONSTRUCTION.items()
+            if len(entry.reason.split()) < 5 or entry.sites < 1
+        )
+
+        assert not reasonless, (
+            f'_SANCTIONED_STEWARD_CONSTRUCTION entries {reasonless} carry no '
+            f'usable reason or a non-positive site count. The recorded reason IS '
+            f'the adjudication this census exists to force; an entry without one '
+            f'is a rubber stamp.'
         )
