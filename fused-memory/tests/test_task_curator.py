@@ -6529,7 +6529,7 @@ class TestPerProjectLockDepth:
         clear_lock_depth_cache()
 
     @staticmethod
-    def _write_snapshot(root: Path, depth=_NO_LOCK_DEPTH_KEY):
+    def _write_snapshot(root: Path, depth: object = _NO_LOCK_DEPTH_KEY) -> None:
         """Write a scheduler snapshot under ``root``.
 
         ``depth`` is written verbatim — including an explicit JSON ``null``.
@@ -6542,7 +6542,11 @@ class TestPerProjectLockDepth:
         """
         d = root / 'data' / 'orchestrator'
         d.mkdir(parents=True, exist_ok=True)
-        body = {'parks': {}, 'current_holders': {}}
+        # dict[str, object] is required, not cosmetic: the seed value infers as
+        # dict[str, dict[...]], and ``depth`` is deliberately typed ``object``
+        # so the sentinel and the unusable values (0, -1, True, '12', 4.0,
+        # None) can all be written verbatim.
+        body: dict[str, object] = {'parks': {}, 'current_holders': {}}
         if depth is not _NO_LOCK_DEPTH_KEY:
             body['lock_depth'] = depth
         (d / 'scheduler_state.json').write_text(json.dumps(body))
