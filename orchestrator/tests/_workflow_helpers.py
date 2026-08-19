@@ -236,10 +236,15 @@ class FakeMetadataBackend:
     persists nothing — this fake keeps a real ``blob`` and models BOTH:
 
     - fused-memory's #1827 ``metadata_mode`` contract, with the same precedence
-      ``Scheduler.update_task`` resolves (scheduler.py:3793-3799):
-      ``metadata_mode`` > ``append=True`` -> ``'additive'`` > ``'merge'``, and
-      the same per-mode semantics ``_merge_metadata`` implements
-      (sqlite_task_backend.py:3301) — ``'merge'`` shallow last-write-wins
+      ``Scheduler.update_task`` resolves (scheduler.py:4289-4310):
+      ``metadata_mode`` > ``append=True`` -> ``'additive'`` > ``'merge'``, with
+      the same ONE carve-out — ``metadata_mode='merge'`` alongside
+      ``append=True`` is **rejected** as a contradiction rather than silently
+      letting 'merge' win and shallow-clobber nested keys (task 3890); the other
+      combinations are honored, ``('replace', True)`` -> ``'replace'`` and
+      ``('additive', True)`` -> ``'additive'``.  It models the same per-mode
+      semantics ``_merge_metadata`` implements
+      (sqlite_task_backend.py:3378) — ``'merge'`` shallow last-write-wins
       (supplied keys overwrite wholesale, omitted keys preserved),
       ``'replace'`` whole-blob overwrite, ``'additive'`` recursive list
       union+dedup / dict-recursive / scalar OLD-wins (see
@@ -248,10 +253,11 @@ class FakeMetadataBackend:
       ``_METADATA_MODES`` too.
     - the scheduler-side ``metadata.files`` persist that
       ``handle_blast_radius_expansion(persist_files=...)`` performs via
-      ``Scheduler._persist_files_metadata`` (scheduler.py:6890),
-      ``merged = {**fresh_md, 'files': sanitize_files_for_persist(files)}`` —
-      on BOTH the successful-refinement branch (scheduler.py:6974) and the
-      lock-conflict/requeue branch (scheduler.py:7023, task 2868).  The only
+      ``Scheduler._persist_files_metadata`` (scheduler.py:7636),
+      ``merged = {**fresh_md, 'files': honest}`` (scheduler.py:7672, where
+      ``honest = sanitize_files_for_persist(files)``) — called on BOTH the
+      successful-refinement branch (scheduler.py:7779) and the
+      lock-conflict/requeue branch (scheduler.py:7828, task 2868).  The only
       non-persist path is the no-op early return when the depth-normalised
       module set is unchanged, modelled here too.
 
@@ -294,6 +300,22 @@ class FakeMetadataBackend:
         append: bool = False,
         metadata_mode: str | None = None,
     ) -> bool:
+        # Mirror Scheduler.update_task's contradictory-pair guard (task 3890):
+        # 'merge' is shallow last-write-wins while append=True means 'additive'
+        # (recursive union), so the pair asks for two incompatible resolutions
+        # of one write.  Raise BEFORE recording the call or touching self.blob —
+        # a refused write must leave backend state untouched and must not read
+        # back as "a write happened", matching the production guard, which
+        # refuses before anything reaches the wire.
+        if metadata_mode == 'merge' and append is True:
+            raise ValueError(
+                "Refusing a contradictory metadata_mode='merge' + append=True "
+                'update_task call: append=True asks for the ADDITIVE recursive '
+                "union merge while metadata_mode='merge' asks for a SHALLOW "
+                "last-write-wins overwrite.  Pass metadata_mode='additive' (or "
+                'append=True alone) to UNION nested fields, or drop append=True '
+                'to CONFIRM a shallow overwrite.  Mirrors Scheduler.update_task.'
+            )
         self.update_task_calls.append({
             'task_id': task_id,
             'metadata': metadata,
@@ -301,7 +323,8 @@ class FakeMetadataBackend:
             'metadata_mode': metadata_mode,
         })
         payload = json.loads(metadata) if isinstance(metadata, str) else (metadata or {})
-        # Mirror Scheduler.update_task's precedence exactly.
+        # Mirror Scheduler.update_task's precedence exactly — modulo the
+        # merge+append=True cell rejected by the guard above.
         if metadata_mode is not None:
             effective = metadata_mode
         elif append:
