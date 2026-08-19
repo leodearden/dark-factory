@@ -387,13 +387,29 @@ class TTLCache(Generic[V]):
           only resident memory.
         * CONCURRENTLY — this method is fully synchronous, so it runs to
           completion without yielding to another coroutine, and a lock is
-          dropped only when ``locked()`` is False. A coroutine that has taken
-          a lock object from ``_locks`` reaches ``lock.acquire()`` with no
-          intervening await (see ``get_or_refresh``), so it cannot be
-          suspended between ``setdefault`` and holding the lock. Any lock a
-          caller is actually using therefore reads as locked here, and only
-          genuinely idle ones are removed. Dropping an idle lock is safe
-          regardless: the next caller for that key simply creates a new one.
+          dropped only when it is neither held nor awaited. A coroutine that
+          has taken a lock object from ``_locks`` reaches ``lock.acquire()``
+          with no intervening await (see ``get_or_refresh``), so it cannot be
+          suspended between ``setdefault`` and entering ``acquire()``.
+
+          ``locked()`` alone would NOT be enough, which is why the predicate
+          below also checks for waiters. ``asyncio.Lock.release()`` clears
+          its ``_locked`` flag and merely SCHEDULES the first waiter's
+          future; between that release and the waiter's task actually
+          resuming, ``locked()`` reads False while a queued waiter is very
+          much still using the lock. A sweep landing in that window — reached
+          on any cold miss, and the key is absent from ``_store`` exactly
+          during an outage, since ``cache_ok`` stores nothing then — would
+          otherwise drop the lock, the next caller would ``setdefault`` a
+          fresh one, and the two would refresh concurrently.
+
+          The waiter probe reads ``asyncio.Lock``'s private ``_waiters``
+          defensively via ``getattr``: if a future CPython drops the
+          attribute, the predicate degrades to the ``locked()``-only test and
+          the cost is at most one duplicate refresh in that narrow window —
+          never corruption, and never a wrong value (the two refreshes write
+          the same key). Dropping a genuinely idle lock is safe regardless:
+          the next caller for that key simply creates a new one.
         """
         horizon = self._ttl_fn() * self._EVICTION_TTL_MULTIPLE
         now = time.monotonic()
@@ -401,8 +417,16 @@ class TTLCache(Generic[V]):
         for key in stale:
             del self._store[key]
         # A lock still guarding a live entry is kept, so single-flight for an
-        # actively-used key is never disturbed by a sweep.
-        for key in [k for k, lk in self._locks.items() if k not in self._store and not lk.locked()]:
+        # actively-used key is never disturbed by a sweep.  ``_waiters`` covers
+        # the released-but-not-yet-resumed window in which ``locked()`` lies —
+        # see the docstring.
+        idle = [
+            k for k, lk in self._locks.items()
+            if k not in self._store
+            and not lk.locked()
+            and not getattr(lk, '_waiters', None)
+        ]
+        for key in idle:
             del self._locks[key]
         return len(stale)
 

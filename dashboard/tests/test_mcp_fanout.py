@@ -871,3 +871,62 @@ class TestTTLCacheEvictsExpiredKeys:
 async def _four_hundred_rows() -> list:
     """Stand-in for a terminal-window page: 400 rows carrying heavy fields."""
     return [{'id': i, 'description': 'x' * 64} for i in range(400)]
+
+
+class TestTTLCacheKeepsLocksWithQueuedWaiters:
+    """A lock with a queued waiter survives a sweep (task 3857 amendment).
+
+    ``_evict_expired`` used to drop any lock whose ``locked()`` read False and
+    whose key was absent from ``_store``. ``asyncio.Lock.release()`` clears
+    ``_locked`` and merely SCHEDULES the first waiter's future, so between the
+    release and the waiter actually resuming there is a real window in which a
+    lock in active use reads as idle. The key is absent from ``_store`` during
+    exactly the case that matters — an outage, where ``cache_ok`` stores
+    nothing — so a concurrent cold miss sweeping in that window would delete
+    the lock, the next caller would mint a fresh one, and single-flight would
+    be silently lost.
+    """
+
+    async def test_released_but_not_yet_resumed_lock_is_not_reclaimed(self):
+        cache: TTLCache[list] = TTLCache(ttl_seconds=lambda: 20.0)
+
+        lock = cache._locks.setdefault('hot-key', asyncio.Lock())
+        await lock.acquire()
+        waiter = asyncio.create_task(lock.acquire())
+        await asyncio.sleep(0)  # let the waiter reach acquire() and queue
+        assert lock.locked()
+
+        lock.release()  # schedules the waiter; does NOT resume it yet
+
+        # The precise window the old predicate could not see.
+        assert not lock.locked(), 'precondition: release() clears the flag'
+        assert getattr(lock, '_waiters', None), 'precondition: a waiter is queued'
+        assert 'hot-key' not in cache._store, 'precondition: nothing cacheable stored'
+
+        cache._evict_expired()
+
+        assert 'hot-key' in cache._locks, (
+            'a lock with a queued waiter must survive the sweep — dropping it '
+            'lets the next caller mint a second lock and refresh concurrently '
+            'with the waiter'
+        )
+        assert cache._locks['hot-key'] is lock, (
+            'the surviving lock must be the SAME object the waiter is queued on'
+        )
+
+        await waiter
+        lock.release()
+
+    async def test_a_genuinely_idle_lock_is_still_reclaimed(self):
+        """The waiter probe must not turn the sweep into a no-op."""
+        cache: TTLCache[list] = TTLCache(ttl_seconds=lambda: 20.0)
+
+        idle = cache._locks.setdefault('cold-key', asyncio.Lock())
+        assert not idle.locked()
+        assert not getattr(idle, '_waiters', None)
+
+        cache._evict_expired()
+
+        assert 'cold-key' not in cache._locks, (
+            'an unheld, unawaited lock for an absent key is still reclaimable'
+        )
