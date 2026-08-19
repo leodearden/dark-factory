@@ -444,12 +444,23 @@ def is_transient_rejection(rejection: str | None) -> bool:
     return any(name in rejection for name in TRANSIENT_ERROR_TYPES)
 
 
-# Marker produced solely by shared.cli_invoke.classify_agent_failure for
-# AgentFailureKind.API_ERROR (cli_invoke.py:362-366).  The planning and
-# execution phases write it into block_reason (workflow.py:2222/2298);
-# _run_simple_task (workflow.py:2599) uses it only as an internal REQUEUED
-# fall-through sentinel and does NOT write block_reason directly — that is
-# done later by the architect phase (workflow.py:2222/2298).
+# LEGACY FALLBACK ONLY as of task 3315 (PRD contract C2).  The PRIMARY
+# transient-routing signal is now the STRUCTURED ``api_error_status`` field,
+# threaded ``TerminalReport -> TaskReport -> Scheduler.record_requeue`` and
+# checked first by ``is_transient_api_requeue`` (INV-1 "structured field over
+# regex").  This regex survives only for reasons produced by phases that do
+# not yet carry the field — the producers land in the sibling PRD tasks γ
+# (execute), η (review) and θ (planning/simple_task) — and it is the one and
+# only site that still parses the marker.
+#
+# The marker itself is produced solely by
+# ``shared.cli_invoke.classify_agent_failure`` (its 5xx rule and its generic
+# ``api_error_status`` rule).  PLANNING is its sole producer in a block reason
+# today: the architect path writes it via ``_mark_blocked('Planning failed:
+# ...')`` and ``_handle_no_plan_failure``.  The EXECUTE phase never calls
+# ``classify_agent_failure`` at all (PRD background §3), and
+# ``_run_simple_task`` uses the classification only as an internal REQUEUED
+# fall-through sentinel — it does not write block_reason.
 _API_ERROR_REASON_RE = re.compile(r'agent API error: HTTP (\d{3})')
 
 
