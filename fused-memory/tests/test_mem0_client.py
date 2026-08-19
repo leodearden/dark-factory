@@ -476,6 +476,112 @@ class TestMem0BackendPayloadFilterSingleHome:
         with pytest.raises(ValueError, match='at least one filter'):
             backend._build_payload_filter({})
 
+    # -- the optional text-needle arm (task 3682) --------------------------
+    #
+    # ``scan_payload_text`` built its own ``Filter(must=[...], should=[...])``
+    # inline, so the "one construction site" claim held for three of the four
+    # metadata-addressed reads and quietly excluded the fourth.  Folding its
+    # needle prefilter in as an optional ``should`` arm is what makes the
+    # cross-method equality below provable at that entry point too.
+
+    def test_text_needles_build_matchtext_should_conditions_in_order(self, backend):
+        """One FieldCondition(key='data', MatchText) per needle, in call order.
+
+        MatchText (not MatchValue) is load-bearing: MatchValue is exact
+        equality on the whole field and can never find a fragment embedded in
+        a longer memory.
+        """
+        from qdrant_client.http import models as qmodels
+
+        built = backend._build_payload_filter({}, text_needles=['alpha', 'beta'])
+
+        assert isinstance(built, qmodels.Filter)
+        assert isinstance(built.should, list)
+        assert len(built.should) == 2
+        conds = [c for c in built.should if isinstance(c, qmodels.FieldCondition)]
+        assert len(conds) == 2
+        assert [c.key for c in conds] == ['data', 'data']
+        for cond, needle in zip(conds, ['alpha', 'beta'], strict=True):
+            assert isinstance(cond.match, qmodels.MatchText)
+            assert cond.match.text == needle
+
+    def test_filters_and_needles_populate_both_arms_of_one_filter(self, backend):
+        """A narrowed prefilter scan is ONE Filter: must AND-ed, should OR-ed."""
+        from qdrant_client.http import models as qmodels
+
+        built = backend._build_payload_filter(
+            {'category': 'procedural_knowledge'}, text_needles=['alpha']
+        )
+
+        assert isinstance(built.must, list) and len(built.must) == 1
+        must_cond = built.must[0]
+        assert isinstance(must_cond, qmodels.FieldCondition)
+        assert must_cond.key == 'category'
+        assert isinstance(must_cond.match, qmodels.MatchValue)
+        assert must_cond.match.value == 'procedural_knowledge'
+
+        assert isinstance(built.should, list) and len(built.should) == 1
+        should_cond = built.should[0]
+        assert isinstance(should_cond, qmodels.FieldCondition)
+        assert should_cond.key == 'data'
+        assert isinstance(should_cond.match, qmodels.MatchText)
+        assert should_cond.match.text == 'alpha'
+
+    def test_an_unused_arm_is_omitted_not_emitted_empty(self, backend):
+        """OMIT an unused arm; never emit ``[]``.
+
+        This is what makes the cross-method anti-drift equality provable.  A
+        live probe (qdrant 1.17.1) measured that ``Filter(must=[c])`` and
+        ``Filter(must=[c], should=[])`` select the SAME points — an empty arm
+        is a server-side no-op, so this is not a live selection bug.  But
+        qdrant models are pydantic, and ``Filter(must=[c]) ==
+        Filter(must=[c], should=[])`` is **False** under structural equality.
+        So a builder that emitted ``should=[]`` could never be asserted equal
+        to what ``count_by_metadata`` hands Qdrant, and the single-home claim
+        would stay untestable at the scan entry point.
+        """
+        filters_only = backend._build_payload_filter({'k': 'v'})
+        assert filters_only.should is None, (
+            'an unused should arm must be omitted, not emitted as []; '
+            f'got {filters_only.should!r}'
+        )
+
+        needles_only = backend._build_payload_filter({}, text_needles=['alpha'])
+        assert needles_only.must is None, (
+            'an unused must arm must be omitted, not emitted as []; '
+            f'got {needles_only.must!r}'
+        )
+
+    def test_needles_only_is_allowed_and_does_not_raise(self, backend):
+        """A prefilter scan with no metadata narrowing is a legitimate call.
+
+        The empty-input guard rejects "no filters AND no needles", not "no
+        filters" — a ``should``-only Filter still selects a proper subset of
+        the collection, so the guard's whole-collection rationale does not
+        apply to it.
+        """
+        from qdrant_client.http import models as qmodels
+
+        built = backend._build_payload_filter({}, text_needles=['alpha'])
+
+        assert isinstance(built, qmodels.Filter)
+        assert built.should and len(built.should) == 1
+
+    @pytest.mark.parametrize(
+        ('filters', 'needles'),
+        [({}, None), ({}, []), (None, None), (None, [])],
+        ids=['empty-none', 'empty-empty', 'none-none', 'none-empty'],
+    )
+    def test_both_arms_empty_still_raises_value_error(self, backend, filters, needles):
+        """Two empty arms is still an unfiltered whole-collection select.
+
+        The message keeps the ``at least one filter`` substring the existing
+        ``test_empty_filters_raises_value_error`` matches on, so widening the
+        guard cannot silently retire that assertion.
+        """
+        with pytest.raises(ValueError, match='at least one filter'):
+            backend._build_payload_filter(filters, text_needles=needles)
+
 
 def _paging_client(pages: list[tuple[list, object]]) -> AsyncMock:
     """AsyncMock Qdrant client whose scroll() replays a scripted sequence of
