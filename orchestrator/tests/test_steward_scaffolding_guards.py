@@ -285,31 +285,33 @@ def _inline_sandbox_asserts(tree: ast.Module) -> list[str]:
     return offenders
 
 
-def _swept_modules() -> list[Path]:
-    """Every ``*.py`` under this tests tree except the canonical owner."""
-    return [
-        p for p in sorted(_TESTS_DIR.rglob('*.py'))
-        if p.name != _CANONICAL_OWNER
-    ]
-
-
 @functools.cache
-def _parsed_swept_modules() -> tuple[tuple[Path, ast.Module], ...]:
-    """``(path, tree)`` for every swept module, parsed ONCE per session.
+def _parsed_modules() -> tuple[tuple[Path, ast.Module], ...]:
+    """``(path, tree)`` for EVERY ``*.py`` under this tests tree, parsed once.
 
-    Reading and parsing the ~530-module tree costs ~25s, and both AST guards in
-    this file sweep the same set; caching keeps the second one free.  Modules
-    that will not parse are skipped rather than reported — a syntax error is
-    already its own loud failure everywhere else in the suite, and swallowing it
-    here would misattribute it to a scaffolding guard.
+    Deliberately unfiltered: both AST guards in this file sweep from here, and
+    each applies its own exclusions at use time.  The recurrence guard drops the
+    canonical owner; the census guard drops nothing, so a steward built in a
+    helper module could never be silently sanctioned by a shared exclusion it
+    was not the subject of.
+
+    Reading and parsing the ~530-module tree costs ~25s, so it is cached for the
+    session.  Modules that will not parse are skipped rather than reported — a
+    syntax error is already its own loud failure everywhere else in the suite,
+    and swallowing it here would misattribute it to a scaffolding guard.
     """
     parsed: list[tuple[Path, ast.Module]] = []
-    for path in _swept_modules():
+    for path in sorted(_TESTS_DIR.rglob('*.py')):
         try:
             parsed.append((path, ast.parse(path.read_text(encoding='utf-8'))))
         except SyntaxError:  # pragma: no cover - a broken module is its own failure
             continue
     return tuple(parsed)
+
+
+def _recurrence_swept_modules() -> list[tuple[Path, ast.Module]]:
+    """Everything the RECURRENCE guard scans: all modules bar the canonical owner."""
+    return [(p, t) for p, t in _parsed_modules() if p.name != _CANONICAL_OWNER]
 
 
 class TestNoInlineSandboxedProjectRootAsserts:
@@ -323,7 +325,7 @@ class TestNoInlineSandboxedProjectRootAsserts:
 
     def test_no_module_reimplements_the_block(self) -> None:
         offenders: list[str] = []
-        for path, tree in _parsed_swept_modules():
+        for path, tree in _recurrence_swept_modules():
             offenders.extend(
                 f'{path.relative_to(_TESTS_DIR)}::{hit}'
                 for hit in _inline_sandbox_asserts(tree)
@@ -350,7 +352,7 @@ class TestNoInlineSandboxedProjectRootAsserts:
         session-ceiling liveness assertion: a structural check that silently
         inspects nothing reads as coverage.
         """
-        swept = _swept_modules()
+        swept = _recurrence_swept_modules()
 
         assert len(swept) >= _MIN_MODULES_SWEPT, (
             f'the recurrence sweep found only {len(swept)} modules under '
@@ -363,7 +365,7 @@ class TestNoInlineSandboxedProjectRootAsserts:
         assert (_TESTS_DIR / _CANONICAL_OWNER).is_file(), (
             f'{_CANONICAL_OWNER} must exist — it owns {_HELPER_NAME}'
         )
-        assert all(p.name != _CANONICAL_OWNER for p in _swept_modules()), (
+        assert all(p.name != _CANONICAL_OWNER for p, _ in _recurrence_swept_modules()), (
             f'{_CANONICAL_OWNER} must be excluded: it is the canonical owner of '
             f'the pattern, so flagging it there would be the guard flagging the fix'
         )
@@ -434,3 +436,183 @@ class TestNoInlineSandboxedProjectRootAsserts:
         )
 
         assert _inline_sandbox_asserts(tree) == []
+
+
+# ===========================================================================
+# Census guard: DECISION 1 — the steward-construction split is PERMANENT
+# ===========================================================================
+
+# Every module allowed to construct a steward outside conftest's `make_steward`
+# factory, mapped to the RECORDED REASON it is sanctioned.  This mapping IS the
+# adjudication record: task 3647 ruled the split permanent, and the census below
+# is what makes that ruling checkable rather than one more prose restatement the
+# next consolidation task re-litigates (3461, 3514 and 3551 each wrote it down;
+# each successor re-derived it from scratch anyway).
+#
+# Adding an entry is a DECISION, not a formality — see the failure message.
+_SANCTIONED_STEWARD_CONSTRUCTION: dict[str, str] = {
+    'conftest.py': (
+        'the canonical `make_steward` fixture-factory itself — the suite\'s one '
+        'steward factory, and the thing every other site should be using'
+    ),
+    'test_workflow_escalated_steward_stall.py': (
+        '`_CapFiringSteward`, the PERMANENT exception (examined by task 3551, '
+        'ruled permanent by 3647). Three structural reasons, none removable: it '
+        'is a `TaskSteward` SUBCLASS declared inside `_make_real_steward_factory`, '
+        'whereas `make_steward` returns a constructed `TaskSteward`; its '
+        'construction passes `config_dir=`, which the fixture does not accept; '
+        'and `_make_real_steward_factory` returns a CALLBACK the workflow invokes '
+        'later with a worktree the WORKFLOW chooses, so it cannot request '
+        '`tmp_path` at construction time. It does share the fixture\'s sandboxed '
+        '`project_root` recipe (task 3551), so the invariant is common even '
+        'though the construction is not'
+    ),
+}
+
+
+def _steward_construction_sites(tree: ast.Module) -> list[str]:
+    """Steward constructions in *tree*: ``<lineno> (<what>)`` for each.
+
+    Two shapes, both structural:
+
+    * an ``ast.Call`` whose func is an ``ast.Name`` ending in ``Steward``
+      (``TaskSteward(...)``, ``_CapFiringSteward(...)``);
+    * an ``ast.ClassDef`` with a base ending in ``Steward`` — a subclass is a
+      second steward SHAPE even before it is instantiated, and the standing
+      exception is exactly that.
+
+    The suffix rule is what keeps this cheap and stable: ``make_steward``
+    (lowercase ``s``) does NOT match, so the canonical factory's ~250 call sites
+    are correctly not swept in, and neither are ``isinstance(x, TaskSteward)``
+    or a ``-> TaskSteward`` annotation (a Name outside any call).  Only genuine
+    constructions and subclass declarations land here.
+    """
+    sites: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id.endswith('Steward')
+        ):
+            sites.append(f'{node.lineno} (constructs {node.func.id})')
+        if isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                name = (
+                    base.id if isinstance(base, ast.Name)
+                    else base.attr if isinstance(base, ast.Attribute)
+                    else None
+                )
+                if name is not None and name.endswith('Steward'):
+                    sites.append(f'{node.lineno} (class {node.name} subclasses {name})')
+    return sites
+
+
+def _census_by_module() -> dict[str, list[str]]:
+    """``{module basename: [site, ...]}`` for every module that builds a steward."""
+    census: dict[str, list[str]] = {}
+    for path, tree in _parsed_modules():
+        sites = _steward_construction_sites(tree)
+        if sites:
+            census[path.name] = sites
+    return census
+
+
+class TestStewardConstructionSitesAreCensused:
+    """Every steward built outside ``make_steward`` is sanctioned, with a reason.
+
+    DECISION 1 of task 3647: the steward-construction split is PERMANENT, not
+    something a future task should fold.  Nothing remains to fold — task 3514
+    already absorbed ``test_steward.py``'s five-fixture graph and
+    ``test_out_of_band_routing.py``'s builder — and the one standing exception
+    cannot fold for three structural reasons.
+
+    Recording that in prose is what 3461, 3514 and 3551 each already did, and it
+    was re-litigated every time; that is the evidence prose alone does not hold.
+    A census turns it into an invariant with teeth in BOTH directions: a fourth
+    idiom cannot appear silently, and its author must either use the factory or
+    write down why they cannot — which is the adjudication this lineage kept
+    having to redo from scratch.
+    """
+
+    def test_every_steward_construction_site_is_sanctioned(self) -> None:
+        unsanctioned = {
+            module: sites
+            for module, sites in _census_by_module().items()
+            if module not in _SANCTIONED_STEWARD_CONSTRUCTION
+        }
+
+        assert not unsanctioned, (
+            'Unsanctioned steward-construction site(s).\n'
+            'This suite has ONE steward factory: the `make_steward` fixture in '
+            'conftest.py (task 3461 merged two copies into it, task 3514 folded '
+            'in the two that remained). A construction outside it is a fourth '
+            'idiom of the kind this census exists to stop appearing silently.\n'
+            'Fix, and it is a real choice between two options:\n'
+            '  (a) fold the site onto `make_steward` — extend that fixture '
+            'rather than adding a factory beside it; or\n'
+            '  (b) if it structurally cannot fold, add the module to '
+            '_SANCTIONED_STEWARD_CONSTRUCTION in this file with the REASON '
+            'recorded, the way the standing exception is recorded there. That '
+            'adjudication is this guard\'s whole purpose — an entry with no '
+            'reason defeats it.\n'
+            f'Unsanctioned: {unsanctioned}'
+        )
+
+    def test_the_census_is_live(self) -> None:
+        """A broken glob must not pass as "every site is sanctioned"."""
+        assert len(_parsed_modules()) >= _MIN_MODULES_SWEPT, (
+            f'the census parsed only {len(_parsed_modules())} modules under '
+            f'{_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A census '
+            f'that reads nothing sanctions everything.'
+        )
+        assert _census_by_module(), (
+            'the census found NO steward construction anywhere, not even '
+            "conftest.py's `make_steward` — the detector has stopped matching, "
+            'so this guard is vacuously green'
+        )
+
+    def test_the_detector_matches_both_construction_shapes(self) -> None:
+        """Self-test over synthetic source: a detector that silently stops
+        matching reads as coverage.  Kept in string literals so the census
+        scanning this module does not self-trip."""
+        tree = ast.parse(
+            'class _MySteward(TaskSteward):\n'
+            '    pass\n'
+            '\n'
+            'def _build(worktree):\n'
+            '    return TaskSteward(task_id="1", worktree=worktree)\n'
+        )
+
+        sites = _steward_construction_sites(tree)
+
+        assert len(sites) == 2, sites
+        assert any('subclasses TaskSteward' in site for site in sites), sites
+        assert any('constructs TaskSteward' in site for site in sites), sites
+
+    def test_the_detector_ignores_the_canonical_factory_and_non_constructions(self) -> None:
+        """Negative self-test: ``make_steward`` is lowercase and must not match,
+        nor must a type annotation or an ``isinstance`` check that merely NAMES
+        the class.  This is what keeps the rule cheap across ~250 call sites."""
+        tree = ast.parse(
+            'def test_something(make_steward) -> TaskSteward:\n'
+            '    steward = make_steward()\n'
+            '    assert isinstance(steward, TaskSteward)\n'
+            '    return steward\n'
+        )
+
+        assert _steward_construction_sites(tree) == []
+
+    def test_no_allowlist_entry_is_stale(self) -> None:
+        """An entry naming a module that no longer builds a steward is rot: it
+        silently pre-sanctions whatever that module does next.  Same shape as
+        ``test_git_repo_isolation_guard.py``'s check that every
+        ``_SELF_INITIALISING_HELPERS`` entry still names a live helper.
+        """
+        census = _census_by_module()
+        stale = sorted(set(_SANCTIONED_STEWARD_CONSTRUCTION) - set(census))
+
+        assert not stale, (
+            f'_SANCTIONED_STEWARD_CONSTRUCTION names {stale}, which no longer '
+            f'construct a steward. Remove the entries — a stale sanction '
+            f'pre-approves whatever that module builds next, unexamined.'
+        )
