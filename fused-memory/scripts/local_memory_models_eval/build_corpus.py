@@ -1243,6 +1243,44 @@ def _window_population(
     return windowed
 
 
+def _reject_duplicate_uuids(population: list[EpisodeRecord]) -> None:
+    """Raise if *population* holds the same episode uuid twice.
+
+    The second half of the same wrong-culprit pattern as
+    :func:`_window_population`, and placed beside it so a reader tracing
+    attribution finds both together. It is its own function, called from
+    OUTSIDE :func:`verify_manifest`'s manifest-attributable ``try``, because
+    the failures that clause used to cover have two different culprits:
+    :func:`select` is handed two MANIFEST values (``n`` and ``seed``) over a
+    STORE-supplied population. No manifest value can put the same node in
+    FalkorDB twice, so reporting a duplicated node as ``bad_manifest`` sends
+    the reader off to re-derive a corpus that is perfectly correct while the
+    duplicated node that actually needs deleting stays put.
+
+    The rule itself is delegated to :func:`_group_by_cell` rather than
+    re-spelled here. That function reads no manifest value at all — it is a
+    function of the population alone — so every failure it can raise (a
+    duplicate uuid, an unplaceable ``stratum_key``) is by construction a store
+    condition. One home for the rule, and no second spelling to drift from it.
+
+    The empty-population case is carved out by the early return rather than
+    swept along with the rest. An empty frame in the verify path is produced
+    by the manifest's OWN recorded window bound, and is the degenerate limit
+    of "the window no longer holds enough episodes to satisfy the recorded
+    ``n``" — which :func:`allocate` already reports, correctly, as
+    ``bad_manifest``. Pulling it out here would make the exit code
+    discontinuous at the point a shrinking window happens to reach zero.
+    """
+    if not population:
+        return
+    try:
+        _group_by_cell(population)
+    except CorpusBuildError as exc:
+        raise CorpusBuildError(
+            f'{exc} — this is a store condition, not a defect in the manifest'
+        ) from exc
+
+
 def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> VerifyReport:
     """Re-derive *manifest*'s sample from its OWN recorded criteria and compare.
 
@@ -1291,7 +1329,8 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
     exits 1, "no verdict was reached". Collapsing the second into
     ``bad_manifest`` would be worse than unhelpful — it names a culprit that is
     innocent, and the reader would re-derive a perfectly good corpus while the
-    real problem stayed in the store. See :func:`_window_population`.
+    real problem stayed in the store. See :func:`_window_population` for a
+    corrupted row, and :func:`_reject_duplicate_uuids` for a duplicated one.
     """
     try:
         criteria, episodes = _read_criteria(manifest)
@@ -1333,8 +1372,18 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
     # corrupted store row, and blaming the artifact for it points the reader at
     # the wrong culprit. See _window_population.
     windowed = _window_population(population, cutoff)
+    # Same reason as the comment above, for the same clause: a duplicated node
+    # is a store condition no manifest value can produce. Run over `windowed`
+    # rather than `population` — that is the frame `select` actually operates
+    # on, so this is the minimum that makes the attribution below true, and a
+    # duplicate outside the recorded window still leaves the reader a verdict.
+    _reject_duplicate_uuids(windowed)
 
     try:
+        # What still reports bad_manifest here is `allocate`'s verdict on the
+        # RECORDED n against the sampling frame — a manifest value the frame
+        # cannot satisfy. The population-integrity failures `_group_by_cell`
+        # owns were pre-run above and cannot arrive here.
         rederived = [
             record.uuid
             for record in select(windowed, criteria['n'], seed=criteria['seed']).selected
