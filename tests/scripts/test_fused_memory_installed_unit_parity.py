@@ -112,8 +112,36 @@ implementer 2026-08-19 against systemd 255.4-1ubuntu8.17:
     returns '4' — so the defect was purely host-side install drift, not a
     repo defect.
 
-POST-FIX CONFIRMATION: recorded in step-2 once the installed unit is
-reconciled via scripts/check_fused_memory_unit_parity.py --fix.
+POST-FIX CONFIRMATION, measured 2026-08-19 after reconciling the installed
+unit via `uv run --project shared python
+scripts/check_fused_memory_unit_parity.py --installed
+~/.config/systemd/user/fused-memory.service --template
+scripts/fused-memory.service.template --fix` (reported the same drift as
+above, then `[fixed] Appended 1 directive(s)`) followed by `systemctl --user
+daemon-reload` (no restart — fused-memory.service backs the orchestrators,
+the dashboard and this session's own MCP tooling):
+
+  - `diff` of the installed unit against its pre-fix backup is exactly
+    `77a78 > RestartSteps=4` — one line appended at line 78, INSIDE the
+    [Service] section (which spans lines 13-78; [Install] begins at 79),
+    nothing removed or reordered. `grep -n Restart` now additionally shows
+    `RestartSteps=4` at line 78.
+  - `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=` still lists all nine
+    project roots (dark-factory, reify, autopilot-video, autotrade,
+    know-live, solar-challenge, mission-control, solar-challenge-platform,
+    pump-web-ui) — the append-only contract held.
+  - `systemctl --user show fused-memory.service -p RestartSteps -p
+    RestartMaxDelayUSec` now reports RestartSteps=4 and
+    RestartMaxDelayUSec=1min (previously RestartSteps=0).
+  - `systemd-analyze --user verify` no longer prints the "Service has
+    RestartMaxDelaySec= but no RestartSteps= setting. Ignoring." line for
+    fused-memory.service (the dark-factory-dashboard.service line was
+    cleared separately by step-4; the remaining jcodemunch-serve.service
+    "No such file or directory" line is Reify-owned, out of scope — see the
+    plan analysis).
+  - fused-memory.service remained `active` throughout; no restart was
+    performed or required.
+  - Both tests in this module pass under `-m integration`.
 
 Marking: both host-touching tests carry `@pytest.mark.integration`, which is
 registered and DESELECTED by the ROOT pyproject.toml's default addopts
