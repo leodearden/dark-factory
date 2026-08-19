@@ -782,33 +782,92 @@ def restore_archived_transcript(
     stamped ``now`` reads to the next archival pass as newer than its own
     archive and is pointlessly re-archived over it.
     """
-    archived = durable_archive_path(archive_root, task_id, session_id)
-    if archived is None:
-        return None
+    # Imported lazily, NOT at module scope: transcript_archive is a leaf on the
+    # PURE_STDLIB_LEAVES contract and cli_invoke is a heavy sibling, so a
+    # module-level edge here would drag it into every archival import.
+    #
+    # _resolve_transcript_path, not its transcript_exists wrapper, and that is
+    # deliberate rather than a reach past the underscore: transcript_exists IS
+    # `_resolve_transcript_path(...) is not None` (cli_invoke.py:403), so this
+    # is the SAME single-homed locator the CLI guard, the harness eligibility
+    # guard and the cap-hit precedent all key on — it simply also yields the
+    # path the no-clobber branch has to return, without globbing twice for one
+    # answer.
+    from shared.cli_invoke import _resolve_transcript_path
 
-    config_dir = Path(config_dir)
-    rel = archived.relative_to(Path(archive_root) / str(task_id))
-    dest = config_dir / 'projects' / rel
-    # Pre-task-3618 archives are still `.jsonl.gz` on disk and
-    # durable_archive_path locates them (I-C, format-agnostic), so the restore
-    # must span both shapes or it silently no-ops on the OLDEST corpus — the
-    # one most likely to need a rehydrate. The destination drops the `.gz`:
-    # the CLI parses plain JSONL and rejects a gzip blob named `.jsonl`
-    # exactly as it rejects a zero-byte one, and transcript_exists globs
-    # `*.jsonl`, so a `.gz`-suffixed destination would not even be seen.
-    gzipped = dest.name.endswith('.jsonl.gz')
-    if gzipped:
-        dest = dest.with_name(dest.name[: -len('.gz')])
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    st = archived.stat()
-    if gzipped:
-        # STREAMED, not read()-then-write: agent-session JSONL runs to many MB
-        # and only grows on resume, so peak RSS stays flat regardless of
-        # transcript size — the same bound _archive_one's comment records for
-        # shutil.copyfile's platform fast-copy path.
-        with gzip.open(archived, 'rb') as src_fh, dest.open('wb') as dest_fh:
-            shutil.copyfileobj(src_fh, dest_fh)
-    else:
-        shutil.copyfile(archived, dest)
-    os.utime(dest, (st.st_atime, st.st_mtime))
-    return dest
+    try:
+        archived = durable_archive_path(archive_root, task_id, session_id)
+        if archived is None:
+            # MISS — the common case (~36% of sessions per the PRD §2 reference
+            # measurement). Return before any mkdir so a miss leaves NO trace,
+            # and stay silent so the common case can never become log noise.
+            return None
+
+        config_dir = Path(config_dir)
+        # NO-CLOBBER. A resumed session's transcript only ever grows (the same
+        # premise durable_archive_path's I-F newest-mtime rule rests on), so a
+        # copy already live in this config dir is by construction at least as
+        # complete as any archive — overwriting it would destroy context on the
+        # very path meant to preserve it. Keyed on the SESSION ID via the same
+        # predicate the CLI and the resume guards use, not on the destination
+        # path: the live copy may sit under a different encoded-cwd dir than
+        # the archive's, and it is still the one to keep.
+        live = _resolve_transcript_path(config_dir, session_id)
+        if live is not None:
+            return live
+
+        rel = archived.relative_to(Path(archive_root) / str(task_id))
+        dest = config_dir / 'projects' / rel
+        # Pre-task-3618 archives are still `.jsonl.gz` on disk and
+        # durable_archive_path locates them (I-C, format-agnostic), so the restore
+        # must span both shapes or it silently no-ops on the OLDEST corpus — the
+        # one most likely to need a rehydrate. The destination drops the `.gz`:
+        # the CLI parses plain JSONL and rejects a gzip blob named `.jsonl`
+        # exactly as it rejects a zero-byte one, and transcript_exists globs
+        # `*.jsonl`, so a `.gz`-suffixed destination would not even be seen.
+        gzipped = dest.name.endswith('.jsonl.gz')
+        if gzipped:
+            dest = dest.with_name(dest.name[: -len('.gz')])
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        st = archived.stat()
+        if gzipped:
+            # STREAMED, not read()-then-write: agent-session JSONL runs to many MB
+            # and only grows on resume, so peak RSS stays flat regardless of
+            # transcript size — the same bound _archive_one's comment records for
+            # shutil.copyfile's platform fast-copy path.
+            with gzip.open(archived, 'rb') as src_fh, dest.open('wb') as dest_fh:
+                shutil.copyfileobj(src_fh, dest_fh)
+        else:
+            shutil.copyfile(archived, dest)
+        os.utime(dest, (st.st_atime, st.st_mtime))
+        return dest
+    except Exception as exc:
+        # One blanket swallow, copying durable_archive_path's I-A rationale
+        # verbatim rather than enumerating OSError subclasses: the whole point
+        # of the contract is that NOTHING escapes onto the dispatch path, which
+        # is what lets the orchestrator's arm-site rehydration stay total.
+        #
+        # Level WARNING, and note what does NOT reach here: the plain MISS
+        # returns None from the branch above and logs nothing at all, so the
+        # ~36%-of-sessions common case can never become log noise. Only a
+        # genuine fault lands in this handler — an unreadable archive root, a
+        # full disk, a config dir whose parent is a regular file — and each of
+        # those is a real breakage an operator should see, so silence or DEBUG
+        # here would be exactly the silent degradation design-invariants
+        # INV-2/INV-4 forbid. Structured extra=, matching the shape
+        # _record_failure and durable_archive_path already emit, so all three
+        # archive-side failure signals stay greppable the same way.
+        logger.warning(
+            'restore_archived_transcript: restore failed for session %s '
+            '(task %s) into %s: %s',
+            session_id,
+            task_id,
+            config_dir,
+            exc,
+            extra={
+                'path': str(config_dir),
+                'task_id': str(task_id),
+                'errno': getattr(exc, 'errno', None),
+            },
+        )
+        return None
