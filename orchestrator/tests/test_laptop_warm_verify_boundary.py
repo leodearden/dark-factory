@@ -59,6 +59,7 @@ import math
 import os
 import re
 import select
+import signal
 import socket
 import subprocess
 import sys
