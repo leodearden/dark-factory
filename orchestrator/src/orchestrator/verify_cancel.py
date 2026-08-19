@@ -530,9 +530,12 @@ PROC_LOCKS_PATH: Path = Path('/proc/locks')
 
 #: How many back-to-back reads of the kernel lock table ONE holder query makes
 #: (task 4227).  A READ-COUNT bound, never a time bound: the loop does not
-#: sleep, so K procfs reads cost microseconds and no wall-clock figure anywhere
-#: moves.  See :func:`lane_lock_holder_pids_strict` for why more than one read
-#: is needed and why a union across them is safe.
+#: sleep, so the extra reads cost well under a millisecond (measured below) and
+#: no wall-clock figure anywhere moves.  See :func:`lane_lock_holder_pids_strict`
+#: for why more than one read is needed, why a union across them is safe, and
+#: why all K are taken unconditionally.  Resolved with a FLOOR of one read, so
+#: neither a caller nor a ``monkeypatch.setattr`` on this global can drive the
+#: query to zero reads.
 _LOCKS_CONFIRM_READS: int = 3
 
 
@@ -624,6 +627,27 @@ def lane_lock_holder_pids_strict(
     whenever two consecutive reads drop the SAME record.  The union misses only
     if ALL K reads drop it.
 
+    WHY ALL K READS ALWAYS — a decision, not an oversight.  Every lock this
+    reader is used for TODAY is ``LOCK_EX`` (``acquire_merge_verify_flock``
+    takes ``LOCK_EX | LOCK_NB``), so the target inode has at most ONE holder
+    row and a non-empty read #1 is already the complete answer: breaking out
+    there would skip the rest.  That is deliberately NOT done, because the
+    shortcut is correct only under a CALLER-side invariant this reader neither
+    states nor enforces.  This function is named for a LIST and documents
+    "every pid holding a ``FLOCK`` record" in first-seen order; an early break
+    would silently TRUNCATE a shared-lock answer to whichever holders happened
+    to land in read #1 — reintroducing, one lock mode over, exactly the
+    false-negative class this loop exists to remove.  The price of keeping it
+    honest is MEASURED, not assumed: 492us for one read+parse of this host's
+    264-row 15623-byte table, so K=3 costs 1.4ms — under a millisecond added
+    per query, against acquire waits and settle bounds measured in SECONDS.
+    Nor does it compound on the acquire-timeout path: ``git_ops``'
+    ``_settled_lane_lock_holder_pids`` keeps polling only while the answer is
+    EMPTY, which is precisely the case in which an early break would never
+    have fired, so its ~25 iterations pay full K either way.
+    ``test_reading_a_static_table_k_times_yields_the_pre_fix_answer`` pins the
+    resulting read COUNT on the non-lossy path, so the cost stays a stated one.
+
     *confirm_reads* defaults to ``None`` and is resolved from the module global
     :data:`_LOCKS_CONFIRM_READS` INSIDE the body, so a ``monkeypatch.setattr``
     on it is honoured — the same call-time-resolution seam
@@ -631,7 +655,8 @@ def lane_lock_holder_pids_strict(
     document.  Passing it EXPLICITLY is the second knob, and not dead surface:
     ``confirm_reads=1`` reproduces the pre-fix one-shot behaviour EXACTLY,
     which is how the regression tests stage the defect beside the fix on
-    identical staging.
+    identical staging.  Whatever it resolves to, ONE read is the FLOOR: see the
+    guard in the body for why zero must not be reachable.
 
     THE FAILURE ASYMMETRY, and why the loop is not one uniform ``try``.  The
     FIRST read establishes whether an answer exists at all, so its ``OSError``
@@ -649,9 +674,9 @@ def lane_lock_holder_pids_strict(
     SYNCHRONOUS and is called from async contexts; this module's standing rule
     — the stated reason ``GitOps._acquire_lane_flock_off_thread`` exists — is
     that no synchronous poll may run on the event loop.  Back-to-back procfs
-    reads take microseconds, so K of them cannot stall the loop, and no
-    existing wall-clock figure (``_LANE_LOCK_HOLDER_SETTLE_SECS``, the 34.0s
-    foreign-holder stack) needs re-deriving.  ``os.stat(path)`` is taken ONCE,
+    reads never sleep and cost 492us each here, so K of them cannot stall the
+    loop, and no existing wall-clock figure (``_LANE_LOCK_HOLDER_SETTLE_SECS``,
+    the 34.0s foreign-holder stack) needs re-deriving.  ``os.stat(path)`` is taken ONCE,
     before any read, so a held lane whose lock file was unlinked still raises
     ``FileNotFoundError`` immediately having examined no rows (task 3604's
     headline case) rather than paying a stat per read.
@@ -661,7 +686,16 @@ def lane_lock_holder_pids_strict(
     st = os.stat(path)
     target = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
 
-    reads = _LOCKS_CONFIRM_READS if confirm_reads is None else confirm_reads
+    # ONE read is the FLOOR, never zero.  The first read is what establishes
+    # whether an answer EXISTS at all — it is the only one whose OSError
+    # propagates (the asymmetry above) — so a resolved count below 1 would
+    # return `[]` having examined NO rows, silently degrading the STRICT
+    # variant into the fail-safe one.  And `[]` is the exact answer that
+    # VACUOUSLY satisfies this variant's reason for existing: the callers
+    # asserting a NEGATIVE (`require_lane_lock_holders`, `lane_is_free`).
+    # A caller — or a `monkeypatch.setattr` on the global — asking for fewer
+    # than one read gets one, not none.
+    reads = max(1, _LOCKS_CONFIRM_READS if confirm_reads is None else confirm_reads)
 
     pids: list[int] = []
     seen: set[int] = set()

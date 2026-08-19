@@ -68,11 +68,14 @@ from test_merge_verify_lease_guard import (  # noqa: F401 -- fixtures used by na
     real_git_ops,
 )
 
-# The chunked-`/proc/locks` fixtures (task 4227), reused rather than forked:
-# `_locks_row` derives MAJ:MIN:INO from a genuine `os.stat`, and
-# `_ChunkedLocksPath` is the Path SUBCLASS that serves scripted snapshots
-# through the reader's existing `locks_path=` keyword.
-from test_verify_cancel import _ChunkedLocksPath, _locks_row
+# The chunked-`/proc/locks` staging (task 4227), reused rather than forked.
+# ONE import, deliberately: `chunk_skipped_locks` is THE definition of "a table
+# whose first read drops our row" — it derives MAJ:MIN:INO from a genuine
+# `os.stat` and serves its scripted snapshots through a `pathlib.Path` SUBCLASS
+# bound to the reader's existing `locks_path=` keyword.  Re-deriving any of that
+# here would let the two modules drift into modelling different defects, so that
+# a later change to one silently stops testing what the other still claims.
+from test_verify_cancel import chunk_skipped_locks
 
 from orchestrator.git_ops import GitOps, MergeVerifyLeaseContended, _run
 from orchestrator.verify_cancel import (
@@ -3256,13 +3259,6 @@ class TestCancelledResetNeverOrphansTheLaneLock:
 # a scripted stub would pin the test's model of the reader, not the reader.
 # ---------------------------------------------------------------------------
 
-#: One row for an inode that is never any lock file (inode 1 is not a regular
-#: file), present in EVERY scripted snapshot.  A chunk-skip drops OUR record
-#: while the rest of a system-wide table reads normally — a fixture serving an
-#: empty first snapshot would be modelling a different, easier defect.
-_UNRELATED_LOCKS_ROW = '309: FLOCK  ADVISORY  WRITE 6001 103:08:1 0 EOF\n'
-
-
 def _chunk_skipping_reader(
     lock_path: Path,
     holder_pid: int,
@@ -3271,24 +3267,25 @@ def _chunk_skipping_reader(
 ) -> Callable[[Path], list[int]]:
     """Bind the REAL reader to a lock table whose FIRST read drops our row.
 
+    The staging itself is `test_verify_cancel.chunk_skipped_locks` — the SAME
+    builder the reader-level cases use, imported rather than re-derived, so a
+    later change to what "a chunk-skipped table" means reaches both modules at
+    once.  What is genuinely leak-guard-specific, and all this adds, is the
+    FRESH snapshot sequence per query below.
+
     *confirm_reads* ``None`` means "take production's default, through the
     plain two-argument call both `holder_pids is None` branches make" — so the
     fix arm exercises what production actually gets, not an override.  Passing
     ``1`` reproduces the pre-fix one-shot read exactly and is the control arm.
 
-    A FRESH snapshot sequence per query is deliberate: in production every
-    one-shot consumer of the reader independently rolls the same dice, so a
-    read counter shared across two call sites would let the second inherit the
-    first's recovery — and the control arm would pass vacuously.
+    A FRESH snapshot sequence per query is deliberate: every one-shot consumer
+    of the reader independently rolls the same dice, so a read counter shared
+    across two call sites would let the second inherit the first's recovery —
+    and the control arm would pass vacuously.
     """
-    ours = _locks_row(lock_path, holder_pid) + '\n'
-    lossy = _UNRELATED_LOCKS_ROW
-    settled = _UNRELATED_LOCKS_ROW + ours
 
     def _read(path: Path) -> list[int]:
-        chunked = _ChunkedLocksPath(
-            lock_path.parent / 'locks', snapshots=[lossy, settled],
-        )
+        chunked = chunk_skipped_locks(lock_path, holder_pid)
         if confirm_reads is None:
             return lane_lock_holder_pids(path, locks_path=chunked)
         return lane_lock_holder_pids(

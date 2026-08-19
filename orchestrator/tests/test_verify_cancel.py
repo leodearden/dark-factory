@@ -1043,23 +1043,34 @@ class TestLaneLockHolderPidsStrict:
 # ---------------------------------------------------------------------------
 
 
+#: One row for an inode that is never any lock file (inode 1 is not a regular
+#: file), present in EVERY scripted snapshot of the chunk-skip staging below.
+UNRELATED_LOCKS_ROW = '309: FLOCK  ADVISORY  WRITE 6001 103:08:1 0 EOF\n'
+
+
+def chunk_skipped_locks(lock_path: Path, pid: int) -> _ChunkedLocksPath:
+    """A table whose FIRST read drops *lock_path*'s row, then settles.
+
+    THE shared staging for the measured defect, module-level and public-ish so
+    ``test_lane_lock_leak_guard`` builds its end-to-end arms from this ONE
+    definition rather than a second copy.  Two copies could drift, and a later
+    "fix" to one (say, to an empty first snapshot) would leave the other
+    silently modelling a different defect while still passing.
+
+    The unrelated row is present throughout: a chunk-skip drops OUR record
+    while the rest of a system-wide table reads normally, so a fixture that
+    served an empty first snapshot would be modelling a different (and easier)
+    defect than the measured one.
+    """
+    ours = _locks_row(lock_path, pid) + '\n'
+    return _ChunkedLocksPath(
+        lock_path.parent / 'locks',
+        snapshots=[UNRELATED_LOCKS_ROW, UNRELATED_LOCKS_ROW + ours],
+    )
+
+
 class TestChunkedLocksReadIsToleratedByTheReader:
     """A record dropped by one chunked read must not read as "no holder"."""
-
-    @staticmethod
-    def _chunk_skipped(lock_path: Path, pid: int) -> _ChunkedLocksPath:
-        """A table whose FIRST read drops *lock_path*'s row, then settles.
-
-        The unrelated row is present throughout: a chunk-skip drops OUR record
-        while the rest of a system-wide table reads normally, so a fixture that
-        served an empty first snapshot would be modelling a different (and
-        easier) defect than the measured one.
-        """
-        unrelated = '309: FLOCK  ADVISORY  WRITE 6001 103:08:1 0 EOF\n'
-        ours = _locks_row(lock_path, pid) + '\n'
-        return _ChunkedLocksPath(
-            lock_path.parent / 'locks', snapshots=[unrelated, unrelated + ours],
-        )
 
     def test_a_record_dropped_by_the_first_read_is_recovered(self, tmp_path: Path):
         """THE root-cause case: the holder is reported despite a lossy read.
@@ -1078,7 +1089,7 @@ class TestChunkedLocksReadIsToleratedByTheReader:
         lock_path = tmp_path / 'lane.lock'
         lock_path.touch()
 
-        strict_locks = self._chunk_skipped(lock_path, 4242)
+        strict_locks = chunk_skipped_locks(lock_path, 4242)
         strict = lane_lock_holder_pids_strict(lock_path, locks_path=strict_locks)
         assert strict == [4242], (
             f'a holder dropped by ONE chunked read must still be reported — '
@@ -1092,7 +1103,7 @@ class TestChunkedLocksReadIsToleratedByTheReader:
             f'read(s)'
         )
 
-        wrapper_locks = self._chunk_skipped(lock_path, 4242)
+        wrapper_locks = chunk_skipped_locks(lock_path, 4242)
         assert lane_lock_holder_pids(lock_path, locks_path=wrapper_locks) == [4242], (
             'ANTI-FORK: the fail-safe wrapper must inherit the read policy '
             'from the strict core, never carry a second copy of it'
@@ -1114,7 +1125,7 @@ class TestChunkedLocksReadIsToleratedByTheReader:
         lock_path = tmp_path / 'lane.lock'
         lock_path.touch()
 
-        strict_locks = self._chunk_skipped(lock_path, 4242)
+        strict_locks = chunk_skipped_locks(lock_path, 4242)
         strict = lane_lock_holder_pids_strict(
             lock_path, locks_path=strict_locks, confirm_reads=1,
         )
@@ -1128,7 +1139,7 @@ class TestChunkedLocksReadIsToleratedByTheReader:
             f'{strict_locks.reads}'
         )
 
-        wrapper_locks = self._chunk_skipped(lock_path, 4242)
+        wrapper_locks = chunk_skipped_locks(lock_path, 4242)
         assert lane_lock_holder_pids(
             lock_path, locks_path=wrapper_locks, confirm_reads=1,
         ) == [], (
@@ -1355,6 +1366,15 @@ class TestChunkedConfirmLoopContract:
         ``POSIX`` rows still excluded, malformed rows still tolerated — for
         BOTH variants.  Without this pin the union could quietly change the
         answer everywhere in exchange for fixing 1.54% of reads.
+
+        Also pins the READ COUNT on that path, so the loop's cost is a STATED
+        one rather than an accident: all K reads are taken even once read #1
+        has named a holder.  The reader deliberately does NOT break out early
+        there — see its "WHY ALL K READS ALWAYS" note — because the shortcut
+        is sound only under the callers' ``LOCK_EX`` invariant, which this
+        reader neither states nor enforces, and would truncate a shared-lock
+        answer.  If that decision is ever revisited, this assertion is what
+        makes the change visible instead of silent.
         """
         from orchestrator.verify_cancel import (
             lane_lock_holder_pids,
@@ -1380,6 +1400,102 @@ class TestChunkedConfirmLoopContract:
         assert lane_lock_holder_pids(
             lock_path, locks_path=locks, confirm_reads=1,
         ) == one_shot
+
+        # The stated cost: K reads, even though read #1 already named a holder.
+        import orchestrator.verify_cancel as vc_mod
+
+        static = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[self._mixed_table(lock_path, other)],
+        )
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=static) == one_shot
+        assert static.reads == vc_mod._LOCKS_CONFIRM_READS, (
+            f'the confirm loop must take all {vc_mod._LOCKS_CONFIRM_READS} '
+            f'reads on the non-lossy path — an early break on a non-empty read '
+            f'#1 is correct only under the callers\' LOCK_EX invariant, which '
+            f'this reader does not enforce, and would truncate a shared-lock '
+            f'answer; took {static.reads}'
+        )
+        control = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[self._mixed_table(lock_path, other)],
+        )
+        assert lane_lock_holder_pids_strict(
+            lock_path, locks_path=control, confirm_reads=1,
+        ) == one_shot
+        assert control.reads == 1, (
+            f'confirm_reads=1 must be exactly the pre-fix one-shot read, or '
+            f'every control arm in this module is measuring something else; '
+            f'took {control.reads}'
+        )
+
+    def test_a_sub_one_read_count_is_floored_at_one_read(self, tmp_path: Path):
+        """Zero reads is not reachable — the STRICT contract survives any count.
+
+        ``confirm_reads=0`` (or a ``_LOCKS_CONFIRM_READS`` monkeypatched to 0)
+        would make ``range(reads)`` empty and return ``[]`` having examined NO
+        rows: a silent fail-soft that converts the STRICT variant into the
+        fail-safe one, and hands back the one answer that VACUOUSLY satisfies
+        the negative-asserting callers this variant exists for
+        (``require_lane_lock_holders``, ``lane_is_free``).  Both knobs are
+        floored at one read, so an unreadable table still RAISES.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        holder = _locks_row(lock_path, 4242) + '\n'
+
+        for count in (0, -3):
+            locks = _ChunkedLocksPath(tmp_path / 'locks', snapshots=[holder])
+            assert lane_lock_holder_pids_strict(
+                lock_path, locks_path=locks, confirm_reads=count,
+            ) == [4242], (
+                f'confirm_reads={count} must still take the FIRST read, not '
+                f'silently answer "nobody holds it" having read nothing'
+            )
+            assert locks.reads == 1, (
+                f'confirm_reads={count} must floor to exactly one read; took '
+                f'{locks.reads}'
+            )
+
+        missing = _ChunkedLocksPath(
+            tmp_path / 'locks',
+            snapshots=[FileNotFoundError(errno.ENOENT, 'No such file', 'locks')],
+        )
+        with pytest.raises(FileNotFoundError):
+            lane_lock_holder_pids_strict(
+                lock_path, locks_path=missing, confirm_reads=0,
+            )
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=missing, confirm_reads=0,
+        ) == [], 'the fail-safe wrapper still degrades, whatever the count'
+
+    def test_the_global_read_count_is_also_floored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The floor covers the MONKEYPATCH seam, not just the keyword.
+
+        ``confirm_reads`` resolves from the module global at CALL time, which
+        is the documented tuning seam.  A global set to 0 must be floored the
+        same way — otherwise the loudest reader in the module could be
+        silenced by a one-line config change with no error anywhere.
+        """
+        import orchestrator.verify_cancel as vc_mod
+        from orchestrator.verify_cancel import lane_lock_holder_pids_strict
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        monkeypatch.setattr(vc_mod, '_LOCKS_CONFIRM_READS', 0)
+        locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[_locks_row(lock_path, 4242) + '\n'],
+        )
+
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=locks) == [4242]
+        assert locks.reads == 1, (
+            f'a zero global must floor to one read, not zero; took {locks.reads}'
+        )
 
     def test_first_seen_order_is_preserved_across_reads(self, tmp_path: Path):
         """(e) The ordering contract survives the union.
