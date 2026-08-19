@@ -1238,8 +1238,13 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
 
     # Essential delegation contract: prompt, system prompt, schema, model,
     # timeout, and session-threading are wired through correctly.
-    # Fine-grained knobs (max_turns, permission_mode, disallowed_tools) are
+    # Fine-grained knobs (permission_mode, disallowed_tools) are
     # implementation details covered by shared/tests/test_cli_invoke.py.
+    # max_turns is NOT one of them and is deliberately excluded from that
+    # carve-out: it is a value only this caller chooses, and waving it through
+    # as someone else's implementation detail is exactly how it sat at a broken
+    # 1 unnoticed.  It is pinned by
+    # test_call_claude_cli_passes_a_workable_max_turns below.
     from pathlib import Path
 
     assert call_kwargs['prompt'] == 'hi'
@@ -1269,6 +1274,60 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     # `response` must be absent from the schema — it was a dead field never read
     # by run() or any caller.  Pinning absence here prevents re-introduction.
     assert 'response' not in CLAUDE_CLI_RESPONSE_SCHEMA['properties']
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_passes_a_workable_max_turns():
+    """The per-invocation turn cap must leave room for the model's prose turn.
+
+    AgentLoop.run() drives multi-turn EXTERNALLY — one _call_claude_cli per
+    outer step, threaded by resume_session_id — so this cap bounds a SINGLE
+    assistant round-trip, not the conversation.  It still cannot be 1: the
+    model emits a prose turn before it calls StructuredOutput, and a cap of 1
+    leaves no room for it.
+
+    Pinned as the INVARIANT (>= 3, the floor both migrated siblings use — see
+    test_judge.py's and test_task_curator.py's identical pins) rather than the
+    tuned constant, so retuning _AGENT_CLI_MAX_TURNS does not churn this test.
+    """
+    from shared.cli_invoke import AgentResult
+
+    fake_gate = make_gate_mock()
+    config = _make_cli_config()
+    tools = [{'name': 'read_file', 'description': 'read', 'input_schema': {}}]
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-1',
+        structured_output={'thinking': 'reasoning', 'tool_calls': []},
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test system prompt',
+            tools={},
+            usage_gate=fake_gate,
+        )
+
+        await agent._call_claude_cli(prompt='hi', tools=tools)  # type: ignore[arg-type]
+
+    call_kwargs = mock_invoke.call_args.kwargs
+    assert call_kwargs['max_turns'] >= 3, (
+        'max_turns=1 leaves no room for the prose turn the model emits before '
+        'calling StructuredOutput, so the CLI returns error_max_turns carrying '
+        'NO structured payload: schema salvage never engages, result.success is '
+        'False, and _call_claude_cli raises.  Measured 0/6 on the real '
+        'recon-verify prompt/schema shape (Claude CLI 2.1.236, and 0/6 on '
+        '2.1.233 before it); re-measure with '
+        'fused-memory/scripts/probe_schema_max_turns.py.'
+    )
 
 
 @pytest.mark.asyncio
