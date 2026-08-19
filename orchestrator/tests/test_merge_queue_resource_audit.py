@@ -2011,15 +2011,31 @@ _STREAK_RE = re.compile(r'consecutive streak=(\d+)')
 _UNCHANGED_RE = re.compile(r'unchanged for (\d+) polls')
 
 
-def _audit_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    """Audit REPORT records, counted level-agnostically.
+def _audit_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """EVERY audit record, at any level — one per violating poll.
 
-    Deliberately level-agnostic: task 3203 step-9 pins the WARNING/INFO/DEBUG
-    routing separately, so every count asserted here survives that step
-    unchanged.  The clear line's prefix (``_CLEAR_PREFIX``) is distinct and is
-    never counted here.
+    A suppressed poll is demoted to DEBUG, never dropped, so this is how a
+    test proves a debug-level operator still sees all of them.  The clear
+    line's prefix (``_CLEAR_PREFIX``) is deliberately distinct and is never
+    counted here.
     """
     return [r for r in caplog.records if r.getMessage().startswith(_AUDIT_PREFIX)]
+
+
+def _audit_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Audit REPORT records — the ones an operator is meant to read.
+
+    Report lines are counted AGNOSTICALLY BETWEEN WARNING AND INFO, which is
+    what makes every count asserted in this class survive task 3203 step-9
+    (which pins exactly which report lines are WARNING and which are INFO)
+    without a single edit.
+
+    DEBUG is excluded because that IS the coalescence contract: a due repeat
+    reports at INFO and a suppressed poll is demoted to DEBUG, and by
+    deliberate design (step-10) both share one format string, so the level is
+    the only discriminator.  Use :func:`_audit_records` to count every poll.
+    """
+    return [r for r in _audit_records(caplog) if r.levelno >= logging.INFO]
 
 
 def _streaks(caplog: pytest.LogCaptureFixture) -> list[int]:
@@ -2125,10 +2141,13 @@ class TestResourceAuditLogCoalescence:
         with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
             self._drive(worker, 512)
 
-        assert len(_audit_lines(caplog)) == 512, (
-            'every violating poll must leave a record at SOME level; only 10 '
-            'are report-level. Got '
-            f'{len(_audit_lines(caplog))}'
+        assert len(_audit_records(caplog)) == 512, (
+            'every violating poll must leave a record at SOME level, got '
+            f'{len(_audit_records(caplog))}'
+        )
+        assert len(_audit_lines(caplog)) == 10, 'only 10 of them are report-level'
+        assert len(_audit_records(caplog)) - len(_audit_lines(caplog)) == 502, (
+            'the other 502 are demoted to DEBUG, not dropped'
         )
 
     def test_a_repeat_line_names_what_it_stands_in_for(
@@ -2183,6 +2202,7 @@ class TestResourceAuditLogCoalescence:
 
         second = _mkdir_worktree(git_ops, '_merge-two', mtime=self._NOW - self._IN_BAND_AGE)
         with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            caplog.clear()  # only the polls below are under test
             self._drive(worker, 1, start_poll=100)   # poll 101 — the change
             change_lines = list(_audit_lines(caplog))
             self._drive(worker, 1, start_poll=101)   # poll 102 — due again
@@ -2214,6 +2234,7 @@ class TestResourceAuditLogCoalescence:
         gone_path = str(gone.resolve())
         gone.rmdir()
         with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            caplog.clear()  # only the poll below is under test
             self._drive(worker, 1, start_poll=100)
 
         lines = _audit_lines(caplog)

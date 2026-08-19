@@ -49,6 +49,7 @@ from orchestrator.landing_evidence import (
     file_unattributed_landing_escalation,
     validate_landing_evidence,
 )
+from orchestrator.log_coalesce import ExponentialLogCoalescer
 from orchestrator.merge_disposition import (
     MergeFailureDisposition,
     SkewEvidence,
@@ -8799,15 +8800,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # _check_resource_audit heartbeats a resource-conservation violation
     # (speculation_accounting_violations / worktree_ledger_violations) must
     # persist before the dedup'd L1 escalation (_alarm_resource_audit) fires.
-    # Every violating call still logs a WARNING immediately — this only
-    # gates the louder escalation, so a transient/racy single-poll blip
-    # (e.g. a register/deregister race) never pages, while a genuine leak
-    # trips well within a handful of heartbeat intervals. Kept as a class
-    # attribute so tests can monkeypatch (e.g.
+    # Every violating call still RUNS both audits, bumps the streak, and
+    # feeds the escalation predicate; its LOG line is coalesced on the
+    # RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS schedule below (task 3203) —
+    # the first violating poll and every change to the violation set log a
+    # WARNING immediately, so nothing this streak gates on is ever delayed.
+    # This constant only gates the louder escalation, so a transient/racy
+    # single-poll blip (e.g. a register/deregister race) never pages, while
+    # a genuine leak trips well within a handful of heartbeat intervals.
+    # Kept as a class attribute so tests can monkeypatch (e.g.
     # worker.RESOURCE_AUDIT_ESCALATION_STREAK = 1) for fast, deterministic
     # coverage. Mirrors the RESOURCE_AUDIT_WORKTREE_GRACE_SECS/MAX_*
     # monkeypatch convention above.
     RESOURCE_AUDIT_ESCALATION_STREAK: int = 3
+    # task 3203: floor on the resource-audit log cadence, in heartbeat polls.
+    # _check_resource_audit's report line is coalesced by an
+    # ExponentialLogCoalescer: the interval between repeats of an UNCHANGED
+    # violation set doubles (polls 1, 2, 4, 8, ...) until it pins here.
+    # DERIVATION: _HEARTBEAT_POLL_S = 30.0, so 120 polls is one hour — a
+    # never-fixed leak still leaves an hourly trace rather than falling
+    # silent, and 'is it still broken?' stays answerable from the journal.
+    # Before this, a leak held for two hours emitted 246 identical WARNINGs
+    # (one measured incident emitted 897); it now emits 9 and 12 lines
+    # respectively. Kept as a class attribute so tests can monkeypatch it
+    # per-instance, matching the RESOURCE_AUDIT_* convention above — the
+    # gate re-reads it through `self` on every observe, so an override set
+    # after __init__ takes effect.
+    RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS: int = 120
     # task 2359: bounded rolling window (count of most-recent post-merge
     # verify outcomes) feeding _recent_verify_fail_rate() -- the flake-rate
     # signal that suppresses variable-depth speculative probing while the
@@ -9406,6 +9425,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # dedup'd L1 escalation (_alarm_resource_audit) fires. See
         # _check_resource_audit for the full contract.
         self._resource_audit_violation_streak: int = 0
+        # task 3203: exponential coalescer for _check_resource_audit's report
+        # line, keyed on _resource_audit_fingerprint(violations). Gates ONLY
+        # the logging arm — never detection, the streak above, or the
+        # escalation predicate. Its cap is re-synced from
+        # RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS on every observe so a
+        # per-instance monkeypatch applied after __init__ takes effect.
+        self._resource_audit_log_gate = ExponentialLogCoalescer(
+            cap_polls=self.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS,
+        )
         # task 2359: bounded rolling window of per-verify pass/fail outcomes.
         # Fed by _record_verify_outcome() (called from the verify-finalize
         # path); read by _recent_verify_fail_rate() to suppress variable-
@@ -13000,10 +13028,39 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         A clean call (no violations) resets
         :attr:`_resource_audit_violation_streak` to 0 and returns. A
-        violating call ALWAYS logs a WARNING naming every violation — unlike
-        :meth:`_check_request_liveness`'s log-dedup, this is not
-        per-episode-deduped, since the streak counter below already bounds
-        how often the louder escalation fires — and increments the streak.
+        violating call increments the streak and reports.
+
+        THE REPORT LINE IS COALESCED (task 3203). Re-logging an UNCHANGING
+        violation set on every 30s poll destroys the greppability the
+        logging exists to buy — a leak held for two hours emitted 246
+        identical WARNINGs. The line is instead gated by
+        :attr:`_resource_audit_log_gate`
+        (:class:`~orchestrator.log_coalesce.ExponentialLogCoalescer`), keyed
+        on :func:`_resource_audit_fingerprint` of the violation set (the
+        volatile age figure elided; the reclaim disposition and the permit
+        arm's counts kept). The cadence:
+
+          * WARNING, full detail, on the FIRST violating poll of an episode
+            and on EVERY change to the violation set — a change is never
+            withheld, so a leak appearing, growing, shrinking, or crossing
+            the reaper's destruction floor still logs loudly and at once.
+          * INFO on each scheduled repeat, on a doubling interval (polls 1,
+            2, 4, 8, ...) pinned at
+            :attr:`RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS`.
+          * DEBUG on the polls in between — suppressed, never DROPPED, so a
+            debug-level operator still sees every poll (mirrors
+            :meth:`_reprobe_quarantined_hosts`'s precedent).
+          * one INFO ``... audit clear ...`` line on the violating → clean
+            transition, so the END of a condition is greppable rather than
+            inferred from an absence of lines.
+
+        THE STREAK AND THE ESCALATION ARE UNCHANGED BY THAT GATE: the
+        violations are recomputed, :attr:`_resource_audit_violation_streak`
+        is bumped, the escalation-floor rescan runs, and
+        :func:`_alarm_resource_audit` fires on EVERY violating poll exactly
+        as before — including on polls whose log line was coalesced away.
+        The gate sits strictly inside the logging arm.
+
         Once the streak reaches :attr:`RESOURCE_AUDIT_ESCALATION_STREAK`
         consecutive violating calls, :func:`_alarm_resource_audit` is
         invoked on every further violating call; its own ``has_open_l1``
@@ -13011,7 +13068,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         how many times this method calls it.
 
         DETECTION AND ESCALATION USE DIFFERENT AGE FLOORS (task 3622).
-        Detection, the WARNING log, the streak, and
+        Detection, the report log, the streak, and
         ``snapshot()['resource_audit']`` all fire at
         :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`, so the leak census stays
         truthful and immediate.  The ESCALATION, however, re-asks the
@@ -13050,12 +13107,38 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._resource_audit_violation_streak = 0
             return
 
-        logger.warning(
-            'merge queue resource-conservation audit: %d violation(s) found '
-            '(consecutive streak=%d): %s',
-            len(violations), self._resource_audit_violation_streak + 1,
-            '; '.join(violations),
+        # ── LOGGING ARM (task 3203) ──────────────────────────────────────
+        # Everything below this block — the streak bump and the whole
+        # escalation predicate — runs on EVERY violating poll, exactly as
+        # before. The gate coalesces the LOG LINE ONLY. Do not hoist it.
+        self._resource_audit_log_gate.cap_polls = self.RESOURCE_AUDIT_LOG_COALESCE_CAP_POLLS
+        decision = self._resource_audit_log_gate.observe(
+            _resource_audit_fingerprint(violations), now,
         )
+        if decision.changed:
+            # First violating poll of an episode, or any change to the
+            # violation set: full detail, pre-3203 format byte-for-byte.
+            logger.warning(
+                'merge queue resource-conservation audit: %d violation(s) found '
+                '(consecutive streak=%d): %s',
+                len(violations), self._resource_audit_violation_streak + 1,
+                '; '.join(violations),
+            )
+        else:
+            # An unchanged repeat. Due repeats report; the polls between them
+            # are NOT dropped, only demoted to DEBUG (mirrors the
+            # _reprobe_last_info precedent above). The violation strings are
+            # deliberately omitted so this branch formats nothing eagerly.
+            logger.log(
+                logging.INFO if decision.should_log else logging.DEBUG,
+                'merge queue resource-conservation audit: %d violation(s) found '
+                '(consecutive streak=%d) (unchanged for %d polls / %.0fs; '
+                'next report in %d polls)',
+                len(violations), self._resource_audit_violation_streak + 1,
+                decision.unchanged_polls, decision.unchanged_secs,
+                decision.next_report_in_polls,
+            )
+
         self._resource_audit_violation_streak += 1
 
         if self._resource_audit_violation_streak >= self.RESOURCE_AUDIT_ESCALATION_STREAK:
