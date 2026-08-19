@@ -1887,6 +1887,95 @@ class TestVerifyAttributesADuplicateUuidToTheStore:
         )
         assert _mod.verify_manifest(manifest, [*population, *outside]).status == 'ok'
 
+    def _straddling(self, *, duplicate_first: bool):
+        """A MANIFEST-NAMED uuid held twice, once inside the window and once outside.
+
+        The outside copy carries DIFFERENT content, because that is what makes
+        "which copy won" observable at all: identical bytes hash the same and
+        the ambiguity stays invisible.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        target = manifest['episodes'][0]['uuid']
+        straddling = dataclasses.replace(
+            next(record for record in population if record.uuid == target),
+            created_at='2027-01-16T12:00:00+00:00',
+            content='bytes that were never in the sampling frame',
+        )
+        rows = [straddling, *population] if duplicate_first else [*population, straddling]
+        return manifest, rows, target
+
+    @pytest.mark.parametrize('duplicate_first', [False, True])
+    def test_a_manifest_named_uuid_duplicated_across_the_cutoff_is_a_store_condition(
+        self, duplicate_first
+    ):
+        """Scoping the frame check to the window must not leave ``present`` reading a phantom.
+
+        The control above is right that a duplicate the sampling frame never
+        sees cannot change the RE-DERIVATION. But ``present`` — the lookup both
+        the missing check and the hash comparison read — is built from the FULL
+        population, deliberately, and a dict comprehension keeps whichever row
+        came LAST. So a manifest-named uuid held twice, once at or before the
+        recorded bound and once after it with different bytes, makes the hash
+        comparison hash a row that was never in the frame.
+
+        BOTH row orders are asserted, because the defect is precisely that the
+        answer depends on the order FalkorDB happened to return rows in — which
+        is not guaranteed. Measured before the fix: duplicate-last reported
+        ``hash_drift`` (exit 3, remedy "the episode bytes changed"), and
+        duplicate-first reported ``ok``, masking it. Either alone reads like a
+        stable verdict; the pair is what shows neither is.
+        """
+        manifest, rows, _ = self._straddling(duplicate_first=duplicate_first)
+        with pytest.raises(_mod.CorpusBuildError):
+            report = _mod.verify_manifest(manifest, rows)
+            raise AssertionError(
+                f'a uuid duplicated across the cutoff came back as a '
+                f'{report.status!r} verdict instead of raising'
+            )
+
+    def test_the_straddling_error_names_the_episode_and_the_culprit(self):
+        """Same two obligations as the in-window case, for the same reason.
+
+        The operator has to be told which node to delete, and told that the
+        artifact is not what needs fixing — so this half of the check emits the
+        identical sentence rather than a second wording of the same finding.
+        """
+        manifest, rows, target = self._straddling(duplicate_first=False)
+        with pytest.raises(_mod.CorpusBuildError) as excinfo:
+            _mod.verify_manifest(manifest, rows)
+        message = str(excinfo.value)
+        assert target in message
+        assert 'store condition' in message
+        assert 'not a defect in the manifest' in message
+
+    def test_verifying_derives_the_stratification_no_more_often_than_selecting_does(
+        self, monkeypatch
+    ):
+        """The attribution fix must not buy itself a second grouping pass.
+
+        Same argument as TestSelectGroupsThePopulationOnce, one call frame out:
+        ``_group_by_cell`` derives a ``stratum_key`` per record — an ISO-8601
+        parse plus a regex substitution each — and the ``--verify`` path already
+        pays that once inside ``select`` (and once more per row back in
+        ``fetch_population``). Reusing the whole grouper merely to borrow its
+        uniqueness rule would double it, and the waste is invisible in the
+        RESULT: every other test in this class would stay green. Hence a pin on
+        the call count, so the uniqueness rule stays a uuid scan.
+        """
+        calls: list[int] = []
+        real = _mod._group_by_cell
+
+        def counted(population):
+            calls.append(len(population))
+            return real(population)
+
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        monkeypatch.setattr(_mod, '_group_by_cell', counted)
+        assert _mod.verify_manifest(manifest, population).status == 'ok'
+        assert len(calls) == 1, f'grouped {len(calls)} times for one re-derivation'
+
     def test_the_cli_path_reports_a_duplicated_node_as_a_run_failure_not_a_verdict(
         self, monkeypatch, tmp_path, capsys
     ):
