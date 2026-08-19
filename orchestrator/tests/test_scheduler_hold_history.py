@@ -280,6 +280,30 @@ def test_scheduler_predicted_remaining_uses_the_schedulers_own_wall_clock():
     assert scheduler.predicted_remaining('1') == pytest.approx(150.0)
 
 
+def test_scheduler_predicted_remaining_survives_a_stale_phantom_beside_a_live_hold():
+    """The per-key staleness sweep reaches the production consumer.
+
+    ``_compute_provable_assembly_delay`` reads this surface; a task whose open
+    map carries one lost-release phantom alongside a genuinely live hold must
+    still yield a real remainder rather than the None that admits no backfill.
+    ``stale_open_secs`` is not a scheduler knob, so the phantom is aged past the
+    module default (86400s) directly.
+    """
+    scheduler = _make_scheduler()
+    module = 'orchestrator/src'
+    for duration in (100.0, 200.0, 300.0):
+        scheduler._hold_history.record(module, duration)
+    scheduler._hold_history.observe_acquired(
+        '1', ['ghost/src'], at=FIXED_DT.timestamp() - 90_000.0
+    )
+    scheduler._hold_history.observe_acquired(
+        '1', [module], at=FIXED_DT.timestamp() - 50.0
+    )
+
+    assert scheduler.predicted_remaining('1') == pytest.approx(150.0)
+    assert scheduler._hold_history.open_modules('1') == [module]
+
+
 @pytest.mark.asyncio
 async def test_dispatch_then_release_lands_a_real_sample_in_the_history():
     """The round trip, through the real dispatch path — the feed is LIVE.

@@ -1579,3 +1579,95 @@ def test_the_default_staleness_ceiling_is_a_day():
 
     assert history.predicted_remaining('T1', now=_at(86_000)) == pytest.approx(0.0)
     assert history.predicted_remaining('T1', now=_at(86_401)) is None
+
+
+# --- the staleness backstop is PER-KEY, not per-task -----------------------
+#
+# The ceiling asks "is THIS hold bookkeeping residue?" — a per-hold question.
+# Answering it by dropping the whole task took a live sibling hold down with
+# the phantom: no prediction for a task that really is holding, and the live
+# hold's real ``lock_released`` then arrives at an ``_open`` map that no longer
+# has its span, so ``_apply_release`` discards it as an orphan and a genuinely
+# observed hold never becomes a sample.
+
+
+def test_a_stale_hold_does_not_discard_a_live_sibling_hold():
+    """The headline case: one phantom must not cost the task its prediction."""
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))       # release never arrived
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))    # genuinely live
+
+    assert history.predicted_remaining('T1', now=_at(1540)) == pytest.approx(60.0)
+    assert history.open_modules('T1') == ['fresh/src']
+
+
+def test_the_surviving_hold_still_records_its_sample_on_release():
+    """The collateral half: sweeping the live span orphans its real release.
+
+    ``_apply_release`` records nothing for a module with no open span, so a
+    hold the feed observed end to end would never become a sample — the
+    predictor silently degrading its own training data.
+    """
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+
+    history.predicted_remaining('T1', now=_at(1540))
+    history.observe_released('T1', ['fresh/src'], at=_at(1560))
+
+    assert history.sample_count(['fresh/src']) == 4
+
+
+def test_the_remainder_measures_from_the_earliest_SURVIVING_hold():
+    """The earliest-open rule survives the sweep — applied to the LIVE holds.
+
+    Measuring from the phantom (t=0) is what the ceiling rejects; measuring
+    from the latest (1700 -> 350.0) would under-count elapsed, the optimistic
+    direction the rule exists to refuse.  1500 is the answer: 150.0.
+    """
+    history = _history_of(
+        {'b/src': [400.0] * 3, 'c/src': [400.0] * 3}, min_samples=3, stale_open_secs=1000.0
+    )
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    history.observe_acquired('T1', ['b/src'], at=_at(1500))
+    history.observe_acquired('T1', ['c/src'], at=_at(1700))
+
+    assert history.predicted_remaining('T1', now=_at(1750)) == pytest.approx(150.0)
+    assert history.open_modules('T1') == ['b/src', 'c/src']
+
+
+def test_every_open_hold_stale_still_refuses_and_empties_the_task():
+    """The backstop keeps its purpose: nothing survives, so nothing is answered."""
+    history = _history_of({'a/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['a/src'], at=_at(0))
+    history.observe_acquired('T1', ['b/src'], at=_at(100))
+
+    assert history.predicted_remaining('T1', now=_at(2000)) is None
+    assert history.open_modules('T1') == []
+
+
+def test_the_stale_sweep_is_scoped_to_the_asking_task():
+    """It sweeps the asking task's keys, never the whole ``_open`` map."""
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+    history.observe_acquired('T2', ['t2ghost/src'], at=_at(0))
+
+    history.predicted_remaining('T1', now=_at(1540))
+
+    assert history.open_modules('T2') == ['t2ghost/src']
+
+
+def test_forget_is_still_all_or_nothing_when_only_some_holds_are_stale():
+    """The contract this deliberately does NOT change.
+
+    ``forget`` answers a different question — ``Scheduler.release`` is the
+    single writer that drops ALL of a task's locks — so it must not inherit the
+    per-key rule the staleness backstop needs.
+    """
+    history = _history_of({'fresh/src': [100.0] * 3}, min_samples=3, stale_open_secs=1000.0)
+    history.observe_acquired('T1', ['ghost/src'], at=_at(0))
+    history.observe_acquired('T1', ['fresh/src'], at=_at(1500))
+
+    assert history.forget('T1') == 2
+    assert history.open_modules('T1') == []
