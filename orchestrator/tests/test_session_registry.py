@@ -5018,6 +5018,217 @@ def test_merge_decision_enrichment_touches_only_the_documented_fields() -> None:
 
     assert merged == dataclasses.replace(existing, severity='urgent')
 
+# ---------------------------------------------------------------------------
+# Task 3872: merge_same_queue_refile -- the SAME watcher re-filing its own id
+# ---------------------------------------------------------------------------
+
+
+def test_merge_same_queue_refile_holds_the_cockpit_owned_fields() -> None:
+    """The three COCKPIT-owned fields survive a same-queue re-file at any state.
+
+    Sibling of test_merge_decision_enrichment_keeps_custody_fields_with_the_
+    first_filer: the custody set is the same one, because custody does not
+    depend on which queue re-filed. ``filed_at`` is queue age (it drives the
+    cockpit's ordering, and a watcher restart is not news about it),
+    ``manual_boost`` is the operator's C5 field (set_manual_boost's), and
+    ``state`` is the operator's / reaper's disposition
+    (update_decision_state's) -- so a watcher restart must not restamp the
+    age, reset the boost, or RE-OPEN a row the human already dropped.
+
+    ``id``/``project`` are asserted unchanged as the caller's PRECONDITION,
+    not as a field this helper forces: unlike merge_decision_enrichment (which
+    rebuilds from *existing* and so pins them structurally), this helper
+    rebuilds from *incoming*, and is only ever reached from
+    _run_write_decision after ``existing.project == project`` and with the id
+    as the on-disk file key. Stating it here is what makes a future caller
+    that widens those preconditions fail loudly rather than silently reassign
+    a live row to another project.
+    """
+    existing = _make_decision(
+        id='esc-5914-1',
+        project='df',
+        filed_at='2026-07-07T00:00:00+00:00',
+        state=sr.DecisionState.DROPPED,
+        manual_boost=7,
+    )
+    incoming = _make_decision(
+        id='esc-5914-1',
+        project='df',
+        filed_at='2026-08-19T00:00:00+00:00',
+        state=sr.DecisionState.OPEN,
+        manual_boost=0,
+    )
+
+    merged = sr.merge_same_queue_refile(existing, incoming)
+
+    assert merged.filed_at == '2026-07-07T00:00:00+00:00'
+    assert merged.state == sr.DecisionState.DROPPED
+    assert merged.manual_boost == 7
+    assert merged.id == 'esc-5914-1'
+    assert merged.project == 'df'
+
+
+def test_merge_same_queue_refile_takes_the_watcher_owned_fields_verbatim() -> None:
+    """The WATCHER-owned half lands exactly as filed -- downgrades and empties too.
+
+    This is the half that keeps the watcher the sole authority on its own
+    escalation, and the one place this helper deliberately differs from
+    merge_decision_enrichment: there a second watcher may only FILL fields
+    the first left empty and may never downgrade severity
+    (_max_decision_severity), because two watchers are two views of one gate.
+    Here there is only ONE view -- the same watcher's, revised -- so freezing
+    the first values would strand stale prose and a stale severity in the
+    cockpit queue forever.
+    """
+    queue = '/queues/orch'
+    existing = _make_decision(
+        text='the original prose',
+        severity='critical',
+        task_id='5914',
+        session_id='watcher-df-1',
+        escalation_id='esc-5914-1',
+        options=['yes', 'no'],
+        escalations_dir=queue,
+    )
+    incoming = _make_decision(
+        text='the rephrased prose',
+        severity='info',
+        task_id=None,
+        session_id=None,
+        escalation_id='esc-5914-2',
+        options=None,
+        escalations_dir=queue,
+    )
+
+    merged = sr.merge_same_queue_refile(existing, incoming)
+
+    assert merged.text == 'the rephrased prose'
+    assert merged.severity == 'info'  # a DOWNGRADE lands (unlike enrichment)
+    assert merged.task_id is None  # ...and so does an EMPTYING
+    assert merged.session_id is None
+    assert merged.escalation_id == 'esc-5914-2'
+    assert merged.options is None
+    assert merged.escalations_dir == queue
+
+
+@pytest.mark.parametrize(
+    'state',
+    [
+        sr.DecisionState.ANSWERED,
+        sr.DecisionState.DROPPED,
+        'deferred-by-hand',
+    ],
+)
+def test_merge_same_queue_refile_preserves_an_unrecognized_state_verbatim(
+    state: str,
+) -> None:
+    """``state`` is copied as an opaque str, never coerced through DecisionState.
+
+    Mirrors DecisionState's own documented additive-safe contract:
+    DecisionRecord.state is a plain ``str`` with NO from_dict coercion, so an
+    unrecognized value must round-trip rather than raise -- or, here, be
+    silently reset to 'open'. A disposition some future writer adds is
+    therefore held back by this helper for free, instead of needing this
+    module to be taught about it first.
+    """
+    existing = _make_decision(state=state)
+    incoming = _make_decision(state=sr.DecisionState.OPEN)
+
+    assert sr.merge_same_queue_refile(existing, incoming).state == state
+
+
+def test_merge_same_queue_refile_is_pure() -> None:
+    """Neither argument may be mutated in place.
+
+    Mirrors test_merge_decision_enrichment_is_pure. The helper is
+    deliberately side-effect-free -- including of LOGGING, which stays in the
+    CLI verb at the policy boundary -- so it is trivially testable in
+    isolation, and so a caller holding the pre-merge record (e.g. to name the
+    held-back state in its divergence warning) still sees what it read.
+    """
+    existing = _make_decision(id='esc-5914-1', text='first?', state='dropped')
+    incoming = _make_decision(id='esc-5914-1', text='second?', state='open')
+    before_existing = existing.to_dict()
+    before_incoming = incoming.to_dict()
+
+    merged = sr.merge_same_queue_refile(existing, incoming)
+
+    assert merged is not existing
+    assert merged is not incoming
+    assert existing.to_dict() == before_existing
+    assert incoming.to_dict() == before_incoming
+
+
+def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> None:
+    """THE ANTI-DIVERGENCE INVARIANT: one custody set, two merge branches.
+
+    After task 3872 the write-decision upsert has two merge arms --
+    merge_decision_enrichment (cross-queue) and merge_same_queue_refile
+    (same-queue) -- and the load-bearing shared rule is WHICH fields are
+    cockpit-owned. They differ only in how the WATCHER-owned half is taken
+    (fill-if-empty + severity-max vs. verbatim). Add a fourth custody field
+    to one and forget the other and the regression is silent: every
+    field-specific test above still passes.
+
+    Arranged so the two halves are separable. *existing* leaves every
+    fill-if-empty field empty (text/task_id/session_id/escalation_id/options/
+    severity), so BOTH helpers take the watcher-owned half from *incoming*
+    and the two runs can only differ on custody. The queue axis is
+    neutralized (equal normalized ``escalations_dir`` on both), which is also
+    the precondition of the same-queue arm.
+
+    ``id``/``project``/``escalations_dir`` land in the set because both
+    records agree on them, not because either helper had to choose -- that
+    agreement is exactly the caller's precondition for this arm, so the set
+    is spelled out in full rather than filtered down to the three fields that
+    genuinely differ.
+    """
+    queue = '/queues/orch'
+    existing = _make_decision(
+        text='',
+        task_id=None,
+        session_id=None,
+        escalation_id=None,
+        options=None,
+        severity='',
+        filed_at='2026-07-07T00:00:00+00:00',
+        state=sr.DecisionState.DROPPED,
+        manual_boost=7,
+        escalations_dir=queue,
+    )
+    incoming = _make_decision(
+        text="the watcher's current view",
+        task_id='5914',
+        session_id='watcher-df-1',
+        escalation_id='esc-5914-1',
+        options=['yes', 'no'],
+        severity='critical',
+        filed_at='2026-08-19T00:00:00+00:00',
+        state=sr.DecisionState.OPEN,
+        manual_boost=0,
+        escalations_dir=queue,
+    )
+
+    def _kept_from_existing(merged: sr.DecisionRecord) -> set[str]:
+        return {
+            f.name
+            for f in dataclasses.fields(sr.DecisionRecord)
+            if getattr(merged, f.name) == getattr(existing, f.name)
+        }
+
+    enriched = _kept_from_existing(sr.merge_decision_enrichment(existing, incoming))
+    refiled = _kept_from_existing(sr.merge_same_queue_refile(existing, incoming))
+
+    assert enriched == refiled
+    assert refiled == {
+        'id',
+        'project',
+        'filed_at',
+        'state',
+        'manual_boost',
+        'escalations_dir',
+    }
+
 
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
     """A still-pending escalation lives directly under the queue root."""
