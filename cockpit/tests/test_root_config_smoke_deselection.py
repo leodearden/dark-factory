@@ -177,9 +177,10 @@ def test_deselection_guard_rejects_a_run_where_collection_never_ran() -> None:
     )
 
     problems = _deselection_problems(never_ran)
-    assert problems, f'expected _deselection_problems to reject a run that never ran pytest, but it did not. Stub: {never_ran!r}'
-    assert any('exit' in p.lower() or 'returncode' in p.lower() for p in problems), (
-        f'expected a problem naming the exit/return code as the reason for rejection, got: {problems}'
+    tags = {tag for tag, _ in problems}
+    assert TAG_EXIT_CODE in tags, (
+        f'expected the exit-code check to reject a run that never executed pytest; '
+        f'got tags {sorted(tags)} from stub {never_ran!r}'
     )
 
 
@@ -209,19 +210,10 @@ def test_positive_control_guard_rejects_a_run_that_collected_nothing() -> None:
     )
 
     problems = _collection_problems(nothing_collected)
-    assert problems, (
-        f'expected _collection_problems to reject a run that collected nothing, '
-        f'but it did not. Stub: {nothing_collected!r}'
-    )
-    assert len(problems) == 2, (
-        f'expected both reasons (exit code not OK, and smoke test name absent) to be '
-        f'reported, got {len(problems)}: {problems}'
-    )
-    assert any('exit' in p.lower() or 'returncode' in p.lower() for p in problems), (
-        f'expected a problem naming the exit/return code, got: {problems}'
-    )
-    assert any(SMOKE_TEST_NAME in p for p in problems), (
-        f'expected a problem naming the missing smoke test, got: {problems}'
+    tags = {tag for tag, _ in problems}
+    assert {TAG_EXIT_CODE, TAG_NOT_COLLECTED} <= tags, (
+        f'expected both the exit-code and missing-test checks to reject a run that '
+        f'collected nothing; got tags {sorted(tags)} from stub {nothing_collected!r}'
     )
 
 
