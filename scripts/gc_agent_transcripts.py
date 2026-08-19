@@ -106,6 +106,15 @@ DEFAULT_ARCHIVE_ROOT = DEFAULT_PROJECT_ROOT / ARCHIVE_ROOT_RELATIVE
 DEFAULT_MAX_AGE_DAYS = 90
 DEFAULT_MAX_TASK_DIRS = 5000
 
+# Smallest number of COMPLETE interior day buckets :func:`observed_daily_rate`
+# will report a rate from. Below it the sample is too sparse to read a peak
+# out of, and the sampler returns None rather than a weak number: absence must
+# never read as a ZERO rate, because a zero rate satisfies any cap trivially
+# and would leave a derived-bound check permanently green while measuring
+# nothing. 7 days is the smallest window spanning a full weekend/idle cycle —
+# the live archive genuinely has consecutive zero-arrival days.
+MIN_RATE_SAMPLE_DAYS = 7
+
 
 def default_archive_root() -> Path:
     """Return the default archive root (``project_root / ARCHIVE_ROOT_RELATIVE``).
@@ -273,6 +282,78 @@ def scan_task_dirs(root: Path) -> list[tuple[Path, float]]:
                 continue
         scanned.append((child, mtime))
     return scanned
+
+
+@dataclass
+class ObservedRate:
+    """Measured task-dir ARRIVAL RATE over the archive's observed span.
+
+    ``peak_per_day`` is the busiest complete day; ``mean_per_day`` averages the
+    complete days (idle days included, so it stays honest about steady state);
+    ``complete_days`` is how many complete day buckets were sampled;
+    ``span_days`` is every observed bucket including the two partial ends; and
+    ``sample_dirs`` is the WHOLE input sample, including the dirs in the dropped
+    boundary buckets. Pure value object — no I/O.
+    """
+
+    peak_per_day: int
+    mean_per_day: float
+    complete_days: int
+    sample_dirs: int
+    span_days: int
+
+
+def observed_daily_rate(
+    task_dirs: list[tuple[Path, float]],
+) -> ObservedRate | None:
+    """Measure the daily task-dir arrival rate from scanned pairs (pure).
+
+    Takes the ``(task_dir, mtime)`` pairs :func:`scan_task_dirs` produces and
+    inherits their retention-age semantics exactly: each mtime is the NEWEST
+    descendant transcript mtime, i.e. the time that task's most recent agent
+    session last wrote. So a dir is counted on the day the retention sweep
+    itself ages it from, and the derived rate is measured against the same
+    clock the count cap prunes on rather than a parallel notion of "arrival".
+
+    Each dir is bucketed by UTC day (``int(mtime // SECONDS_PER_DAY)``). EVERY
+    day across the observed span is materialised, including ZERO-arrival days:
+    an idle day is still a day, so it lowers the mean rather than being deleted
+    from the denominator, and the live archive genuinely has idle days.
+
+    The FIRST and LAST buckets are dropped as PARTIAL BY CONSTRUCTION — the
+    sample begins and ends mid-day, so neither bucket saw a whole day of
+    arrivals. The direction of that error is what matters: a partial bucket
+    UNDERSTATES the rate (measured 2026-08-19, the live trailing bucket held 6
+    dirs against an 89/day interior peak), and an understated rate would
+    silently weaken any bound derived from it.
+
+    Returns ``None`` — never a zero rate — when the sample is empty or leaves
+    fewer than :data:`MIN_RATE_SAMPLE_DAYS` complete buckets. A caller must be
+    able to tell "too sparse to measure" from "measured and fine"; a zero rate
+    would satisfy any cap trivially and read as the latter.
+    """
+    if not task_dirs:
+        return None
+
+    per_day: dict[int, int] = {}
+    for _path, mtime in task_dirs:
+        day = int(mtime // SECONDS_PER_DAY)
+        per_day[day] = per_day.get(day, 0) + 1
+
+    first_day, last_day = min(per_day), max(per_day)
+    # range() over the span materialises the zero-arrival interior days that
+    # per_day has no key for, and excludes both partial boundary buckets.
+    interior = [per_day.get(day, 0) for day in range(first_day + 1, last_day)]
+    if len(interior) < MIN_RATE_SAMPLE_DAYS:
+        return None
+
+    return ObservedRate(
+        peak_per_day=max(interior),
+        mean_per_day=sum(interior) / len(interior),
+        complete_days=len(interior),
+        sample_dirs=len(task_dirs),
+        span_days=last_day - first_day + 1,
+    )
 
 
 @dataclass
