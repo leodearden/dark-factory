@@ -12,6 +12,7 @@ Steps covered:
   13 (test) real-process capstone: setsid + start_new_session escape tree reaped
 """
 
+import errno
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -1134,6 +1135,289 @@ class TestChunkedLocksReadIsToleratedByTheReader:
             'the wrapper must diverge from the strict core ONLY on OSError '
             'policy — the read count is core behaviour and must track it'
         )
+
+
+class TestChunkedConfirmLoopContract:
+    """What the confirm loop must NOT change, on either side of the fix.
+
+    A fix for a 1.54% loss is only worth having if it leaves task 3604's raise
+    contract bit-for-bit intact and returns the SAME answer on the
+    overwhelmingly common non-lossy path.  Both are easy to break silently
+    here: K reads give a previously-single-read function K chances to raise,
+    and a union across snapshots could quietly reorder or invent a holder.
+    """
+
+    @staticmethod
+    def _mixed_table(lock_path: Path, other: Path) -> str:
+        """The full parse-exercising table: holder, waiter, POSIX, foreign, junk."""
+        return (
+            'garbage\n'
+            '311: FLOCK  ADVISORY  WRITE notapid 103:08:zzz 0 EOF\n'
+            + _locks_row(lock_path, 4242)
+            + '\n'
+            + _locks_row(lock_path, 4243, row_id=309, waiter=True)
+            + '\n'
+            + _locks_row(lock_path, 5150, row_id=310, kind='POSIX')
+            + '\n'
+            + _locks_row(other, 6001, row_id=311)
+            + '\n'
+            + _locks_row(lock_path, 4242, row_id=312)
+            + '\n'
+        )
+
+    def test_a_first_read_failure_still_propagates_unchanged(self, tmp_path: Path):
+        """(a) Task 3604's contract, bit-for-bit: read #1 failing means UNKNOWN.
+
+        A first read that fails means NO rows were examined at all, so the
+        answer carries no information about the target inode and the strict
+        variant must still raise — with errno AND filename intact, which
+        ``require_lane_lock_holders``' deliberate ``!s``-not-``!r`` message
+        depends on to name the path that could not be read.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        denied = PermissionError(
+            errno.EACCES, 'Permission denied', str(tmp_path / 'locks'),
+        )
+        good = _locks_row(lock_path, 4242) + '\n'
+
+        strict_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[denied, good],
+        )
+        with pytest.raises(PermissionError) as excinfo:
+            lane_lock_holder_pids_strict(lock_path, locks_path=strict_locks)
+
+        assert excinfo.value.errno == errno.EACCES
+        assert str(tmp_path / 'locks') in str(excinfo.value), (
+            f'the filename must survive to the message — a confirm loop that '
+            f're-raised a bare OSError would leave the operator without the '
+            f'path that could not be read; got {str(excinfo.value)!r}'
+        )
+        assert strict_locks.reads == 1, (
+            f'a failed FIRST read must not be retried past: the confirm reads '
+            f'exist to enrich an answer, and there is no answer yet; took '
+            f'{strict_locks.reads} read(s)'
+        )
+
+        wrapper_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[denied, good],
+        )
+        assert lane_lock_holder_pids(lock_path, locks_path=wrapper_locks) == [], (
+            'the fail-safe wrapper must keep its production contract unchanged'
+        )
+
+    def test_a_missing_lock_file_raises_before_any_read_is_taken(
+        self, tmp_path: Path,
+    ):
+        """(a) The stat stays ONCE, outside the loop — no stat-per-read.
+
+        Task 3604's headline case is a held lane whose lock file was unlinked:
+        ``os.stat`` fails and the answer is unknown having examined no rows.
+        Asserting ZERO reads is what pins the stat OUTSIDE the confirm loop —
+        a stat moved inside would still raise, so the raise alone cannot tell
+        the two structures apart.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        absent = tmp_path / 'absent.lock'
+        locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=['313: FLOCK  ADVISORY  WRITE 4242 103:08:1 0 EOF\n'],
+        )
+
+        with pytest.raises(FileNotFoundError):
+            lane_lock_holder_pids_strict(absent, locks_path=locks)
+        assert locks.reads == 0, (
+            f'a structurally-unknown answer must cost no procfs I/O at all; '
+            f'the lock table was read {locks.reads} time(s)'
+        )
+        assert lane_lock_holder_pids(absent, locks_path=locks) == []
+
+    def test_a_missing_locks_table_still_raises_on_the_first_read(
+        self, tmp_path: Path,
+    ):
+        """(a) The plain existing seam: an absent ``/proc/locks`` is still UNKNOWN."""
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        missing = tmp_path / 'nope'
+
+        with pytest.raises(OSError):
+            lane_lock_holder_pids_strict(lock_path, locks_path=missing)
+        assert lane_lock_holder_pids(lock_path, locks_path=missing) == []
+
+    def test_a_later_confirm_read_failure_is_best_effort(self, tmp_path: Path):
+        """(b) A LATER read failing must not subtract information.
+
+        The confirm reads exist only to RECOVER a possibly-dropped record, so
+        failing to obtain an EXTRA one cannot make the answer less known than
+        the first read already made it.  Letting it raise would take a reader
+        that previously raised on 1-in-N reads and hand it K chances to raise —
+        manufacturing a NEW failure class out of a fix, on precisely the
+        acquire-timeout paths whose documented reason for using the fail-safe
+        wrapper is that an exception there converts a diagnosable stall into a
+        broken merge.  The wrapper's degradation is the sharper half: a
+        perfectly good answer would become ``[]``, which is the very
+        "nobody holds it" this task exists to stop rendering.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        good = _locks_row(lock_path, 4242) + '\n'
+        denied = PermissionError(
+            errno.EACCES, 'Permission denied', str(tmp_path / 'locks'),
+        )
+
+        strict_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[good, denied],
+        )
+        assert lane_lock_holder_pids_strict(
+            lock_path, locks_path=strict_locks,
+        ) == [4242], (
+            'read #1 already answered the question — a failed CONFIRM read '
+            'must end the loop, not propagate'
+        )
+
+        wrapper_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[good, denied],
+        )
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=wrapper_locks,
+        ) == [4242], (
+            'the fail-safe wrapper must not degrade a known holder set to [] '
+            'because an EXTRA read it did not need happened to fail'
+        )
+
+    def test_the_union_never_fabricates_a_holder(self, tmp_path: Path):
+        """(c) The union may only ADD what the kernel actually reported.
+
+        The defect being fixed is false-negative-only, and the fix must stay
+        that way: a pid in no snapshot must never appear, and a target row
+        absent from EVERY snapshot must still read as ``[]`` — otherwise a
+        genuine RELEASE would stop reading as released, which is the opposite
+        (and louder) error.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        other = tmp_path / 'other.lock'
+        other.write_text('x')  # distinct inode on the same device
+
+        foreign = _locks_row(other, 6001) + '\n'
+        released = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[foreign, foreign, foreign],
+        )
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=released) == [], (
+            'a lock genuinely released must still read as released — the union '
+            'is a recovery mechanism, not a source of holders'
+        )
+        assert released.reads > 1, (
+            'staging error: the empty answer must have survived the WHOLE '
+            'confirm loop, not been returned before it ran'
+        )
+
+        mixed = _ChunkedLocksPath(
+            tmp_path / 'locks',
+            snapshots=[foreign, foreign + _locks_row(lock_path, 4242) + '\n'],
+        )
+        assert lane_lock_holder_pids(lock_path, locks_path=mixed) == [4242], (
+            'only the target inode\'s holders may appear: a foreign row read '
+            'K times must not leak into the answer'
+        )
+
+    def test_reading_a_static_table_k_times_yields_the_pre_fix_answer(
+        self, tmp_path: Path,
+    ):
+        """(d) STATIC EQUIVALENCE: the non-lossy path answers exactly as before.
+
+        The overwhelmingly common case is a table that reads correctly every
+        time.  Reading it K times must be bit-for-bit the one-read answer —
+        de-duplicated, first-seen order preserved, ``-> FLOCK`` waiters and
+        ``POSIX`` rows still excluded, malformed rows still tolerated — for
+        BOTH variants.  Without this pin the union could quietly change the
+        answer everywhere in exchange for fixing 1.54% of reads.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        other = tmp_path / 'other.lock'
+        other.write_text('x')
+        locks = tmp_path / 'locks'
+        locks.write_text(self._mixed_table(lock_path, other))
+
+        one_shot = lane_lock_holder_pids_strict(
+            lock_path, locks_path=locks, confirm_reads=1,
+        )
+        assert one_shot == [4242], (
+            f'staging error: the fixture must exercise waiter/POSIX/foreign/'
+            f'malformed exclusion in ONE read; got {one_shot!r}'
+        )
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=locks) == one_shot
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == one_shot
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=locks, confirm_reads=1,
+        ) == one_shot
+
+    def test_first_seen_order_is_preserved_across_reads(self, tmp_path: Path):
+        """(e) The ordering contract survives the union.
+
+        The docstring promises first-seen order, and with more than one read
+        "first seen" spans them: a holder observed only in read #2 must sort
+        AFTER one observed in read #1, even though the settled table lists it
+        first.  Sorting by the final table's textual order instead would be a
+        different, undocumented contract.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        first = _locks_row(lock_path, 4242) + '\n'
+        second = _locks_row(lock_path, 4243, row_id=309) + '\n'
+
+        # Read #1 shows only 4243; read #2 shows the settled table, which lists
+        # 4242 FIRST.  First-seen-across-reads therefore means [4243, 4242].
+        strict_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[second, first + second],
+        )
+        assert lane_lock_holder_pids_strict(
+            lock_path, locks_path=strict_locks,
+        ) == [4243, 4242], (
+            'first-seen order must be taken across the whole confirm loop, '
+            'not re-derived from the last snapshot read'
+        )
+
+        wrapper_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[second, first + second],
+        )
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=wrapper_locks,
+        ) == [4243, 4242]
 
 
 # ---------------------------------------------------------------------------
