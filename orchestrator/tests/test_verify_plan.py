@@ -1237,9 +1237,20 @@ class TestScoperTrailingClausePreservation:
         drift that motivated task 3495. ``ROOT_TEST_COMMAND``'s exact text is
         pinned against the live yaml by ``test_verify_config_corpus.py``, so
         this docstring names the key and leaves the value to the gate.
+
+        The rendered project changed under task 3830: the retained first clause
+        is ``cd shared && uv run pytest``, which parses to the same state a
+        ``--directory shared`` flag would (``uv_project == ''``,
+        ``cwd_rel == 'shared'``), so ``promote_cwd_to_project`` now carries that
+        selection onto the render instead of letting ``strip_cwd`` discard it.
+        The fan-out TRUNCATION this test exists to pin is unchanged — the two
+        assertions below it are what carry that meaning. Preserving ``shared``
+        is faithful to what the dropped ``cd shared`` selected, and it happens
+        to equal ``verify._FALLBACK_UV_PROJECT``; the previous bare ``uv run``
+        was the depless-workspace-root shape of regression ef68777a17.
         """
         scoped = verify._scope_to_keyword(ROOT_TEST_COMMAND, 'pytest', self._FILES)
-        assert scoped == 'uv run pytest fused-memory/tests/test_harness.py'
+        assert scoped == 'uv run --project shared pytest fused-memory/tests/test_harness.py'
         assert 'cd ../escalation' not in scoped
         assert 'cockpit' not in scoped
 
