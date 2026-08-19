@@ -1066,3 +1066,144 @@ def test_gc_report_carries_a_stable_count_cap_block_bound_and_unbound():
     # The block reports the cap that was ACTUALLY applied, matching `caps`.
     assert bound["max_task_dirs"] == 1
     assert unbound["max_task_dirs"] == HIGH_COUNT_CAP
+
+
+# ---------------------------------------------------------------------------
+# step-9 (task 3621): the sweep SAYS SO — CLI end-to-end over a real archive.
+#
+# step-7/8 made the count-cap bind a structured fact in the JSON report. This
+# closes the loop on the operator-facing half: a bind must also be LOUD on
+# stderr, and the two prune causes must be DISTINGUISHABLE in the output —
+# which is the exact defect this leaf fixes.
+# ---------------------------------------------------------------------------
+
+# The operator-facing GREP CONTRACT. This substring is what a human or a
+# cron/watchdog wrapper searches stderr for, so it is pinned deliberately:
+# changing it is a breaking change to the alarm, not a wording tweak.
+COUNT_CAP_MARKER = "COUNT CAP BOUND"
+
+
+def _count_cap_warnings(stderr: str) -> list[str]:
+    """The count-cap alarm records in a CLI run's stderr.
+
+    ``logging.basicConfig`` writes one ``LEVELNAME:logger:message`` line per
+    record, so a line-wise filter recovers exactly the alarm records — and
+    lets an assertion address the WARNING itself rather than the whole stream,
+    which in a dry-run also carries the pre-existing 'would prune' INFO lines.
+    """
+    return [
+        line
+        for line in stderr.splitlines()
+        if line.startswith("WARNING:") and COUNT_CAP_MARKER in line
+    ]
+
+
+def test_cli_count_cap_bind_is_loud_and_carries_the_same_numbers(tmp_path):
+    """(a) The age axis is ON and the cap still bites, so the dropped dirs are
+    tagged 'count' — fresh enough to keep, dropped anyway. stderr must carry a
+    LOUD, greppable WARNING, and stdout's JSON must carry the SAME numbers, so
+    a cron/watchdog wrapper never has to re-parse the log to recover a fact the
+    emitter already held in a variable (INV-2)."""
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(root, _five_fresh_specs())
+
+    result = _run_cli(
+        "--root", str(root),
+        "--now", str(NOW),
+        "--max-task-dirs", "2",
+        "--max-age-days", "90",  # age axis ON — every drop below is 'count'
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+
+    block = json.loads(result.stdout)["count_cap"]
+    assert block["bound"] is True
+    assert block["max_task_dirs"] == 2
+    assert block["pruned"] == 3
+    assert block["truncated"] == 3          # all three were inside the age window
+    assert block["oldest_dropped_age_days"] == 4.0
+    assert block["effective_window_days"] == 2.0
+    # A 90-day policy that in practice retains 2 days: the whole point.
+    assert block["effective_window_days"] < 90
+
+    warnings = _count_cap_warnings(result.stderr)
+    assert len(warnings) == 1, f"expected exactly one alarm, got {warnings!r}"
+    alarm = warnings[0]
+
+    assert LOG_PREFIX in alarm                        # greppable prefix
+    assert f"max_task_dirs={block['max_task_dirs']}" in alarm
+    assert str(block["truncated"]) in alarm
+    assert f"{block['oldest_dropped_age_days']:.1f}" in alarm
+    assert f"{block['effective_window_days']:.1f}" in alarm
+    # It must tell the operator what to DO, not merely that something happened.
+    assert "re-derive" in alarm.lower()
+    assert "plans/transcript-preservation-seam-prd.md" in alarm
+    # (d) The alarm is not a dry-run line. The pre-existing
+    # test_cli_count_cap_prunes_oldest_over_cap asserts 'would prune' is absent
+    # from a REAL run's stderr and must keep passing unmodified.
+    assert "would prune" not in alarm
+
+
+def test_cli_age_only_prune_is_not_a_count_cap_alarm(tmp_path):
+    """(b) An age prune is the retention policy working as designed. It must
+    emit NO alarm and report bound=False — the two prune causes are now
+    DISTINGUISHABLE, which is the defect this leaf fixes."""
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(
+        root,
+        [("100", NOW), ("101", NOW - DAY), ("ancient", NOW - 200 * DAY)],
+    )
+
+    result = _run_cli(
+        "--root", str(root),
+        "--now", str(NOW),
+        "--max-task-dirs", "10",  # count axis slack
+        "--max-age-days", "90",
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+
+    report = json.loads(result.stdout)
+    assert report["removed"] == 1                     # the age axis really pruned
+    assert report["reason_counts"] == {"age": 1}
+    block = report["count_cap"]
+    assert block["bound"] is False
+    assert block["pruned"] == 0
+    assert block["truncated"] == 0
+    assert block["oldest_dropped_age_days"] is None
+    assert block["effective_window_days"] is None
+
+    assert _count_cap_warnings(result.stderr) == []
+
+
+def test_cli_check_still_warns_while_deleting_nothing(tmp_path):
+    """(c) A dry run is PRECISELY when an operator wants to hear that the cap
+    is about to truncate the window, so --check must still alarm."""
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(root, _five_fresh_specs())
+
+    result = _run_cli(
+        "--root", str(root),
+        "--now", str(NOW),
+        "--max-task-dirs", "2",
+        "--max-age-days", "90",
+        "--check",
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    for i in range(5):
+        assert (root / str(100 + i)).exists()  # dry-run deletes nothing
+
+    report = json.loads(result.stdout)
+    assert report["check"] is True
+    assert report["removed"] == 0
+    assert report["count_cap"]["bound"] is True       # classified, not deleted
+    assert report["count_cap"]["truncated"] == 3
+
+    warnings = _count_cap_warnings(result.stderr)
+    assert len(warnings) == 1, f"expected exactly one alarm, got {warnings!r}"
+    # (d) at its sharpest: this stderr DOES carry the pre-existing dry-run
+    # 'would prune' INFO lines, and the alarm is still a separate record that
+    # does not contain that substring.
+    assert "would prune" in result.stderr
+    assert "would prune" not in warnings[0]
