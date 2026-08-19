@@ -1425,15 +1425,11 @@ async def build_journal_with_closed_run(
     return journal
 
 
-_UNSET = object()
-
-
 class FakeMemoryLookup:
-    """Stub for the two ``MemoryService`` reads the repair path uses.
+    """Async ``get_memory_by_id`` stub with an explicit per-id verdict.
 
-    ``get_memory_by_id`` (the CORROBORATION read) is driven by ``memories``,
-    whose value decides the branch so a test states which of the THREE outcomes
-    it means without any implicit default:
+    The map's value decides the branch, so a test states which of the THREE
+    outcomes it means without any implicit default:
 
     - ``dict``      -> the memory resolves (live);
     - ``None``      -> genuinely absent (the only verdict that licenses a repair);
@@ -1443,59 +1439,21 @@ class FakeMemoryLookup:
     not-found return. ``calls`` records every ``(project_id, memory_id)`` in
     order, so a test can assert a gate fired BEFORE any lookup was attempted.
 
-    ``get_memory`` (the FINGERPRINT read ``cite_memory`` uses, and therefore what
-    ``citation_repair`` calls so a repaired citation is shaped and valued exactly
-    like an in-run one) is driven by ``fingerprints`` and logged separately in
-    ``fingerprint_calls`` — separately because the two are different reads with
-    different failure shapes, and because ``calls``' documented job is pinning
-    that a gate fired before any corroboration read.
-
-    An id absent from ``fingerprints`` falls back to deriving the
-    ``{category, agent_id, created_at}`` triple from that id's ``memories``
-    record, and RAISES for an id that is absent/raising there — mirroring the
-    real ``get_memory``, which raises ``MemoryNotFoundError`` on a miss rather
-    than returning ``None``. That fallback is a fixture convenience only: the
-    real ``get_memory`` reads ``category``/``created_at`` off the mem0 record's
-    TOP level, not out of the raw Qdrant payload, so a test that cares about
-    that divergence passes an explicit ``fingerprints`` entry.
+    Deliberately exposes NO ``get_memory``: ``citation_repair`` reads the
+    replacement's fingerprint off the raw Qdrant payload this returns, not
+    through ``MemoryService.get_memory`` (whose mem0 fingerprint is
+    structurally ``{category: None, agent_id: None, ...}`` — see
+    ``citation_repair._fingerprint_from_record``). A test that needs to pin
+    that non-call subclasses this and adds a recording ``get_memory``.
     """
 
-    def __init__(
-        self,
-        memories: dict[str, Any] | None = None,
-        fingerprints: dict[str, Any] | None = None,
-    ):
+    def __init__(self, memories: dict[str, Any] | None = None):
         self.memories: dict[str, Any] = dict(memories or {})
-        self.fingerprints: dict[str, Any] = dict(fingerprints or {})
         self.calls: list[tuple[str, str]] = []
-        self.fingerprint_calls: list[tuple[str, str, str]] = []
 
     async def get_memory_by_id(self, project_id: str, memory_id: str) -> Any:
         self.calls.append((project_id, memory_id))
         verdict = self.memories.get(memory_id)
-        if isinstance(verdict, BaseException):
-            raise verdict
-        return verdict
-
-    async def get_memory(self, memory_id: str, store: str, project_id: str) -> Any:
-        from fused_memory.services.memory_service import (  # noqa: PLC0415
-            MemoryNotFoundError,
-        )
-
-        self.fingerprint_calls.append((project_id, memory_id, store))
-        verdict = self.fingerprints.get(memory_id, _UNSET)
-        if verdict is _UNSET:
-            record = self.memories.get(memory_id)
-            if isinstance(record, BaseException):
-                raise record
-            if not record:
-                raise MemoryNotFoundError(memory_id)
-            payload = record.get('metadata') or {}
-            return {
-                'category': payload.get('category'),
-                'agent_id': payload.get('agent_id'),
-                'created_at': payload.get('created_at'),
-            }
         if isinstance(verdict, BaseException):
             raise verdict
         return verdict

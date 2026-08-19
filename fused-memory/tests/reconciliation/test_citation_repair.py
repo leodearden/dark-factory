@@ -1145,44 +1145,60 @@ class TestRepairCitationMatching:
 
 
 class TestRepairFingerprintProvenance:
-    """The replacement's fingerprint comes from the CANONICAL read."""
+    """Where the replacement citation's ``metadata_fingerprint`` comes from."""
 
     @pytest.mark.asyncio
-    async def test_fingerprint_is_taken_from_get_memory_not_re_derived(self, tmp_path):
-        """``cite_memory``'s own primitive supplies the fingerprint.
+    async def test_fingerprint_is_read_from_the_raw_payload_not_get_memory(
+        self, tmp_path
+    ):
+        """The RAW Qdrant payload, deliberately not ``MemoryService.get_memory``.
 
-        ``MemoryService.get_memory`` reads ``category``/``created_at`` off the
-        mem0 record's TOP level and ``agent_id`` out of its nested metadata,
-        while ``get_memory_by_id`` returns the raw Qdrant payload — so a
-        fingerprint re-derived here from the corroboration record would agree in
-        SHAPE and could differ in VALUE from the one ``cite_memory`` writes for
-        the same id. The two reads are given deliberately DIFFERENT values so
-        only the canonical one can satisfy this.
+        ``get_memory`` is the primitive ``cite_memory`` uses, so matching it
+        would make a repaired citation byte-identical to an in-run one — but
+        matching it would also reproduce a defect. mem0's ``AsyncMemory.get``
+        lifts its ``promoted_payload_keys`` (``agent_id`` among them) to the TOP
+        level and EXCLUDES them from ``metadata``, while every other payload key
+        — ``category`` included — stays INSIDE ``metadata``; ``get_memory``
+        reads ``category`` off the top level and ``agent_id`` out of
+        ``metadata``, i.e. neither where mem0 put it. Its mem0 fingerprint is
+        therefore structurally ``{category: None, agent_id: None, created_at:
+        <real>}``.
+
+        ``get_memory_by_id`` returns the full unprocessed payload, where all
+        three genuinely live. A durable audit record is the wrong place to
+        reproduce a known-broken read for the sake of agreeing with it, so this
+        pins BOTH halves: the real values are recorded, and ``get_memory`` is
+        not called at all. (Convergence belongs in ``get_memory``; that module
+        is outside this task's scope and the fix is filed separately.)
         """
-        canonical = {
-            'category': 'procedural_knowledge',
-            'agent_id': 'recon-stage-memory_consolidator',
-            'created_at': '2026-07-26T04:34:05Z',
-        }
-        decoy_record = {
-            'id': SUCCESSOR,
-            'content': 'the surviving consolidated entry',
-            'metadata': {
-                'category': 'raw-payload-category',
-                'agent_id': 'raw-payload-agent',
-                'created_at': 'raw-payload-created-at',
-            },
-        }
+
+        class RecordingLookup(FakeMemoryLookup):
+            """``FakeMemoryLookup`` plus the arm the repair must NOT reach."""
+
+            def __init__(self, memories: dict[str, Any]):
+                super().__init__(memories)
+                self.get_memory_calls: list[tuple[str, str, str]] = []
+
+            async def get_memory(
+                self, memory_id: str, store: str, project_id: str
+            ) -> dict[str, Any]:
+                self.get_memory_calls.append((memory_id, store, project_id))
+                # What the real one returns for a mem0 id: two fields always
+                # None. Recording it makes the fingerprint assertion below fail
+                # too, so switching the source breaks this test twice over.
+                return {
+                    'category': None,
+                    'agent_id': None,
+                    'created_at': '2026-07-26T04:34:05Z',
+                }
+
         journal = await build_journal_with_closed_run(
             tmp_path,
             run_id=RUN_ID,
             findings=[_finding('f-1', [_citation(DANGLING)])],
         )
         try:
-            memory = FakeMemoryLookup(
-                {DANGLING: None, SUCCESSOR: decoy_record},
-                fingerprints={SUCCESSOR: canonical},
-            )
+            memory = RecordingLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
 
             outcome = await citation_repair.repair_memory_citation(
                 journal,
@@ -1196,44 +1212,16 @@ class TestRepairFingerprintProvenance:
             )
 
             assert outcome['status'] == 'repaired'
-            assert memory.fingerprint_calls == [('reify', SUCCESSOR, 'mem0')]
+            assert memory.get_memory_calls == []
             repaired = _dump(await journal.get_run(RUN_ID))[
                 'memory_consolidator'
             ]['items_flagged'][0]
-            assert repaired['cited_memories'][0]['metadata_fingerprint'] == canonical
-        finally:
-            await journal.close()
-
-    @pytest.mark.asyncio
-    async def test_fingerprint_read_that_raises_is_never_a_repair(self, tmp_path):
-        """A raised fingerprint read is UNKNOWN, like every other lookup here."""
-        journal = await build_journal_with_closed_run(
-            tmp_path,
-            run_id=RUN_ID,
-            findings=[_finding('f-1', [_citation(DANGLING)])],
-        )
-        try:
-            before = _dump(await journal.get_run(RUN_ID))
-            memory = FakeMemoryLookup(
-                {DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD},
-                fingerprints={SUCCESSOR: TimeoutError('qdrant read timed out')},
-            )
-
-            outcome = await citation_repair.repair_memory_citation(
-                journal,
-                memory,
-                target_run_id=RUN_ID,
-                finding_id='f-1',
-                memory_id=DANGLING,
-                store='mem0',
-                replacement_memory_id=SUCCESSOR,
-                repaired_by='run:caller-1',
-            )
-
-            assert outcome['error'] == 'verification_error'
-            assert outcome['exception_type'] == 'TimeoutError'
-            assert outcome['role'] == 'replacement_fingerprint'
-            assert _dump(await journal.get_run(RUN_ID)) == before
+            # The REAL provenance, off the raw payload — not two Nones.
+            assert repaired['cited_memories'][0]['metadata_fingerprint'] == {
+                'category': 'procedural_knowledge',
+                'agent_id': 'recon-stage-memory_consolidator',
+                'created_at': '2026-07-26T04:34:05Z',
+            }
         finally:
             await journal.close()
 

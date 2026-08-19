@@ -208,6 +208,41 @@ def build_citation_repair_record(
     }
 
 
+def _fingerprint_from_record(record: Any) -> dict[str, Any]:
+    """The mem0 ``metadata_fingerprint`` triple, read off a ``get_memory_by_id`` record.
+
+    Same ``{category, agent_id, created_at}`` SHAPE ``MemoryService.get_memory``
+    returns for a mem0 citation, deliberately NOT the same extraction — and the
+    divergence is on purpose, not an oversight, so do not "unify" these two
+    without fixing ``get_memory`` first:
+
+    ``get_memory`` reads ``category`` and ``created_at`` off the TOP LEVEL of
+    mem0's ``AsyncMemory.get`` record and ``agent_id`` out of its nested
+    ``metadata``. mem0 puts none of ``category``/``agent_id`` where that reads:
+    ``get``'s ``promoted_payload_keys`` (``user_id``, ``agent_id``, ``run_id``,
+    ``actor_id``, ``role``) are lifted to the TOP level and EXCLUDED from
+    ``metadata``, while every other payload key — ``category`` included — stays
+    INSIDE ``metadata``. So ``get_memory``'s mem0 fingerprint is
+    ``{category: None, agent_id: None, created_at: <real>}``: two of its three
+    fields are structurally always None, and every citation ``cite_memory`` has
+    ever written carries that.
+
+    ``get_memory_by_id`` returns the FULL unprocessed Qdrant payload under
+    ``metadata``, where all three genuinely live — so reading them here yields
+    the REAL values, from the record the corroboration read already fetched.
+    A durable audit record is the wrong place to reproduce a known-broken read
+    for the sake of matching it. Convergence belongs in ``get_memory`` (one fix
+    there repairs ``cite_memory`` corpus-wide and this path with it), which is
+    outside this task's module scope and is filed as follow-up work.
+    """
+    payload = (record or {}).get('metadata') or {}
+    return {
+        'category': payload.get('category'),
+        'agent_id': payload.get('agent_id'),
+        'created_at': payload.get('created_at'),
+    }
+
+
 # What an operator needs to know for each phase of journal I/O: whether
 # anything was written. Declared per phase because that answer is the only
 # question a backend error raises, and a generic "the journal failed" leaves it
@@ -551,7 +586,7 @@ async def repair_memory_citation(
             ),
         }
 
-    replacement_fingerprint: dict[str, Any] | None = None
+    replacement_record = None
     if replacement_memory_id is not None:
         try:
             replacement_record = await memory_service.get_memory_by_id(
@@ -572,27 +607,6 @@ async def repair_memory_citation(
                     'citation instead of re-pointing it.'
                 ),
             }
-        # The fingerprint comes from ``MemoryService.get_memory`` — the SAME
-        # primitive ``cite_memory`` calls — so a repaired citation is
-        # byte-identical to the one an in-run citation would have written for
-        # this id. Deliberately NOT re-derived from the ``get_memory_by_id``
-        # record the corroboration read already holds: that returns the raw
-        # Qdrant payload, whose ``category``/``created_at`` sit in a different
-        # place than the mem0 record ``get_memory`` reads, so extracting here
-        # would be a second implementation of the fingerprint that agrees in
-        # SHAPE and can silently diverge in VALUE — exactly the lockstep
-        # duplication INV-5 forbids. One extra point read, on a path that
-        # already does two, buys one extraction site instead of two.
-        try:
-            replacement_fingerprint = await memory_service.get_memory(
-                replacement_memory_id, store, run.project_id
-            )
-        except Exception as exc:
-            # Includes the not-found raise: the id resolved a moment ago, so a
-            # miss here is a race, and a race is UNKNOWN — never a repair.
-            return _verification_error(
-                replacement_memory_id, 'replacement_fingerprint', exc
-            )
 
     # ── Compute the new citation list (no mutation yet) ───────────────────
     # The mutation is confined to cited_memories plus the appended provenance
@@ -615,7 +629,7 @@ async def repair_memory_citation(
                 {
                     'memory_id': replacement_memory_id,
                     'store': store,
-                    'metadata_fingerprint': replacement_fingerprint,
+                    'metadata_fingerprint': _fingerprint_from_record(replacement_record),
                 }
             )
 
