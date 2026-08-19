@@ -656,8 +656,8 @@ resolve_detached() {
 
 # resolve_sibling: called after a sibling-mode (Fleet Cockpit C7) child has
 # been launched detached (via _detach above on the emulator branches that
-# detach themselves, which applies setsid only where the host actually has
-# it -- and not at all on the mac-terminal lane, where `open` already
+# detach themselves, which applies setsid only where this host can actually
+# run it -- and not at all on the mac-terminal lane, where `open` already
 # detaches via LaunchServices and stock macOS ships no setsid -- plus stdio
 # redirected off this script's own pipe; see the emulator case dispatch
 # below). Deliberately does NOT wait
@@ -813,7 +813,7 @@ case "$first_word" in
   xterm)
     # xterm is naturally foreground -- in sibling mode (Fleet Cockpit C7) it
     # must be detached explicitly, which is what _detach above does: setsid
-    # where the host has it (survive this script's exit), plus stdio
+    # where this host can run it (survive this script's exit), plus stdio
     # redirected off this script's own pipe (else a caller capturing
     # this script's output, e.g. /spawn's background task, would block
     # until the detached xterm itself exits).
@@ -962,8 +962,8 @@ case "$first_word" in
   *)
     # User-supplied launcher via $CLAUDE_TERMINAL_CMD. Assume `<cmd> -- bash -c '<payload>'`
     # and detaching semantics — wait on sentinel (or, in sibling mode,
-    # detach explicitly via _detach (setsid where the host has it) + stdio
-    # redirect and don't wait at all -- same treatment as
+    # detach explicitly via _detach (setsid where this host can run it) +
+    # stdio redirect and don't wait at all -- same treatment as
     # xterm/kitty/konsole above. NOT mac-terminal: that branch detaches via
     # `open`'s LaunchServices handoff and deliberately never calls setsid --
     # see its own note. This branch is where a macOS user who points
