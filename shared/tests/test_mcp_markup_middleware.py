@@ -1125,6 +1125,170 @@ class TestB3ExtendedListTypedRecovery:
         assert warning['recovered_params'] == ['evidence', 'suggested_action']
 
 
+class TestCoercionNeverGuesses:
+    """The three ways a NAIVE decode of a recovered value is wrong.
+
+    Task **3690**. Typing a recovered value against the invoked tool's schema
+    is the fix for the list-typed gap above, but a decode that fires on the
+    wrong parameter is a silent RETYPING of the caller's data — a far quieter
+    defect than the loud ``list_type`` error it replaces. C2 L187 ("nothing is
+    guessed") has to hold for the coercion step too: a value the guard cannot
+    confidently type must reach pydantic UNCHANGED and produce a legible
+    declared-type error, never a fabricated one.
+    """
+
+    REQUIRED = {
+        'task_id': '3690',
+        'agent_role': 'implementer',
+        'category': 'risk_identified',
+        'summary': 'A coercion that guesses is worse than one that refuses.',
+    }
+
+    def _payload(self, absorbed: str, recovered_param: str, recovered_value: str) -> str:
+        """A ``detail`` that mis-closed and swallowed exactly one parameter."""
+        return (
+            absorbed
+            + _closer('detail')
+            + '\n'
+            + _opener(recovered_param)
+            + recovered_value
+            + _closer(recovered_param)
+            + INVOKE_CLOSER
+        )
+
+    async def _call(self, detail: str):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        result = await h.call(
+            'escalate_info_typed', {**self.REQUIRED, 'detail': detail}
+        )
+        return h, result
+
+    # -- (a) a union type must still coerce -------------------------------
+
+    async def test_the_union_declaration_is_what_makes_this_hard(self):
+        """Documents WHY, not merely THAT — measured off the live schema.
+
+        ``evidence: list[dict[str, Any]] | None`` carries NO top-level
+        ``'type'`` key. A coercion that reads ``properties[name]['type']``
+        therefore skips the single most important parameter in this task.
+        """
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        tool = await h.mcp.get_tool('escalate_info_typed')
+        declared = tool.parameters['properties']['evidence']
+
+        assert 'type' not in declared, (
+            'the premise of this row changed: evidence now carries a '
+            'top-level type, so the union branch below no longer guards it'
+        )
+        assert 'anyOf' in declared
+        assert {branch.get('type') for branch in declared['anyOf']} == {'array', 'null'}
+
+    async def test_a_union_typed_recovery_still_lands_as_a_list(self):
+        h, _ = await self._call(
+            self._payload('A union.', 'evidence', '[{"observation": "measured"}]')
+        )
+
+        evidence = h.recorder.args['evidence']
+        assert evidence == [{'observation': 'measured'}]
+
+    # -- (b) a string-typed parameter is NEVER decoded ---------------------
+
+    async def test_a_str_typed_recovery_that_looks_like_json_stays_a_str(self):
+        """The regression that would silently retype every str recovery.
+
+        ``suggested_action`` is declared ``str`` and is 26 of the measured
+        recoveries on the real escalation server. Its verbatim slice is
+        ALREADY the correct value (D5); decoding it because it happens to
+        parse would hand the tool a list where it declared text.
+        """
+        looks_like_json = '[consolidate, then re-measure]'
+        h, _ = await self._call(
+            self._payload('A list-ish string.', 'suggested_action', looks_like_json)
+        )
+
+        landed = h.recorder.args['suggested_action']
+        assert landed == looks_like_json
+        assert isinstance(landed, str)
+
+    async def test_a_str_typed_recovery_that_is_a_bare_numeral_stays_a_str(self):
+        """The same defect in its most decodable form: ``json.loads('3690')``
+        succeeds and yields an ``int``."""
+        h, _ = await self._call(
+            self._payload('A numeric string.', 'suggested_action', '3690')
+        )
+
+        landed = h.recorder.args['suggested_action']
+        assert landed == '3690'
+        assert isinstance(landed, str), f'retyped to {type(landed).__name__}'
+
+    # -- (c) a non-decodable value is left verbatim, never fabricated ------
+
+    async def test_an_undecodable_value_is_left_verbatim_not_invented(self):
+        """A decode failure is a failure to recover, not a licence to invent.
+
+        The caller must see pydantic's own ``list_type`` error NAMING
+        ``evidence``. Swallowing the failure into ``[]`` or ``None`` would
+        destroy the payload while reporting success — precisely the silent
+        loss this whole task exists to end (C2 L187).
+        """
+        truncated = '[{"observation": "the tail was cut off'
+
+        with pytest.raises(ToolError) as excinfo:
+            await self._call(self._payload('Ill-formed.', 'evidence', truncated))
+
+        message = str(excinfo.value)
+        assert 'evidence' in message
+        assert 'list_type' in message
+
+    async def test_an_undecodable_value_does_not_reach_the_tool_at_all(self):
+        """No partial write: pydantic refuses the call, so the body never runs."""
+        truncated = '[{"observation": "the tail was cut off'
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        with pytest.raises(ToolError):
+            await h.call(
+                'escalate_info_typed',
+                {
+                    **self.REQUIRED,
+                    'detail': self._payload('Ill-formed.', 'evidence', truncated),
+                },
+            )
+
+        assert h.recorder.calls == []
+
+    # -- D5 is preserved: the transform is a BOUNDARY layer ----------------
+
+    async def test_the_repair_itself_still_returns_only_strs(self):
+        """``Repair.recovered`` stays ``dict[str, str]`` — the coercion is
+        applied at the boundary, not pushed down into the parser.
+
+        Asserted against ``repair()`` DIRECTLY with the same inputs the
+        middleware hands it, so a future change that "simplified" the fix by
+        making toolcall_markup decode its own tail would fail here. That
+        module owns parsing and knows nothing of the invoked tool's schema;
+        typing a value against a tool is this layer's job.
+        """
+        from shared.toolcall_markup import repair
+
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        tool = await h.mcp.get_tool('escalate_info_typed')
+        detail = self._payload('A union.', 'evidence', '[{"observation": "measured"}]')
+
+        fix = repair(
+            detail,
+            'detail',
+            tuple(tool.parameters['properties']),
+            tuple({**self.REQUIRED, 'detail': detail}),
+        )
+
+        assert fix is not None
+        assert sorted(fix.recovered) == ['evidence']
+        assert all(isinstance(v, str) for v in fix.recovered.values()), (
+            'D5 broke: repair() must return every recovered value as a '
+            'verbatim str slice of the tail'
+        )
+
+
 class TestB4LastParameterNothingDropped:
     """The absorbing parameter was the LAST one, so there is nothing to recover.
 
