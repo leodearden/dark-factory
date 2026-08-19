@@ -428,10 +428,10 @@ class TestLiveClaimantIdShapeGuard:
     mismatch is not PROOF that the filer is dead, so a non-composed identity
     on EITHER side is treated as unknown.
 
-    That describes the SHAPES that resolver can emit, not production reach: its
-    plan.lock leg still reads the pre-relocation lock path and so resolves to
-    ``None`` on a real run (task 4262), and no production caller passes a live
-    identity into ``classify_pins`` yet (task 3541).
+    Its plan.lock leg reads the ``.task-meta`` root the lock's writer targets
+    (task 4028), so a composed identity from that source is reachable on a real
+    run; no production caller passes a live identity into ``classify_pins`` yet
+    (task 3541).
 
     The cases below are UNCHANGED and stay load-bearing: a bare session_id is
     still a shape this guard must reject, merely no longer one the in-repo
