@@ -1257,3 +1257,92 @@ class TestGitErrorArmsFailClosed:
             f'the degradation must be loud about abandoning resolution, not just '
             f'the per-probe error; got: {msg!r}'
         )
+
+    async def test_rename_delete_probe_error_after_chain_advanced_names_hop_and_declared(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A git error on HOP 2's delete probe — after the chain already
+        advanced past hop 1, so ``current != norm`` — must still fail
+        CLOSED.
+
+        The two tests above both inject the fault on hop 1, where
+        ``current == norm`` at the point the sentinel is returned, so
+        neither could catch a regression that moved the
+        ``isinstance(pair, _RenameProbeUnmeasurable)`` check outside the
+        loop, or that logged ``norm`` twice instead of naming the hop that
+        was actually being probed when resolution failed.  Reuses the
+        ``declared -> hop1 -> final`` shape from
+        ``TestBasenameFallbackUsesLastResolvedHop``, but the fault fires
+        only on the SECOND ``git log --diff-filter=D`` call (keyed on
+        ``hop1``), not the first (keyed on ``declared``).
+        """
+        declared = 'crates/tests/topo_e2e.rs'
+        hop1 = 'crates/tests/harness_topo/topo_suite.rs'
+        final = 'crates/harness/topo_suite.rs'
+
+        await _commit_on_main(
+            git_repo, {declared: 'fn topo() {}\n'}, 'add topo_e2e',
+        )
+        await _rename_on_main(
+            git_repo, declared, hop1, 'harness: hop 1 rename + retarget',
+        )
+        await _relocate_as_delete_then_add(git_repo, hop1, final)
+
+        wt = (await git_ops.create_worktree('rename-delete-probe-error-hop2')).path
+        base = await _head_of(wt)
+        (wt / final).write_text('// branch edit\nfn topo() { assert_eq!(5, 5); }\n')
+        await git_ops.commit(wt, 'step-2')
+        head = await _head_of(wt)
+
+        def _is_declared_delete_probe(cmd: Sequence[str]) -> bool:
+            """The FIRST delete probe: what deleted `declared` (resolves hop 1)."""
+            return _is_rename_delete_probe(cmd) and declared in cmd
+
+        def _is_hop1_delete_probe(cmd: Sequence[str]) -> bool:
+            """The SECOND delete probe: what deleted `hop1` (resolves hop 2)."""
+            return _is_rename_delete_probe(cmd) and hop1 in cmd
+
+        spy = _RunSpy(fail_when=_is_hop1_delete_probe)
+        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_files_touched_in_branch(
+                [declared], base, head, git_ops, task_id='rename-delete-error-hop2',
+            )
+
+        # Sanity: the probe for `declared` ran for real and succeeded —
+        # otherwise the chain could never have advanced past hop 1, and
+        # this test would silently degenerate into the current==norm case
+        # the prior two tests already cover.
+        assert spy.count(_is_declared_delete_probe) >= 1, (
+            'the probe for `declared` must have run for real for the chain '
+            'to advance past hop 1'
+        )
+        assert spy.count(_is_hop1_delete_probe) >= 1, (
+            'the fault must have fired on the SECOND (hop1 -> hop2) delete probe'
+        )
+        assert result.not_touched == [declared], (
+            'an unmeasurable rename probe still blocks — the gate fails CLOSED'
+        )
+        assert result.resolved_renames == {}, (
+            'a git error on the rename probe must never fall through to the '
+            'basename heuristic, even after the chain has already advanced'
+        )
+        assert result.missing_from_tree == [declared], (
+            'the existence probe DID succeed and DID measure a genuine absence; '
+            'only the rename RESOLUTION was unmeasurable'
+        )
+
+        msg = ' '.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert hop1 in msg, (
+            'the warning must name the HOP (`current`) where resolution was '
+            f'abandoned, not just the originally declared path; got: {msg!r}'
+        )
+        assert declared in msg, (
+            f'the warning must ALSO name the originally declared path; got: {msg!r}'
+        )
