@@ -16,7 +16,8 @@ verbatim, to run in a hermetic tmp tree.
 Endpoints are DERIVED from markers, never pinned line numbers, so a slice
 follows a reflow of its block instead of silently shifting off it.
 
-MARKERS ARE CODE, NOT COMMENT PROSE. Each parity block hoists a uniquely-named
+MARKERS ARE CODE, NOT COMMENT PROSE — enforced, not merely stated: every
+marker is located on a non-comment line. Each parity block hoists a uniquely-named
 `_<gate>_parity_script="$REPO_ROOT/scripts/check_<x>_unit_parity.py"`
 assignment at its top, and that line is the anchor. Anchoring on the section
 comment instead would make CI red for a reworded comment or a fixed typo — zero
@@ -75,7 +76,36 @@ def setup_host_text() -> str:
     return SETUP_HOST_PATH.read_text(encoding="utf-8")
 
 
-def slice_section(start_marker: str, end_marker: str) -> str:
+def _find_in_code(text: str, marker: str, *, start: int = 0) -> int:
+    """Index of the first occurrence of *marker* on a NON-COMMENT line.
+
+    Enforces this module's "MARKERS ARE CODE, NOT COMMENT PROSE" rule rather
+    than merely stating it, and matches the discovery rule the structural sweep
+    in test_check_dashboard_unit_parity.py::_parity_call_sites already applies
+    (`line.lstrip().startswith("#")`).
+
+    Not cosmetic. MEASURED before this existed: a plain `text.find` for
+    `_orch_parity_script=` landed on setup-host.sh's own harness-constraint
+    COMMENT, which quotes the anchor, and the resulting slice reached back over
+    189 lines of real installer code — including an `install -m 0755` writing
+    into `$HOME`. These slices are EXECUTED, so that is a test running against
+    the developer's real home directory.
+
+    Returns -1 when *marker* appears only in comments (or not at all), so the
+    caller raises its own self-naming AssertionError.
+    """
+    pos = text.find(marker, start)
+    while pos != -1:
+        line_start = text.rfind("\n", 0, pos) + 1
+        if not text[line_start:pos].lstrip().startswith("#"):
+            return pos
+        pos = text.find(marker, pos + 1)
+    return -1
+
+
+def slice_section(
+    start_marker: str, end_marker: str, *, end_after: str | None = None
+) -> str:
     """Return setup-host.sh from the line carrying *start_marker* through *end_marker*.
 
     The slice runs from the START of the line containing the first instance of
@@ -83,25 +113,54 @@ def slice_section(start_marker: str, end_marker: str) -> str:
     *end_marker* at or after it — both endpoints derived, so the slice survives
     a reflow of the block.
 
-    Raises AssertionError NAMING the missing marker when either is absent. That
+    Every marker is located on a NON-COMMENT line (see `_find_in_code`): a
+    comment that quotes an anchor is prose about the code, not the code.
+
+    *end_after* is an optional THIRD anchor. When given, the search for
+    *end_marker* begins at it rather than at *start_marker*, so a slice can be
+    made to run THROUGH an inner construct that closes with the same token —
+    the orchestrator installer slice must end at the column-0 `fi` closing the
+    INSTALL construct, not at the gate's own, which is the first one after the
+    start.
+
+    Deliberately an ANCHOR rather than the counted `occurrence` parameter task
+    3557 deleted as dead. "The second `fi`" is a number that shifts silently
+    the moment the block is reflowed — re-pointing the slice at a region nobody
+    chose — whereas a marker that moves out from under the slice fails loudly,
+    which is the same reason 3557 removed the counted form.
+
+    Raises AssertionError NAMING the missing marker when any is absent. That
     matters: the silent alternative is a slice of the wrong (or empty) region,
     which runs cleanly and produces a vacuously green test — the same
     "reported green because it never ran" failure these tests exist to catch.
     """
     text = setup_host_text()
 
-    pos = text.find(start_marker)
+    pos = _find_in_code(text, start_marker)
     assert pos != -1, (
-        f"start_marker {start_marker!r} not found in {SETUP_HOST_PATH}. A "
-        f"renamed anchor must fail here, not slice an empty region."
+        f"start_marker {start_marker!r} not found in {SETUP_HOST_PATH} on a "
+        f"non-comment line. A renamed anchor must fail here, not slice an "
+        f"empty region."
     )
 
     start = text.rfind("\n", 0, pos) + 1
 
-    end_pos = text.find(end_marker, pos)
+    search_from = pos
+    if end_after is not None:
+        after_pos = _find_in_code(text, end_after, start=pos)
+        assert after_pos != -1, (
+            f"end_after {end_after!r} not found in {SETUP_HOST_PATH} on a "
+            f"non-comment line at or after {start_marker!r}."
+        )
+        search_from = after_pos
+
+    end_pos = text.find(end_marker, search_from)
+    # Names whichever anchor the search actually started from, so the message
+    # points at the region that was searched rather than at a marker that was
+    # found.
     assert end_pos != -1, (
         f"end_marker {end_marker!r} not found in {SETUP_HOST_PATH} at or after "
-        f"{start_marker!r}."
+        f"{end_after if end_after is not None else start_marker!r}."
     )
     # Search for the line end from the marker's LAST character, not its first.
     # An end_marker may itself span lines (`"\nfi\n"` is the natural way to name
