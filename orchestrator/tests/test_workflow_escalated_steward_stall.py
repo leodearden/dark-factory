@@ -40,7 +40,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import pydantic_spec, stamp_stock_routing_config
+from _orch_helpers import (
+    assert_sandboxed_project_root,
+    pydantic_spec,
+    stamp_stock_routing_config,
+)
 from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import (
     FakeBriefing,
@@ -717,30 +721,18 @@ def _make_steward_config(project_root: Path) -> MagicMock:
 def test_make_steward_config_project_root_is_sandboxed(tmp_path):
     """``_make_steward_config``'s ``project_root`` is a real dir under ``tmp_path``.
 
+    The invariant and its rationale are owned by
+    ``_orch_helpers.assert_sandboxed_project_root`` (task 3647); this test's job
+    is to pin that THIS factory's produced root satisfies it, since the factory
+    reproduces ``make_steward``'s recipe rather than calling it.
+
     Deliberately a plain SYNCHRONOUS unit test with no ``git_repo`` / ``git_ops``
     / ``config`` fixtures — every sibling test in this module builds a real git
     worktree, and this one only needs the factory.
     """
     cfg = _make_steward_config(tmp_path / 'project')
 
-    root = cfg.project_root
-    assert isinstance(root, Path), (
-        f'expected project_root to be a real Path, got '
-        f'{type(root).__name__!r} — a MagicMock child silently satisfies every '
-        f'"/"-join the steward performs without ever producing a directory'
-    )
-    assert root.is_dir(), (
-        f'expected the factory to CREATE {root}; the retired '
-        f"Path('/tmp/fake-project') literal was never created by anything, so a "
-        f'dangling project_root is a latent cwd= failure the moment a test stops '
-        f'patching the invoke seam'
-    )
-    assert root.resolve().is_relative_to(tmp_path.resolve()), (
-        f'expected project_root under tmp_path={tmp_path}, got {root} — the '
-        f"retired '/tmp/fake-project' literal pointed OUTSIDE the test sandbox, "
-        f'so anything the steward wrote relative to config.project_root escaped '
-        f"pytest's tmp_path retention sweep"
-    )
+    assert_sandboxed_project_root(cfg.project_root, tmp_path)
 
 
 def _make_real_steward_factory(

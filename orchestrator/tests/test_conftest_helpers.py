@@ -399,26 +399,26 @@ class TestMakeStewardFixture:
         )
 
     def test_project_root_is_a_real_path_inside_the_sandbox(self, make_steward, tmp_path):
-        """``config.project_root`` is a real ``Path`` under ``tmp_path``, not a bare mock.
+        """``make_steward``'s PRODUCED ``config.project_root`` satisfies the sandbox invariant.
 
-        The sandbox invariant this refactor fixed: the retired triage factory
-        set the ``/tmp/project`` literal, which pointed outside the test's tmp
-        dir, so anything the steward wrote relative to it escaped pytest's
-        retention sweep.  A ``MagicMock`` here would also silently satisfy every
-        ``/``-join in the steward without producing a real directory.
+        The invariant itself — a real ``Path``, a created directory, strictly
+        below ``tmp_path`` — is owned by
+        ``_orch_helpers.assert_sandboxed_project_root``, along with the full
+        rationale for each of its four clauses.  This test's job is only to pin
+        that the fixture's produced root satisfies it; ``make_steward`` is the
+        PRODUCER of that value and is deliberately not self-checked.
+
+        Folding onto the helper STRENGTHENED this test (task 3647): the copy
+        that lived here carried neither the ``.is_dir()`` clause nor the
+        strictly-below clause.
 
         The scalar config defaults (``steward_max_attempts``, ``models.*``,
         ``escalation.port``, …) are deliberately NOT asserted — they would
         restate ``conftest.py``'s literals without detecting a regression.
         """
-        project_root = make_steward().config.project_root
-        assert isinstance(project_root, Path), (
-            f'expected project_root to be a real Path, got {type(project_root).__name__!r}'
-        )
-        assert project_root.resolve().is_relative_to(tmp_path.resolve()), (
-            f'expected project_root under tmp_path={tmp_path}, got {project_root} — '
-            f'the old /tmp/project literal pointed outside the test sandbox'
-        )
+        from _orch_helpers import assert_sandboxed_project_root
+
+        assert_sandboxed_project_root(make_steward().config.project_root, tmp_path)
 
     def test_config_overrides_applied_after_defaults(self, make_steward):
         """``config_overrides`` wins over the defaults, and does not leak between builds.
