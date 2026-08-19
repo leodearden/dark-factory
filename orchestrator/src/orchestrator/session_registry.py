@@ -1198,19 +1198,37 @@ def merge_same_queue_refile(
     WHY ``state`` IS SAFE TO HOLD HERE BUT NOT CROSS-QUEUE (task 3872). This
     helper is scoped by its caller to a SAME-project, SAME-queue re-file, and
     within ONE queue an ``esc-<taskid>-<n>`` id is unique -- that is the
-    entire premise of task 3528's queue axis. So this is definitively the
-    same gate the human already answered or dropped, not a new ask, and
-    preserving their disposition is respecting a VERIFIED human act. Across
-    queues the id namespaces genuinely collide (dark_factory runs
-    ``data/escalations`` and ``data/reconciliation/escalations`` over one
-    namespace), so a non-open cross-queue filing may be an unrelated NEW ask;
+    entire premise of task 3528's queue axis. So this is the same gate the
+    human already answered or dropped rather than a new ask, and preserving
+    their disposition is respecting a VERIFIED human act. Across queues the
+    id namespaces genuinely collide (dark_factory runs ``data/escalations``
+    and ``data/reconciliation/escalations`` over one namespace), so a
+    non-open cross-queue filing may be an unrelated NEW ask;
     _run_write_decision deliberately keeps today's full overwrite there.
+
+    THAT UNIQUENESS IS STRONG BUT NOT ABSOLUTE, and the hole is named here
+    once rather than rounded off, because every other statement of this
+    policy (the caller's comment, both watcher SKILLs) leans on it:
+    EscalationQueue._recover_seq_from_disk (escalation/queue.py) rebuilds a
+    LOST or corrupt per-task seq counter by scanning the queue root and
+    archive, and its own docstring concedes both bounds -- the archive half
+    is bounded by prune_archive retention, and an id minted but not yet
+    submitted when the counter was lost is invisible to the scan. After a
+    counter loss an id CAN therefore be re-minted inside one queue, landing a
+    genuinely NEW gate on a closed row that this helper then holds closed --
+    invisible in C5b, which filters to state=='open', i.e. the fail-CLOSED
+    direction. The residual needs a counter loss to reach and is far narrower
+    than the unbounded harm below, and _run_write_decision's divergence
+    WARNING is its backstop: the hold is ANNOUNCED for a human or agent to
+    adjudicate rather than applied silently, which is exactly the case that
+    reads it.
 
     WHY THIS IS NOT THE FAIL-CLOSED DIRECTION the reaper docstrings in this
     module warn about. "An over-held decision is a human-triageable row,
     while a falsely closed one is invisible" governs the REAPER's join across
     an id namespace it CANNOT verify -- an automatic close on uncertain
-    evidence. Here identity is certain (above) and the closure came from an
+    evidence. Here identity is knowable (above, down to the one named
+    counter-loss residual) and the closure came from an
     operator's explicit C5b act (cockpit/app.py -> update_decision_state(...,
     DROPPED)) or from the reaper resolving against an escalation in this SAME
     queue. The alternative is not a benign over-surfacing but an UNBOUNDED
@@ -1218,10 +1236,15 @@ def merge_same_queue_refile(
     reap_answered_decisions skips a non-open record ("already resolved -- no
     re-close"), so without this the operator's dismissal is undone forever
     and C5b's drop action is inert for exactly the class of row it exists
-    for. The escape hatch for a genuinely NEW ask at a closed id survives on
-    both sides: the operator can re-open via update_decision_state, and the
-    watcher can file under a new id -- and _run_write_decision's divergence
-    WARNING is what tells it to.
+    for. The escape hatch for a genuinely NEW ask at a closed id is to FILE
+    IT UNDER A NEW ID -- the remedy that exists on a shipped surface, and the
+    one _run_write_decision's divergence WARNING points a watcher at.
+    Re-opening the row IN PLACE is deliberately not offered as the headline
+    remedy, because today it needs a direct registry write: this module's
+    update_decision_state has no operator-facing caller that re-opens (the
+    cockpit's C5b decision pane writes DROPPED only) and the argparse below
+    exposes write-decision / reap-decisions but no update-decision-state
+    verb. Say "file a new id" until one of those exists.
 
     ADDITIVE-SAFE: ``state`` is copied as an opaque ``str``, never coerced
     through DecisionState -- mirrors DecisionRecord's own no-coercion note,
@@ -3612,10 +3635,12 @@ def _run_write_decision(
                     #
                     # NOT scoped to an OPEN record (task 3872), unlike the two
                     # arms around it. This is the ONE axis on which identity
-                    # is certain: within a single queue an esc-<taskid>-<n> id
-                    # is unique (task 3528's premise), so a same-project
-                    # same-queue re-file is definitively the same gate the
-                    # human already answered or dropped. Re-opening it would
+                    # is knowable: within a single queue an esc-<taskid>-<n>
+                    # id is unique (task 3528's premise), so a same-project
+                    # same-queue re-file is the same gate the human already
+                    # answered or dropped -- modulo the counter-loss re-mint
+                    # hole merge_same_queue_refile names, which the WARNING
+                    # just below is the backstop for. Re-opening it would
                     # make an operator's C5b dismissal impossible to ever make
                     # stick -- a watcher re-files on EVERY restart while an
                     # item stays parked, and reap_answered_decisions skips a
@@ -3652,8 +3677,11 @@ def _run_write_decision(
                             'stick, since a watcher re-files its stable id on every '
                             'restart while an item stays parked. ADJUDICATE this rather '
                             'than re-filing blindly: if the gate is genuinely a NEW ask, '
-                            'file it under a new id, or have the operator re-open this '
-                            'row.',
+                            'file it under a NEW id -- that is the remedy with a shipped '
+                            'surface, since re-opening this row in place currently needs '
+                            'a direct registry write (the cockpit decision pane offers a '
+                            'drop action but no re-open, and there is no '
+                            'update-decision-state CLI verb).',
                             decision_id,
                             str(existing.state),
                             stamp,
