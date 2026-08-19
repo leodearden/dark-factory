@@ -108,7 +108,10 @@ are split by CLASS, because one rule cannot fit all of them:
   ``EnvironmentFile=`` is registered per unit
   (``UnitSpec.override_directives``) and fires when one copy declares it and
   the other does not.  Neither is present for these units today, so neither
-  can misfire now.
+  can misfire now.  A third path needs no separate file at all: an
+  ``Environment=`` line added straight to the installed unit.  That is
+  registered per unit too (``UnitSpec.environment_section``, compared by
+  variable-NAME set) and is now closed on both service units.
 
 One unit has THREE sites, not two: ``setup-host.sh`` installs
 ``dark-factory-dashboard.service`` by RENDERING
@@ -227,8 +230,16 @@ def _log(message: str, *, stream=None) -> None:
 # surface this script's test suite reads (mod.parse_unit_directives,
 # mod._join_continuations) intact, so that suite is the extraction's own
 # regression net.
+#
+# find_dropins moved there too, for a sharper version of the same reason: it
+# was already forked, code-identical, between this file and
+# check_orchestrator_unit_parity.py, and check_lms_unit_parity.py would have
+# been a third copy. Re-exported on the same terms -- this suite's existing
+# find_dropins tests still call mod.find_dropins and are what proves the lift
+# was behaviour-preserving.
 from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
     _join_continuations,  # noqa: F401  (re-exported: read by the test suite)
+    find_dropins,
     parse_unit_directives,
 )
 
@@ -287,8 +298,13 @@ class UnitSpec:
     present_only: tuple[tuple[str, str], ...] = ()
     # Section whose Environment= directives are compared by variable-NAME set
     # (values compared only for names off DIVERGENCE_ALLOWLIST). None disables
-    # the branch entirely, which is right for the two watchdog units — they
-    # declare no Environment= at all.
+    # the branch entirely, which is right for the .timer ONLY: it has no
+    # [Service] section, and Environment= is not a valid directive in a timer
+    # unit. Registering a section whose Environment= set is EMPTY in BOTH
+    # copies today (the watchdog .service) is deliberate, not rot — the
+    # comparison is by variable-NAME set, so a variable declared on either
+    # side alone is reported, which is the whole point on a unit that should
+    # declare none at all.
     environment_section: str | None = None
     # Bare uvicorn flag names (no leading '--') compared INSIDE [Service]
     # ExecStart. This is how a presence-only ExecStart still gets its
@@ -746,31 +762,6 @@ def compare_unit(
     return drifts
 
 
-def find_dropins(installed_dir: pathlib.Path, unit_name: str) -> list[pathlib.Path]:
-    """Return the ``.conf`` drop-ins systemd would layer over *unit_name*.
-
-    ``systemctl --user edit`` does not modify the unit file; it writes
-    ``<unit>.d/override.conf`` beside it, and systemd merges that over the
-    unit at load time.  Reading only ``<installed-dir>/<unit>`` is therefore
-    blind to it: a drop-in setting ``Restart=always`` or ``TimeoutStopSec=90``
-    leaves every compared directive matching while the RUNNING configuration
-    is not the committed one — the precise claim this gate exists to make
-    checkable.
-
-    Not hypothetical on this host: no dashboard unit has a drop-in today, but
-    ``~/.config/systemd/user/orchestrator-reify.service.d/`` exists, so the
-    mechanism is already in live use here.
-
-    Returns the sorted ``.conf`` files, or ``[]`` when the directory is absent
-    or holds none (systemd ignores non-``.conf`` files there, so this counts
-    exactly what would take effect).
-    """
-    dropin_dir = installed_dir / f"{unit_name}.d"
-    if not dropin_dir.is_dir():
-        return []
-    return sorted(p for p in dropin_dir.glob("*.conf") if p.is_file())
-
-
 # ---------------------------------------------------------------------------
 # The unit registry
 # ---------------------------------------------------------------------------
@@ -896,6 +887,19 @@ UNITS: dict[str, UnitSpec] = {
         # (it is activated by the timer, never enabled directly).
         present_only=(("Service", "ExecStart"),),
         override_directives=(("Service", "EnvironmentFile"),),
+        # Neither copy declares Environment= today, so this branch
+        # contributes zero drift lines until real drift appears — same
+        # registration shape as the dashboard spec's environment_section
+        # above. Registering the section is what makes an inline
+        # `Environment=DASHBOARD_WATCHDOG_FAIL_STREAK=99` added to the
+        # installed copy ALONE visible: scripts/dashboard-watchdog.py reads
+        # nine knobs (PROBE_URL, PROBE_TIMEOUT, GRACE_SECS, FAIL_STREAK,
+        # MAX_RESTARTS, RATE_WINDOW_SECS, STATE_PATH, ESCALATION_QUEUE_DIR,
+        # UV_BIN) that ARE the hysteresis/grace/rate-ceiling supervision
+        # policy, so an inline injection here is the same class of hole
+        # EnvironmentFile= was registered to close — on the same unit, left
+        # open until now.
+        environment_section="Service",
     ),
     "dark-factory-dashboard-watchdog.timer": UnitSpec(
         name="dark-factory-dashboard-watchdog.timer",

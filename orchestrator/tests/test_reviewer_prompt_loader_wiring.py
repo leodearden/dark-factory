@@ -166,3 +166,48 @@ class TestResolveRoleSystemPromptLazyStore:
         # default_artifacts_root() (which honored the env override).
         assert workflow._prompt_store is not None
         assert workflow._prompt_store.root == artifacts_root
+
+
+class TestResolveRoleSystemPromptUnreadableRoot:
+    """``_resolve_role_system_prompt``'s docstring claims
+    ":meth:`PromptArtifactStore.resolve` never raises ... so this call is
+    always fail-safe" — and it catches nothing itself, on a path reached on
+    every reviewer dispatch. Pin that claim against an unreadable artifacts
+    tree, the one case ``resolve()`` did not actually absorb.
+
+    Uses the selective ``Path.exists`` monkeypatch rather than ``chmod 0o000``
+    so the guard also runs under a root CI, where chmod is a no-op.
+    """
+
+    def test_unreadable_heuristics_stat_falls_back_to_in_code_constant(
+        self, tmp_path, monkeypatch,
+    ):
+        store = PromptArtifactStore(tmp_path / 'artifacts')
+        workflow = _make_workflow(tmp_path=tmp_path, prompt_store=store)
+        spec = REVIEWER_COMPREHENSIVE.prompt_spec
+        assert spec is not None  # premise: the reviewer role opts in
+
+        heuristics = 'PINNED: prefer flagging more suggestions.'
+        store.pin(
+            spec.prompt_id, 'opus', _REVIEWER_PROMPT_HARNESS_VERSION,
+            heuristics=heuristics, provenance=ArtifactProvenance(**_provenance_kwargs()),
+        )
+        # Premise: the pin genuinely resolves before the permission flip.
+        assert workflow._resolve_role_system_prompt(
+            REVIEWER_COMPREHENSIVE, 'opus'
+        ) == compose_prompt(spec.contract, heuristics)
+
+        _real_exists = Path.exists
+
+        def boom(self, *args, **kwargs):
+            # Selective: an unconditional patch breaks pytest internals, which
+            # stat unrelated paths.
+            if self.name == 'heuristics.txt':
+                raise PermissionError(13, 'Permission denied')
+            return _real_exists(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'exists', boom)
+
+        result = workflow._resolve_role_system_prompt(REVIEWER_COMPREHENSIVE, 'opus')
+
+        assert result == spec.in_code_constant

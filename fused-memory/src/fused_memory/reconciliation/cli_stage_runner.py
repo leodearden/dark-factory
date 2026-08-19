@@ -51,8 +51,11 @@ DISALLOW_TASK_WRITES = [
 # created_at — and shipped unclassified: it was in NO disallow list at all, so
 # Stage 3 (the read-only integrity check) was neither denied it here nor
 # turned away by the mem0_update authz gate, whose shipped default
-# content_amend_allowed_agent_prefixes=['recon-stage-'] admits every recon
-# stage's f'recon-stage-{stage_id}' agent_id. Stage 1 and Stage 2 KEEP the
+# content_amend_allowed_agent_prefixes=['recon-stage-', 'curator-'] admits
+# every recon stage's f'recon-stage-{stage_id}' agent_id via its recon-stage-
+# entry (curator-, added for the interactive consolidation sitting per
+# esc-3524-1, matches no recon stage and does not move this reasoning).
+# Stage 1 and Stage 2 KEEP the
 # tool because neither STAGE1_DISALLOWED nor STAGE2_DISALLOWED (below) folds
 # DISALLOW_MEMORY_WRITES — the very asymmetry the AMEND_AND_EPISODE_TOOLS_BLOCK
 # prompt addition (prompts/__init__.py) now advertises.

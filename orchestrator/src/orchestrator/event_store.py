@@ -251,6 +251,23 @@ class EventType(StrEnum):
     # the numerator by json_extract(data, '$.reason') to separate expected
     # reseeds from genuine corroboration failures. (enabled=False emits nothing,
     # so a zero total means either no recovered sessions or the kill switch.)
+    #
+    # session_resume_fallback additionally carries `data.archive_available: bool`
+    # (task 3727) on BOTH reasons — reseeded and {stale, no_transcript} alike —
+    # answering "was this session actually RECOVERABLE from the durable
+    # transcript archive?", i.e. did its transcript survive outside the wiped
+    # worktree. Query it as json_extract(data, '$.archive_available') alongside
+    # the existing '$.reason' split, so the fallback population can be cut into
+    # recoverable vs genuinely lost.
+    #
+    # session_resume and session_resume_capped deliberately do NOT carry the
+    # field, so the ratio recipe's DENOMINATOR above is unchanged — the
+    # instrument was added to exactly one of the three outcome events.
+    #
+    # The rate this field exposes is a MEASUREMENT, not a target: it quantifies
+    # a recoverable population that nothing yet acts on (INV-3
+    # instrument-before-acting). Task 3619 will deliberately move it upward, so
+    # a rising archive_available rate is that work landing, not a regression.
     session_resume = 'session_resume'
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'
@@ -271,6 +288,29 @@ class EventType(StrEnum):
     # Scheduler-scoped (task_id=None). Payload: {consecutive_failures}.
     park_eviction_deferred_fm_unavailable = 'park_eviction_deferred_fm_unavailable'
     scheduler_tier_cap_idle = 'scheduler_tier_cap_idle'
+    # EASY-backfill admission through parks (task 3823 / scheduler-scoring PRD
+    # C7).  Emitted when a candidate blocked ONLY by another task's park is
+    # admitted through it because its predicted hold, times the configured
+    # safety factor, fits inside the gap that park is provably still waiting
+    # on.  Payload: {predicted_hold, safety_factor, admission_bound,
+    # provable_assembly_delay, park_owners, modules}.
+    #
+    # Predicted AND (via park_backfill_overstay) realized are both recorded so
+    # the modelled 7-9% overstay rate at safety x2.5
+    # (plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:254-255)
+    # is MEASURED in production rather than assumed.  backfill_safety_factor
+    # is green-tier reloadable precisely so that measurement can retune it.
+    park_backfill_granted = 'park_backfill_granted'
+    # The settlement of the above: emitted at release when a back-filled hold
+    # ran LONGER than the bound its admission promised.  Payload:
+    # {predicted_hold, safety_factor, admission_bound, realized_hold,
+    # overstay_secs, park_owners, modules}.  Predicted and realized both ride
+    # on the event on purpose — the comparison is the finding, and nobody
+    # should have to reconstruct it from log lines.
+    #
+    # NOT emitted through _emit_lock_event: that chokepoint is contractually
+    # the lock-event single writer and raises on any other event type.
+    park_backfill_overstay = 'park_backfill_overstay'
 
     # Scheduler priority overrides
     #
@@ -490,6 +530,53 @@ class EventType(StrEnum):
     #   writable set so an operator can diff exactly what a given invocation
     #   could touch (INV-2 structured facts). Consumed by γ1's soak predicate.
     sandbox_applied = 'sandbox_applied'
+
+    # Recovery-decision emission (PRD plans/task-escalation-state-graph-prd.md
+    # D5; spec docs/task-escalation-state-spec.md S6/E12; task beta 3535).  The
+    # canonical WHY lives in orchestrator/src/orchestrator/recovery_emission.py
+    # (module docstring) — every other site carries a pointer, never a copy.
+    #
+    # Both members share ONE payload key vocabulary:
+    #   {task_id, site, shape, reason, escalation_ids, ages_secs, measured_at,
+    #    store_unavailable, streak}
+    #   site           — a RecoverySite member naming WHICH veto/LEAVE site
+    #                    spoke (the deterministic-recon pair deliberately use
+    #                    two distinct labels so their duplication is countable).
+    #   shape          — the pipe-joined 5-tuple task_ground_truth._shape keys
+    #                    the _RECOVERY table on, rendered by render_shape.
+    #   reason         — the closed LeaveReason vocabulary: escalation_pinned,
+    #                    escalation_store_unavailable, unmapped_shape,
+    #                    live_claimant, deploy_phase_in_flight,
+    #                    provenance_arbitration.
+    #   escalation_ids — the open records that held it, bucketed by
+    #                    escalation.pins.classify_pins
+    #                    ({dead_l0, queue_handoff, non_pinning}).
+    #   ages_secs      — {escalation_id: seconds}, a MAPPING (join by id, never
+    #                    by position); an unparseable timestamp maps to null
+    #                    rather than dropping the id.
+    # task_id is ALSO a first-class column, so these rows stay joinable against
+    # task_completed / escalation_created.
+    #
+    # The discriminator between the two:
+    #   recovery_vetoed — an open escalation actively vetoed a recovery /
+    #     redispatch / done-flip / dispatch that would OTHERWISE have been
+    #     taken.  Something was held back, and the payload names by what:
+    #     reason escalation_pinned, or provenance_arbitration for the
+    #     already-landed gate's contested-task withhold.
+    #   recovery_left   — a LEAVE fall-through for a NON-veto reason: an
+    #     unmapped shape, an in-flight deploy phase, or escalation_store_
+    #     unavailable.  Nothing was held back by a record; the site simply had
+    #     no mapped action (or could not read the store to find out).
+    #
+    # Read these as STATE, not as a rate.  Emission is signature-transition-
+    # gated (new-or-changed (site, task_id) veto signature, plus exactly once at
+    # the streak threshold crossing) rather than one row per observation,
+    # because two of the sites run per dispatch TICK and unconditional emission
+    # would storm the store (INV-4).  Per-sweep cadence is carried by the
+    # reconcile sweep's always-logged summary line instead.  The ABSENCE of
+    # these rows for a stranded task is therefore meaningful: nothing held it.
+    recovery_vetoed = 'recovery_vetoed'
+    recovery_left = 'recovery_left'
 
 
 class EventStore:

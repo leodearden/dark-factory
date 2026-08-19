@@ -2186,6 +2186,19 @@ def test_spawn_fail_soft_skips_result_handback_when_registry_faults(
 # existing caller byte-identical.
 
 
+def _fake_claude_argv_capture_line(capture_file: pathlib.Path) -> str:
+    """The single shell line that dumps a fake ``claude``'s argv, NUL-delimited,
+    to *capture_file*.
+
+    Factored out so the argv-only writer below and the full-environment writer
+    used by the task-4015 tests (which captures argv *alongside* the
+    environment, and so cannot simply call the argv-only writer -- both write
+    the same ``bin_dir/claude`` path, and the second would overwrite the
+    first) stay byte-identical in what they record.
+    """
+    return f'printf "%s\\0" "$@" > {capture_file!s}\n'
+
+
 def _write_fake_claude_capturing_argv(
     bin_dir: pathlib.Path, capture_file: pathlib.Path
 ) -> None:
@@ -2204,8 +2217,8 @@ def _write_fake_claude_capturing_argv(
     p = bin_dir / "claude"
     p.write_text(
         "#!/usr/bin/env bash\n"
-        f'printf "%s\\0" "$@" > {capture_file!s}\n'
-        "exit 0\n"
+        + _fake_claude_argv_capture_line(capture_file)
+        + "exit 0\n"
     )
     p.chmod(0o755)
 
@@ -3085,4 +3098,382 @@ def test_sibling_mode_foreground_emulator_is_fire_and_forget(tmp_path: pathlib.P
     record = session_registry.SessionRecord.from_json(record_path.read_text())
     assert record.status == session_registry.Status.RUNNING, (
         f"expected a best-effort refresh to RUNNING, got {record.status}"
+    )
+
+
+# ===========================================================================
+# task-4015: CLAUDE_SPAWN_* launch inputs are consumed, then REMOVED from the
+# spawned session's own environment
+# ===========================================================================
+# spawn-claude.sh's inputs (CLAUDE_SPAWN_CLAUDE_ARGS / MODE / MODEL / BACKEND /
+# TMUX_SESSION / ...) reach it by ordinary environment inheritance, and until
+# task 4015 nothing removed them from the environment the payload then exec'd
+# `claude` with. A spawned session therefore carried its OWN launch parameters
+# forward, and its Bash tool handed them straight back to the next
+# spawn-claude.sh it ran -- so an inherited value was re-served as apparent
+# caller intent one level down.
+#
+# The 2026-08-11 incident: a fleet crash-recovery launch sets
+# CLAUDE_SPAWN_CLAUDE_ARGS="--resume <that session's own id>". The recovered
+# session inherited it, and its next /spawn -- meant to be a FRESH sibling --
+# came up as a live resume of the spawner instead.
+#
+# Every test below poisons the namespace EXPLICITLY on top of _base_env's
+# prefix scrub (see test_base_env_scrubs_every_claude_spawn_var), rather than
+# depending on the runner's ambient state, so they fail on the merge worker's
+# clean systemd unit too -- same rationale as the task-3062 tests above.
+
+
+def _write_fake_claude_dumping_full_env(
+    bin_dir: pathlib.Path,
+    capture_file: pathlib.Path,
+    argv_file: pathlib.Path | None = None,
+) -> None:
+    """Write a fake ``claude`` that dumps its ENTIRE environment (NUL-delimited,
+    via ``env -0``) to *capture_file* -- and, when *argv_file* is given, its
+    own argv alongside -- then exits 0.
+
+    The full environment, not just the ``CLAUDE_SPAWN_*`` slice, and it is the
+    ONLY env capture these tests use. Two reasons it is worth capturing more
+    than is asserted:
+
+    - It is exactly what the spawned session's Bash tool would hand to the
+      next spawn-claude.sh it runs, so it can be fed straight back in as a
+      second invocation's environment (see the two-level test below).
+    - NUL delimiting is the only unambiguous framing. An environment value may
+      itself contain newlines -- the same reason
+      ``_write_fake_claude_capturing_argv`` is NUL-delimited -- so a line-wise
+      ``env`` capture would split such a value across "lines", and a parser
+      partitioning each on its first ``=`` would record a bogus key from the
+      continuation. A ``not in captured`` assertion could then pass for
+      entirely the wrong reason, which is precisely what the task-4015 tests
+      must not do.
+
+    Read back with ``_read_env0`` (everything) or ``_read_spawn_namespace``
+    (just the launch namespace) / ``_read_argv``.
+    """
+    p = bin_dir / "claude"
+    body = f"env -0 > {capture_file!s}\n"
+    if argv_file is not None:
+        body += _fake_claude_argv_capture_line(argv_file)
+    p.write_text("#!/usr/bin/env bash\n" + body + "exit 0\n")
+    p.chmod(0o755)
+
+
+def _read_env0(capture_file: pathlib.Path) -> dict[str, str]:
+    """Read a NUL-delimited ``env -0`` capture into a dict.
+
+    Partitions each entry on its FIRST ``=`` (a value may contain further
+    ``=`` characters) and drops the trailing empty element left by the final
+    NUL terminator -- the env-shaped counterpart of ``_read_argv``.
+    """
+    parsed: dict[str, str] = {}
+    for entry in capture_file.read_bytes().decode().split("\0"):
+        if not entry:
+            continue
+        key, _, value = entry.partition("=")
+        parsed[key] = value
+    return parsed
+
+
+def _read_spawn_namespace(capture_file: pathlib.Path) -> dict[str, str]:
+    """The ``CLAUDE_SPAWN_*`` slice of a full ``env -0`` capture.
+
+    Filtering by prefix here rather than with ``env | grep`` inside the fake
+    claude keeps the capture NUL-delimited end to end (see above), and keeps
+    the filter prefix-generic: the whole point of the tests below is that a
+    var this file never names -- a future launch knob -- must not survive into
+    the child either, so neither the capture nor the read may be an
+    enumeration.
+    """
+    return {
+        k: v
+        for k, v in _read_env0(capture_file).items()
+        if k.startswith("CLAUDE_SPAWN_")
+    }
+
+
+def test_spawn_unsets_inherited_launch_inputs_from_child_env(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The four pure-input launch knobs must NOT be visible in the spawned
+    session's own environment, however they reached this invocation.
+
+    The poison values are chosen so neither reroutes the launcher away from
+    the foreground-xterm path under test: ``MODE=child`` is the default, and
+    a ``BACKEND`` of anything other than ``tmux`` falls through to normal
+    emulator discovery. What is asserted is purely what the CHILD can see.
+
+    The positive half matters just as much: the scrub must not be
+    over-broad, so the child must still see its own freshly-computed
+    CLAUDE_SPAWN_SESSION_ID and CLAUDE_SPAWN_RESULT_FILE -- the values THIS
+    spawn computed for THAT child, not inherited ones.
+
+    RED today: nothing in the payload unsets the namespace, so all four
+    inherited vars reach the child by plain environment inheritance.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_CLAUDE_ARGS"] = "--resume poisoned-parent-session"
+    env["CLAUDE_SPAWN_MODE"] = "child"
+    env["CLAUDE_SPAWN_MODEL"] = "haiku"
+    env["CLAUDE_SPAWN_BACKEND"] = "leak-not-tmux"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _read_spawn_namespace(capture_file)
+    for var in (
+        "CLAUDE_SPAWN_CLAUDE_ARGS",
+        "CLAUDE_SPAWN_MODE",
+        "CLAUDE_SPAWN_MODEL",
+        "CLAUDE_SPAWN_BACKEND",
+    ):
+        assert var not in captured, (
+            f"{var} is a per-launch INPUT: consumed by this invocation, then "
+            f"removed from the child's environment so it cannot be re-served "
+            f"to a grandchild. Child saw: {captured!r}"
+        )
+
+    # Not over-broad: this child's OWN computed values must survive.
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert captured.get("CLAUDE_SPAWN_SESSION_ID") == record.session_slug, (
+        f"the child must still see its own new session slug "
+        f"{record.session_slug!r}, got {captured!r}"
+    )
+    assert captured.get("CLAUDE_SPAWN_RESULT_FILE") == record.result_file, (
+        f"the child must still see the result file allocated for THIS spawn "
+        f"({record.result_file!r}), got {captured!r}"
+    )
+
+
+def test_spawn_unset_is_prefix_generic_not_an_enumerated_list(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The scrub must cover the whole ``CLAUDE_SPAWN_*`` namespace, not a
+    hand-maintained list of the names known today.
+
+    CLAUDE_SPAWN_FUTURE_KNOB exists nowhere in the codebase, which is the
+    entire point: it is the only assertion that can distinguish a
+    prefix-generic ``${!CLAUDE_SPAWN_@}`` sweep from a fourth named
+    enumeration that a future launch knob would silently fall outside of.
+    Same idiom this file already applies to its OWN scrub in
+    test_base_env_scrubs_every_claude_spawn_var -- kept deliberately
+    identical so the harness-side and script-side scrubs read the same.
+
+    A real input var is poisoned alongside it so a regression that drops the
+    sweep entirely fails here too, not only in the test above.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_FUTURE_KNOB"] = "leak"
+    env["CLAUDE_SPAWN_CLAUDE_ARGS"] = "--resume poisoned-parent-session"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _read_spawn_namespace(capture_file)
+    assert "CLAUDE_SPAWN_FUTURE_KNOB" not in captured, (
+        "the unset must be prefix-generic (${!CLAUDE_SPAWN_@}), so a var "
+        "that exists nowhere in the codebase is stripped too -- an "
+        "enumerated name list would leak every knob added after it was "
+        f"written. Child saw: {captured!r}"
+    )
+    assert "CLAUDE_SPAWN_CLAUDE_ARGS" not in captured, (
+        f"the known input var must be stripped as well, got {captured!r}"
+    )
+
+
+def test_spawn_registry_fault_unsets_parent_result_file_rather_than_inheriting_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """On a session-registry fault the child must see NO
+    CLAUDE_SPAWN_RESULT_FILE at all -- never the SPAWNER's inherited one.
+
+    This case gets its own test rather than an assertion folded into the
+    prefix-genericity one above because it is the only one that silently
+    corrupts a PARENT session's outcome record: with the registry faulted,
+    SESSION_RECORD_DIR is empty, so ``result_export`` is the empty string
+    and nothing is exported -- and before task 4015 the parent's inherited
+    value simply survived into the child, which would then dutifully write
+    its own outcome over its spawner's result.md.
+
+    Uses the same deterministic fault injection as
+    test_spawn_fail_soft_skips_result_handback_when_registry_faults: a
+    CLAUDE_FLEET_ROOT nested under a pre-existing regular file, so the
+    registry's mkdir raises NotADirectoryError rather than depending on
+    permission semantics that vary across CI users and containers.
+
+    RED if the unset were nested inside the ``if [ -n
+    "$CLAUDE_SPAWN_RESULT_FILE" ]`` / ``if [ -n "$SESSION_RECORD_DIR" ]``
+    guards, whose bodies are skipped on exactly this path: the skip path
+    must UNSET, not merely decline to set. Fail-soft must also stay
+    fail-soft -- the exit-code contract is asserted unchanged.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    parent_result = "/parent/session/result.md"
+    env["CLAUDE_SPAWN_RESULT_FILE"] = parent_result
+
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("i am a regular file, not a directory\n")
+    env["CLAUDE_FLEET_ROOT"] = str(blocker / "fleet")
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, (
+        f"a registry fault must never change the exit-code contract: "
+        f"expected 0, got {result.returncode}\nstderr: {result.stderr.decode()}"
+    )
+
+    captured = _read_spawn_namespace(capture_file)
+    assert captured.get("CLAUDE_SPAWN_RESULT_FILE") != parent_result, (
+        "a child must never inherit its SPAWNER's result file -- it would "
+        f"overwrite the parent's outcome record. Child saw: {captured!r}"
+    )
+    assert "CLAUDE_SPAWN_RESULT_FILE" not in captured, (
+        "with no record dir of its own the child must see NO result file at "
+        f"all, not a stale inherited one. Child saw: {captured!r}"
+    )
+
+
+def test_spawned_session_cannot_reserve_its_own_launch_args_to_a_grandchild(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The 2026-08-11 incident, reproduced end-to-end across TWO real spawns.
+
+    Level 1 is a fleet crash-recovery launch:
+    CLAUDE_SPAWN_CLAUDE_ARGS="--resume <a session id>". That is a DELIBERATE
+    input and the direct child must honour it -- asserted below on the
+    level-1 child's own argv. Requirement (4): inputs are consumed before
+    the unset, and from inside the script a deliberate command-prefix
+    assignment is indistinguishable from an inherited one, so the direct
+    child's argv is NOT where this is fixed. Do not "fix" that path -- it
+    would delete the documented CLAUDE_SPAWN_CLAUDE_ARGS passthrough and
+    break test_spawn_model_env_precedes_raw_claude_args.
+
+    Level 2 is where the fix bites. The recovered session's own environment
+    -- captured verbatim at level 1, exactly what its Bash tool would hand
+    to the next spawn-claude.sh it runs -- is fed back in as a second
+    invocation's environment. That grandchild is meant to be FRESH, and
+    before task 4015 it came up as a live resume of its spawner because the
+    inherited CLAUDE_SPAWN_CLAUDE_ARGS was re-served as apparent caller
+    intent.
+
+    Two real script invocations rather than a fake claude that spawns
+    recursively: the level-1 run has fully completed before level 2 starts,
+    so the fake ``claude`` can simply be rewritten in between and nothing
+    races.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    child_env_file = tmp_path / "child_env.bin"
+    child_argv_file = tmp_path / "child_argv.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, child_env_file, child_argv_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_CLAUDE_ARGS"] = "--resume poisoned-parent-session"
+
+    # --- level 1: the crash-recovery launch -------------------------------
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    child_argv = _read_argv(child_argv_file)
+    assert "--resume" in child_argv and "poisoned-parent-session" in child_argv, (
+        f"the DIRECT child must still receive args deliberately passed on "
+        f"this invocation (requirement 4) -- got: {child_argv!r}"
+    )
+
+    # The FULL environment here, not just the launch namespace -- level 2 feeds
+    # it back in verbatim as the next invocation's environment, PATH and all.
+    child_env = _read_env0(child_env_file)
+    assert "CLAUDE_SPAWN_CLAUDE_ARGS" not in child_env, (
+        f"the recovered session must not carry its own launch args forward "
+        f"in its environment, got: {_read_spawn_namespace(child_env_file)!r}"
+    )
+
+    # --- level 2: what that session's next /spawn would actually run ------
+    grandchild_argv_file = tmp_path / "grandchild_argv.bin"
+    _write_fake_claude_capturing_argv(bin_dir, grandchild_argv_file)
+
+    result2 = _run_spawn(child_env, tmp_path)
+    assert result2.returncode == 0, f"stderr: {result2.stderr.decode()}"
+
+    grandchild_argv = _read_argv(grandchild_argv_file)
+    assert "--resume" not in grandchild_argv, (
+        f"a session spawned from within the recovered session must be FRESH, "
+        f"not a resume of its spawner -- got: {grandchild_argv!r}"
+    )
+    assert not any("poisoned-parent-session" in tok for tok in grandchild_argv), (
+        f"the spawner's own resume target must not reach the grandchild's "
+        f"argv anywhere, got: {grandchild_argv!r}"
+    )
+
+
+def test_sanitization_preserves_launcher_stamped_record_identity(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The not-over-broad lock, in the two-way style of
+    test_sibling_parentage_two_way_into_hook_record: identity must survive
+    on the session-registry RECORD even though it no longer travels in the
+    child's environment.
+
+    CLAUDE_SPAWN_ROLE / TASK_ID are launcher-side inputs. They are stamped
+    by the ``python3 ... launching`` write, which runs in its own subprocess
+    BEFORE and OUTSIDE $inner -- so a payload-level unset cannot reach it.
+    The child itself has no consumer for them: session_hooks.run_session_start
+    reads identity from the environment only in its ``except
+    FileNotFoundError`` branch, and a spawn-claude.sh child provably has a
+    record at its slug already (CLAUDE_SPAWN_SESSION_ID is exported only
+    when SESSION_RECORD_DIR is non-empty), so that branch is unreachable
+    here.
+
+    Stripping them is in fact corrective: a leaked inherited identity used
+    to resolve as ``implementer:<project>#<id>`` on an unrelated session --
+    the same leak orchestrator/tests/test_session_hooks.py::_clear_claude_
+    spawn_env exists to defend against.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_ROLE"] = "implementer"
+    env["CLAUDE_SPAWN_TASK_ID"] = "9999"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.role == "implementer", (
+        f"the launching write runs before/outside $inner, so the payload's "
+        f"unset must not disturb the stamped role, got {record.role!r}"
+    )
+    assert record.task_id == "9999", (
+        f"same for the stamped task_id, got {record.task_id!r}"
+    )
+
+    captured = _read_spawn_namespace(capture_file)
+    assert "CLAUDE_SPAWN_ROLE" not in captured, (
+        f"identity belongs on the record, not in the child's environment "
+        f"where it would be re-served to the next spawn: {captured!r}"
+    )
+    assert "CLAUDE_SPAWN_TASK_ID" not in captured, (
+        f"same for the task id: {captured!r}"
     )

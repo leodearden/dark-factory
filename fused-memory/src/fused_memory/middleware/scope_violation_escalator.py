@@ -16,14 +16,21 @@ Since task 2206 (commit 0204e25fa5) the guard produces TWO outcomes, and
   structured ``DarkFactoryPathScopeViolation`` error dict is returned to the
   caller.
 * **PROSE-only advisory** (``advisory=True``) — a regex-over-prose heuristic
-  hit with no files-level mismatch.  Nothing is blocked: the task IS created
-  and stamped with ``metadata.possible_scope_mismatch``.
+  hit with no files-level mismatch.  Nothing is blocked: the submission
+  proceeds, carrying ``metadata.possible_scope_mismatch``.
 
 The distinction is load-bearing rather than cosmetic (task 3119): this
 escalation is read by operators and rendered into agent briefings, so an
-advisory described in rejection wording reports that a task was rejected when
-it in fact exists — and tells the reader to resubmit work that already
-landed.  Both outcomes are severity ``info`` — the FLOOR of the
+advisory described in rejection wording reports a rejection that never
+happened — and tells the reader to resubmit work that was never blocked.
+The advisory wording may not over-claim in the other direction either
+(task 4159): ``report_rejection`` is called from the ``submit_task``
+PHASE-1 guard, before ``tm.add_task`` and before the submission has been
+resolved at all, so it cannot state that a task exists.  The stamp above
+reaches a task only when one is actually CREATED from the submission — a
+candidate that is dropped, or folded into an existing task, never carries
+it (``_execute_combine`` does not propagate it to a combine target).
+Both outcomes are severity ``info`` — the FLOOR of the
 ``blocking|info|critical|urgent`` vocabulary in ``escalation.models``, so the
 wording is what distinguishes them, not the severity.
 
@@ -33,8 +40,8 @@ Design mirrors :class:`fused_memory.middleware.curator_escalator.CuratorEscalato
   the package is missing (minimal envs, tests without escalation infra),
   ``report_rejection`` becomes a logged no-op — the guard's own outcome is
   unaffected (on the FILES-certain path the error dict is still returned;
-  on the advisory path the task is still created and stamped), so
-  escalation is purely additive.
+  on the advisory path the submission still proceeds and still carries the
+  stamp), so escalation is purely additive.
 * Per-project ``EscalationQueue`` cache keyed by ``project_root``.
 * Escalations land in ``{project_root}/data/escalations`` — the *filing*
   project's queue (the place the agent was operating against), regardless
@@ -112,6 +119,14 @@ _ADVISORY_FINGERPRINT_TOKEN: str = 'mode:advisory'
 # instruction on a submission that was never blocked reads as a directive to
 # redo work that already landed (task 3119).
 _ADVISORY_SUGGESTED_ACTION: str = 'no_action_advisory_only'
+
+# Operator-facing outcome-mode labels for this module's log lines.  Named
+# constants rather than inline literals so the unavailable-package debug line
+# and the terminal queued warning are guaranteed to emit the SAME token — an
+# operator greps one mode across both, and the two lines used to be
+# indistinguishable by mode at all (task 4159).
+_ADVISORY_MODE_LABEL: str = 'advisory'
+_REJECTION_MODE_LABEL: str = 'rejection'
 
 # Budget-misconfig escalation constants — deliberately distinct from the
 # scope_violation family so operators can immediately tell these apart.
@@ -197,9 +212,21 @@ class ScopeViolationEscalator:
         Despite the name (kept for call-site/test-double back-compat), this
         method covers BOTH outcomes described in the module docstring, selected
         by *advisory*: a FILES-certain hard rejection (default — wording tells
-        the operator to resubmit to the owner) or a PROSE-only advisory (the
-        task WAS created and stamped, so the wording says so and
+        the operator to resubmit to the owner) or a PROSE-only advisory
+        (nothing was blocked, so the wording says only that, and
         ``suggested_action`` is ``no_action_advisory_only``).
+
+        The advisory wording deliberately does NOT say a task exists
+        (task 4159).  This method is reached from the ``submit_task``
+        PHASE-1 path guard, which returns before ``tm.add_task`` is called
+        and before the submission has been resolved — so at the moment this
+        record is written the outcome is genuinely unknown, and the
+        ``metadata.possible_scope_mismatch`` stamp reaches a task only when
+        one is actually created from the submission (``_execute_combine``
+        does not propagate it to a combine target).  The wording names no
+        resolver and no timing either: the ordinary ticket path is resolved
+        asynchronously by the curator, but ``planning_mode`` bypasses the
+        curator and creates the task synchronously.
 
         Returns the escalation id when one was filed, ``None`` otherwise
         (escalation package missing, queue write failed, etc.).  Never
@@ -235,13 +262,14 @@ class ScopeViolationEscalator:
                 Default ``False`` — the FILES-certain rejection wording,
                 byte-identical to the pre-task-3119 output.
         """
+        # One label for every operator-facing line this call emits.
+        mode = _ADVISORY_MODE_LABEL if advisory else _REJECTION_MODE_LABEL
         queue = self._queue_for(project_root)
         if queue is None:
             logger.debug(
                 'scope_violation_escalator: escalation package unavailable; '
                 '%s of %r in project %r will not be escalated',
-                'advisory' if advisory else 'rejection',
-                candidate_title[:80], project_id,
+                mode, candidate_title[:80], project_id,
             )
             return None
 
@@ -274,16 +302,37 @@ class ScopeViolationEscalator:
         # identical either way.
         detail_lines.append('')
         if advisory:
+            # Claims ONLY what is established at guard time (task 4159).  This
+            # fires from submit_task phase-1 — before tm.add_task, before the
+            # submission has been resolved at all — so any assertion that a
+            # task exists would be unverified here, and false if the candidate
+            # is dropped or folded into an existing task.  The prose states
+            # only that epistemic fact: it names no RESOLVER and no timing,
+            # because both differ by path.  The ordinary ticket path is
+            # resolved asynchronously by the curator, but planning_mode
+            # bypasses the curator and creates the task synchronously, and
+            # that kwarg is not read until well after this guard runs — so
+            # "queued for curation" / "resolved asynchronously" would be the
+            # same class of unverified claim in a new direction.  The stamp
+            # sentence is conditional on a task actually being CREATED:
+            # _execute_combine merges only curator_* keys onto the target, so
+            # a combine target never receives this candidate's
+            # possible_scope_mismatch.
             detail_lines.append(
                 'A task creation request cited paths that look like they belong '
                 'to another project, based on a heuristic scan of its prose '
                 '(title/description/details) only.  The submission was NOT '
-                'blocked: the task WAS created, and the match is recorded on it '
-                'as metadata.possible_scope_mismatch so async triage can see it '
-                'too.  suggested_project above is a POSSIBLE owner, not a '
-                'verdict — no resubmission is needed and nothing was lost.  '
-                'Review and reroute the created task ONLY if the attribution '
-                'above is actually correct and the task is in the wrong place.',
+                'blocked, and no resubmission is needed.  This record is filed '
+                'at the submission guard, BEFORE the submission has been '
+                'resolved, so it does not establish that a task exists: the '
+                'submission may result in a new task, be folded into an '
+                'existing one, or be dropped.  Only a task newly created from '
+                'this submission carries the match as '
+                'metadata.possible_scope_mismatch — a candidate that is '
+                'dropped, or folded into an existing task, does not.  '
+                'suggested_project above is a POSSIBLE owner, not a verdict: '
+                'review and reroute ONLY if a task does result and the '
+                'attribution above is actually correct.',
             )
         else:
             detail_lines.append(
@@ -303,8 +352,14 @@ class ScopeViolationEscalator:
                 severity='info',
                 category=_CATEGORY,
                 summary=(
-                    f'Path-scope ADVISORY: task CREATED and stamped, '
-                    f'cites {paths_str} (possible owner: {target})'
+                    # No creation claim: this is written in submit_task
+                    # phase-1, before the curator resolves the submission
+                    # (task 4159).  briefing.py renders summary verbatim into
+                    # an agent briefing, so an unverified claim here misleads
+                    # exactly as the detail's did.
+                    f'Path-scope ADVISORY: submission not blocked, outcome '
+                    f'not yet resolved, cites {paths_str} '
+                    f'(possible owner: {target})'
                     if advisory else
                     f'Misrouted task rejected: cites {paths_str} '
                     f'(suggested target: {target})'
@@ -343,10 +398,14 @@ class ScopeViolationEscalator:
             )
             return None
 
+        # Mode is interpolated into the EXISTING single line, after the id:
+        # 'scope_violation_escalator: queued <id>' is the greppable anchor
+        # shared with the sibling escalators, so neither the prefix nor the
+        # one-line-per-submit shape may change (task 4159).
         logger.warning(
-            'scope_violation_escalator: queued %s for project %s '
+            'scope_violation_escalator: queued %s (%s) for project %s '
             '(candidate=%r, suggested=%s)',
-            esc_id, project_id, candidate_title[:80], target,
+            esc_id, mode, project_id, candidate_title[:80], target,
         )
         return esc_id
 

@@ -8,6 +8,7 @@ without conflicting with sibling subprojects' conftests under
 import itertools
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -147,10 +148,19 @@ async def _reap_leaked_aiosqlite_connections():
     future via ``future.get_loop().call_soon_threadsafe(...)`` it raises
     ``RuntimeError: Event loop is closed`` from inside the thread. pytest's
     threadexception plugin surfaces this as a
-    ``PytestUnhandledThreadExceptionWarning`` (promoted to a hard error by this
-    project's ``filterwarnings``) and attributes it to whatever unrelated test
-    happens to be running when the thread fires — under ``-n auto`` on an
-    oversubscribed host that is reliably a *different*, innocent test.
+    ``PytestUnhandledThreadExceptionWarning`` and attributes it to whatever
+    unrelated test happens to be running when the thread fires — under
+    ``-n auto`` on an oversubscribed host that is reliably a *different*,
+    innocent test. That warning is promoted to a hard error by the
+    ``error::pytest.PytestUnhandledThreadExceptionWarning`` entry in
+    orchestrator/pyproject.toml's ``[tool.pytest.ini_options] filterwarnings``
+    (task 4075), which governs the ORCHESTRATOR-BOUND invocation the
+    merge-verify harness uses (``cd orchestrator && uv run pytest tests/``,
+    dark-factory-orchestrator.yaml:142); a root-bound run resolves the
+    repo-root inifile instead — pytest reads exactly one, never merging across
+    workspace members — and does NOT promote. Pinned by
+    tests/test_aiosqlite_leak_isolation.py's
+    "PytestUnhandledThreadExceptionWarning promotion" section.
 
     Reaping here — in the test's own loop, before it is closed — closes and
     joins any live aiosqlite connection so its worker thread is guaranteed
@@ -352,6 +362,59 @@ def _isolate_warm_lane_script_dir(monkeypatch):
     """
     monkeypatch.setenv(
         "ORCH_WARM_LANE_SCRIPT_DIR", _ABSENT_WARM_LANE_SCRIPT_DIR,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_mock_derived_stray_dirs(request):
+    """Fail any test that leaves a ``MagicMock/`` DIRECTORY in the process CWD.
+
+    **Mechanism.**  ``unittest.mock.MagicMock`` configures ``__fspath__`` as a
+    supported magic method whose default return value is a genuine ``str``.  A
+    MagicMock is therefore a *fully valid* ``os.PathLike[str]``, and
+    ``os.fspath()`` of one is derived from its repr, so it ALWAYS begins with a
+    literal ``MagicMock`` path component::
+
+        os.fspath(MagicMock().project_root / 'data' / 'x.json')
+        # -> 'MagicMock/mock.project_root.__truediv__()...()/1404727137'
+
+    Any production code that coerces such an object with ``Path()`` and then
+    creates directories materialises that tree for real, relative to the
+    process CWD.  Task 3223 hit exactly this: ``merge_queue`` read
+    ``project_root`` off a MagicMock, handed the derived path to
+    ``LandedOutbox``, and ``shared.safe_io.atomic_write_text(..., mkdir=True)``
+    dutifully created it — landing a junk tree in a commit.  The write
+    primitive cannot detect this (there is no type-level signal separating a
+    mock from a genuine relative path), so the fence belongs here.
+
+    The fixture REMOVES the tree as well as failing, so a single polluting test
+    does not cascade into a failure for every subsequent test sharing the same
+    xdist worker's CWD.
+
+    **Deliberately narrow — directory shape only.**  This does NOT match the
+    ``<MagicMock name='...' id='...'>`` FILE shape.  That is the
+    ``str(mock)``/repr shape, it is pre-existing on main and unrelated to task
+    3223 (produced by ``sqlite3.connect(str(...))`` at
+    ``park_eviction_requests.py:84``, not by ``safe_io``), and it is already
+    contained by the ``<MagicMock*`` entry at ``.gitignore:50`` — dozens of
+    such files currently sit untracked in the main checkout, so a guard
+    matching them would go red on day one for reasons this task cannot fix.
+    That pollution is tracked separately as follow-up ticket
+    ``tkt_0RRXS67RDHVVRVM811KFCAPSX8``.
+    """
+    yield
+    stray = Path.cwd() / "MagicMock"
+    if not stray.exists():
+        return
+    shutil.rmtree(stray, ignore_errors=True)
+    pytest.fail(
+        f"{request.node.nodeid} left a mock-derived directory at {stray}. "
+        "A MagicMock is a valid os.PathLike[str] whose os.fspath() is "
+        "repr-derived, so passing one where real code calls Path(...).mkdir() "
+        "creates a real tree under the CWD. Give the mock a genuine path "
+        "(e.g. `git_ops.project_root = tmp_path`) rather than leaving the "
+        "attribute to auto-spec into a child mock. The stray tree has been "
+        "removed so following tests are unaffected."
     )
 
 
@@ -747,14 +810,37 @@ def _drain_async_mock_coroutines():
 def make_steward(tmp_path: Path):
     """Build a minimal ``TaskSteward`` on a fixture-OWNED, ``tmp_path``-rooted worktree.
 
-    This is the suite's ONLY steward factory.  Task 3461 merged the two
-    near-identical ``_make_steward`` copies from ``test_suggestion_triage.py``
-    and ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two
-    that remained — ``test_out_of_band_routing.py``'s ``_steward_config`` /
-    ``_build_steward``, and ``test_steward.py``'s five-fixture graph (whose
-    ``worktree`` / ``mock_config`` / ``mock_queue`` / ``mock_mcp`` /
-    ``mock_briefing`` names survive there as one-line views onto this factory's
-    build).  If you are here to add another, EXTEND this one instead.
+    This is the suite's steward factory, with ONE documented exception (below).
+    Task 3461 merged the two near-identical ``_make_steward`` copies from
+    ``test_suggestion_triage.py`` and ``test_workflow_state_machine_boundary.py``;
+    task 3514 folded in the two that remained —
+    ``test_out_of_band_routing.py``'s ``_steward_config`` / ``_build_steward``,
+    and ``test_steward.py``'s five-fixture graph (whose ``worktree`` /
+    ``mock_config`` / ``mock_queue`` / ``mock_mcp`` / ``mock_briefing`` names
+    survive there as one-line views onto this factory's build).  If you are here
+    to add another, EXTEND this one instead.
+
+    The exception, examined and left standing by task 3551:
+    ``test_workflow_escalated_steward_stall.py``'s ``_make_steward_config``.  It
+    structurally cannot fold in, for three independent reasons — recorded here so
+    the next reader does not re-litigate it:
+
+    1. it feeds ``_CapFiringSteward``, a ``TaskSteward`` SUBCLASS that module
+       declares inside ``_make_real_steward_factory``, whereas this fixture
+       returns a constructed ``TaskSteward``;
+    2. that construction passes ``config_dir=``, a parameter this fixture does
+       not accept;
+    3. ``_make_real_steward_factory`` returns a CALLBACK the workflow invokes
+       later, with a worktree the *workflow* chooses — it is not a fixture and
+       cannot request ``tmp_path`` at the moment of construction, whereas this
+       one owns its worktree by design.
+
+    Absorbing all three would mean adding ``steward_cls=`` / ``config_dir=``
+    surface AND relaxing the strictly-below-``tmp_path`` worktree assertion below
+    (which task 3514 promoted from convention to an enforced invariant) to serve
+    exactly one consumer.  That factory instead adopted this one's ``project_root``
+    recipe directly (task 3551), so the sandbox invariant is shared even though
+    the construction is not.
 
     Lives in conftest.py — rather than ``_orch_helpers.py``, which is scoped to
     non-fixture helpers — because it must close over ``tmp_path`` to own the

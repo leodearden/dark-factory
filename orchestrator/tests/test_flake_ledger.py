@@ -14,11 +14,13 @@ mixed-colour (sync writer/readers, async debt functions); the split is structura
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
 import os
 import sqlite3
-from datetime import UTC, datetime, timedelta
+import time
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -70,6 +72,40 @@ def _table_names(db_path: Path) -> list[str]:
 
 def _column_names(db_path: Path, table: str) -> list[str]:
     return [r['name'] for r in _rows(db_path, f'PRAGMA table_info({table})')]
+
+
+@contextlib.contextmanager
+def _non_utc_host_tz():
+    """Pin the host TZ to a deliberately non-UTC zone for the duration of the block.
+
+    A ``naive``-spelling test case asserting a fixed instant (e.g. ``stamp ==
+    '...T12:00:00+00:00'``) passes vacuously under a ``.astimezone()`` regression
+    whenever the host already runs with ``TZ=UTC`` — the common case, including most
+    CI — because ``.astimezone()`` on a naive datetime interprets it in the HOST's
+    local zone first, and UTC's own local zone is a no-op.  Pinning a non-UTC zone here
+    makes that regression fail everywhere instead of only on a developer's non-UTC
+    workstation: under a real ``.astimezone(UTC)`` regression the stamp comes out
+    shifted by the pinned zone's offset, so the fixed-instant assertion fails
+    deterministically regardless of where the test runs.
+
+    Restores the previous ``TZ`` (or its absence) and re-runs ``time.tzset()``
+    afterward, both done BY HAND in this generator's own ``finally`` rather than via
+    ``monkeypatch.setenv``: a fixture built on ``monkeypatch`` would have its revert run
+    as monkeypatch's OWN finalizer, which unwinds AFTER this generator's teardown
+    (finalizers run inside-out) — leaving libc's cached zone pointed at the pinned
+    non-UTC zone for whatever runs next.
+    """
+    previous = os.environ.get('TZ')
+    os.environ['TZ'] = 'America/New_York'
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop('TZ', None)
+        else:
+            os.environ['TZ'] = previous
+        time.tzset()
 
 
 class TestEnsureSchema:
@@ -878,9 +914,15 @@ class TestRecordFlakeOccurrenceWireHardening:
     def test_a_naive_stamp_is_read_as_utc_not_as_host_local_time(self, tmp_path: Path) -> None:
         """The field is documented as UTC, so a missing offset is ATTACHED, never
         ``.astimezone()``-ed — that would apply the DISPATCHER's local offset and
-        silently shift a remote host's observation."""
+        silently shift a remote host's observation.
+
+        Host TZ is pinned away from UTC (:func:`_non_utc_host_tz`) so this assertion
+        cannot pass vacuously just because the machine running it already happens to be
+        UTC — the common case, including most CI.
+        """
         db_path = tmp_path / 'runs.db'
-        self._record(db_path, observed_at='2026-08-06T12:00:00')
+        with _non_utc_host_tz():
+            self._record(db_path, observed_at='2026-08-06T12:00:00')
 
         assert _rows(db_path, 'SELECT observed_at FROM flake_occurrence')[0]['observed_at'] == (
             '2026-08-06T12:00:00+00:00'
@@ -1225,6 +1267,106 @@ class TestOpenDebt:
         assert parsed.tzinfo is not None
         assert parsed.utcoffset() == timedelta(0)
 
+    @pytest.mark.parametrize(
+        'now',
+        [
+            datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            datetime(2026, 8, 6, 13, 0, tzinfo=timezone(timedelta(hours=1))),
+            datetime(2026, 8, 6, 7, 0, tzinfo=timezone(timedelta(hours=-5))),
+            datetime(2026, 8, 6, 12, 0),  # naive; documented as UTC, so UTC is ATTACHED
+        ],
+        ids=['utc_offset', 'plus_one', 'minus_five', 'naive'],
+    )
+    async def test_now_is_canonicalised_regardless_of_spelling(
+        self, tmp_path: Path, now: datetime
+    ) -> None:
+        """Mirrors ``TestReadOccurrences::test_since_accepts_any_spelling_of_the_boundary_instant``
+        for the LEDGER-owned clock (task 3847): several equivalent spellings of one
+        instant passed as *now* must produce the SAME canonical stored stamp, so
+        ``list_open_debt``'s ``ORDER BY opened_at`` contract holds against rows written
+        by the default aware-UTC path.
+
+        Host TZ is pinned non-UTC (:func:`_non_utc_host_tz`) for the whole body —
+        harmless for the three aware spellings, and what makes the ``naive`` case
+        actually discriminate a ``.astimezone()`` regression instead of passing
+        vacuously on a UTC machine."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        with _non_utc_host_tz():
+            row = await open_debt(db_path, 'dark_factory', self.TEST_ID, now=now)
+
+        assert row is not None
+        assert row.opened_at == self.NOW.isoformat()
+        assert row.last_occurrence_at == self.NOW.isoformat()
+
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
+        assert raw['opened_at'] == self.NOW.isoformat()
+        assert raw['last_occurrence_at'] == self.NOW.isoformat()
+
+    async def test_list_open_debt_orders_consistently_across_now_spellings(
+        self, tmp_path: Path
+    ) -> None:
+        """A naive or non-UTC ``now`` must sort exactly where an equivalent aware-UTC
+        ``now`` would.  This is the same failure class as ``esc-3785-3``: a mis-sorted
+        ``list_open_debt`` reads as a data trend, not as a bug, so silent misordering
+        is the dangerous direction.
+
+        The third (naive) call is wrapped in :func:`_non_utc_host_tz` — otherwise it
+        would discriminate a ``.astimezone()`` regression only on a non-UTC machine,
+        the same vacuous-pass gap as ``test_now_is_canonicalised_regardless_of_spelling``.
+        """
+        from orchestrator.flake_ledger import list_open_debt, open_debt
+
+        db_path = tmp_path / 'runs.db'
+        # All three denote the SAME instant, spelled three different ways.
+        await open_debt(db_path, 'dark_factory', 'a::t', now=self.NOW)
+        await open_debt(
+            db_path,
+            'dark_factory',
+            'b::t',
+            now=datetime(2026, 8, 6, 13, 0, tzinfo=timezone(timedelta(hours=1))),
+        )
+        with _non_utc_host_tz():
+            await open_debt(db_path, 'dark_factory', 'c::t', now=datetime(2026, 8, 6, 12, 0))
+
+        rows = list_open_debt(db_path)
+        assert [r.opened_at for r in rows] == [self.NOW.isoformat()] * 3
+        # Same opened_at for all three (canonicalised), so the test_id tiebreak sorts.
+        assert [r.test_id for r in rows] == ['a::t', 'b::t', 'c::t']
+
+    async def test_a_naive_now_logs_a_loud_warning(self, tmp_path: Path, caplog) -> None:
+        """Unlike :func:`_normalize_observed_at`'s wire-supplied ``observed_at``, a
+        naive ``now`` here is an IN-REPO caller bug, not untrusted input — coerced
+        rather than rejected (the never-raises invariant still holds), but never
+        silently: a future ζ/ε call site passing ``datetime.now()`` instead of
+        ``datetime.now(UTC)`` must be visible in the logs."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID, now=datetime(2026, 8, 6, 12, 0)
+            )
+
+        assert row is not None  # coerced, not rejected
+        warnings = [r for r in caplog.records if r.name == 'orchestrator.flake_ledger']
+        assert len(warnings) == 1
+        assert 'open_debt' in warnings[0].getMessage()
+        assert 'naive' in warnings[0].getMessage()
+
+    async def test_an_aware_now_logs_nothing(self, tmp_path: Path, caplog) -> None:
+        """The warning is naive-specific — an ordinary aware-UTC caller, the documented
+        contract, must stay silent or the log line stops signalling anything."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+
+        assert row is not None
+        assert [r for r in caplog.records if r.name == 'orchestrator.flake_ledger'] == []
+
     async def test_reopen_while_still_open_is_not_a_re_entry(self, tmp_path: Path) -> None:
         """The debt never closed, so this is the SAME cycle: ``open_count`` and
         ``opened_at`` hold, and only ``last_occurrence_at`` advances.  Counting it as a
@@ -1355,6 +1497,80 @@ class TestResolveDebt:
         # start one.
         assert raw['opened_at'] == self.NOW.isoformat()
         assert raw['open_count'] == 1
+
+    @pytest.mark.parametrize(
+        'now',
+        [
+            datetime(2026, 8, 6, 13, 0, tzinfo=UTC),
+            datetime(2026, 8, 6, 14, 0, tzinfo=timezone(timedelta(hours=1))),
+            datetime(2026, 8, 6, 8, 0, tzinfo=timezone(timedelta(hours=-5))),
+            datetime(2026, 8, 6, 13, 0),  # naive; documented as UTC, so UTC is ATTACHED
+        ],
+        ids=['utc_offset', 'plus_one', 'minus_five', 'naive'],
+    )
+    async def test_resolved_at_is_canonicalised_regardless_of_spelling(
+        self, tmp_path: Path, now: datetime
+    ) -> None:
+        """Mirrors the ``open_debt`` coverage (task 3847) for ``resolved_at`` — an
+        un-canonicalised stamp here would break ``read_debt``'s equally-documented
+        aware-UTC contract on this column the same way it would break
+        ``list_open_debt``'s ``opened_at`` ordering.
+
+        Host TZ is pinned non-UTC (:func:`_non_utc_host_tz`) around the ``resolve_debt``
+        call so the ``naive`` case discriminates a ``.astimezone()`` regression instead
+        of passing vacuously on a UTC machine."""
+        from orchestrator.flake_ledger import open_debt, read_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+        with _non_utc_host_tz():
+            await resolve_debt(
+                db_path, 'dark_factory', self.TEST_ID, resolving_commit='deadbee', now=now
+            )
+
+        row = read_debt(db_path, self.TEST_ID)
+        assert row is not None
+        assert row.resolved_at == self.LATER.isoformat()
+
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
+        assert raw['resolved_at'] == self.LATER.isoformat()
+
+    async def test_a_naive_now_logs_a_loud_warning(self, tmp_path: Path, caplog) -> None:
+        """Mirrors ``TestOpenDebt``'s coverage of the same loud-on-naive treatment."""
+        from orchestrator.flake_ledger import open_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert (
+                await resolve_debt(
+                    db_path,
+                    'dark_factory',
+                    self.TEST_ID,
+                    resolving_commit='deadbee',
+                    now=datetime(2026, 8, 6, 13, 0),
+                )
+                is None  # coerced, not rejected — resolve_debt always returns None
+            )
+
+        warnings = [r for r in caplog.records if r.name == 'orchestrator.flake_ledger']
+        assert len(warnings) == 1
+        assert 'resolve_debt' in warnings[0].getMessage()
+        assert 'naive' in warnings[0].getMessage()
+
+    async def test_an_aware_now_logs_nothing(self, tmp_path: Path, caplog) -> None:
+        """The warning is naive-specific — an ordinary aware-UTC caller, the documented
+        contract, must stay silent or the log line stops signalling anything."""
+        from orchestrator.flake_ledger import open_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            await resolve_debt(
+                db_path, 'dark_factory', self.TEST_ID, resolving_commit='deadbee', now=self.LATER
+            )
+
+        assert [r for r in caplog.records if r.name == 'orchestrator.flake_ledger'] == []
 
     async def test_the_resolved_row_is_retained(self, tmp_path: Path) -> None:
         """§5.2: resolved rows are kept DELIBERATELY because η's recurrence trigger

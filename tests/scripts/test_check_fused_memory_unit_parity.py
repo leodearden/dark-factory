@@ -11,11 +11,18 @@ mirroring the pattern in tests/scripts/test_orchestrator_watchdog.py::_load_watc
 
 import importlib.util
 import pathlib
+import re
 import subprocess
 import sys
 import types
 
 import pytest
+from setup_host_sections import (
+    run_section,
+    slice_section,
+    usage_error_checker,
+    write_checker,
+)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_fused_memory_unit_parity.py"
@@ -579,4 +586,261 @@ def test_parity_checker_callable_as_subprocess(tmp_path: pathlib.Path):
     )
     assert "MEM0_TELEMETRY" in result_drifted.stdout, (
         "Expected drift output to name the missing directive on stdout."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The parity GATE in setup-host.sh is wired so it can actually stop something
+# ---------------------------------------------------------------------------
+#
+# Everything above tests the CHECKER. This group tests its WIRING — the block
+# in scripts/setup-host.sh that runs it and decides what its exit status meant.
+#
+# The defect these pin: that block believed a bare exit status, and 2 is
+# overloaded three ways — the checker's benign "not installed on this host",
+# `python3` refusing to open a missing script, and argparse rejecting an
+# unknown flag. So renaming the checker or one of its flags made the installer
+# print a reassuring "not installed ... (skipping parity check)" and move on: a
+# gate reporting green because it never ran, which is the exact silent-drift
+# failure the checker exists to catch, reproduced one level up in its own
+# wiring.
+#
+# Nothing here touches ~/.config/systemd/user or real systemd: REPO_ROOT and
+# UNIT_DIR are tmp_path trees and `systemctl` is a PATH stub that exits 0.
+
+# Anchored on the block's hoisted `_fm_parity_script=` assignment — CODE, and
+# unique to this site — not on the section comment above it. A comment anchor
+# turns a reworded comment or a fixed typo into a red CI run for no behavioural
+# change, and it is the same line the structural sweep in
+# test_check_dashboard_unit_parity.py keys on, so both share one anchor.
+_GATE_START = "_fm_parity_script="
+_GATE_END = "\nfi\n"
+
+# The status is believed only when the checker's own report is present. Unlike
+# the dashboard and orchestrator checkers, this one defines no LOG_TAG (it is
+# read-only for this task), so the gate greps the bracketed markers it does
+# emit. `_gate_report_lines` is that same regex; test_gate_markers_appear_on_
+# every_real_exit_path_and_neither_collision below is the contract pin that
+# keeps this vocabulary from drifting out from under the gate.
+_REPORT_MARKER_RE = re.compile(r"^\[(ok|skip|drift|fixed)\]", re.MULTILINE)
+
+
+def _gate_repo(
+    tmp_path: pathlib.Path,
+    *,
+    checker_body: str | None = None,
+    with_checker: bool = True,
+) -> pathlib.Path:
+    """A tmp repo root holding the template and (optionally) the checker.
+
+    The checker is copied from the real repo so the gate drives the real one;
+    only the TREE is fake. It imports nothing from scripts/, so one file is the
+    whole dependency.
+    """
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True, exist_ok=True)
+    (repo / "scripts" / "fused-memory.service.template").write_text(
+        TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    if with_checker:
+        write_checker(repo, CHECKER_PATH.name, body=checker_body)
+    return repo
+
+
+def _gate_unit_dir(
+    tmp_path: pathlib.Path, *, content: str | None = None
+) -> pathlib.Path:
+    """A tmp UNIT_DIR, optionally holding an installed fused-memory.service."""
+    unit_dir = tmp_path / "installed"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    if content is not None:
+        (unit_dir / "fused-memory.service").write_text(content, encoding="utf-8")
+    return unit_dir
+
+
+def _run_gate(
+    tmp_path: pathlib.Path, repo: pathlib.Path, unit_dir: pathlib.Path
+) -> subprocess.CompletedProcess:
+    return run_section(
+        tmp_path,
+        slice_section(_GATE_START, _GATE_END),
+        repo_root=repo,
+        unit_dir=unit_dir,
+    )
+
+
+# The argparse-shaped stub: exit 2, usage-shaped stderr, and no report marker —
+# what renaming a flag in a future refactor would actually produce. The real
+# flag spellings are kept because their bracketed tokens ([-h], [--fix]) are
+# precisely what a non-line-anchored marker match would misread as a report.
+_USAGE_ERROR_CHECKER = usage_error_checker(
+    CHECKER_PATH.name,
+    "[-h] [--installed INSTALLED] [--template TEMPLATE] [--fix]",
+    "--installed",
+)
+
+
+def test_gate_markers_appear_on_every_real_exit_path_and_neither_collision(
+    tmp_path: pathlib.Path,
+):
+    """CONTRACT PIN: the marker vocabulary the gate is about to depend on.
+
+    check_fused_memory_unit_parity.py has no LOG_TAG, so the gate believes a
+    status only when a line matching ^\\[(ok|skip|drift|fixed)\\] is present.
+    The dashboard side has its equivalent contract guarded already
+    (test_main_every_emitted_line_carries_the_log_tag); this side had nothing,
+    so pin it here. A future change to the checker's output then fails as a
+    legible contract-test failure, instead of silently wedging the installer's
+    gate into permanent "it did not run".
+
+    stdout and stderr are MERGED throughout, because the [skip] line and the
+    drift trailer go to stderr — which is also why the gate captures 2>&1.
+    """
+    template = TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    def _merged(argv: list[str]) -> tuple[int, str]:
+        result = subprocess.run(
+            [sys.executable, *argv],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode, result.stdout + result.stderr
+
+    # exit 0 — a unit that carries every required directive.
+    parity = _write_unit(tmp_path, template, name="parity.service")
+    rc, out = _merged([str(CHECKER_PATH), "--installed", str(parity)])
+    assert rc == 0, out
+    assert _REPORT_MARKER_RE.search(out), f"exit 0 emitted no report marker:\n{out}"
+
+    # exit 1 — a required directive removed.
+    drifted = _write_unit(tmp_path, _MISSING_MEM0_UNIT, name="drifted.service")
+    rc, out = _merged([str(CHECKER_PATH), "--installed", str(drifted)])
+    assert rc == 1, out
+    assert _REPORT_MARKER_RE.search(out), f"exit 1 emitted no report marker:\n{out}"
+
+    # exit 2 — the installed unit is absent.
+    rc, out = _merged(
+        [str(CHECKER_PATH), "--installed", str(tmp_path / "nonexistent.service")]
+    )
+    assert rc == 2, out
+    assert _REPORT_MARKER_RE.search(out), f"exit 2 emitted no report marker:\n{out}"
+
+    # COLLISION 1 — argparse usage error also exits 2. Its output carries
+    # bracketed tokens ([-h], [--fix]), but they are flag spellings, and the
+    # wrapped usage continuation is indented — so nothing matches at line start.
+    rc, out = _merged([str(CHECKER_PATH), "--bogus"])
+    assert rc == 2, out
+    assert not _REPORT_MARKER_RE.search(out), (
+        f"An argparse usage error must NOT look like a report:\n{out}"
+    )
+
+    # COLLISION 2 — python3 refusing to open a renamed/moved script also exits
+    # 2. Its message carries `[Errno 2]`, which is mid-line and not in the
+    # alternation.
+    rc, out = _merged([str(tmp_path / "check_fused_memory_unit_parity_RENAMED.py")])
+    assert rc == 2, out
+    assert not _REPORT_MARKER_RE.search(out), (
+        f"A missing script must NOT look like a report:\n{out}"
+    )
+
+
+def test_gate_missing_checker_does_not_read_as_not_installed(
+    tmp_path: pathlib.Path,
+):
+    """EXIT-CODE COLLISION: `python3 <missing script>` also exits 2.
+
+    2 is the checker's benign "not installed on this host". If the checker were
+    renamed or moved, python3's own 2 would land in that same branch and the
+    gate would report the reassuring "skipping parity check" — telling the
+    operator a check was skipped for a benign reason when in fact no check ran
+    at all.
+    """
+    repo = _gate_repo(tmp_path, with_checker=False)
+    unit_dir = _gate_unit_dir(
+        tmp_path, content=TEMPLATE_PATH.read_text(encoding="utf-8")
+    )
+
+    result = _run_gate(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, (
+        "The gate is non-fatal — fail() only printfs, so it must not abort the "
+        f"health-check section.\n{result.stdout}\n{result.stderr}"
+    )
+    assert "not installed at" not in result.stdout, (
+        "A missing checker was reported as the benign 'not installed on this "
+        f"host'.\n{result.stdout}"
+    )
+    assert "FAIL " in result.stdout, (
+        f"A gate that did not run must say so loudly.\n{result.stdout}"
+    )
+
+
+def test_gate_usage_error_does_not_read_as_not_installed(tmp_path: pathlib.Path):
+    """SAME COLLISION, second source: argparse exits 2 on any usage error.
+
+    Simulated with a stub checker exiting 2 with argparse-shaped stderr and no
+    report marker — what renaming a flag in a future refactor would produce.
+    The marker, not the exit code, is what makes a status believable.
+    """
+    repo = _gate_repo(tmp_path, checker_body=_USAGE_ERROR_CHECKER)
+    unit_dir = _gate_unit_dir(
+        tmp_path, content=TEMPLATE_PATH.read_text(encoding="utf-8")
+    )
+
+    result = _run_gate(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not installed at" not in result.stdout, result.stdout
+    assert "FAIL " in result.stdout, (
+        f"A gate that did not run must say so loudly.\n{result.stdout}"
+    )
+
+
+def test_gate_reports_parity_when_the_installed_unit_matches(
+    tmp_path: pathlib.Path,
+):
+    """Happy path — the fix must not degenerate into 'always report failure'."""
+    repo = _gate_repo(tmp_path)
+    unit_dir = _gate_unit_dir(
+        tmp_path, content=TEMPLATE_PATH.read_text(encoding="utf-8")
+    )
+
+    result = _run_gate(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "OK " in result.stdout, result.stdout
+    assert "parity with template" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, result.stdout
+
+
+def test_gate_reports_drift_when_a_required_directive_is_missing(
+    tmp_path: pathlib.Path,
+):
+    """Real drift stays a DRIFT warning naming --fix — not a "did not run" fail."""
+    repo = _gate_repo(tmp_path)
+    unit_dir = _gate_unit_dir(tmp_path, content=_MISSING_MEM0_UNIT)
+
+    result = _run_gate(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "DRIFT detected" in result.stdout, result.stdout
+    assert "--fix" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, (
+        f"Drift is a real verdict from a gate that RAN.\n{result.stdout}"
+    )
+
+
+def test_gate_reports_skip_when_the_unit_is_genuinely_not_installed(
+    tmp_path: pathlib.Path,
+):
+    """The benign branch must survive: a real exit 2 still reads as 'not installed'."""
+    repo = _gate_repo(tmp_path)
+    unit_dir = _gate_unit_dir(tmp_path)  # no fused-memory.service written
+
+    result = _run_gate(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not installed at" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, (
+        f"A genuine 'not installed' is a real verdict.\n{result.stdout}"
     )

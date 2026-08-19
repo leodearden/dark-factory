@@ -1060,7 +1060,7 @@ class RetentionConfig(BaseModel):
 class TranscriptArchiveConfig(BaseModel):
     """Agent-transcript archival (task 2742, plans/agent-transcript-archival-prd.md α).
 
-    The producer hook in TaskWorkflow._invoke's finally gzips each finished
+    The producer hook in TaskWorkflow._invoke's finally archives each finished
     agent session's transcripts (see shared.transcript_archive) to
     ``<project_root>/<root>`` — a durable location OUTSIDE the per-task
     worktree so the archive survives worktree teardown.
@@ -1090,6 +1090,43 @@ class TranscriptArchiveConfig(BaseModel):
         ),
     )
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    storm_threshold: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Archival-failure burst detector (task 3619, INV-4): how many '
+            'per-file archive failures within storm_window_secs constitute a '
+            'storm worth one L1 escalation. One failure is routine and is '
+            'already counted + logged by shared.transcript_archive; a BURST '
+            'is the systemic condition (archive root full, unmounted, or '
+            'permission-denied) an operator has to act on. Harness reads this '
+            'LIVE on every failure, so a hot reload takes effect without a '
+            'restart.'
+            ' Must be >= 1, matching session_resume.fallback_storm_threshold: '
+            'both leaves are green-tier hot-reloadable and are read LIVE on '
+            'every failure, so an unbounded 0 or negative would take effect '
+            'immediately and fire the L1 on the very first routine failure, '
+            'with no validation error and no log line to say so.'
+        ),
+    )
+    storm_window_secs: float = Field(
+        default=600.0,
+        gt=0,
+        description=(
+            'Rolling window for storm_threshold, and the rate limit between '
+            'archival-storm escalations — at most one L1 per window, on top '
+            'of the has_open_l1 dedup. Also read LIVE on every failure. '
+            'Must be > 0, matching session_resume.storm_window_secs. A value '
+            '<= 0 does not merely shrink the window, it DISABLES the '
+            'detector permanently and silently: StormCounter._prune uses a '
+            'half-open window (events[0] <= cutoff), so a zero window makes '
+            'the cutoff equal now and the event record() just appended is '
+            'popped again — the count is always 0 and no burst can ever '
+            'fire. Exactly the silent-degradation-on-misconfiguration this '
+            'escalation exists to prevent, so it is rejected loudly at '
+            'validation instead.'
+        ),
+    )
 
 
 class FusedMemoryConfig(BaseModel):
@@ -2353,6 +2390,83 @@ class ZeroProgressRequeueConfig(BaseModel):
             'positive. 900s (15 min) of CONTINUOUS zero progress is well '
             'past any contention blip but still hours short of the 46h '
             'origin incident.'
+        ),
+    )
+
+
+class RecoveryEmissionConfig(BaseModel):
+    """Structured recovery-decision emission (task 3535, PRD D5).
+
+    Every veto/LEAVE site in the recovery machinery — the reconcile sweep, the
+    scheduler's stranded-blocked redispatch phase, the deterministic recon
+    pair, the already-landed dispatch gate — emits a structured
+    ``recovery_vetoed`` / ``recovery_left`` event describing the decision it
+    ALREADY made.  This section changes NO disposition; the canonical
+    explanation (including why emission is signature-transition-gated rather
+    than one row per observation) is documented once, canonically, in
+    ``orchestrator.recovery_emission``'s module docstring.  Read that before
+    retuning anything here.
+
+    The streak alarm predicate is two-dimensional like ``zero_progress_requeue``
+    — ``veto_streak_threshold`` consecutive IDENTICAL vetoes AND
+    ``veto_streak_min_span_secs`` of wall clock — for the same reason: a streak
+    count alone would page a human for a hold that is only seconds old.
+
+    Ships ENABLED: emission is the whole deliverable, and shipping it off would
+    leave every strand unexplained.  ``streak_escalation_enabled`` is the
+    separate, narrower kill switch for the only part that WRITES to the
+    escalation queue.  All fields are green-tier hot-tunable via
+    RELOADABLE_FIELDS, so a noisy detector can be retuned or silenced live.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to disable structured recovery-decision emission '
+            '(recovery_vetoed / recovery_left events and the veto streak '
+            'counter). Shipped enabled — without it a stranded task held by '
+            'an open escalation leaves no machine-readable trace of WHAT held '
+            'it. Disabling suppresses new emissions only; it never changes a '
+            'recovery disposition, in either direction.'
+        ),
+    )
+    veto_streak_threshold: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Consecutive IDENTICAL vetoes of the same (site, task) before a '
+            'blocking L1 is filed against the streak sentinel (both this AND '
+            'veto_streak_min_span_secs must be satisfied). Must be >= 1. A '
+            'DIFFERENT veto signature restarts the count, so the alarm only '
+            'ever describes N genuinely identical consecutive holds.'
+        ),
+    )
+    veto_streak_min_span_secs: float = Field(
+        default=1500.0,
+        ge=0.0,
+        description=(
+            'Wall-clock seconds the veto streak must ALSO span before a '
+            'blocking L1 is filed. Set to 0 to alarm on streak count alone. '
+            'The default is derived, not picked: stranded_reconcile_interval_'
+            'secs and deterministic_recon_sweep_interval_secs are both 900.0s, '
+            'so three consecutive sweeps span 1800s at the threshold crossing '
+            'and 1500s clears that with 300s of jitter headroom. It is ALSO '
+            'the backstop that makes it impossible for a per-dispatch-TICK '
+            'veto site to file an L1 within seconds of a strand appearing '
+            'should a future site charge the counter by mistake (only the '
+            'sweep-frequency sites charge it today).'
+        ),
+    )
+    streak_escalation_enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to keep emitting recovery_vetoed / recovery_left '
+            'events while suppressing the blocking L1 the veto streak files. '
+            'The narrower kill switch: this is the only part of the mechanism '
+            'that WRITES to the escalation queue, so an operator can silence '
+            'a noisy alarm without losing the telemetry that explains it. '
+            'Disabling suppresses new filings only; an already-filed L1 still '
+            'auto-resolves when its veto stops.'
         ),
     )
 
@@ -3763,6 +3877,74 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
 
+    # EASY-backfill admission through parks (task 3823 / PRD task η, C7).
+    # A candidate blocked ONLY by another task's park may be admitted through
+    # it when its predicted hold, times a safety factor, provably fits inside
+    # the gap the park's owner is going to wait anyway.  Flat top-level fields
+    # (not a submodel) mirroring the park_stop_* block above: the capability
+    # manifest greps config.py for the three literal leaf names below, and
+    # nesting would rename them.
+    #
+    # Evidence base:
+    # plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md
+    # :116-126 — module hold-history median is the ONLY predictor with a
+    # positive R² (0.26 dark-factory / 0.68 reify); every static-attribute
+    # predictor scored WORSE than the test-set mean.
+    backfill_enabled: bool = Field(
+        default=True,
+        description=(
+            'Enable EASY-backfill admission through parks (PRD C7). When '
+            'disabled, a candidate blocked by a foreign park is simply passed '
+            'over as before — the operator kill switch, mirroring '
+            'park_stop_enabled / starvation_watchdog.enabled.'
+        ),
+    )
+    backfill_safety_factor: float = Field(
+        default=2.5,
+        gt=0,
+        description=(
+            'Multiplier applied to a candidate\'s predicted hold before it is '
+            'compared against the parked owner\'s provable assembly delay; '
+            'admission requires predicted_hold * factor <= provable_delay. '
+            '2.5 is INTERPOLATED BETWEEN two measured 80%-coverage multipliers '
+            '(PARKING_MODEL_REPORT.md:126: x2.9 dark-factory, x2.0 reify) '
+            'rather than guessed, and the modelled overstay rate at x2.5 is '
+            '7-9% (:254-255). Green-tier so production park_backfill_overstay '
+            'data can settle 2.5-vs-2.9 without a restart (PRD Open Q3).'
+        ),
+    )
+    backfill_min_samples: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Minimum observed hold samples on a task\'s modules before the '
+            'predictor will answer at all; below it, predicted_hold is None '
+            'and backfill REFUSES. This is the SINGLE SOURCE OF TRUTH for '
+            'HoldHistory\'s sample floor — the Scheduler constructs its '
+            'HoldHistory with this value, and hold_history.py deliberately '
+            'carries only a module default so it can stand alone without the '
+            'config object. ge=1 is contract, not decoration: a floor of 0 '
+            'would let an EMPTY history certify a backfill, which C7 forbids '
+            'by name.'
+        ),
+    )
+    backfill_max_park_age_secs: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'Refuse backfill through any park older than this many seconds, '
+            'measured from the owner\'s FIRST install (its total wait). The '
+            'CLAUSE is measured, the NUMBER is a judgment call: '
+            'PARKING_MODEL_REPORT.md:256 names the casualty of having no '
+            'cutoff (one reify starver flips to never-dispatched in-window) '
+            'but publishes no figure. 1h is ~40% of the measured 2.2-3h median '
+            'process era, so it protects parks that have already burned a '
+            'substantial fraction of an era while still admitting backfill in '
+            'the fresh window where most grants occur. Green-tier, so a replay '
+            'can retune it from production data without a deploy.'
+        ),
+    )
+
     # Escalation-watcher subprocess supervisor (AFK hardening, task 1326).
     # Keeps a fresh escalation-watcher-auto agent alive across multi-day AFK
     # windows with rotation, exponential backoff, and a crashloop→pause_scheduler
@@ -4033,6 +4215,14 @@ class OrchestratorConfig(BaseSettings):
     # only detector for requeue loops the per-task requeue cap cannot see.
     zero_progress_requeue: ZeroProgressRequeueConfig = Field(
         default_factory=ZeroProgressRequeueConfig
+    )
+
+    # Structured recovery-decision emission (task 3535, PRD D5). An absent
+    # stanza in orchestrator.yaml yields the ENABLED-by-default instance —
+    # without it a stranded task held by an open escalation leaves no
+    # machine-readable trace of what held it.
+    recovery_emission: RecoveryEmissionConfig = Field(
+        default_factory=RecoveryEmissionConfig
     )
 
     # κ: shared sccache backend (the laptop warm multiplier)
@@ -4928,6 +5118,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # detector you can only silence by restarting is one that gets silenced by
     # ignoring it instead.
     _submodel_leaf_paths('zero_progress_requeue', ZeroProgressRequeueConfig),
+    # Structured recovery-decision emission (task 3535) — same
+    # whole-submodel-group idiom, and green-tier for the same reason: an
+    # operator must be able to retune the streak threshold, or silence a noisy
+    # detector, WITHOUT a fleet restart.  streak_escalation_enabled in
+    # particular is the narrow kill switch for the only part that writes to the
+    # escalation queue, and a kill switch behind a restart is not one.
+    _submodel_leaf_paths('recovery_emission', RecoveryEmissionConfig),
     # Variable-depth speculative verify placement (task 2359) — a new
     # dedicated submodel, same whole-submodel-group idiom: every probe knob
     # (probe_fraction/probe_depths/suppress_flake_rate) is green-tier
@@ -4967,6 +5164,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'steward_lifetime_budget',
         # Scheduler tuning
         'fairness.skip_threshold',
+        # EASY-backfill admission (task 3823 / PRD C7).  Explicit literals, not
+        # a _submodel_leaf_paths group: these are FLAT top-level fields, not a
+        # submodel.  Green-tier on purpose — PRD Open Q3 ships safety_factor
+        # 2.5 and lets production park_backfill_overstay data settle
+        # 2.5-vs-2.9, which is only actionable if the factor retunes live.
+        'backfill_enabled',
+        'backfill_safety_factor',
+        'backfill_min_samples',
+        'backfill_max_park_age_secs',
         'starvation_watchdog.enabled',
         'starvation_watchdog.skip_threshold',
         'starvation_watchdog.idle_secs',

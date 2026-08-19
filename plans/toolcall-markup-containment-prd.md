@@ -87,6 +87,18 @@ Corrupted strings include cases where `rationale` was absorbed into `decision`, 
 
 Exhaustive scan: 21,064 Mem0 records, 41 legacy specimens, newest `2026-07-30T05:07:34Z` — **21 minutes before 3141 merged** (`da94baf14a`, 07-30 05:28:07Z). Zero new specimens in six days. The tripwire is not the problem; its *coverage* is.
 
+**Recurrence log** (live specimens observed after this PRD was written). Entries at a *gated* boundary are blocked writes — the gate holding, not landed damage. Entries at an *ungated* boundary are landed damage, and are the direct evidence for γ:
+
+| Observed | Boundary | Reported `matched_pattern` | Outcome |
+|---|---|---|---|
+| 2026-08-15 (task 4156, esc-4156-1) | `add_memory.content` (`procedural_knowledge`) | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected`; immediate retry of the same semantic content landed clean (`bf93699b-35ac-4d98-a90b-55a56e5bd0d5`, `stores_written=['mem0']`). Nothing persisted corrupt. |
+| 2026-08-17 (task 4193, esc-4193-2) | `add_memory.content` (`procedural_knowledge`) — **gated** | closing `content` tag | Rejected `McpEnvelopeMarkupWriteRejected`; storm block fired at **3/3** in a 3600s window (`esc-markup-tripwire-12`). Immediate resubmission of equivalent content landed clean (`5047308d-d83b-4c31-b90b-68fe025b2664`, `stores_written=['mem0']`). Nothing persisted corrupt. |
+| 2026-08-17 (task 4193, **esc-4193-2 itself**) | `escalate_info.detail` — **ungated** | none — there is no gate at this boundary to report one | **Landed damage.** The filing that reported the row above was corrupted by the same defect. `detail` over-consumed its own closing position and absorbed both following parameters; the stored record carries `suggested_action=""` and `evidence=[]`. Confirmed by reading the record back via `get_escalation`. |
+
+The 08-17 pair is the sharpest evidence in this document for the coverage thesis, because both halves occurred in the **same act**: the gated `add_memory.content` boundary blocked the corrupt write and the clean resubmission landed, while the ungated `escalate_info.detail` boundary silently absorbed the identical failure shape *in the very filing that reported it* — dropping exactly the parameter §2.6 already ranks among the most-lost (`escalate_info.suggested_action` ×13). The filing agent could not have noticed: it never reads its own record back. Two consequences worth carrying into γ. First, this specimen would have been caught had the boundary been gated — its dialect is the well-formed `</parameter>` closer followed by the next parameter's opening tag, and that opening-tag literal is already in `MCP_MARKUP_PATTERNS` (§2.2). Second, it is landed damage now sitting in `data/escalations/**`, i.e. δ's sweep lane, which is one more specimen than the ~50 §2.4 measured. Neither number needs editing — §2.4 already says to re-measure at sweep time.
+
+The 08-15 entry is consistent with §2.1: `add_memory.content` remains the single most-hit fused-memory parameter (90 of 96), the leak was **transient for that call pair** rather than a property of the payload text, and the gated boundary behaved exactly as designed. It is evidence for the *coverage* thesis, not against the tripwire — the ungated boundaries in §2.3 would have absorbed the same specimen silently.
+
 ### 2.6 The corruption is deterministically repairable
 
 Replaying all 334 specimens through a schema-validated repairer: **308 repair cleanly (92.2%), recovering 194 dropped parameters**; 26 (7.8%) are ambiguous (doubly-corrupted calls) and must escalate. Recovered parameters are exactly the silently-lost ones: `add_memory.category` ×70, `add_memory.project_id` ×32, `add_design_decision.rationale` ×25, `add_memory.agent_id` ×18, `escalate_info.suggested_action` ×13, `submit_review_verdict.issues` ×10, `submit_task.priority` ×5.
@@ -104,7 +116,7 @@ shared/src/shared/toolcall_markup.py
   ├─ detect(value)            -> MarkupHit | None       (single pattern source, INV-5)
   ├─ repair(value, param, schema_params, supplied)
   │                           -> Repair(clean_value, recovered:{name:value}) | Unrepairable
-  └─ FIXTURES: 334 real specimens committed as the regression pin
+  └─ FIXTURES: 504 real specimens committed as the regression pin
 
 shared/src/shared/mcp_markup_middleware.py
   MarkupGuardMiddleware(policy: RepairPolicy, exempt_tools: frozenset)
@@ -143,7 +155,7 @@ def repair(value: str, param: str, schema_params: Collection[str],
 - `repair` is pure, synchronous, and never raises for any input.
 - `clean_value` is always a **prefix** of the input — the repairer never invents or reorders caller text.
 - `recovered` values are verbatim substrings of the input — the repairer never synthesises a value.
-- Determinism: identical input ⇒ identical output. Pinned by the 334-specimen corpus.
+- Determinism: identical input ⇒ identical output. Pinned by the committed 504-record corpus (see §9 α on why that is not the survey's 334).
 
 ### C2 — Boundary policy contract (`MarkupGuardMiddleware`)
 
@@ -247,7 +259,8 @@ No reciprocal-ownership ambiguity: 3083 and 3141 are both terminal, so this PRD 
 
 **α — `shared.toolcall_markup`: detector, deterministic repairer, committed fixture corpus.** *(intermediate — unlocks β, δ, ε, ζ, θ)*
 Modules: `shared/src/shared/toolcall_markup.py`, `shared/tests/`, `shared/tests/fixtures/toolcall_markup_corpus.jsonl`.
-Implements C1. Extracts the 334 real specimens from the archived transcripts into a committed corpus (tool, param, supplied keys, raw value) and pins the repairer against it.
+Implements C1. Extracts the real specimens from the archived transcripts into a committed corpus (tool, param, supplied keys, raw value) and pins the repairer against it.
+*Two numbers, both correct — do not reconcile them by editing one.* **334 / 308 / 26** is the **2026-08-05 survey**, measured over that window's transcripts (§2.3, §2.6, §5 D2, §6, and the G6 note below all quote it). **504 records, 443 repaired / 61 unrepairable** is the **committed corpus** at `shared/tests/fixtures/toolcall_markup_corpus.jsonl` as extraction actually landed it — re-derived from that file 2026-08-15 (task 4022). Where this document states a present-tense fact about the committed file (§4 C1 determinism, §10 B13, §11 open question 3) it uses the 504 figures; where it reports what the survey found, it keeps 334.
 *Unlocks:* β (the middleware imports `detect`/`repair`), δ, ε.
 *Evidence:* each corpus record carries its **expected outcome** (`repaired` with the expected recovered-parameter names, or `unrepairable`), committed alongside the specimens; replay asserts the repairer matches every committed expectation, that replay is byte-identical across two runs, and that D5 holds for every repaired case (`clean_value` is a prefix of the input; every recovered value is a verbatim substring).
 *G6 note — deliberately not a bare threshold.* The reference implementation scores **308 repaired / 26 unrepairable (92.2%)**, and that is the basis for expecting a high rate; but the signal is agreement-with-committed-expectations, not a literal count. A correct implementation that repairs *more* of the 26 ambiguous cases must update the expectation file in the same commit — which is a reviewable improvement, not a RED test. Pinning the literal 308 would make a better repairer look like a regression.
@@ -332,13 +345,16 @@ No waivers required.
 | B10 | Storm escape fires | 3 repairs within the window on one project | Storm escalation filed once, naming outcome `repaired` |
 | B11 | Sweep atomicity | δ interrupted between temp-write and replace | Target file unchanged and still parses; no partial JSON |
 | B12 | Lazy write-back under concurrency | ε repairs a live plan while a task reads it | Reader observes either the old or the repaired file, never a partial one |
-| B13 | Corpus determinism | replay all 334 specimens twice | Byte-identical results both runs; every outcome matches the committed per-specimen expectation (reference: 308 repaired / 26 unrepairable) |
+| B13 | Corpus determinism | replay all 504 specimens twice | Byte-identical results both runs; every outcome matches the committed per-specimen expectation (reference: 443 repaired / 61 unrepairable) |
+| B14 | REQUIRED absorbed parameter is recoverable | `add_memory.content` absorbs the REQUIRED `project_id`, which is then absent from the call; both tiers | `on_call_tool` runs before pydantic validation, so the repair is reached: `REJECT_WITH_REPAIR` bounces with `repaired_call.project_id` and `error_type=mcp_markup_detected` (NOT a missing-required-field error) and nothing is written; `FORWARD_REPAIR` executes the tool bound to a required argument that was never on the wire |
+| B15 | The ordering's one precondition | the same call with `strict_input_validation=True` | Middleware never runs; caller gets `Input validation error`; NO `markup_detected` fact and NO storm count — every required-parameter leak is silently unrepairable. Registration (γ) must not enable it |
 
 ---
 
 ## 11. Open questions (tactical, implementation-time)
 
 1. **Middleware ordering.** If a server later adds a second middleware, does the markup guard run first? **Suggested resolution:** register it first and assert its position in a test. Decide during γ.
+   *Partly settled (task 4022, empirically, fastmcp 3.2.2).* The FRAMEWORK-ordering half is no longer open: `on_call_tool` runs strictly BEFORE pydantic argument validation, so a REQUIRED absorbed parameter is recoverable — boundary rows B14/B15, with the one precondition that `strict_input_validation` stays off. This item's actual question — ordering relative to a SECOND middleware, if one is ever added — is untouched by that and remains for γ.
 2. **`add_system_record` / `update_memory` policy tier.** Both are fused-memory writes, so they inherit `REJECT_WITH_REPAIR`; `add_system_record` is recon-stage-only and may not retry. **Suggested resolution:** start with the server default, revisit if the storm counter shows rejections there. Decide during γ.
-3. **Fixture corpus size in-repo.** 334 raw values include long text; the committed corpus may be large. **Suggested resolution:** store truncated-but-sufficient values (tail + 200 chars of lead-in) if size is a problem, keeping the 26 unrepairable cases verbatim. Decide during α.
+3. **Fixture corpus size in-repo.** 504 raw values include long text; the committed corpus may be large. **Suggested resolution:** store truncated-but-sufficient values (tail + 200 chars of lead-in) if size is a problem, keeping the 61 unrepairable cases verbatim. Decide during α.
 4. **Retention of the archived transcripts.** The corpus is extracted from `agent-transcripts/`, which is retention-bounded. **Suggested resolution:** the committed corpus is the durable artifact; no dependency on the archive after α.

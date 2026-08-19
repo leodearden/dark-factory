@@ -112,6 +112,10 @@ def _wire_gate_harness(mock_orch_config, repo: Path, *, task_id: str) -> Harness
     h.scheduler.mark_done = AsyncMock()
     h._escalation_queue = MagicMock()
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
+    # Explicit (task 3534): the gate's veto reads the ANY-LEVEL pending rows,
+    # so "no open escalations" must be stated, not inherited from
+    # MagicMock.__iter__'s empty default.
+    h._escalation_queue.get_by_task = MagicMock(return_value=[])
     h._escalation_queue.make_id = MagicMock(return_value=f'esc-{task_id}-1')
     return h
 

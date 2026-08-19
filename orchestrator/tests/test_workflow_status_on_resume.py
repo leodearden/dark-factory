@@ -25,6 +25,7 @@ from _workflow_helpers import (
     FakeScheduler,
     _make_resolving_steward,
     _make_status_setting_steward,
+    same_module_siblings,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -46,31 +47,6 @@ from orchestrator.workflow_types import StewardResolved
 # ---------------------------------------------------------------------------
 # Fixtures (kept local — these tests don't share runtime with test_workflow_e2e)
 # ---------------------------------------------------------------------------
-
-
-def _same_module_siblings(lock_depth: int) -> tuple[str, str]:
-    """Two DISTINCT file paths guaranteed to share a module at *lock_depth*.
-
-    ``shared.locking.normalize_lock`` truncates a path to its first ``depth``
-    components, so two files share a lock module iff those components agree.
-    A fixed literal like ``a/b/c/d/{e,f}.py`` satisfies that only while
-    ``lock_depth <= 4``: at a deeper setting the two paths normalize to
-    themselves and become DIFFERENT modules, making the "same-module widen"
-    premise unsatisfiable.
-
-    That is not hypothetical — it is why these tests went red on main when
-    ``dark-factory-orchestrator.yaml`` moved ``lock_depth`` 4 -> 12 (commit
-    094d634465, deliberately making module locks file-granular). The autouse
-    ``_isolate_orch_config`` fixture in conftest.py pins ``ORCH_CONFIG_PATH``
-    at the LIVE operational config, so ``config.lock_depth`` here is the real
-    deployed value by design, not a code default.
-
-    Deriving the package prefix FROM ``lock_depth`` keeps the premise true BY
-    CONSTRUCTION at any depth, so these stay tests of same-module widen
-    behaviour instead of silently becoming tests of the knob's current value.
-    """
-    package = '/'.join(f'p{i}' for i in range(lock_depth))
-    return f'{package}/e.py', f'{package}/f.py'
 
 
 @pytest.fixture
@@ -558,7 +534,7 @@ class TestStatusPreservationOnResume:
         module set is unchanged.
         """
         # Same-package siblings: identical module set at config.lock_depth.
-        f1, f2 = _same_module_siblings(config.lock_depth)
+        f1, f2 = same_module_siblings(config.lock_depth)
         assert files_to_modules([f1], config.lock_depth) == files_to_modules(
             [f1, f2], config.lock_depth,
         ), (
@@ -834,7 +810,7 @@ class TestSetTaskScope:
         # Two files co-located in the same package: at config.lock_depth the
         # module set is identical with or without F2 — a genuine same-module
         # widen (self-validating precondition asserted first).
-        f1, f2 = _same_module_siblings(config.lock_depth)
+        f1, f2 = same_module_siblings(config.lock_depth)
         assert files_to_modules([f1], config.lock_depth) == files_to_modules(
             [f1, f2], config.lock_depth,
         ), (
@@ -995,7 +971,7 @@ class TestCheckScopeInvariant:
         old file-granularity comparison (which would escalate) and passes under
         the module-granularity comparison.
         """
-        _f1, _f2 = _same_module_siblings(config.lock_depth)
+        _f1, _f2 = same_module_siblings(config.lock_depth)
         plan_files = [_f1, _f2]
         metadata_files = [_f1]
         # Self-validating precondition: genuinely same-module but file-divergent.

@@ -3,6 +3,7 @@
 
 import asyncio
 import dataclasses
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -505,6 +506,108 @@ class TestGetTasksNormalizesMetadata:
         for task, expected in cases:
             Scheduler._normalize_task_metadata(task)
             assert task['metadata'] == expected, f'failed for input: {task}'
+
+
+# ---------------------------------------------------------------------------
+# TestNormalizeTaskMetadataLoudness (task 3121 — step-15 RED / step-16 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeTaskMetadataLoudness:
+    """The metadata→{} collapse must be LOUD, not silent.
+
+    Silence, not the coercion, is the hazard: a task whose metadata arrived as
+    an unparseable string reaches the dispatch-time cross-repo gate looking
+    marker-free and is waved through with no trace that anything was
+    discarded.  This is the loud-over-silent-degradation norm
+    (structured-facts-at-failure / no-silent-fail-soft).
+
+    Observability only — every assertion below also pins that the coercion
+    behaviour is UNCHANGED.
+    """
+
+    LOGGER = 'orchestrator.scheduler'
+
+    @staticmethod
+    def _warnings(caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.parametrize('raw', [[1, 2], ['a'], 42, 3.5, True, False, object()])
+    def test_non_dict_non_string_warns(self, raw, caplog):
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '7788', 'metadata': raw}
+
+        Scheduler._normalize_task_metadata(task)
+
+        warnings = self._warnings(caplog)
+        assert warnings, f'metadata={raw!r} must warn, not collapse silently'
+        message = ' '.join(warnings)
+        assert '7788' in message, f'warning must name the task id; got {message!r}'
+        assert type(raw).__name__ in message, (
+            f'warning must name the discarded type; got {message!r}'
+        )
+        assert task['metadata'] == {}, 'coercion behaviour must be unchanged'
+
+    @pytest.mark.parametrize('raw', ['not-json', '{unclosed', '[1,2,3]', '"just-a-string"',
+                                     '42', 'null', 'true'])
+    def test_unusable_string_warns(self, raw, caplog):
+        """Both the JSONDecodeError path and the decoded-non-dict path."""
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '9911', 'metadata': raw}
+
+        Scheduler._normalize_task_metadata(task)
+
+        warnings = self._warnings(caplog)
+        assert warnings, f'metadata={raw!r} must warn, not collapse silently'
+        message = ' '.join(warnings)
+        assert '9911' in message, f'warning must name the task id; got {message!r}'
+        assert 'str' in message, f'warning must name the discarded type; got {message!r}'
+        assert task['metadata'] == {}, 'coercion behaviour must be unchanged'
+
+    def test_dict_metadata_is_silent(self, caplog):
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '1', 'metadata': {'foo': 1}}
+
+        Scheduler._normalize_task_metadata(task)
+
+        assert not self._warnings(caplog), 'a dict is the normal shape'
+        assert task['metadata'] == {'foo': 1}
+
+    def test_valid_json_string_is_silent(self, caplog):
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '2', 'metadata': '{"foo": 1}'}
+
+        Scheduler._normalize_task_metadata(task)
+
+        assert not self._warnings(caplog), (
+            'a JSON string decoding to a dict is a supported wire format, not a defect'
+        )
+        assert task['metadata'] == {'foo': 1}
+
+    @pytest.mark.parametrize('task', [{'id': '3', 'metadata': None}, {'id': '4'}])
+    def test_absent_or_none_metadata_is_silent(self, task, caplog):
+        """Most tasks carry no metadata — warning here would be pure noise."""
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+
+        Scheduler._normalize_task_metadata(task)
+
+        assert not self._warnings(caplog), (
+            'absent/None metadata is the normal shape, not a discarded value'
+        )
+        assert task['metadata'] == {}
+
+    def test_warning_repr_is_truncated(self, caplog):
+        """A pathological value must not flood the log."""
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '5', 'metadata': ['x' * 5000]}
+
+        Scheduler._normalize_task_metadata(task)
+
+        message = ' '.join(self._warnings(caplog))
+        assert message, 'must still warn'
+        assert len(message) < 1000, (
+            f'the discarded repr must be truncated; got a {len(message)}-char message'
+        )
 
 
 # ---------------------------------------------------------------------------

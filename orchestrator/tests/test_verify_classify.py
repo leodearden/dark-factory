@@ -31,7 +31,12 @@ import json
 import pytest
 
 from orchestrator import verify_classify
-from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES, FailureCategory
+from orchestrator.verify_categories import (
+    CATEGORY_POLICY,
+    INFRA_TRANSIENT_CATEGORIES,
+    FailureCategory,
+    RetryKind,
+)
 from orchestrator.verify_cmd import ToolKind
 
 # Every recognised tool identity, including OPAQUE — the guards in step-1
@@ -822,15 +827,30 @@ _SLOT_TIMEOUT_LANE_X_OUTPUT = (
     '(LOCK=/tmp/reify-lane-x.lock)\n'
 )
 
-# reify companion task — NOT emitted by reify today (verified by grep over
-# reify `scripts/` on 2026-08-05). Same column-0, first-token `@@REIFY_*@@`
-# emission contract as scripts/lib_clock_stop.sh:141, so DF can detect it the
-# moment reify starts emitting it. This asserts DF's OWN classifier behaviour
-# on an anchored line — a capability this task delivers and verifies
-# first-hand — NOT that reify emits the line; it is a COMPLEMENT to the three
-# grounded anchors above and never the sole positive.
+# task 4212 update: this shape predates reify 6024's `disposition` field
+# (invented by task 3679, before reify emitted `@@REIFY_SLOT_TIMEOUT@@` at
+# all — same column-0, first-token `@@REIFY_*@@` emission contract as
+# scripts/lib_clock_stop.sh:141). It is retained DELIBERATELY, now doing
+# double duty as the FIELD-ABSENT / older-reify compatibility shape: a
+# sentinel line with no `disposition=` token at all. reify's emit is
+# prefix-compatible with the anchor, so this must keep classifying
+# SEMAPHORE_TIMEOUT unchanged — pinned, across every ToolKind, by this
+# corpus entry's membership below in `TestGroundedSlotTimeoutMarkersAreDetected`;
+# see `_has_fatal_slot_timeout_sentinel`'s fail-safe-direction docstring
+# (verify_classify.py) for why an absent field classifies rather than demotes.
 _SLOT_TIMEOUT_SENTINEL_OUTPUT = (
     '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation waited=1800s pid=4711\n'
+)
+
+# reify scripts/lib_test_semaphore.sh via slot_acquire's `fatal` default (the
+# 6th arg all three wrapper paths omit) — task 4212's fatal-disposition
+# counterpart to `_SLOT_TIMEOUT_SOFT_POOL_OUTPUT` (defined in the task-4212
+# section below). Defined here, alongside the other grounded sentinel/
+# basename shapes and ahead of `_ANCHORED_SLOT_TIMEOUT_SHAPES`, rather than
+# in that later section, so step-5 (task 4212) can add it to this corpus.
+_SLOT_TIMEOUT_FATAL_SENTINEL_OUTPUT = (
+    '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation slots=8 waited=1800 '
+    'disposition=fatal lock=/tmp/reify-test-slot.lock\n'
 )
 
 # reify scripts/lib_test_semaphore.sh:170-173 — when REIFY_TEST_SEMAPHORE_WAIT
@@ -851,14 +871,118 @@ _SLOT_TIMEOUT_UNLIMITED_WAIT_OUTPUT = (
 # nothing, even though the anchoring is the heart of task 3679.
 _SLOT_TIMEOUT_INDENTED_OUTPUT = '    ' + _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT
 
-_GROUNDED_SLOT_TIMEOUT_OUTPUTS = [
-    _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT,
-    _SLOT_TIMEOUT_OCCT_OUTPUT,
-    _SLOT_TIMEOUT_LANE_X_OUTPUT,
-    _SLOT_TIMEOUT_SENTINEL_OUTPUT,
-    _SLOT_TIMEOUT_UNLIMITED_WAIT_OUTPUT,
-    _SLOT_TIMEOUT_INDENTED_OUTPUT,
+# Named (name, output) pairs — same shape as _ALL_COLLATERAL_SHAPES below —
+# so a cross-product against another axis (task 4126) gets legible pytest ids
+# instead of positional ones. _GROUNDED_SLOT_TIMEOUT_OUTPUTS is DERIVED from
+# this, not re-spelled, keeping exactly one literal per producer line (the
+# discipline stated above).
+_ANCHORED_SLOT_TIMEOUT_SHAPES: list[tuple[str, str]] = [
+    ('test_semaphore', _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT),
+    ('occt', _SLOT_TIMEOUT_OCCT_OUTPUT),
+    ('lane_x', _SLOT_TIMEOUT_LANE_X_OUTPUT),
+    ('sentinel', _SLOT_TIMEOUT_SENTINEL_OUTPUT),
+    ('sentinel_fatal', _SLOT_TIMEOUT_FATAL_SENTINEL_OUTPUT),
+    ('unlimited_wait', _SLOT_TIMEOUT_UNLIMITED_WAIT_OUTPUT),
+    ('indented', _SLOT_TIMEOUT_INDENTED_OUTPUT),
 ]
+
+_GROUNDED_SLOT_TIMEOUT_OUTPUTS = [output for _, output in _ANCHORED_SLOT_TIMEOUT_SHAPES]
+
+
+# ---------------------------------------------------------------------------
+# task 4212 — reify task 6024 landed `disposition=<fatal|soft>` as
+# `slot_acquire`'s optional 6th argument (reify scripts/lib_slot_acquire.sh:147,
+# closed vocabulary documented at reify docs/notes/verify-pipeline-knobs.md:
+# 74-77; default `fatal`, taken by all three wrapper call sites whose grounded
+# shapes make up `_ANCHORED_SLOT_TIMEOUT_SHAPES` above). Exactly ONE caller
+# passes `soft`: reify tests/infra/run_all.sh:1692's pool worker
+# (run_all.sh:1398-1427). Its rc=75 is a SOFT ADMISSION — the worker proceeds
+# UNSLOTTED, the member still runs, and run_all itself still exits 0 — not an
+# infra hold. That pool wait is deliberately NOT one of the three basenames
+# `_SLOT_ACQUIRE_DEADLINE_RE` allowlists (run_all.sh:1398-1408 states this
+# explicitly), so the `@@REIFY_SLOT_TIMEOUT@@` sentinel is the pool's ONLY
+# classification route, which is exactly why a `disposition=soft` sentinel
+# must not classify SEMAPHORE_TIMEOUT.
+#
+# RED today (measured against the live module on this branch, not assumed):
+# every case below classifies `semaphore_timeout`.
+# ---------------------------------------------------------------------------
+
+# reify tests/infra/run_all.sh:1692 — the pool worker, the ONLY caller
+# that passes slot_acquire's 6th arg as `soft`. Its rc=75 is a SOFT
+# ADMISSION: the worker proceeds unslotted, the member still runs, and
+# run_all still exits 0. Deliberately NOT one of the three basenames in
+# _SLOT_ACQUIRE_DEADLINE_RE (run_all.sh:1398-1408), so this sentinel is
+# the pool's only classification route — which is why the gate belongs
+# on the sentinel arm.
+_SLOT_TIMEOUT_SOFT_POOL_OUTPUT = (
+    '@@REIFY_SLOT_TIMEOUT@@ reason=run_all_pool_starvation slots=8 waited=1800 '
+    'disposition=soft lock=/tmp/reify-run-all-pool.lock\n'
+)
+
+# Deliberately NOT added to `_ANCHORED_SLOT_TIMEOUT_SHAPES` above: that list
+# is the "must classify SEMAPHORE_TIMEOUT" corpus feeding
+# `_SLOT_TIMEOUT_WITH_COLLATERAL_CASES` below — the soft shape's contract is
+# the opposite.
+
+
+class TestSoftDispositionSlotTimeoutIsNotSemaphoreTimeout:
+    """task 4212: a `disposition=soft` slot-timeout sentinel is a degraded-
+    but-healthy pool admission (reify run_all.sh's pool worker proceeding
+    unslotted), not an infra hold, and must not classify SEMAPHORE_TIMEOUT —
+    mirroring `TestGroundedSlotTimeoutMarkersAreDetected`'s tool-blind style,
+    since a soft admission is equally not-a-timeout regardless of which
+    tool's command was waiting on the pool."""
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_soft_disposition_is_not_semaphore_timeout(self, tool):
+        result = _classify(tool, _SLOT_TIMEOUT_SOFT_POOL_OUTPUT, 1, False)
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a disposition=soft slot-timeout sentinel must not classify '
+            f'semaphore_timeout, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_soft_disposition_is_not_infra_transient(self, tool):
+        """The operationally meaningful half, mirroring
+        ``TestDeterministicLintFailureIsNotSemaphoreTimeout.
+        test_deterministic_fault_is_not_infra_transient``'s stated reasoning:
+        merely asserting ``!= SEMAPHORE_TIMEOUT`` would still pass if the
+        output were relabelled to some other infra-transient category, which
+        would reproduce the incident this task exists to close (a red routed
+        into the bounded infra-retry loop, terminating in a blocking human
+        escalation, instead of reaching the debugger). The concrete post-fix
+        category is asserted too, so this cannot pass vacuously."""
+        result = _classify(tool, _SLOT_TIMEOUT_SOFT_POOL_OUTPUT, 1, False)
+        assert result == FailureCategory.UNKNOWN_TEST_FAILURE, (
+            f'a disposition=soft-only output with no other signal must fall '
+            f'through to unknown_test_failure, got {result!r}'
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a disposition=soft slot-timeout sentinel must not land in an '
+            f'infra-transient category (it would be silently retried), got '
+            f'{result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', [ToolKind.PYTEST, ToolKind.OPAQUE])
+    @pytest.mark.parametrize('order', ['soft_first', 'pytest_first'])
+    def test_soft_pool_sharing_a_leg_with_a_real_test_failure_keeps_test_failure(
+        self, order, tool
+    ):
+        """task 4212 / the misfiling incident itself: a genuine pytest red
+        sharing ONE aggregated leg with a degraded-but-healthy pool (a soft
+        admission, not an infra hold) must keep its real cause —
+        ``_SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT`` is the task-2821
+        grounded golden from the reify 2026-07-19 red-main incident."""
+        if order == 'soft_first':
+            output = _SLOT_TIMEOUT_SOFT_POOL_OUTPUT + _SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT
+        else:
+            output = _SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT + _SLOT_TIMEOUT_SOFT_POOL_OUTPUT
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.TEST_FAILURE, (
+            f'a genuine pytest verdict sharing a leg with a soft pool '
+            f'admission must keep classifying test_failure, got {result!r}'
+        )
 
 
 class TestGroundedSlotTimeoutMarkersAreDetected:
@@ -1518,6 +1642,300 @@ class TestBrokenWorktreeOrderingNegatives:
         assert (
             _classify(ToolKind.OPAQUE, _SEMAPHORE_TIMEOUT_SLOT_OUTPUT, 1, False)
             == FailureCategory.SEMAPHORE_TIMEOUT
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 4126, recovered from the task-3679 review: verify_classify.py:421 has
+# cited a class named ``TestAnchoredSlotTimeoutWithCollateralIsEnvTransient``
+# since task 3679 landed, but no such class existed anywhere in the repo —
+# the ORDERING note's co-occurrence tie (an anchored slot-timeout marker and
+# a merge-verify restart-collateral shape in ONE aggregated output) was
+# documented but never pinned.
+#
+# GREEN today (measured against the live module on this branch, not
+# assumed): every slot-shape x collateral-shape x order x ToolKind
+# combination already classifies ENV_TRANSIENT — the arm order in
+# ``_classify_environmental`` already resolves the tie correctly. The corpus
+# below samples that full cross-product at ``ToolKind.OPAQUE`` plus one
+# representative non-opaque tool rather than re-crossing every ``ToolKind``,
+# because guard 3 runs before any per-tool dispatch and its tool-blindness is
+# already pinned, tool-by-tool, by ``TestMergeVerifyCollateralEnvGuard``
+# above. The defect is missing PROTECTION of the ordering, not wrong
+# behaviour, so this class is green on arrival by design; see its docstring
+# for the mutation-kill that supplies the RED half.
+# ---------------------------------------------------------------------------
+
+_SLOT_TIMEOUT_WITH_COLLATERAL_CASES: list[tuple[str, str]] = [
+    (f'{slot_name}+{shape_name}:{order_name}', combined)
+    for slot_name, slot in _ANCHORED_SLOT_TIMEOUT_SHAPES
+    for shape_name, collateral in _ALL_COLLATERAL_SHAPES
+    for order_name, combined in (
+        ('slot_first', slot + collateral),
+        ('collateral_first', collateral + slot),
+    )
+]
+
+# `pytest.param(..., id=case_id)` so pytest node ids surface the compact
+# combination name (e.g. `sentinel+getcwd:collateral_first`) instead of
+# embedding the raw fixture text positionally.
+_SLOT_TIMEOUT_WITH_COLLATERAL_PARAMS = [
+    pytest.param(case_id, output, id=case_id)
+    for case_id, output in _SLOT_TIMEOUT_WITH_COLLATERAL_CASES
+]
+
+# Guard 3 (`_classify_environmental`) runs BEFORE any per-tool dispatch and
+# is tool-blind by construction (it never even receives `tool`); that
+# tool-blindness is already pinned, cross-producted over every ToolKind, by
+# `TestMergeVerifyCollateralEnvGuard` and `TestGroundedSlotTimeoutMarkersAreDetected`
+# above. Re-crossing ALL_TOOL_KINDS here would multiply the same 70 real
+# cases (task 4212 grew this from 60 by adding the `sentinel_fatal` shape to
+# `_ANCHORED_SLOT_TIMEOUT_SHAPES`) by 7 identical code paths for no added
+# detection power — confirmed by mutation-kill: hoisting the SEMAPHORE_TIMEOUT arm
+# (verify_classify.py:571-572) above the ENV_TRANSIENT branches flips every
+# case in this corpus regardless of which ToolKind carries it, so any single
+# tool already kills the mutant. OPAQUE (the generic fallback) plus PYTEST
+# (the one ToolKind with its own, unrelated ENV_TRANSIENT path —
+# `_ENV_TRANSIENT_PATTERNS` above — so this also shows guard 3's tie-break
+# winning even for a tool with an overlapping category of its own) is enough
+# to demonstrate the tool-blindness locally without re-paying that cost.
+_REPRESENTATIVE_TOOL_KINDS = (ToolKind.OPAQUE, ToolKind.PYTEST)
+
+
+class TestAnchoredSlotTimeoutWithCollateralIsEnvTransient:
+    """task 4126 (recovered from the task-3679 review): pins the
+    co-occurrence tie the ORDERING note in ``_classify_environmental``'s
+    docstring documents — an anchored slot-timeout marker (the
+    ``_ANCHORED_SLOT_TIMEOUT_SHAPES`` corpus above) co-occurring, in ONE
+    aggregated output, with a merge-verify restart-collateral shape (the
+    ``_ALL_COLLATERAL_SHAPES`` corpus above) — which resolves ENV_TRANSIENT,
+    not SEMAPHORE_TIMEOUT, because the removed worktree is the more specific
+    root cause and the only one of the two with a recovery path.
+
+    The category-pin method below,
+    ``test_anchored_slot_timeout_with_collateral_is_env_transient``,
+    parametrizes the full slot-shape x collateral-shape x order
+    cross-product at ``ToolKind.OPAQUE`` and one representative non-opaque
+    tool (``_REPRESENTATIVE_TOOL_KINDS`` above), not the full
+    ``ALL_TOOL_KINDS`` axis: guard 3 runs before any per-tool dispatch and is
+    tool-blind by construction, and that tool-blindness is already
+    cross-producted over every ``ToolKind`` by
+    ``TestMergeVerifyCollateralEnvGuard`` above, so re-crossing it here
+    would add cases with no added detection power.
+
+    GREEN ON ARRIVAL, by design: every combination below already classifies
+    ENV_TRANSIENT on this branch (measured before this class was written),
+    because the three ENV_TRANSIENT branches in ``_classify_environmental``
+    are all evaluated before the SEMAPHORE_TIMEOUT arm. The defect this
+    class fixes is that nothing PINNED that ordering, not that the ordering
+    was wrong — so there is no failing assertion to author.
+
+    The RED half is instead a recorded mutation-kill: hoisting the
+    SEMAPHORE_TIMEOUT arm (``_SLOT_TIMEOUT_SENTINEL_RE`` /
+    ``_SLOT_ACQUIRE_DEADLINE_RE``, verify_classify.py:571-572) to sit
+    immediately after the two DISK_FULL checks and before
+    ``_VERIFY_ENV_BROKEN_RE`` flips every one of this class's cases to
+    SEMAPHORE_TIMEOUT (measured), while
+    ``TestReplayedMergeVerifyCollateralWinsOverSemaphore``,
+    ``TestMergeVerifyCollateralEnvGuard``,
+    ``TestGroundedSlotTimeoutMarkersAreDetected`` and
+    ``TestBrokenWorktreeOrderingNegatives`` all stay green under that same
+    mutation (also measured) — demonstrating, not merely asserting, the
+    ORDERING note's claim that the replayed 5164/5071 fixtures "pin nothing
+    about this tie". See the task-4126 commit message for both recorded
+    runs.
+
+    The narrowness side — an anchored slot timeout with NO collateral still
+    classifies SEMAPHORE_TIMEOUT — is deliberately NOT re-asserted here: it
+    is already pinned once, by ``TestBrokenWorktreeOrderingNegatives.
+    test_genuine_slot_timeout_without_collateral_stays_semaphore_timeout``
+    and by ``TestGroundedSlotTimeoutMarkersAreDetected`` above."""
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    @pytest.mark.parametrize(('case_id', 'output'), _SLOT_TIMEOUT_WITH_COLLATERAL_PARAMS)
+    def test_anchored_slot_timeout_with_collateral_is_env_transient(self, tool, case_id, output):
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.ENV_TRANSIENT, (
+            f'case {case_id!r} must classify ENV_TRANSIENT (not SEMAPHORE_TIMEOUT) '
+            f'under {tool!r}, got {result!r}'
+        )
+
+    @pytest.mark.parametrize(('case_id', 'output'), _SLOT_TIMEOUT_WITH_COLLATERAL_PARAMS)
+    def test_anchored_slot_timeout_with_collateral_keeps_recovery_path(self, case_id, output):
+        """Pins the CONSEQUENCE the ORDERING note names, not just the label:
+        ENV_TRANSIENT carries a bounded self-recovery
+        (``RetryKind.ENV_SERIAL``), where SEMAPHORE_TIMEOUT's
+        ``RetryKind.NONE`` would instead surface to a human."""
+        result = _classify(ToolKind.OPAQUE, output, 1, False)
+        assert CATEGORY_POLICY[result].retry_kind is RetryKind.ENV_SERIAL, (
+            f'case {case_id!r} must keep the ENV_SERIAL recovery path (not '
+            f"SEMAPHORE_TIMEOUT's blocking RetryKind.NONE), got {result!r}"
+        )
+        assert result in INFRA_TRANSIENT_CATEGORIES
+
+
+# ---------------------------------------------------------------------------
+# task 4212 (continued from the section above `_ANCHORED_SLOT_TIMEOUT_SHAPES`,
+# see that section for the disposition-gate grounding): step-2's whole-output
+# `disposition=soft` search is the simplest change that turns
+# `TestSoftDispositionSlotTimeoutIsNotSemaphoreTimeout` above green, and it is
+# wrong in two measurable ways this section pins. Placed here, after
+# `_REPRESENTATIVE_TOOL_KINDS` is defined, rather than alongside the rest of
+# the task-4212 fixtures above, purely so its cases can use that same
+# representative-tool axis — task 4126's stated rationale for why
+# re-crossing every ToolKind on a combination axis adds no detection power
+# applies identically here (guard 3 runs before any per-tool dispatch and is
+# tool-blind by construction; that tool-blindness is already cross-producted
+# over every ToolKind by `TestGroundedSlotTimeoutMarkersAreDetected` and
+# `TestSoftDispositionSlotTimeoutIsNotSemaphoreTimeout` above).
+#
+# RED under step-2 (measured against that tree, not assumed): cases (a) and
+# (b) below classify `unknown_test_failure` / `unknown_test_failure` — the
+# whole-output soft search suppresses a co-occurring genuine starvation
+# abort. Cases (c) and (d) are GREEN ON ARRIVAL under step-2 and are pinned
+# anyway, as guards against a future refactor: (c) against hoisting the soft
+# check above the whole arm, (d) against step-4's head-of-line disposition
+# parse regressing the narrowness of the fix in the other direction.
+# ---------------------------------------------------------------------------
+
+
+class TestSoftDispositionDoesNotVetoAGenuineSlotTimeout:
+    """task 4212: step-2's whole-output `disposition=soft` search is wrong in
+    two ways this class pins — a soft line must never veto a co-occurring
+    FATAL slot timeout (verify hands this classifier the ENTIRE aggregated
+    leg output, so a degraded pool and a genuine starved test slot CAN
+    co-occur in one leg), and the operator-controlled `lock=` tail must not
+    be able to forge or suppress the disposition (reify's field-order
+    contract puts `lock=` last precisely because it is the one field an
+    operator controls)."""
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    @pytest.mark.parametrize('order', ['soft_first', 'fatal_first'])
+    def test_cooccurring_fatal_sentinel_is_not_vetoed_by_a_soft_one(self, order, tool):
+        """(a) RED under step-2: a soft pool deadline and a fatal test-slot
+        deadline in ONE output — the whole-output soft search suppresses the
+        arm entirely, when only the co-occurring soft LINE should ever be
+        demoted."""
+        if order == 'soft_first':
+            output = _SLOT_TIMEOUT_SOFT_POOL_OUTPUT + _SLOT_TIMEOUT_FATAL_SENTINEL_OUTPUT
+        else:
+            output = _SLOT_TIMEOUT_FATAL_SENTINEL_OUTPUT + _SLOT_TIMEOUT_SOFT_POOL_OUTPUT
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a genuine fatal slot timeout sharing a leg with a soft pool '
+            f'admission must still classify semaphore_timeout, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    def test_lock_path_forging_the_soft_token_does_not_suppress_a_fatal_sentinel(self, tool):
+        """(b) RED under step-2: the OPERATOR-controlled lock base
+        (`REIFY_TEST_SEMAPHORE_LOCK` et al.) is the one field reify's own
+        field-order contract treats as untrusted; a fatal sentinel whose lock
+        path happens to embed the literal `disposition=soft` token must still
+        classify semaphore_timeout."""
+        output = (
+            '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation slots=8 waited=1800 '
+            'disposition=fatal lock=/tmp/df-4212-disposition=soft.lock\n'
+        )
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a disposition=fatal sentinel must not be suppressed by a lock '
+            f'path that happens to embed the literal disposition=soft token, '
+            f'got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    @pytest.mark.parametrize(
+        ('basename_name', 'basename_output'),
+        [
+            ('test_semaphore', _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT),
+            ('occt', _SLOT_TIMEOUT_OCCT_OUTPUT),
+            ('lane_x', _SLOT_TIMEOUT_LANE_X_OUTPUT),
+        ],
+    )
+    @pytest.mark.parametrize('order', ['soft_first', 'basename_first'])
+    def test_soft_sentinel_does_not_suppress_a_cooccurring_basename_deadline(
+        self, order, basename_name, basename_output, tool
+    ):
+        """(c) Green already under step-2 (the ``or`` keeps the ungated
+        basename half live) — pinned anyway as a guard against a future
+        refactor that hoists the soft check above the whole arm."""
+        if order == 'soft_first':
+            output = _SLOT_TIMEOUT_SOFT_POOL_OUTPUT + basename_output
+        else:
+            output = basename_output + _SLOT_TIMEOUT_SOFT_POOL_OUTPUT
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'basename shape {basename_name!r} co-occurring with a soft pool '
+            f'sentinel must still classify semaphore_timeout, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    def test_lock_path_forging_the_fatal_token_does_not_promote_a_soft_sentinel(self, tool):
+        """(d) CONVERSE FORGERY, green already under step-2 — pinned so
+        step-4's head-of-line parse cannot regress it in the other
+        direction: a soft sentinel whose lock path happens to embed the
+        literal `disposition=fatal` token must still be treated as soft."""
+        output = (
+            '@@REIFY_SLOT_TIMEOUT@@ reason=run_all_pool_starvation slots=8 waited=1800 '
+            'disposition=soft lock=/tmp/df-4212-disposition=fatal.lock\n'
+        )
+        result = _classify(tool, output, 1, False)
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a disposition=soft sentinel must not be promoted by a lock '
+            f'path that happens to embed the literal disposition=fatal '
+            f'token, got {result!r}'
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a disposition=soft sentinel forged with a disposition=fatal '
+            f'lock path must still avoid every infra-transient category, '
+            f'got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    def test_unrecognized_disposition_token_is_treated_as_fatal(self, tool):
+        """(e) Fail-safe-direction pin: `_has_fatal_slot_timeout_sentinel`'s
+        docstring promises an unrecognized future token is treated as NOT
+        soft. reify's disposition vocabulary is closed to `fatal`/`soft`
+        today (docs/notes/verify-pipeline-knobs.md:74-77), so `deferred` is
+        a deliberately-invented future/unknown token, not a grounded shape —
+        it exists solely to pin the documented fail-safe direction.
+        Mutation-killing: a whitelist read (`token == 'fatal'`) in place of
+        the documented blacklist (`token != 'soft'`) would silently demote
+        this to `unknown_test_failure`."""
+        output = (
+            '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation slots=8 waited=1800 '
+            'disposition=deferred lock=/tmp/reify-test-slot.lock\n'
+        )
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'an unrecognized disposition token must be treated as fatal '
+            f'(fail-safe direction), got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    def test_soft_disposition_with_no_lock_field_is_still_demoted(self, tool):
+        """(f) Every `_SLOT_TIMEOUT_SOFT_POOL_OUTPUT`-derived fixture used
+        elsewhere in this module carries a trailing ` lock=` field, so the
+        no-lock (`head = tail`) branch of `_has_fatal_slot_timeout_sentinel`'s
+        parse is otherwise never exercised. `slot_acquire`'s `lock=%s`
+        argument is always populated in practice, so this is a defensive-
+        parse pin rather than a grounded producer shape. Mutation-killing: a
+        parse that only ever looked at `tail[:lock.start()]` (assuming a
+        match) would raise ``AttributeError`` on this input instead of
+        falling back to the whole tail."""
+        output = (
+            '@@REIFY_SLOT_TIMEOUT@@ reason=run_all_pool_starvation slots=8 '
+            'waited=1800 disposition=soft\n'
+        )
+        result = _classify(tool, output, 1, False)
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a disposition=soft sentinel with no trailing lock= field must '
+            f'still be demoted, got {result!r}'
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a disposition=soft sentinel with no trailing lock= field must '
+            f'not land in an infra-transient category, got {result!r}'
         )
 
 

@@ -123,8 +123,8 @@ tasks:
       expect: present
 - label: η
   task_id: 3720
-  title: 'LME-η: LLM screening — all 4 candidates × small subset; survivors ≤3 per
-    pre-registered rule'
+  title: 'LME-η: LLM screening — every manifest candidate × small subset; survivors
+    ≤3 selected per the pre-registered rule'
   capabilities:
   - name: screening-report-committed
     binding: endpoints (α), harness (ε), survivor rule (ζ) all upstream; Phi-4 16K

@@ -11,6 +11,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, NamedTuple, TypedDict, cast
 from urllib.parse import urlparse
@@ -26,10 +27,26 @@ from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.errors import NodeNotFoundError as GraphitiCoreNodeNotFoundError
 from graphiti_core.helpers import validate_group_ids
 from graphiti_core.llm_client import OpenAIClient
+from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
+from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.backends.falkor_fulltext import build_query
+from fused_memory.backends.falkor_indices import (
+    IndexHeaderShapeError,
+    IndexProvisionResult,
+    IndexRecordShapeError,
+    IndexSpec,
+    expected_index_set,
+    normalize_index_records,
+    plan_index_statements,
+    resolve_header_positions,
+    vector_drop_statement,
+    vector_index_properties,
+)
+from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.utils.async_utils import gather_or_raise
 from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
@@ -121,6 +138,130 @@ def check_openai_responses_api() -> None:
         "and restart the service to install a compatible openai version. "
         "(task 2053)"
     )
+
+
+def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
+    """Construct the graphiti LLM client from unified config, or None.
+
+    Returns None when the configured provider block is absent or carries no
+    api_key — the same "run without an LLM" posture ``initialize()`` has always
+    had.
+
+    Deliberately module-level and public: this is the DRIVER-FREE construction
+    seam. Callers that need an LLM client for a single arm (e.g. an evaluation
+    harness building one client per candidate model) must not have to call
+    ``GraphitiBackend.initialize()`` to get one — that would construct a
+    ``_MultiTenantFalkorDriver``, and ``FalkorDriver.__init__`` fire-and-forgets
+    ``build_indices_and_constraints()``, creating indices on a real graph. That
+    is a binding project hazard (docs/prds/falkordb-index-provisioning.md), and
+    a seam that makes it structurally unreachable is a far stronger guarantee
+    than a monkeypatch at every call site.
+
+    ``cfg.llm.client_class`` selects among the OpenAI-shaped clients only; the
+    anthropic branch is unaffected by it.
+    """
+    # LLMConfig's validator already rejects this combination at construction,
+    # but pydantic does not re-validate on attribute assignment, so a config
+    # mutated after loading — how tests and per-arm harnesses build variants —
+    # reaches here unchecked. Warn rather than raise: by this point the config
+    # is loaded and a hard failure would take down a server over a knob that is
+    # merely inert. Covers the anthropic arm too, where the mode is equally
+    # meaningless.
+    if cfg.llm.structured_output_mode != 'auto' and cfg.llm.client_class != 'openai_generic':
+        logger.warning(
+            f'llm.structured_output_mode={cfg.llm.structured_output_mode!r} is IGNORED: '
+            f'it applies only to llm.client_class="openai_generic", and client_class is '
+            f'{cfg.llm.client_class!r} (provider={cfg.llm.provider!r}). The client being '
+            'built will use its stock structured-output behaviour.'
+        )
+
+    if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
+        api_key = cfg.llm.providers.openai.api_key
+        if api_key:
+            # api_url has a non-None default ('https://api.openai.com/v1',
+            # config/schema.py OpenAIProviderConfig), so base_url below is now
+            # ALWAYS passed. That makes config authoritative over the ambient
+            # OPENAI_BASE_URL / OPENAI_API_BASE fallback the openai SDK would
+            # otherwise apply — which is the point of this plumbing, but it is
+            # not a no-op for a site that routes through a gateway by exporting
+            # OPENAI_BASE_URL without setting OPENAI_API_URL: that traffic now
+            # goes back to api.openai.com. An egress/billing change must not be
+            # silent, hence the warning.
+            warn_if_ambient_base_url_is_overridden(
+                cfg.llm.providers.openai.api_url, context='graphiti LLM',
+            )
+            llm_config = GraphitiLLMConfig(
+                api_key=api_key,
+                model=cfg.llm.model,
+                small_model=cfg.llm.model,
+                temperature=cfg.llm.temperature or 0.0,
+                max_tokens=cfg.llm.max_tokens,
+                # Mirrors the embedder (see initialize()) and the reranker,
+                # which have always passed the configured endpoint. The LLM
+                # path was the outlier: a configured api_url was silently
+                # dropped in favour of the openai SDK default.
+                base_url=cfg.llm.providers.openai.api_url,
+            )
+            llm_client: LLMClient
+            if cfg.llm.client_class == 'openai_generic':
+                # No preflight on this arm — deliberately. Its sole purpose is
+                # to guard OpenAIClient's client.responses.create call (see
+                # check_openai_responses_api above); OpenAIGenericClient drives
+                # chat.completions and never resolves that SDK surface, so the
+                # check is both unnecessary here and actively harmful — it
+                # would abort an otherwise-valid local endpoint on a
+                # requirement that endpoint does not have.
+                #
+                # max_tokens= is NOT redundant with GraphitiLLMConfig(max_tokens=...)
+                # above, and must not be "simplified" away: OpenAIGenericClient
+                # .__init__ declares its own `max_tokens: int = 16384` and
+                # re-assigns `self.max_tokens = max_tokens` immediately after
+                # super().__init__() has correctly set it from the config
+                # object. _generate_response then sends `self.max_tokens`,
+                # ignoring its per-call argument — so this constructor kwarg is
+                # the ONLY lever that reaches the wire. Without it every request
+                # on this arm asks for 16384 output tokens regardless of
+                # configuration, which a local endpoint may reject outright or
+                # which may overrun its served context.
+                # ForceJsonObjectOpenAIGenericClient overrides only
+                # _generate_response, so it inherits this __init__ unchanged —
+                # which is why the mode can select the CLASS and leave one
+                # shared construction call. Keeping a single call site is
+                # deliberate: two copies of the argument list are how one arm
+                # silently drifts from the other when a kwarg is added.
+                generic_cls: type[OpenAIGenericClient] = (
+                    ForceJsonObjectOpenAIGenericClient
+                    if cfg.llm.structured_output_mode == 'json_object'
+                    else OpenAIGenericClient
+                )
+                llm_client = generic_cls(config=llm_config, max_tokens=cfg.llm.max_tokens)
+            else:
+                check_openai_responses_api()
+                llm_client = OpenAIClient(config=llm_config)
+            logger.info(
+                f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
+                f'({type(llm_client).__name__})'
+            )
+            return llm_client
+    elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
+        api_key = cfg.llm.providers.anthropic.api_key
+        if api_key:
+            try:
+                from graphiti_core.llm_client.anthropic_client import AnthropicClient
+
+                llm_config = GraphitiLLMConfig(
+                    api_key=api_key,
+                    model=cfg.llm.model,
+                    temperature=cfg.llm.temperature or 0.0,
+                    max_tokens=cfg.llm.max_tokens,
+                )
+                llm_client = AnthropicClient(config=llm_config)
+                logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
+                return llm_client
+            except ImportError:
+                logger.warning('Anthropic client not available for Graphiti')
+
+    return None
 
 
 def _canonicalize_group_args(func):
@@ -234,6 +375,643 @@ class AmbiguousEntityError(Exception):
     The error message includes all matching UUIDs so the caller can
     disambiguate and call refresh_entity_summary with a specific UUID.
     """
+
+
+class IncompleteEnumerationError(Exception):
+    """Raised when a whole-graph enumeration was STRUCTURALLY incomplete.
+
+    Not "the read failed" — the read was never validly performed.  Either it
+    refused to start (``INCOMPLETE_STRUCTURAL_REFUSAL``: zero queries issued,
+    so the emptiness is fabricated rather than observed) or it ran out of page
+    budget mid-corpus (``INCOMPLETE_PAGE_CAP``: the rows are a PREFIX in
+    ``ORDER BY`` order, not a sample).
+
+    WHY THIS RAISES INSTEAD OF RETURNING THE COLLECTION, which is what made
+    the original defect corrupting rather than merely under-reporting: a
+    caller cannot tell a fabricated empty from a genuinely empty graph, and
+    the consumer downstream is a WRITE.  ``MemoryService.rebuild_entity_summaries``
+    -> ``_rebuild_one`` -> ``all_edges.get(uuid, [])`` -> ``rebuild_entity_from_edges``
+    computes ``'\\n'.join([]) == ''`` and ``update_node_summary`` persists it,
+    blanking a real summary with the *absence of evidence* that the read was
+    never performed.  The ``force=True`` path is the sharpest vector: it does
+    not consult staleness at all, so it writes to every entity returned.
+
+    Deliberately an ``Exception``, never a ``BaseException``: both
+    reconciliation sweeps catch ``Exception`` while re-raising
+    ``CancelledError``/``KeyboardInterrupt``/``SystemExit``, so subclassing
+    ``BaseException`` would escape their handlers and turn a handled per-cycle
+    error into an outage.
+
+    Empirical incompleteness (``INCOMPLETE_CENSUS_UNAVAILABLE``,
+    ``INCOMPLETE_SHORT_READ``) does NOT raise — see the shims for why.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Paginated whole-graph reads (task 4340)
+# ---------------------------------------------------------------------------
+
+_RESULTSET_SIZE = 10000
+"""FalkorDB's server-wide result-set ceiling: every query returns at most this
+many rows, silently truncated — no error, no marker.
+
+This is an ASSUMPTION about server configuration, not a fact this repo
+controls: nothing here sets ``RESULTSET_SIZE``, and a grep finds no override
+anywhere.  Measured 2026-08-17 against localhost:6379::
+
+    GRAPH.CONFIG GET RESULTSET_SIZE  ->  10000
+
+That it is an assumption is exactly why ``_paged_ro_query`` does not trust it
+alone and cross-checks against a server-side census (see the guards there).
+"""
+
+_DEFAULT_READ_PAGE_SIZE = 5000
+"""Rows per page: half the assumed cap, so a short page really is end-of-data.
+
+The page loop breaks on a page shorter than the requested size, reasoning
+"the data is exhausted".  That reasoning is sound only while the server
+cannot be what shortened the page — i.e. only while the page size stays
+strictly below the cap.  Half the cap buys a full page of margin.
+"""
+
+_MAX_READ_PAGES = 1000
+"""Hard bound on pages per enumeration, so a pathological corpus (or a store
+that never returns a short page) cannot spin forever.
+
+At the default page size that is 5,000,000 rows, against a live maximum near
+32,000 — normal use never approaches it.  Hitting it is REPORTED
+(``complete=False`` + a WARNING naming the numbers), never silently swallowed:
+a page cap that truncates in silence would just be the defect this module
+exists to fix, moved one layer up.
+"""
+
+# The four fail-closed paths of ``_paged_ro_query``, as a typed discriminator
+# on ``PagedRead.incomplete_kind``.  PUBLIC (no leading underscore, unlike
+# ``_RESULTSET_SIZE``): a caller reads these off a returned PagedRead to learn
+# WHY a read was incomplete, so they are part of the contract.
+#
+# They exist so nobody has to sniff ``PagedRead.reason``, which is diagnostic
+# prose written for an operator reading a log and is deliberately NOT a stable
+# interface — any wording improvement would silently break a substring match,
+# and the branch it broke is the one that stops a fabricated empty from being
+# written back over real summaries.
+
+INCOMPLETE_STRUCTURAL_REFUSAL = 'structural_refusal'
+"""Guard 1: ``page_size >= resultset_size``. Zero queries issued, zero rows.
+
+The returned emptiness is FABRICATED — no read was attempted — which is why
+it must never be confused with a genuinely empty corpus.
+"""
+
+INCOMPLETE_PAGE_CAP = 'page_cap'
+"""Guard 2: ``max_pages`` exhausted while the last page was still full.
+
+The rows are a PREFIX of the corpus in ``ORDER BY`` order, not a sample.
+"""
+
+INCOMPLETE_CENSUS_UNAVAILABLE = 'census_unavailable'
+"""Guard 3: no usable count. The rows were fetched; only the PROOF is missing."""
+
+INCOMPLETE_SHORT_READ = 'short_read'
+"""Guard 4: ``rows_seen < expected_rows`` — the enumeration is SHORT."""
+
+INCOMPLETE_STRUCTURAL_KINDS = frozenset(
+    {INCOMPLETE_STRUCTURAL_REFUSAL, INCOMPLETE_PAGE_CAP}
+)
+"""The DETERMINISTIC, non-transient incompleteness kinds.
+
+Both are fully determined by configuration and code: they reproduce exactly
+on retry and can never be caused by a concurrent write.  That is what makes
+them safe to RAISE on (see the shims), where the empirical kinds are not — a
+census disagreeing by a handful of rows is the expected signature of a live
+graph being written to mid-read.
+
+Callers should branch on membership in this set rather than on a specific
+kind, so a future fifth structural path is covered by construction.
+"""
+
+# --------------------------------------------------------------------------- #
+# RESULT-SET CAP AUDIT — every read in this file, re-checked 2026-08-17
+# (task 4340).  Recorded so the next person does not have to redo it, and
+# stated as claims with reasons so it can be FALSIFIED rather than trusted.
+#
+# THIS BLOCK IS THE ONE PLACE the measured figures, the open residual, and the
+# ticket cross-references are written down.  Everything else that used to
+# restate them — the two shim docstrings, _paged_ro_query's residual
+# paragraph, the pagination test module's docstring, and the task-4340
+# amendment in reconciliation/stale_status_snapshot_edge_sweep.py — now points
+# HERE, so a re-measurement is a one-block edit.  Keep it that way.  Moving
+# the block out of source entirely, into a reference doc, is tracked as ticket
+# tkt_0RSKFG5RX196H9CJ0RXGJCZF4F; the counts below are date-stamped precisely
+# because they rot (Entity nodes on dark_factory read 16038, then 16083, then
+# 16262 over roughly 24 hours of task 4340).
+#
+# Measured live against localhost:6379, RESULTSET_SIZE=10000:
+#
+#     graph          Entity nodes   valid-edge rows   an unpaginated read saw
+#     dark_factory       16083            25040                10000
+#     reify              23616            31659                10000
+#
+# FIXED HERE — both were measurably truncated, and they COMPOUND:
+# ``detect_stale_with_edges`` calls them on consecutive lines and the two
+# truncations were INDEPENDENT, so an entity surviving the node cut could
+# still lose every edge to the edge cut, yielding a bogus "stale, zero valid
+# facts" verdict that ``rebuild_entity_from_edges`` then WROTE BACK into
+# ``n.summary``.  Corrupting, not merely under-reporting.
+#   - get_all_valid_edges  -> enumerate_all_valid_edges
+#   - list_entity_nodes    -> enumerate_entity_nodes
+# The old names survive as thin shims with UNCHANGED signatures applying a
+# SPLIT incompleteness policy: they RAISE IncompleteEnumerationError on a
+# STRUCTURAL incompleteness (a read that was never validly performed — its
+# emptiness or prefix is fabricated, and returning it is what let '' be
+# written back over real summaries) and WARN-and-return on an EMPIRICAL one
+# (a census disagreement, transient on a continuously-written graph).  The
+# completeness signal itself is a first-class return value on the enumerate_*
+# methods, which never raise.  No consumer ACTS on it yet — the two
+# reconciliation sweeps and cleanup_count_snapshots still call the shims, so
+# they cannot yet distinguish "swept a complete corpus" from "swept what we
+# could fetch".  Filed as ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH.
+#
+# MEASURED COST of paging, and the keyset rewrite it rules out.  Measured
+# 2026-08-18 against localhost:6379, warm, 3 repeats, median reported; the
+# whole enumeration (census + every page), page_size 5000:
+#
+#     graph          read          UNPAGINATED     PAGED       rows
+#     dark_factory   entity nodes     860 ms      862 ms      16262
+#     dark_factory   valid edges      771 ms     3301 ms      25382
+#     reify          entity nodes    3326 ms     1498 ms      23671
+#     reify          valid edges     3126 ms     3685 ms      31783
+#
+# The UNPAGINATED column is the OLD behaviour and returned 10000 truncated
+# rows for its money, so it is a cost floor, not a comparable answer.  One
+# full detect_stale_with_edges (both reads) costs ~4.2 s on dark_factory —
+# about +2.6 s per reconciliation cycle — and ~5.2 s on reify, which is
+# FASTER than the ~6.5 s the two truncated reads used to cost there.  Paging
+# a large result set in 5000-row chunks beats transferring one 10000-row set.
+#
+# KEYSET/SEEK PAGINATION WAS TRIED AND DECLINED, on measurement rather than
+# on taste.  The concern it answers is real in principle: ORDER BY ... SKIP k
+# LIMIT n re-scans and re-sorts the whole matched population per page, so an
+# enumeration is O(P * N log N) where a seek would be O(N log N).  For the
+# node read the seek form is available — `WHERE n.uuid > $last ORDER BY
+# n.uuid LIMIT k` over the RANGE index ensure_indices creates on
+# Entity(uuid).  Measured head to head, running SEEK FIRST each round so any
+# warm-cache advantage favoured it:
+#
+#     graph          node SEEK (keyset)        node SKIP (offset)
+#     dark_factory   [781, 904, 862] ms        [796, 862, 1610] ms
+#     reify          [1414, 1310, 1577] ms     [1814, 1498, 1214] ms
+#
+# Indistinguishable — identical medians on dark_factory, ~6% on reify, well
+# inside the run-to-run spread.  The asymptotic argument does not bite at
+# this N: 4-5 pages over ~16-24k rows, where the sort is not the bottleneck.
+# So a second paging mode in _paged_ro_query would buy no measured latency
+# and cost a second code path to keep correct.  Re-open only WITH a
+# measurement showing the sort dominating — and note the edge read, which is
+# the expensive one, cannot use it anyway: its ORDER BY is the composite
+# (e.uuid, n.uuid) needed for a total order over ROWS.
+#
+# DOWNSTREAM FAN-OUT, the other cost this fix moved.  detect_stale_dry_run
+# issues one get_valid_edges_for_node per non-empty-summary entity, and now
+# runs over the COMPLETE node set instead of a truncated 10000.  Measured
+# 0.70 ms/entity amortised at max_concurrency=10 on dark_factory (0.39 ms on
+# reify), so the full fan-out is ~9.0 s against ~7.0 s before (dark_factory)
+# and ~8.8 s against ~3.9 s (reify).  Seconds, bounded, and it is the price
+# of the answer being right; it is not a liveness risk at these sizes.
+#
+# RESIDUAL LEFT OPEN DELIBERATELY, and not an oversight: a materially-short
+# INCOMPLETE_SHORT_READ still returns a partial collection that the
+# force=True path (memory_service.py:5826-5834, MemoryService.rebuild_entity_summaries)
+# will write back, blanking the summary of any entity whose edges fell in the
+# missing remainder.  That path never consults staleness, so it writes to
+# every entity the node read returned.  Do NOT close it by tightening the shims — guard 4 fires on any
+# shortfall at all, including a single concurrently-invalidated edge, so
+# raising there would take down the live rebuild for exactly the transient
+# the warn-not-raise decision rejected.  The fix belongs at the consumer, as
+# a policy on how short is too short applied where the destructive write is
+# decided, which is the same code the ticket above must touch.
+#
+# STILL UNPAGINATED and assessed AT RISK.  Left out of 4340 only because they
+# are separable — different call chains, no shared verdict, no write-back —
+# and folding them in would have doubled the diff.  Follow-up filed as ticket
+# tkt_0RSJP82N82SNKT2BHRT3HWK3DA (a TICKET id, not a task id — the curator
+# resolves it to a task asynchronously).
+#   - query_stale_node_embeddings: ~16083 rows on dark_factory.  A truncated
+#     read makes an embedding-dimension migration look COMPLETE when it is
+#     not — the worst shape of this bug, because the operator's evidence of
+#     success is the very thing being truncated.
+#   - query_stale_edge_embeddings: ~15242/22392 rows.  No ``invalid_at``
+#     filter, so it includes superseded edges and its row count runs ahead of
+#     the valid-edge census above.
+#   - query_edges_by_time_range: bounded only by the caller's window width;
+#     any window wide enough to span >10000 edges truncates.
+#   - retrieve_episodes: reaches the same server through graphiti-core's
+#     ``get_by_group_ids(limit=None)`` rather than ``ro_query``, so it is not
+#     fixable with ``_paged_ro_query`` as-is.  Its existing comment reasons
+#     about transfer COST and about ``last_n`` being capped in tools.py;
+#     neither protects against server-side truncation.  Truncation is worse
+#     than slowness here: the Python-side ``sorted(...)[:last_n]`` would be
+#     selecting the most-recent of a truncated 10000, i.e. silently returning
+#     the wrong episodes rather than merely fewer of them.
+#
+# ASSESSED SAFE, with the reason (a bare list would not be checkable):
+#   - every uuid-keyed lookup: the key is unique, so the result is 0 or 1 rows.
+#   - every exact-name lookup: bounded by the duplicate-name count, which
+#     ``find_duplicate_entity_nodes`` reports in single digits.
+#   - every single-row aggregate: one row by construction.
+#   - server-side grouped/filtered aggregates that SCAN the whole graph but
+#     whose RESULT set is small — the cap applies to rows RETURNED, not rows
+#     scanned, so a ``count``/``collect`` folding 20k rows into a handful is
+#     safe.
+#   - ``CALL db.indexes()``: one row per index, single digits.
+#   - every per-node neighbourhood read.  ``get_valid_edges_for_node`` is
+#     called out by name because task 4340 asked about it specifically: its
+#     row count is ONE node's valid degree, and a single node would have to
+#     hold >10000 of the graph's ~12506 valid edges to reach the cap.  It is
+#     left unpaginated deliberately, not by oversight.
+# --------------------------------------------------------------------------- #
+
+
+# Page/census pairs for the paginated whole-graph reads. Each pair shares an
+# IDENTICAL MATCH/WHERE so the two numbers describe the same population and
+# are therefore directly comparable.
+#
+# The ORDER BY must be a TOTAL order over ROWS, not merely over the entity or
+# edge: the undirected edge pattern yields two rows per edge, so `e.uuid`
+# alone would leave that pair free to reshuffle across a page boundary — and a
+# reshuffle at a boundary drops rows permanently and silently.
+_ALL_VALID_EDGES_MATCH = (
+    'MATCH (n:Entity)-[e:RELATES_TO]-() '
+    'WHERE e.invalid_at IS NULL '
+)
+_ALL_VALID_EDGES_PAGE_TEMPLATE = (
+    _ALL_VALID_EDGES_MATCH
+    + 'RETURN n.uuid, e.uuid, e.fact, e.name '
+    'ORDER BY e.uuid, n.uuid '
+    'SKIP {skip} LIMIT {limit}'
+)
+_ALL_VALID_EDGES_CENSUS = _ALL_VALID_EDGES_MATCH + 'RETURN count(*)'
+
+# Entity nodes. Here `n.uuid` alone IS a total order — one row per node, and
+# node uuids are unique — unlike the edge case above.
+_ENTITY_NODES_MATCH = 'MATCH (n:Entity) '
+_ENTITY_NODES_PAGE_TEMPLATE = (
+    _ENTITY_NODES_MATCH
+    + 'RETURN n.uuid, n.name, n.summary '
+    'ORDER BY n.uuid '
+    'SKIP {skip} LIMIT {limit}'
+)
+_ENTITY_NODES_CENSUS = _ENTITY_NODES_MATCH + 'RETURN count(*)'
+
+
+@dataclass(frozen=True)
+class PagedRead:
+    """Result of a paginated read: the rows, plus whether they are all of them.
+
+    ``reason`` is None exactly when ``complete`` is True.  ``expected_rows`` is
+    None when the census probe could not produce a usable count — an
+    unavailable proof, which is itself a reason to report incomplete.
+
+    ``incomplete_kind`` is one of the four module-level ``INCOMPLETE_*``
+    constants, and is None exactly when ``complete`` is True.  It exists so a
+    caller can branch on WHY a read was incomplete without parsing ``reason``,
+    whose wording is diagnostic prose aimed at an operator reading a log and
+    is deliberately NOT a stable interface.  The distinction matters most for
+    ``INCOMPLETE_STRUCTURAL_REFUSAL``, where the returned emptiness is
+    fabricated rather than read: without a typed discriminator that is
+    indistinguishable from a genuinely empty graph, and the difference decides
+    whether a caller writes an empty summary back over a real one.
+
+    The field is last and defaulted so the five original fields — none of
+    which have defaults — keep working under positional construction.
+    """
+
+    rows: list[list]
+    complete: bool
+    rows_seen: int
+    expected_rows: int | None
+    reason: str | None
+    incomplete_kind: str | None = None
+
+
+async def _census_count(graph, cypher: str, params: dict | None = None) -> int | None:
+    """Return the single integer a ``count(...)`` probe reports, or None.
+
+    EVERY "the store did not say" shape collapses to None — no rows, a null
+    result set, a row with no columns, a NULL value, a non-integer — because
+    the caller treats None as fail-closed and there is nothing to gain from
+    distinguishing flavours of missing evidence.
+
+    A single-row aggregate can never be truncated by the row cap it is being
+    used to detect, which is what makes this a proof rather than one more
+    heuristic.
+    """
+    result = await graph.ro_query(cypher, params)
+    rows = getattr(result, 'result_set', None) or []
+    if not rows:
+        return None
+    first = rows[0]
+    if first is None or len(first) == 0:
+        return None
+    try:
+        return int(first[0])
+    except (TypeError, ValueError):
+        return None
+
+
+_SKIP_PLACEHOLDER = '{skip}'
+_LIMIT_PLACEHOLDER = '{limit}'
+
+
+def _render_page_bounds(page_template: str, *, skip: int, limit: int) -> str:
+    """Substitute the two SKIP/LIMIT placeholders, leaving every other brace alone.
+
+    Deliberately NOT ``str.format``.  Cypher map patterns carry literal braces
+    — ``MATCH (n:Entity {name: $name})``, a shape several other queries in this
+    file already use — and ``str.format`` raises ``KeyError``/``ValueError`` on
+    one of those BEFORE any query is issued, from a traceback that points at a
+    formatting call rather than at the offending template.  Since more reads
+    are meant to be routed through this primitive, that trap would be one map
+    literal away for the next author, and it would need a brace-doubling
+    convention nobody has to remember here.  Two literal replacements have no
+    such failure mode.
+
+    Both placeholders are REQUIRED.  A template missing ``{skip}`` would
+    re-fetch the same offset every iteration until ``max_pages``, then report
+    a page-cap shortfall — a real authoring bug wearing the costume of a
+    server truncation.  Raising is how it stays legible.
+
+    Bounds are coerced to ``int`` before substitution, so nothing but a
+    validated integer this module computed can reach the Cypher text.
+    """
+    for placeholder in (_SKIP_PLACEHOLDER, _LIMIT_PLACEHOLDER):
+        if placeholder not in page_template:
+            raise ValueError(
+                f'page_template is missing the {placeholder} placeholder, so '
+                f'its pages could never advance: {page_template!r}'
+            )
+    return page_template.replace(_SKIP_PLACEHOLDER, str(int(skip))).replace(
+        _LIMIT_PLACEHOLDER, str(int(limit))
+    )
+
+
+async def _paged_ro_query(
+    graph,
+    page_template: str,
+    census_cypher: str,
+    *,
+    params: dict | None = None,
+    page_size: int = _DEFAULT_READ_PAGE_SIZE,
+    resultset_size: int = _RESULTSET_SIZE,
+    max_pages: int = _MAX_READ_PAGES,
+) -> PagedRead:
+    """Read every row a whole-graph query matches, past the server's row cap.
+
+    ``page_template`` must be a Cypher string with ``{skip}`` and ``{limit}``
+    placeholders and a TOTAL ``ORDER BY``; ``census_cypher`` must be the
+    identical MATCH/WHERE returning ``count(*)``, so the two numbers describe
+    the same population.
+
+    The ``ORDER BY`` is load-bearing, not cosmetic: every page is a SEPARATE
+    query, and SKIP/LIMIT with no total order gives the store no obligation to
+    return rows in the same order twice — so ``SKIP n`` on page 2 can skip rows
+    page 1 never returned (silently dropped, permanently) or re-return rows it
+    did (harmlessly deduped, which is what makes the drop so easy to miss).
+
+    SKIP/LIMIT bounds are substituted as validated ints rather than bound as
+    ``$`` parameters: parameterised SKIP/LIMIT is not portable across Cypher
+    implementations, and these are integers this module computes, never caller
+    data, so there is no injection surface.  Substitution goes through
+    ``_render_page_bounds``, which replaces the two placeholders LITERALLY
+    rather than running ``str.format`` over the whole template — so a template
+    containing a Cypher map pattern (``{name: $name}``) is safe, and no
+    brace-doubling convention has to be remembered.  See that helper.
+
+    The read fails CLOSED on four independent paths, each logging a WARNING
+    that names the numbers as structured facts rather than prose:
+
+      STRUCTURAL (fires on the numbers alone, before any evidence)
+        1. ``page_size >= resultset_size`` — refuse to enumerate at all and
+           return NO rows.  See the guard body for why a partial list is worse
+           than none.
+        2. ``max_pages`` exhausted while the last page was still full.
+
+      EMPIRICAL (compares fetched against what the server says exists)
+        3. The census probe returned no usable count.
+        4. ``rows_seen < expected_rows`` — the enumeration is SHORT.
+
+    BOTH kinds are kept, and neither subsumes the other.  ``resultset_size``
+    is an assumption about server configuration; if the live server is ever
+    configured BELOW it, the structural check passes and the short-page break
+    lies exactly as an unpaginated query does today — the identical silent
+    truncation, undetected — and only the census catches it.  Conversely the
+    structural check fails FAST, before any query, with a specific operator
+    action.  They fail differently and usefully.
+
+    Completeness is ``rows_seen >= expected_rows``, NOT ``==``: a corpus that
+    grew between the census probe and the last page is not a truncation, and
+    on a graph under continuous write, growth is the common case.
+
+    WHY THE TWO KINDS ARE NAMED SEPARATELY on ``PagedRead.incomplete_kind``,
+    and why callers branch on ``INCOMPLETE_STRUCTURAL_KINDS`` rather than on
+    an individual kind: the split is not a taxonomy for its own sake, it is
+    the line between "safe to raise on" and "must not raise on".
+
+      The STRUCTURAL kinds are DETERMINISTIC and non-transient.  They are
+      properties of the configuration and of this code — a page size at or
+      above the cap, a page budget too small for the corpus.  They reproduce
+      exactly on retry, they can never be caused by a concurrent write, and
+      neither is reachable at the shipped defaults.  A caller that treats
+      them as fatal will never be woken by a passing graph.
+
+      The EMPIRICAL kinds are transient-capable.  A census disagreeing by a
+      handful of rows is the *expected* signature of a live graph being
+      written to mid-read, not evidence of a defect, which is precisely why
+      the design warns rather than raises on them: raising would take down
+      the reconciliation rebuild for something that self-heals next cycle.
+
+    KNOWN RESIDUAL, left open deliberately (task 4340): a materially-short
+    ``INCOMPLETE_SHORT_READ`` still returns a partial collection that the
+    ``force=True`` rebuild path writes back.  Tightening guard 4 into a raise
+    is the WRONG fix — it fires on a single concurrently-invalidated edge, so
+    it would take down the live rebuild for exactly the transient described
+    above.  Full statement, the affected call site, and the ticket that closes
+    it are in the RESULT-SET CAP AUDIT block at the top of this module.
+
+    Args:
+        graph: FalkorDB graph handle exposing ``async ro_query(cypher, params)``.
+        page_template: Page query with ``{skip}``/``{limit}`` placeholders,
+            both required. Other braces are left untouched (see
+            ``_render_page_bounds``); no escaping is needed.
+        census_cypher: Single-row ``count(*)`` over the identical MATCH/WHERE.
+        params: Optional bound parameters, passed to every query.
+        page_size: Rows per page. Must stay strictly below ``resultset_size``.
+        resultset_size: Assumed server row cap (see ``_RESULTSET_SIZE``).
+        max_pages: Hard bound on pages fetched.
+
+    Returns:
+        PagedRead. ``reason`` is None exactly when ``complete`` is True.
+    """
+    page_size = int(page_size)
+    resultset_size = int(resultset_size)
+    max_pages = int(max_pages)
+
+    # Guard 1 (structural). At or above the cap there is nothing trustworthy
+    # to return, so return nothing. The short-page break reasons "this page
+    # was not full, therefore the data is exhausted" — sound only while the
+    # server cannot be what shortened it. At or above the cap those two causes
+    # are indistinguishable, and a partial list would simply invite the caller
+    # to use it anyway, recreating the silently-short-collection defect one
+    # layer up. The comparison is >= and not > deliberately: equality is
+    # arithmetically safe on a server configured at exactly _RESULTSET_SIZE,
+    # but that constant is an assumption, so equality leaves zero margin and a
+    # server configured one row lower silently re-opens the truncation.
+    if page_size >= resultset_size:
+        reason = (
+            f'page_size={page_size} is at or above the assumed server '
+            f'resultset_size={resultset_size}, so a short page cannot be '
+            f'distinguished from a server-truncated one; refusing to '
+            f'enumerate. Re-run with a page size well below the cap '
+            f'(default {_DEFAULT_READ_PAGE_SIZE}).'
+        )
+        logger.warning('_paged_ro_query: %s', reason)
+        return PagedRead(
+            rows=[],
+            complete=False,
+            rows_seen=0,
+            expected_rows=None,
+            reason=reason,
+            incomplete_kind=INCOMPLETE_STRUCTURAL_REFUSAL,
+        )
+
+    # Census FIRST, before paging, so the target is fixed up front rather than
+    # inferred from the same pages whose completeness is in question.
+    expected = await _census_count(graph, census_cypher, params)
+    if expected is None:
+        # Guard 3 (empirical). An unavailable proof is not a passing proof —
+        # but keep paging: the rows are still worth returning, only the proof
+        # is missing.
+        logger.warning(
+            '_paged_ro_query: census probe returned no usable count '
+            '(cypher=%r); the enumeration cannot be proven complete and will '
+            'be reported incomplete even if every row was fetched',
+            census_cypher,
+        )
+
+    rows: list[list] = []
+    skip = 0
+    paged_to_the_end = False
+    for _ in range(max_pages):
+        page_cypher = _render_page_bounds(page_template, skip=skip, limit=page_size)
+        result = await graph.ro_query(page_cypher, params)
+        page = list(getattr(result, 'result_set', None) or [])
+        rows.extend(page)
+        if len(page) < page_size:
+            paged_to_the_end = True
+            break
+        skip += len(page)
+
+    rows_seen = len(rows)
+
+    reason: str | None = None
+    kind: str | None = None
+    if not paged_to_the_end:
+        # Guard 2 (structural). Hitting the page cap on a still-full page is
+        # REPORTED, never swallowed: a page cap that truncated in silence
+        # would just be this module's own defect, one layer up.
+        kind = INCOMPLETE_PAGE_CAP
+        reason = (
+            f'max_pages={max_pages} exhausted at page_size={page_size} with '
+            f'rows_seen={rows_seen} and the last page still full, so more '
+            f'rows almost certainly remain unread'
+        )
+        logger.warning('_paged_ro_query: %s', reason)
+    elif expected is None:
+        kind = INCOMPLETE_CENSUS_UNAVAILABLE
+        reason = (
+            f'census probe returned no usable count, so the {rows_seen} rows '
+            f'fetched cannot be proven to be all of them'
+        )
+    elif rows_seen < expected:
+        # Guard 4 (empirical). Name BOTH candidate causes: an operator reading
+        # this log must not be misled into chasing a phantom truncation when
+        # the graph was simply written to mid-read.
+        kind = INCOMPLETE_SHORT_READ
+        reason = (
+            f'enumeration is SHORT: fetched rows_seen={rows_seen} but the '
+            f'census reports expected_rows={expected}. Most likely a server '
+            f'result-set cap below the assumed resultset_size={resultset_size}; '
+            f'the benign alternative is concurrent invalidation of edges '
+            f'between the census probe and the last page'
+        )
+        logger.warning('_paged_ro_query: %s', reason)
+
+    return PagedRead(
+        rows=rows,
+        complete=reason is None,
+        rows_seen=rows_seen,
+        expected_rows=expected,
+        reason=reason,
+        incomplete_kind=kind,
+    )
+
+
+def _apply_incompleteness_policy(
+    paged: PagedRead,
+    *,
+    method: str,
+    group_id: str,
+    returned_count: int,
+    noun: str,
+    consequence: str,
+) -> None:
+    """Apply the SPLIT incompleteness policy to a shim's PagedRead.
+
+    ONE implementation, shared by every back-compat shim over
+    ``_paged_ro_query``, because the policy is a single decision and not a
+    per-method opinion: copies drift, and the drift would be silent in exactly
+    the direction that matters — a shim that forgot to raise returns a
+    fabricated empty and the write-back path blanks summaries with it.  It is
+    also the single seam the follow-up ticket
+    (tkt_0RSJP8CH1M9GAAJTABV8FZB4AH, wire the completeness signal through to
+    consumers) has to move when the policy migrates to the consumer.
+
+      STRUCTURAL (``INCOMPLETE_STRUCTURAL_KINDS``) -> raise
+      ``IncompleteEnumerationError``.  Deterministic, non-transient, and
+      unreachable at the shipped defaults, so a raise here cannot flap.
+
+      EMPIRICAL (census unavailable, or a short read) -> WARN naming the
+      numbers and return what was fetched.  Transient-capable on a graph
+      under continuous write; raising would take the live rebuild down for
+      something that self-heals next cycle.
+
+    Args:
+        paged: The PagedRead the enumeration returned.
+        method: Shim name, for the message an operator reads.
+        group_id: Graph the read targeted.
+        returned_count: Size of the collection the shim would return.
+        noun: What ``returned_count`` counts, e.g. ``'entities'``/``'nodes'``.
+        consequence: Method-specific clause naming what must NOT be done with
+            a structurally incomplete result, appended to the raise message.
+
+    Raises:
+        IncompleteEnumerationError: ``paged`` is structurally incomplete.
+    """
+    if paged.incomplete_kind in INCOMPLETE_STRUCTURAL_KINDS:
+        raise IncompleteEnumerationError(
+            f'{method}(group_id={group_id!r}): the enumeration was '
+            f'structurally incomplete '
+            f'(incomplete_kind={paged.incomplete_kind!r}), so the '
+            f'{returned_count} {noun} it would have returned are not an '
+            f'answer and {consequence}. {paged.reason}'
+        )
+    if not paged.complete:
+        logger.warning(
+            '%s(group_id=%r): enumeration INCOMPLETE — returning %d rows as '
+            '%d %s, but %s. rows_seen=%s expected_rows=%s',
+            method, group_id, paged.rows_seen, returned_count, noun,
+            paged.reason, paged.rows_seen, paged.expected_rows,
+        )
 
 
 def _as_sortable_utc(created_at: datetime | None) -> datetime:
@@ -356,6 +1134,12 @@ class GraphitiBackend:
         self._indexed_graphs: set[str] = set()
         self._cloned_drivers: dict[str, GraphDriver] = {}
         self._identity_locks: dict[str, asyncio.Lock] = {}
+        # Guards ensure_indices' read-diff-write critical section, one Lock per
+        # graph.  Deliberately SEPARATE from _identity_locks: asyncio.Lock is not
+        # reentrant, and task γ's first-write choke point calls ensure_indices
+        # from a write path that may already hold _identity_lock_for(group_id) —
+        # reusing that lock would deadlock rather than serialize.
+        self._index_provision_locks: dict[str, asyncio.Lock] = {}
         self._llm_client = None
         self._embedder = None
         self._cross_encoder = None
@@ -472,13 +1256,44 @@ class GraphitiBackend:
         return cast(Any, driver).client
 
     async def _ensure_indices(self, group_id: str) -> None:
-        """Build indices on *group_id*'s graph if not already done this session."""
+        """A DELIBERATE no-op today. NOT the provisioning path — see ``ensure_indices``.
+
+        ``build_indices_and_constraints`` is overridden to ``pass`` on
+        ``_MultiTenantFalkorDriver`` (D4, kept on purpose: removing it is what
+        caused the ``723ec915c3`` connection storm), so this method builds
+        nothing.  It previously ended with a ``logger.debug`` line claiming the
+        graph's indices had been ensured — fired unconditionally after that
+        no-op, and at DEBUG, so at the service's INFO level it produced neither a
+        positive nor a negative signal.  There was no signal in the logs at all.
+        Task 3707 (β) deleted it; the structured :class:`IndexProvisionResult`
+        (INFO on change, WARNING on failure) replaces it at the boundary where the
+        work actually happens.  ``test_ensure_indices.py`` pins the property
+        behaviourally — this method must emit no log record at ANY level — so the
+        guard tracks the semantics rather than a substring, and stays valid under
+        any rewording here.
+
+        β deliberately does NOT route this method through
+        :meth:`ensure_indices`, and that is not an abandoned half-fix.
+        ``initialize()`` enumerates every graph on the server under the
+        ``!= 'default_db' and not endswith('_db')`` filter — all 35 probe / test /
+        scratch graphs plus the 6 real trap graphs — and calls this on each.
+        Wiring it here would therefore provision every real project graph on the
+        next ``fused-memory.service`` restart: destroying esc-3375-1's protected
+        evidence (the current absence of indices) and bypassing PRD D10's
+        activation gate, which is exactly why the follow-on task γ depends on
+        external tasks 3658/3659/3660 and is named "the task whose merge changes
+        live graphs".
+
+        **Task γ owns the rewiring** — both call sites (the startup enumeration
+        and the first-write choke point) — and lands the D5 registry filter in the
+        same change, so the enumeration stops sweeping scratch graphs at the
+        moment it starts doing real work.
+        """
         if group_id in self._indexed_graphs:
             return
         driver = self._driver_for(group_id)
         await driver.build_indices_and_constraints()
         self._indexed_graphs.add(group_id)
-        logger.debug('Ensured indices on graph %r', group_id)
 
     async def initialize(self, *, skip_maintenance: bool = False) -> None:
         """Create FalkorDriver + Graphiti client from unified config.
@@ -494,36 +1309,7 @@ class GraphitiBackend:
         cfg = self.config
 
         # --- LLM client ---
-        llm_client = None
-        if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
-            api_key = cfg.llm.providers.openai.api_key
-            if api_key:
-                check_openai_responses_api()
-                llm_config = GraphitiLLMConfig(
-                    api_key=api_key,
-                    model=cfg.llm.model,
-                    small_model=cfg.llm.model,
-                    temperature=cfg.llm.temperature or 0.0,
-                    max_tokens=cfg.llm.max_tokens,
-                )
-                llm_client = OpenAIClient(config=llm_config)
-                logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
-        elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
-            api_key = cfg.llm.providers.anthropic.api_key
-            if api_key:
-                try:
-                    from graphiti_core.llm_client.anthropic_client import AnthropicClient
-
-                    llm_config = GraphitiLLMConfig(
-                        api_key=api_key,
-                        model=cfg.llm.model,
-                        temperature=cfg.llm.temperature or 0.0,
-                        max_tokens=cfg.llm.max_tokens,
-                    )
-                    llm_client = AnthropicClient(config=llm_config)
-                    logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
-                except ImportError:
-                    logger.warning('Anthropic client not available for Graphiti')
+        llm_client = build_llm_client(cfg)
 
         # --- Embedder ---
         embedder_client = None
@@ -635,12 +1421,24 @@ class GraphitiBackend:
         entity_types: dict | None = None,
         uuid: str | None = None,
         temporal_context: str | None = None,
+        unverified_claim: bool = False,
     ) -> Any:
-        """Add an episode to Graphiti and return the result."""
+        """Add an episode to Graphiti and return the result.
+
+        ``unverified_claim`` (task 3142) prefixes ``source_description`` with
+        ``'[unverified_claim] '``, exactly as ``temporal_context`` prefixes it
+        with ``'[temporal:X] '``. It is applied OUTERMOST so the caveat is the
+        first thing a reader of the episodic node sees, and so the two prefixes
+        compose rather than overwrite. This is the only channel that reaches
+        the persisted episode: the harm being labelled is the EDGES extracted
+        from it, not the tool response.
+        """
         client = self._client_for(group_id)
         ref_time = reference_time or datetime.now(UTC)
         if temporal_context is not None:
             source_description = f'[temporal:{temporal_context}] {source_description}'
+        if unverified_claim:
+            source_description = f'[unverified_claim] {source_description}'
         return await asyncio.wait_for(
             client.add_episode(
                 name=name,
@@ -1395,51 +2193,39 @@ class GraphitiBackend:
         return [row[0] for row in (result.result_set or [])]
 
     @_canonicalize_group_args
-    async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
-        """Return all currently-valid RELATES_TO edges grouped by entity UUID.
+    async def enumerate_all_valid_edges(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE
+    ) -> tuple[dict[str, list[EdgeDict]], PagedRead]:
+        """Paginated variant of get_all_valid_edges that also reports completeness.
 
-        Bulk variant of get_valid_edges_for_node that issues a single Cypher query
-        instead of O(N) per-entity round-trips.  The undirected MATCH pattern causes
-        each directed edge to appear under both its source and target entity: for a
-        directed A→B edge, traversal matches it from A's side (row: A.uuid, e.uuid)
-        and from B's side (row: B.uuid, e.uuid) — two genuinely distinct rows because
-        n.uuid differs.
-
-        Deduplicates in Python, keyed on (n.uuid, e.uuid). RELATES_TO edge uuids
-        are unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
-        redirect_node_edges; task 2210 W6-epsilon repaired legacy dup-uuid edges),
-        so keying on the (entity, edge-uuid) pair is equivalent to the prior
-        element-identity dedup: it preserves the intended double-attribution (each
-        directed edge appears once under each endpoint entity, as distinct
-        (n.uuid, e.uuid) pairs) and still collapses the undirected self-loop
-        double-match (A→A edges, where both traversal directions yield the
-        identical (n.uuid, e.uuid) pair).
-
-        Uses ro_query since no writes are performed.
+        Same grouping and dedup semantics as get_all_valid_edges (which is a
+        thin shim over this method); the difference is that the completeness
+        of the underlying enumeration is returned as a first-class value
+        instead of only reaching a log line.
 
         Args:
             group_id: Project graph to query.
+            page_size: Rows per page. Must stay strictly below the server's
+                result-set cap — see _paged_ro_query.
 
         Returns:
-            Dict mapping entity UUID → list of edge dicts with keys: uuid, fact, name.
-            fact and name default to empty string when the property is NULL.
-            Each directed edge appears under both its source and target entity UUID
-            (double-attribution from the undirected MATCH pattern).
-
-        Note:
-            Using a directed pattern (n:Entity)-[e:RELATES_TO]->() would give
-            single-appearance semantics per edge if ever needed.
+            (grouped, paged) where *grouped* is the same dict
+            get_all_valid_edges returns and *paged* is the PagedRead carrying
+            ``complete``/``rows_seen``/``expected_rows``/``reason``.
         """
         graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH (n:Entity)-[e:RELATES_TO]-() '
-            'WHERE e.invalid_at IS NULL '
-            'RETURN n.uuid, e.uuid, e.fact, e.name'
+        paged = await _paged_ro_query(
+            graph,
+            _ALL_VALID_EDGES_PAGE_TEMPLATE,
+            _ALL_VALID_EDGES_CENSUS,
+            page_size=page_size,
         )
-        result = await graph.ro_query(cypher)
+        # The dedup map is built ONCE across every page, never per page: the
+        # same (n.uuid, e.uuid) pair can straddle a page boundary, and a
+        # per-page map would let the repeat through and double-count the edge.
         seen: dict[tuple[str, str], EdgeDict] = {}
         grouped: dict[str, list[EdgeDict]] = {}
-        for row in (result.result_set or []):
+        for row in paged.rows:
             entity_uuid, edge_uuid = row[0], row[1]
             key = (entity_uuid, edge_uuid)
             if key in seen:
@@ -1459,6 +2245,78 @@ class GraphitiBackend:
             edge = self._edge_dict(row[1], row[2], row[3])
             seen[key] = edge
             grouped.setdefault(entity_uuid, []).append(edge)
+        return grouped, paged
+
+    @_canonicalize_group_args
+    async def get_all_valid_edges(self, *, group_id: str) -> dict[str, list[EdgeDict]]:
+        """Return all currently-valid RELATES_TO edges grouped by entity UUID.
+
+        Bulk variant of get_valid_edges_for_node that pages through the whole
+        graph instead of O(N) per-entity round-trips.  The undirected MATCH pattern causes
+        each directed edge to appear under both its source and target entity: for a
+        directed A→B edge, traversal matches it from A's side (row: A.uuid, e.uuid)
+        and from B's side (row: B.uuid, e.uuid) — two genuinely distinct rows because
+        n.uuid differs.
+
+        Deduplicates in Python, keyed on (n.uuid, e.uuid). RELATES_TO edge uuids
+        are unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
+        redirect_node_edges; task 2210 W6-epsilon repaired legacy dup-uuid edges),
+        so keying on the (entity, edge-uuid) pair is equivalent to the prior
+        element-identity dedup: it preserves the intended double-attribution (each
+        directed edge appears once under each endpoint entity, as distinct
+        (n.uuid, e.uuid) pairs) and still collapses the undirected self-loop
+        double-match (A→A edges, where both traversal directions yield the
+        identical (n.uuid, e.uuid) pair).
+
+        Uses ro_query since no writes are performed.
+
+        PAGINATED (task 4340).  This read is NOT a single query: FalkorDB
+        truncates every result set at a server-wide RESULTSET_SIZE ceiling,
+        silently, and this query exceeded it by roughly 2x on the live corpus
+        — about HALF the valid-edge population was invisible to every caller,
+        with no error and no marker.  Do not "simplify" it back to one query.
+        The measured row counts, the paging cost, and the per-query audit that
+        found this live in the RESULT-SET CAP AUDIT block at the top of this
+        module (the single place they are recorded, so a re-measurement is a
+        one-block edit); the ORDER BY and completeness rules that make paging
+        safe are in _paged_ro_query.
+
+        Incompleteness is handled by the shared _apply_incompleteness_policy:
+        STRUCTURAL kinds raise IncompleteEnumerationError, EMPIRICAL ones warn
+        and return what was fetched.  See that helper for the policy and
+        IncompleteEnumerationError for why a structural non-read must not be
+        handed back as a collection.  enumerate_all_valid_edges returns the
+        same completeness signal as a value and never raises.
+
+        Args:
+            group_id: Project graph to query.
+
+        Returns:
+            Dict mapping entity UUID → list of edge dicts with keys: uuid, fact, name.
+            fact and name default to empty string when the property is NULL.
+            Each directed edge appears under both its source and target entity UUID
+            (double-attribution from the undirected MATCH pattern).
+
+        Raises:
+            IncompleteEnumerationError: The underlying enumeration was
+                structurally incomplete — see the policy above.
+
+        Note:
+            Using a directed pattern (n:Entity)-[e:RELATES_TO]->() would give
+            single-appearance semantics per edge if ever needed.  It would also
+            roughly halve the row count — but pagination would still be
+            required, because 12506 distinct edges exceeds the cap on its own.
+            Halving buys margin, not correctness.
+        """
+        grouped, paged = await self.enumerate_all_valid_edges(group_id=group_id)
+        _apply_incompleteness_policy(
+            paged,
+            method='get_all_valid_edges',
+            group_id=group_id,
+            returned_count=len(grouped),
+            noun='entities',
+            consequence='must not be written back',
+        )
         return grouped
 
     @_canonicalize_group_args
@@ -2702,6 +3560,74 @@ class GraphitiBackend:
         }
 
     @_canonicalize_group_args
+    async def enumerate_entity_nodes(
+        self, *, group_id: str, page_size: int = _DEFAULT_READ_PAGE_SIZE
+    ) -> tuple[list[dict], PagedRead]:
+        """Paginated variant of list_entity_nodes that also reports completeness.
+
+        Same rows and same NULL coercions as list_entity_nodes (which is a thin
+        shim over this method); the difference is that the completeness of the
+        underlying enumeration is returned as a first-class value instead of
+        only reaching a log line.
+
+        Args:
+            group_id: Project graph to query.
+            page_size: Rows per page. Must stay strictly below the server's
+                result-set cap — see _paged_ro_query.
+
+        Rows are deduplicated on ``n.uuid`` across ALL pages — see the loop
+        body for why paging makes that necessary where a single query never
+        did.
+
+        Returns:
+            (nodes, paged) where *nodes* is the same list list_entity_nodes
+            returns and *paged* is the PagedRead carrying
+            ``complete``/``rows_seen``/``expected_rows``/``reason``.  Note that
+            ``paged.rows_seen`` counts ROWS FETCHED, so it can exceed
+            ``len(nodes)`` when a boundary row was re-emitted.
+        """
+        graph = self._graph_for(group_id)
+        paged = await _paged_ro_query(
+            graph,
+            _ENTITY_NODES_PAGE_TEMPLATE,
+            _ENTITY_NODES_CENSUS,
+            page_size=page_size,
+        )
+        # Dedup on n.uuid, built ONCE across every page — mirroring the
+        # (n.uuid, e.uuid) map in enumerate_all_valid_edges, and necessary for
+        # the same reason: this is a hazard PAGING INTRODUCED, not one it
+        # inherited.  Each page is a separate query against a graph under
+        # concurrent write, so an Entity inserted with a uuid sorting BEFORE
+        # the current offset shifts every later row up by one and the next
+        # page's SKIP re-returns the previous page's last row.  A single
+        # unpaginated query could never return a uuid twice, so every consumer
+        # is entitled to assume it cannot happen — and the ones downstream do:
+        # detect_stale_with_edges reports one stale entry per element and uses
+        # len(entities) as its total_count denominator, and
+        # rebuild_entity_summaries would schedule two concurrent writers for
+        # the repeated node.
+        seen: set[str] = set()
+        nodes: list[dict] = []
+        for row in paged.rows:
+            uuid = row[0]
+            if uuid in seen:
+                logger.debug(
+                    'enumerate_entity_nodes: node uuid %r seen on more than '
+                    'one page — most likely a row re-emitted across a '
+                    'SKIP/LIMIT boundary by a concurrent insert; keeping '
+                    'first-seen row',
+                    uuid,
+                )
+                continue
+            seen.add(uuid)
+            nodes.append({
+                'uuid': uuid,
+                'name': row[1] or '',
+                'summary': row[2] or '',
+            })
+        return nodes, paged
+
+    @_canonicalize_group_args
     async def list_entity_nodes(self, *, group_id: str) -> list[dict]:
         """Return all Entity nodes (uuid, name, summary) for a given group_id.
 
@@ -2709,24 +3635,45 @@ class GraphitiBackend:
         group_id filter is needed in the Cypher itself.  Uses ro_query since
         no writes are performed.
 
+        PAGINATED (task 4340).  This read was truncated at the same server-wide
+        RESULTSET_SIZE ceiling as get_all_valid_edges — measured counts in the
+        RESULT-SET CAP AUDIT block at the top of this module.
+
+        THE COMPOUNDING HAZARD, and the reason this method is in scope for a
+        task nominally about edges: ``detect_stale_with_edges`` calls this
+        method and ``get_all_valid_edges`` on consecutive lines, and the two
+        truncations were INDEPENDENT.  An entity that survived the node cut
+        could still lose every one of its edges to the edge cut, yielding a
+        bogus "stale, zero valid facts" verdict that ``rebuild_entity_from_edges``
+        then WROTE BACK into ``n.summary``.  That makes the defect corrupting
+        rather than merely under-reporting, which is why it was fixed rather
+        than deferred.
+
+        Incompleteness is handled by the same shared
+        _apply_incompleteness_policy get_all_valid_edges uses; see that helper.
+        enumerate_entity_nodes returns the signal as a value and never raises.
+
         Args:
             group_id: Project graph to query.
 
         Returns:
             List of dicts with keys: uuid, name, summary (summary defaults to
             empty string when the node property is NULL).
+
+        Raises:
+            IncompleteEnumerationError: The underlying enumeration was
+                structurally incomplete.
         """
-        graph = self._graph_for(group_id)
-        cypher = 'MATCH (n:Entity) RETURN n.uuid, n.name, n.summary'
-        result = await graph.ro_query(cypher)
-        return [
-            {
-                'uuid': row[0],
-                'name': row[1] or '',
-                'summary': row[2] or '',
-            }
-            for row in (result.result_set or [])
-        ]
+        nodes, paged = await self.enumerate_entity_nodes(group_id=group_id)
+        _apply_incompleteness_policy(
+            paged,
+            method='list_entity_nodes',
+            group_id=group_id,
+            returned_count=len(nodes),
+            noun='nodes',
+            consequence='must not drive a staleness verdict or a summary rewrite',
+        )
+        return nodes
 
     @_canonicalize_group_args
     async def detect_stale_with_edges(
@@ -2736,6 +3683,30 @@ class GraphitiBackend:
 
         Shared by detect_stale_summaries (public API) and MemoryService.rebuild_entity_summaries
         to avoid a duplicate bulk edge fetch when both are needed.
+
+        Both reads below are paginated (task 4340).  Before that they were
+        INDEPENDENTLY truncated at the server's 10000-row result-set cap, and
+        the compounding is what made the defect corrupting: an entity that
+        survived the node cut could still lose every edge to the edge cut,
+        yielding a bogus "stale, zero valid facts" verdict that
+        rebuild_entity_from_edges then wrote back into n.summary.
+
+        ``total_count`` is fixed by construction as a side effect: it is
+        ``len(entities)``, and so was a silently-capped denominator (10000 on
+        any graph above the cap) that made every rate computed against it
+        wrong.  With pagination it is the true node count.
+
+        PROTECTED AT THE SOURCE.  Both calls below are the back-compat shims,
+        which RAISE ``IncompleteEnumerationError`` on a structurally
+        incomplete read.  So this method can no longer manufacture a stale
+        verdict from a non-enumeration: were the edge read to return a
+        fabricated ``{}`` (or a uuid-ordered PREFIX), ``_build_stale_entry``
+        would compute ``canonical = '\\n'.join([]) == ''`` for every affected
+        entity, find ``summary != canonical`` for every non-empty summary, and
+        report the whole graph stale — which ``rebuild_entity_from_edges``
+        would then write back as ``''``.  The raise stops that before a single
+        verdict is formed.  An empirically short read still reaches here and
+        is only WARNed about; see the residual noted in the module audit.
 
         Args:
             group_id: Project graph to query.
@@ -3014,6 +3985,43 @@ class GraphitiBackend:
 
         Each record is a dict with keys: label, field, type, entity_type.
 
+        Columns are resolved BY NAME from ``result.header``, not positionally.
+        The measured live header (2026-08-06, task 3706) is 9 two-tuples::
+
+            [label, properties, types, options, language, stopwords,
+             entitytype, status, info]
+
+        This method previously bound ``entity_type`` to ``row[3]`` — the
+        ``options`` column, an ``OrderedDict`` like ``{'uuid': {}}`` — instead of
+        ``entitytype`` (``row[6]``, the string ``'NODE'``/``'RELATIONSHIP'``).
+        The fix is by-name resolution rather than a corrected index: switching to
+        ``row[6]`` would repair today's symptom while leaving the same silent
+        degradation armed for the next FalkorDB column reorder.
+
+        The resolution is delegated to
+        ``fused_memory.backends.falkor_indices.resolve_header_positions`` rather
+        than hand-rolled here, so the next reader of ``CALL db.indexes()``
+        (β's ``ensure_indices``, δ's ``summarize_index_health``) shares one
+        implementation instead of re-forking the build-names / check-missing /
+        ``.index()`` sequence — re-forking is how the positional read survived.
+        ``tests/_fm_helpers.await_index_operational`` still carries its own copy
+        (it resolves ``status`` by name for exactly this reason); collapsing that
+        third copy onto this helper is filed as a follow-up, as ``_fm_helpers``
+        is outside task 3706's locked scope.
+
+        A missing required column — or a header entry that is not a
+        ``(type, name)`` pair — raises ``IndexHeaderShapeError`` (a ``ValueError``
+        subclass, preserving this method's historical contract) rather than
+        returning a record with a silently-wrong or absent value.
+
+        Note the returned ``type`` value is the ``types`` COLUMN — a dict of
+        property -> list of index-type strings, e.g. ``{'uuid': ['RANGE']}`` —
+        NOT a scalar.  ``fused_memory.backends.falkor_indices.normalize_index_record``
+        models that shape, as does ``falkor_indices.vector_index_properties``,
+        through which ``drop_vector_indices`` consumes it PER PROPERTY.  Reading
+        it as a scalar is exactly the defect task 3769 fixed; see that method's
+        docstring.
+
         Note on the CALL db.indexes() procedure and the read-only path:
         ``CALL db.indexes()`` is the *only* stored-procedure call sent on the
         read-only path in this file — all other ``ro_query`` callers use plain
@@ -3033,37 +4041,369 @@ class GraphitiBackend:
         # CALL db.indexes() is a read-only procedure; FalkorDB accepts it via
         # GRAPH.RO_QUERY (verified via test_list_indices_integration.py).
         result = await graph.ro_query('CALL db.indexes()')
+
+        # Resolve columns by name, so a FalkorDB column reorder fails loudly
+        # here instead of silently reading the wrong column (see the docstring).
+        # The resolution itself lives in falkor_indices so this is not a second
+        # hand-rolled copy of it -- see resolve_header_positions.
+        positions = resolve_header_positions(
+            result.header,
+            {
+                'label': 'label',
+                'field': 'properties',
+                'type': 'types',
+                'entity_type': 'entitytype',
+            },
+        )
+
         indices = []
         for row in (result.result_set or []):
-            indices.append({
-                'label': row[0],
-                'field': row[1],
-                'type': row[2],
-                'entity_type': row[3],
-            })
+            indices.append({key: row[idx] for key, idx in positions.items()})
         return indices
 
     @_canonicalize_group_args
+    async def ensure_indices(self, *, group_id: str) -> IndexProvisionResult:
+        """Provision *group_id*'s graph up to the expected index set. Task 3707 (β).
+
+        Diff-then-create, never create-and-hope: the expected set
+        (``falkor_indices.expected_index_set``, derived from what graphiti itself
+        emits) is differenced against what the graph ACTUALLY carries
+        (``list_indices`` projected through ``normalize_index_records``), and only
+        the gap is written.
+
+        Contract
+        --------
+        * **Idempotent.**  A fully-provisioned graph is not written to at all —
+          the plan is empty, so no statement is issued.  Idempotence is
+          structural; it does NOT rest on FalkorDB tolerating a re-create (D2).
+        * **Never raises on a per-statement failure.**  A rejected statement is
+          recorded in ``failed`` with its error text and logged at WARNING, and
+          the remaining statements are still issued.  This is the whole point:
+          the loop it replaces lets one rejection take down everything after it,
+          and ``falkordb_driver.py``'s ``execute_query`` swallows the error so
+          nothing in the logs says so.
+        * **Absorbing a per-statement failure is the ONLY absorb.**  Everything
+          else fails CLOSED and propagates — see ``Raises`` below.  In particular
+          an unreachable driver raises rather than reading as "zero indices".  A
+          graph that does not exist yet DOES carry zero indices and is provisioned
+          from scratch — measured, the CREATE statements auto-create the key, so
+          this is self-healing.  Absence is decided STRUCTURALLY
+          (``group_id not in await client.list_graphs()``), never by matching
+          FalkorDB's error wording (D2).
+        * **Serialized per graph.**  The read-diff-write section runs under a
+          per-``group_id`` ``asyncio.Lock`` (``_index_provision_locks``, an
+          in-process registry separate from ``_identity_locks``; see ``__init__``
+          for why reusing the identity lock would deadlock).  Without it two
+          concurrent calls for one graph both observe the same pre-write ``actual``
+          and both issue the whole plan, so the loser collects ~30
+          ``Attribute '...' is already indexed`` rejections into ``failed`` —
+          indistinguishable from a genuine provisioning failure, and exactly the
+          signal task δ's drift detector keys on.  γ's first-write choke point is
+          the concurrent case by construction.
+          RESIDUAL, deliberately not solved here: the lock is per PROCESS.  Two
+          fused-memory processes provisioning one graph still produce that
+          signature, and a caller seeing a ``failed`` list that is entirely
+          ``already indexed`` errors should re-read before concluding drift.
+        * **RANGE indices are issued PER-PROPERTY**, never as upstream's composite
+          form — measured: the composite is rejected wholesale with
+          ``Attribute 'uuid' is already indexed`` when any listed property already
+          exists, losing all 4 (``Entity``) or all 7 (``RELATES_TO``) silently.
+          FULLTEXT is issued byte-verbatim, a form measured to succeed against
+          that same trap state.  See ``falkor_indices.plan_index_statements``.
+
+        LOAD-BEARING (INV-6): a spec in ``created`` means its ``CREATE`` was
+        ACCEPTED, **not** that the index is serving.  ``CREATE`` returns in
+        0.5-2.0 ms while the index reaches ``OPERATIONAL`` up to 594.5 ms later.
+        This method deliberately adds NO barrier and issues exactly one
+        ``CALL db.indexes()`` (the diff read) — establishing that an index is
+        serving is task ε's canary, and the wait belongs in test fixtures
+        (``tests/_fm_helpers.await_index_operational``), never here.
+
+        Decorated with ``@_canonicalize_group_args`` for correctness, not hygiene:
+        the writes resolve a FalkorDB graph KEY through ``_graph_for``, and the
+        inner ``list_indices`` call being decorated does not cover that — the diff
+        read and the writes resolve the key independently (PRD seam S4).
+
+        Measured live 2026-08-09 against uuid-suffixed scratch graphs (pinned in
+        ``tests/test_ensure_indices_integration.py``):
+
+        * Trap state (an ``Entity(uuid)`` + ``RELATES_TO(uuid)`` range index) →
+          24 per-property RANGE + 4 verbatim FULLTEXT = 28 statements, 0 failures,
+          all 11 previously-lost range fields restored.
+        * Virgin graph → 26 + 4 = 30 statements, ``len(created) == 38 ==
+          expected_total``.  Statement and spec counts differ because the 4
+          fulltext statements cover 12 specs between them — hence per-SPEC
+          accounting.
+        * Round-trip afterwards: ``normalize_index_records(list_indices(g)) ==
+          expected_index_set()`` exactly, which is what makes ``already_present ==
+          expected_total`` reachable on the idempotent re-run (measured: 0
+          statements issued).
+
+        Args:
+            group_id: The project/graph id to provision.
+
+        Returns:
+            An :class:`~fused_memory.backends.falkor_indices.IndexProvisionResult`
+            recording what was created, what was already there, what failed, and
+            the statements actually issued.
+
+        Raises:
+            PathShapedProjectIdError: *group_id* is path-shaped — raised by
+                ``@_canonicalize_group_args`` before any DB call.
+            IndexHeaderShapeError: ``CALL db.indexes()`` came back with columns α
+                cannot resolve by name (FalkorDB changed its result shape).  α
+                fails closed on purpose and β must NOT re-read that as "absent":
+                provisioning against an index state that was never determined is
+                the silent-fail-soft class this PRD removes (INV-4).
+            IndexRecordShapeError: a record projected to the wrong shape — same
+                fail-closed rationale.
+            UnparsedIndexStatementError: ``expected_index_set()`` could not parse
+                a statement graphiti emitted, i.e. an upgrade changed the
+                index-statement syntax.  Loud by design: a silently-shrunk
+                expected set under-reports what is missing.
+            ValueError: ``plan_index_statements`` was handed a spec whose shape it
+                refuses to guess a statement for.
+            Exception: whatever the driver raises when it is unreachable, from
+                either the diff read or the ``list_graphs()`` existence probe.
+
+            All five are DELIBERATE fail-closed raises, distinct from the
+            per-statement failures absorbed into ``failed``.  A caller wiring this
+            into a write path (task γ) must guard for them; a caller that treats
+            "it returned" as "indices exist" is reading the contract wrong either
+            way — see the INV-6 note above.
+        """
+        # See the "Serialized per graph" contract bullet: the diff read and the
+        # writes it plans must not interleave with another call for this graph.
+        lock = self._index_provision_locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._index_provision_locks[group_id] = lock
+        async with lock:
+            return await self._ensure_indices_locked(group_id)
+
+    async def _ensure_indices_locked(self, group_id: str) -> IndexProvisionResult:
+        """``ensure_indices``' body, run under that graph's provisioning lock.
+
+        Split out rather than inlined under ``async with`` so the critical section
+        is named: everything here is read-diff-write and MUST NOT be called
+        without the lock held.  *group_id* is already canonical — the caller is
+        decorated, this is not.
+        """
+        try:
+            records = await self.list_indices(group_id=group_id)
+        except (IndexHeaderShapeError, IndexRecordShapeError):
+            # α fails CLOSED when FalkorDB's result shape is not what it can
+            # project.  That must never be absorbed by the absent-graph branch
+            # below: a shape error on a graph missing from list_graphs() (a raced
+            # first write, a concurrently-deleted scratch key) would otherwise be
+            # read as `actual = set()` and issue the whole plan against a graph
+            # whose real index state was never determined (INV-4).  Re-raised
+            # ahead of the broad handler, which is scoped to "the key does not
+            # exist yet" and nothing else.
+            raise
+        except Exception:
+            # A graph KEY that has never been written does not exist yet, and
+            # `CALL db.indexes()` against it fails.  MEASURED 2026-08-09, the
+            # error is `redis.exceptions.ResponseError: Invalid graph operation
+            # on empty key` -- recorded here for the next reader, but deliberately
+            # NOT depended on.  D2: no correctness property may rest on FalkorDB's
+            # error WORDING; that is the same class of load-bearing sentinel that
+            # made the composite rejection invisible in the first place.
+            #
+            # The decision is made STRUCTURALLY instead, which also keeps the
+            # unreachable-driver raise for free: an
+            # unreachable driver makes list_graphs() raise too, so the original
+            # error propagates rather than being misread as "zero indices" --
+            # which would issue every statement against a graph that may already
+            # be fully provisioned.
+            #
+            # The RAW client's list_graphs() is used, not GraphitiBackend's, which
+            # filters `default_db` / `*_db` and would misclassify those names as
+            # absent.
+            if group_id in await self._require_falkor_client().list_graphs():
+                raise
+            records = []
+
+        # Normalized OUTSIDE the try on purpose: normalize_index_records raises
+        # IndexRecordShapeError, another of α's fail-closed errors, and inside the
+        # try it would be caught by the broad handler and silently become
+        # `actual = set()` on any graph that happens not to be in list_graphs().
+        actual = normalize_index_records(records)
+
+        expected = expected_index_set()
+        missing = expected - actual
+        already_present = len(expected & actual)
+
+        graph = self._graph_for(group_id)
+        created: list[IndexSpec] = []
+        failed: list[tuple[IndexSpec, str]] = []
+        statements: list[str] = []
+
+        for statement, specs in plan_index_statements(missing):
+            statements.append(statement)
+            try:
+                await graph.query(statement)
+            except Exception as exc:  # noqa: BLE001 - absorbed by contract, see docstring
+                failed.extend((spec, str(exc)) for spec in specs)
+                # Emitted HERE rather than reconstructed from `failed` afterwards
+                # because `failed` is keyed by IndexSpec, and a fulltext spec's
+                # statement is upstream's verbatim string, which cannot be derived
+                # back from the spec.  Both facts are in scope only inside the
+                # loop (D7: the absorb must never be silent).
+                logger.warning(
+                    'Index provisioning statement failed on graph %r: %s | statement: %s',
+                    group_id, exc, statement,
+                )
+            else:
+                created.extend(specs)
+
+        result = IndexProvisionResult(
+            created=tuple(created),
+            already_present=already_present,
+            failed=tuple(failed),
+            expected_total=len(expected),
+            statements=tuple(statements),
+        )
+
+        # Nothing is logged when nothing changed: a no-op must never emit a line
+        # an operator would read as "provisioned" (INV-2).  That false-positive is
+        # exactly what the DEBUG line deleted from _ensure_indices was.
+        if result.changed:
+            logger.info(
+                'Provisioned indices on graph %r: created=%d already_present=%d '
+                'failed=%d expected_total=%d',
+                group_id, len(result.created), result.already_present,
+                len(result.failed), result.expected_total,
+            )
+        return result
+
+    @_canonicalize_group_args
     async def drop_index(self, label: str, field: str, *, group_id: str) -> None:
-        """Drop an index on the given label and field (FalkorDB syntax)."""
+        """Drop a RANGE index on the given label and field (FalkorDB syntax).
+
+        RANGE ONLY — measured, the old-style ``DROP INDEX ON :label(field)`` form
+        this issues fails with ``no such index`` against a live VECTOR index.  A
+        VECTOR index must go through :meth:`drop_vector_index`; see
+        :meth:`drop_vector_indices` for the measurement and why it matters.
+        """
         graph = self._graph_for(group_id)
         cypher = f'DROP INDEX ON :{label}({field})'
         await graph.query(cypher)
 
     @_canonicalize_group_args
-    async def drop_vector_indices(self, *, group_id: str) -> list[dict]:
-        """Drop all VECTOR-type indices in the graph.
+    async def drop_vector_index(
+        self, label: str, field: str, *, entity_type: str, group_id: str,
+    ) -> None:
+        """Drop ONE VECTOR index, on the given label/property/entity type.
 
-        Calls list_indices() to find indices with type == 'VECTOR', then calls
-        drop_index() for each.  Returns a list of {'label': ..., 'field': ...}
-        dicts for each dropped index.
+        The VECTOR-specific sibling of :meth:`drop_index`, which is RANGE-only.
+        The statement shape comes from
+        :func:`fused_memory.backends.falkor_indices.vector_drop_statement`, which
+        raises on an unrecognised ``entity_type`` rather than guessing; see
+        :meth:`drop_vector_indices` for the measurements behind both.
+
+        Args:
+            label: Node label or relationship type carrying the index.
+            field: A SINGLE property name (not a list).
+            entity_type: ``'NODE'`` or ``'RELATIONSHIP'``.  KEYWORD-ONLY: it is
+                load-bearing (measured, the NODE statement against a RELATIONSHIP
+                vector index fails with ``no such index``) and it is a plain
+                ``str`` just like *field*, so a positional swap would type-check.
+                The argument order matches ``vector_drop_statement`` exactly —
+                ``(label, field)`` positional, ``entity_type`` by keyword — so
+                neither call site has to re-order to reach the other.
+            group_id: The graph to act on.
+        """
+        graph = self._graph_for(group_id)
+        await graph.query(vector_drop_statement(label, field, entity_type=entity_type))
+
+    @_canonicalize_group_args
+    async def drop_vector_indices(self, *, group_id: str) -> list[dict]:
+        """Drop every VECTOR index in the graph, one property at a time.
+
+        Calls :meth:`list_indices`, asks
+        :func:`fused_memory.backends.falkor_indices.vector_index_properties`
+        which properties of each record carry a VECTOR index, and issues one
+        :meth:`drop_vector_index` per (label, property).
+
+        Until task 3769 this was a PERMANENT NO-OP with THREE distinct defects,
+        each of which alone would have been enough to break it:
+
+        1. The predicate was ``entry.get('type') == 'VECTOR'``, comparing the
+           ``types`` COLUMN — a dict of property -> list of type strings, e.g.
+           ``{'name_embedding': ['VECTOR']}`` — against a bare string.  Never
+           true, so nothing was ever dropped.
+        2. It passed ``entry['field']`` — a LIST of properties, because FalkorDB
+           MERGES every index on a label into one record — where a per-property
+           string is required.  A list renders as ``ON (n.['name_embedding'])``.
+        3. It routed through :meth:`drop_index`, whose old-style
+           ``DROP INDEX ON :label(field)`` form targets RANGE indices ONLY.
+           MEASURED 2026-08-16: it fails against a live VECTOR index with
+           ``ERR Unable to drop index on :Entity(emb): no such index.``  So
+           repairing (1) and (2) alone would have converted a silent no-op into a
+           drop path that RAISES on the first vector index — a worse regression
+           than the bug, since ``reindex(drop_indices=True)`` would go from
+           quietly doing nothing to failing outright.
+
+        The measured-WORKING replacements, synthesized by
+        :func:`fused_memory.backends.falkor_indices.vector_drop_statement`, are
+        ``DROP VECTOR INDEX FOR (n:Label) ON (n.prop)`` for nodes and
+        ``DROP VECTOR INDEX FOR ()-[e:Label]-() ON (e.prop)`` for relationships
+        (``Indices deleted: 1`` each).  ``entity_type`` selects between them and
+        is load-bearing, not cosmetic: measured, the node form against a
+        RELATIONSHIP vector index also fails with ``no such index``.
+
+        The ``logger.info`` line below was therefore a measured-FALSE report: it
+        emitted "Dropped 0 VECTOR index(es)" on graphs that demonstrably had
+        vector indices.  An operator reading an old log line must not treat that
+        0 as evidence of an index-free graph.
+
+        Per-statement failures are NOT absorbed — deliberately the inverse of
+        :meth:`ensure_indices`, which tolerates them because a partial provision
+        beats none.  The sole caller (``maintenance/reindex.py``) drops indices
+        immediately BEFORE re-embedding, so a partial drop reported as success
+        would leave stale fixed-dimension indices behind while the operator
+        believes the rebuild was clean — the same silent fail-soft this method's
+        defect was.
+
+        Propagating is not the same as saying nothing, though.  A mid-loop failure
+        leaves the graph GENUINELY half-dropped, and neither the exception nor
+        ``ReindexManager.reindex_and_replay`` reports which indices are already
+        gone: ``indices_dropped`` is never assigned because this never returns, and
+        the local list dies with the frame.  So the partial list is logged at ERROR
+        before the re-raise — structured facts at failure, so the operator
+        recovering from it knows what already changed.  The propagate-don't-absorb
+        contract is unchanged.
+
+        Returns:
+            One ``{'label': ..., 'field': ...}`` dict per dropped index, with
+            ``field`` a single property STRING.  The shape is deliberately
+            unchanged: ``reindex.py``'s docstring documents it and
+            ``test_returns_list_of_dropped_indices`` asserts exact dict equality,
+            and ``label`` already disambiguates Entity from RELATES_TO.
         """
         indices = await self.list_indices(group_id=group_id)
         dropped: list[dict] = []
-        for entry in indices:
-            if entry.get('type') == 'VECTOR':
-                await self.drop_index(entry['label'], entry['field'], group_id=group_id)
-                dropped.append({'label': entry['label'], 'field': entry['field']})
+        try:
+            for record in indices:
+                for prop in vector_index_properties(record):
+                    await self.drop_vector_index(
+                        record['label'],
+                        prop,
+                        entity_type=record['entity_type'],
+                        group_id=group_id,
+                    )
+                    dropped.append({'label': record['label'], 'field': prop})
+        except Exception:
+            # The exception names the drop that FAILED; only this names the ones
+            # that already SUCCEEDED.  Without it the graph is half-dropped and
+            # nothing on the wire or in the logs says which half.
+            logger.error(
+                'drop_vector_indices failed on graph %r after dropping %d '
+                'index(es) — those are already gone, the rest remain: %r',
+                group_id, len(dropped), dropped,
+            )
+            raise
         logger.info(f'Dropped {len(dropped)} VECTOR index(es)')
         return dropped
 

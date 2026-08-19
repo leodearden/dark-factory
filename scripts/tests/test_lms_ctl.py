@@ -36,7 +36,10 @@ _FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
 """Fake `systemctl` recording every invocation (minus --user) as JSON.
 
 `list-units` echoes $FAKE_SYSTEMCTL_LIST_UNITS verbatim so a test can pin the
-exact column layout it must parse.  Everything else succeeds.
+exact column layout it must parse.  `show` echoes $FAKE_SYSTEMCTL_SHOW the same
+way, because the installer's parity gate asks systemd what the EFFECTIVE
+configuration is and an unanswered probe is (correctly) unverifiable rather
+than clean.  Everything else succeeds.
 """
 import json
 import os
@@ -55,6 +58,8 @@ def main(argv):
 
     if args and args[0] == "list-units":
         sys.stdout.write(os.environ.get("FAKE_SYSTEMCTL_LIST_UNITS", ""))
+    if args and args[0] == "show":
+        sys.stdout.write(os.environ.get("FAKE_SYSTEMCTL_SHOW", ""))
     if args and args[0] == "status":
         return int(os.environ.get("FAKE_SYSTEMCTL_STATUS_RC", "0"))
     return 0
@@ -63,6 +68,30 @@ def main(argv):
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
 '''
+
+
+@pytest.fixture(autouse=True)
+def no_real_gpu_probe(monkeypatch):
+    """Nothing in this module may shell out to the real `nvidia-smi`.
+
+    AUTOUSE, and that is the point.  `start()` reads the consumer inventory
+    itself when the caller passes no `consumers=`, so a test that only injects
+    `gpu=` silently reached the host's actual card -- and then PASSED OR FAILED
+    ON WHATEVER THAT CARD HAPPENED TO HOLD.  Verified: with a stub nvidia-smi
+    reproducing the documented 2026-08-06 reading (whisper 4050 + ollama
+    10314), seven tests in this file failed; they were green only because the
+    developer's card was idle at that moment.  A suite whose verdict depends on
+    the machine's GPU state is not pinning anything, and the failure would
+    surface as an unrelated-looking red on someone else's rig.
+
+    The default is the ORDINARY card -- whisper-writer alone, which every
+    `EXPECTED_CONSUMERS` rule admits -- so a test that does not care about the
+    inventory need not mention it.  A test that does care overrides this by
+    passing `consumers=` or monkeypatching again; both win, because they are
+    applied after.
+    """
+    monkeypatch.setattr(lms_vram, 'probe_gpu', lambda *a, **k: MEASURED_GPU)
+    monkeypatch.setattr(lms_vram, 'probe_gpu_consumers', lambda *a, **k: [WHISPER])
 
 
 @pytest.fixture
@@ -160,7 +189,7 @@ def test_start_records_the_pre_start_gpu_reading_as_this_arm_s_baseline(
     """
     lms_ctl.start(_arm(), gpu=MEASURED_GPU)
 
-    recorded = lms_vram.read_baseline('qwen3.5-9b')
+    recorded = lms_vram.read_baseline_record('qwen3.5-9b').reading
 
     assert recorded.used_mib == MEASURED_GPU.used_mib
     assert recorded.free_mib == MEASURED_GPU.free_mib
@@ -189,7 +218,438 @@ def test_restarting_an_arm_overwrites_its_previous_baseline(
 
     lms_ctl.start(_arm(), gpu=later)
 
-    assert lms_vram.read_baseline('qwen3.5-9b').used_mib == 8000
+    assert lms_vram.read_baseline_record('qwen3.5-9b').reading.used_mib == 8000
+
+
+# ---------------------------------------------------------------------------
+# the baseline carries WHO held the card, and a polluted card refuses a start
+# ---------------------------------------------------------------------------
+#
+# Measured on this host 2026-08-06: ollama (`/usr/local/lib/ollama/llama-server`,
+# pid 905936) held 10314 MiB with qwen3:14b resident on keep_alive while a slate
+# ran against the same card.  `ollama.service` is a persistent unit here, so
+# this is a recurring condition and not a one-off.
+#
+# The load-bearing assertion is again a NEGATIVE one: an arm must not be
+# launched onto a polluted card AND THEN judged against it.  Every number that
+# run produced would be uninterpretable, and the artifact would not say so.
+
+WHISPER = lms_vram.GpuConsumer(pid=7575, process_name='python', used_mib=4050)
+OLLAMA = lms_vram.GpuConsumer(
+    pid=905936, process_name='/usr/local/lib/ollama/llama-server', used_mib=10314,
+)
+
+
+def test_start_records_the_consumer_inventory_alongside_the_reading(
+    fake_systemctl, baseline_dir,
+):
+    """Who held the card is evidence, and it is captured by the start event for
+    the same reason the reading is: it cannot be typed in afterwards."""
+    lms_ctl.start(_arm(), gpu=MEASURED_GPU, consumers=[WHISPER])
+
+    record = lms_vram.read_baseline_record('qwen3.5-9b')
+
+    assert record.reading.used_mib == MEASURED_GPU.used_mib
+    assert record.consumers == [WHISPER]
+
+
+def test_start_brackets_the_reading_between_two_inventories(
+    fake_systemctl, baseline_dir, monkeypatch,
+):
+    """One capture, not two.  A reading and an inventory taken at different
+    moments would describe a card that never existed.
+
+    Separate nvidia-smi invocations cannot be atomic, so `start` does the next
+    best thing and makes the window CHECKABLE: inventory, reading, inventory.
+    An earlier revision took the reading first and the inventory after it,
+    under a docstring claiming they were one capture -- which left the silent
+    failure open, where a holder resident for the reading and gone by the
+    inventory inflates the baseline and under-charges every later arm.
+    """
+    probed = []
+    monkeypatch.setattr(
+        lms_vram, 'probe_gpu', lambda *a, **k: probed.append('reading') or MEASURED_GPU,
+    )
+    monkeypatch.setattr(
+        lms_vram, 'probe_gpu_consumers',
+        lambda *a, **k: probed.append('consumers') or [WHISPER],
+    )
+
+    lms_ctl.start(_arm())
+
+    assert probed == ['consumers', 'reading', 'consumers']
+    assert lms_vram.read_baseline_record('qwen3.5-9b').consumers == [WHISPER]
+
+
+def test_start_refuses_a_card_that_moved_under_the_baseline_capture(
+    fake_systemctl, baseline_dir, monkeypatch,
+):
+    """The window this bracket exists to close, in its flattering direction.
+
+    ollama holds the card while the reading is taken and its keep_alive expires
+    before the inventory: the baseline carries its 10314 MiB, the inventory
+    looks spotless, and every later `used - baseline` under-charges the arm with
+    nothing downstream able to notice.  Refused before any systemctl call and
+    with no baseline file left behind, like every other refusal here.
+    """
+    inventories = iter([[WHISPER, OLLAMA], [WHISPER]])
+    monkeypatch.setattr(
+        lms_vram, 'probe_gpu_consumers', lambda *a, **k: next(inventories),
+    )
+
+    with pytest.raises(lms_vram.PollutedBaselineError) as excinfo:
+        lms_ctl.start(_arm())
+
+    assert str(OLLAMA.pid) in str(excinfo.value)
+    assert not lms_vram.baseline_path('qwen3.5-9b').exists()
+    assert fake_systemctl.calls() == []
+
+
+def test_an_injected_inventory_is_the_callers_own_pairing(
+    fake_systemctl, baseline_dir, monkeypatch,
+):
+    """Passing `consumers=` skips the bracket rather than half-applying it.
+
+    The check is about a pairing this function made; a caller that supplies
+    both halves has made its own, and re-probing to second-guess it would
+    reintroduce exactly the mismatch the bracket exists to prevent.
+    """
+    monkeypatch.setattr(
+        lms_vram, 'probe_gpu_consumers',
+        lambda *a, **k: pytest.fail('probed the card despite an injected inventory'),
+    )
+
+    lms_ctl.start(_arm(), gpu=MEASURED_GPU, consumers=[WHISPER])
+
+    assert lms_vram.read_baseline_record('qwen3.5-9b').consumers == [WHISPER]
+
+
+def test_start_refuses_a_polluted_card_and_launches_nothing(
+    fake_systemctl, baseline_dir,
+):
+    """The refusal must come BEFORE the side effect, exactly as the pre-flight's
+    does.  Starting the arm and then discovering the card was polluted leaves a
+    running unit whose every measurement is void."""
+    with pytest.raises(lms_vram.PollutedBaselineError) as excinfo:
+        lms_ctl.start(_arm(), gpu=MEASURED_GPU, consumers=[WHISPER, OLLAMA])
+
+    assert '/usr/local/lib/ollama/llama-server' in str(excinfo.value)
+    assert not lms_vram.baseline_path('qwen3.5-9b').exists()
+    assert fake_systemctl.calls() == []
+
+
+def test_a_polluted_refusal_does_not_clobber_an_earlier_clean_baseline(
+    fake_systemctl, baseline_dir,
+):
+    lms_ctl.start(_arm(), gpu=MEASURED_GPU, consumers=[WHISPER])
+
+    # A card where ollama is resident but the arm would still FIT, so the
+    # pollution guard is what refuses and not the pre-flight. On a busier card
+    # the pre-flight often fires first; both refusals are correct, and this
+    # test is about the one that is new.
+    polluted = lms_vram.GpuReading(total_mib=24576, used_mib=14364, free_mib=10212)
+
+    with pytest.raises(lms_vram.PollutedBaselineError):
+        lms_ctl.start(_arm(), gpu=polluted, consumers=[WHISPER, OLLAMA])
+
+    assert lms_vram.read_baseline_record('qwen3.5-9b').reading.used_mib == 7362
+
+
+# ---------------------------------------------------------------------------
+# the CLI's exit codes: a polluted card and an oversized arm have OPPOSITE fixes
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cli_gpu(monkeypatch):
+    """Patch the two GPU probes the CLI's `start` reaches for.
+
+    Returns a setter so each test states the card's condition rather than
+    threading it through the fixture signature.
+    """
+    state = {'reading': MEASURED_GPU, 'consumers': [WHISPER]}
+    monkeypatch.setattr(lms_vram, 'probe_gpu', lambda *a, **k: state['reading'])
+    monkeypatch.setattr(
+        lms_vram, 'probe_gpu_consumers', lambda *a, **k: list(state['consumers']),
+    )
+    return state
+
+
+def test_the_cli_exit_codes_are_the_numbers_the_readme_documents():
+    """The names are for readers; the NUMBERS are the contract.
+
+    Every other assertion in this file now goes through the constant, so
+    renumbering one would move the whole suite with it and pin nothing.  A
+    wrapper script and the README both read these as literals, and 2 is shared
+    with `lms_healthcheck` on purpose.
+    """
+    assert lms_ctl.EXIT_OK == 0
+    assert lms_ctl.EXIT_NOT_READY == 1
+    assert lms_ctl.EXIT_MANIFEST_ERROR == 2
+    assert lms_ctl.EXIT_ARM_REFUSED == 4
+    assert lms_ctl.EXIT_CARD_HELD == 5
+
+
+def test_cli_start_on_a_clean_card_succeeds(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    code = lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert code == lms_ctl.EXIT_OK
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] in fake_systemctl.calls()
+
+
+def test_cli_start_returns_a_distinct_code_when_the_card_is_polluted(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    """5, not the generic 4.
+
+    4 means "this arm is too big for this card" -- the fix is a smaller arm or
+    a bigger budget.  5 means "another process is holding the card" -- the fix
+    is to free the card and try the same arm again.  Collapsing them sends an
+    operator down the wrong path.
+    """
+    cli_gpu['consumers'] = [WHISPER, OLLAMA]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert code == lms_ctl.EXIT_CARD_HELD
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
+
+
+def test_cli_start_names_the_offending_consumer_on_stderr(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    """An operator reading only stderr must know which process to deal with,
+    and must not be left expecting this tool to have stopped it."""
+    cli_gpu['consumers'] = [WHISPER, OLLAMA]
+
+    lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    err = capsys.readouterr().err
+    assert '905936' in err
+    assert '/usr/local/lib/ollama/llama-server' in err
+    assert '10314' in err
+
+
+def test_cli_start_still_returns_4_when_the_arm_simply_does_not_fit(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    """The pre-existing refusal keeps its own code, so the two stay separable.
+
+    The card is nearly full but nothing FOREIGN holds it -- whisper-writer is
+    expected here -- so this is an oversized arm, not a polluted slate.
+    """
+    cli_gpu['reading'] = lms_vram.GpuReading(
+        total_mib=24576, used_mib=20000, free_mib=4576,
+    )
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert code == lms_ctl.EXIT_ARM_REFUSED
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
+
+
+# --- `--no-exclusive` must survive the pollution guard ----------------------
+#
+# The flag is documented and supported ("you have checked the arithmetic
+# yourself", README "One arm at a time"), and in exactly the case it exists for
+# another arm's containerised vLLM is legitimately on the card.  nvidia-smi
+# calls it `python` and it holds far more than whisper-writer's ceiling, so the
+# strict positive allowlist reads it as an intruder -- which would make the flag
+# unreachable and tell the operator to free a card they deliberately loaded.
+
+#: A co-resident arm's vLLM container as `--query-compute-apps` reports it:
+#: indistinguishable from any other `python`, and far over whisper's ceiling.
+CORESIDENT_ARM = lms_vram.GpuConsumer(pid=41001, process_name='python', used_mib=9000)
+
+
+def test_an_exclusive_start_blames_the_running_arm_not_the_card(
+    fake_systemctl, baseline_dir, cli_gpu, monkeypatch, capsys,
+):
+    """Exit 4 and "stop them first", NOT exit 5 and "free the card".
+
+    The co-resident arm is in the inventory as an oversized `python`, so the
+    strict pollution rule would call it a foreign intruder. Both refusals are
+    correct; only one is actionable. "Another ARM is running" is decidable from
+    systemd and nowhere else, so it must be asked BEFORE the guard that cannot
+    tell ours from theirs -- otherwise the operator is told to free a card they
+    deliberately loaded, and the message names ollama, which is not there.
+    """
+    monkeypatch.setenv('FAKE_SYSTEMCTL_LIST_UNITS', _LIST_UNITS_FIXTURE)
+    cli_gpu['consumers'] = [WHISPER, CORESIDENT_ARM]
+
+    code = lms_ctl.main(['start', 'phi-4-14b'])
+
+    assert code == lms_ctl.EXIT_ARM_REFUSED
+    err = capsys.readouterr().err
+    assert 'granite-embedding-english-r2' in err or 'qwen3.5-9b' in err
+    assert 'stop them first' in err
+    # The polluted-card remedy must not appear: it would send the operator
+    # into a retry loop against an intruder that does not exist.
+    assert 'free the card' not in err
+    assert ['start', 'lms-arm@phi-4-14b.service'] not in fake_systemctl.calls()
+
+
+def test_an_exclusive_start_on_an_idle_card_still_refuses_a_real_intruder(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    """Reordering exclusivity ahead of pollution must not cost exit 5 its
+    motivating case: with no arm running, ollama is still the answer."""
+    cli_gpu['consumers'] = [WHISPER, OLLAMA]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert code == lms_ctl.EXIT_CARD_HELD
+    assert '/usr/local/lib/ollama/llama-server' in capsys.readouterr().err
+
+
+def test_no_exclusive_starts_while_another_arm_legitimately_holds_the_card(
+    fake_systemctl, baseline_dir, cli_gpu, monkeypatch,
+):
+    """The flag must actually reach systemd, not die on the pollution guard."""
+    monkeypatch.setenv('FAKE_SYSTEMCTL_LIST_UNITS', _LIST_UNITS_FIXTURE)
+    cli_gpu['consumers'] = [WHISPER, CORESIDENT_ARM]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b', '--no-exclusive'])
+
+    assert code == lms_ctl.EXIT_OK
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] in fake_systemctl.calls()
+
+
+def test_the_excused_arm_and_its_memory_are_both_recorded_not_forgotten(
+    fake_systemctl, baseline_dir, cli_gpu, monkeypatch,
+):
+    """Relaxing the rule buys an audit trail, not silence: the inventory keeps
+    the co-resident consumer verbatim and the record names who excused it."""
+    monkeypatch.setenv('FAKE_SYSTEMCTL_LIST_UNITS', _LIST_UNITS_FIXTURE)
+    cli_gpu['consumers'] = [WHISPER, CORESIDENT_ARM]
+
+    lms_ctl.main(['start', 'qwen3.5-9b', '--no-exclusive'])
+
+    record = lms_vram.read_baseline_record('qwen3.5-9b')
+    assert CORESIDENT_ARM in record.consumers
+    # The arm being started is never its own excuse.
+    assert record.coresident_arms == ['granite-embedding-english-r2']
+
+
+def test_no_exclusive_still_refuses_ollama_with_the_same_distinct_code(
+    fake_systemctl, baseline_dir, cli_gpu, monkeypatch, capsys,
+):
+    """The flag excuses ARMS, not the foreign holder the guard exists for."""
+    monkeypatch.setenv('FAKE_SYSTEMCTL_LIST_UNITS', _LIST_UNITS_FIXTURE)
+    cli_gpu['consumers'] = [WHISPER, CORESIDENT_ARM, OLLAMA]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b', '--no-exclusive'])
+
+    assert code == lms_ctl.EXIT_CARD_HELD
+    assert '/usr/local/lib/ollama/llama-server' in capsys.readouterr().err
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
+
+
+def test_no_exclusive_on_an_idle_card_keeps_the_strict_rule(
+    fake_systemctl, baseline_dir, cli_gpu,
+):
+    """Only arms systemd reports RUNNING buy the relaxation.  Otherwise the
+    flag would be a blanket opt-out of the guard, and a leftover containerised
+    vLLM could sit in a 'clean' baseline under the name `python`."""
+    cli_gpu['consumers'] = [WHISPER, CORESIDENT_ARM]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b', '--no-exclusive'])
+
+    assert code == lms_ctl.EXIT_CARD_HELD
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
+
+
+def test_an_exclusive_start_records_no_excuse_at_all(
+    fake_systemctl, baseline_dir, cli_gpu,
+):
+    """The ordinary path must leave `coresident_arms` empty, so a later reader
+    of the file applies the strict rule it was written under."""
+    lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert lms_vram.read_baseline_record('qwen3.5-9b').coresident_arms == []
+
+
+# --- exit 5 must be REACHABLE in the scenario that motivated it -------------
+#
+# The intruder that motivates code 5 is, by construction, large enough to eat
+# the free VRAM the fit check measures: a process under POLLUTION_FLOOR_MIB is
+# not pollution at all.  So checking fit FIRST makes 5 unreachable in exactly
+# the case it exists for, and hands the operator code 4 -- "use a smaller arm"
+# -- for an arm that fits perfectly well once ollama releases the card.
+#
+# The card below is the measured 2026-08-06 one: whisper-writer 4050 MiB plus
+# ollama 10314 MiB, leaving 10212 MiB free, against a qwen3.5-9b that declares
+# 12.0 GiB in the committed manifest.
+
+#: The measured contended card: 4050 + 10314 held, 10212 MiB free.
+CONTENDED_GPU = lms_vram.GpuReading(total_mib=24576, used_mib=14364, free_mib=10212)
+
+
+def test_a_polluted_card_refuses_before_the_fit_check_gets_to_decide(
+    fake_systemctl, baseline_dir,
+):
+    """Both refusals are correct on this card; only one of them is USEFUL.
+
+    "Another process is holding the card" and "this arm is too big for this
+    card" have opposite fixes, and the operator can only act on the one they
+    are told.
+    """
+    oversized = _arm(est_vram_gib=12.0)
+    assert not lms_vram.arm_fits(oversized, CONTENDED_GPU.free_gib)
+
+    with pytest.raises(lms_vram.PollutedBaselineError) as excinfo:
+        lms_ctl.start(oversized, gpu=CONTENDED_GPU, consumers=[WHISPER, OLLAMA])
+
+    assert not isinstance(excinfo.value, lms_ctl.ArmPreflightError)
+    assert '/usr/local/lib/ollama/llama-server' in str(excinfo.value)
+    assert not lms_vram.baseline_path('qwen3.5-9b').exists()
+    assert fake_systemctl.calls() == []
+
+
+def test_cli_start_returns_5_not_4_on_the_measured_contended_card(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    """The exact documented reading, through the CLI and the real manifest.
+
+    qwen3.5-9b declares 12.0 GiB + 0.5 GiB margin against 9.97 GiB free, so the
+    fit check WOULD refuse -- and would say the wrong thing.
+    """
+    cli_gpu['reading'] = CONTENDED_GPU
+    cli_gpu['consumers'] = [WHISPER, OLLAMA]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert code == lms_ctl.EXIT_CARD_HELD
+    assert code != 4
+    assert '/usr/local/lib/ollama/llama-server' in capsys.readouterr().err
+    assert not lms_vram.baseline_path('qwen3.5-9b').exists()
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
+
+
+def test_cli_start_returns_4_for_a_sub_floor_stray_on_a_card_too_small(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    """The floor still governs which refusal fires, so the hoist cannot
+    over-rotate into calling every occupied card polluted.
+
+    512 MiB is noise, not an intruder: this card is simply too small for this
+    arm, and 4 is the honest answer.
+    """
+    cli_gpu['reading'] = CONTENDED_GPU
+    cli_gpu['consumers'] = [
+        WHISPER,
+        lms_vram.GpuConsumer(
+            pid=905936, process_name='/usr/local/lib/ollama/llama-server',
+            used_mib=512,
+        ),
+    ]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert code == lms_ctl.EXIT_ARM_REFUSED
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
 
 
 def test_stop_issues_exactly_one_systemctl_stop(fake_systemctl):
@@ -414,17 +874,54 @@ def test_wait_ready_returns_false_when_health_never_goes_green(install_fake_http
 # ---------------------------------------------------------------------------
 
 
+def _template_working_directory():
+    """The `[Service] WorkingDirectory` the COMMITTED template declares.
+
+    Read from the template rather than hardcoded.  A literal here could drift
+    away from the shipped unit and make the fake systemctl fabricate a clean
+    answer the parity gate would then believe — a fake that lies in the
+    direction of success is worse than no fake at all.
+    """
+    for line in UNIT_TEMPLATE.read_text().splitlines():
+        if line.startswith('WorkingDirectory='):
+            return line.partition('=')[2].strip()
+    raise AssertionError(f'{UNIT_TEMPLATE} declares no WorkingDirectory')
+
+
+def _clean_show_output():
+    """The `systemctl show` answer meaning "the template is what applies"."""
+    return f'WorkingDirectory={_template_working_directory()}\nDropInPaths=\n'
+
+
 def _run_installer(tmp_path, shim, extra_env=None):
     env = dict(os.environ)
     env['PATH'] = f'{shim.bin_dir}{os.pathsep}{env["PATH"]}'
     env['FAKE_SYSTEMCTL_STATE'] = str(shim.state_path)
     env['XDG_CONFIG_HOME'] = str(tmp_path / 'config')
+    # The installer's parity gate probes `systemctl show`, and the shim answers
+    # every unhandled subcommand with EMPTY stdout — which the checker reads
+    # (correctly) as "could not verify" rather than as clean.  Without a
+    # default here every installer test would go red for a reason unrelated to
+    # what it asserts.  Derived from the template, and overridable through the
+    # existing extra_env seam, so a test that wants a dirty answer just says so.
+    env['FAKE_SYSTEMCTL_SHOW'] = _clean_show_output()
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
         ['bash', str(INSTALLER)],
         env=env, capture_output=True, text=True, timeout=60,
     )
+
+
+def _plant_dropin(tmp_path, text='[Service]\nWorkingDirectory=/home/leo/src/dark-factory/.worktrees/3713\n'):
+    """Plant a drop-in under the installer's XDG_CONFIG_HOME unit dir."""
+    dropin_dir = (
+        tmp_path / 'config' / 'systemd' / 'user' / 'lms-arm@.service.d'
+    )
+    dropin_dir.mkdir(parents=True, exist_ok=True)
+    dropin = dropin_dir / '10-worktree-3713.conf'
+    dropin.write_text(text)
+    return dropin
 
 
 def test_installer_copies_the_unit_template_verbatim(tmp_path, fake_systemctl):
@@ -475,6 +972,147 @@ def test_installer_never_pipes_systemctl_into_grep():
         if line.strip().startswith('#'):
             continue
         assert not ('systemctl' in line and '| grep' in line), line
+
+
+def test_installer_branches_on_the_parity_exit_code():
+    """Every non-zero checker exit must NOT be described as a drop-in.
+
+    Exit 2 (not installed), [vanished] (committed template gone),
+    [unverifiable] (no systemd user manager) and python3 missing from PATH all
+    reach the same `else`, and a single message asserting "a drop-in is winning"
+    names three of them wrongly -- while setup-host.sh, the other consumer of
+    this same checker, does branch on the code.  Two consumers giving
+    contradictory accounts of one exit code is worse than either account alone.
+
+    Read from the source rather than executed, deliberately: exit 2 is
+    unreachable through this installer (the presence check above it exits
+    first), and a missing checker cannot be staged without deleting a tracked
+    file from the real checkout.  A source-level pin is what is actually
+    available, and it is enough to stop the branch collapsing back into one
+    message -- the same trade
+    test_installer_never_pipes_systemctl_into_grep makes.
+    """
+    source = INSTALLER.read_text()
+
+    # The checker's absence is reported as ITSELF, not as a finding.
+    assert '-f "$PARITY_CHECKER"' in source
+    # And the findings are told apart by code.
+    assert '"$parity_rc" -eq 2' in source
+    assert '"$parity_rc" -eq 1' in source
+
+
+def test_installer_confirms_the_template_is_the_effective_configuration(
+    tmp_path, fake_systemctl,
+):
+    """A clean install AFFIRMS what it verified, rather than just not complaining.
+
+    The old self-verify checked the file was THERE.  File presence is exactly
+    what a drop-in leaves untouched, so "installed" was never the claim an
+    operator needed — "the committed template is what systemd will apply" is.
+    """
+    result = _run_installer(tmp_path, fake_systemctl)
+
+    assert result.returncode == 0, result.stderr
+    combined = result.stdout + result.stderr
+    assert 'effective' in combined.lower()
+    assert _template_working_directory() in combined
+
+
+def test_installer_fails_when_a_dropin_is_in_effect(tmp_path, fake_systemctl):
+    """A drop-in present at install time FAILS the install, by path.
+
+    This is the headline finding: the drop-in pins WorkingDirectory at a
+    worktree, every byte of the unit file still matches the template, and the
+    old installer reported success.
+    """
+    dropin = _plant_dropin(tmp_path)
+
+    result = _run_installer(tmp_path, fake_systemctl)
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert str(dropin) in combined
+    assert '[ok] parity' not in combined
+
+
+def test_installer_does_not_remove_a_dropin_it_does_not_own(
+    tmp_path, fake_systemctl,
+):
+    """Failing loud never means deleting someone else's file.
+
+    Task 3750's finding is that the observed drop-in was LOAD-BEARING while
+    its worktree was unmerged: removing it then would have pointed every arm
+    at a directory with no launcher.  Removal stays
+    scripts/remove-lms-arm-worktree-dropin.sh's job, behind preconditions an
+    installer does not check.
+    """
+    dropin = _plant_dropin(tmp_path)
+    original = dropin.read_text()
+
+    result = _run_installer(tmp_path, fake_systemctl)
+
+    assert result.returncode != 0
+    assert dropin.is_file()
+    assert dropin.read_text() == original
+    assert dropin.parent.is_dir()
+
+
+def test_reinstalling_over_a_dropin_still_fails(tmp_path, fake_systemctl):
+    """Re-running the documented installer must not silently inherit an override.
+
+    The whole reported failure mode is that reinstallation LOOKED like a fix.
+    Both runs are asserted, because a gate that only fires on a fresh install
+    would leave the second run reporting the success the first one denied.
+    """
+    _plant_dropin(tmp_path)
+
+    first = _run_installer(tmp_path, fake_systemctl)
+    second = _run_installer(tmp_path, fake_systemctl)
+
+    assert first.returncode != 0
+    assert second.returncode != 0
+
+
+def test_installer_fails_when_the_effective_workingdirectory_is_elsewhere(
+    tmp_path, fake_systemctl,
+):
+    """No drop-in on disk, yet systemd resolves elsewhere => still a failure.
+
+    The case file presence provably cannot catch, and the reason the check had
+    to move to the effective configuration: systemd also merges drop-ins from
+    /etc/systemd/user/ and /run/systemd/user/, which the installer's own unit
+    directory never sees.
+    """
+    result = _run_installer(
+        tmp_path,
+        fake_systemctl,
+        extra_env={
+            'FAKE_SYSTEMCTL_SHOW': (
+                'WorkingDirectory=/home/leo/src/dark-factory/.worktrees/3713\n'
+                'DropInPaths=\n'
+            ),
+        },
+    )
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert '/home/leo/src/dark-factory/.worktrees/3713' in combined
+
+
+def test_installer_fails_when_the_probe_itself_fails(tmp_path, fake_systemctl):
+    """A probe that answered nothing is unverifiable, never success.
+
+    Deliberately asserted rather than left as an accident of the shim: an
+    installer that shrugged when the probe came back empty and printed success
+    would reproduce this task's own bug one level up — a green claim covering
+    nothing.
+    """
+    result = _run_installer(
+        tmp_path, fake_systemctl, extra_env={'FAKE_SYSTEMCTL_SHOW': ''},
+    )
+
+    assert result.returncode != 0
+    assert 'could not verify' in (result.stdout + result.stderr).lower()
 
 
 def test_wait_ready_gives_up_once_the_unit_has_failed(monkeypatch, install_fake_httpx):

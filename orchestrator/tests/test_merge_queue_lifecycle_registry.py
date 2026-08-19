@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import textwrap
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -964,6 +965,279 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             'SAME request_id expression (the canonical requeue recipe: '
             'release_or_cleanup + put_nowait + on_requeued + _note_requeue + '
             f'InflightStatus.REQUEUED). Unpaired: {unpaired!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3204 step-1 RED / step-2 GREEN: the requeue recipe has a single
+# CHOKEPOINT — `SpeculativeMergeWorker._requeue_request`.
+#
+# This is the strictly stronger, "preferred" form of the pairing invariant
+# that TestOnRequeuedIsAlwaysPairedWithNoteRequeue (above) asserts in its
+# weaker sibling form. Both are kept deliberately: after the extraction the
+# sibling test still holds (the helper body keeps the two calls as siblings in
+# one statement block), while sole-callership adds the property that makes
+# re-introducing task 3082's defect impossible to EXPRESS — an unpaired
+# requeue can no longer be written outside the helper at all.
+# ---------------------------------------------------------------------------
+
+_MQ_CHOKEPOINT_CLASS = 'SpeculativeMergeWorker'
+_MQ_REQUEUE_CHOKEPOINT = '_requeue_request'
+
+
+def _chokepoint_ranges(tree: ast.Module, cls_name: str, method_name: str) -> list[tuple[int, int]]:
+    """Line ranges of every *method_name* defined DIRECTLY on ``class cls_name``.
+
+    Copied from test_lock_release_single_writer_guard.py:134 (and the same
+    recursion in test_prune_chokepoint_guard.py) per the per-file duplication
+    convention for orchestrator test helpers — there is deliberately no shared
+    guard conftest.
+
+    Class-qualification matters: a plain name-only scan would also sanction a
+    same-named method on ANOTHER class, or a module-level function. The walk
+    tracks the nearest *directly enclosing* ClassDef and resets it to None
+    inside a function body, so a closure nested within a method does not
+    inherit the class qualification either.
+    """
+    ranges: list[tuple[int, int]] = []
+
+    def visit(node: ast.AST, enclosing_class: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                visit(child, child.name)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if child.name == method_name and enclosing_class == cls_name:
+                    ranges.append((child.lineno, getattr(child, 'end_lineno', child.lineno)))
+                visit(child, None)
+            else:
+                visit(child, enclosing_class)
+
+    visit(tree, None)
+    return ranges
+
+
+def _requeue_chokepoint_offenders(source: str) -> list[str]:
+    """Every requeue-recipe call site in *source* OUTSIDE the chokepoint.
+
+    A "requeue-recipe call site" is a ``self._queue.put_nowait(...)`` (the
+    queue half) or any ``<something>.on_requeued(...)`` (the ledger half).
+    Both must live inside ``SpeculativeMergeWorker._requeue_request``, which is
+    what makes the two halves — plus the ``_note_requeue`` registry mirror the
+    helper also fires — impossible to separate.
+
+    Deliberately does NOT scan ``_note_requeue`` call sites: the invariant is
+    ONE-DIRECTIONAL (every ``on_requeued`` needs a ``_note_requeue``, not the
+    converse), and ``_finalize_inflight``'s sentinel chokepoint repair is a
+    legitimate unpaired ``_note_requeue``. Deliberately does NOT assert a site
+    COUNT either — see the :888 docstring above: a count is a number, not an
+    invariant.
+
+    Pure (takes source text, not a path) so the scanner self-tests below can
+    drive it on synthetic modules; :func:`_scan_merge_queue_requeue_sites` is
+    the thin read_text() wrapper. Returns ``[]`` rather than raising on a
+    source that cannot be parsed.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    ranges = _chokepoint_ranges(tree, _MQ_CHOKEPOINT_CLASS, _MQ_REQUEUE_CHOKEPOINT)
+
+    parent: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[id(child)] = node
+
+    def _enclosing_fn(node: ast.AST) -> str:
+        cur: ast.AST | None = node
+        while cur is not None and not isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            cur = parent.get(id(cur))
+        return getattr(cur, 'name', '<module>')
+
+    # `put_nowait` is anchored on the `_queue` receiver: an unrelated
+    # `.put_nowait()` on some other queue is not a requeue. `on_requeued` needs
+    # no anchor — it exists solely for this recipe.
+    sites: list[ast.Call] = [
+        call for call in _attr_calls(tree, 'put_nowait')
+        if isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Attribute)
+        and call.func.value.attr == '_queue'
+    ]
+    sites += _attr_calls(tree, 'on_requeued')
+
+    offenders = [
+        f'{_enclosing_fn(call)}:{call.lineno} {ast.unparse(call)}'
+        for call in sites
+        if not any(start <= call.lineno <= end for start, end in ranges)
+    ]
+    # ast.walk is breadth-first, so hits come out in tree-depth order rather
+    # than source order. Sort so the offender list reads top-to-bottom.
+    offenders.sort(key=lambda entry: int(entry.split(':', 1)[1].split(' ', 1)[0]))
+    return offenders
+
+
+def _scan_merge_queue_requeue_sites() -> list[str]:
+    """Thin read_text() wrapper around :func:`_requeue_chokepoint_offenders`."""
+    import orchestrator.merge_queue as _mq  # module-local import convention
+
+    return _requeue_chokepoint_offenders(Path(inspect.getfile(_mq)).read_text())
+
+
+class TestRequeueRecipeHasASingleChokepoint:
+    """``_requeue_request`` is the SOLE caller of both ``_queue.put_nowait``
+    and ``on_requeued`` (task 3204 requirement 3, "preferred" form).
+
+    RED until step-2 adds the helper and routes all five requeue sites
+    through it.
+    """
+
+    # ── scanner self-tests: the ratchet must never pass vacuously ──────────
+
+    def test_scanner_accepts_a_compliant_chokepoint(self) -> None:
+        """POSITIVE control: both halves inside the helper -> no offenders."""
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    def _requeue_request(self, req):\n'
+            '        self._queue.put_nowait(req)\n'
+            '        self._request_ledger.on_requeued(req.request_id)\n'
+            '        self._note_requeue(req.request_id, live_obj=req)\n'
+        )
+        assert _requeue_chokepoint_offenders(src) == []
+
+    def test_scanner_flags_a_bypass_outside_the_helper(self) -> None:
+        """SYNTHETIC BYPASS: a second method re-queuing by hand is flagged.
+
+        This is the whole point of the guard — without it the scanner could be
+        mis-wired and still report a green ratchet.
+        """
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    def _requeue_request(self, req):\n'
+            '        self._queue.put_nowait(req)\n'
+            '        self._request_ledger.on_requeued(req.request_id)\n'
+            '\n'
+            '    def _sneaky(self, req):\n'
+            '        self._queue.put_nowait(req)\n'
+            '        self._request_ledger.on_requeued(req.request_id)\n'
+        )
+        offenders = _requeue_chokepoint_offenders(src)
+        assert len(offenders) == 2, offenders
+        assert all(entry.startswith('_sneaky:') for entry in offenders), offenders
+
+    def test_scanner_flags_a_same_named_method_on_another_class(self) -> None:
+        """CLASS-QUALIFICATION: a ``_requeue_request`` on some OTHER class does
+        not sanction its body — that is why the copied ``_chokepoint_ranges``
+        recursion tracks the nearest directly-enclosing ClassDef.
+        """
+        src = (
+            'class SomethingElse:\n'
+            '    def _requeue_request(self, req):\n'
+            '        self._queue.put_nowait(req)\n'
+        )
+        offenders = _requeue_chokepoint_offenders(src)
+        assert len(offenders) == 1, offenders
+        assert offenders[0].startswith('_requeue_request:'), offenders
+
+    def test_scanner_ignores_docstring_and_comment_mentions(self) -> None:
+        """AST-not-regex: prose naming the guarded symbols is not a call site.
+
+        merge_queue.py genuinely contains several such mentions (the
+        ``_queue.put_nowait(req)`` re-arm narrative and the REQUEUED_PREDISPATCH
+        comment), so a grep-based guard would report them as offenders forever.
+        """
+        src = (
+            '"""A module whose docstring names on_requeued and\n'
+            'self._queue.put_nowait(req) purely as prose."""\n'
+            '\n'
+            '# self._queue.put_nowait(req) in a comment is not a call either.\n'
+            'X = 1\n'
+        )
+        assert _requeue_chokepoint_offenders(src) == []
+
+    def test_scanner_returns_empty_on_unparseable_source(self) -> None:
+        """SYNTAX ERROR: return [] rather than raising."""
+        assert _requeue_chokepoint_offenders('def broken(:\n') == []
+
+    # ── the ratchet ────────────────────────────────────────────────────────
+
+    def test_requeue_recipe_has_exactly_one_chokepoint(self) -> None:
+        """STRUCTURAL: no ``_queue.put_nowait`` / ``on_requeued`` call site in
+        merge_queue.py lives outside ``_requeue_request``.
+        """
+        offenders = _scan_merge_queue_requeue_sites()
+        assert offenders == [], (
+            'the requeue recipe must have exactly ONE chokepoint: every '
+            '`self._queue.put_nowait(...)` and `.on_requeued(...)` call site in '
+            'merge_queue.py must live inside '
+            f'`{_MQ_CHOKEPOINT_CLASS}.{_MQ_REQUEUE_CHOKEPOINT}`, which fires the '
+            'queue, the ledger and the lifecycle-registry re-arm together and '
+            'atomically. Route these sites through `self._requeue_request(req)` '
+            f'instead. Offenders: {offenders!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestRequeueRequestHelperContract:
+    """``_requeue_request`` moves the queue, the ledger and the registry
+    together, and is deliberately SYNCHRONOUS (task 3204 step-1 RED).
+    """
+
+    async def test_requeue_request_moves_queue_ledger_and_registry_together(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        worker = _make_worker(git_ops)
+        req = _make_request('df3204-helper', 'df3204-helper', tmp_path, config)
+        rid = worker._register_item(req, initial=ItemLifecycleState.VERIFYING)
+        worker._request_ledger.on_dequeue(req, now=0.0)
+        assert rid in worker._request_ledger.open_request_ids()
+
+        worker._requeue_request(req)
+
+        assert worker._queue.qsize() == 1, 'the request must be back on _queue'
+        assert worker._queue.get_nowait() is req
+        assert rid not in worker._request_ledger.open_request_ids(), (
+            'the ledger entry must be removed so this parked request never ages out'
+        )
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.QUEUED, (
+            f'registry must read QUEUED; reads {worker._lifecycle.current(rid)!r}'
+        )
+        # The OBJECT SWAP is what actually prevents a phantom finalize head:
+        # `_finalizing_head_entry()` only counts `isinstance(obj, InflightEntry)`.
+        assert worker._live_items[rid] is req, (
+            '_live_items must hold the MergeRequest, not the InflightEntry'
+        )
+
+    async def test_requeue_request_is_synchronous(self, git_ops: GitOps) -> None:
+        """The helper must be a plain ``def``, never ``async def``.
+
+        That is the property which makes the documented atomicity — no `await`
+        between the ``put_nowait`` and the registry re-arm, so the merger
+        loop's drain can never observe the request on ``_queue`` while the
+        registry still reads VERIFYING — STRUCTURAL rather than conventional.
+        """
+        worker = _make_worker(git_ops)
+        assert not inspect.iscoroutinefunction(worker._requeue_request), (
+            '_requeue_request must stay sync: an await between the put_nowait and '
+            'the _note_requeue re-opens exactly the window task 3082 closed'
+        )
+        # AST, not a substring grep: the docstring legitimately discusses
+        # `await`, and this repo's guard convention is against
+        # inspect.getsource substring tripwires as brittle.
+        body = ast.parse(
+            textwrap.dedent(inspect.getsource(type(worker)._requeue_request)),
+        )
+        suspend_points = [
+            node for node in ast.walk(body)
+            if isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith))
+        ]
+        assert suspend_points == [], (
+            '_requeue_request must contain no suspension point: an await between '
+            'the put_nowait and the _note_requeue lets the merger loop drain a '
+            'request whose registry still reads VERIFYING — the exact window '
+            f'task 3082 closed. Found at lines {[n.lineno for n in suspend_points]}'
         )
 
 

@@ -379,12 +379,28 @@ def clamp_unit_score(score: float) -> float:
     path delivered it.
 
     Clamps to ``[0, 1]`` and rounds to 4 decimal places — the precision
-    :func:`score_plan_structure` has always used. Does NOT handle NaN: ``min``/
-    ``max`` are ordering operations and NaN is unordered, so a NaN input passes
-    straight through unclamped (``round(min(max(nan, 0.0), 1.0), 4)`` is
-    ``nan``). A caller with untrusted input (:func:`judge_plan_quality`) must
-    check for that itself before calling this.
+    :func:`score_plan_structure` has always used. ``min``/``max`` are ordering
+    operations, so if this function accepted non-finite input, a NaN would
+    pass straight through unclamped (``round(min(max(nan, 0.0), 1.0), 4)`` is
+    ``nan``) and ``+/-Infinity`` would clamp mechanically (to ``1.0``/``0.0``)
+    while actually being a fabricated best/worst score rather than a
+    measurement — not something this function could tell apart from a real
+    one. Rather than leave that a convention callers must remember, this
+    function REJECTS all non-finite input outright with ``ValueError`` — a
+    loud floor, not just a documented one (structured-facts-at-failure). The
+    one caller with untrusted input (:func:`judge_plan_quality`) already
+    pre-checks with its own ``math.isfinite`` guard and degrades gracefully to
+    the ``None`` sentinel (with a WARNING) before ever reaching here, so in
+    practice this raise is a defense-in-depth backstop for a future second
+    caller that forgets to — the same class of gap :func:`is_scorable_plan`'s
+    docstring warns a second caller could otherwise silently re-open. This
+    function's contract is finite-in, ``[0, 1]``/4dp-out, ``ValueError`` on
+    anything else.
     """
+    if not math.isfinite(score):
+        raise ValueError(
+            f'clamp_unit_score requires finite input, got {score!r}'
+        )
     return round(min(max(score, 0.0), 1.0), 4)
 
 
@@ -539,14 +555,13 @@ async def judge_plan_quality(
     A successfully parsed ``plan_quality`` is put through
     :func:`clamp_unit_score` rather than returned as a raw float — see that
     function's docstring for why a runtime clamp is still needed despite
-    ``PLAN_QUALITY_SCHEMA``'s declared bounds, and for the NaN-is-unorderable
+    ``PLAN_QUALITY_SCHEMA``'s declared bounds, and for the non-finite-input
     mechanics behind the exception below. The parse contract is one rule with
     two LOUD exceptions (never silent — each leaves one WARNING naming the
-    cell): an out-of-range-but-orderable answer (e.g. ``1.5``) is clamped and
-    the WARNING names the raw and clamped values; a non-finite, unorderable
-    answer (``NaN``) degrades to the ``None`` sentinel instead, exactly like a
-    parse failure. ``+/-Infinity`` IS orderable, so it takes the ordinary
-    clamp path (``1.0``/``0.0``), not the NaN one.
+    cell): an out-of-range but FINITE answer (e.g. ``1.5``) is clamped and
+    the WARNING names the raw and clamped values; ANY non-finite answer
+    (``NaN``, ``+/-Infinity``) degrades to the ``None`` sentinel instead,
+    exactly like a parse failure, because it is not a judgement at all.
 
     On any parse failure the verdict's ``plan_quality`` is ``None`` (the
     sentinel :func:`run_architect_eval` degrades on), never a crash. When the
@@ -703,26 +718,31 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
             plan_quality = None
         else:
             raw_quality = float(raw_quality)
-            # NaN is unorderable, so clamp_unit_score cannot enforce [0, 1] on
-            # it (see that function's docstring for the mechanics) — checked
-            # BEFORE the clamp, not after. +/-Infinity IS orderable and falls
-            # through to the clamp + out-of-range warning below instead: a
-            # judge answering infinity clearly means "as high/low as it
-            # goes", the same intent-preserving reasoning that governs any
-            # other out-of-range-but-orderable answer.
-            if math.isnan(raw_quality):
+            # A non-finite answer is not a judgement at all, so it degrades
+            # to the None sentinel BEFORE the clamp (see clamp_unit_score's
+            # docstring for the mechanics): NaN because it is unordered and
+            # the clamp cannot constrain it at all; +/-Infinity because the
+            # clamp CAN constrain it, but only by fabricating the best/worst
+            # possible score (1.0/0.0) on a live ranking surface
+            # (report._mean_plan_quality -> select_survivors) — a worse
+            # failure than admitting no measurement. The finite
+            # out-of-range clamp + WARNING path immediately below is
+            # DELIBERATELY unchanged (operator SCOPE RULING 2026-08-12):
+            # this narrows the task-3410 amendment, it does not reverse it
+            # — finite overshoots stay orderable and intent-preserving.
+            if not math.isfinite(raw_quality):
                 logger.warning(
                     f'Plan judge for {cell} answered a non-finite '
-                    f'plan_quality (NaN) — not a real judgement, degraded to '
-                    f'the None sentinel (run_architect_eval falls back to '
-                    f'the deterministic structural floor).'
+                    f'plan_quality ({raw_quality!r}) — not a real judgement, '
+                    f'degraded to the None sentinel (run_architect_eval '
+                    f'falls back to the deterministic structural floor).'
                 )
                 return PlanQualityVerdict(
                     plan_quality=None,
                     per_criterion={},
                     reasoning=(
                         f'Plan judge answered a non-finite plan_quality '
-                        f'(NaN) for {cell}'
+                        f'({raw_quality!r}) for {cell}'
                     ),
                     # The judge DID run and produced an answer (a nonsense
                     # one) — real spend, not $0.

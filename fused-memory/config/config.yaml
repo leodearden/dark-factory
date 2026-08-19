@@ -14,6 +14,26 @@ llm:
   model: "gpt-4o-mini"
   max_tokens: 4096
 
+  # Which graphiti LLM client to build (restart-tier — not hot-reloadable).
+  # Leave commented for stock OpenAI. Uncomment for an OpenAI-compatible LOCAL
+  # endpoint (llama.cpp / vLLM / LM Studio): those serve chat.completions but
+  # not the Responses API that the default 'openai' client requires. Point
+  # providers.openai.api_url below at the local endpoint as well.
+  # client_class: "openai_generic"
+  #
+  # Force response_format={'type': 'json_object'} instead of json_schema.
+  # Only applies when client_class is "openai_generic". Needed for the
+  # llama.cpp MoE arm, which silently ignores $ref/$defs in a json_schema
+  # response_format (llama.cpp#21228).
+  # structured_output_mode: "json_object"
+
+  # NOTE: api_url below is always passed explicitly to the LLM/embedder
+  # clients, so this config WINS over the ambient OPENAI_BASE_URL /
+  # OPENAI_API_BASE environment variables that the openai SDK and mem0 would
+  # otherwise fall back to. If you route OpenAI traffic through a gateway by
+  # exporting OPENAI_BASE_URL, set OPENAI_API_URL (or edit api_url) to the same
+  # value — otherwise traffic goes to whatever is written here. A disagreement
+  # is logged as a warning at client construction.
   providers:
     openai:
       api_key: ${OPENAI_API_KEY}
@@ -26,8 +46,18 @@ llm:
 embedder:
   provider: "openai"
   model: "text-embedding-3-small"
+  # NOTE: changing this on an EXISTING deployment is not a live migration.
+  # It is now plumbed through to both the embedder (what width is requested
+  # from the API) and the Qdrant collection (what width the collection is
+  # created with), but mem0 skips creation for a collection that already
+  # exists — so an existing 1536-wide collection stays 1536-wide and every
+  # upsert then fails on a dimension mismatch. Recreate and re-embed the
+  # collection when changing this.
   dimensions: 1536
 
+  # api_url wins over OPENAI_BASE_URL / OPENAI_API_BASE here too — see the
+  # note in the llm block above. Set this to a different literal from the llm
+  # one to point the embedder at a separate endpoint.
   providers:
     openai:
       api_key: ${OPENAI_API_KEY}
@@ -150,7 +180,28 @@ reconciliation:
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
   buffer_size_threshold: 250
   max_staleness_seconds: 14400
-  conditional_trigger_ratio: 0.2
+  # Task 3049 lever 2 (was 0.2). The quiescent trigger fires at
+  # buffer_size_threshold * conditional_trigger_ratio, so 250 * 0.6 = 150 =
+  # throughput.STEADY_STATE_AMORTISATION_MIN_BATCH.
+  #
+  # Cycle cost fits T(B) = F + c*B with F ~ 900s and c ~ 2.5 s/event — almost
+  # entirely FIXED (measured 2026-07-25 on reify: 50 events/945s steady state =
+  # 18.9 s/event; 393 events/954s backlog chunk = 2.43 s/event). At the old
+  # 50-event batch that 900s bought only 50 events: (900 + 2.5*50)/50 = 20.5
+  # s/event, matching the 18.9 observed. At 150 it buys three times as many:
+  # (900 + 2.5*150)/150 = 8.5 s/event — a 2.2x amortisation for a batching
+  # change alone, no work saved.
+  #
+  # Latency stays bounded: max_staleness_seconds above is a HARD trigger that
+  # fires independently of this ratio (event_buffer.py:359), so raising it
+  # delays the quiescent trigger, NOT the staleness backstop. An event's
+  # worst-case wait is unchanged.
+  #
+  # The fit is deliberately conservative and comes from two points on two
+  # different tiers — re-derive it from live data with
+  # `python -m fused_memory.reconciliation.throughput --db ... --project ...`
+  # rather than trusting it indefinitely.
+  conditional_trigger_ratio: 0.6
   burst_window_seconds: 30
   burst_cooldown_seconds: 150
   stale_lock_seconds: 7200
@@ -193,6 +244,28 @@ reconciliation:
   sonnet_model: "sonnet"
   opus_model: "opus"
   opus_threshold_ratio: 1.5
+  # Task 3049: consecutive full cycles for which the inline remediation pass is
+  # deferred while the project is in backlog mode (buffer >
+  # buffer_size_threshold * opus_threshold_ratio). Every backlog chunk is a full
+  # cycle and so drags in its own zero-event remediation pass — measured at ~44%
+  # of backlog-mode drain wall-clock on 2026-07-25 (reify), i.e. roughly half the
+  # drain duty cycle spent not draining. Deferral is lossless (Stage-3 findings
+  # are persisted before this point and forward-fed to the next cycle) and
+  # self-terminating (the gate re-reads the buffer, so remediation resumes once
+  # the backlog drains). The cap bounds the debt so a deep backlog cannot starve
+  # remediation; 0 disables deferral entirely.
+  #
+  # 1 is the schema ceiling (MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING), not a
+  # taste call: a deferred cycle writes ONE completed run instead of two, so a
+  # longer streak would let the integrity-finding persistence counter reach its
+  # recurrence threshold without a single remediation attempt having run — the
+  # first failed remediation would then escalate immediately. The gate reads
+  # D deferred parents + this cycle's parent + this cycle's own remediation run
+  # = D + 2, and that must stay below the recurrence threshold of 4, so D <= 1.
+  # Costs some of lever 1's ideal 1.78x (remediation runs once per two cycles
+  # rather than never during a backlog); correctness of the escalation
+  # semantics wins.
+  max_backlog_remediation_deferrals: 1
   sonnet_episode_limit: 125
   sonnet_memory_limit: 250
   opus_episode_limit: 500
@@ -279,8 +352,17 @@ summary_rebuild:
 #   # to notice and cheap to correct, a silent content rewrite is neither.
 #   # agent_id is self-reported, so this deters misuse by cooperating callers
 #   # rather than enforcing a security boundary.
-#   content_amend_allowed_agent_prefixes: ['recon-stage-']
-#   metadata_patch_allowed_agent_prefixes: ['recon-stage-']
+#   #
+#   # curator- is part of the SCHEMA DEFAULT (ruling 2026-08-12, promoting the
+#   # 2026-08-11 esc-3524-1 ruling (b) from a per-machine override here to an
+#   # all-deployments default): it admits the interactive memory-consolidation
+#   # sitting defined by skills/curate-fused-memories, which cannot work
+#   # without the grant. Both arms deliberately — gate 3200's retain-and-tag
+#   # stamps retained peers via metadata-only patches, so content_amend alone
+#   # would be the destructive half without the preserving half. Full
+#   # rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
+#   content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
+#   metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-']
 #   # Content-amend burst alarm: escalates, never blocks (a hard block would
 #   # risk a legitimate large consolidation cycle failing mid-run over its own
 #   # success count). Metadata-only calls do not count toward it.

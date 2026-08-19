@@ -13,6 +13,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from shared.cli_invoke import (
+    AgentResult,
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+)
 from shared.usage_gate import UsageGate
 
 from orchestrator.agents.briefing import BriefingAssembler
@@ -56,6 +61,108 @@ from .snapshots import create_eval_worktree, read_python_pin
 logger = logging.getLogger(__name__)
 
 RESULTS_DIR = Path(__file__).parent / 'results'
+
+# Cap-wait patience for the architect eval invoke (eval-revival φ) — the INV-4
+# storm escape. `invoke_with_cap_retry` otherwise inherits
+# `_DEFAULT_CAP_WAIT_SANITY_SECS` (14 days), which is the right answer for a
+# per-task AFK implementer and the WRONG one here: an eval campaign is a
+# bounded, queue-blocking job, so a fully-capped pool must fail LOUD into the
+# existing cap_tainted/cap_excluded backstop rather than park a campaign for
+# two weeks. 1800 s is the established house value for short-lived,
+# queue-blocking callers — `_DRY_RUN_CAP_WAIT_SANITY_SECS` (dry_run_unblock.py)
+# and `_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS` (the three reconciliation
+# stage runners) — both recorded in cli_invoke.py's per-caller policy table
+# alongside this one.
+#
+# Deliberately NO `max_cap_retries` companion: a fixed count scales the wrong
+# way. Cooldown doubles per full cycle through the pool, so a fixed count buys
+# a 4-account pool far LESS wall-clock patience than a 1-account pool — a
+# bigger, healthier pool would give up sooner. Wall clock is also the bound
+# that literally expresses the requirement ("never hang a campaign"). Both
+# bounds raise the same AllAccountsCappedException from one chokepoint, so the
+# handler below is correct either way.
+#
+# WHAT THIS BOUND DOES NOT COVER (reviewer: robustness — stated here so the
+# guarantee is not read as stronger than it is). `cap_wait_sanity_secs` is
+# consulted at exactly one place, `_check_cap_wait`, which runs in the cap-hit
+# branch AFTER an invocation returned and was classified as a cap. It therefore
+# bounds cap-RETRY patience. It does NOT bound the gate's own all-accounts-
+# capped wait: the next loop iteration re-enters `usage_gate.invoke_slot` →
+# `before_invoke`, which ends in an unbounded `await self._open.wait()`
+# (usage_gate.py:996) released only by a real cap reset or a successful resume
+# probe — hours, not 30 minutes. So a pool that is ALREADY frozen when a cell
+# starts can still block; what this bound guarantees is that a campaign
+# cap-retrying in a loop gives up loudly instead of churning for two weeks.
+#
+# Deliberately NOT closed here with an outer
+# `asyncio.wait_for(invoke_with_cap_retry(...), ...)`: that timer cannot tell a
+# frozen pool from a genuinely slow candidate, so it would route a slow-but-
+# healthy architect into the cap handler → arch_unmeasurable → EXCLUDED, which
+# is the differential-exclusion bias φ exists to remove, re-created from the
+# other side. The bound belongs where the cause is known — inside the shared
+# wrapper, where waiting in `before_invoke` is definitionally a cap wait — and
+# that is a shared-seam change affecting dry_run_unblock and the reconciliation
+# stage runners too, so it is filed as follow-up rather than done here.
+_EVAL_CAP_WAIT_SANITY_SECS = 30 * 60
+
+
+async def _build_eval_usage_gate(orch_config: OrchestratorConfig) -> UsageGate | None:
+    """Build the account-failover gate for an eval entry point, or None.
+
+    ONE home for the construction all three entry points need (``run_eval``,
+    ``run_end_to_end``, ``run_architect_eval``), extracted from three
+    byte-identical copies (reviewer: duplication). Identical-by-copy is
+    precisely the shape that drifts: the empty-pool degrade below is a fix that
+    would otherwise have had to be remembered in three places, or leave the
+    entry points silently divergent about what "gated" means.
+
+    Three ways to come back ungated, all deliberate, all warn-and-degrade
+    rather than raise — losing failover costs CELLS, but raising costs the
+    whole CAMPAIGN, for a reason having nothing to do with the candidate under
+    test:
+
+    1. ``usage_cap.enabled=False`` — a real production configuration. A
+       deployment that opted out of the account pool must not pay for probe
+       dirs and account state it never asked for.
+    2. The constructor raised.
+    3. The gate CONSTRUCTED but resolved ZERO accounts (reviewer: robustness).
+       ``_init_accounts`` logs "No accounts configured and no default
+       credential found" and returns ``[]``, so construction SUCCEEDS and the
+       failure is deferred to the first ``before_invoke``, which raises
+       ``RuntimeError('No OAuth accounts available ...')``. That lands in the
+       caller's generic handler, is stamped ``harness_error:`` → unmeasurable →
+       the cell is EXCLUDED. With ``usage_cap.enabled=True`` but no
+       ``CLAUDE_OAUTH_*`` exported and no ``~/.claude/.credentials.json`` (an
+       ordinary CI shell), that loses EVERY architect cell — where the same
+       campaign ran fine ungated on ambient credentials pre-φ. That would be a
+       strictly WORSE version of the ~40% cell loss this gate exists to fix.
+       An empty pool has nothing to fail over TO, so degrading to the ungated
+       path forfeits nothing and saves the run.
+    """
+    if not orch_config.usage_cap.enabled:
+        return None
+    try:
+        gate = UsageGate(orch_config.usage_cap)
+    except Exception as exc:
+        logger.warning(f'Failed to create UsageGate for eval: {exc} — running without failover')
+        return None
+    if gate.account_count == 0:
+        logger.warning(
+            'UsageGate resolved ZERO accounts (no CLAUDE_OAUTH_* env and no '
+            'default credential?) — running without failover rather than '
+            'refusing every invocation'
+        )
+        # Tear the discarded gate down rather than dropping it on the floor:
+        # even with no accounts the constructor allocated a FALLBACK probe
+        # TaskConfigDir (the `or TaskConfigDir(...)` alias branch) and
+        # installed a SIGHUP handler, and this runs once PER CELL. Best-effort
+        # — a teardown failure must not turn the degrade into a raise.
+        try:
+            await gate.shutdown()
+        except Exception:
+            logger.warning('shutdown of the discarded empty UsageGate failed', exc_info=True)
+        return None
+    return gate
 
 
 @dataclass
@@ -403,12 +510,7 @@ async def run_eval(
         logger.info(f'Using fixed plan ({len(initial_plan.get("steps", []))} steps)')
 
     # 5b. Usage gate for account failover (judge hits Claude API, may cap)
-    usage_gate: UsageGate | None = None
-    if orch_config.usage_cap.enabled:
-        try:
-            usage_gate = UsageGate(orch_config.usage_cap)
-        except Exception as exc:
-            logger.warning(f'Failed to create UsageGate for eval: {exc} — running without failover')
+    usage_gate = await _build_eval_usage_gate(orch_config)
 
     # 6. Run the real workflow
     workflow = build_workflow(
@@ -652,6 +754,16 @@ async def run_architect_eval(
     )
 
     plan: dict = {}
+    # Pre-initialised so the cap-exhaustion handler below can best-effort
+    # re-read the plan artifact: that handler runs on an exception raised AT
+    # the invoke, which is before the normal ``artifacts.read_plan()``, and on
+    # the earlier failure paths (worktree/config) the name is genuinely unbound
+    # — which pyright correctly flags without this.
+    artifacts: TaskArtifacts | None = None
+    # Pre-initialised for the SAME reason, plus one more: the finally block
+    # shuts the gate down, and it must not NameError when the failure happened
+    # before the gate was built (worktree/orch-config).
+    usage_gate: UsageGate | None = None
     # Renamed from ``cost_usd`` (eval-revival υ): this local is ONLY the
     # architect invocation's spend. The cell's persisted ``cost_usd`` below
     # additionally folds in the plan judge's spend (``judge_cost_usd``), so
@@ -697,6 +809,10 @@ async def run_architect_eval(
     # (run_eval convention — the CLI threads the same --timeout to both); without
     # this a hung architect run would block indefinitely, bounded only by
     # max_budget_usd.
+    #
+    # Since eval-revival φ this bounds each ATTEMPT, not the whole cap-retry
+    # loop — see _timed_invoke below for why the distinction is load-bearing
+    # rather than incidental.
     timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
     # Hoisted out of the try so its PRICE TABLE survives to the cost resolution
     # after the finally. A harness crash before it is built leaves an explicit
@@ -710,6 +826,27 @@ async def run_architect_eval(
         orch_config = build_eval_orch_config(
             config, task, base_config, memory_endpoint=memory_endpoint,
         )
+
+        # 2b. Usage gate for account failover (eval-revival φ).
+        #     This was the LAST eval entry point invoking an agent ungated —
+        #     run_eval (:401-407) and run_end_to_end (:1039-1045) have always
+        #     built one. Ungated, a capped account refuses the architect
+        #     outright and the cell is recorded cap_tainted, i.e. EXCLUDED from
+        #     the reported mean (the taint table above). The 2026-07-28
+        #     architect wave lost ~40% of its cells that way — 37 blocked.
+        #
+        #     Exclusion is NOT neutral, which is why this is a correctness fix
+        #     and not a convenience: the costlier candidate runs longer, is more
+        #     cap-exposed, and so loses MORE cells than its cheaper rival. The
+        #     surviving cells are then a biased sample and the comparison the
+        #     campaign exists to make is silently wrong. Failing over to a
+        #     healthy account measures the candidate instead of the schedule.
+        #
+        #     Construction (enabled guard, warn-and-degrade, empty-pool
+        #     degrade) lives in _build_eval_usage_gate so all three entry
+        #     points build the gate from ONE definition rather than three
+        #     copies that can drift.
+        usage_gate = await _build_eval_usage_gate(orch_config)
 
         # 3. Init artifacts so the architect has a place to write plan.json.
         #    Target the RELOCATED .task-meta/<name>/ root — the SAME root the
@@ -734,24 +871,86 @@ async def run_architect_eval(
         # strict_mcp_config stays default False so the ambient .mcp.json
         # escalation/fused-memory servers still merge, mirroring _invoke.
         mcp_config = _inject_plan_tools_mcp(None, worktree)
-        result = await asyncio.wait_for(
-            invoke_agent(
-                prompt=prompt,
-                system_prompt=ARCHITECT.system_prompt,
-                cwd=worktree,
-                model=config.model,
-                max_turns=task.get('max_architect_turns', 50),
-                max_budget_usd=config.max_budget_usd,
-                allowed_tools=ARCHITECT.allowed_tools or None,
-                disallowed_tools=ARCHITECT.disallowed_tools or None,
-                effort=config.effort or 'high',
-                backend=config.backend,
-                env_overrides=config.env_overrides or None,
-                mcp_config=mcp_config,
-            ),
-            timeout=timeout_minutes * 60,
+
+        async def _timed_invoke(**kwargs) -> AgentResult:
+            """Bound ONE attempt by the operator's --timeout, and bank its spend.
+
+            The timeout deliberately lives HERE, per attempt, rather than
+            wrapped around ``invoke_with_cap_retry`` as a whole. Wrapping the
+            retry loop would make a cap WAIT surface as ``TimeoutError`` →
+            ``outcome='timeout'`` → NOT tainted (the deliberate timeout
+            asymmetry in the docstring above) → a cap-starved cell scored a
+            fabricated 0.0 and INCLUDED in the mean. That is exactly the
+            differential-exclusion bias φ exists to remove, and it would fire
+            whenever the operator's --timeout is shorter than the cap patience
+            bound.
+
+            Per-attempt keeps the two clocks orthogonal and each one's meaning
+            intact: candidate-attributable slowness → ``TimeoutError`` →
+            ``outcome='timeout'``, kept and scored on content; infra cap
+            starvation → ``AllAccountsCappedException`` → the cap backstop.
+            Worst-case wall clock stays bounded in practice because a
+            cap-classified attempt is by construction near-instant and
+            zero-cost, so an attempt that burns the full timeout is never the
+            one being retried.
+
+            SPEND IS ACCUMULATED HERE, per attempt, rather than read off the
+            returned result (reviewer: correctness). ``invoke_with_cap_retry``
+            returns only the LAST AgentResult and never aggregates cost, so a
+            cap landing MID-run — after the architect already spent real money
+            through plan-tools — would contribute its spend to nothing. That
+            matters specifically BECAUSE of φ: the cell is now INCLUDED in the
+            aggregate, so an under-reported cost biases the cost comparison in
+            the same direction the quality comparison was biased, and for the
+            same reason (the more cap-exposed candidate fails over more often).
+            The resume path has the identical shape — the retried attempt
+            reports only the resumed segment.
+
+            Only ``cost_usd`` accumulates. ``arch_duration_ms`` deliberately
+            stays the WINNING attempt's latency: cap waits and abandoned
+            attempts are infra time, not candidate latency, and folding them in
+            would corrupt the per-candidate duration the campaign compares.
+            ``coerce_cost_usd`` guards the read so a Mock/None/NaN degrades to
+            an honest 0.0 instead of poisoning the sum (metrics.py:547).
+            """
+            nonlocal arch_cost_usd
+            attempt = await asyncio.wait_for(
+                invoke_agent(**kwargs), timeout=timeout_minutes * 60,
+            )
+            arch_cost_usd += coerce_cost_usd(getattr(attempt, 'cost_usd', 0.0))
+            return attempt
+
+        # Account failover (eval-revival φ): all retry/resume/backoff behaviour
+        # comes from the shared wrapper — this call site adds none of its own.
+        # With usage_gate=None it degrades to a single invocation, i.e. exactly
+        # the pre-φ behaviour, so a deployment with usage_cap disabled is
+        # unchanged. `backend` moves to the wrapper's own keyword-only
+        # parameter, which forwards it into the dispatched call because a
+        # custom invoke_fn is supplied.
+        result = await invoke_with_cap_retry(
+            usage_gate,
+            f'Architect eval {task_id} × {config.name}',
+            cap_wait_sanity_secs=_EVAL_CAP_WAIT_SANITY_SECS,
+            invoke_fn=_timed_invoke,
+            backend=config.backend,
+            prompt=prompt,
+            system_prompt=ARCHITECT.system_prompt,
+            cwd=worktree,
+            model=config.model,
+            max_turns=task.get('max_architect_turns', 50),
+            max_budget_usd=config.max_budget_usd,
+            allowed_tools=ARCHITECT.allowed_tools or None,
+            disallowed_tools=ARCHITECT.disallowed_tools or None,
+            effort=config.effort or 'high',
+            env_overrides=config.env_overrides or None,
+            mcp_config=mcp_config,
         )
-        arch_cost_usd = result.cost_usd
+        # arch_cost_usd is banked inside _timed_invoke (every attempt), not
+        # read off `result` (the last attempt only) — see its docstring. The
+        # token/turn counters below DO come off `result`, i.e. the final
+        # attempt: they feed the P5 price-table provenance, which describes the
+        # invocation that actually produced the scored plan.
+        #
         # ``or 0``, not a bare read: AgentResult declares both ``int | None``,
         # and a provider that did not report usage must persist an honest 0
         # rather than a None that would poison the price-table arithmetic.
@@ -791,6 +990,53 @@ async def run_architect_eval(
         # MARKED but NOT unmeasurable: see the scoring block for why a timeout
         # keeps scoring on content while a cap hit does not.
         arch_error = arch_error or f'timeout: no answer within {timeout_minutes}m'
+    except AllAccountsCappedException as e:
+        # Every account in the pool was capped for longer than this eval's
+        # patience bound. Caught HERE, ahead of the generic handler, for two
+        # reasons that both matter to the persisted cell:
+        #
+        # 1. LABELLING. The generic handler stamps
+        #    `harness_error: AllAccountsCappedException: ...`, which charges a
+        #    TRANSPORT refusal to our own crash and collapses two rows of the
+        #    docstring's taint table that exist precisely to stay
+        #    distinguishable. Legibility of the failure marker is the whole
+        #    point of the 3118 marker machinery.
+        #
+        # 2. THE ARTIFACT RE-READ. The exception is raised at the invoke, so
+        #    the normal `artifacts.read_plan()` above never ran. A plan the
+        #    architect wrote through plan-tools BEFORE the pool ran dry would
+        #    otherwise be silently discarded — converting a scorable cell into
+        #    an exclusion and re-opening the differential-exclusion hazard from
+        #    the other side. Re-reading makes cap exhaustion obey the SAME
+        #    taint-table row an inline mid-run 429 already obeys, with zero
+        #    change to the taint predicate itself.
+        #
+        # `arch_cost_usd` already holds whatever the ABANDONED attempts spent:
+        # _timed_invoke banks each attempt's cost as it returns, so a cap that
+        # landed after the architect burned real money still reports that money
+        # here, even though no AgentResult survives to be read. It stays 0.0
+        # only when the pool was dry before anything ran, which is the honest
+        # answer for that case.
+        logger.error(
+            f'Architect eval {task_id} × {config.name}: all accounts capped '
+            f'after {e.retries} retries ({e.elapsed_secs:.1f}s) — giving up on '
+            f'this cell rather than stalling the campaign'
+        )
+        outcome = 'blocked'
+        reason = ' '.join(str(e).split())[:80]
+        arch_error = arch_error or f'cap_exhausted: {reason}'
+        arch_unmeasurable = True
+        if artifacts is not None:
+            # Best-effort: an unreadable artifact here must degrade to the
+            # tainted path, never turn a cap into a harness crash.
+            try:
+                plan = artifacts.read_plan() or {}
+            except Exception:
+                logger.warning(
+                    f'plan re-read after cap exhaustion failed for {task_id} × '
+                    f'{config.name}; cell stays unmeasurable',
+                    exc_info=True,
+                )
     except Exception as e:
         logger.error(f'Architect eval {task_id} × {config.name} failed: {e}')
         outcome = 'blocked'
@@ -807,12 +1053,41 @@ async def run_architect_eval(
         # Plan already read above; the worktree is no longer needed (scoring
         # reads the in-memory plan + the committed reference diff).
         await snapshots.cleanup_eval_worktree(project_root, worktree)
+        # The gate is built PER CELL — cli.py loops this coroutine over every
+        # config, and a campaign loops fixtures × trials in ONE process — so it
+        # has to be torn DOWN per cell too (reviewer: resource-cleanup). Left
+        # running, every cell that hit a cap leaks a live account-resume probe
+        # loop firing real CLI probes for the rest of the campaign, and each
+        # new gate steals the SIGHUP handler from predecessors that are still
+        # alive via those background tasks.
+        #
+        # What this does NOT do is carry cap STATE across cells: cell N+1 still
+        # re-leases the account cell N proved capped, costing one wasted
+        # invocation plus a cooldown per cell. Fixing that means hoisting the
+        # gate to the campaign level and threading it through cli.py — outside
+        # this task's locked modules, so it is filed as follow-up rather than
+        # smuggled in here.
+        #
+        # Best-effort: a teardown failure must never turn a scored cell into a
+        # harness error.
+        if usage_gate is not None:
+            try:
+                await usage_gate.shutdown()
+            except Exception:
+                logger.warning(
+                    f'UsageGate shutdown failed for {task_id} × {config.name} '
+                    f'— continuing (the cell is already scored)',
+                    exc_info=True,
+                )
 
     # 6. Materialize the landed reference diff — the always-available ground
     #    truth (ζ fixtures frequently carry plan: null).
     reference = task.get('reference') or {}
     post = reference.get('post_task_commit')
     reference_diff = ''
+    # Set only where the judge's OWN number is kept (step 7) — see the comment
+    # there for why the assignment does not live at this site.
+    judged_without_reference = False
     if post:
         try:
             reference_diff = await snapshots.get_diff_between_commits(
@@ -820,6 +1095,25 @@ async def run_architect_eval(
             )
         except Exception as e:
             logger.warning(f'reference diff failed for {task_id}: {e}')
+    else:
+        # Loud at RUN time (eval-revival σ, task 3628). The v1 campaign judged
+        # half its hard subset this way and it was discoverable only by
+        # archaeology, because a fixture with no ``reference`` block reached the
+        # judge silently.
+        #
+        # Scoped to the FIXTURE-LEVEL fact, which is all that is known here
+        # (reviewer: robustness). At this point the architect's outcome is not
+        # yet decided, so this site cannot say anything about a judge score: a
+        # cap-tainted cell and a no-scorable-plan cell both skip the judge
+        # entirely, and claiming their score is plausibility-based would be
+        # false. That claim belongs to — and is made by — the step-7 warning
+        # below, which fires exactly where the judge is invoked blind. This is
+        # the same over-broad keying the marker's comment at step 7 rejects for
+        # the metrics field, and it is rejected here for the same reason.
+        logger.warning(
+            f'Architect eval {task_id} × {config.name}: fixture carries no '
+            f'reference.post_task_commit, so NO reference diff is available'
+        )
 
     # 7. Score the produced plan: LLM judge vs the landed diff, degrading to the
     #    deterministic structural floor on ANY judge failure so plan_quality is a
@@ -917,6 +1211,12 @@ async def run_architect_eval(
             f'scored on the structural floor ({plan_quality}), NOT tainted'
         )
     else:
+        if not reference_diff:
+            logger.warning(
+                f'Architect eval {task_id} × {config.name}: invoking the plan '
+                f'judge with an EMPTY reference diff — no ground truth to '
+                f'grade against'
+            )
         try:
             verdict = await judge_plan_quality(plan, reference_diff, task)
             plan_quality = verdict.plan_quality
@@ -957,6 +1257,19 @@ async def run_architect_eval(
             )
         if plan_quality is None:
             plan_quality = score_plan_structure(plan)
+        else:
+            # The marker lives HERE, on the one path where the judge's own
+            # number is KEPT — not at the materialization site above (task
+            # 3628). Its name asserts something about the PERSISTED score:
+            # this score was judged, without a reference. Every other path
+            # persists ``score_plan_structure``, which never consults a
+            # reference and is therefore valid ground-truth-independently, so
+            # keying on ``not reference_diff`` at the materialization site
+            # would mark every no-plan and judge-failed cell too — ~every
+            # no-plan cell in a hard campaign, i.e. exactly the population the
+            # consumer must be able to see PAST — diluting the count used to
+            # bound plan_quality validity into uselessness.
+            judged_without_reference = not reference_diff
 
     wall_clock_ms = int(time.monotonic() * 1000) - start_ms
 
@@ -1090,6 +1403,7 @@ async def run_architect_eval(
         cap_tainted=tainted,
         judge_cost_usd=judge_cost_usd,
         judge_invocations=judge_invocations,
+        judged_without_reference=judged_without_reference,
     )
     result_obj = EvalResult(
         task_id=task_id,
@@ -1111,6 +1425,8 @@ async def run_architect_eval(
             f'{metrics.invocation_error}]'
             if metrics.invocation_error else ''
         )
+        # So a run's OWN log carries the validity bound, not just the report.
+        + (' [judged_without_reference]' if judged_without_reference else '')
     )
     return result_obj
 
@@ -1179,12 +1495,7 @@ async def run_end_to_end(
     briefing = BriefingAssembler(orch_config)
     mcp = _EvalMcpStub(orch_config.fused_memory.url)
 
-    usage_gate: UsageGate | None = None
-    if orch_config.usage_cap.enabled:
-        try:
-            usage_gate = UsageGate(orch_config.usage_cap)
-        except Exception as exc:
-            logger.warning(f'Failed to create UsageGate for eval: {exc} — running without failover')
+    usage_gate = await _build_eval_usage_gate(orch_config)
 
     # 5. Build the workflow with initial_plan=None → the architect plans LIVE and
     #    feeds the live implementer (the both-live path; run_eval hands a frozen

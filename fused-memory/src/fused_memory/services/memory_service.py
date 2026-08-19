@@ -14,7 +14,7 @@ import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from graphiti_core.nodes import EpisodeType
 
@@ -26,10 +26,14 @@ from fused_memory.backends.mem0_client import (
 )
 from fused_memory.config.schema import FusedMemoryConfig, MemoryMetadataConfig
 from fused_memory.memory_metadata import (
+    PARENT_ID_DEAD_CODE,
+    PARENT_ID_UNAVAILABLE_CODE,
     CanonicalUniquenessViolation,
     MemoryMetadataValidationError,
     MetadataViolation,
+    ParentHasChildrenError,
     is_valid_topic_slug,
+    parent_liveness_violation,
     validate_memory_metadata,
 )
 from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
@@ -72,7 +76,15 @@ from fused_memory.services.memory_metadata_census import (
     file_unknown_key_storm_escalation,
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
+from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.referent_resolution import (
+    REFERENT_SOURCES,
+    ReferentResolution,
+    ReferentSet,
+    resolve_referents,
+)
 from fused_memory.utils.task_naming import canonicalize_task_node_name
+from fused_memory.utils.validation import _safe_repr, require_full_uuid
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -91,6 +103,44 @@ logger = logging.getLogger(__name__)
 # outer step budget lives in server/main.py as _MEMORY_CLOSE_STEP_TIMEOUT and
 # must dominate 6 * _SUBCLOSE_TIMEOUT (guarded by TestShutdownBudgetArithmetic).
 _SUBCLOSE_TIMEOUT = 3.0
+
+# Reciprocal Rank Fusion constant for the cross-store merge in
+# MemoryService.search (task 3658, PRD D4 — deliberately a module constant, not
+# config: it is part of the documented read contract, not an operator knob).
+#
+# The consequence worth internalizing: because K dominates the ranks in play
+# (limit is typically <= 20), the fused value is an ORDINAL, never a similarity.
+# Every possible score lives in the narrow band 1/(K+1) .. 1/(K+limit) — for
+# K=60, roughly 0.0164 down to 0.0125. Do not read a fused score as "how
+# similar"; per-store truth lives in metadata['store_score'].
+RRF_K = 60
+
+
+def _rrf_score(rank: int) -> float:
+    """Reciprocal Rank Fusion score for a 1-based per-store rank (task 3658).
+
+    The value is ORDINAL, never a similarity: rank-1 scores 1/(RRF_K + 1) =
+    1/61 ~ 0.0164 and rank-2 scores 1/62 ~ 0.0161, regardless of how good
+    either result actually is.  Consumers must not compare it across API
+    versions or treat it as a distance; the honest per-store signal is
+    ``metadata['store_score']`` (the Mem0 cosine; ``None`` for Graphiti, which
+    exposes no scores at all — the very reason RRF was chosen over score
+    calibration).
+
+    The PRD writes fusion as ``Σ over stores of 1/(K + rank_store(r))``, but
+    that sum degenerates to this single term for every result here: Graphiti
+    results are keyed by edge uuid and Mem0 results by memory id, and there is
+    no cross-store dedup anywhere in the pipeline, so no result is ever
+    contributed by more than one store.  A real multi-term accumulator would be
+    dead code no input can exercise.
+
+    That degeneracy is exactly what fixes the Mem0 shut-out: with one term per
+    result, the merged order becomes a rank INTERLEAVE (graphiti-1, mem0-1,
+    graphiti-2, mem0-2, ...) rather than one store's results wholesale
+    preceding the other's.
+    """
+    return 1.0 / (RRF_K + rank)
+
 
 # Canonical relational verb for dependency facts (mirrors routing/classifier.py:19).
 # Used by _restore_superseded_dependency_edges to identify edges that should
@@ -414,29 +464,128 @@ async def _apply_memory_metadata_validation(
     config: MemoryMetadataConfig,
     storm_detector: UnknownKeyStormDetector,
     project_root: str,
+    parent_lookup: Callable[[str, str], Awaitable[dict | None]],
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
+    baseline: dict | None = None,
 ) -> None:
     """Validate the Mem0 metadata vocabulary at the write boundary, in place.
 
     Task 3195 (leaf β of ``docs/prds/memory-metadata-vocabulary.md``).  The
     third of this module's shared in-place metadata helpers, alongside
     :func:`_normalize_task_id_metadata` and
-    :func:`_apply_cycle_summary_metadata_tagging`, and shared by
-    ``add_memory`` and ``add_system_record`` for the same reason the
-    task-2222 amendment made the cycle-summary tagging shared: PRD D8/§2 pin
-    enforcement at the SERVICE seam precisely because ``add_system_record``
-    is a second write path that a tools-layer validator would leak past.
-    Two call sites with drifting behaviour would reopen that hole.
+    :func:`_apply_cycle_summary_metadata_tagging`, and shared by ALL THREE
+    Mem0 write paths — ``add_memory``, ``add_system_record`` and (task 3523)
+    ``update_memory`` — for the same reason the task-2222 amendment made the
+    cycle-summary tagging shared: PRD D8/§2 pin enforcement at the SERVICE
+    seam precisely because ``add_system_record`` is a second write path that
+    a tools-layer validator would leak past.  Call sites with drifting
+    behaviour would reopen that hole.
 
-    Discharges three obligations:
+    ``update_memory`` is the third such path and reproduced exactly that
+    leak until task 3523: a patch could set any ``topic`` spelling or a
+    second ``canonical`` for a taken topic without ever reaching this
+    function.  D8/§2 enumerated only the two add paths, and that silence
+    read as coverage.  If a FOURTH write path appears, it belongs here too —
+    the enumeration above is the checkable list.
+
+    Discharges five obligations:
 
     1. **Normalize + shape-check** via ``validate_memory_metadata`` (the only
        in-place mutation is ``supersedes`` scalar→list, PRD D2).
-    2. **Census** every violation, fatal or not, so warn-mode leaves a trace.
-    3. **Reject** — but ONLY when ``enforce`` is on AND at least one
+    2. **Resolve ``parent_id`` LIVENESS** (task 3197, leaf δ) — see below.
+    3. **Census** every violation, fatal or not, so warn-mode leaves a trace.
+    4. **Reject** — but ONLY when ``enforce`` is on AND at least one
        violation is fatal.  Unknown keys are never fatal, so flipping
        ``enforce`` cannot turn the 1,627-key long tail into an outage.
+    5. **Re-check ``canonical`` UNIQUENESS** (task 3198, leaf ε) via
+       :func:`_check_canonical_uniqueness`, which raises its own
+       :class:`CanonicalUniquenessViolation`.  It runs AFTER the reject arm
+       above: malformed metadata is refused on shape before any live-state
+       probe is spent on it.
+
+    ``baseline`` — JUDGE THE DELTA, NEVER THE CORPUS (task 3523).  The two
+    add paths CREATE a record, so there is no pre-image: they pass no
+    ``baseline`` and every obligation above applies to the whole dict,
+    bit-identically to before this parameter existed.  ``update_memory``
+    AMENDS one, and passes the record's pre-image custom subset.  When it is
+    supplied, obligations 2 through 5 are reduced to what this write actually
+    CHANGED — a violation the record already carried (on a key this write
+    left alone) is neither re-censused nor re-rejected, the ``parent_id``
+    liveness probe fires only for a parent this write ASSERTS, and the
+    uniqueness probe fires only for a ``canonical``/``topic`` claim the
+    record does not already hold.
+
+    That reduction has THREE implementation sites, not one, because the
+    rules reach live state differently.  Obligations 3 and 4 are reduced by
+    the ``(key, code)`` subtraction below; obligation 5 by
+    :func:`_check_canonical_uniqueness`'s guard 3; obligation 2 by its own
+    claim-is-NEW gate on the liveness block, because the subtraction
+    structurally cannot see liveness codes (the pure validator cannot
+    produce them) and would let both survive every patch.  A fourth rule
+    that reads live state needs its own gate too — the subtraction will not
+    cover it.
+
+    That reduction is not a leniency knob; it is what keeps ``enforce``
+    meaning "reject WRITES" instead of quietly becoming "re-validate the
+    corpus".  Both PRD §9 leaf ε's 2026-08-04 amendment and
+    :func:`_check_canonical_uniqueness` state that model in prose, and task
+    3626's decision to flip ``enforce`` on is measured against it (~20 → ~19
+    false rejections/week).  Validating the full effective dict on every
+    patch would silently invalidate that measurement: legacy records are
+    known fatal-invalid today (``scripts/sweep_toolcall_xml_leak.py``
+    enumerates the classes — unknown ``kind``, malformed ``supersedes``,
+    non-bool ``canonical``), so re-tagging exactly those records would start
+    failing the moment the flip landed.  ``scripts/retro_stamp_topics.py``
+    is the in-repo bulk re-tagger that would hit it: it stamps ``topic``
+    onto legacy records through THIS path, one metadata-only patch each.
+    (That sweep is cited for the enumeration and for the re-tagging
+    exposure, NOT as a caller of this arm — it repairs by delete + re-add
+    through ``add_memory`` and pre-checks with ``validate_memory_metadata``
+    itself, so it never reaches ``update_memory``.)  Costs one extra PURE
+    synchronous
+    ``validate_memory_metadata`` call on a shallow copy, and zero I/O; see
+    the block comment at the subtraction for the two-halves forgiveness rule
+    and its ordering constraints.
+
+    LIVENESS IS HERE, NOT IN THE REGISTRY, on purpose.  Leaf β made
+    ``validate_memory_metadata`` a pure synchronous function taking only a
+    dict, so it structurally *cannot* perform a store lookup — a boundary
+    its docstring states explicitly so a later leaf "cannot accidentally
+    grow a second implementation of it in here (INV-5)".  This helper is
+    the nearest layer that can reach a store, and it is already the SINGLE
+    shared home for both write paths, so putting liveness here gets
+    ``add_system_record`` covered by construction.  Only the CODES and the
+    message wording stay in the registry, behind
+    :func:`~fused_memory.memory_metadata.parent_liveness_violation`, so the
+    rule still has exactly one normative home.
+
+    The lookup fires only when ``parent_id`` is PRESENT, already
+    shape-valid, *and* (task 3523, when a ``baseline`` is supplied) actually
+    ASSERTED by this write: the common write path (no ``parent_id`` at all —
+    leaf α measured zero live records carrying one) pays no round-trip, an
+    id no store could resolve is never spent on, and a patch that leaves an
+    existing ``parent_id`` untouched is answerable for neither the lookup
+    nor its verdict.  Liveness ADDS a violation
+    rather than opening a second rejection path: because
+    ``parent_liveness_violation`` is ``fatal=True``, warn mode censuses and
+    proceeds while ``enforce`` rejects, both through the same arms below.
+
+    A lookup that FAILS is a different fact from a parent that is gone, and
+    gets its own code (``parent_id_liveness_unavailable``).
+    ``Mem0Backend.get_point_by_id`` propagates a Qdrant read-timeout rather
+    than collapsing it into ``None`` precisely to preserve that
+    distinction; folding both into ``dead_parent_id`` would discard it here
+    and tell an operator a live parent is dead.  That code is fatal too, so
+    ``enforce`` fails CLOSED on it — INV-3 read literally: an actor that
+    cannot corroborate must not act.  The blast radius of failing closed is
+    confined to writes that actually carry ``parent_id``, a population leaf
+    α measured at zero live records, and only while ``enforce`` is on.
+
+    ``parent_lookup`` is REQUIRED and takes no ``None`` default.  A
+    defaultable resolver would let a future third write path construct this
+    helper without one and silently skip liveness — reintroducing the exact
+    silent-orphan class leaf δ exists to close, and doing it invisibly.
 
     The enforce flags are read PER CALL off the shared config object rather
     than captured, so a config edit takes effect on the next write.
@@ -464,6 +613,119 @@ async def _apply_memory_metadata_validation(
     violations = validate_memory_metadata(
         meta, enforce_kind_registry=config.enforce_kind_registry
     )
+
+    # parent_id LIVENESS (leaf δ). Gated on the SHAPE check having passed —
+    # `validate_memory_metadata` emits `invalid_parent_id_shape` under the
+    # same key, so any parent_id-keyed violation means the id is malformed
+    # and no store could resolve it in that spelling.
+    #
+    # ALSO gated on the parent_id claim being NEW (task 3523), mirroring
+    # `_check_canonical_uniqueness`'s guard 3 in shape and for the same
+    # reason. Liveness is the ONE rule the (key, code) subtraction below
+    # structurally cannot delta-scope: the baseline set is built by the PURE
+    # `validate_memory_metadata`, which cannot produce `dead_parent_id` or
+    # `parent_id_liveness_unavailable`, so those codes would survive the
+    # subtraction on EVERY patch — including one that never mentions
+    # parent_id. A record whose parent was later deleted would then become
+    # permanently un-patchable under `enforce` (and census a `dead_parent_id`
+    # line per patch under the shipped warn mode), which is exactly the
+    # "`enforce` re-validates the corpus" failure the delta rule exists to
+    # prevent. So the scoping happens HERE, at the source, instead.
+    #
+    # Fail-CLOSED is preserved for every write that ASSERTS a parent: a new
+    # or CHANGED parent_id still pays the round-trip and still rejects under
+    # `enforce`. Only an untouched pre-existing one is forgiven — the same
+    # value-unchanged half the shape rules use below. Compared raw rather
+    # than against the normalized copy because `validate_memory_metadata`'s
+    # only in-place mutation is `supersedes`; `parent_id` is never rewritten.
+    if (
+        'parent_id' in meta
+        and (baseline is None or baseline.get('parent_id') != meta['parent_id'])
+        and not any(v.key == 'parent_id' for v in violations)
+    ):
+        try:
+            parent = await parent_lookup(project_id, meta['parent_id'])
+        except Exception as exc:
+            # `Exception`, never `BaseException`: CancelledError,
+            # KeyboardInterrupt and SystemExit must keep propagating, per
+            # the repo's cancellation convention.
+            #
+            # The exception TYPE is logged so the raw backend cause is
+            # degraded, not discarded — the census code says only "could
+            # not be checked", and an operator debugging a burst of
+            # `parent_id_liveness_unavailable` needs something to correlate
+            # against.
+            logger.warning(
+                'memory_metadata: parent_id liveness lookup failed for '
+                'project_id=%r parent_id=%r: %s: %s',
+                project_id, meta['parent_id'], type(exc).__name__, exc,
+            )
+            liveness_code = PARENT_ID_UNAVAILABLE_CODE
+        else:
+            liveness_code = None if parent is not None else PARENT_ID_DEAD_CODE
+        if liveness_code is not None:
+            violations.append(
+                parent_liveness_violation(meta['parent_id'], code=liveness_code)
+            )
+
+    # DELTA SCOPING (task 3523) — judge what this write CHANGED, never the
+    # record at rest.  Supplied only by `update_memory`, which is amending an
+    # existing record; the two add paths create one and so have no pre-image,
+    # pass no baseline, and are bit-identical to before.
+    #
+    # Reducing the set here, ONCE, is what makes the rule uniform: all three
+    # arms below — census, storm detector, enforce-reject — then operate on
+    # NEW violations only.  Re-censusing a pre-existing violation on every
+    # patch would inflate the census stream the task-3626 flip is measured
+    # from and trip false unknown-key storms off a long tail that was already
+    # counted; re-rejecting one would quietly restate `enforce` from "rejects
+    # WRITES" to "re-validates the corpus", which is the model both
+    # `_check_canonical_uniqueness`'s docstring and PRD §9 leaf ε's
+    # 2026-08-04 amendment state and measure against.
+    #
+    # AFTER the liveness block on purpose: that block gates its round-trip on
+    # `parent_id` carrying no shape violation, so subtracting first would let
+    # a pre-existing `invalid_parent_id_shape` spend a lookup on an id no
+    # store could resolve and then census `dead_parent_id` for it — blaming
+    # the wrong rule, which leaf δ explicitly forbids.
+    #
+    # THIS SUBTRACTION DOES NOT DELTA-SCOPE LIVENESS, and cannot: `already`
+    # comes from the PURE `validate_memory_metadata`, which structurally
+    # cannot emit `dead_parent_id` / `parent_id_liveness_unavailable`, so
+    # `(v.key, v.code) not in already` is unconditionally True for both and
+    # they would survive every patch. Liveness is delta-scoped at its SOURCE
+    # instead — see the claim-is-NEW gate on the block above. Do not "unify"
+    # the two by deleting that gate and relying on this list comprehension:
+    # it would silently reinstate corpus re-validation for exactly one rule.
+    #
+    # Forgiven only when BOTH halves hold: the baseline already carried this
+    # (key, code) AND the write left that key's value alone.  (key, code)
+    # alone is not enough — swapping one bad slug for a DIFFERENT bad slug
+    # repeats the pair while being entirely this write's doing, and would
+    # earn a free pass.  "Judge what the write CHANGED" is about the KEY's
+    # value, not about which rule happens to fire.
+    #
+    # Compared against the NORMALIZED baseline copy, not the raw pre-image:
+    # `validate_memory_metadata` mutates in place, so a record whose stored
+    # `supersedes` is a legacy scalar would otherwise read as "changed" on
+    # every patch that never mentioned it.
+    #
+    # One extra PURE synchronous call on a shallow COPY, and zero I/O.
+    if baseline is not None:
+        _unset = object()
+        before = dict(baseline)
+        already = {
+            (v.key, v.code)
+            for v in validate_memory_metadata(
+                before, enforce_kind_registry=config.enforce_kind_registry
+            )
+        }
+        violations = [
+            v for v in violations
+            if (v.key, v.code) not in already
+            or meta.get(v.key, _unset) != before.get(v.key, _unset)
+        ]
+
     # NOTE: this is `if violations:`, not an early `return` — the canonical
     # uniqueness re-check below must still run for metadata that is
     # perfectly well-formed, which is the overwhelmingly common case for a
@@ -502,6 +764,7 @@ async def _apply_memory_metadata_validation(
         config=config,
         count_canonical=count_canonical,
         find_canonical=find_canonical,
+        baseline=baseline,
     )
 
 
@@ -520,6 +783,7 @@ async def _check_canonical_uniqueness(
     config: MemoryMetadataConfig,
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
+    baseline: dict | None = None,
 ) -> None:
     """Enforce <=1 canonical memory per ``(project, topic)`` (PRD V1, INV-3).
 
@@ -590,9 +854,30 @@ async def _check_canonical_uniqueness(
        was already reported by the pure validator, and we must never build
        a query on a malformed key (``count_by_metadata`` also rejects an
        empty filter).
-    3. count == 0 → return.  The happy path pays exactly one exact Qdrant
+    3. *baseline* supplied and the effective ``(canonical, topic)`` claim
+       EQUALS the baseline's → return (task 3523).  This write asserts no
+       claim the record does not already hold, so there is nothing new to
+       check, and ε's contracted zero-extra-round-trips property must hold
+       for a no-op too.  Only ``update_memory`` supplies a baseline; the two
+       add paths pass none, keep this guard inert, and so keep today's exact
+       guard order and round-trip count.
+
+       THIS IS WHAT MAKES SELF-INCUMBENCY STRUCTURALLY IMPOSSIBLE — do not
+       "fix" it later by adding an ``exclude_id``.  The probe now runs only
+       when the record is ACQUIRING a claim, and a record that does not yet
+       hold the claim in the store cannot appear in the store-side count.
+       An ``exclude_id`` would instead cost an extra round-trip on every
+       canonical patch, need ``limit=2`` to filter self out of the scroll,
+       add a parameter to both injected collaborators, and risk
+       over-excluding a genuine duplicate — while STILL needing this guard
+       to avoid probing on a no-op.
+
+       Compared as a PAIR, not on ``canonical`` alone: a canonical record
+       re-homed from topic T to topic U changes no ``canonical`` value but
+       is acquiring a claim at U, where it genuinely is not the incumbent.
+    4. count == 0 → return.  The happy path pays exactly one exact Qdrant
        count and never scrolls.
-    4. otherwise resolve the incumbent's id and reject.
+    5. otherwise resolve the incumbent's id and reject.
 
     WHY COUNT THEN SCROLL: V1 contract-fixes ``count_memories_by_metadata``
     as the INV-3 mechanism, but also requires the error to name the existing
@@ -628,6 +913,17 @@ async def _check_canonical_uniqueness(
       who were never told the rule: ``_MEMORY_INSTRUCTIONS`` still carries
       no slug guidance.  THE REAL PRECONDITION is leaf ι (task 3202).
 
+    STILL TRUE AFTER TASK 3523, and deliberately so.  Wiring this seam into
+    ``update_memory`` added a third write path, but its enforcement is
+    DELTA-scoped: a patch is judged only on the violations and claims it
+    introduces, so amending a record never re-validates what that record
+    already carried.  Had it been full-dict instead, every patch of a legacy
+    record would have become a rejection under ``enforce`` and the ~19/week
+    figure above — the number 3626 flips against — would have silently
+    stopped describing the system.  Guard 3 is the uniqueness half of that
+    rule; see :func:`_apply_memory_metadata_validation`'s ``baseline`` for
+    the shape half.
+
     Task 3626 is the gate that re-measures and decides the flip; it carries
     the full model and the re-measurement recipes.  Do not flip from this
     docstring alone.
@@ -646,6 +942,14 @@ async def _check_canonical_uniqueness(
 
     topic = meta.get('topic')
     if not isinstance(topic, str) or not is_valid_topic_slug(topic):
+        return
+
+    # Guard 3 (task 3523) — no NEW claim, no probe.  See the numbered list in
+    # the docstring: this is what makes the record's own presence in the
+    # store irrelevant, so no `exclude_id` is needed anywhere below.
+    if baseline is not None and (
+        (baseline.get('canonical'), baseline.get('topic')) == (True, topic)
+    ):
         return
 
     filters = {'topic': topic, 'canonical': True}
@@ -782,6 +1086,182 @@ def _serialize_temporal(
         'valid_at': _to_iso(valid_at),
         'invalid_at': _to_iso(invalid_at),
     }
+
+
+def _encode_referents(resolution: ReferentResolution) -> dict[str, Any]:
+    """Encode a resolved referent set for the durable-queue payload.
+
+    THE WIRE CONTRACT (task 3670, PRD leaf epsilon).  One additional key,
+    ``'referents'``, on the EXISTING ``add_episode`` / ``add_memory_graphiti``
+    payloads::
+
+        {'source': <one of REFERENT_SOURCES>,
+         'refs': [{'kind': ..., 'project_id': ..., 'number': ...}, ...]}
+
+    Deliberately NO ``payload_version``, no unknown-operation guard and no
+    migration (PRD "Queue compatibility is free here").  An OLD consumer
+    draining a new row ignores exactly one unknown key; a NEW consumer draining
+    an old row finds the key absent and treats it as "no referents" — which is
+    today's behaviour exactly.  A new queue OPERATION would have needed all
+    three; one additional key on an existing payload needs none of them.
+
+    Nesting everything under a single key (rather than flat ``referent_source``
+    + ``referent_refs``) keeps the back-compat story to one presence test and
+    gives :func:`_decode_referents` exactly one thing to validate.
+
+    Emits PLAIN JSON SCALARS ONLY, never the frozen :class:`Referent` dataclass
+    itself: the queue persists payloads as JSON TEXT in SQLite, so a
+    non-serializable value here would surface only in production.
+
+    AMBIGUITY IS DELIBERATELY NOT THREADED — READ THIS BEFORE WRITING ZETA.
+    ``ReferentResolution.ambiguous`` (and ``.conflicts``) are dropped here; only
+    ``.source`` and ``.referents`` ride the wire.  That matters because gamma
+    excludes ambiguous referents from ``.referents`` on purpose ("recorded, not
+    guessed"), so a consumer that reads ONLY ``refs`` sees an ambiguous endpoint
+    as a plain non-member of the set — indistinguishable from a genuine
+    conflation.  Leaf zeta must therefore NOT treat "endpoint not in the decoded
+    set" as sufficient grounds for leaf eta to repoint the edge, or an ambiguous
+    reference gets destructively repaired instead of recorded and left alone
+    (PRD boundary-test table: "Ambiguous scan | ref routed to ``.ambiguous``;
+    treated as undeclared; recorded, not guessed").
+
+    Zeta re-derives it rather than reading it off the wire.  ``.ambiguous`` is
+    ``scan_content(content, group_id=group_id).ambiguous`` verbatim on EVERY
+    precedence path — a pure function of ``(content, group_id)``, independent of
+    ``declared``/``metadata`` (referent_resolution.py: "`.ambiguous` is the
+    scan's verbatim answer on every path").  ``_execute_graphiti_write`` holds
+    both ``payload['content']`` and ``payload['group_id']``, so zeta can recover
+    the producer's exact ambiguity set from data already on the payload.
+
+    That re-derivation is a SECOND SCAN SITE, which gamma's own comment flags as
+    the INV-5 lockstep duplication canonical_labels exists to prevent — so
+    carrying ``'ambiguous'`` as a third key is the better long-term shape and is
+    filed as follow-up work.  It is not done here because this leaf's frozen
+    contract is the two-key blob and widening it changes this function's return
+    arity and the wire shape every test in
+    tests/test_referent_queue_threading.py pins.  Extending it later is
+    additive and needs no migration, exactly as adding ``'referents'`` did.
+    """
+    return {
+        'source': resolution.source,
+        'refs': [
+            {'kind': r.kind, 'project_id': r.project_id, 'number': r.number}
+            for r in resolution.referents
+        ],
+    }
+
+
+def _decode_referents(payload: dict[str, Any]) -> tuple[ReferentSet, str]:
+    """Pop and decode the ``'referents'`` blob :func:`_encode_referents` wrote.
+
+    Returns ``(referents, source)``.  An ABSENT key decodes to ``((), 'none')``
+    — an old-format queue row executes byte-identically to today.
+
+    POPS the key, matching how ``_execute_graphiti_write`` already treats
+    ``temporal_context`` / ``unverified_claim`` / ``reference_time``.  Safe
+    because ``DurableWriteQueue._process_item`` hands the executor one
+    ``parsed_payload()`` and the registered callback a SECOND, FRESH one,
+    precisely so the executor can pop what the callbacks read back.
+
+    Each entry is rebuilt through the ``Referent(...)`` constructor rather than
+    kept as a bare dict, so the frozen type's kind-registry validation runs on
+    untrusted wire data too — which is also what makes an unregistered ``kind``
+    on the wire fall into the degradation path below instead of minting a bogus
+    referent.  That constructor validates ``kind`` ONLY, so ``number`` and
+    ``project_id`` are type-checked here before it runs; see the inline comment
+    in the decode loop for the three distinct ways an unchecked field escapes.
+
+    DEGRADATION IS ALL-OR-NOTHING.  Any unreadable element — a non-dict blob, a
+    ``source`` outside :data:`REFERENT_SOURCES`, a non-list ``refs``, or a
+    SINGLE malformed entry — degrades the WHOLE blob to ``((), 'none')``, never
+    a partial set.  A partial set is worse than no set for the consumer this
+    exists to serve: leaf zeta's set-membership check reads "endpoint not in
+    the referent set" as a conflation and leaf eta repairs it by repointing the
+    edge, so a referent silently dropped by a lenient decoder would manufacture
+    a false conflation and drive destructive edge surgery onto the wrong node.
+    Referents are therefore accumulated into a local list and only frozen into
+    a tuple on FULL success, so a partial set cannot escape by construction.
+
+    DEGRADES RATHER THAN RAISES, deliberately.  This runs inside the queue
+    executor: raising would route the item to ``_handle_failure`` and
+    eventually dead-letter it, LOSING the memory over a telemetry field.
+    Degrading is safe here only BECAUSE the anomaly lands in the 'none' bucket
+    that ``_execute_graphiti_write``'s counter makes loud — the INV-4 escape,
+    not a silent fallthrough.  The ABSENT key is the one case that does NOT
+    warn: it is the load-bearing back-compat path (every row written before
+    task 3670), not an anomaly, and warning on it would drown the log during a
+    drain of a pre-feature queue.  It is still COUNTED, in the same bucket.
+
+    Loud-and-degrade mirrors the invalid-``reference_time`` arm already in
+    ``_execute_graphiti_write``, so this file has one idiom, not two.
+    """
+    blob = payload.pop('referents', None)
+    if blob is None:
+        return (), 'none'
+
+    def _degrade(reason: str) -> tuple[ReferentSet, str]:
+        # _safe_repr, not a bare %r: the blob is arbitrary decoded JSON from a
+        # queue row and this warning fires on EVERY retry attempt of that item,
+        # so an oversized corrupt value would otherwise dump its full repr into
+        # the log repeatedly. Matches how the sibling module this codec is
+        # written against (utils/referent_resolution.py) renders every one of
+        # its untrusted-value rejection messages.
+        logger.warning(
+            "Unreadable 'referents' payload key (%s); treating the write as "
+            'having no referents. Blob: %s',
+            reason, _safe_repr(blob),
+        )
+        return (), 'none'
+
+    if not isinstance(blob, dict):
+        return _degrade(f'expected a dict, got {type(blob).__name__}')
+    source = blob.get('source')
+    if source not in REFERENT_SOURCES:
+        return _degrade(f'source {source!r} is not one of {list(REFERENT_SOURCES)}')
+    refs = blob.get('refs')
+    if not isinstance(refs, list):
+        return _degrade(f"'refs' must be a list, got {type(refs).__name__}")
+
+    decoded: list[Referent] = []
+    for entry in refs:
+        if not isinstance(entry, dict):
+            return _degrade(f'entry {_safe_repr(entry)} is not a dict')
+        # `Referent.__post_init__` validates `kind` against the kind registry
+        # but NOT `number`/`project_id` — those two fields accept any object at
+        # all, so the constructor alone does NOT harden this boundary. Each
+        # unchecked type is a distinct downstream failure:
+        #   - a non-str `number` (e.g. 3127) mints a Referent that compares
+        #     UNEQUAL to its string twin, so leaf zeta's set-membership check
+        #     would read a legitimate endpoint as a conflation and leaf eta
+        #     would repoint the edge destructively — the same false-conflation
+        #     failure the all-or-nothing rule above exists to prevent, arriving
+        #     through a mistyped field instead of a dropped one;
+        #   - a None `number`/`project_id` mints a referent whose `node_name`
+        #     is the literal string 'Task None';
+        #   - an UNHASHABLE `number` (a list) mints a Referent that raises
+        #     TypeError the moment a consumer puts it in a set — a raise inside
+        #     the queue executor, i.e. exactly the dead-letter-and-lose-the-
+        #     memory outcome degrade-rather-than-raise exists to prevent.
+        # `_encode_referents` only ever emits strings, so this is reachable
+        # today only from a corrupt or hand-edited SQLite row — but this
+        # function is the wire-hardening boundary, so it hardens the fields
+        # that matter rather than assuming its own encoder wrote the row.
+        number = entry.get('number')
+        project_id = entry.get('project_id', '')
+        if not isinstance(number, str) or not isinstance(project_id, str):
+            return _degrade(
+                f'entry {_safe_repr(entry)} has a non-string number/project_id'
+            )
+        try:
+            decoded.append(Referent(
+                kind=entry.get('kind', 'task'),
+                project_id=project_id,
+                number=number,
+            ))
+        except (KeyError, TypeError, ValueError) as e:
+            return _degrade(f'entry {_safe_repr(entry)} is not a valid Referent: {e}')
+
+    return tuple(decoded), source
 
 
 def _created_at_to_utc_iso(created_at: datetime | None) -> str | None:
@@ -1074,6 +1554,20 @@ class ReconcileStats:
     errors: list[str] = field(default_factory=list)
 
 
+class DescendantScan(NamedTuple):
+    """What a cascade WOULD destroy — and whether that answer is complete.
+
+    ``truncated`` is not decoration: a read-only walk cannot page past
+    ``MemoryService._CHILD_SCAN_LIMIT``, so the id list can genuinely be a
+    subset. Carrying that as data forces a caller gating an irreversible
+    multi-record delete to decide what to do about "I could not see all of
+    them" instead of reading a partial set as complete.
+    """
+
+    ids: list[str]
+    truncated: bool
+
+
 class MemoryService:
     """Central orchestration — fused read/write across Graphiti + Mem0."""
 
@@ -1104,6 +1598,26 @@ class MemoryService:
         # likely to be noticed any other way.
         self._mem0_update_storm_counters: dict[str, StormCounter] = {}
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
+        # INV-4 storm escape for the referent-set queue channel (task 3670, PRD
+        # leaf epsilon). `_decode_referents` degrades an unreadable or absent
+        # blob to ('none') rather than raising — losing the memory over a
+        # telemetry field would be worse — so that degradation MUST be counted
+        # rather than silently fallen through. Constructed UNCONDITIONALLY, for
+        # the same reason the two counters above are: an alarm that only exists
+        # when `_write_journal` is configured would vanish in exactly the
+        # degraded configuration where a referent-less write storm is least
+        # likely to be noticed any other way.
+        #
+        # Bucketed by ALL FOUR sources, not just 'none', because leaf iota needs
+        # a DENOMINATOR: "sustained 100% none" is a rate, and an absolute
+        # none-count alone cannot distinguish a broken producer from a quiet
+        # system. Keyed off gamma's exported REFERENT_SOURCES so the vocabulary
+        # lives at ONE site (that constant's stated purpose) and a fifth source
+        # cannot escape the counter.
+        #
+        # Bounded by that four-member closed vocabulary, so unlike the per-agent
+        # storm counters above it needs no pruning.
+        self._referent_source_counts: dict[str, int] = dict.fromkeys(REFERENT_SOURCES, 0)
         # Test seam for the injectable-clock convention: a 3600s window has to
         # be exercised by advancing a fake clock, not by sleeping.
         self._mem0_update_storm_time_provider: Callable[[], float] = time.time
@@ -2193,6 +2707,47 @@ class MemoryService:
         )
         return stats
 
+    def referent_source_counts(self) -> dict[str, int]:
+        """How many Graphiti write ATTEMPTS resolved to each referent source.
+
+        ATTEMPTS, not completed writes, and the distinction is load-bearing for
+        anyone building an alert on the rate.  The increment sits at the TOP of
+        ``_execute_graphiti_write``, which ``DurableWriteQueue._process_item``
+        re-invokes on every RETRY of an item with a freshly parsed payload — so
+        a retry storm on one group inflates whichever bucket that item lands in,
+        and an item that eventually dead-letters is still counted.  Retries are
+        in the numerator AND the denominator; the skew is roughly uniform across
+        buckets in the common case (a row's source does not change between its
+        own attempts), so a "sustained 100% none" reading survives it, but a
+        per-bucket ABSOLUTE count must not be read as a count of memories.
+
+        The increment deliberately stays at the top rather than moving after the
+        successful backend call: counting only successes would make the escape
+        go dark during a backend outage — exactly when a referent-less write
+        storm is least likely to be noticed any other way — and would decouple
+        it from the single decode the journal stamp also reads.
+
+        The INV-4 storm escape for the referent-set queue channel (task 3670,
+        PRD leaf epsilon), and the read side of ``_referent_source_counts``.
+
+        Emitted at the CONSUMER (``_execute_graphiti_write``), not at the three
+        producers, deliberately: the regression this exists to detect is "the
+        plumbing breaks, every row arrives referent-less, and the feature
+        no-ops in total silence", and that failure lives on the PRODUCER side —
+        a counter emitted there would go dark in exactly that scenario. Only
+        the consumer sees both new-format and old-format rows.
+
+        Buckets ALL FOUR sources rather than only 'none', because leaf iota
+        needs a denominator: "sustained 100% none" is a RATE, and an absolute
+        none-count alone cannot distinguish a broken producer from a quiet
+        system.
+
+        Returns a COPY, so a caller cannot mutate the escape hatch's own state.
+        Process-lifetime totals, never reset — a monotonic counter a reader
+        samples and differences, matching the uptime-baseline convention above.
+        """
+        return dict(self._referent_source_counts)
+
     async def _execute_graphiti_write(
         self, operation: str, payload: dict[str, Any]
     ) -> Any:
@@ -2207,6 +2762,27 @@ class MemoryService:
         causation_id = payload.pop('_causation_id', None)
         write_op_id = payload.pop('_write_op_id', None)
         temporal_context = payload.pop('temporal_context', None)
+        # task 3142: rides the same payload channel temporal_context does, so
+        # the tag reaches the persisted episodic node (and, via
+        # _dual_write_callback, every fact derived from it).
+        unverified_claim = bool(payload.pop('unverified_claim', False))
+        # task 3670: the referent set resolved at the write boundary, popped on
+        # the same channel. An ABSENT key decodes to ((), 'none'), so a queue
+        # row written before this feature executes byte-identically to today.
+        #
+        # `referents` is the value leaf zeta will hand to
+        # `_verify_episode_referents(result, group_id=..., referents=referents)`
+        # INSIDE the identity-lock critical section below — deliberately inside,
+        # so no wrongly-attached state is ever externally visible between the
+        # write and its verification. Nothing else in this method changes, which
+        # is what keeps an old-format row byte-identical.
+        referents: ReferentSet
+        referents, referent_source = _decode_referents(payload)
+        # INV-4 escape: EVERY Graphiti write is bucketed, so the absent and
+        # degraded paths are counted rather than silently falling through. See
+        # `_referent_source_counts` in __init__ for why this is unconditional
+        # and why all four sources are bucketed. Leaf iota reads it.
+        self._referent_source_counts[referent_source] += 1
         reference_time_iso = payload.pop('reference_time', None)
         reference_time = None
         if reference_time_iso is not None:
@@ -2238,7 +2814,26 @@ class MemoryService:
                 causation_id=causation_id,
                 backend='graphiti',
                 operation='add_episode',
-                payload={'content': payload['content'][:200], 'group_id': payload.get('group_id')},
+                # referent_source/referent_count (task 3670) are the DURABLE
+                # half of the telemetry split, and come from the ONE decode
+                # above — never re-derived, so the durable channel and the
+                # in-process counter cannot disagree. The counter is the
+                # unconditional INV-4 escape (it exists even when
+                # `_write_journal` is None); this row is what gives leaf iota
+                # per-project, time-windowed data, through a journal row that
+                # already exists — no new schema, no new table, no new write.
+                # That resolves epsilon's half of PRD open question 2 (which
+                # suggested `write_ops.params`) without pre-empting iota's
+                # read-path choice.
+                #
+                # `len(referents)` is also what keeps the decoded set a live
+                # local rather than dead code until leaf zeta lands.
+                payload={
+                    'content': payload['content'][:200],
+                    'group_id': payload.get('group_id'),
+                    'referent_source': referent_source,
+                    'referent_count': len(referents),
+                },
                 coro=self.graphiti.add_episode(
                     name=payload.get('name', ''),
                     content=payload['content'],
@@ -2248,6 +2843,7 @@ class MemoryService:
                     uuid=payload.get('uuid'),
                     temporal_context=temporal_context,
                     reference_time=reference_time,
+                    unverified_claim=unverified_claim,
                 ),
             )
             reconcile_stats = await self._reconcile_episode_identity(
@@ -2337,6 +2933,7 @@ class MemoryService:
         fact_text = payload['fact_text']
         causation_id = payload.get('_causation_id')
         temporal_context = payload.get('temporal_context')
+        unverified_claim = bool(payload.get('unverified_claim', False))
         write_op_id = str(uuid_mod.uuid4())
         scope = Scope(
             project_id=payload.get('project_id', 'main'),
@@ -2357,6 +2954,11 @@ class MemoryService:
             metadata['secondary_category'] = classification.secondary.value
         if temporal_context == 'planning':
             metadata['planned'] = True
+        # Omitted entirely when untagged (task 3142) rather than set False, so
+        # no existing record shape changes and a metadata filter for the key
+        # matches only genuinely flagged facts.
+        if unverified_claim:
+            metadata['unverified_claim'] = True
 
         result = await self._journaled_backend_call(
             write_op_id=write_op_id,
@@ -2468,6 +3070,11 @@ class MemoryService:
                         'session_id': payload.get('session_id'),
                         '_causation_id': payload.get('_causation_id'),
                         'temporal_context': payload.get('temporal_context'),
+                        # task 3142: the Mem0 half rides its own payload
+                        # channel, so the episode's tag must be copied onto
+                        # every derived fact explicitly — those facts ARE the
+                        # artefacts the incident produced.
+                        'unverified_claim': payload.get('unverified_claim', False),
                     },
                 }
                 for edge in edges
@@ -2509,9 +3116,18 @@ class MemoryService:
         source_description: str = '',
         causation_id: str | None = None,
         temporal_context: str | None = None,
+        unverified_claim: bool = False,
         _source: str = 'mcp_tool',
     ) -> AddEpisodeResponse:
-        """Full ingestion pipeline — durably enqueue episode, return immediately."""
+        """Full ingestion pipeline — durably enqueue episode, return immediately.
+
+        ``unverified_claim`` (task 3142) marks an episode carrying a completion
+        claim that could not be confirmed against its live authority. It is a
+        LABEL, never a rejection: the episode is ingested either way, and the
+        flag follows the same payload -> backend path as ``temporal_context``
+        so both the Graphiti episodic node and every derived Mem0 fact carry
+        it.
+        """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         episode_id = str(uuid_mod.uuid4())
         write_op_id = str(uuid_mod.uuid4())
@@ -2523,6 +3139,26 @@ class MemoryService:
             source_name = 'text'
 
         assert self.durable_queue is not None
+
+        # Resolve WHICH referents this episode is about (task 3670, PRD leaf
+        # epsilon) BEFORE the try below, for the same loud-over-silent reason
+        # add_memory's call sits outside its own try: gamma raises
+        # InputValidationError on a structural wiring bug, and that must not be
+        # absorbed by an enqueue-failure handler.
+        #
+        # metadata=None is not an oversight: add_episode deliberately never
+        # persists a metadata argument — the same fact that forced task 3142's
+        # `unverified_claim` onto this payload channel — so the bridge has
+        # nothing to read and the derived scan is the only live source here.
+        #
+        # declared=None: leaf delta owns the `entities` parameter; this is the
+        # seam it fills.
+        resolution = resolve_referents(
+            declared=None,
+            metadata=None,
+            content=content,
+            group_id=scope.graphiti_group_id,
+        )
 
         success = True
         error_msg = None
@@ -2545,7 +3181,9 @@ class MemoryService:
                     '_causation_id': causation_id,
                     '_write_op_id': write_op_id,
                     'temporal_context': temporal_context,
+                    'unverified_claim': unverified_claim,
                     'reference_time': reference_time.isoformat() if reference_time is not None else None,
+                    'referents': _encode_referents(resolution),
                 },
                 callback_type='dual_write_episode',
             )
@@ -2655,6 +3293,7 @@ class MemoryService:
             # Bound methods, not `self`: the module-level helper stays
             # decoupled from MemoryService and trivially stubbable, matching
             # how it already takes storm_detector/config as collaborators.
+            parent_lookup=self.get_memory_by_id,
             count_canonical=self.count_memories_by_metadata,
             find_canonical=self.get_memories_by_metadata,
         )
@@ -2671,6 +3310,32 @@ class MemoryService:
 
         # Graphiti: enqueue via durable queue (async, but durably persisted)
         if write_graphiti:
+            # Resolve WHICH referents this write is about (task 3670, PRD leaf
+            # epsilon), so leaf zeta can verify the resulting edges against it.
+            #
+            # Placement is load-bearing at BOTH ends:
+            #   INSIDE `if write_graphiti:` — a Mem0-only write never reaches
+            #   Graphiti, so it pays for no scan;
+            #   OUTSIDE the `try:` below, which degrades to `_graphiti_error`
+            #   and DROPS the Graphiti write. gamma raises InputValidationError
+            #   on structural inputs (a non-str content or group_id) precisely
+            #   so a wiring bug is loud; resolving inside that try would
+            #   convert that loud signal into a silently skipped Graphiti
+            #   write.
+            #
+            # `meta` is read AFTER _normalize_task_id_metadata has coerced
+            # task_id to a scalar str, which is the contract gamma's metadata
+            # bridge documents itself against.
+            #
+            # declared=None: leaf delta owns the `entities` parameter and its
+            # `_entities_gate`, and THIS CALL is the single seam it fills. No
+            # declared referents can exist until it lands.
+            resolution = resolve_referents(
+                declared=None,
+                metadata=meta,
+                content=content,
+                group_id=scope.graphiti_group_id,
+            )
             try:
                 assert self.durable_queue is not None
                 await self.durable_queue.enqueue(
@@ -2684,6 +3349,8 @@ class MemoryService:
                         'source_description': f'add_memory:{resolved_category.value}',
                         '_causation_id': causation_id,
                         '_write_op_id': write_op_id,
+                        # Popped and decoded by _execute_graphiti_write.
+                        'referents': _encode_referents(resolution),
                     },
                     callback_type='refresh_entity_summaries',
                 )
@@ -3026,6 +3693,7 @@ class MemoryService:
             # Bound methods, not `self`: the module-level helper stays
             # decoupled from MemoryService and trivially stubbable, matching
             # how it already takes storm_detector/config as collaborators.
+            parent_lookup=self.get_memory_by_id,
             count_canonical=self.count_memories_by_metadata,
             find_canonical=self.get_memories_by_metadata,
         )
@@ -3168,8 +3836,43 @@ class MemoryService:
             content = mem.get('memory', '')
             if not content:
                 continue
+            if not isinstance(content, str):
+                # `resolve_referents` (task 3670) raises InputValidationError on
+                # a truthy non-str content, deliberately — but this call sits in
+                # a per-memory loop whose `enqueue_batch` only runs AFTER the
+                # loop completes, so letting it propagate would abort the WHOLE
+                # replay and enqueue nothing over ONE malformed Mem0 record.
+                # Skipping the record keeps the blast radius at one row, which
+                # is what it was before referents were threaded here. Loud
+                # rather than silent, unlike the empty-content skip above: an
+                # empty memory is ordinary, a non-str one is a Mem0 anomaly.
+                logger.warning(
+                    'Skipping replay of a Mem0 record whose memory is not a '
+                    'string (got %s): %s',
+                    type(content).__name__, _safe_repr(content),
+                )
+                continue
             meta = mem.get('metadata', {}) or {}
             category = meta.get('category', 'observations_and_summaries')
+            # The THIRD and last producer of add_memory_graphiti rows (task
+            # 3670, PRD leaf epsilon). Threaded even though the PRD named only
+            # the two primary write-boundary sites: replayed rows carry real
+            # prose whose referents the derived scanner can see, so leaving
+            # them on the absent path would stamp them 'none' and inflate leaf
+            # iota's undeclared bucket with writes that were plainly derivable
+            # — a false regression signal in the very counter this task exists
+            # to make trustworthy. They also produce real graph edges leaf zeta
+            # will want to verify.
+            #
+            # Unlike add_episode, this loop DOES hold a metadata dict (the Mem0
+            # record's own), so the bridge is live here. declared=None: leaf
+            # delta's seam, as at the other two producers.
+            #
+            # add_system_record is deliberately NOT threaded — it is Mem0-only
+            # and never routes to Graphiti.
+            resolution = resolve_referents(
+                declared=None, metadata=meta, content=content, group_id=target,
+            )
             batch.append({
                 'group_id': target,
                 'operation': 'add_memory_graphiti',
@@ -3179,6 +3882,7 @@ class MemoryService:
                     'source': 'text',
                     'group_id': target,
                     'source_description': f'replay_from_mem0:{category}',
+                    'referents': _encode_referents(resolution),
                 },
                 'callback_type': 'refresh_entity_summaries',
             })
@@ -3189,6 +3893,14 @@ class MemoryService:
 
     # ------------------------------------------------------------------
     # Read: search
+    #
+    # Cross-store merge is Reciprocal Rank Fusion with RRF_K (task 3658, PRD
+    # D4). The router's primary_store is a TIEBREAK, not precedence: it used to
+    # order results wholesale, which let one store fill `limit` and made the
+    # other structurally unreachable no matter how well it matched. Graphiti
+    # emits no synthesized scores any more — it has none of its own to report,
+    # which is why fusion is by rank rather than by calibrated score. See
+    # `_rrf_score` and the `search` docstring for the full consumer contract.
     # ------------------------------------------------------------------
 
     async def search(
@@ -3208,6 +3920,30 @@ class MemoryService:
         When include_planned=False (default), edges and memories from planning
         episodes (temporal_context='planning') are excluded.  Set include_planned=True
         to include them — useful for reconciliation and auditing.
+
+        Ordering (task 3658, PRD D4).  Each responding store ranks its own
+        results — Mem0 by cosine descending, Graphiti by its backend rank — and
+        the two are merged by Reciprocal Rank Fusion with ``K = RRF_K``, ties
+        broken by (router primary store, store-internal rank).  The router's
+        primary store is a TIEBREAK ONLY; it is no longer precedence, so
+        neither store can fill ``limit`` and shut the other out.
+
+        Scores.  ``relevance_score`` is the fused RRF value and is **ORDINAL,
+        never a similarity**: single-store rank-1 is 1/61 ~ 0.0164 no matter
+        how good the match is.  Do not threshold it, do not compare it across
+        API versions, and do not compare it to a cosine.  Per-store truth lives
+        in ``metadata``:
+
+          - ``store_rank`` — int, 1-based rank within the store that returned
+            it (over that store's surviving results; deliberately not
+            renumbered by the category filter below, since it is a per-store
+            telemetry fact rather than a position in the merged output).
+          - ``store_score`` — the Mem0 cosine, verbatim; ``None`` for Graphiti,
+            whose public search() exposes no scores at all.
+
+        ``degraded`` / ``failed_stores`` / ``failure_diagnostics`` and
+        per-store error absorption are unchanged: a store that raises or times
+        out is absorbed, and the surviving store's results are still returned.
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
 
@@ -3270,10 +4006,17 @@ class MemoryService:
                     failed_stores.append(store_list[i])
                     failure_diagnostics.append(diag)
 
-        # Sort: primary store results first, then by relevance score
-        def sort_key(r: MemoryResult) -> tuple[int, float]:
-            is_primary = 0 if r.source_store == route.primary_store else 1
-            return (is_primary, -r.relevance_score)
+        # Merge by Reciprocal Rank Fusion (task 3658, PRD D4).  Primary sort is
+        # the fused score descending; the router's primary store is only a
+        # TIEBREAK — it used to be outright precedence, which let one store
+        # fill `limit` and made the other structurally unreachable.  Store rank
+        # is the final tiebreak, which makes the ordering total and
+        # deterministic (is_primary already distinguishes the only two stores
+        # that can tie on score).  Read store_rank defensively so a result from
+        # a future code path that lacks the key can never raise here.
+        def sort_key(r: MemoryResult) -> tuple[float, int, int]:
+            primary_rank = 0 if r.source_store == route.primary_store else 1
+            return (-r.relevance_score, primary_rank, r.metadata.get('store_rank', 0))
 
         results.sort(key=sort_key)
 
@@ -3337,6 +4080,19 @@ class MemoryService:
         When include_planned=False (default), edges whose entire provenance is
         composed of planned-only episodes are excluded.  When include_planned=True,
         those edges are returned and marked with metadata['planned'] = True.
+
+        Results are ranked by Graphiti's own backend ordering and carry, in
+        metadata (task 3658):
+
+          - ``store_rank``: 1-based rank, contiguous over the SURVIVING edges
+            (an edge dropped for ``invalid_at`` or planned-only provenance does
+            not consume a rank).
+          - ``store_score``: always ``None`` — Graphiti's public ``search()``
+            exposes no scores, and synthesizing one would be a lie the
+            cross-store merge would then act on.
+
+        ``relevance_score`` is the ordinal ``_rrf_score(store_rank)``, not a
+        similarity.
         """
         edges = await self.graphiti.search(
             query=query,
@@ -3352,7 +4108,7 @@ class MemoryService:
             )
 
         results = []
-        for i, edge in enumerate(edges):
+        for edge in edges:
             fact = getattr(edge, 'fact', str(edge))
             valid_at = getattr(edge, 'valid_at', None)
             invalid_at = getattr(edge, 'invalid_at', None)
@@ -3387,19 +4143,22 @@ class MemoryService:
                 # Skip planning-only edges in normal search results.
                 continue
 
-            # Score: rank-based (no explicit score from Graphiti search)
-            score = max(0.0, 1.0 - (i * 0.05))
+            # Rank over SURVIVORS only (task 3658): the raw enumerate index
+            # counted edges skipped above, and since RRF maps rank directly to
+            # score, a gap would silently penalize Graphiti for facts the
+            # caller never sees.
+            rank = len(results) + 1
 
-            metadata: dict[str, Any] = {}
+            metadata: dict[str, Any] = {'store_rank': rank, 'store_score': None}
             if is_planned_edge:
                 metadata['planned'] = True
 
             results.append(MemoryResult(
-                id=getattr(edge, 'uuid', str(i)),
+                id=getattr(edge, 'uuid', str(rank)),
                 content=fact,
                 category=None,
                 source_store=SourceStore.graphiti,
-                relevance_score=score,
+                relevance_score=_rrf_score(rank),
                 provenance=provenance,
                 temporal=temporal,
                 entities=entities,
@@ -3420,6 +4179,19 @@ class MemoryService:
 
         When include_planned=False (default), results tagged with planned=True
         in their metadata are excluded.  When include_planned=True they are returned.
+
+        Results are ranked by Mem0's own cosine-descending ordering and carry,
+        in metadata (task 3658):
+
+          - ``store_rank``: 1-based rank, contiguous over the SURVIVING results
+            (a result dropped for ``planned`` does not consume a rank).
+          - ``store_score``: Mem0's raw cosine, verbatim and un-clamped — the
+            honest per-store signal for the E1 retrieval probe and the task
+            3212 telemetry.
+
+        ``relevance_score`` is the ordinal ``_rrf_score(store_rank)``: the
+        cosine no longer reaches it, so it is no longer comparable to a
+        similarity.
         """
         # Forward categories so Mem0Backend pushes the filter down to Qdrant
         # (task 1083: prevents false-negatives caused by post-filtering on
@@ -3441,13 +4213,29 @@ class MemoryService:
                 with contextlib.suppress(ValueError):
                     category = MemoryCategory(meta['category'])
 
+            # Rank over SURVIVORS only (task 3658) — a result skipped above must
+            # not consume a rank, since RRF maps rank directly to score.
+            rank = len(results) + 1
+
+            # COPY before stamping: `meta` is the dict object handed back by
+            # Mem0Backend.search, i.e. the caller's own response structure.
+            # Stamping into it would mutate that response in place.  The cosine
+            # is stored raw and un-clamped — store_score is a plain dict value
+            # with no pydantic bound, and clamping would corrupt the honest
+            # per-store signal.  (The old min(score, 1.0) existed only to
+            # satisfy MemoryResult.relevance_score's le=1.0; the RRF value is
+            # <= 1/61, so that clamp is no longer needed there either.)
+            metadata = dict(meta)
+            metadata['store_rank'] = rank
+            metadata['store_score'] = score
+
             results.append(MemoryResult(
                 id=item.get('id', ''),
                 content=content,
                 category=category,
                 source_store=SourceStore.mem0,
-                relevance_score=min(score, 1.0),
-                metadata=meta,
+                relevance_score=_rrf_score(rank),
+                metadata=metadata,
                 created_at=item.get('created_at'),
             ))
         return results
@@ -4094,6 +4882,246 @@ class MemoryService:
     # Delete
     # ------------------------------------------------------------------
 
+    #: How many child ids :meth:`delete_memory` lists in one scroll.
+    #:
+    #: The refusal message has to be READABLE — an unbounded listing of a
+    #: pathological fan-out would produce an error string no agent or
+    #: operator can act on, and the scroll fetches full payloads.  When the
+    #: live count exceeds what the scroll returned, the listing is marked
+    #: ``truncated`` ("at least N") rather than silently reading as
+    #: exhaustive.  A CASCADE is not bounded by this: it re-scrolls until a
+    #: pass yields no unvisited children.
+    _CHILD_SCAN_LIMIT = 100
+
+    async def _count_children(self, memory_id: str, *, project_id: str) -> int:
+        """Live count of records whose ``metadata.parent_id`` is *memory_id*.
+
+        The cheap exact primitive (Qdrant's count API), read fresh at every
+        call — INV-3: corroborate against the store, never against
+        remembered state.  A child can be written between two deletes, so a
+        gate trusting a cached "childless" answer would be checking history.
+        """
+        return await self.count_memories_by_metadata(
+            project_id, {'parent_id': memory_id}
+        )
+
+    async def _list_children(self, memory_id: str, *, project_id: str) -> list[str]:
+        """Ids of *memory_id*'s children, bounded by ``_CHILD_SCAN_LIMIT``."""
+        rows = await self.get_memories_by_metadata(
+            project_id, {'parent_id': memory_id}, limit=self._CHILD_SCAN_LIMIT
+        )
+        return [row['id'] for row in rows]
+
+    async def list_descendant_ids(
+        self, memory_id: str, *, project_id: str
+    ) -> DescendantScan:
+        """Every descendant of *memory_id*, deepest-first — WITHOUT deleting.
+
+        The read-only twin of :meth:`_cascade_delete_children`: same
+        primitives (:meth:`_count_children` / :meth:`_list_children`), same
+        visited-set termination for self-parent records and cycles, same
+        deepest-first order, no new backend call and no second tree-walk
+        (INV-5).  The enumeration a caller GATES on and the traversal the
+        cascade PERFORMS therefore cannot disagree about the shape of the
+        tree — a disagreement would mean checking one set and destroying
+        another.
+
+        Public and side-effect-free on purpose.  The citation-repoint gate
+        lives at the MCP tool layer, which needs to ask "what would this
+        cascade destroy?" *before* anything is destroyed; a hook that
+        mutated would turn look-before-you-leap into the leap.
+
+        ONE deliberate divergence from the cascade, surfaced as data rather
+        than hidden: ``truncated``.  ``_cascade_delete_children`` re-scrolls
+        past ``_CHILD_SCAN_LIMIT`` only because DELETING a page is what
+        makes the next one visible; a non-mutating walk has no such lever,
+        so a fan-out wider than the bound genuinely cannot be fully seen
+        here.  Do not "fix" this by copying the cascade's ``while`` loop
+        into this context — it would spin on the same page forever.  Say so
+        instead, and let the caller refuse.
+
+        Returns:
+            DescendantScan: ``ids`` deepest-first (the order the cascade
+            would destroy them in), excluding *memory_id* itself; and
+            ``truncated``, true when any visited node reported more children
+            than the bounded scroll returned.
+        """
+        # Seeded with the target so a record that is its own parent, or a
+        # cycle leading back to the target, terminates instead of recursing.
+        visited = {memory_id}
+        ordered: list[str] = []
+        truncated = False
+
+        async def walk(node: str) -> None:
+            nonlocal truncated
+            # Count first, scroll only on a non-zero count — the same cheap
+            # ordering the refusal gate uses, so a leaf costs one exact
+            # count and no payload fetch.
+            count = await self._count_children(node, project_id=project_id)
+            if not count:
+                return
+            children = await self._list_children(node, project_id=project_id)
+            if len(children) < count:
+                truncated = True
+            for child in children:
+                if child in visited:
+                    continue
+                visited.add(child)
+                await walk(child)
+                # Appended AFTER its own subtree: post-order is what makes
+                # the listing deepest-first.
+                ordered.append(child)
+
+        await walk(memory_id)
+        return DescendantScan(ids=ordered, truncated=truncated)
+
+    async def refuse_if_children(self, memory_id: str, *, project_id: str) -> None:
+        """Raise ``ParentHasChildrenError`` if *memory_id* still has children.
+
+        PUBLIC and side-effect-free (it either raises or returns), for the
+        same reason :meth:`list_descendant_ids` is: the MCP tool layer needs
+        to ask "would this delete be refused?" BEFORE it runs the citation
+        gate, whose repoint pass mutates live task metadata.  Without that
+        pre-flight a delete of a cited PARENT rewrote every citation to the
+        replacement and only then hit this refusal — mutation left behind by
+        an operation that reported failure, and the exact asymmetry the
+        cascade path avoids by enumerating before it gates.  Exposing the
+        one gate (rather than a count the caller re-wraps in its own error)
+        keeps the refusal's construction — ids, count, ``truncated``,
+        registry pointer — with exactly one home (INV-5).
+
+        Count FIRST, scroll only on a non-zero count: the count is exact and
+        cheap while the scroll fetches full payloads, and ``delete_memory``
+        has six in-repo recon callers (including bulk pool GC) that would
+        otherwise pay for a listing nobody reads.
+
+        A scroll returning FEWER ids than the count — the bound above, or a
+        concurrent write between the two reads — still refuses, marked
+        ``truncated``.  Downgrading a disagreement to "no children" would be
+        precisely the silent orphan this gate exists to prevent; presenting
+        a partial list as exhaustive would understate it.
+        """
+        child_count = await self._count_children(memory_id, project_id=project_id)
+        if child_count == 0:
+            return
+        child_ids = await self._list_children(memory_id, project_id=project_id)
+        raise ParentHasChildrenError(
+            parent_id=memory_id,
+            child_ids=child_ids,
+            truncated=len(child_ids) < child_count,
+        )
+
+    async def _cascade_delete_children(
+        self,
+        memory_id: str,
+        *,
+        project_id: str,
+        agent_id: str | None,
+        session_id: str | None,
+        causation_id: str | None,
+        _source: str,
+        visited: set[str] | None,
+    ) -> list[str]:
+        """Delete *memory_id*'s subtree, depth-first, and return EVERY id it took.
+
+        The return value is the whole destroyed set — grandchildren
+        included, deepest-first — not just the direct children.  It is what
+        the caller reports as ``cascaded_child_ids`` on the result, the
+        journal row and the ``memory_deleted`` event, and an MCP caller
+        never sees the server's journal: naming only the direct children
+        would tell them a SMALLER set was destroyed than actually was, and
+        leave them to reconstruct the rest from a log they cannot read.
+
+        CHILDREN FIRST, parent last — the caller deletes the parent only
+        after this returns.  Parent-first would re-open precisely the orphan
+        window this gate closes: a crash between the two leaves live
+        children pointing at a dead uuid, still recognised as children,
+        still suppressed from grouped search, content unreachable while
+        remaining in Qdrant.  Children-first fails safe: the surviving state
+        is "parent alive, some children gone", which the refusal gate still
+        protects and an operator can retry.
+
+        Each child is deleted by RE-ENTERING :meth:`delete_memory` rather
+        than by a local ``mem0.delete`` loop, so every child gets its own
+        write-journal row, its own reconciliation event and its own child
+        gate for free — no second, unguarded delete implementation to drift
+        (INV-5).
+
+        The ``await`` loop is SEQUENTIAL on purpose: an ``asyncio.gather``
+        would destroy the ordering the contract depends on (and trip the
+        repo's gather-convention guard).
+
+        *visited* terminates self-parent records and parent cycles: it is
+        seeded with the parent id and carries every id the chain has
+        committed to deleting, so a cycle's second visit is filtered out
+        instead of recursing.  The loop re-scrolls until a pass yields
+        nothing unvisited, so a fan-out wider than ``_CHILD_SCAN_LIMIT`` is
+        fully covered — the id LISTING is bounded, the cascade is not.
+        :meth:`list_descendant_ids` walks the same tree read-only and
+        therefore CANNOT re-scroll like this (deleting a page is what makes
+        the next one visible), which is why it reports ``truncated`` where
+        this loop simply keeps going.
+
+        Then CORROBORATE (INV-3, after acting): re-count the children and
+        raise rather than delete the parent if any survived.  Survivors are
+        measured against the ENCLOSING frames' in-flight set only, never
+        against the ids this frame just deleted — otherwise a child whose
+        delete silently did not take would be filtered out as "already
+        handled", which is exactly the partial-failure this re-read exists
+        to catch.  Without it the operation reports success while leaving
+        an orphan behind.
+        """
+        # Records an ENCLOSING frame is already committed to deleting. They
+        # are excluded from the corroboration below — an ancestor still in
+        # flight is not an orphan-to-be. Ids THIS frame deletes are
+        # deliberately NOT added here, so a delete that silently did not
+        # take resurfaces as a survivor instead of being explained away.
+        in_flight = set(visited) if visited else set()
+        in_flight.add(memory_id)
+        visited = set(in_flight)
+        deleted: list[str] = []
+
+        while await self._count_children(memory_id, project_id=project_id):
+            child_ids = await self._list_children(memory_id, project_id=project_id)
+            fresh = [cid for cid in child_ids if cid not in visited]
+            if not fresh:
+                break
+            for child_id in fresh:
+                visited.add(child_id)
+                child_result = await self.delete_memory(
+                    memory_id=child_id,
+                    store='mem0',
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    causation_id=causation_id,
+                    _source=_source,
+                    cascade=True,
+                    _visited=visited,
+                    _cascade_parent=memory_id,
+                )
+                # The child's OWN subtree went first, so its ids precede it
+                # here — the same deepest-first order the deletes actually
+                # ran in. Dropping this frame's return value would report
+                # A→B→C as having destroyed only B.
+                deleted.extend(child_result.get('cascaded_child_ids') or [])
+                deleted.append(child_id)
+
+        if await self._count_children(memory_id, project_id=project_id):
+            survivors = [
+                cid
+                for cid in await self._list_children(
+                    memory_id, project_id=project_id
+                )
+                if cid not in in_flight
+            ]
+            if survivors:
+                raise ParentHasChildrenError(
+                    parent_id=memory_id, child_ids=survivors
+                )
+
+        return deleted
+
     async def delete_memory(
         self,
         memory_id: str,
@@ -4103,11 +5131,108 @@ class MemoryService:
         session_id: str | None = None,
         causation_id: str | None = None,
         _source: str = 'mcp_tool',
+        *,
+        cascade: bool = False,
+        _visited: set[str] | None = None,
+        _cascade_parent: str | None = None,
     ) -> dict:
-        """Delete a memory from the specified store."""
+        """Delete a memory from the specified store.
+
+        REFUSES to orphan children (task 3197, leaf δ; PRD V3's lifecycle
+        contract — "no operation may silently orphan a child or dangle a
+        pointer it could have seen").  Deleting a Mem0 record that other
+        records point at via ``metadata.parent_id`` raises
+        :class:`~fused_memory.memory_metadata.ParentHasChildrenError`
+        listing the child ids, BEFORE any backend call, journal row or
+        reconciliation event — so a refused delete leaves nothing claiming a
+        deletion happened.  The caller's explicit way out is
+        ``cascade=True``.
+
+        The gate is UNCONDITIONAL — deliberately not behind
+        ``memory_metadata.enforce``, unlike the V1 shape checks.  It is a
+        lifecycle safety gate, not a vocabulary check: behind a default-off
+        flag the orphan hole would stay open exactly as long as the flag
+        stayed off, i.e. the machinery would ship and none of the
+        protection.  Shipping it on is safe because leaf α measured
+        ``metadata.parent_id`` at zero live corpus footprint — there are no
+        existing children, so no live delete (including the six in-repo
+        recon callers) can regress.
+
+        The child check is a LIVE re-read per INV-3, never cached state, and
+        it is charged only where the relationship can exist: ``parent_id``
+        is a Mem0 payload key, so the graphiti arm keeps its current
+        zero-extra-round-trip cost.  On the common childless path the cost
+        is ONE exact Qdrant count and ZERO scrolls; the payload scroll is
+        paid only when there is something to list, because the error
+        contract needs the child *ids* and a count cannot supply them.
+
+        ``cascade=True`` is the caller's explicit opt-in: it deletes the
+        CHILDREN FIRST and the parent last, then re-checks.  See
+        :meth:`_cascade_delete_children`.  The result's
+        ``cascaded_child_ids`` — and the journal row and ``memory_deleted``
+        event that carry it — name EVERY record the cascade destroyed,
+        grandchildren included, deepest-first.  ``cascade`` is Mem0-only:
+        ``store='graphiti'`` with ``cascade=True`` raises ``ValueError``
+        rather than performing a silent plain delete (see below).
+
+        ``memory_id`` is validated for SHAPE ONLY: it must be a canonical
+        36-character UUID. A truncated id (e.g. an 8-char hex prefix lifted out
+        of a search-result snippet) raises rather than silently no-opping —
+        both backends treat a miss as "already deleted", so without this guard
+        such a call got a confirming ``{'status': 'deleted'}`` envelope, a
+        ``success=True`` journal entry and a ``memory_deleted`` event while
+        nothing was removed.
+
+        EXISTENCE IS NOT CHECKED, and the difference is user-visible: a
+        well-formed UUID that no longer resolves — a stale id copied out of an
+        old report, a survivor id from an earlier consolidation — still reports
+        ``deleted``, for exactly the same backend reason. Closing that half
+        needs a per-store existence read: ``update_memory`` below already does
+        it for its Qdrant arm (see the §5(c) read-leg comment there), while the
+        Graphiti arm additionally needs a ``remove_edge`` that distinguishes
+        not-found from already-deleted. Deliberately out of scope here — task
+        3132 closes the malformed-shape half only.
+
+        The guard sits above the store branch so ONE check covers both the
+        Graphiti and Mem0 paths, and above the journal write and event emission
+        so a rejected delete leaves no false audit trail. It sits BELOW
+        ``SourceStore(store)`` so a call that is wrong in both ways reports the
+        bad store first — the same store-then-shape precedence the MCP boundary
+        gives agents, rather than the inverse for internal callers.
+
+        Raises:
+            ParentHasChildrenError: the target still has children and
+                ``cascade`` was not requested — or a child SURVIVED a
+                requested cascade, in which case the parent is left in
+                place too.
+            ValueError: ``cascade=True`` was combined with a non-Mem0
+                store, which no store branch can honour.
+        """
         scope = Scope(project_id=project_id)
         source = SourceStore(store)
+        # `cascade` is MEM0-ONLY, and an unhonourable request is refused
+        # rather than dropped. The graphiti arm has no `metadata.parent_id`
+        # to recurse on, so tolerating the flag there meant a plain delete
+        # returning a bare {'status': 'deleted'} — while the `memory_deleted`
+        # event still carried `cascade: True` with an empty child list,
+        # recording a cascade as requested-and-satisfied when nothing
+        # recursive ever ran. Refusing keeps the audit trail unable to lie
+        # (loud-over-silent-degradation).
+        #
+        # Placed with the store check and BEFORE `require_full_uuid` so this
+        # layer and the MCP boundary agree on precedence: store validity,
+        # then store/cascade compatibility, then id shape.
+        if cascade and source != SourceStore.mem0:
+            raise ValueError(
+                f'cascade=True is not supported for store={store!r}: parent/child '
+                'links are the Mem0 payload key metadata.parent_id, so a '
+                f'{store} record has no children to cascade to. Retry without '
+                'cascade if a plain delete of this record is what was meant.'
+            )
+        require_full_uuid(memory_id, field_name='memory_id')
+
         write_op_id = str(uuid_mod.uuid4())
+        cascaded_child_ids: list[str] = []
 
         if source == SourceStore.graphiti:
             await self._journaled_backend_call(
@@ -4120,6 +5245,23 @@ class MemoryService:
             )
             result = {'status': 'deleted', 'store': 'graphiti', 'id': memory_id}
         else:
+            # Child gate — BEFORE the backend call, the journal row and the
+            # event, so a refused delete leaves no trace claiming a
+            # deletion. `parent_id` is a Mem0 payload key, which is why this
+            # is in the mem0 arm only.
+            if cascade:
+                cascaded_child_ids = await self._cascade_delete_children(
+                    memory_id,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    causation_id=causation_id,
+                    _source=_source,
+                    visited=_visited,
+                )
+            else:
+                await self.refuse_if_children(memory_id, project_id=project_id)
+
             del_result = await self._journaled_backend_call(
                 write_op_id=write_op_id,
                 causation_id=causation_id,
@@ -4129,6 +5271,8 @@ class MemoryService:
                 coro=self.mem0.delete(memory_id, scope),
             )
             result = {'status': 'deleted', 'store': 'mem0', 'id': memory_id, **del_result}
+            if cascaded_child_ids:
+                result['cascaded_child_ids'] = cascaded_child_ids
 
         if self._write_journal:
             await self._write_journal.log_write_op(
@@ -4139,7 +5283,16 @@ class MemoryService:
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'memory_id': memory_id, 'store': store},
+                params={
+                    'memory_id': memory_id,
+                    'store': store,
+                    'cascade': cascade,
+                    # Whose cascade took this record. Without it a cascaded
+                    # delete is indistinguishable from a direct one in the
+                    # journal, and the PRD's "children deleted too,
+                    # journalled" signal is only half legible.
+                    'cascade_parent_id': _cascade_parent,
+                },
                 result_summary=result,
                 success=True,
             )
@@ -4150,7 +5303,13 @@ class MemoryService:
             source=EventSource.agent,
             project_id=project_id,
             timestamp=datetime.now(UTC),
-            payload={'memory_id': memory_id, 'store': store},
+            payload={
+                'memory_id': memory_id,
+                'store': store,
+                'cascade': cascade,
+                'cascade_parent_id': _cascade_parent,
+                'cascaded_child_ids': cascaded_child_ids,
+            },
         ))
 
         return result
@@ -4301,10 +5460,41 @@ class MemoryService:
         fails those loud before dispatching here — mirroring how ``update_edge``
         splits its boundary checks from its write path.
 
+        METADATA VOCABULARY is the exception, and belongs HERE (task 3523).  A
+        patch runs :func:`_apply_memory_metadata_validation` at this seam, the
+        same one ``add_memory`` and ``add_system_record`` use, for the reason
+        PRD D8 pins enforcement at the service layer: a tools-layer validator
+        leaks past every additional write path, and this was the third one.
+        Placed after the §5(c) existence check and before every journaled
+        backend call, so a rejection cannot leave a journal row, a partial
+        write, or a pending mem0 intent behind.
+
+        Two properties of that check are deliberate and easy to "simplify" away:
+
+        * It is DELTA-scoped — only violations and ``canonical`` claims NEW
+          relative to the record's pre-image are judged.  Amending a record
+          never re-validates the record.  See ``baseline`` on the seam.
+        * A CONTENT-ONLY amend does not run it at all.  Such a write leaves the
+          metadata byte-identical, so there is nothing it is responsible for.
+          That reason stands unaided; the consequence of getting it wrong is
+          that a legacy record's TEXT would become uncorrectable under
+          ``enforce`` because of metadata the amend never touched.
+
         Returns the ``{'status': 'updated', 'store': 'mem0', 'id': memory_id,
         ...}`` envelope on success, or a structured ``{'error_type': ...}``
         rejection. The id is echoed so a caller can assert identity stability
         straight from the response instead of re-fetching.
+
+        A vocabulary rejection is the one outcome that does NOT use that
+        envelope: :class:`MemoryMetadataValidationError` and
+        :class:`CanonicalUniquenessViolation` PROPAGATE from here, exactly as
+        they do from ``add_memory``.  PRD V1 keeps the two deliberately
+        distinguishable at an ``except`` (neither subclasses the other), and
+        flattening them into ``error_type`` strings at this layer would discard
+        their structured fields — the incumbent id a caller needs in order to
+        act.  The MCP tool above converts every exception to an
+        ``{'error', 'error_type'}`` envelope via ``@mcp_tool_errors()``, and
+        does so identically for all three write paths.
 
         *emit_event* forces a ``memory_updated`` event on a metadata-only route,
         which is otherwise silent (a patch leaves the record saying the same
@@ -4366,10 +5556,12 @@ class MemoryService:
         # metadata-only path — a caller must get the same resulting metadata
         # whether or not it also amended the content.
         #
-        # The set_payload / delete_payload fast paths deliberately do NOT read
-        # it: they hand the raw patch / key list to Qdrant and let it apply
-        # merge and delete SERVER-side, which is the entire reason those routes
-        # can skip a read-modify-write. So the INV-5 single-home claim is
+        # The set_payload / delete_payload fast paths read it for VALUES only
+        # (task 3523 — so the seam's `supersedes` scalar→list normalization is
+        # not lost on this route), never for merge / delete SEMANTICS: they
+        # still name only the patch keys / key list and let Qdrant apply the
+        # merge and the delete SERVER-side, which is the entire reason those
+        # routes can skip a read-modify-write. So the INV-5 single-home claim is
         # narrower than "every arm calls _apply_metadata_delta": merge and
         # delete semantics have two implementations that have to agree — this
         # one and Qdrant's primitives. ``TestMetadataFastPathEquivalence`` pins
@@ -4381,6 +5573,47 @@ class MemoryService:
             metadata_delete_keys=metadata_delete_keys,
             metadata_mode=metadata_mode,
         )
+
+        # Mem0 metadata vocabulary validation on the THIRD write path (task
+        # 3523). PRD D8/§2 pin enforcement at this seam precisely because a
+        # second write path leaks past a tools-layer validator; update_memory
+        # is a third one and reproduced exactly that leak.
+        #
+        # Placement mirrors add_memory's (see the note at its call site):
+        # AFTER the §5(c) read leg's existence check and the delta, so the
+        # EFFECTIVE post-patch custom subset is what gets judged; BEFORE
+        # `scope` and every _journaled_backend_call below, so a rejection can
+        # never leave a journal row or a half-applied patch behind.
+        #
+        # GATED ON A METADATA DELTA EXISTING. A content-only amend leaves the
+        # record's metadata byte-identical, so this write is responsible for
+        # none of it; validating it anyway would be corpus re-validation by
+        # another name. That first-principles reason is the whole
+        # justification and stands unaided — do not prop it up with a named
+        # repair sweep: no in-repo sweep drives this arm (grepped — the only
+        # callers of MemoryService.update_memory are the MCP tool and
+        # scripts/retro_stamp_topics.py, and the latter never amends
+        # content). The consequence of getting it wrong is nonetheless real:
+        # under `enforce` a legacy record's TEXT would become uncorrectable
+        # because of unrelated legacy metadata, and `enforce` would quietly
+        # restate from "rejects WRITES" to "re-validates the corpus", the
+        # model task 3626's flip measurement depends on. It also keeps the
+        # seam's cost off the one arm that already pays for a re-embed.
+        if metadata_patch or metadata_delete_keys:
+            await _apply_memory_metadata_validation(
+                new_custom,
+                project_id=project_id,
+                agent_id=agent_id,
+                config=self.config.memory_metadata,
+                storm_detector=self._metadata_storm_detector,
+                project_root=self._memory_metadata_project_root(),
+                parent_lookup=self.get_memory_by_id,
+                count_canonical=self.count_memories_by_metadata,
+                find_canonical=self.get_memories_by_metadata,
+                # The record's PRE-IMAGE, free from the §5(c) read leg above.
+                # Only violations NEW relative to it are this write's problem.
+                baseline=existing_custom,
+            )
 
         scope = Scope(project_id=project_id)
 
@@ -4461,8 +5694,48 @@ class MemoryService:
             elif metadata_patch:
                 # Qdrant merges server-side, so unlisted pre-existing keys
                 # survive without this layer reconstructing the whole payload.
+                #
+                # The VALIDATED values for the patch keys, not the raw patch
+                # (task 3523): the vocabulary seam normalizes in place —
+                # `supersedes` scalar→list, PRD D2 — and writing the raw patch
+                # here would persist the legacy scalar on this route while the
+                # overwrite and content arms persisted a list. Restricted to
+                # the patch keys, so the fast path keeps its whole point:
+                # Qdrant still merges server-side and no pre-image key the
+                # caller did not name is rewritten.
+                #
+                # UNFILTERED on purpose, and LOUD if that ever stops holding.
+                # This branch is reached only for `metadata_mode == 'merge'`
+                # with no delete keys, so `_apply_metadata_delta`'s
+                # `new_custom.update(metadata_patch)` puts every patch key in
+                # and the seam only ever ASSIGNS (`meta['supersedes'] =
+                # members`), never pops — so `missing` is unreachable today.
+                # Were a future normalizer to drop a key, an `if k in
+                # new_custom` filter would silently skip it here while
+                # set_payload merged server-side and LEFT THE OLD VALUE in
+                # Qdrant, whereas the overwrite and content arms would drop
+                # it: the three-route split this whole change closed,
+                # reopened silently. Raising costs the write and names the
+                # divergence, which is the house's loud-over-silent norm; it
+                # happens before the coroutine is built, so no journal row
+                # and no un-awaited coroutine are left behind.
+                missing = [k for k in metadata_patch if k not in new_custom]
+                if missing:
+                    raise RuntimeError(
+                        'update_memory: the metadata vocabulary seam removed '
+                        f'patch key(s) {missing!r} from the effective metadata; '
+                        'the set_payload fast path cannot express a key REMOVAL '
+                        '(Qdrant merges server-side), so this write would leave '
+                        'the stale value in place while the overwrite and '
+                        'content arms would drop it. Route key-removing '
+                        'normalization through the overwrite arm instead.'
+                    )
                 operation = 'update_memory_set_payload'
-                coro = self.mem0.set_payload(memory_id, dict(metadata_patch), scope)
+                coro = self.mem0.set_payload(
+                    memory_id,
+                    {k: new_custom[k] for k in metadata_patch},
+                    scope,
+                )
             else:
                 operation = 'update_memory_delete_payload'
                 coro = self.mem0.delete_payload(

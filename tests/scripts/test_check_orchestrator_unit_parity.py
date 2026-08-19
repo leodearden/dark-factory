@@ -50,6 +50,25 @@ import subprocess
 import sys
 import types
 
+import pytest
+
+# The parsing of setup-host.sh section 5 is SHARED with
+# tests/scripts/test_orchestrator_service_files.py, which derives its own
+# claims from the same `_orch_units` array and the same loop statements. Both
+# suites held private copies of it; one brittle source text parsed two ways is
+# how a reflow of that section turns two suites red for one cause, with each
+# failure naming the other module's helper.
+#
+# Importable by name because tests/scripts/conftest.py puts this directory on
+# sys.path (cf. systemd_unit_invariants.py); pytest's --import-mode=importlib
+# deliberately does not.
+from setup_host_parsing import (
+    INSTALL_LOOP_CP as _INSTALL_LOOP_CP,
+)
+from setup_host_parsing import (
+    declared_orchestrator_units as _units_installed_by_setup_host,
+)
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_orchestrator_unit_parity.py"
 DASHBOARD_CHECKER_PATH = REPO_ROOT / "scripts" / "check_dashboard_unit_parity.py"
@@ -188,6 +207,66 @@ def test_dashboard_checker_consumes_the_lifted_parser():
     assert dashboard._join_continuations is systemd_unit_parity._join_continuations
 
 
+def test_find_dropins_is_shared_not_duplicated():
+    """IDENTITY guard for the SECOND lift: ``find_dropins`` has one home.
+
+    ``find_dropins`` arrived in this family ALREADY duplicated — code-identical
+    bodies in check_dashboard_unit_parity.py and check_orchestrator_unit_parity.py,
+    differing only in their docstrings' example directives. A third consumer
+    (check_lms_unit_parity.py) forced the question, and pasting a third copy
+    would reproduce, inside the tooling built to catch silent drift, precisely
+    the failure it exists to report.
+
+    Same assertion shape as the parser guard above, for the same reason: a
+    look-alike copy pasted back into either checker would leave every other
+    test in both suites green while the implementations quietly diverged.
+    Object identity is the only check that fires on that.
+    """
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+
+    checker = _load_checker()
+    dashboard = _load_dashboard_checker()
+
+    assert checker.find_dropins is systemd_unit_parity.find_dropins
+    assert dashboard.find_dropins is systemd_unit_parity.find_dropins
+
+
+def test_shared_find_dropins_counts_only_conf_files(tmp_path: pathlib.Path):
+    """The lifted helper counts exactly what systemd would actually merge.
+
+    Exercised against the SHARED module rather than through either checker's
+    re-export, so the behaviour is pinned at its new home: no ``<unit>.d``
+    directory yields ``[]``; a directory yields its ``.conf`` files SORTED as
+    absolute paths; and non-``.conf`` entries plus directories that merely
+    happen to be named ``*.conf`` are excluded (the helper filters on
+    ``is_file()``). Counting a stray ``override.conf.bak`` would report an
+    override that has no effect at all.
+    """
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+
+    installed_dir = tmp_path / "user"
+    installed_dir.mkdir()
+    unit = "lms-arm@.service"
+
+    # No <unit>.d directory at all.
+    assert systemd_unit_parity.find_dropins(installed_dir, unit) == []
+
+    dropin_dir = installed_dir / f"{unit}.d"
+    dropin_dir.mkdir()
+    limits = dropin_dir / "10-limits.conf"
+    override = dropin_dir / "override.conf"
+    for path in (override, limits):
+        path.write_text("[Service]\n", encoding="utf-8")
+    (dropin_dir / "override.conf.bak").write_text("[Service]\n", encoding="utf-8")
+    # A DIRECTORY named like a drop-in: systemd would not merge it either.
+    (dropin_dir / "x.conf").mkdir()
+
+    found = systemd_unit_parity.find_dropins(installed_dir, unit)
+
+    assert found == [limits, override]
+    assert all(p.is_absolute() for p in found)
+
+
 # ---------------------------------------------------------------------------
 # The unit registry, and its staleness guard  (step-3 / step-4)
 # ---------------------------------------------------------------------------
@@ -206,24 +285,6 @@ _EXPECTED_UNITS = {
     "orchestrator-know-live.service",
     "orchestrator-pump-web-ui.service",
 }
-
-# Matches setup-host.sh's install lines, e.g.
-#   cp "$REPO_ROOT/scripts/orchestrator-reify.service"   "$UNIT_DIR/"
-# Anchored on BOTH endpoints (the scripts/ source and the $UNIT_DIR
-# destination) so an unrelated `cp` elsewhere in the installer cannot be
-# mistaken for a unit install.
-_CP_UNIT_RE = re.compile(
-    r'cp\s+"\$REPO_ROOT/scripts/(?P<unit>[^"]+\.(?:service|timer))"\s+"\$UNIT_DIR/?"'
-)
-
-
-def _units_installed_by_setup_host() -> set[str]:
-    """Extract the unit names setup-host.sh `cp`s verbatim into $UNIT_DIR."""
-    return set(
-        m.group("unit")
-        for m in _CP_UNIT_RE.finditer(SETUP_HOST_PATH.read_text(encoding="utf-8"))
-    )
-
 
 def test_registry_covers_the_nine_verbatim_copied_units():
     """UNITS registers exactly the nine units setup-host.sh copies verbatim."""
@@ -277,9 +338,9 @@ def test_registry_matches_setup_host_cp_lines():
     # assertion below would still fail, but with a message pointing at the
     # registry rather than at the parsing.
     assert installed_by_setup_host, (
-        f"Parsed ZERO `cp` unit lines out of {SETUP_HOST_PATH}. The installer's "
-        "cp idiom has changed and _CP_UNIT_RE no longer matches it — fix the "
-        "regex, do not weaken this test."
+        f"Parsed ZERO units out of {SETUP_HOST_PATH}'s `_orch_units` array. The "
+        "installer's declaration idiom has changed and _ORCH_UNITS_ARRAY_RE no "
+        "longer matches it — fix the regex, do not weaken this test."
     )
 
     assert installed_by_setup_host == set(checker.UNITS), (
@@ -294,6 +355,21 @@ def test_registry_matches_setup_host_cp_lines():
         "installed-but-unchecked: it can drift forever while this gate "
         "reports green."
     )
+
+
+# The claim "the `_orch_units` array is what DRIVES the copy, not decoration"
+# — declaration -> per-unit decision -> cleared set -> copy into $UNIT_DIR — is
+# asserted ONCE, in tests/scripts/test_orchestrator_service_files.py's
+# test_setup_host_installs_every_orchestrator_unit, which makes the same four
+# statement assertions per committed template against an independently parsed
+# statement list. This module used to restate it verbatim; the duplicate was
+# pinned to the same brittle source text, so a reflow of section 5 turned two
+# suites red for one cause.
+#
+# The staleness guard above still depends on that claim (it derives the
+# registry from the array), and the behavioural tests at the end of this module
+# are its stronger guard anyway: they EXECUTE the sliced section against tmp
+# trees and assert which unit files actually appear.
 
 
 # ---------------------------------------------------------------------------
@@ -687,12 +763,17 @@ def _run_cli(
     repo_root: pathlib.Path,
     installed_dir: pathlib.Path,
     *units: str,
+    extra_args: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     """Invoke the checker as a real subprocess against tmp_path trees.
 
     Uses sys.executable rather than a bare `python3`: commit 5178360711 fixed
     exactly that defect in the sibling scanner CLI tests, where a bare python3
     resolved to a different interpreter than the one running the suite.
+
+    ``extra_args`` appends flags after the two tree flags, which is how the
+    machine-readable-verdict tests run the SAME invocation with and without
+    ``--print-verdicts`` to prove the flag is a pure addition.
     """
     argv = [
         sys.executable,
@@ -702,6 +783,7 @@ def _run_cli(
     ]
     for unit in units:
         argv += ["--unit", unit]
+    argv += list(extra_args)
     return subprocess.run(argv, capture_output=True, text=True)
 
 
@@ -906,12 +988,446 @@ def test_cli_run_that_compared_nothing_never_reports_parity(
 
 
 # ---------------------------------------------------------------------------
+# Machine-readable per-unit verdicts  (--print-verdicts)
+# ---------------------------------------------------------------------------
+#
+# The human report above is written to be READ. setup-host.sh needs the same
+# findings PER UNIT so it can install the clean units and skip only the drifted
+# ones, and re-parsing the free-form report for that would be a second, brittle
+# parser of prose that exists to be prose. `--print-verdicts` is the machine
+# channel: one line per SELECTED unit, carrying the same [orchestrator_unit_parity]
+# tag the installer's "did the gate actually run" guard already keys on.
+#
+# It is OPT-IN and additive by construction: without the flag nothing changes,
+# and with it neither the exit codes nor the human report move. Both halves are
+# asserted below, because a "machine-readable mode" that perturbs the exit code
+# would silently re-point the installer's 0/2/other branch.
+
+# The tag prefix every line of this checker's output carries. Spelled literally
+# rather than derived from checker.LOG_TAG so a rename of the constant cannot
+# quietly re-point BOTH sides of the assertion at each other — setup-host.sh
+# greps for this exact string.
+_LOG_TAG_PREFIX = "[orchestrator_unit_parity] "
+
+_VERDICT_LINE_RE = re.compile(
+    r"^" + re.escape(_LOG_TAG_PREFIX) + r"verdict (?P<unit>\S+) (?P<kinds>\S+)$"
+)
+
+
+def _verdict_lookalikes(stdout: str) -> list[str]:
+    """Every line that is trying to be a verdict line, tagged or not.
+
+    Deliberately looser than _VERDICT_LINE_RE: an UNTAGGED verdict line must
+    fail loudly here rather than be invisible to the strict parser, where it
+    would surface as a confusing "no verdict emitted for <unit>".
+    """
+    return [line for line in stdout.splitlines() if " verdict " in line]
+
+
+def _parse_verdicts(stdout: str) -> dict[str, list[str]]:
+    """Parse the verdict lines into ``{unit: [kind, ...]}``.
+
+    Duplicates raise instead of merging. Two lines for one unit would let a
+    last-write-wins consumer and a first-write-wins one disagree about the same
+    run — and the consumer here is a bash associative array, which silently
+    takes the last. A checker that can emit a unit twice must fail a test, not
+    a host.
+    """
+    known_kinds = set(_load_checker().VERDICT_KINDS)
+
+    verdicts: dict[str, list[str]] = {}
+    for line in _verdict_lookalikes(stdout):
+        match = _VERDICT_LINE_RE.match(line)
+        assert match is not None, (
+            f"Verdict-shaped line does not match the documented format "
+            f"'{_LOG_TAG_PREFIX}verdict <unit> <kind>[,<kind>...]':\n  {line!r}\n"
+            "setup-host.sh refuses to believe any output that does not carry "
+            "the [orchestrator_unit_parity] tag, so an untagged or reshaped "
+            "verdict line reaches the installer as NO verdict at all."
+        )
+        unit = match.group("unit")
+        assert unit not in verdicts, (
+            f"{unit} got more than one verdict line in a single run:\n{stdout}"
+        )
+        kinds = match.group("kinds").split(",")
+
+        # Checked HERE, in the shared parser, so it holds for every verdict
+        # case in this file rather than one dedicated test. VERDICT_KINDS is
+        # the published vocabulary setup-host.sh writes a case arm for; a kind
+        # emitted outside it reaches the installer's `*)` fallback and produces
+        # a warning naming no actionable cause. The vocabulary must not be able
+        # to grow silently.
+        unknown = [k for k in kinds if k not in known_kinds]
+        assert not unknown, (
+            f"{unit} was given verdict kind(s) {unknown} that are not in "
+            f"check_orchestrator_unit_parity.VERDICT_KINDS "
+            f"({sorted(known_kinds)}). Add the kind to that tuple AND a case "
+            "arm to setup-host.sh's _orch_skip_reason, or the installer will "
+            "skip the unit without telling the operator why."
+        )
+        verdicts[unit] = kinds
+    return verdicts
+
+
+def _add_dropin(
+    installed_dir: pathlib.Path,
+    unit: str,
+    *,
+    body: str = "[Timer]\nAccuracySec=1min\n",
+    name: str = "override.conf",
+) -> pathlib.Path:
+    """Write a ``<unit>.d/<name>`` drop-in — what `systemctl --user edit` does."""
+    dropin_dir = installed_dir / f"{unit}.d"
+    dropin_dir.mkdir(exist_ok=True)
+    dropin = dropin_dir / name
+    dropin.write_text(body, encoding="utf-8")
+    return dropin
+
+
+def _verdict_for(
+    tmp_path: pathlib.Path,
+    *,
+    repo_text: str | None = _BASE_TIMER,
+    installed_text: str | None = _BASE_TIMER,
+    dropin: bool = False,
+    installed_bytes: bytes | None = None,
+) -> list[str]:
+    """Build a one-unit tree in the given shape and return that unit's kinds.
+
+    Returns ``[]`` when the checker emitted no verdict line for it — which is
+    itself a finding, since the installer reads a missing verdict as
+    "unverified" and declines to install.
+    """
+    repo_root, installed_dir = _make_trees(
+        tmp_path, repo_text=repo_text, installed_text=installed_text
+    )
+    if installed_bytes is not None:
+        (installed_dir / _REAL_UNIT).write_bytes(installed_bytes)
+    if dropin:
+        _add_dropin(installed_dir, _REAL_UNIT)
+
+    result = _run_cli(
+        repo_root, installed_dir, _REAL_UNIT, extra_args=("--print-verdicts",)
+    )
+    return _parse_verdicts(result.stdout).get(_REAL_UNIT, [])
+
+
+def test_verdict_kinds_is_the_published_vocabulary():
+    """VERDICT_KINDS is public, non-empty, deduplicated and ordered.
+
+    Guard the guard for _parse_verdicts' membership check above and for the
+    cross-artifact derivation against setup-host.sh: both iterate this tuple,
+    and an empty or duplicate-bearing one would let them pass while checking
+    less than they claim.
+    """
+    checker = _load_checker()
+
+    assert checker.VERDICT_KINDS, "VERDICT_KINDS is empty"
+    assert len(set(checker.VERDICT_KINDS)) == len(checker.VERDICT_KINDS), (
+        f"VERDICT_KINDS has duplicates: {checker.VERDICT_KINDS}"
+    )
+    # The two install-eligible kinds must exist by these names: setup-host.sh's
+    # install condition names them literally.
+    assert {"clean", "absent"} <= set(checker.VERDICT_KINDS), checker.VERDICT_KINDS
+
+
+def test_verdict_drifted_unit_reports_drift(tmp_path: pathlib.Path):
+    """A real directive difference => `drift`."""
+    assert _verdict_for(tmp_path, installed_text=_DRIFTED_TIMER) == ["drift"]
+
+
+def test_verdict_comment_only_difference_plus_dropin_is_override_not_drift(
+    tmp_path: pathlib.Path,
+):
+    """The LIVE reify shape: a drop-in over a comment-only difference.
+
+    ``~/.config/systemd/user/orchestrator-reify.service.d/warm-lane.conf`` is a
+    deliberate, in-use drop-in on this host. Its unit file differs from the
+    committed copy only in comments, which the shared parser strips before
+    comparison — so this must read as `override` ALONE.
+
+    Reporting `drift` here would send the operator hunting for a directive diff
+    that does not exist, and would make the installer's skip warning name the
+    wrong remedy: a drop-in is removed with `systemctl --user cat/edit`, not by
+    reconciling a directive.
+    """
+    commented = _BASE_TIMER + "# a comment-only edit, invisible to the parser\n"
+
+    assert _verdict_for(tmp_path, installed_text=commented, dropin=True) == [
+        "override"
+    ]
+
+
+def test_verdict_drift_and_dropin_render_in_precedence_order(
+    tmp_path: pathlib.Path,
+):
+    """Both conditions => exactly `drift,override`, in VERDICT_KINDS order.
+
+    Order is a CONTRACT, not an artifact of set iteration: a consumer diffing
+    one run's verdicts against another's (or one host against another) can only
+    do that if the same findings always render the same string.
+    """
+    assert _verdict_for(tmp_path, installed_text=_DRIFTED_TIMER, dropin=True) == [
+        "drift",
+        "override",
+    ]
+
+
+def test_verdict_absent_installed_copy_reports_absent(tmp_path: pathlib.Path):
+    """No installed copy => `absent`, which is install-eligible but NOT `clean`.
+
+    Kept apart from `clean` deliberately: this checker may only claim what it
+    verified, and an absent copy was never compared. Calling it `clean` would
+    be a parity assertion about a measurement that never happened.
+    """
+    assert _verdict_for(tmp_path, installed_text=None) == ["absent"]
+
+
+def test_verdict_vanished_committed_copy_reports_vanished(tmp_path: pathlib.Path):
+    """No COMMITTED copy => `vanished`.
+
+    Load-bearing for the installer: with no source file, a bare `cp` would fail
+    and abort the whole `set -e` script. This kind is what lets the installer
+    skip that unit instead of dying.
+    """
+    assert _verdict_for(tmp_path, repo_text=None) == ["vanished"]
+
+
+def test_verdict_undecodable_unit_reports_unreadable(tmp_path: pathlib.Path):
+    """A unit that exists but cannot be decoded => `unreadable`, never `clean`."""
+    assert _verdict_for(
+        tmp_path, installed_bytes=b"[Timer]\nOnBootSec=\xff\xfe30\n"
+    ) == ["unreadable"]
+
+
+def test_verdict_dropin_over_an_undecodable_unit_reports_both(
+    tmp_path: pathlib.Path,
+):
+    """The SECOND producible combination: `override,unreadable`.
+
+    The drop-in scan runs before either read is attempted, so a unit that is
+    both drop-in'd and undecodable carries both kinds — this is not a
+    hypothetical the vocabulary merely permits. It is asserted here because
+    setup-host.sh has a dedicated `_orch_skip_reason` arm for it, and an arm
+    for an unreachable combination is dead code while a reachable combination
+    with no arm tells the operator half a remedy.
+
+    `drift,unreadable` is NOT reachable by the same control flow: `drift` is
+    marked only after both reads have succeeded.
+    """
+    assert _verdict_for(
+        tmp_path,
+        installed_bytes=b"[Timer]\nOnBootSec=\xff\xfe30\n",
+        dropin=True,
+    ) == ["override", "unreadable"]
+
+
+def test_verdict_lines_are_restricted_to_the_selected_units(
+    tmp_path: pathlib.Path,
+):
+    """--unit scopes the machine channel exactly as it scopes the report.
+
+    A verdict for an unselected unit would tell the installer something the run
+    did not measure.
+    """
+    repo_root, installed_dir = _make_trees(tmp_path)
+    (repo_root / _SECOND_UNIT_RELPATH).write_text(_BASE_SERVICE, encoding="utf-8")
+    (installed_dir / _SECOND_UNIT).write_text(_BASE_SERVICE, encoding="utf-8")
+
+    scoped = _run_cli(
+        repo_root, installed_dir, _REAL_UNIT, extra_args=("--print-verdicts",)
+    )
+    assert _parse_verdicts(scoped.stdout) == {_REAL_UNIT: ["clean"]}, scoped.stdout
+
+    both = _run_cli(
+        repo_root,
+        installed_dir,
+        _REAL_UNIT,
+        _SECOND_UNIT,
+        extra_args=("--print-verdicts",),
+    )
+    assert _parse_verdicts(both.stdout) == {
+        _REAL_UNIT: ["clean"],
+        _SECOND_UNIT: ["clean"],
+    }, both.stdout
+
+
+def test_every_verdict_kind_is_reachable(tmp_path: pathlib.Path):
+    """COVERAGE: every VERDICT_KINDS member is actually emitted by some tree.
+
+    A kind nobody can produce is dead vocabulary that still forces a case arm
+    in setup-host.sh, and — worse — hides the reverse defect: a bucket the
+    checker populates but never renders leaves the installer with NO verdict
+    for that unit, which it fail-safes into "skip". A unit silently skipped
+    forever looks identical to a unit correctly declined.
+    """
+    checker = _load_checker()
+    commented = _BASE_TIMER + "# comment-only\n"
+
+    emitted = set()
+    emitted.update(_verdict_for(tmp_path / "clean"))
+    emitted.update(_verdict_for(tmp_path / "drift", installed_text=_DRIFTED_TIMER))
+    emitted.update(
+        _verdict_for(tmp_path / "override", installed_text=commented, dropin=True)
+    )
+    emitted.update(_verdict_for(tmp_path / "absent", installed_text=None))
+    emitted.update(_verdict_for(tmp_path / "vanished", repo_text=None))
+    emitted.update(
+        _verdict_for(
+            tmp_path / "unreadable",
+            installed_bytes=b"[Timer]\nOnBootSec=\xff\xfe30\n",
+        )
+    )
+
+    assert emitted == set(checker.VERDICT_KINDS), (
+        "VERDICT_KINDS and the kinds this checker can actually emit disagree.\n"
+        f"  declared but never emitted: {sorted(set(checker.VERDICT_KINDS) - emitted)}\n"
+        f"  emitted but not declared:   {sorted(emitted - set(checker.VERDICT_KINDS))}"
+    )
+
+
+def test_print_verdicts_emits_exactly_one_clean_line_per_selected_unit(
+    tmp_path: pathlib.Path,
+):
+    """Byte-identical trees => one `verdict <unit> clean` line per selected unit.
+
+    Compared as a DICT against the selected set, not with `in` checks: a
+    missing line and a duplicated line are both defects the installer would
+    experience as "this unit has no verdict" / "this unit's verdict is whichever
+    line came last", and only an exact comparison catches either.
+    """
+    repo_root, installed_dir = _make_trees(tmp_path)
+    (repo_root / _SECOND_UNIT_RELPATH).write_text(_BASE_SERVICE, encoding="utf-8")
+    (installed_dir / _SECOND_UNIT).write_text(_BASE_SERVICE, encoding="utf-8")
+
+    result = _run_cli(
+        repo_root,
+        installed_dir,
+        _REAL_UNIT,
+        _SECOND_UNIT,
+        extra_args=("--print-verdicts",),
+    )
+
+    assert result.returncode == 0, (
+        f"Expected 0 for matching copies; got {result.returncode}. "
+        f"stdout: {result.stdout} stderr: {result.stderr}"
+    )
+    assert _parse_verdicts(result.stdout) == {
+        _REAL_UNIT: ["clean"],
+        _SECOND_UNIT: ["clean"],
+    }, result.stdout
+
+
+def test_verdict_lines_carry_the_parity_log_tag(tmp_path: pathlib.Path):
+    """Every verdict line is prefixed with [orchestrator_unit_parity].
+
+    Not cosmetic. setup-host.sh believes NO status from this checker unless
+    that tag appears in the output (the guard that stops a renamed script's
+    argparse exit 2 from reading as the benign "not installed on this host").
+    Emitting the machine channel through the same tagged writer extends that
+    guard to it for free: rename the flag, argparse exits 2, no tag and no
+    verdict lines appear, and every unit falls back to "unverified" — so the
+    installer copies nothing. An untagged prefix would have re-opened exactly
+    the silent-green hole the tag guard exists to close.
+    """
+    repo_root, installed_dir = _make_trees(tmp_path)
+
+    result = _run_cli(
+        repo_root, installed_dir, _REAL_UNIT, extra_args=("--print-verdicts",)
+    )
+
+    lines = _verdict_lookalikes(result.stdout)
+    assert lines, f"--print-verdicts emitted no verdict line at all:\n{result.stdout}"
+    for line in lines:
+        assert line.startswith(_LOG_TAG_PREFIX), (
+            f"Verdict line is not tagged: {line!r}. setup-host.sh greps for "
+            f"{_LOG_TAG_PREFIX!r} before believing anything this checker says."
+        )
+
+
+def test_no_verdict_lines_without_the_flag(tmp_path: pathlib.Path):
+    """The channel is OPT-IN: a default run's output is unchanged.
+
+    An operator reading the human report should not have to skim past nine
+    machine lines to find the finding, and — more importantly — the report is
+    the artifact whose wording other tests and the docstring pin. Additive
+    means additive.
+    """
+    repo_root, installed_dir = _make_trees(tmp_path)
+
+    result = _run_cli(repo_root, installed_dir, _REAL_UNIT)
+
+    assert _verdict_lookalikes(result.stdout) == [], (
+        "A run WITHOUT --print-verdicts printed verdict lines:\n" + result.stdout
+    )
+    assert "[ok] parity" in result.stdout, result.stdout
+    assert "1 unit(s)" in result.stdout, result.stdout
+
+
+def test_print_verdicts_never_changes_the_exit_code(tmp_path: pathlib.Path):
+    """The flag is observationally pure on every exit-code path.
+
+    setup-host.sh's gate branches on 0 / 2 / other, and this flag is added to
+    that very invocation. If turning it on moved any exit code, the gate would
+    silently re-classify a host — a fresh machine reading as drift, or drift
+    reading as benign. Each path is run twice, with and without, and compared.
+    """
+    # parity => 0, drift => 1, installed copy absent => 2.
+    cases = {
+        "parity": _make_trees(tmp_path / "parity"),
+        "drift": _make_trees(tmp_path / "drift", installed_text=_DRIFTED_TIMER),
+        "absent": _make_trees(tmp_path / "absent", installed_text=None),
+    }
+
+    observed: dict[str, int] = {}
+    for label, (repo_root, installed_dir) in cases.items():
+        plain = _run_cli(repo_root, installed_dir, _REAL_UNIT)
+        with_flag = _run_cli(
+            repo_root, installed_dir, _REAL_UNIT, extra_args=("--print-verdicts",)
+        )
+        assert plain.returncode == with_flag.returncode, (
+            f"--print-verdicts changed the {label} exit code: "
+            f"{plain.returncode} -> {with_flag.returncode}.\n"
+            f"plain stdout: {plain.stdout}\nflagged stdout: {with_flag.stdout}"
+        )
+        observed[label] = plain.returncode
+
+    # Guard the guard: three fixtures that all happened to return the same code
+    # would satisfy the equality above while exercising ONE path. Pin which
+    # code each case is supposed to produce.
+    assert observed == {"parity": 0, "drift": 1, "absent": 2}, observed
+
+
+# ---------------------------------------------------------------------------
 # setup-host.sh wiring contract  (step-13 / step-14)
 # ---------------------------------------------------------------------------
 
 
 def _setup_host_text() -> str:
     return SETUP_HOST_PATH.read_text(encoding="utf-8")
+
+
+def _anchor_index(text: str, anchor: str, what: str) -> int:
+    """`text.index(anchor)`, but failing with a message that explains itself.
+
+    Every slice below is anchored on a literal from setup-host.sh, and a bare
+    `str.index` raises `ValueError: substring not found` from inside a helper
+    when one of those literals is edited away. That error names neither the
+    file nor the missing statement, and — because the slicing helpers are
+    shared — it would ERROR OUT roughly fifteen behavioural tests in this
+    module at once, burying whichever guard was written to explain the change.
+
+    Raising here instead turns that into a single legible failure, and keeps
+    the guards downstream from being unreachable behind an exception thrown
+    before they run.
+    """
+    assert anchor in text, (
+        f"{SETUP_HOST_PATH}: {what} is gone, so this module can no longer "
+        f"locate the section it tests. Expected the statement:\n    {anchor}\n"
+        "Retarget the anchor deliberately — every behavioural test below "
+        "slices from it."
+    )
+    return text.index(anchor)
 
 
 def _orchestrator_gate_block(text: str) -> str:
@@ -930,7 +1446,9 @@ def _orchestrator_gate_block(text: str) -> str:
     script. End: the first column-0 `fi` after it — the gate's own `if` closes
     there, and every `fi` nested inside it is indented.
     """
-    mention = text.index("check_orchestrator_unit_parity.py")
+    mention = _anchor_index(
+        text, "check_orchestrator_unit_parity.py", "the parity gate's invocation"
+    )
     start = text.rfind("\n", 0, mention) + 1
     end = text.index("\nfi\n", mention) + len("\nfi\n")
     return text[start:end]
@@ -939,11 +1457,15 @@ def _orchestrator_gate_block(text: str) -> str:
 def _orchestrator_install_block(text: str) -> str:
     """Slice the construct that performs the orchestrator unit `cp`s.
 
-    Derived the same way: from the column-0 `if` preceding the first
-    orchestrator `cp` to the column-0 `fi` that closes it. Empty-ish slices
-    are impossible — the caller asserts the `cp` lines are inside.
+    Derived the same way: from the column-0 `if` preceding the install loop's
+    `cp` to the column-0 `fi` that closes it. Empty-ish slices are impossible —
+    the caller asserts the loop is inside.
+
+    The end anchor is a COLUMN-0 `fi`, so the loops' own indented `fi`/`done`
+    are invisible to it and the slice still terminates at the install
+    construct's close.
     """
-    first_cp = text.index('cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"')
+    first_cp = _anchor_index(text, _INSTALL_LOOP_CP, "the install loop's copy")
     start = text.rindex("\nif ", 0, first_cp) + 1
     end = text.index("\nfi\n", first_cp) + len("\nfi\n")
     return text[start:end]
@@ -983,10 +1505,10 @@ def test_parity_gate_runs_BEFORE_the_units_are_copied():
     """
     text = _setup_host_text()
 
-    gate_at = text.index("check_orchestrator_unit_parity.py")
-    first_cp_at = text.index(
-        'cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"'
+    gate_at = _anchor_index(
+        text, "check_orchestrator_unit_parity.py", "the parity gate's invocation"
     )
+    first_cp_at = _anchor_index(text, _INSTALL_LOOP_CP, "the install loop's copy")
 
     assert gate_at < first_cp_at, (
         "check_orchestrator_unit_parity.py is invoked at offset "
@@ -1047,10 +1569,18 @@ def _installer_section() -> str:
     From the line carrying the first mention of the checker through the `fi`
     that closes the install construct — endpoints derived, so this follows a
     reflow of the block instead of pinning one.
+
+    Both anchors go through _anchor_index: every behavioural test below runs
+    this slice, so a bare `str.index` losing one of them would error out the
+    whole set with `ValueError: substring not found` instead of failing once,
+    legibly, on the literal that moved.
     """
     text = _setup_host_text()
-    start = text.rfind("\n", 0, text.index("check_orchestrator_unit_parity.py")) + 1
-    first_cp = text.index('cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"')
+    mention = _anchor_index(
+        text, "check_orchestrator_unit_parity.py", "the parity gate's invocation"
+    )
+    start = text.rfind("\n", 0, mention) + 1
+    first_cp = _anchor_index(text, _INSTALL_LOOP_CP, "the install loop's copy")
     end = text.index("\nfi\n", first_cp) + len("\nfi\n")
     return text[start:end]
 
@@ -1083,6 +1613,9 @@ def _fake_repo(
     return repo
 
 
+_SYSTEMCTL_LOG = "systemctl-calls.log"
+
+
 def _run_installer_section(
     tmp_path: pathlib.Path,
     repo: pathlib.Path,
@@ -1094,7 +1627,18 @@ def _run_installer_section(
     stub_bin = tmp_path / "stub-bin"
     stub_bin.mkdir(exist_ok=True)
     systemctl = stub_bin / "systemctl"
-    systemctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    # The stub RECORDS its argv (one call per line) before exiting 0, so the
+    # enable half of the install is observable and not merely assumed. Half of
+    # what this section does is `systemctl --user enable`, and a per-unit gate
+    # that copied the right files while enabling the wrong set would pass every
+    # file-content assertion in this module. Purely additive: tests that do not
+    # read the log are unaffected.
+    systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {tmp_path / _SYSTEMCTL_LOG}\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
     systemctl.chmod(0o755)
 
     script = tmp_path / "section.sh"
@@ -1117,6 +1661,29 @@ def _run_installer_section(
     return subprocess.run(
         ["bash", str(script)], capture_output=True, text=True, env=env
     )
+
+
+def _systemctl_calls(tmp_path: pathlib.Path) -> list[list[str]]:
+    """Every `systemctl` invocation the run made, as argv token lists."""
+    log = tmp_path / _SYSTEMCTL_LOG
+    if not log.is_file():
+        return []
+    return [
+        line.split() for line in log.read_text(encoding="utf-8").splitlines() if line
+    ]
+
+
+def _enabled_units(tmp_path: pathlib.Path) -> list[str]:
+    """The units passed to `systemctl ... enable <unit>` during the run.
+
+    Token-matched rather than substring-matched: `enable` naming one unit must
+    never be satisfied by a line naming a different one.
+    """
+    enabled: list[str] = []
+    for argv in _systemctl_calls(tmp_path):
+        if "enable" in argv:
+            enabled.extend(argv[argv.index("enable") + 1 :])
+    return enabled
 
 
 def _install_all_units(repo: pathlib.Path, unit_dir: pathlib.Path) -> None:
@@ -1210,6 +1777,487 @@ def test_installer_copies_over_drift_when_explicitly_opted_in(
     )
 
 
+def _warnings(stdout: str) -> str:
+    """Just the harness's `WARN ` lines, joined.
+
+    The installer echoes the checker's whole report to stdout, and that report
+    NAMES every drifted unit. Asserting "no warning names a clean unit" against
+    raw stdout would therefore be asserting against the checker's own output.
+    Only the installer's own warnings are the installer's claim.
+    """
+    return "\n".join(
+        line for line in stdout.splitlines() if line.startswith("WARN ")
+    )
+
+
+def _warnings_naming(stdout: str, unit: str) -> str:
+    """The installer's own WARN lines that NAME *unit*, joined.
+
+    Scoped to one unit because the aggregate gate warnings describe the run as
+    a whole — asserting a phrase is merely "in the warnings" would be satisfied
+    by a line about some other unit entirely.
+    """
+    return "\n".join(line for line in _warnings(stdout).splitlines() if unit in line)
+
+
+def test_one_drifted_unit_does_not_block_its_clean_siblings(
+    tmp_path: pathlib.Path,
+):
+    """PER-UNIT: a single drifted unit must not decline the other eight.
+
+    This is the whole point of the task. The old gate was all-or-nothing: any
+    unit reporting drift, an override or an unverifiable state skipped the
+    install of ALL nine — so the deliberate, permanent
+    orchestrator-reify.service.d/warm-lane.conf drop-in on this host also
+    blocked the watchdog pair from ever being reinstalled and re-enabled by a
+    plain setup-host.sh run. A supervision safety net that cannot be repaired
+    by the installer is a worse outcome than the drift the gate was protecting.
+
+    The policy is UNCHANGED and still ratified: a drifted unit is never
+    overwritten without DF_INSTALL_ORCH_UNITS=1, because drift does not tell
+    you which side is stale. Only the blast radius shrinks, from nine to one.
+
+    The clean sibling checked here is one whose installed copy is DELETED
+    first, so its reinstall is positively observable — asserting on a unit that
+    was already byte-identical would be satisfied by doing nothing at all.
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+
+    drifted = unit_dir / "orchestrator-reify.service"
+    drifted.write_text(
+        drifted.read_text(encoding="utf-8") + "\n[Service]\nTimeoutStopSec=99\n",
+        encoding="utf-8",
+    )
+    before = drifted.read_text(encoding="utf-8")
+
+    reinstalled = unit_dir / "orchestrator-watchdog.timer"
+    reinstalled.unlink()
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, (
+        "The gate must stay NON-FATAL — it declines individual units, it does "
+        f"not abort the installer.\n{result.stdout}\n{result.stderr}"
+    )
+    assert reinstalled.is_file(), (
+        "orchestrator-watchdog.timer was clean (absent) but was not installed — "
+        "one unrelated unit's drift is still blocking the whole set.\n"
+        + result.stdout
+    )
+    assert reinstalled.read_text(encoding="utf-8") == (
+        repo / "scripts" / "orchestrator-watchdog.timer"
+    ).read_text(encoding="utf-8")
+
+    assert drifted.read_text(encoding="utf-8") == before, (
+        "The installer overwrote a unit the parity gate reported drift on. The "
+        "per-unit gate narrows the skip; it does not relax it."
+    )
+
+    warnings = _warnings(result.stdout)
+    assert "orchestrator-reify.service" in warnings, (
+        "The skip warning does not NAME the unit that was skipped. An operator "
+        f"cannot act on 'something drifted'.\n{result.stdout}"
+    )
+    assert "byte-drift" in warnings, (
+        "The skip warning does not say WHICH KIND of divergence was found. "
+        "byte-drift is reconciled by editing a directive; a drop-in is removed "
+        f"with systemctl --user edit — different remedies.\n{result.stdout}"
+    )
+
+    checker = _load_checker()
+    wrongly_named = sorted(
+        unit
+        for unit in set(checker.UNITS) - {"orchestrator-reify.service"}
+        if unit in warnings
+    )
+    assert not wrongly_named, (
+        f"The installer warned about clean units {wrongly_named}, which it "
+        f"installed. A warning naming a unit nothing was wrong with trains an "
+        f"operator to ignore the whole block.\n{result.stdout}"
+    )
+
+
+def test_the_live_reify_dropin_blocks_only_reify_and_the_watchdog_is_re_enabled(
+    tmp_path: pathlib.Path,
+):
+    """THE LIVE SCENARIO, end to end, including the ENABLE half.
+
+    Reproduces this host exactly: ``orchestrator-reify.service`` carries a
+    deliberate, permanent ``orchestrator-reify.service.d/warm-lane.conf``
+    drop-in over a unit file that differs from the committed copy only in
+    comments — so its verdict is `override`, not `drift`. Under the old
+    all-or-nothing gate that ONE unit declined the install of all nine, which
+    is why the watchdog pair could not be reinstalled and re-enabled by a plain
+    setup-host.sh run. On 2026-08-10 that left the fleet 31.8h stale: the
+    supervision safety net was the thing the gate was protecting from repair.
+
+    The enable half is asserted from the systemctl stub's call log, not
+    inferred from file contents, because it is a genuinely separate obligation:
+    copying orchestrator-watchdog.timer into place does nothing at all until it
+    is enabled. Three distinct properties are checked:
+      - the timer IS enabled (the repair path the stale fleet needed);
+      - orchestrator-watchdog.service is NOT (it is static — no [Install] — and
+        `systemctl enable` on a static unit is an ERROR, not a no-op, so under
+        `set -e` that would abort the installer outright);
+      - orchestrator-reify.service is NOT (a unit that did not clear the gate is
+        neither copied NOR enabled — enabling a unit whose install was declined
+        would act on exactly the state the skip refused to act on).
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+
+    # Reify: comment-only divergence + a drop-in. The parser strips comments,
+    # so this must read as `override` ALONE — the phrasing matters because the
+    # remedies differ (edit a directive vs. `systemctl --user cat/edit`).
+    reify = unit_dir / "orchestrator-reify.service"
+    reify.write_text(
+        reify.read_text(encoding="utf-8")
+        + "\n# host-local annotation, invisible to the parser\n",
+        encoding="utf-8",
+    )
+    reify_before = reify.read_text(encoding="utf-8")
+    dropin = _add_dropin(
+        unit_dir,
+        "orchestrator-reify.service",
+        body="[Unit]\nWants=reify-warm-lane.service\nAfter=reify-warm-lane.service\n",
+        name="warm-lane.conf",
+    )
+    dropin_before = dropin.read_text(encoding="utf-8")
+
+    # Deleted so their reinstall is positively observable: asserting on units
+    # that were already byte-identical would be satisfied by doing nothing.
+    (unit_dir / "orchestrator-watchdog.timer").unlink()
+    (unit_dir / "orchestrator-watchdog.service").unlink()
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, (
+        "The gate must stay NON-FATAL — it declines individual units, it does "
+        f"not abort the installer.\n{result.stdout}\n{result.stderr}"
+    )
+
+    for name in ("orchestrator-watchdog.service", "orchestrator-watchdog.timer"):
+        installed = unit_dir / name
+        assert installed.is_file(), (
+            f"{name} was absent (install-eligible) but was not installed — "
+            "reify's drop-in is still blocking the watchdog pair, which is the "
+            f"exact failure this task exists to fix.\n{result.stdout}"
+        )
+        assert installed.read_text(encoding="utf-8") == (
+            repo / "scripts" / name
+        ).read_text(encoding="utf-8")
+
+    enabled = _enabled_units(tmp_path)
+    assert "orchestrator-watchdog.timer" in enabled, (
+        "orchestrator-watchdog.timer was copied but never enabled. A timer "
+        "unit file on disk supervises nothing; enabling it is the repair the "
+        f"31.8h-stale fleet needed.\ncalls: {_systemctl_calls(tmp_path)}"
+    )
+    assert "orchestrator-watchdog.service" not in enabled, (
+        "orchestrator-watchdog.service is STATIC (no [Install]) — `systemctl "
+        "enable` on it is an error, not a no-op, so under `set -e` this would "
+        f"abort the installer.\ncalls: {_systemctl_calls(tmp_path)}"
+    )
+    assert "orchestrator-reify.service" not in enabled, (
+        "A unit the gate declined to install was still enabled. The skip must "
+        "cover BOTH halves: enabling a unit whose install was declined acts on "
+        f"exactly the unverified state the skip refused.\nenabled: {enabled}"
+    )
+
+    reload_calls = [argv for argv in _systemctl_calls(tmp_path) if "daemon-reload" in argv]
+    assert len(reload_calls) == 1, (
+        "daemon-reload must run exactly once, AFTER the copies and BEFORE the "
+        "enables — systemd must not be asked to enable a unit it has not "
+        f"re-read.\ncalls: {_systemctl_calls(tmp_path)}"
+    )
+
+    assert reify.read_text(encoding="utf-8") == reify_before, (
+        "The installer overwrote a unit the gate reported an override on."
+    )
+    assert dropin.read_text(encoding="utf-8") == dropin_before, (
+        "The installer disturbed the deliberate warm-lane.conf drop-in."
+    )
+
+    reify_warning = _warnings_naming(result.stdout, "orchestrator-reify.service")
+    assert "drop-in" in reify_warning, (
+        "The skip warning for a drop-in'd unit does not say `drop-in`. The "
+        "remedy is `systemctl --user cat/edit`, not reconciling a directive."
+        f"\n{result.stdout}"
+    )
+    assert "byte-drift" not in reify_warning, (
+        "The skip warning blames byte-drift on a unit whose only divergence is "
+        "a drop-in over comment-only edits — sending the operator hunting for "
+        f"a directive diff that does not exist.\n{result.stdout}"
+    )
+
+
+def _verdict_stub(exit_code: int, verdicts: dict[str, str]) -> str:
+    """A stub checker printing a TAGGED report and the given verdict lines.
+
+    Used to reach states the real checker cannot be driven into from a tmp tree
+    — chiefly "the report is well formed but a unit has no verdict line", which
+    is what an older checker, a refactor that dropped the emit, or a registry
+    that does not know a unit would each produce.
+    """
+    lines = ["[orchestrator_unit_parity] stub report over 9 units"]
+    lines += [
+        f"[orchestrator_unit_parity] verdict {unit} {kinds}"
+        for unit, kinds in sorted(verdicts.items())
+    ]
+    return (
+        "import sys\n"
+        + "".join(f"print({line!r})\n" for line in lines)
+        + f"sys.exit({exit_code})\n"
+    )
+
+
+def test_a_report_with_no_verdict_lines_installs_nothing(tmp_path: pathlib.Path):
+    """FAIL-SAFE: a tagged, exit-0 report carrying NO verdicts installs NOTHING.
+
+    The third face of the same collision the two tests below cover, and the one
+    the machine channel newly opens: here the gate DID run, its tag IS present
+    and it exited 0 — everything the installer checks before reading verdicts
+    says "green" — yet it said nothing per-unit. A checker refactored to drop
+    the emit, an older copy on a rebuilt host, or a registry that does not know
+    these units all land exactly here.
+
+    Reading that as "no findings, install everything" would make the per-unit
+    gate strictly WEAKER than the all-or-nothing one it replaces: the states
+    that produce no verdict are precisely "nothing was checked", and installing
+    on the strength of nothing is the silent-drift failure this gate exists to
+    catch. A unit with no verdict is therefore BLOCKED, and the warning must
+    say so — "skipped" with no cause is indistinguishable from a real finding.
+    """
+    repo = _fake_repo(tmp_path, checker_body=_verdict_stub(0, {}))
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+    deleted = unit_dir / "orchestrator-watchdog.timer"
+    deleted.unlink()
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert not deleted.exists(), (
+        "A unit with NO verdict was installed anyway. The gate reported no "
+        "finding because it measured nothing, not because there was nothing "
+        f"to find.\n{result.stdout}"
+    )
+    assert _enabled_units(tmp_path) == [], (
+        "Units were enabled on a run where nothing cleared the gate.\n"
+        f"{_systemctl_calls(tmp_path)}"
+    )
+    assert "SKIPPING" in result.stdout, result.stdout
+
+    warning = _warnings_naming(result.stdout, "orchestrator-watchdog.timer")
+    assert "no verdict" in warning, (
+        "The skip warning does not tell the operator the gate returned NO "
+        "VERDICT for this unit. Without that, a checker that silently stopped "
+        "reporting is indistinguishable from a host with real drift — and the "
+        f"remedies are opposite.\n{result.stdout}"
+    )
+
+
+def test_a_vanished_committed_unit_is_skipped_not_fatal(tmp_path: pathlib.Path):
+    """A missing SOURCE file must skip that unit, never abort the installer.
+
+    `cp` of a nonexistent source fails, and under `set -euo pipefail` that
+    aborts the whole script — taking every section after this one with it. The
+    `vanished` verdict is what lets the loop decline that unit instead of dying
+    on it, so this is the regression that must never land: the per-unit gate
+    made `cp` run inside a loop over a computed set, which is exactly where an
+    unguarded missing source would first bite.
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+    (repo / "scripts" / "orchestrator-know-live.service").unlink()
+
+    survivor = unit_dir / "orchestrator-watchdog.timer"
+    survivor.unlink()
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, (
+        "A vanished committed unit ABORTED the installer instead of being "
+        f"skipped.\n{result.stdout}\n{result.stderr}"
+    )
+    assert survivor.is_file(), (
+        "The vanished unit stopped its clean siblings from being installed.\n"
+        + result.stdout
+    )
+    assert "orchestrator-know-live.service" in _warnings_naming(
+        result.stdout, "orchestrator-know-live.service"
+    ), f"The vanished unit was skipped silently.\n{result.stdout}"
+    assert "orchestrator-know-live.service" not in _enabled_units(tmp_path), (
+        "A unit with no committed copy was enabled.\n"
+        f"{_systemctl_calls(tmp_path)}"
+    )
+
+
+def test_force_all_installs_even_drifted_and_unverified_units(
+    tmp_path: pathlib.Path,
+):
+    """DF_INSTALL_ORCH_UNITS=1 still means ALL, per-unit gate notwithstanding.
+
+    The override is the operator's escape hatch after they have read the report
+    and decided the committed side is correct. A per-unit gate that quietly
+    kept skipping the no-verdict units under the override would leave them with
+    no way to install those units at all without editing the installer.
+    """
+    checker = _load_checker()
+    unverified = "orchestrator-watchdog.timer"
+    drifted = "orchestrator-reify.service"
+    stub = _verdict_stub(
+        1,
+        {
+            unit: ("drift" if unit == drifted else "clean")
+            for unit in checker.UNITS
+            if unit != unverified
+        },
+    )
+    repo = _fake_repo(tmp_path, checker_body=stub)
+    unit_dir = tmp_path / "installed"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+
+    result = _run_installer_section(
+        tmp_path, repo, unit_dir, env_extra={"DF_INSTALL_ORCH_UNITS": "1"}
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "SKIPPING" not in result.stdout, (
+        f"The override skipped a unit anyway.\n{result.stdout}"
+    )
+    assert "installing over the reported drift" in result.stdout, (
+        "The override installed over a reported finding SILENTLY. The escape "
+        "hatch must still say out loud that it acted against the gate — that "
+        f"line is the only record in the run's output.\n{result.stdout}"
+    )
+    missing = sorted(
+        name for name in checker.UNITS if not (unit_dir / name).is_file()
+    )
+    assert not missing, (
+        f"DF_INSTALL_ORCH_UNITS=1 did not install {missing}. The override is "
+        f"force-ALL; the per-unit gate narrows the default, not the escape "
+        f"hatch.\n{result.stdout}"
+    )
+    assert unverified in _enabled_units(tmp_path), (
+        f"{unverified} was force-installed but not enabled.\n"
+        f"{_systemctl_calls(tmp_path)}"
+    )
+
+
+def test_force_all_still_cannot_copy_a_source_that_does_not_exist(
+    tmp_path: pathlib.Path,
+):
+    """The override installs over a FINDING; it cannot conjure a missing file.
+
+    Measured before this guard existed: DF_INSTALL_ORCH_UNITS=1 with one
+    committed template deleted exits 1 at `cp: cannot stat ...`, and under
+    `set -euo pipefail` that aborts setup-host.sh outright — no daemon-reload,
+    no enables, and every LATER section of the host installer (jCodeMunch,
+    Claude config, ...) silently never runs. The operator asked to install over
+    a reported drift; they did not ask to halt the host setup.
+
+    The guard is deliberately PHYSICAL (does the source file exist) rather than
+    a fourth verdict arm, because it must also hold for a unit the gate never
+    reported on at all — `_orch_units` and the checker's registry are kept in
+    step by a test, but under the override a unit with no verdict is installed
+    on trust, and trust does not create a file.
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+    (repo / "scripts" / "orchestrator-know-live.service").unlink()
+
+    survivor = unit_dir / "orchestrator-watchdog.timer"
+    survivor.unlink()
+
+    result = _run_installer_section(
+        tmp_path, repo, unit_dir, env_extra={"DF_INSTALL_ORCH_UNITS": "1"}
+    )
+
+    assert result.returncode == 0, (
+        "DF_INSTALL_ORCH_UNITS=1 with a vanished committed unit ABORTED the "
+        "installer. Every section after this one was skipped.\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+    assert survivor.is_file(), (
+        "The vanished unit stopped its siblings from being installed even "
+        f"under the override.\n{result.stdout}"
+    )
+    assert "orchestrator-know-live.service" in _warnings_naming(
+        result.stdout, "orchestrator-know-live.service"
+    ), f"The unit with no source was skipped silently.\n{result.stdout}"
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root ignores the permission bits this test uses to make `cp` fail",
+)
+def test_a_unit_that_cannot_be_copied_does_not_abort_the_installer(
+    tmp_path: pathlib.Path,
+):
+    """An UNWRITABLE destination must skip that unit, never kill the run.
+
+    The sibling guard above covers a source that does not EXIST. This is the
+    other half, and the existence test cannot reach it: the checker raises
+    `unreadable` on ``(OSError, UnicodeDecodeError)``, and the OSError half is
+    precisely a file `cp` cannot touch. Reproduced here the way an operator
+    meets it — DF_INSTALL_ORCH_UNITS=1 over an installed unit at mode 000, i.e.
+    the override told the installer to write a file this user cannot open for
+    writing. `cp` exits 1 at "cannot create regular file: Permission denied",
+    and under `set -euo pipefail` a bare `cp` would abort setup-host.sh right
+    there: no daemon-reload, no enables, and every LATER section of the host
+    installer (jCodeMunch, Claude config, ...) silently never runs.
+
+    The unwritable unit is deliberately ordered BEFORE the survivor in
+    `_orch_units`, so a run that aborts on it cannot accidentally satisfy the
+    survivor assertion.
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+
+    unwritable = unit_dir / "orchestrator-know-live.service"
+    unwritable.chmod(0o000)
+
+    # Copied last by the array's order, and absent, so only a run that got past
+    # the failure can produce it.
+    survivor = unit_dir / "orchestrator-watchdog.timer"
+    survivor.unlink()
+
+    result = _run_installer_section(
+        tmp_path, repo, unit_dir, env_extra={"DF_INSTALL_ORCH_UNITS": "1"}
+    )
+    unwritable.chmod(0o644)
+
+    assert result.returncode == 0, (
+        "A unit that could not be copied ABORTED the installer. Every section "
+        f"after this one was skipped.\n{result.stdout}\n{result.stderr}"
+    )
+    assert survivor.is_file(), (
+        "The uncopyable unit stopped its siblings from being installed.\n"
+        + result.stdout
+    )
+    assert "orchestrator-watchdog.timer" in _enabled_units(tmp_path), (
+        "The run survived the failure but never reached the enable loop.\n"
+        f"{_systemctl_calls(tmp_path)}"
+    )
+    assert "FAILED" in _warnings_naming(
+        result.stdout, "orchestrator-know-live.service"
+    ), (
+        "The failed copy was not reported. A unit silently not installed is "
+        f"the state this whole section exists to make observable.\n{result.stdout}"
+    )
+    assert "orchestrator-know-live.service" not in _enabled_units(tmp_path), (
+        "A unit whose copy FAILED was enabled anyway — that acts on bytes "
+        f"nobody managed to write.\n{_systemctl_calls(tmp_path)}"
+    )
+
+
 def test_a_missing_checker_does_not_read_as_not_installed_here(
     tmp_path: pathlib.Path,
 ):
@@ -1277,6 +2325,178 @@ def test_a_usage_error_does_not_read_as_not_installed_here(
     assert (unit_dir / "orchestrator-watchdog.timer").read_text(
         encoding="utf-8"
     ) == before
+
+
+# A `_orch_skip_reason` case arm: `*,drift,*)`, or a `|`-alternated one like
+# `*,drift,override,*|*,drift,*,override,*)`. Alternation is included because
+# an arm the parse cannot see reads as a MISSING arm, and this guard's failure
+# would then name a kind that is in fact handled.
+_SKIP_ARM_RE = re.compile(r"^\s*(\*,[a-z,*|]+,\*)\)\s*$", re.M)
+# A literal kind named in the install-eligible condition: `[ "$_kinds" = clean ]`.
+_INSTALL_ELIGIBLE_RE = re.compile(r'\[\s*"\$_kinds"\s*=\s*([a-z]+)\s*\]')
+
+
+def _skip_arm_kinds(section: str) -> set[str]:
+    """Kinds named by `_orch_skip_reason`'s case arms."""
+    return {
+        kind
+        for arm in _SKIP_ARM_RE.findall(section)
+        for kind in re.findall(r"[a-z]+", arm)
+    }
+
+
+def _install_eligible_kinds(section: str) -> set[str]:
+    """Kinds the install condition accepts literally."""
+    return set(_INSTALL_ELIGIBLE_RE.findall(section))
+
+
+def _skip_reason(kinds: str, unit: str = "orchestrator-x.service") -> str:
+    """Run setup-host.sh's own `_orch_skip_reason` for *kinds*, under bash.
+
+    Extracted from the live script and EXECUTED rather than read, because the
+    defect class here is a case pattern that parses fine, reads plausibly and
+    never matches — invisible to any test that only greps for the arm.
+    """
+    section = _installer_section()
+    start = section.index("_orch_skip_reason() {")
+    end = section.index("\n}\n", start) + len("\n}\n")
+    result = subprocess.run(
+        ["bash", "-c", f'{section[start:end]}\n_orch_skip_reason "$1" "$2"', "_", kinds, unit],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"_orch_skip_reason({kinds!r}) failed: {result.stderr}"
+    return result.stdout
+
+
+def test_every_skip_reason_arm_fires_for_the_kinds_it_claims():
+    """Each arm is EXECUTED, because an arm that never matches is invisible.
+
+    Measured: the combined arm was written `*,drift,*,override,*)`, which can
+    never match `,drift,override,` — the comma the first `,drift,` consumes is
+    the same one `,override,` needs. It parsed, it read correctly, and it
+    silently lost every match to the drift-only arm below it.
+
+    The consequence is not cosmetic. A unit with BOTH byte-drift and a drop-in
+    would be reported as byte-drift alone; the operator reconciles the
+    directive, re-runs, and the unit is skipped AGAIN — for a drop-in nobody
+    ever told them about. A warning that names an incomplete remedy is worse
+    than one that names none, because it looks like progress.
+    """
+    checker = _load_checker()
+    blocking = [k for k in checker.VERDICT_KINDS if k not in {"clean", "absent"}]
+
+    for kind in [*blocking, "unverified"]:
+        message = _skip_reason(kind).strip()
+        assert message, f"{kind} produced an EMPTY reason"
+
+    # BOTH combinations the checker's control flow can produce. `drift` is
+    # marked only after both reads succeed, and `vanished`/`absent`/`clean`
+    # cannot combine at all, so these two are the whole space — and each is a
+    # separate chance to name half a remedy.
+    for kinds, first, second in (
+        ("drift,override", "drift", "drop-in"),
+        ("override,unreadable", "drop-in", "could not be read"),
+    ):
+        combined = _skip_reason(kinds)
+        assert first in combined and second in combined, (
+            f"A unit whose verdict is {kinds!r} is told about only one of its "
+            f"two findings: {combined!r}\nThe operator fixes what they were "
+            "told about, re-runs, and is skipped again for the other."
+        )
+
+    # Each single kind must still get ITS OWN message, not the combined one —
+    # a combined arm widened until it swallows the singles is the same defect
+    # with the sign flipped.
+    assert "drop-in" not in _skip_reason("drift"), _skip_reason("drift")
+    assert "byte-drift" not in _skip_reason("override"), _skip_reason("override")
+    assert "drop-in" not in _skip_reason("unreadable"), _skip_reason("unreadable")
+    assert "could not be read" not in _skip_reason("override"), _skip_reason(
+        "override"
+    )
+
+    unknown = _skip_reason("masked")
+    assert "masked" in unknown, (
+        "The `*)` fallback does not name the unhandled kind VERBATIM, so an "
+        f"operator cannot tell which kind went unhandled: {unknown!r}"
+    )
+    assert "setup-host.sh" in unknown, (
+        "The fallback does not name the file that has to change. It is the one "
+        f"message whose reader has no other clue where to look: {unknown!r}"
+    )
+
+
+def test_setup_host_handles_every_verdict_kind_the_checker_can_emit():
+    """CROSS-ARTIFACT: the checker's vocabulary and the shell's arms agree.
+
+    The two artifacts are coupled by a string protocol with no compiler between
+    them. A kind added to VERDICT_KINDS later — by someone reading only the
+    checker — reaches setup-host.sh's `*)` fallback, and the operator gets a
+    unit skipped for a cause the installer cannot name. That is the precise
+    shape of silent degradation these gates exist to prevent: the install still
+    "works", it just quietly stops doing something, and the one line that could
+    have explained it says nothing actionable.
+
+    Kinds are matched by PARSING the case arms and the install condition, not
+    by searching the region for the word. The region's comments name every kind
+    repeatedly, so a substring check would pass on documentation alone —
+    exactly the vacuous guard this is meant not to be.
+    """
+    checker = _load_checker()
+    section = _installer_section()
+
+    # Guard the guard: every assertion below is over a derived set, and an
+    # empty derivation would pass while checking nothing.
+    assert section.strip(), "The installer section sliced EMPTY."
+    assert "_orch_skip_reason" in section, (
+        "The sliced region does not contain _orch_skip_reason — the slice "
+        "anchors have drifted off the block this test is about."
+    )
+    assert checker.VERDICT_KINDS, "VERDICT_KINDS is empty"
+
+    arms = _skip_arm_kinds(section)
+    eligible = _install_eligible_kinds(section)
+    assert arms, (
+        "Parsed ZERO case arms out of _orch_skip_reason. Fix the arm regex — "
+        "do NOT weaken this test; a zero-arm parse makes every assertion below "
+        "vacuously true."
+    )
+    assert eligible, (
+        "Parsed ZERO kinds out of the install-eligible condition. Fix the "
+        "regex rather than dropping the assertion."
+    )
+
+    unhandled = sorted(set(checker.VERDICT_KINDS) - arms - eligible)
+    assert not unhandled, (
+        f"check_orchestrator_unit_parity.VERDICT_KINDS can emit {unhandled}, "
+        "which setup-host.sh neither treats as install-eligible nor phrases in "
+        "_orch_skip_reason. Add a case arm (or name it in the install "
+        "condition) — otherwise a unit is skipped with a warning that names no "
+        "actionable cause."
+    )
+
+    # The shell-only kind: no verdict line at all. It never appears in
+    # VERDICT_KINDS (the checker cannot emit "I said nothing"), so it would be
+    # invisible to the loop above — and it is the single most likely kind an
+    # operator actually meets, since it is what a missing or older checker
+    # produces for every unit at once.
+    assert "unverified" in arms, (
+        "setup-host.sh's `unverified` default — a unit with NO verdict line — "
+        "has no _orch_skip_reason arm, so the most common real-world skip "
+        "would fall through to the unhandled-kind fallback."
+    )
+
+    assert "clean" in eligible and "absent" in eligible, (
+        "The two install-eligible kinds are no longer named literally in the "
+        f"install condition (found {sorted(eligible)}), so this guard can no "
+        "longer tell an install-eligible kind from an unhandled one."
+    )
+
+    assert re.search(r"^\s*\*\)\s*$", section, re.M), (
+        "_orch_skip_reason has no `*)` fallback arm. Under a future kind the "
+        "case would fall through and print nothing at all, leaving the warning "
+        "reading 'SKIPPING <unit> — ; its installed copy is UNCHANGED'."
+    )
 
 
 def test_setup_host_parses_cleanly():

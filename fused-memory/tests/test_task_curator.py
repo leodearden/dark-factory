@@ -18,6 +18,7 @@ from shared.prompt_artifact import (
     PromptSpec,
     compose_prompt,
 )
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import TaskmasterError, TaskNotFoundError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
@@ -42,6 +43,7 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     _trim_pool,
     flatten_task_tree,
+    is_combine_eligible_status,
     normalize_title,
 )
 
@@ -88,7 +90,13 @@ class TestTaskDependencies:
 
 
 class TestToPoolEntry:
-    def test_pending_is_combine_eligible(self):
+    def test_maps_task_fields(self):
+        """Field mapping only — combine_eligible is covered by the class below.
+
+        (The per-status eligibility assertions that used to live here are
+        subsumed by ``TestCombineEligibilityNoDivergence``, which parametrizes
+        the same call over the full status vocabulary.)
+        """
         task = {
             'id': '42',
             'title': 'Fix parser',
@@ -101,15 +109,8 @@ class TestToPoolEntry:
         entry = _to_pool_entry(task, source='module', lock_depth=2)
         assert entry is not None
         assert entry.task_id == '42'
-        assert entry.combine_eligible is True
         assert entry.source == 'module'
         assert entry.module_keys == ['src/parser.py']
-
-    def test_done_is_not_combine_eligible(self):
-        task = {'id': '1', 'title': 'x', 'status': 'done'}
-        entry = _to_pool_entry(task, source='module', lock_depth=2)
-        assert entry is not None
-        assert entry.combine_eligible is False
 
     def test_missing_id_returns_none(self):
         entry = _to_pool_entry({'title': 'x'}, source='module', lock_depth=2)
@@ -117,6 +118,79 @@ class TestToPoolEntry:
 
     def test_none_returns_none(self):
         assert _to_pool_entry(None, source='module', lock_depth=2) is None
+
+
+class TestIsCombineEligibleStatus:
+    """The ONE shared combine STATUS predicate (task 4035).
+
+    Selection (``_to_pool_entry.combine_eligible``) and execution
+    (``task_interceptor._execute_combine``) previously hand-copied
+    ``status == 'pending'`` and silently diverged, letting combines land on
+    non-pending targets mid-planning. These tests pin the single definition;
+    the SELECTION call site is pinned to it by
+    ``TestCombineEligibilityNoDivergence`` below, and the EXECUTION call site
+    by ``test_curator_combine_execution_matches_shared_predicate`` in
+    ``test_task_interceptor.py``.
+    """
+
+    @pytest.mark.parametrize('status', list(TaskStatus))
+    def test_pending_only_over_full_vocabulary(self, status: TaskStatus):
+        expected = status is TaskStatus.PENDING
+        assert is_combine_eligible_status(status.value) is expected
+
+    def test_in_progress_is_not_eligible(self):
+        """THE BUG, kept as a named regression case though the sweep above covers it.
+
+        An in-progress target sailed through the old execution guard; naming
+        the incident status explicitly is what makes a future deletion of this
+        behaviour read as deliberate rather than as parametrize-list churn.
+        """
+        assert is_combine_eligible_status('in-progress') is False
+
+    @pytest.mark.parametrize(
+        'status',
+        [
+            'unknown',
+            '',
+            'PENDING',  # wrong case is not the canonical spelling
+            'Pending',
+            ' pending ',
+            'pending-review',
+        ],
+    )
+    def test_unrecognised_status_fails_closed(self, status: str):
+        assert is_combine_eligible_status(status) is False
+
+
+class TestCombineEligibilityNoDivergence:
+    """INV-5 anti-divergence pin for the SELECTION site only.
+
+    Scope is deliberately narrow: these assertions drive
+    ``_to_pool_entry`` and say nothing about the interceptor. Because
+    ``_to_pool_entry`` calls ``is_combine_eligible_status`` directly, they
+    fail only if that call is deleted or re-forked into a second literal —
+    which is exactly the selection-side half of the 20.2% race.
+
+    The EXECUTION site (``task_interceptor._execute_combine``, the half that
+    actually diverged and caused the incident) cannot be covered from here;
+    it is pinned by ``test_curator_combine_execution_matches_shared_predicate``
+    in ``test_task_interceptor.py``, which drives the real combine path over
+    the same full vocabulary.
+    """
+
+    @pytest.mark.parametrize('status', list(TaskStatus))
+    def test_pool_entry_agrees_with_shared_predicate(self, status: TaskStatus):
+        task = {'id': '42', 'title': 'Fix parser', 'status': status.value}
+        entry = _to_pool_entry(task, source='module', lock_depth=2)
+        assert entry is not None
+        assert entry.combine_eligible is is_combine_eligible_status(status.value)
+
+    def test_pool_entry_agrees_on_unknown_status(self):
+        """A task dict with no status reads as 'unknown' — both sides refuse it."""
+        entry = _to_pool_entry({'id': '42', 'title': 'x'}, source='module', lock_depth=2)
+        assert entry is not None
+        assert entry.combine_eligible is is_combine_eligible_status('unknown')
+        assert entry.combine_eligible is False
 
 
 class TestFlattenTaskTree:
@@ -343,7 +417,7 @@ def _pool_with_ids(*pairs: tuple[str, str]) -> list[_PoolEntry]:
             status=status,
             priority='medium',
             source='module',
-            combine_eligible=(status == 'pending'),
+            combine_eligible=is_combine_eligible_status(status),
         )
         for tid, status in pairs
     ]
@@ -6166,6 +6240,65 @@ class TestCuratorPromptLoaderWiringSingle:
         assert mock.await_args is not None
         assert mock.await_args.kwargs['system_prompt'] == compose_prompt(
             CURATOR_SINGLE_SPEC.contract, heuristics,
+        )
+
+
+class TestCuratorPromptResolveFailSafe:
+    """``_resolve_curator_prompt``'s docstring leans on "PromptArtifactStore.
+    resolve never raises ... so the curator's best-effort contract is
+    preserved", and it runs on every live reconciliation cycle. Pin that
+    dependency at the consumer boundary so a future refactor reintroducing the
+    raise fails where it actually hurts.
+    """
+
+    def test_resolve_curator_prompt_degrades_when_provenance_sidecar_becomes_unreadable(
+        self, tmp_path
+    ):
+        """A *good* pin must degrade to the in-code baseline, not raise.
+
+        Deliberately starts from a working pin and asserts the curator serves
+        the composed pinned text, so breaking the sidecar afterwards proves a
+        degradation. Asserting only the post-break state would hold just as
+        well for a key that was never pinned at all, which is a weaker claim
+        than the docstring this test exists to pin.
+
+        Synchronous — the guard under test is reached before any LLM call, so
+        no ``invoke_with_cap_retry`` patch and no event loop are needed.
+        """
+        config = _make_config()
+        store = PromptArtifactStore(tmp_path)
+        curator = TaskCurator(config=config, taskmaster=None, prompt_store=store)
+
+        heuristics = 'PINNED: prefer combining aggressively when in doubt.'
+        provenance = ArtifactProvenance(
+            **_prompt_artifact_provenance_kwargs(harness_version=_CURATOR_PROMPT_HARNESS_VERSION)
+        )
+        store.pin(
+            CURATOR_SINGLE_SPEC.prompt_id,
+            config.curator.model,
+            _CURATOR_PROMPT_HARNESS_VERSION,
+            heuristics=heuristics,
+            provenance=provenance,
+        )
+
+        # Premise: the curator genuinely serves this pin before the break.
+        assert curator._resolve_curator_prompt(CURATOR_SINGLE_SPEC) == compose_prompt(
+            CURATOR_SINGLE_SPEC.contract, heuristics,
+        )
+
+        # Now make the sidecar unreadable in place — directory-in-place-of-file,
+        # the uid-independent trigger (chmod 0o000 is a no-op under root).
+        provenance_path = store._key_dir(
+            CURATOR_SINGLE_SPEC.prompt_id,
+            config.curator.model,
+            _CURATOR_PROMPT_HARNESS_VERSION,
+        ) / 'provenance.json'
+        provenance_path.unlink()
+        provenance_path.mkdir()
+
+        assert (
+            curator._resolve_curator_prompt(CURATOR_SINGLE_SPEC)
+            == CURATOR_SINGLE_SPEC.in_code_constant
         )
 
 

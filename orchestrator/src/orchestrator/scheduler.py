@@ -7,16 +7,16 @@ import hashlib
 import json
 import logging
 import math
-import os
 import re
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
+from shared import safe_io
 from shared.locking import (
     files_to_modules,
     modules_conflict,
@@ -40,10 +40,24 @@ from orchestrator.config import (
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
+from orchestrator.hold_history import HoldHistory
 from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.recovery_emission import (
+    LeaveReason,
+    RecoverySite,
+    RecoveryVetoStreakTracker,
+    as_ageable_records,
+    build_recovery_payload,
+    emit_recovery_event,
+    escalation_ages_secs,
+    pin_buckets,
+    render_shape,
+    should_emit_event,
+    veto_signature,
+)
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
@@ -86,6 +100,40 @@ _DELIVERED_CHECK_ERROR_LOG_THRESHOLD: int = 20
 # a wedged/crash-looping fm. Module-level (not config-schema) so it can be
 # tuned here without a schema migration.
 _FM_READ_FAILURE_ESCALATION_THRESHOLD: int = 12
+
+# EASY-backfill (task 3823 / PRD C7) live-grant map ceiling.  A LEAK
+# BACKSTOP, not a policy limit: one entry per back-filled dispatch that has
+# not yet released, and max_concurrent_tasks keeps the real population orders
+# of magnitude below this.  It exists because a grant whose owner never
+# releases in this process era (crash, lost release) would otherwise pin an
+# entry forever.  Same discipline as the predictor's bounded live-open map.
+_BACKFILL_GRANTS_MAX: int = 512
+
+# EASY-backfill overstay-rate escalation (task 3823 / PRD C7, INV-4).  The
+# model measured a 7-9% overstay rate at safety x2.5
+# (plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:254-255),
+# so a SUSTAINED rate ~3x that means the predictor has drifted or the factor
+# is wrong — a finding, not an incident.  A rate, not a per-breach alarm:
+# individual overstays are the model working as designed, and one event each
+# is exactly the storm INV-4 forbids.
+_BACKFILL_OVERSTAY_RATE_THRESHOLD: float = 0.25
+# Denominator floor — the minimum WINDOW FILL below which no rate is claimed.
+# A 1-of-1 breach is noise, not a rate; 8 is reachable within days at the
+# modelled 23-122 grants/30d.
+_BACKFILL_OVERSTAY_MIN_GRANTS: int = 8
+# The rate is measured over a bounded window of the most recent SETTLEMENTS,
+# not over lifetime totals.  A lifetime ratio never decays: after an operator
+# raises backfill_safety_factor and resolves the L1, a lifetime rate stays
+# above the threshold for roughly 3x more clean grants than the breaches it
+# accumulated, so the next single overstay re-files an L1 blaming a mis-tune
+# the retune already fixed — repeat churn on a signal the operator cannot
+# clear.  A window also lets the escalation mean "currently mis-tuned" rather
+# than "was mis-tuned at some point in this process era".  64 is ~8x the floor,
+# so the floor still gates a genuinely partial sample and a settled era is
+# fully flushed within one window.
+_BACKFILL_OUTCOME_WINDOW: int = 64
+# Dedup key, mirroring _FM_READ_STORM_SENTINEL: one open L1 per episode.
+_BACKFILL_OVERSTAY_SENTINEL: str = '__backfill_overstay_rate__'
 
 # Sentinel distinguishing "caller omitted this claimant kwarg" (default,
 # leave the wire argument absent) from "caller explicitly passed None"
@@ -779,6 +827,57 @@ class TickOutcome:
     assignment: TaskAssignment | None
 
 
+@dataclass(frozen=True)
+class _BackfillGrant:
+    """The facts behind one EASY-backfill admission (task 3823 / PRD C7).
+
+    Carries the PREDICTION and the BOUND it was compared against, not just the
+    verdict.  Settlement at release re-reads both to decide whether a hold
+    overstayed, and the ``park_backfill_granted`` /``park_backfill_overstay``
+    payloads are built straight from these fields — so nobody has to
+    reconstruct the arithmetic from log lines to answer "why was this
+    admitted, and did it hold up?" (INV-2).
+
+    ``granted_at`` is wall POSIX seconds stamped at DISPATCH, not at
+    admission: :meth:`Scheduler._backfill_admission` is a pure decision that
+    ``try_acquire`` may still refuse (INV-3), and a grant that never became a
+    dispatch must not contribute a realized duration.  It is therefore ``0.0``
+    on a freshly-decided grant and filled in by ``_record_backfill_grant``.
+    """
+
+    task_id: str
+    modules: tuple[str, ...]
+    park_owners: tuple[str, ...]
+    predicted_hold: float
+    safety_factor: float
+    admission_bound: float
+    provable_assembly_delay: float
+    granted_at: float = 0.0
+
+
+@dataclass
+class _BackfillScanCache:
+    """Per-scan memo for backfill admission's READ-ONLY inputs (task 3823).
+
+    ``_backfill_admission`` runs for every scored candidate whose first
+    ``try_acquire`` fails, on every tick, and ``_provable_assembly_delay``
+    rebuilds the whole park map and re-medians every blocking holder's
+    remaining time each time it is called.  Nothing it reads is mutated inside
+    the candidate loop — ``clear_parks_for`` and ``_bump_skip_and_maybe_park``
+    are on the dispatch path, which returns immediately, or run after the loop
+    — so every candidate re-derives an identical answer.
+
+    Scoped to ONE scan and nulled in a ``finally``, not kept on the Scheduler:
+    park and hold state genuinely does move between ticks, and a memo that
+    outlived its scan would hand a later tick a stale gap.  Existence of the
+    cache is what enables memoization at all, so a call made outside a scan
+    (a direct unit-test call, a future caller) is computed exactly.
+    """
+
+    parks: dict[str, dict] | None = None
+    delays: dict[str, float] = field(default_factory=dict)
+
+
 def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
     """Return *ts* if provided, else the stdlib ``time.monotonic`` callable.
 
@@ -819,6 +918,7 @@ class ModuleLockTable:
         config: OrchestratorConfig,
         *,
         time_source: Callable[[], float] | None = None,
+        wall_time_source: Callable[[], datetime] | None = None,
     ):
         self._limits: dict[str, int] = {}
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
@@ -833,6 +933,15 @@ class ModuleLockTable:
         self._park_install_at: dict[str, str] = {}
         self._config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
+        # WALL clock for park install stamps (task 3823 / PRD task η).  Distinct
+        # from _time_source (monotonic, no epoch relation): _park_install_at
+        # holds ISO-8601 strings that must be comparable with the Scheduler's
+        # own _wall_now() when park_age_secs() computes an age, and with the
+        # timestamps in the event log.  Resolved through the shared helper so
+        # there is exactly one None-fallback rule for wall clocks.
+        self._wall_time_source: Callable[[], datetime] = _resolve_wall_time_source(
+            wall_time_source
+        )
 
     # --- Hierarchy helpers ---
 
@@ -857,9 +966,29 @@ class ModuleLockTable:
 
     # --- Park (reservation) helpers ---
 
-    def _is_parked_blocks(self, module: str, task_id: str) -> bool:
-        """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*
-        and is owned by a different task that task_id cannot preempt (INV-2).
+    def _iter_blocking_park_owners(
+        self,
+        module: str,
+        task_id: str,
+        *,
+        ignore_owners: frozenset[str] = frozenset(),
+    ) -> Iterator[str]:
+        """EVERY owner of an ACTIVE park that blocks *task_id* on *module*.
+
+        THE single rank-aware park-blocking rule.  ``_blocking_park_owner`` is
+        the first-match view over it, ``_is_parked_blocks`` the bool view, and
+        ``park_owners_blocking`` the naming view — one rule, three views
+        (INV-5).  Forking the rank logic is what would let admission believe it
+        can borrow through a park that ``try_acquire`` then refuses: churn with
+        no dispatch.
+
+        A GENERATOR on purpose, so the first-match view stays short-circuiting
+        (``next()`` stops the scan at the first yield, exactly as the old
+        early-``return`` did) while the naming view can drain it.  More than
+        one owner can block a single requested module — two owners parked on
+        different children of the same requested parent both conflict with it —
+        and admission needs ALL of them, because ``try_acquire`` re-checks
+        every park and admits only the owners it was handed.
 
         A buried (shadowed) reservation never blocks — only the active top of
         each stack is consulted.
@@ -873,6 +1002,11 @@ class ModuleLockTable:
         preemptor acquire its own module even when hierarchical victim parks
         are kept under their original keys (their active tops are no longer
         moved to the preemptor's key by a re-key step).
+
+        *ignore_owners* (task 3823 / PRD C7) names park owners whose parks are
+        treated as absent for this request — the EASY-backfill admission
+        bypass.  It is scoped to the park rule alone and has no bearing on the
+        held-lock limit gate.
         """
         # Step 1: compute task_id's own dominant rank among conflicting active tops.
         own_dominant_rank: int | None = None
@@ -890,7 +1024,7 @@ class ModuleLockTable:
             if not stack:
                 continue
             owner, rank = stack[-1]  # active TOP only (INV-2)
-            if owner == task_id:
+            if owner == task_id or owner in ignore_owners:
                 continue
             if not self._conflicts(parked_module, module):
                 continue
@@ -899,8 +1033,108 @@ class ModuleLockTable:
             if own_dominant_rank is not None and own_dominant_rank < rank:
                 # task_id preempts this foreign top — not blocked by it.
                 continue
-            return True
-        return False
+            yield owner
+
+    def _blocking_park_owner(
+        self,
+        module: str,
+        task_id: str,
+        *,
+        ignore_owners: frozenset[str] = frozenset(),
+    ) -> str | None:
+        """The FIRST active park owner blocking *task_id* on *module*, or None.
+
+        The first-match view of :meth:`_iter_blocking_park_owners`.  Enough for
+        the gate (``_is_parked_blocks`` only needs to know THAT something
+        blocks) and it stops scanning at the first hit, which is why the hot
+        ``try_acquire`` path keeps its original cost.  Callers that must reason
+        about every blocking owner — admission — drain the generator instead.
+        """
+        return next(
+            self._iter_blocking_park_owners(
+                module, task_id, ignore_owners=ignore_owners
+            ),
+            None,
+        )
+
+    def park_owners_blocking(self, task_id: str, modules: list[str]) -> list[str]:
+        """Distinct active-top park owners that would make ``try_acquire`` refuse.
+
+        Sorted for determinism.  Normalizes *modules* exactly as
+        ``try_acquire`` does, so the answer is about the same keys the gate
+        will actually test.
+
+        This is C7's ``c.modules ∩ M ≠ ∅`` clause: the hierarchical
+        ``_conflicts`` rule already IS the intersection test, so an empty list
+        means there is nothing to backfill through and admission must refuse.
+
+        UNIONS every blocking owner per module, not the first one found: two
+        owners parked on different children of one requested parent both
+        conflict with it, and a set missing the second would be handed to
+        ``try_acquire`` as ``admitted_parks`` — which re-checks every park and
+        would refuse on the owner nobody named.  That failure mode is silent
+        (admission pays for the full prediction pipeline every tick and the
+        acquire always fails), so it has to be excluded here rather than
+        detected downstream.
+
+        A READ — it mutates nothing and evicts nothing.
+        """
+        depth = self._config.lock_depth
+        normalized = {normalize_lock(m, depth) for m in modules}
+        owners: set[str] = set()
+        for module in normalized:
+            owners.update(self._iter_blocking_park_owners(module, task_id))
+        return sorted(owners)
+
+    def blocking_holders(
+        self, modules: list[str], *, exclude_task: str
+    ) -> dict[str, list[str]]:
+        """``{requested_module: [foreign holders]}`` for modules at/over their limit.
+
+        Only modules that are ACTUALLY blocked appear; everything free is
+        omitted, so an empty mapping means the requester could take all of
+        *modules* right now.  Keys are the requested modules in normalized
+        form (not the holders' own keys), because the caller asked about those.
+
+        Honours ``_limit_for`` rather than mere presence: a module with
+        headroom (``max_per_module`` > current holders) is free to take, so it
+        contributes no wait.  Built from the existing ``_conflicts`` /
+        ``_count_conflicts`` / ``_limit_for`` trio — no third conflict rule.
+        """
+        depth = self._config.lock_depth
+        result: dict[str, list[str]] = {}
+        for module in {normalize_lock(m, depth) for m in modules}:
+            if self._count_conflicts(module, exclude_task=exclude_task) < self._limit_for(module):
+                continue
+            holders = sorted(
+                task_id
+                for task_id, held in self._held.items()
+                if task_id != exclude_task
+                and any(self._conflicts(h, module) for h in held)
+            )
+            if holders:
+                result[module] = holders
+        return result
+
+    def _is_parked_blocks(
+        self,
+        module: str,
+        task_id: str,
+        *,
+        ignore_owners: frozenset[str] = frozenset(),
+    ) -> bool:
+        """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*
+        and is owned by a different task that task_id cannot preempt (INV-2).
+
+        The bool view of :meth:`_blocking_park_owner`, which carries the rank
+        logic.  Kept as a delegate rather than inlined so ``try_acquire`` /
+        ``try_acquire_additional`` and every existing test keep their call
+        shape, and so the naming view (``park_owners_blocking``) and this
+        gating view can never disagree (INV-5).
+        """
+        return self._blocking_park_owner(
+            module, task_id, ignore_owners=ignore_owners
+        ) is not None
 
     def has_parks(self, task_id: str) -> bool:
         """Return True if *task_id* owns any reservation at ANY stack level (INV-5).
@@ -994,7 +1228,13 @@ class ModuleLockTable:
             for owner in shadow_order
         ]
         if installed:
-            self._park_install_at.setdefault(task_id, datetime.now(UTC).isoformat())
+            # ``setdefault``, not assignment: C7's ``park_age(p)`` is the owner's
+            # TOTAL wait, so a re-install must not reset the clock — a refreshed
+            # stamp would make an indefinitely-starving park read as permanently
+            # fresh and keep admitting backfillers through it.
+            self._park_install_at.setdefault(
+                task_id, self._wall_time_source().isoformat()
+            )
         return installed, shadowed
 
     def _remove_owner(self, task_id: str) -> list[tuple[str, list[str]]]:
@@ -1149,6 +1389,56 @@ class ModuleLockTable:
 
     # --- Snapshot helpers (public accessors for observability) ---
 
+    def park_age_secs(self, owner: str, *, now: datetime) -> float | None:
+        """Seconds since *owner* FIRST installed a park, or ``None`` if unknown.
+
+        **``None`` means "age unknown ⇒ the caller must REFUSE".**  This is
+        deliberately the OPPOSITE of the dashboard's ``_park_age_seconds``
+        (dashboard/src/dashboard/data/scheduler.py), which fails soft to ``0``
+        because it is rendering a number for a human and a wrong zero there is
+        a harmless display artefact.  Here the age GATES AN ADMISSION (task
+        3823 / PRD C7 refuses backfill through a park older than
+        ``backfill_max_park_age_secs``), so a soft zero would make an
+        unreadable park look brand new and ADMIT a backfiller through it —
+        fail-soft in the unsafe direction.  The two contracts must disagree;
+        do not "fix" the divergence by consolidating them.
+
+        Reads ``_park_install_at``, which is written once per owner via
+        ``setdefault`` — so this is the owner's TOTAL wait, which is what C7's
+        ``park_age(p)`` means, not the time since its most recent re-park.
+
+        A stamp in the FUTURE clamps to ``0.0`` rather than going negative:
+        a negative age would sail under every ``age > cutoff`` test, so an NTP
+        step backwards would silently re-open admission through arbitrarily
+        old parks.
+
+        This is a READ.  It never evicts a park — task 1228 removed park
+        leases deliberately and nothing here reintroduces wall-clock park
+        death.
+        """
+        raw = self._park_install_at.get(owner)
+        if not raw:
+            return None
+        try:
+            installed_at = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+        except (ValueError, TypeError):
+            logger.warning(
+                'park_age_secs: unparseable install stamp %r for park owner %s — '
+                'returning None (age unknown; callers must refuse)',
+                raw, owner,
+            )
+            return None
+        try:
+            return max(0.0, (now - installed_at).total_seconds())
+        except TypeError:
+            # Naive/aware mismatch — same "unknown, refuse" answer as a bad parse.
+            logger.warning(
+                'park_age_secs: cannot compare install stamp %r for park owner %s '
+                'against now=%r — returning None (age unknown)',
+                raw, owner, now,
+            )
+            return None
+
     def snapshot_parks(self) -> dict[str, dict]:
         """Return a snapshot of current parks: ``{task_id: {modules, installed_at}}``.
 
@@ -1245,7 +1535,13 @@ class ModuleLockTable:
         """Return True if task_id currently holds any module locks."""
         return task_id in self._held
 
-    def try_acquire(self, task_id: str, modules: list[str]) -> bool:
+    def try_acquire(
+        self,
+        task_id: str,
+        modules: list[str],
+        *,
+        admitted_parks: frozenset[str] = frozenset(),
+    ) -> bool:
         """Non-blocking attempt to acquire all module locks.
 
         Uses hierarchical conflict detection: a lock on ``A/B`` conflicts with
@@ -1254,6 +1550,25 @@ class ModuleLockTable:
         owned by a different task (see ``install_parks``).
 
         Returns True if all acquired, False if any unavailable.
+
+        *admitted_parks* (task 3823 / PRD task η, C7) names park owners whose
+        reservations this request has been ADMITTED THROUGH by EASY-backfill:
+        their parks are ignored by the park gate below, and by nothing else.
+
+        **The held-lock gate is deliberately untouched, and this is the whole
+        safety property of C7 (INV-3).**  The limit check below is evaluated on
+        LIVE state at call time, inside this method, on every call — admitted
+        or not.  Admission never pre-computes a "c's modules are otherwise
+        free" set and then acquires on that basis, because a stale scoring-time
+        snapshot used as the ACTING basis is precisely the failure class INV-3
+        exists to prevent.  So an admitted candidate whose modules turn out to
+        be genuinely contended simply fails here and does not dispatch; the
+        bypass can only ever waive a PARK, never a real holder.
+
+        Admission also does not disturb the parks it borrows through: nothing
+        here removes, shadows or re-ranks them.  Backfill borrows a gap the
+        owner was going to wait anyway — PRD §7 rejects preemption of a held
+        lock, and this is the mirror-image discipline for parks.
         """
         depth = self._config.lock_depth
         normalized = list({normalize_lock(m, depth) for m in modules})
@@ -1261,9 +1576,10 @@ class ModuleLockTable:
         # Check every requested module against all other tasks' held locks and
         # active reservations owned by other tasks.
         for module in normalized:
+            # INV-3: live held-lock state, never bypassed by admitted_parks.
             if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
                 return False
-            if self._is_parked_blocks(module, task_id):
+            if self._is_parked_blocks(module, task_id, ignore_owners=admitted_parks):
                 return False
 
         self._held[task_id] = set(normalized)
@@ -1442,8 +1758,75 @@ class Scheduler:
         self._park_stop_clock: Callable[[], float] = (
             monotonic_clock_source if monotonic_clock_source is not None else time.monotonic
         )
-        self.lock_table = ModuleLockTable(config, time_source=self._time_source)
+        # Both clocks are passed down (task 3823 / PRD task η): the monotonic
+        # _time_source as before, and the injectable WALL clock so park install
+        # stamps share one epoch with _emit_lock_event's timestamps and with
+        # the ISO strings in the event log.  Without it, park_age_secs() would
+        # be measuring `Scheduler._wall_now() - <some other clock>`.
+        self.lock_table = ModuleLockTable(
+            config,
+            time_source=self._time_source,
+            wall_time_source=self._wall_now,
+        )
         self.event_store = event_store
+        # Module hold-duration predictor (task 3822 / PRD task ζ).  Built
+        # unconditionally, BEFORE any event store exists: the Harness
+        # constructs the Scheduler with event_store=None and attribute-injects
+        # the store later (harness.py:1498-1514 -> :2121-2122), so the live
+        # feed needs somewhere to go from the first tick.  The durable seed
+        # happens in finish_startup(), by which time the store is attached.
+        #
+        # The sample floor is read from config HERE AND NOWHERE ELSE (task 3823
+        # / PRD task η).  hold_history.py deliberately stands alone without the
+        # config object and so carries only a module default (:591-593), which
+        # makes this construction site the single seam where the
+        # ``backfill_min_samples`` leaf becomes live — hard-coding it would
+        # leave an operator's edit silently inert.
+        #
+        # It is passed as a PROVIDER, not a value, because the leaf is declared
+        # green-tier (config.py:5045): ``apply_reload`` writes the new floor
+        # into this same config object in place, and a value captured here
+        # would be frozen for the process era — reload_config would report the
+        # leaf applied while the predictor kept certifying from the old floor.
+        # A pull (resolved inside each ``predicted_hold``) matches the house
+        # contract every other reloadable consumer honours — ``_backfill_admission``
+        # reads ``self.config.X`` at call time — so no reload hook has to exist;
+        # a push would have to be re-issued at every entry point and
+        # ``HoldHistory.predicted_remaining`` calls ``predicted_hold``
+        # INTERNALLY, so a push discipline would silently miss that path.  The
+        # lambda closes over ``self``, not ``self.config``, so a wholesale
+        # config replacement is picked up too, not merely an in-place leaf write.
+        #
+        # ``window`` and ``stale_open_secs`` stay at their module defaults on
+        # purpose: C7 names only the sample floor, and adding unrequested knobs
+        # widens the config surface for no contract.
+        self._hold_history = HoldHistory(
+            min_samples=lambda: self.config.backfill_min_samples
+        )
+        # EASY-backfill grant bookkeeping (task 3823 / PRD C7).  One entry per
+        # live back-filled dispatch, popped at release when the realized hold
+        # is judged against the bound admission promised.
+        self._backfill_grants: dict[str, _BackfillGrant] = {}
+        # The overstay RATE is measured over a bounded window of the most
+        # recent SETTLEMENTS — one bool appended per settled grant, True on a
+        # breach.  Deliberately not lifetime totals: see
+        # _BACKFILL_OUTCOME_WINDOW for why a never-decaying ratio re-files an
+        # L1 the operator has already acted on.
+        #
+        # Settlements, not grants, are the denominator: only a settled grant
+        # has a realized hold to judge, so a live one contributes nothing in
+        # either direction (a grants denominator would count it while it could
+        # not yet contribute a breach, understating the rate), and a grant
+        # evicted by the _BACKFILL_GRANTS_MAX backstop — which can never settle
+        # — is simply never sampled instead of sitting in a denominator forever.
+        self._backfill_outcomes: deque[bool] = deque(maxlen=_BACKFILL_OUTCOME_WINDOW)
+        # The factor the current window was accumulated under.  A retune is a
+        # new policy era, so the sample from the old one is discarded rather
+        # than left to keep the rate above threshold after the fix.
+        self._backfill_outcomes_factor = float(config.backfill_safety_factor)
+        # Set for the duration of ONE scored dispatch scan and nulled after —
+        # None means "not in a scan, compute exactly".  See _BackfillScanCache.
+        self._backfill_scan_cache: _BackfillScanCache | None = None
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
         # Task 2408 mechanism 2: attribute-injected by the Harness right
@@ -1455,6 +1838,18 @@ class Scheduler:
         # blocked-redispatch sweep (_phase_redispatch_stranded_blocked) can
         # never verify "no open escalation" without it, so it never flips.
         self.escalation_queue: EscalationQueue | None = None
+        # --- Structured recovery-disposition emission (task 3535) ---
+        # Emission CADENCE state for _phase_redispatch_stranded_blocked's veto
+        # sites.  This phase runs per dispatch TICK, so an unconditional emit
+        # would append one event row per tick per pinned task indefinitely;
+        # the tracker gates on the veto SIGNATURE changing instead.  Both are
+        # also read getattr-tolerantly at their use sites, since bare-Scheduler
+        # unit tests build minimal instances (the same accommodation
+        # escalation_queue-is-None carries above).
+        self._recovery_veto_tracker = RecoveryVetoStreakTracker()
+        #: One-shot latch for the PROCESS-scoped queue-absent notice; re-armed
+        #: by the phase whenever the queue is present.
+        self._recovery_queue_absent_emitted = False
         # --- Workflow-cancel grace stamp (task 2235, relocated from Harness) ---
         # Written by cancel_workflow/hard_cancel_workflow so a mid-run
         # reconcile sweep does not race a workflow's finally-block teardown
@@ -2029,6 +2424,19 @@ class Scheduler:
         A non-JSON or non-dict-shaped value collapses to ``{}`` — every
         consumer reads dict-keyed sub-fields, so a non-dict carries no
         information they can use.
+
+        The collapse is LOUD: a discarded value emits a WARNING naming the task
+        id, the discarded type and a truncated repr.  It warns rather than
+        raises because this runs per task inside the scheduler's task-list
+        normalisation, so one malformed task must not take down a whole tick.
+        Silence, not the coercion, was the hazard: the dispatch-time cross-repo
+        gate (``cross_repo_gate.classify_cross_repo``) depends on this signal to
+        distinguish "no markers" from "markers unreadable" — without it a task
+        whose metadata arrived as an unparseable string is waved through
+        looking marker-free, with no trace that anything was dropped.
+
+        Absent / ``None`` metadata is the NORMAL shape (most tasks carry none)
+        and stays silent — warning there would be pure noise, every tick.
         """
         raw = task.get('metadata')
         if isinstance(raw, dict):
@@ -2038,8 +2446,24 @@ class Scheduler:
                 parsed = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
                 parsed = None
-            task['metadata'] = parsed if isinstance(parsed, dict) else {}
+            if not isinstance(parsed, dict):
+                logger.warning(
+                    'Task %s metadata discarded: str did not decode to a dict '
+                    '(type=str, repr=%.200r) — collapsing to {}; any markers it '
+                    'carried are NOT visible to downstream gates',
+                    task.get('id'), raw,
+                )
+                task['metadata'] = {}
+                return
+            task['metadata'] = parsed
             return
+        if raw is not None:
+            logger.warning(
+                'Task %s metadata discarded: not a dict or JSON string '
+                '(type=%s, repr=%.200r) — collapsing to {}; any markers it '
+                'carried are NOT visible to downstream gates',
+                task.get('id'), type(raw).__name__, raw,
+            )
         task['metadata'] = {}
 
     @staticmethod
@@ -5615,6 +6039,157 @@ class Scheduler:
         self._gc_expired_cooldowns()
         return _CONTINUE
 
+    def _emit_recovery_disposition(
+        self,
+        task_id: str | None,
+        *,
+        reason: LeaveReason,
+        shape: str,
+        rows: Sequence[Any] | None,
+    ) -> None:
+        """DESCRIBE one already-reached blocked-redispatch skip — never change it.
+
+        Thin config-reading adapter over ``orchestrator.recovery_emission``
+        (the Harness has the same-shaped ``_emit_recovery_disposition``): the
+        module stays pure and injectable, this supplies ``self.event_store``,
+        the tracker and the config.  The caller has ALREADY decided; this only
+        writes down what it decided and why.  The canonical WHY for the whole
+        mechanism is ``recovery_emission``'s module docstring — not restated
+        here, and not restated at the call sites.
+
+        ``rows`` is the task's open escalations, or ``None`` when the store
+        could not be READ (``classify_pins``' store-unavailable third state,
+        never collapsed into "no records").
+
+        ``task_id=None`` is a PROCESS-scoped notice with no single subject —
+        the queue-absent case.  With no subject there is no per-subject
+        signature to track, so it is gated by a one-shot latch instead of the
+        streak tracker; the caller re-arms that latch when the queue reappears.
+
+        This site deliberately does NOT charge the veto-streak escalation.  It
+        runs per dispatch TICK, so charging it would file a blocking L1 within
+        seconds of a strand appearing rather than after three ~900s sweeps;
+        only the sweep-frequency sites charge it (see the adapter's twin in
+        ``harness.py``).  The tracker is still consulted here — for emission
+        CADENCE alone, which is what keeps a per-tick site from storming the
+        event store (INV-4).
+
+        Wholly wrapped in try/except: telemetry must never disturb the sweep.
+        """
+        try:
+            cfg = getattr(self.config, 'recovery_emission', None)
+            if cfg is None or not cfg.enabled:
+                return
+
+            store_unavailable = rows is None
+            # Lazily created and getattr-tolerant, for the same reason
+            # ``escalation_queue is None`` is tolerated throughout this phase:
+            # bare-Scheduler unit tests build minimal instances.
+            tracker = getattr(self, '_recovery_veto_tracker', None)
+            if tracker is None:
+                tracker = RecoveryVetoStreakTracker()
+                self._recovery_veto_tracker = tracker
+
+            # Shared with the Harness's twin adapter rather than hand-rolled
+            # here: classify_pins is consulted ONLY to bucket the ids for the
+            # payload and never for the veto answer — that stays the caller's
+            # own untouched ``bool(rows)`` predicate (rewiring it is task
+            # 3541).
+            pins = pin_buckets(task_id, rows, store_unavailable=store_unavailable)
+            buckets = pins.buckets
+
+            if task_id is None:
+                if getattr(self, '_recovery_queue_absent_emitted', False):
+                    return
+                self._recovery_queue_absent_emitted = True
+                streak = 1
+            else:
+                # ONE definition of this format, shared with the Harness's
+                # twin adapter: it decides "unchanged hold, stay quiet" versus
+                # "new fact, emit", so two sites spelling it differently would
+                # diverge on cadence with nothing failing.
+                signature = veto_signature(reason, shape, buckets)
+                observation = tracker.observe(
+                    RecoverySite.scheduler_blocked_redispatch, task_id, signature,
+                )
+                if not should_emit_event(
+                    observation, threshold=cfg.veto_streak_threshold,
+                ):
+                    # A quiet repeat of a hold already on record.  Still
+                    # OBSERVED (the streak above kept climbing) — just not
+                    # re-stated, because this phase runs every dispatch tick.
+                    return
+                streak = observation.streak
+
+            now = datetime.now(UTC)
+            emit_recovery_event(
+                event_store=self.event_store,
+                # A record actively held the redispatch back -> vetoed.  An
+                # unreadable store held nothing: the phase simply could not
+                # find out, so it fell through to its fail-safe skip.
+                event_type=(
+                    EventType.recovery_vetoed
+                    if reason is LeaveReason.escalation_pinned
+                    else EventType.recovery_left
+                ),
+                task_id=task_id,
+                payload=build_recovery_payload(
+                    task_id=task_id,
+                    site=RecoverySite.scheduler_blocked_redispatch,
+                    shape=shape,
+                    reason=reason,
+                    escalation_ids=buckets,
+                    ages_secs=escalation_ages_secs(
+                        as_ageable_records(rows), now=now,
+                    ),
+                    store_unavailable=store_unavailable or pins.store_unavailable,
+                    streak=streak,
+                    now=now,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry never disturbs a sweep
+            logger.warning(
+                'Task %s: recovery-disposition emission failed (non-fatal): %s',
+                task_id, exc,
+            )
+
+    def _release_recovery_veto_streaks(self, observed: set[str]) -> None:
+        """End-of-tick: pop every streak this phase did NOT re-observe.
+
+        ``_emit_recovery_disposition`` seeds a ``(site, task_id)`` tracker
+        entry for every task it describes, and this phase runs per dispatch
+        TICK — so without a release edge a task vetoed once here and then gone
+        done or cancelled would leave its entry behind for the life of the
+        process, which is precisely the unbounded growth
+        ``RecoveryVetoStreakTracker.clear``'s docstring says the pop exists to
+        prevent.
+
+        Driven off the tick's own observed set rather than a per-task "the
+        hold ended" signal, for the same reason the Harness's same-named method
+        is driven off its sweep tally: a task can stop being held by leaving
+        the candidate set entirely, and an edge that only fired for a task this
+        phase still visits would never see that.
+
+        Footprint-only, unlike the Harness's version: this site is deliberately
+        absent from ``STREAK_CHARGING_SITES``, so there is no alarm to resolve
+        — and resolving one here would stand down a record only the
+        sweep-frequency sites are entitled to file.
+
+        Whole-body guarded: bookkeeping never aborts a tick phase.
+        """
+        try:
+            tracker = getattr(self, '_recovery_veto_tracker', None)
+            if tracker is None:
+                return
+            site = str(RecoverySite.scheduler_blocked_redispatch)
+            for tracked_site, tid in tuple(tracker.tracked()):
+                if str(tracked_site) == site and tid not in observed:
+                    tracker.clear(tracked_site, tid)
+        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a tick
+            logger.warning(
+                'recovery veto-streak release failed (non-fatal): %s', exc,
+            )
+
     async def _phase_redispatch_stranded_blocked(self, ctx: TickContext) -> object:
         """Mechanism 2 (task 2408): sweep-redispatch genuinely-stranded
         BLOCKED tasks back to ``pending``.
@@ -5645,11 +6220,18 @@ class Scheduler:
         crash-strand).
 
         Fails safe (never flips) when the sweep is disabled via
-        ``config.stranded_blocked_redispatch_enabled``, or when
-        ``self.escalation_queue`` is ``None`` — without the queue this
-        method cannot verify "no open escalation" (the park-protection
-        guard for a non-deterministic human ``/unblock`` park), so it must
-        never flip.
+        ``config.stranded_blocked_redispatch_enabled``, when
+        ``self.escalation_queue`` is ``None``, or when the queue read RAISES
+        — without a readable queue this method cannot verify "no open
+        escalation" (the park-protection guard for a non-deterministic human
+        ``/unblock`` park), so it must never flip.
+
+        Each of those three skips is now DESCRIBED rather than silent (task
+        3535): the escalation veto emits ``recovery_vetoed`` naming the
+        pinning ids and their ages, and the two unreadable-store arms emit
+        ``recovery_left``.  Emission changes no disposition — see
+        :meth:`_emit_recovery_disposition` and, for the whole mechanism,
+        ``orchestrator.recovery_emission``'s module docstring.
 
         **"deps resolved" is LOCAL deps only.** The ``_deps_satisfied`` call
         below intentionally omits ``external_status_cache`` (leaving the
@@ -5682,10 +6264,31 @@ class Scheduler:
         if not self.config.stranded_blocked_redispatch_enabled:
             return _CONTINUE
         if self.escalation_queue is None:
+            # Task 3535: this fail-safe used to be a completely bare `return`,
+            # so a fleet whose queue injection never happened swept nothing,
+            # forever, and said nothing about it.  PROCESS-scoped (task_id
+            # None) — the whole phase is degraded, not one task — and emitted
+            # once rather than once per tick.
+            self._emit_recovery_disposition(
+                None,
+                reason=LeaveReason.escalation_store_unavailable,
+                shape=render_shape(None, None, None, None, None),
+                rows=None,
+            )
             return _CONTINUE
+        # The queue is present: re-arm the one-shot notice above.  The Harness
+        # attribute-injects the queue AFTER constructing the Scheduler, so
+        # "absent" is a state this process genuinely leaves — a latch that
+        # never re-armed would silently swallow a LATER outage.
+        self._recovery_queue_absent_emitted = False
 
         now = self._wall_now()
         ttl = timedelta(seconds=self.config.claimant_liveness_ttl_secs)
+        # Every task this tick DESCRIBED a skip for.  Read as the complement
+        # at the end of the loop: a tracked task absent from it has stopped
+        # being held here (or left the candidate set entirely), so its streak
+        # entry is popped rather than left to accumulate on a per-tick path.
+        described: set[str] = set()
 
         for task in ctx.tasks:
             if task.get('status') != 'blocked':
@@ -5716,7 +6319,52 @@ class Scheduler:
                     continue
                 if not self._deps_satisfied(task, ctx.status_map, ctx.tasks_by_id):
                     continue
-                if self.escalation_queue.get_by_task(tid, status='pending'):
+                # Task 3535: the READ is guarded on its own, narrowed out of
+                # the broad per-task handler below, so an unreadable store is
+                # DESCRIBED as the third state (`recovery_left`) instead of
+                # being absorbed as an anonymous skip.  The disposition is
+                # byte-identical to what that handler already produced — an
+                # unreadable store still skips and never flips, because a
+                # false "no open escalation" would redispatch a deliberately
+                # parked task (the esc-3163 lesson).
+                try:
+                    rows = self.escalation_queue.get_by_task(tid, status='pending')
+                except Exception:
+                    logger.warning(
+                        'Task %s: stranded-blocked-redispatch could not READ the '
+                        'escalation store; skipping (never flipping) on an '
+                        'unreadable store',
+                        tid,
+                        exc_info=True,
+                    )
+                    described.add(tid)
+                    self._emit_recovery_disposition(
+                        tid,
+                        reason=LeaveReason.escalation_store_unavailable,
+                        shape=render_shape('blocked', False, None, None, None),
+                        rows=None,
+                    )
+                    continue
+                # The veto predicate is `bool(rows)`, VERBATIM.  Task 3541
+                # owns relaxing it to `classify_pins(...).pins` — which would
+                # stop an info-severity record vetoing here, a real
+                # disposition change — and owns the resulting deliberate
+                # difference from the already-landed dispatch gate's
+                # predicate.  Until then classify_pins is consulted inside the
+                # emission adapter for id bucketing only, never for this
+                # answer.
+                if rows:
+                    described.add(tid)
+                    self._emit_recovery_disposition(
+                        tid,
+                        reason=LeaveReason.escalation_pinned,
+                        # live_claimant=False is free and exact: is_stranded_
+                        # blocked just returned True.  The branch state is not
+                        # resolved at this site by design, so it renders
+                        # 'unknown' rather than being guessed.
+                        shape=render_shape('blocked', False, None, True, None),
+                        rows=rows,
+                    )
                     continue
                 logger.warning(
                     'Task %s: crash-stranded-blocked-redispatch — flipping blocked -> '
@@ -5750,7 +6398,19 @@ class Scheduler:
                     tid,
                     exc_info=True,
                 )
+                # DESCRIBED, so the release below leaves this task's streak
+                # alone: the isolation guard means the phase never reached its
+                # verdict, and popping on an unknown verdict would read as
+                # "the hold ended" — the opposite of what an exception says.
+                described.add(tid)
                 continue
+
+        # Complement of `described`: every tracked task this tick did not
+        # describe has stopped being held here (task 3535 amendment — see
+        # _release_recovery_veto_streaks).  After the loop, so a task the loop
+        # skipped for ANY reason (dispatched, cooling down, no longer stranded)
+        # releases too, not just one that reached the veto arms.
+        self._release_recovery_veto_streaks(described)
 
         return _CONTINUE
 
@@ -6310,12 +6970,12 @@ class Scheduler:
                         pin_tid, coerce_tier(pin_task.get('priority'))
                     )
                     self._dispatched_priority[pin_tid] = pin_pri
-                    if self.event_store:
-                        self.event_store.emit(
-                            EventType.lock_acquired,
-                            task_id=pin_tid,
-                            data={'modules': pin_modules, 'priority': pin_pri},
-                        )
+                    self._emit_lock_event(
+                        EventType.lock_acquired,
+                        task_id=pin_tid,
+                        modules=pin_modules,
+                        priority=pin_pri,
+                    )
                     await self._write_snapshot_best_effort()
                     return TickOutcome(TaskAssignment(
                         task_id=pin_tid, task=pin_task, modules=pin_modules
@@ -6369,68 +7029,102 @@ class Scheduler:
         top_modules = self._get_modules(top_task)
         top_had_parks = self.lock_table.has_parks(top_id)
 
-        for _score, task_id, task, pri in scored:
-            if ctx.psi_hold and not self.is_deterministic(task):
-                # Dispatch-admission gate (DA3): defer this HEAVY candidate —
-                # deterministic candidates are exempt (DA-D4) and lower-
-                # ranked exempt/light candidates behind it still get a turn
-                # (per-candidate `continue`, not a top-level `return None`).
-                self._note_heavy_deferral(ctx, task_id)
-                continue
-            modules = self._get_modules(task)
-            if self.lock_table.try_acquire(task_id, modules):
-                self._dispatched.add(task_id)
-                # Starvation-watchdog resolve (task 1880): if this scored task
-                # had an open INFO escalation, self-resolve it now that it is
-                # dispatching.  Wrapped in try/except so a resolve failure can
-                # NEVER abort a successful dispatch (PROPERTY 1).
-                try:
-                    await self._resolve_starvation_escalation(task_id)
-                except Exception:
-                    logger.warning(
-                        'Starvation watchdog resolve for task_id=%s raised — '
-                        'dispatch continues normally',
-                        task_id,
-                        exc_info=True,
-                    )
-                # arm cooldown gate — only for signal-bearing dispatches.
-                # Steward signals that arrive *after* a signal-free dispatch
-                # will not retroactively suppress re-dispatch; the gate is
-                # intentionally scoped to tasks that were already flagged
-                # when first picked up (bounded _last_dispatch_at size).
-                if ctx.candidate_signals.get(task_id) is not None:
-                    self._last_dispatch_at[task_id] = self._time_source()
-                self._dispatched_priority[task_id] = pri
-                if task_id == top_id:
-                    self._skip_count.pop(task_id, None)
-                    if top_had_parks:
-                        restored_pairs = self.lock_table.clear_parks_for(task_id)
-                        if self.event_store:
-                            self.event_store.emit(
-                                EventType.reservation_used,
-                                task_id=task_id,
-                                data={'modules': modules, 'priority': pri},
-                            )
-                            for restored_owner, restored_modules in restored_pairs:
+        # One scan, one memo for admission's read-only inputs (task 3823 /
+        # PRD C7).  Park and hold state does not move inside this loop, so
+        # every candidate would otherwise re-derive an identical park map and
+        # identical per-owner assembly delays.  Nulled in the ``finally`` so a
+        # dispatch ``return`` from inside the loop cannot leak a stale gap into
+        # the next tick — the memo must never outlive the state it read.
+        self._backfill_scan_cache = _BackfillScanCache()
+        try:
+            for _score, task_id, task, pri in scored:
+                if ctx.psi_hold and not self.is_deterministic(task):
+                    # Dispatch-admission gate (DA3): defer this HEAVY candidate —
+                    # deterministic candidates are exempt (DA-D4) and lower-
+                    # ranked exempt/light candidates behind it still get a turn
+                    # (per-candidate `continue`, not a top-level `return None`).
+                    self._note_heavy_deferral(ctx, task_id)
+                    continue
+                modules = self._get_modules(task)
+                acquired = self.lock_table.try_acquire(task_id, modules)
+                grant: _BackfillGrant | None = None
+                if not acquired:
+                    # EASY-backfill (task 3823 / PRD C7): this candidate may be
+                    # blocked only by another task's PARK, in front of a gap that
+                    # park is provably still waiting on.  If so, retry ignoring
+                    # exactly those owners' parks.
+                    #
+                    # The SECOND try_acquire — not the admission predicate — is the
+                    # acting basis (INV-3).  ``admitted_parks`` is scoped to the
+                    # park gate alone; the held-lock limit gate is untouched and is
+                    # re-evaluated here on live state.  So admission being wrong
+                    # costs one failed acquire, never a double-held module, and a
+                    # grant that does not become a dispatch is discarded rather
+                    # than recorded as a borrow that never happened.
+                    grant = self._backfill_admission(task_id, task, modules)
+                    if grant is not None:
+                        acquired = self.lock_table.try_acquire(
+                            task_id, modules, admitted_parks=frozenset(grant.park_owners)
+                        )
+                        if not acquired:
+                            grant = None
+                if acquired:
+                    self._dispatched.add(task_id)
+                    # Starvation-watchdog resolve (task 1880): if this scored task
+                    # had an open INFO escalation, self-resolve it now that it is
+                    # dispatching.  Wrapped in try/except so a resolve failure can
+                    # NEVER abort a successful dispatch (PROPERTY 1).
+                    try:
+                        await self._resolve_starvation_escalation(task_id)
+                    except Exception:
+                        logger.warning(
+                            'Starvation watchdog resolve for task_id=%s raised — '
+                            'dispatch continues normally',
+                            task_id,
+                            exc_info=True,
+                        )
+                    # arm cooldown gate — only for signal-bearing dispatches.
+                    # Steward signals that arrive *after* a signal-free dispatch
+                    # will not retroactively suppress re-dispatch; the gate is
+                    # intentionally scoped to tasks that were already flagged
+                    # when first picked up (bounded _last_dispatch_at size).
+                    if ctx.candidate_signals.get(task_id) is not None:
+                        self._last_dispatch_at[task_id] = self._time_source()
+                    self._dispatched_priority[task_id] = pri
+                    if task_id == top_id:
+                        self._skip_count.pop(task_id, None)
+                        if top_had_parks:
+                            restored_pairs = self.lock_table.clear_parks_for(task_id)
+                            if self.event_store:
                                 self.event_store.emit(
-                                    EventType.reservation_restored,
-                                    task_id=restored_owner,
-                                    data={
-                                        'restored_owner': restored_owner,
-                                        'modules': restored_modules,
-                                    },
+                                    EventType.reservation_used,
+                                    task_id=task_id,
+                                    data={'modules': modules, 'priority': pri},
                                 )
-                else:
-                    # A lower-ranked task won — top was passed over this tick.
-                    self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
-                if self.event_store:
-                    self.event_store.emit(
+                                for restored_owner, restored_modules in restored_pairs:
+                                    self.event_store.emit(
+                                        EventType.reservation_restored,
+                                        task_id=restored_owner,
+                                        data={
+                                            'restored_owner': restored_owner,
+                                            'modules': restored_modules,
+                                        },
+                                    )
+                    else:
+                        # A lower-ranked task won — top was passed over this tick.
+                        self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
+                    if grant is not None:
+                        self._record_backfill_grant(grant)
+                    self._emit_lock_event(
                         EventType.lock_acquired,
                         task_id=task_id,
-                        data={'modules': modules, 'priority': pri},
+                        modules=modules,
+                        priority=pri,
                     )
-                await self._write_snapshot_best_effort()
-                return TickOutcome(TaskAssignment(task_id=task_id, task=task, modules=modules))
+                    await self._write_snapshot_best_effort()
+                    return TickOutcome(TaskAssignment(task_id=task_id, task=task, modules=modules))
+        finally:
+            self._backfill_scan_cache = None
 
         # Loop exhausted with no acquire — top candidate was also skipped.
         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
@@ -6669,8 +7363,12 @@ class Scheduler:
     def _write_state_snapshot_raw(self, path: Path, payload: str | None = None) -> None:
         """Atomically write the current state snapshot to *path* as JSON.
 
-        Creates parent directories if missing.  Uses a tmp-file + os.replace
-        atomic rename so concurrent readers never see a partial write.
+        Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223),
+        which creates parent directories if missing and does the tmp-file +
+        ``os.replace`` atomic rename so concurrent readers never see a partial
+        write.  ``mode`` is deliberately left at the helper's umask default
+        rather than narrowed: this snapshot is read by other processes (the
+        dashboard, scripts/drain_check.py).
 
         Exceptions propagate to the caller (``_write_snapshot_best_effort``),
         which swallows them via its own try/except so the scheduler never stops
@@ -6690,16 +7388,13 @@ class Scheduler:
                 direct callers such as tests).
         """
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix('.json.tmp')
         # Serialise the full snapshot (including snapshot_at) for the on-disk
         # record.  Note: this is independent of the dedup payload built in
         # _write_snapshot_best_effort; when a pre-built payload is passed,
         # no second get_state_snapshot() call is needed.
         if payload is None:
             payload = json.dumps(self.get_state_snapshot(), default=str)
-        tmp_path.write_text(payload, encoding='utf-8')
-        os.replace(tmp_path, path)
+        safe_io.atomic_write_text(path, payload, encoding='utf-8', mkdir=True)
 
     async def _write_snapshot_best_effort(self, force: bool = False) -> None:
         """Write the scheduler state snapshot to the default path off the event loop.
@@ -6949,13 +7644,36 @@ class Scheduler:
 
         released: list[str] = []
         if not additional or self.lock_table.try_acquire_additional(task_id, additional):
+            if additional:
+                # A WIDEN/SHIFT really does take new module locks here, so it
+                # emits a lock_acquired for them like any other acquire.  Without
+                # this the predictor never sees a start for the widened modules:
+                # the eventual full release names them (they are in
+                # lock_table._held), the history has no matching open span, and
+                # they are discarded as orphan releases — so refinement-acquired
+                # holds contribute nothing, forever.  Worse for a pure SHIFT,
+                # where every original module is stale and every new one is
+                # additional: the task's open-span set empties out and
+                # predicted_remaining refuses for a task that is demonstrably
+                # holding locks right now — the exact case task η must reason
+                # about.  Routed through _emit_lock_event so the durable stream
+                # gains the row too: feeding only the in-process history would
+                # make the live feed and seed_from_event_store disagree about
+                # this hold, which is the drift INV-5 forbids.
+                self._emit_lock_event(
+                    EventType.lock_acquired,
+                    task_id=task_id,
+                    modules=additional,
+                    reason='plan_refinement',
+                )
             if stale:
                 released = self.lock_table.release_subset(task_id, stale)
-                if released and self.event_store:
-                    self.event_store.emit(
+                if released:
+                    self._emit_lock_event(
                         EventType.lock_released,
                         task_id=task_id,
-                        data={'modules': released, 'reason': 'plan_refinement'},
+                        modules=released,
+                        reason='plan_refinement',
                     )
             # Persist metadata.files on EVERY successful refinement (widen,
             # narrow, or shift) — hoisted OUT of `if stale:` so a pure widen
@@ -7056,12 +7774,27 @@ class Scheduler:
         self.lock_table.release(task_id)
         # Defensive: clear any reservations still owned by this task.
         restored_pairs = self.lock_table.clear_parks_for(task_id)
-        if self.event_store and modules:
-            self.event_store.emit(
+        if modules:
+            self._emit_lock_event(
                 EventType.lock_released,
                 task_id=task_id,
-                data={'modules': modules},
+                modules=modules,
             )
+        # Reconcile the predictor's live open-span map with the lock table,
+        # UNCONDITIONALLY — including when `modules` was empty and no event was
+        # emitted.  This call drops every lock the task holds, so nothing of its
+        # may still be open afterwards; anything left is residue from a hold
+        # whose release the history never saw.  Left in place it is not inert:
+        # predicted_remaining would keep answering for the phantom, and as its
+        # elapsed time grew would answer a floored 0.0 forever — the "overdue
+        # holder" reading, which is a live actionable claim, about a task that
+        # released hours ago.  The whole contract turns on callers telling 0.0
+        # from None, so a permanent 0.0 is the worst output this API can give.
+        self._hold_history.forget(task_id)
+        # Settle any EASY-backfill grant (task 3823 / PRD C7) AFTER the release
+        # has been recorded above, so the hold this judges is the one the
+        # predictor just closed.
+        self._settle_backfill_grant(task_id)
         if self.event_store:
             for restored_owner, restored_modules in restored_pairs:
                 self.event_store.emit(
@@ -7170,14 +7903,567 @@ class Scheduler:
         """
         return self._started
 
+    # --- Hold-duration prediction (task 3822 / PRD task ζ, consumed by η) ---
+
+    def predicted_hold(
+        self, task: dict, *, modules: list[str] | None = None
+    ) -> float | None:
+        """Predicted lock-hold duration (seconds) for *task*, or None.
+
+        Takes the TASK, not a module list, on purpose: ``_get_modules`` applies
+        the ``lock_depth`` coarsening, the deterministic-task short-circuit and
+        the ``task-<id>`` fallback, so it is the only thing that produces the
+        keys the lock layer — and therefore the history — actually uses.  A
+        caller splitting paths its own way would key the history on strings
+        that never appear in a lock event.
+
+        **None means NO PREDICTION** — too few observed holds on this task's
+        modules to say anything.  A caller (task η deciding whether a backfill
+        is worth the wait) MUST refuse on None rather than substitute a
+        default: 0.0, a global mean or a configured "typical" hold would all
+        read as a confident answer the evidence does not support.  The measured
+        basis for that caution is
+        plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:116-126
+        — every static-attribute predictor scored WORSE than the test-set mean
+        (R² -0.22 to -0.82); only module hold history scored positive.
+
+        *modules* lets a caller that has ALREADY computed ``_get_modules(task)``
+        hand the result back instead of having it re-derived — the scored
+        dispatch loop has it in hand before it asks.  It must be exactly that
+        output: a hand-split path list would key the history on strings that
+        never appear in a lock event, which is the failure the task-taking
+        signature exists to prevent, so this is a caching parameter and not an
+        invitation to supply a different module set.
+        """
+        return self._hold_history.predicted_hold(
+            self._get_modules(task) if modules is None else modules
+        )
+
+    def predicted_remaining(self, holder: str) -> float | None:
+        """Predicted seconds *holder* will keep its locks, or None.
+
+        Reads the Scheduler's own wall clock (``_wall_now``) rather than taking
+        a ``now`` argument: hold starts are wall-clock POSIX seconds, comparable
+        with the ISO timestamps in the event log, and a caller passing a
+        monotonic reading would get a remainder computed across two unrelated
+        epochs.
+
+        **None means NO PREDICTION** — *holder* holds nothing, or its modules
+        are below ``min_samples``.  It is NOT the same answer as 0.0, which
+        means "predicted to have finished already, and hasn't": that is a live
+        fact about an overdue holder and the one signal a waiting caller most
+        needs.  η must keep them apart.
+        """
+        return self._hold_history.predicted_remaining(
+            holder, now=self._wall_now().timestamp()
+        )
+
+    # --- EASY-backfill admission through parks (task 3823 / PRD task η, C7) ---
+
+    def _provable_assembly_delay(self, owner: str) -> float:
+        """Seconds *owner*'s park is PROVABLY still waiting to assemble.
+
+        C7's right-hand side: ``min`` over *owner*'s still-blocked park modules
+        of ``max(0, predicted_hold(holder) - elapsed_hold)``.  This is the gap a
+        park has to lend a backfiller, so every ambiguity here resolves toward
+        the SMALLER number — the one that admits fewer candidates.
+
+        Three deliberate choices, each in the safe direction:
+
+        * **MIN over modules, not max.**  *owner* cannot assemble until EVERY
+          parked module frees, so the max is its TRUE wait.  But the true wait
+          is not a *provable* wait: only the soonest-freeing module is
+          guaranteed still to be blocked for that long, and the number is spent
+          admitting somebody else through.  The min is a provable lower bound;
+          lending the max would lend time no single observation supports.
+        * **An empty blocked set is 0.0.**  Nothing is holding *owner* back —
+          it can assemble on the next tick — so there is no gap at all, and
+          admission must refuse rather than treat "not waiting" as "patient".
+        * **A holder with no prediction contributes 0.0**, which drives the
+          whole result to 0.0.  "Provable" is in the name.  Skipping the
+          unpredictable module instead would let the one well-evidenced module
+          certify the entire park — the empty-history-certifies-structure
+          failure the PRD forbids by name, and the reason
+          :meth:`predicted_remaining` returns None instead of a default.
+
+        ``0.0`` from an OVERDUE holder (predicted to have finished and hasn't)
+        and ``0.0`` from an unpredictable one are the same answer here — both
+        refuse — but they reach it by different branches on purpose, so ζ's
+        ``0.0 != None`` distinction survives in the layer that owns it.
+
+        A READ: mutates neither the lock table nor scheduler state.  Basis:
+        plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:116-126
+        — module hold history is the only predictor with positive R², so it is
+        the only thing this arithmetic is allowed to rest on.
+
+        MEMOIZED for the duration of one scored scan (see
+        :class:`_BackfillScanCache`), because every candidate in a tick asks
+        the same question of the same unchanged state.  Outside a scan the
+        answer is computed exactly, so the memo can never be the reason two
+        callers disagree.
+        """
+        cache = self._backfill_scan_cache
+        if cache is None:
+            return self._compute_provable_assembly_delay(owner)
+        if owner not in cache.delays:
+            cache.delays[owner] = self._compute_provable_assembly_delay(owner)
+        return cache.delays[owner]
+
+    def _snapshot_parks_for_backfill(self) -> dict[str, dict]:
+        """``lock_table.snapshot_parks()``, read at most once per scored scan.
+
+        The map is rebuilt from every park stack on each call, and admission
+        asks for it once per blocking owner per candidate.  Uncached outside a
+        scan, for the same reason the delay memo is.
+        """
+        cache = self._backfill_scan_cache
+        if cache is None:
+            return self.lock_table.snapshot_parks()
+        if cache.parks is None:
+            cache.parks = self.lock_table.snapshot_parks()
+        return cache.parks
+
+    def _compute_provable_assembly_delay(self, owner: str) -> float:
+        """The uncached arithmetic behind :meth:`_provable_assembly_delay`."""
+        park_modules = self._snapshot_parks_for_backfill().get(owner, {}).get('modules', [])
+        if not park_modules:
+            return 0.0
+        blocked = self.lock_table.blocking_holders(park_modules, exclude_task=owner)
+        if not blocked:
+            # Every parked module is free — owner can assemble now.
+            return 0.0
+        gap: float | None = None
+        for holders in blocked.values():
+            # The module regains headroom when its SOONEST holder releases.
+            module_gap: float | None = None
+            for holder in holders:
+                remaining = self.predicted_remaining(holder)
+                if remaining is None:
+                    # Explicit branch, never ``or``: ``0.0 or x`` would silently
+                    # discard a legitimate overdue-holder zero and read as the
+                    # unpredictable case, collapsing two different facts.
+                    return 0.0
+                if module_gap is None or remaining < module_gap:
+                    module_gap = remaining
+            if module_gap is None:
+                return 0.0
+            if gap is None or module_gap < gap:
+                gap = module_gap
+        return 0.0 if gap is None else gap
+
+    def _backfill_admission(
+        self, task_id: str, task: dict, modules: list[str]
+    ) -> _BackfillGrant | None:
+        """C7's predicate: may *task_id* be admitted through the parks blocking it?
+
+        Returns a :class:`_BackfillGrant` on admit, ``None`` on refuse.  A PURE
+        DECISION — it mutates neither the lock table nor scheduler state, and
+        it takes no lock.  The caller must still call ``try_acquire`` with
+        ``admitted_parks=frozenset(grant.park_owners)``; that call, on live
+        state, is the ACTING BASIS (INV-3).  Nothing read here is authoritative
+        by the time the lock is taken, which is why a wrong admit costs a
+        failed acquire rather than a double-held module.
+
+        The clauses, in the order they are cheapest to refuse on::
+
+            backfill_enabled                                    (kill switch)
+            park_owners_blocking(c) is non-empty        (C7: c.modules ∩ M ≠ ∅)
+            predicted_hold(c) is not None            (an empty history REFUSES)
+            for every blocking owner p:
+                park_age(p) is known and <= backfill_max_park_age_secs
+                predicted_hold(c) * safety <= provable_assembly_delay(p)
+
+        The owner loop is a CONJUNCTION, deliberately: acquisition has to
+        bypass every blocking park to dispatch, so "find one willing lender"
+        would admit a candidate that then fails to acquire — churn with no
+        dispatch, and a grant event describing a borrow that never happened.
+
+        ``<=`` and ``age > cutoff`` are the operators C7 specifies; both
+        boundaries have their own test because an off-by-one in either would
+        show up in production only as slightly-different backfill volume.
+
+        Refusals are logged at DEBUG with a distinct reason, never emitted as
+        events: a refusal is the ordinary outcome for every parked module on
+        every tick, and per-refusal events would be exactly the storm INV-4
+        forbids.  Grants are rare and DO get an event.
+        """
+        if not self.config.backfill_enabled:
+            logger.debug('backfill refuse task=%s reason=disabled', task_id)
+            return None
+
+        owners = self.lock_table.park_owners_blocking(task_id, modules)
+        if not owners:
+            # Free, or blocked by a real HOLDER — either way there is no park
+            # to borrow a gap from and the ordinary try_acquire outcome stands.
+            logger.debug('backfill refuse task=%s reason=not_park_blocked', task_id)
+            return None
+
+        # ``modules`` is the caller's ``_get_modules(task)`` output — the same
+        # list this method normalizes below — so it is handed through rather
+        # than re-derived per candidate per tick.
+        predicted = self.predicted_hold(task, modules=modules)
+        if predicted is None:
+            # REFUSE on no prediction, never substitute a default: an empty or
+            # thin history certifies structure, not capability.  See
+            # predicted_hold's own docstring — the producer mandates this.
+            logger.debug('backfill refuse task=%s reason=no_hold_samples', task_id)
+            return None
+
+        bound = predicted * self.config.backfill_safety_factor
+        now = self._wall_now()
+        tightest_gap: float | None = None
+        for owner in owners:
+            age = self.lock_table.park_age_secs(owner, now=now)
+            if age is None:
+                # Unknown age must refuse.  Reading it as "brand new" would
+                # make a corrupt stamp the most permissive state in the system.
+                logger.debug(
+                    'backfill refuse task=%s reason=park_age_unknown owner=%s',
+                    task_id, owner,
+                )
+                return None
+            if age > self.config.backfill_max_park_age_secs:
+                logger.debug(
+                    'backfill refuse task=%s reason=park_too_old owner=%s age=%.0fs '
+                    'cutoff=%.0fs',
+                    task_id, owner, age, self.config.backfill_max_park_age_secs,
+                )
+                return None
+            delay = self._provable_assembly_delay(owner)
+            if delay <= 0.0:
+                # The park is waiting on nothing — it assembles next tick, so
+                # any time borrowed here comes straight out of its own dispatch.
+                logger.debug(
+                    'backfill refuse task=%s reason=no_provable_gap owner=%s',
+                    task_id, owner,
+                )
+                return None
+            if bound > delay:
+                logger.debug(
+                    'backfill refuse task=%s reason=predicted_hold_exceeds_gap '
+                    'owner=%s predicted=%.1fs bound=%.1fs gap=%.1fs',
+                    task_id, owner, predicted, bound, delay,
+                )
+                return None
+            if tightest_gap is None or delay < tightest_gap:
+                tightest_gap = delay
+
+        depth = self.config.lock_depth
+        return _BackfillGrant(
+            task_id=task_id,
+            modules=tuple(normalize_lock(m, depth) for m in modules),
+            park_owners=tuple(owners),
+            predicted_hold=predicted,
+            safety_factor=float(self.config.backfill_safety_factor),
+            admission_bound=bound,
+            # The TIGHTEST gap actually borrowed, not the first or the widest:
+            # it is the one the candidate has to fit inside for every blocking
+            # park at once, so it is the number settlement should be judged
+            # against.
+            provable_assembly_delay=tightest_gap if tightest_gap is not None else 0.0,
+        )
+
+    def _record_backfill_grant(self, grant: _BackfillGrant) -> None:
+        """Stamp, store and announce a grant that actually became a dispatch.
+
+        Called only after the second ``try_acquire`` has SUCCEEDED, which is
+        why ``granted_at`` is stamped here rather than in the predicate: the
+        realized hold must be measured from the moment the lock was taken, and
+        an admission that the lock layer refused has no realized hold at all.
+
+        Unlike a refusal — the ordinary per-tick outcome, logged at DEBUG and
+        never emitted — a grant is rare and gets an event, because the whole
+        point of C7 is that the modelled overstay rate becomes measurable
+        instead of assumed.
+        """
+        stamped = replace(grant, granted_at=self._wall_now().timestamp())
+        if (
+            len(self._backfill_grants) >= _BACKFILL_GRANTS_MAX
+            and stamped.task_id not in self._backfill_grants
+        ):
+            # dict preserves insertion order, so the first key is the oldest.
+            self._backfill_grants.pop(next(iter(self._backfill_grants)), None)
+        self._backfill_grants[stamped.task_id] = stamped
+        if self.event_store:
+            self.event_store.emit(
+                EventType.park_backfill_granted,
+                task_id=stamped.task_id,
+                data={
+                    'predicted_hold': stamped.predicted_hold,
+                    'safety_factor': stamped.safety_factor,
+                    'admission_bound': stamped.admission_bound,
+                    'provable_assembly_delay': stamped.provable_assembly_delay,
+                    'park_owners': list(stamped.park_owners),
+                    'modules': list(stamped.modules),
+                },
+            )
+
+    def _settle_backfill_grant(self, task_id: str) -> None:
+        """Judge a back-filled hold against the bound its admission promised.
+
+        POPS the grant, so a release called twice (it is, defensively, on some
+        cleanup paths) cannot count one breach twice and quietly inflate the
+        rate that drives the escalation.  A task that never back-filled has no
+        grant and settles to nothing.
+
+        ``realized > admission_bound`` is the breach test: the bound is the
+        promise, and landing exactly on it is the best outcome a prediction
+        can have — counting that as a breach would inflate the very rate the
+        safety factor is meant to be retuned from.
+
+        Emitted directly rather than through ``_emit_lock_event``: that
+        chokepoint is contractually the single writer for ``lock_acquired`` /
+        ``lock_released`` and rejects any other event type.
+
+        Not hooked into ``release_subset``.  A partial release does not end the
+        hold, so settling there would report a realized duration that has not
+        finished happening.
+
+        EVERY settlement is sampled into the rate window and re-checks the
+        escalation, not just the breaches: a clean settlement is what fills the
+        window past ``_BACKFILL_OVERSTAY_MIN_GRANTS`` in a burst that started
+        with breaches, and checking only on breaches would leave an
+        already-over-threshold sample unreported until the next one.  It also
+        means a clean run can carry the rate back DOWN through the threshold,
+        which a breach-only sampler could never observe.
+        """
+        grant = self._backfill_grants.pop(task_id, None)
+        if grant is None:
+            return
+        realized = self._wall_now().timestamp() - grant.granted_at
+        breached = realized > grant.admission_bound
+        self._record_backfill_outcome(breached)
+        if not breached:
+            self._maybe_escalate_backfill_overstay_rate()
+            return
+        overstay = realized - grant.admission_bound
+        logger.info(
+            'backfill overstay task=%s realized=%.1fs bound=%.1fs over=%.1fs '
+            '(predicted=%.1fs x%.2f)',
+            task_id, realized, grant.admission_bound, overstay,
+            grant.predicted_hold, grant.safety_factor,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.park_backfill_overstay,
+                task_id=task_id,
+                data={
+                    'predicted_hold': grant.predicted_hold,
+                    'safety_factor': grant.safety_factor,
+                    'admission_bound': grant.admission_bound,
+                    'realized_hold': realized,
+                    'overstay_secs': overstay,
+                    'park_owners': list(grant.park_owners),
+                    'modules': list(grant.modules),
+                },
+            )
+        self._maybe_escalate_backfill_overstay_rate()
+
+    def _record_backfill_outcome(self, breached: bool) -> None:
+        """Sample one settled grant into the bounded overstay-rate window.
+
+        Drops the whole sample when ``backfill_safety_factor`` has moved since
+        it started accumulating.  The factor is a green-tier reloadable leaf,
+        so an operator acting on the L1 retunes it live — and every outcome in
+        the window was produced under the OLD factor, against bounds that no
+        longer exist.  Keeping them would re-file an L1 blaming a mis-tune the
+        operator already fixed, on a rate they have no way to clear.  Read from
+        ``self.config`` at settlement time (a pull), matching the house
+        contract for every reloadable consumer here, so no reload hook has to
+        exist for this to work.
+        """
+        factor = float(self.config.backfill_safety_factor)
+        if factor != self._backfill_outcomes_factor:
+            logger.info(
+                'backfill_safety_factor changed %s -> %s — discarding the %d '
+                'outcome(s) sampled under the old factor',
+                self._backfill_outcomes_factor, factor, len(self._backfill_outcomes),
+            )
+            self._backfill_outcomes.clear()
+            self._backfill_outcomes_factor = factor
+        self._backfill_outcomes.append(breached)
+
+    def _maybe_escalate_backfill_overstay_rate(self) -> None:
+        """File one L1 when the overstay RATE stays well above the modelled one.
+
+        A rate, not a per-breach alarm.  Individual overstays are the model
+        working as designed — it was fitted to cover 80% of realized durations,
+        not all of them — so an event each would be the storm INV-4 forbids.
+        What is actionable is a SUSTAINED rate several times the measured
+        7-9%: that means the predictor has drifted or the factor is wrong.
+
+        Measured over the BOUNDED settlement window, so the claim is about the
+        current regime.  The window floor matters as much as the threshold:
+        without it the first back-filled dispatch that ran long would file an
+        L1 claiming a 100% overstay rate.
+
+        Deduped on ``has_open_l1`` so a sustained mis-tune produces one open
+        escalation per episode rather than one per release, and best-effort
+        throughout — a missing queue is a warning, and any failure is
+        swallowed, because a release that raised because escalation filing
+        failed would strand the task's locks and turn a reporting problem into
+        a dispatch outage.
+        """
+        settled = len(self._backfill_outcomes)
+        if settled < _BACKFILL_OVERSTAY_MIN_GRANTS:
+            return
+        breaches = sum(self._backfill_outcomes)
+        rate = breaches / settled
+        if rate < _BACKFILL_OVERSTAY_RATE_THRESHOLD:
+            return
+        if self.escalation_queue is None:  # bare-Scheduler unit tests stay green
+            logger.warning(
+                'backfill overstay rate is %.0f%% (%d of the last %d settled '
+                'grants) but no escalation_queue is wired — skipping rate '
+                'escalation',
+                rate * 100, breaches, settled,
+            )
+            return
+        try:
+            if self.escalation_queue.has_open_l1(_BACKFILL_OVERSTAY_SENTINEL):
+                return  # dedup: one open L1 per episode
+            from escalation.models import Escalation
+
+            factor = self.config.backfill_safety_factor
+            esc = Escalation(
+                id=self.escalation_queue.make_id(_BACKFILL_OVERSTAY_SENTINEL),
+                task_id=_BACKFILL_OVERSTAY_SENTINEL,
+                agent_role='orchestrator-scheduler',
+                severity='blocking',
+                category='risk_identified',
+                summary=(
+                    f'EASY-backfill overstay rate {rate * 100:.0f}% '
+                    f'({breaches} of the last {settled} settled grants) — '
+                    f'well above the modelled 7-9% at safety x2.5'
+                )[:200],
+                detail=(
+                    f'{breaches} of the last {settled} settled backfill '
+                    f'grants held their locks LONGER than the bound their '
+                    f'admission promised — a measured overstay rate of '
+                    f'{rate * 100:.0f}%, against a threshold of '
+                    f'{_BACKFILL_OVERSTAY_RATE_THRESHOLD * 100:.0f}%.\n\n'
+                    f'The rate is measured over a rolling window of the last '
+                    f'{_BACKFILL_OUTCOME_WINDOW} settled grants, and the window '
+                    f'is DISCARDED when backfill_safety_factor changes — so '
+                    f'this figure describes the current tuning, and retuning '
+                    f'below starts a fresh sample rather than leaving a stale '
+                    f'rate to re-file this escalation.\n\n'
+                    f'The parking model measured 7-9% overstay at '
+                    f'backfill_safety_factor x2.5 '
+                    f'(plans/evidence/scheduler-scoring-2026-08-06/'
+                    f'PARKING_MODEL_REPORT.md:254-255).  The factor is '
+                    f'currently {factor}.  A sustained rate several times the '
+                    f'modelled one means either the hold-duration predictor '
+                    f'has drifted from the workload it was fitted to, or the '
+                    f'factor is too low for this workload.\n\n'
+                    f'REMEDY: raise backfill_safety_factor toward the measured '
+                    f'x2.9 upper bracket (the multiplier that covered 80% of '
+                    f'realized durations in the dark-factory sample; reify '
+                    f'measured x2.0).  It is a green-tier reloadable leaf, so '
+                    f'this is a live retune via reload_config — no restart.  '
+                    f'backfill_enabled=false is the kill switch if backfill '
+                    f'needs to stop entirely while this is investigated.\n\n'
+                    f'Per-grant evidence is in the park_backfill_granted and '
+                    f'park_backfill_overstay events, which carry predicted and '
+                    f'realized hold side by side.'
+                ),
+                suggested_action='retune_backfill_safety_factor',
+                level=1,
+            )
+            self.escalation_queue.submit(esc)
+            logger.warning('Filed L1 backfill-overstay-rate escalation %s', esc.id)
+        except Exception:
+            logger.warning(
+                'Failed to file backfill-overstay-rate escalation', exc_info=True
+            )
+
+    def _emit_lock_event(
+        self,
+        event_type: EventType,
+        *,
+        task_id: str,
+        modules: list[str],
+        **extra,
+    ) -> None:
+        """The ONE writer for ``lock_acquired`` / ``lock_released`` events.
+
+        Every lock event both (a) feeds the in-process hold-history predictor
+        and (b) lands in the event store, in that order and from this one
+        place.  Splitting them across call sites is what INV-5 forbids: a site
+        that emitted without feeding would leave the event stream complete —
+        so nothing would look broken — while the live history silently drifted
+        from what ``seed_from_event_store`` would reconstruct off the same
+        stream.  test_scheduler_hold_history.py enforces the single site
+        structurally, by AST scan.
+
+        The predictor is fed even when ``self.event_store`` is None: the
+        Harness runs a store-less Scheduler through construction and the store
+        is attached later, and holds observed in that window are real.
+
+        Being the one writer is necessary but not sufficient for the predictor
+        to see every hold — a site that acquires locks without calling this at
+        all is invisible to both halves of INV-5 at once, so the drift never
+        shows up as a seed/live disagreement.  ``try_acquire_additional`` on the
+        plan-refinement path was exactly that gap and now routes through here;
+        the release half is reconciled by ``HoldHistory.forget`` in
+        ``release()``, which catches any hold whose release this never saw.
+
+        Timestamps come from ``self._wall_now()`` — the injectable WALL clock,
+        not ``_time_source`` (monotonic).  Durations must be comparable with
+        the ISO-8601 timestamps ``EventStore.emit`` writes, which the seed
+        parses back into POSIX seconds; a monotonic reading has no epoch
+        relation and would produce nonsense the moment the two feeds mixed.
+
+        *extra* is merged into the event payload verbatim (``priority`` for an
+        acquire, ``reason`` for a partial release), so each site's payload is
+        preserved byte-for-byte.
+
+        Each branch names its ``EventType`` constant LITERALLY rather than
+        forwarding the ``event_type`` parameter into ``emit``.  That is not
+        redundancy to tidy away: it is what lets the AST guard see that each
+        lock event has exactly one emit site, and it puts the constant right
+        next to the ``observe_*`` call that must always accompany it.
+        Forwarding the parameter would make both constants invisible to the
+        scan, and the guard would pass with zero sites found.
+        """
+        at = self._wall_now().timestamp()
+        data = {'modules': modules, **extra}
+        if event_type == EventType.lock_acquired:
+            self._hold_history.observe_acquired(task_id, modules, at=at)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.lock_acquired, task_id=task_id, data=data,
+                )
+        elif event_type == EventType.lock_released:
+            self._hold_history.observe_released(task_id, modules, at=at)
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.lock_released, task_id=task_id, data=data,
+                )
+        else:
+            # Loud, not fail-soft: a caller routing some third event through
+            # the lock chokepoint would have its payload emitted while the
+            # predictor saw nothing, which is precisely the drift INV-5 forbids.
+            raise ValueError(f'_emit_lock_event: not a lock event: {event_type!r}')
+
     def finish_startup(self) -> None:
         """Mark startup complete, allowing ``acquire_next()`` to run.
 
         Callers (the Harness main-loop bootstrap, and Scheduler-only test
         factories that drive ``acquire_next()`` directly) must call this
         once their startup reconcile sweeps have finished.  Idempotent.
+
+        This is also where the hold-history predictor is seeded from the
+        durable event log.  It cannot happen in ``__init__``: the Harness
+        builds the Scheduler with ``event_store=None`` and attribute-injects
+        the store afterwards (harness.py:2121-2122), so a constructor seed
+        would read None and leave the predictor permanently empty.
+        ``seed_from_event_store`` is itself seed-once and fail-soft, which is
+        what keeps this call safe under the idempotence promise above.
         """
         self._started = True
+        if self.event_store:
+            self._hold_history.seed_from_event_store(self.event_store)
 
     # --- Retry cap (per-task REQUEUED counter) ---
 

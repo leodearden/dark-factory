@@ -293,7 +293,13 @@ function OrchTab({ projectFilter, search }) {
                           <tr key={t.id}>
                             <td className="mono" style={{ color: 'var(--fg-1)', whiteSpace: 'nowrap' }}>{window.DF_SHELL.taskId(t.id)}</td>
                             <td style={{ color: isDone ? 'var(--fg-2)' : 'var(--fg-1)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={t.title}>{t.title}</td>
-                            <td className="mono" style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.agent || '—'}</td>
+                            {/* `agent` is worktree presence, not liveness. The strand
+                                verdict (task 3543) rides alongside it, gated on its own
+                                server-computed field — never on the agent value. */}
+                            <td className="mono" style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {t.agent || '—'}
+                              {t.stranded && <span className="badge bad" style={{ marginLeft: 4 }} title="stranded: in-progress with no live claimant / stale heartbeat">stranded</span>}
+                            </td>
                             <td className="num">{rtCell(t.loops)}</td>
                             <td className="num">{rtCell(t.attempts)}</td>
                             <td className="num" style={{ color: 'var(--fg-3)' }}>{isDone ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : isPending ? '—' : rtAge(t.started)}</td>
@@ -888,6 +894,14 @@ function MergeTab({ projectFilter }) {
             <HaltPill halt={d.halt} />
             <span className="pip"><span className="pip-dot" style={{ background: CP.accent }}></span>{d.latency.count} attempts</span>
             <span className="pip"><span className="pip-dot" style={{ background: CP.warn }}></span>{d.active.length} queued</span>
+            {/* The approximate-data warning belongs on the SUMMARY STRIP, not
+                inside the "Currently queued" panel: the strip renders whether
+                or not the group is collapsed AND regardless of
+                d.active.length, so the warning is now visible in exactly the
+                case that matters — orchestrator unreachable and the
+                event-derived fallback empty, where "0 queued" previously read
+                as a confident zero. */}
+            {d.active_approximate && <span className="badge warn">approx · event-derived</span>}
             <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{fmtMs(d.latency.p50)} p50</span>
             <span style={{ color: 'var(--fg-3)' }}>· {hitPct}% spec hit</span>
           </>
@@ -965,7 +979,9 @@ function MergeTab({ projectFilter }) {
                   <div className="col-span-6 panel">
                     <div className="panel-head">
                       <span className="title">Currently queued</span>
-                      {d.active_approximate && <span className="meta" style={{ color: 'var(--warn,#fbbf24)' }}>approx · event-derived</span>}
+                      {/* The approx · event-derived badge moved to the summary
+                          strip above — rendering it here too would double up
+                          the same warning whenever this panel is shown. */}
                     </div>
                     <div className="panel-body flush">
                       <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>State</th><th>Branch</th><th className="num">Age</th><th className="num">Pos</th><th>Waiter</th><th className="num">When</th></tr></thead>
@@ -1181,6 +1197,25 @@ function BurnTab({ projectFilter, displayWindow }) {
   const [openMap, toggle, setAll] = useOpenSet(projIds, true, 'df.open.burn');
   const allOpen = projIds.every(p => openMap[p]);
 
+  // Concurrency-parity banner (E12). The verdict is computed server-side, where
+  // each snapshot is judged against the cap stored ON that snapshot.
+  // max_concurrent_tasks is restart-only (red-tier), but a burndown window spans
+  // restarts and the cap also varies between projects, so it is TIME-VARYING
+  // across the window regardless: re-deriving one cap here from the rendered
+  // series would forgive a real past breach after a raise and invent one after a
+  // cut. This renders the verdict and nothing else.
+  const parityBanner = (block, projects) => {
+    if (!block || !block.parity_alarm) return null;
+    const n = block.parity_breach_count ?? 0;
+    const who = projects && projects.length ? ` · ${projects.join(', ')}` : '';
+    return (
+      <div className="badge bad" style={{ padding: '6px 12px', fontSize: 11 }}>
+        ⚠ Over concurrency cap · peaked at {block.parity_peak} in flight, cap {block.parity_cap}
+        {` · ${n} snapshot${n !== 1 ? 's' : ''} over${who}`}
+      </div>
+    );
+  };
+
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       {(() => {
@@ -1241,16 +1276,21 @@ function BurnTab({ projectFilter, displayWindow }) {
             <span className="meta">aggregate · all projects</span>
           </div>
           <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {b.parity_alarm && parityBanner(b, b.parity_projects)}
             <div style={{ display: 'flex', gap: 16, fontSize: 11 }}>
-              {[['done',CP.ok],['in-progress',CP.accent],['blocked',CP.bad],['pending',CP.warn]].map(([l,c]) => (
+              {[['done',CP.ok],['live',CP.accent],['stranded',CP.stranded],['blocked',CP.bad],['pending',CP.warn]].map(([l,c]) => (
                 <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
               ))}
             </div>
+            {/* in_progress is banded as live + stranded, never alongside them:
+                stacking the whole beside its parts would draw a total no
+                census ever produced. The server guarantees they sum. */}
             <SA labels={b.labels} stacks={[
-              { key: 'done',        color: CP.ok,     values: b.done },
-              { key: 'in_progress', color: CP.accent, values: b.in_progress },
-              { key: 'blocked',     color: CP.bad,    values: b.blocked },
-              { key: 'pending',     color: CP.warn,   values: b.pending },
+              { key: 'done',                 color: CP.ok,       values: b.done },
+              { key: 'in_progress_live',     color: CP.accent,   values: b.in_progress_live },
+              { key: 'in_progress_stranded', color: CP.stranded, values: b.in_progress_stranded },
+              { key: 'blocked',              color: CP.bad,      values: b.blocked },
+              { key: 'pending',              color: CP.warn,     values: b.pending },
             ]} height={300} formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
@@ -1311,16 +1351,21 @@ function BurnTab({ projectFilter, displayWindow }) {
                     <span className="title">Status mix · 30d</span>
                   </div>
                   <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    {pb.parity_alarm && parityBanner(pb, null)}
                     <div style={{ display: 'flex', gap: 16, fontSize: 11 }}>
-                      {[['done',CP.ok],['in-progress',CP.accent],['blocked',CP.bad],['pending',CP.warn]].map(([l,c]) => (
+                      {[['done',CP.ok],['live',CP.accent],['stranded',CP.stranded],['blocked',CP.bad],['pending',CP.warn]].map(([l,c]) => (
                         <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
                       ))}
                     </div>
-                    <SA labels={b.labels} stacks={[
-                      { key: 'done',        color: CP.ok,     values: pb.done },
-                      { key: 'in_progress', color: CP.accent, values: pb.in_progress },
-                      { key: 'blocked',     color: CP.bad,    values: pb.blocked },
-                      { key: 'pending',     color: CP.warn,   values: pb.pending },
+                    {/* Bands must be indexed by THIS project's own snapshot row: b.labels is
+                        the sorted union across all projects (redux_api.py shape_burndown), so
+                        pairing it with pb.* both overruns and index-shifts them. */}
+                    <SA labels={pb.labels} stacks={[
+                      { key: 'done',                 color: CP.ok,       values: pb.done },
+                      { key: 'in_progress_live',     color: CP.accent,   values: pb.in_progress_live },
+                      { key: 'in_progress_stranded', color: CP.stranded, values: pb.in_progress_stranded },
+                      { key: 'blocked',              color: CP.bad,      values: pb.blocked },
+                      { key: 'pending',              color: CP.warn,     values: pb.pending },
                     ]} height={220} formatX={window.DF_SHELL.fmtDateTime} />
                   </div>
                 </div>

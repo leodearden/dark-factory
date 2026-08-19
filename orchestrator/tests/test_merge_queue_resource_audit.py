@@ -755,6 +755,218 @@ class TestWorktreeLedgerViolations:
 
         assert worker.worktree_ledger_violations(now=self._NOW) == []
 
+    # -- task 3622: the reclaim DISPOSITION carried in the violation string --
+    #
+    # Detection now fires well before escalation does, so an operator reading
+    # the WARNING log or snapshot()['resource_audit']['worktree_ledger'] sees
+    # violations that are self-healing and violations that are stuck, with
+    # nothing to tell them apart. The string itself carries the distinction —
+    # it is the single value that flows to all three consumers (log line,
+    # snapshot census, escalation body), so annotating it once reaches every
+    # consumer with no snapshot key churn (those are pinned by exact dict
+    # equality in three places).
+
+    _REAP_AGE = 200.0  # test-scale PERIODIC_REAP_MIN_AGE_SECS (destruction floor)
+
+    def test_leak_inside_the_reclaim_window_is_marked_as_scheduled(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._REAP_AGE
+        wt = _mkdir_worktree(git_ops, '_merge-inband', mtime=self._NOW - 150.0)
+
+        violations = worker.worktree_ledger_violations(now=self._NOW)
+
+        assert len(violations) == 1
+        v = violations[0]
+        assert str(wt.resolve()) in v
+        assert 'scheduled for automatic reclaim' in v
+        # Names the age at which reclaim comes due, so the reader can tell how
+        # long the self-healing window still has to run.
+        assert '200s' in v, f'expected the destruction floor named, got: {v!r}'
+        assert 'overdue' not in v
+
+    def test_leak_past_the_destruction_floor_is_marked_overdue(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._REAP_AGE
+        _mkdir_worktree(git_ops, '_merge-stuck', mtime=self._NOW - 300.0)
+
+        violations = worker.worktree_ledger_violations(now=self._NOW)
+
+        assert len(violations) == 1
+        v = violations[0]
+        assert 'reclaim overdue' in v
+        assert 'scheduled for automatic reclaim' not in v
+
+    def test_annotated_string_preserves_the_path_and_age_grace_figures(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The annotation is APPENDED — the pre-existing leading text is
+        byte-identical, so the substring/count assertions elsewhere in this
+        suite and in the reaper/lifecycle gates keep holding.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._REAP_AGE
+
+        inband = _mkdir_worktree(git_ops, '_merge-a', mtime=self._NOW - 150.0)
+        stuck = _mkdir_worktree(git_ops, '_merge-b', mtime=self._NOW - 300.0)
+
+        violations = worker.worktree_ledger_violations(now=self._NOW)
+        assert len(violations) == 2
+        matches = {
+            p: [v for v in violations if str(p.resolve()) in v] for p in (inband, stuck)
+        }
+        # An explicit COUNT, not a dict comprehension whose inner loop would
+        # silently keep only the last match: if a regression made both strings
+        # name both paths, `len(matches) == 2` would still pass and the
+        # per-path assertions below could then check the wrong string.
+        assert all(len(vs) == 1 for vs in matches.values()), (
+            f'each path must appear in exactly one violation: {violations!r}'
+        )
+
+        for path, (v,) in matches.items():
+            assert v.startswith(
+                f'unregistered on-disk merge worktree {path.resolve()} '
+            ), f'leading text must be unchanged, got: {v!r}'
+            assert f'grace {self._GRACE:.0f}s' in v
+            assert 'absent from owned ledger — possible leak' in v
+
+    def test_snapshot_census_carries_the_same_annotated_strings(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The disposition reaches snapshot()['resource_audit'] through the
+        string, with no new sub-key (those are pinned by exact dict equality).
+        """
+        import time
+
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._REAP_AGE
+        # snapshot() calls the audit with no `now`, so back-date off the real
+        # clock to land the tree inside the reclaim window.
+        _mkdir_worktree(git_ops, '_merge-snap', mtime=time.time() - 150.0)
+
+        census = worker.snapshot()['resource_audit']['worktree_ledger']
+
+        assert len(census) == 1
+        assert 'scheduled for automatic reclaim' in census[0]
+        # Still structurally identical to a direct call (the pin at
+        # test_resource_audit_is_additive_and_matches_direct_audit_calls).
+        assert set(worker.snapshot()['resource_audit']) == {
+            'speculation_accounting', 'worktree_ledger',
+        }
+
+    # -- task 3622: the `grace_secs` floor override ------------------------
+    #
+    # Mirrors reap_orphaned_merge_worktrees' `min_age_secs` idiom (same
+    # module, same "None means inherit the class default" semantics), so
+    # detection and remediation expose the identical override shape. Raising
+    # the floor narrows WHICH leaks are reported; it never disables the check
+    # and never touches any other exclusion.
+
+    def test_grace_secs_override_can_raise_the_floor_above_an_aged_tree(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        _mkdir_worktree(
+            git_ops, '_merge-justpast', mtime=self._NOW - self._GRACE - 10,
+        )
+
+        # Flagged at the default floor...
+        assert len(worker.worktree_ledger_violations(now=self._NOW)) == 1
+        # ...but not once the floor is raised past its age.
+        assert worker.worktree_ledger_violations(
+            now=self._NOW, grace_secs=self._GRACE * 10,
+        ) == []
+
+    def test_grace_secs_none_is_identical_to_omitting_it(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        _mkdir_worktree(
+            git_ops, '_merge-inherit', mtime=self._NOW - self._GRACE - 10,
+        )
+
+        omitted = worker.worktree_ledger_violations(now=self._NOW)
+        explicit_none = worker.worktree_ledger_violations(
+            now=self._NOW, grace_secs=None,
+        )
+
+        assert len(omitted) == 1
+        assert explicit_none == omitted
+
+    def test_tree_older_than_the_explicit_grace_is_still_flagged(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The override RAISES the floor — it does not disable the check."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        raised = self._GRACE * 10
+        wt = _mkdir_worktree(
+            git_ops, '_merge-ancient', mtime=self._NOW - raised - 10,
+        )
+
+        violations = worker.worktree_ledger_violations(
+            now=self._NOW, grace_secs=raised,
+        )
+
+        assert len(violations) == 1, f'expected exactly one violation, got: {violations!r}'
+        assert str(wt.resolve()) in violations[0]
+
+    def test_grace_secs_override_does_not_disturb_the_other_exclusions(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Ownership / prefix / persistent-worktree / _running exclusions are
+        orthogonal to the floor: an excluded tree stays unflagged at ANY
+        grace_secs, including 0 (which admits every age).
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        aged = self._NOW - self._GRACE - 10
+
+        owned = _mkdir_worktree(git_ops, '_merge-owned', mtime=aged)
+        worker._register_owned_merge_worktree(owned)
+        _mkdir_worktree(git_ops, PERSISTENT_MERGE_WORKTREE_NAME, mtime=aged)
+        _mkdir_worktree(git_ops, '_solo-xyz', mtime=aged)
+
+        for grace in (0.0, self._GRACE, self._GRACE * 10):
+            assert worker.worktree_ledger_violations(
+                now=self._NOW, grace_secs=grace,
+            ) == [], f'exclusions must hold at grace_secs={grace}'
+
+        # ...and the _running guard still short-circuits ahead of the floor.
+        _mkdir_worktree(git_ops, '_merge-leaked', mtime=aged)
+        assert len(worker.worktree_ledger_violations(
+            now=self._NOW, grace_secs=0.0,
+        )) == 1
+        worker._running = False
+        assert worker.worktree_ledger_violations(
+            now=self._NOW, grace_secs=0.0,
+        ) == []
+
 
 # ---------------------------------------------------------------------------
 # step-5 RED / step-6 GREEN: additive snapshot()['resource_audit'] key
@@ -1224,3 +1436,398 @@ class TestSpeculationLedgerWiring:
         asyncio.run(worker._speculation_controller.acquire_for_lookahead())
 
         assert worker.speculation_accounting_violations() == []
+
+
+# ---------------------------------------------------------------------------
+# task 3622 step-1 RED / step-2 GREEN: the derived ESCALATION age floor
+# (_resource_audit_escalation_age_secs) — the age past which a leaked worktree
+# has outlived its scheduled automatic reclaim and is therefore genuinely
+# escalation-worthy.
+# ---------------------------------------------------------------------------
+
+
+class TestResourceAuditEscalationFloor:
+    """Unit tests for ``SpeculativeMergeWorker._resource_audit_escalation_age_secs()``
+    and the ``RESOURCE_AUDIT_REAP_GRACE_SWEEPS`` tuning constant (task 3622).
+
+    The floor is DERIVED at runtime from the reaper it waits on rather than
+    being a fourth hand-picked seconds constant: the periodic sweep
+    (``_maybe_reap_orphaned_merge_worktrees``) destroys any unowned
+    ``_merge-*`` past ``PERIODIC_REAP_MIN_AGE_SECS`` on its next firing, so
+    ONE ``_reap_interval_s`` is the guaranteed-opportunity bound and the
+    SECOND covers a single fail-open ``cleanup_merge_worktree`` failure and
+    retry.  It must be a METHOD, not a class constant, because
+    ``_reap_interval_s`` is an instance attribute set in ``__init__``.
+
+    RED until step-2 GREEN adds the constant + method to merge_queue.py.
+    """
+
+    def test_floor_is_the_reap_age_plus_grace_sweeps_times_the_reap_interval(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+
+        assert worker._resource_audit_escalation_age_secs() == (
+            worker.PERIODIC_REAP_MIN_AGE_SECS
+            + worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS * worker._reap_interval_s
+        )
+
+    def test_at_shipped_defaults_the_floor_exceeds_both_existing_floors(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The ordering that makes the reclaim band a real band.
+
+        detection floor < destruction floor < escalation floor — so there is
+        a non-empty age range in which a leak is DETECTED (and logged, and
+        censused in ``snapshot()``) but not yet ESCALATED, because the reaper
+        is still scheduled to clear it.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        floor = worker._resource_audit_escalation_age_secs()
+
+        assert floor > worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+        assert floor > worker.PERIODIC_REAP_MIN_AGE_SECS
+        # The band the suppression lives in is bounded by the reaper's own
+        # cadence, not by an arbitrary constant.
+        assert worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS >= 1.0
+        assert worker._reap_interval_s > 0.0
+
+    def test_floor_tracks_a_per_instance_monkeypatch_of_the_reap_age(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.PERIODIC_REAP_MIN_AGE_SECS = 200.0
+        worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS = 2.0
+        worker._reap_interval_s = 10.0
+
+        assert worker._resource_audit_escalation_age_secs() == 220.0
+
+    def test_floor_tracks_a_per_instance_monkeypatch_of_the_reap_interval(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Recomputed on every call — the floor never caches a stale interval."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.PERIODIC_REAP_MIN_AGE_SECS = 200.0
+        worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS = 1.0
+        worker._reap_interval_s = 10.0
+        assert worker._resource_audit_escalation_age_secs() == 210.0
+
+        worker._reap_interval_s = 50.0
+        assert worker._resource_audit_escalation_age_secs() == 250.0
+
+    def test_grace_sweeps_is_a_monkeypatchable_class_attribute(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Declared on the class (per the RESOURCE_AUDIT_*/MAX_* convention) so
+        a test can shrink it per-instance without a monkeypatch fixture.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        # Captured BEFORE the per-instance assignment below, so the no-leak
+        # check compares against whatever the shipped default happens to be
+        # rather than pinning it away from one arbitrary value (3.0 — "three
+        # sweeps" — is a perfectly plausible future retune).
+        original = SpeculativeMergeWorker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.PERIODIC_REAP_MIN_AGE_SECS = 100.0
+        worker._reap_interval_s = 5.0
+        worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS = 3.0
+
+        assert worker._resource_audit_escalation_age_secs() == 115.0
+        # Per-instance only — the class default is untouched for other tests.
+        # (Written original-first: ruff SIM300 reads an ALL_CAPS attribute on
+        # the left of `==` as a Yoda condition.)
+        assert original == SpeculativeMergeWorker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS, (
+            'the per-instance assignment must not leak to the class default'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3622 step-5 RED / step-6 GREEN: _check_resource_audit must NOT escalate
+# a leaked worktree that is still inside the periodic reaper's scheduled-
+# reclaim window (esc-__merge_resource_leak__-46/-47 regression).
+# ---------------------------------------------------------------------------
+
+
+class TestCheckResourceAuditReclaimBandSuppression:
+    """The reclaim band: detected + logged, but not yet escalation-worthy.
+
+    A leaked ``_merge-*`` worktree aged between the DETECTION floor
+    (``RESOURCE_AUDIT_WORKTREE_GRACE_SECS``) and the ESCALATION floor
+    (``_resource_audit_escalation_age_secs()``) is a condition
+    ``_maybe_reap_orphaned_merge_worktrees`` is already SCHEDULED to clear.
+    Paging a human about it reports work that is about to happen anyway —
+    which is exactly what produced esc-``__merge_resource_leak__``-46/-47.
+
+    Suppression is applied at the ALARM call site only.  Detection, the
+    WARNING log, the streak counter, and ``snapshot()['resource_audit']`` all
+    keep firing at the lower detection floor, so the leak census stays
+    truthful throughout the band and a tree that crosses the escalation floor
+    mid-streak alarms on the very NEXT poll rather than restarting a
+    3-heartbeat countdown.
+
+    RED until step-6 GREEN partitions the escalation predicate.
+    """
+
+    _NOW = 1_000_000.0
+    # Test-scale floors: detection 100 < destruction 200 < escalation 220
+    # (200 + 2 sweeps x 10 s).  Ages 100..220 are the band under test.
+    _DETECT = 100.0
+    _REAP_AGE = 200.0
+    _REAP_INTERVAL = 10.0
+    _SWEEPS = 2.0
+    _ESCALATION_FLOOR = 220.0
+    _IN_BAND_AGE = 150.0
+    _PAST_FLOOR_AGE = 300.0
+
+    def _worker(self, git_ops: GitOps, fake_eq: _FakeEscalationQueue):
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=fake_eq, speculation_depth=2,
+        )
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._DETECT
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._REAP_AGE
+        worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS = self._SWEEPS
+        worker._reap_interval_s = self._REAP_INTERVAL
+        assert worker._resource_audit_escalation_age_secs() == self._ESCALATION_FLOOR
+        assert self._DETECT < self._IN_BAND_AGE < self._ESCALATION_FLOOR
+        return worker
+
+    def test_in_band_leak_is_detected_and_logged_but_never_escalated(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """THE regression. Across more consecutive violating heartbeats than
+        the streak threshold, an in-band leak still warns every time and still
+        drives the streak — but never pages a human.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        wt = _mkdir_worktree(
+            git_ops, '_merge-inband', mtime=self._NOW - self._IN_BAND_AGE,
+        )
+        calls = worker.RESOURCE_AUDIT_ESCALATION_STREAK + 2
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            for i in range(1, calls + 1):
+                worker._check_resource_audit(self._NOW + i)
+
+        # Detection is untouched: the tree is still a reported violation.
+        violations = worker.worktree_ledger_violations(now=self._NOW + calls)
+        assert len(violations) == 1
+        assert str(wt.resolve()) in violations[0]
+
+        # Logging is untouched: one WARNING per violating call.
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == calls, f'expected {calls} WARNINGs, got: {caplog.text}'
+
+        # The streak is untouched: it keeps counting through the band.
+        assert worker._resource_audit_violation_streak == calls
+
+        # ...but nothing pages, even well past the streak threshold.
+        assert fake_eq.submitted == [], (
+            'a worktree still inside its scheduled-reclaim window must not '
+            f'escalate, got: {fake_eq.submitted!r}'
+        )
+
+    def test_leak_past_the_escalation_floor_still_escalates_exactly_once(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The suppression is a delay, not a mute: past the floor the reaper
+        has demonstrably failed and the alarm fires exactly as before.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        wt = _mkdir_worktree(
+            git_ops, '_merge-stuck', mtime=self._NOW - self._PAST_FLOOR_AGE,
+        )
+        n = worker.RESOURCE_AUDIT_ESCALATION_STREAK
+
+        for i in range(1, n + 1):
+            worker._check_resource_audit(self._NOW + i)
+
+        assert len(fake_eq.submitted) == 1, (
+            f'expected exactly one escalation after {n} consecutive violating '
+            f'heartbeats, got {len(fake_eq.submitted)}'
+        )
+        esc = fake_eq.submitted[0]
+        assert esc.category == 'merge_resource_leak'
+        assert esc.severity == 'blocking'
+        assert esc.level == 1
+        assert str(wt.resolve()) in esc.detail
+
+        # Dedup is unchanged: with the L1 now open (as the real queue would
+        # report after the submit above), further violating polls do not
+        # resubmit. Mirrors TestCheckResourceAudit's convention.
+        fake_eq.open_it()
+        worker._check_resource_audit(self._NOW + n + 1)
+        assert len(fake_eq.submitted) == 1, 'must not resubmit while the L1 is open'
+
+    def test_tree_crossing_the_floor_mid_streak_alarms_on_the_next_poll(
+        self, git_ops: GitOps,
+    ) -> None:
+        """No fresh countdown: the streak accrued during the band is retained,
+        so the first poll past the floor is the one that pages.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        _mkdir_worktree(
+            git_ops, '_merge-crossing', mtime=self._NOW - self._IN_BAND_AGE,
+        )
+        n = worker.RESOURCE_AUDIT_ESCALATION_STREAK
+
+        # Exhaust the streak entirely inside the band — no escalation.
+        for i in range(1, n + 1):
+            worker._check_resource_audit(self._NOW + i)
+        assert worker._resource_audit_violation_streak == n
+        assert fake_eq.submitted == []
+
+        # One further poll, late enough that the tree has now outlived the
+        # escalation floor (age = _IN_BAND_AGE + 100 = 250 > 220).
+        worker._check_resource_audit(self._NOW + 100)
+
+        assert len(fake_eq.submitted) == 1, (
+            'a tree that crosses the escalation floor must alarm on the next '
+            'poll without restarting the streak'
+        )
+
+    def test_permit_leak_escalates_unfiltered_alongside_an_in_band_worktree(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Only the worktree arm is age-suppressed.
+
+        Nothing reclaims a leaked speculation permit, so a permit leak is a
+        genuine "nobody is going to clean this up" from its first heartbeat
+        and must keep paging — while the in-band worktree sharing that same
+        heartbeat stays out of the escalation body.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        wt = _mkdir_worktree(
+            git_ops, '_merge-inband-mixed', mtime=self._NOW - self._IN_BAND_AGE,
+        )
+        worker._speculation_slot._value -= 1  # forced, PERSISTING permit leak
+        n = worker.RESOURCE_AUDIT_ESCALATION_STREAK
+
+        for i in range(1, n + 1):
+            worker._check_resource_audit(self._NOW + i)
+
+        assert len(fake_eq.submitted) == 1, (
+            'a permit leak must escalate at the streak threshold regardless '
+            'of any co-occurring in-band worktree'
+        )
+        esc = fake_eq.submitted[0]
+        assert 'speculation' in esc.detail.lower()
+        assert str(wt.resolve()) not in esc.detail, (
+            'the in-band worktree is still inside its reclaim window and must '
+            'not be named in the escalation body'
+        )
+
+    # -- the sub-band, and the strict-inequality boundary ------------------
+    #
+    # The tests above probe 150 (well inside the band) and 300 (well past the
+    # floor), leaving the two least-obvious states this change creates untested.
+    #
+    #   1. The SUB-BAND between the DESTRUCTION floor (_REAP_AGE) and the
+    #      ESCALATION floor: the tree is already labelled 'reclaim overdue' in
+    #      the WARNING log and in snapshot()['resource_audit'] — because the
+    #      disposition is annotated against the destruction floor — and yet it
+    #      still must not page, because the reaper's grace sweeps are not spent.
+    #      A refactor that annotated against the ESCALATION floor instead, or
+    #      that suppressed on the disposition rather than on a re-run of the
+    #      audit, would pass every other test in this class.
+    #   2. The BOUNDARY itself: worktree_ledger_violations gates on
+    #      ``age > grace`` (STRICT), while the disposition uses
+    #      ``age >= reap_age``.  Flipping either comparison is invisible to
+    #      tests that only probe far sides.
+    #
+    # Both drive _check_resource_audit at a FIXED ``now`` (unlike the tests
+    # above, which advance it per poll) so the age under test stays pinned to
+    # the boundary however RESOURCE_AUDIT_ESCALATION_STREAK is later retuned.
+
+    _OVERDUE_IN_BAND_AGE = 210.0  # _REAP_AGE < this < _ESCALATION_FLOOR
+
+    def test_overdue_but_still_in_band_leak_is_labelled_yet_not_escalated(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Past the DESTRUCTION floor, inside the reaper's grace sweeps."""
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        assert self._REAP_AGE < self._OVERDUE_IN_BAND_AGE < self._ESCALATION_FLOOR
+        wt = _mkdir_worktree(
+            git_ops, '_merge-overdue-inband',
+            mtime=self._NOW - self._OVERDUE_IN_BAND_AGE,
+        )
+
+        for _ in range(worker.RESOURCE_AUDIT_ESCALATION_STREAK + 2):
+            worker._check_resource_audit(self._NOW)
+
+        violations = worker.worktree_ledger_violations(now=self._NOW)
+        assert len(violations) == 1
+        assert str(wt.resolve()) in violations[0]
+        # The census and the WARNING log already say "overdue" — the
+        # disposition tracks the DESTRUCTION floor, not the escalation floor.
+        assert 'reclaim overdue' in violations[0], (
+            f'expected the overdue disposition past {self._REAP_AGE}s, '
+            f'got: {violations[0]!r}'
+        )
+        # ...and it still must not page.
+        assert fake_eq.submitted == [], (
+            'a tree past the destruction floor but still inside the reaper '
+            f'grace-sweep window must not escalate, got: {fake_eq.submitted!r}'
+        )
+
+    def test_age_exactly_at_the_escalation_floor_does_not_escalate(
+        self, git_ops: GitOps,
+    ) -> None:
+        """``age > grace`` is STRICT: exactly at the floor is not past it."""
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        wt = _mkdir_worktree(
+            git_ops, '_merge-at-floor', mtime=self._NOW - self._ESCALATION_FLOOR,
+        )
+        # Self-verifying: were the backdated mtime ever quantised by the
+        # filesystem, this test would silently stop probing the boundary.
+        assert self._NOW - wt.stat().st_mtime == self._ESCALATION_FLOOR
+
+        for _ in range(worker.RESOURCE_AUDIT_ESCALATION_STREAK + 2):
+            worker._check_resource_audit(self._NOW)
+
+        # Still DETECTED at the lower detection floor...
+        assert len(worker.worktree_ledger_violations(now=self._NOW)) == 1
+        # ...but age == floor has not yet OUTLIVED the floor.
+        assert fake_eq.submitted == [], (
+            f'age exactly {self._ESCALATION_FLOOR}s is not past the escalation '
+            f'floor, got: {fake_eq.submitted!r}'
+        )
+
+    def test_one_second_past_the_escalation_floor_escalates(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The other side of the same strict ``>``, so the pair pins the
+        boundary itself rather than only its two far sides.
+        """
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker = self._worker(git_ops, fake_eq)
+        wt = _mkdir_worktree(
+            git_ops, '_merge-past-floor',
+            mtime=self._NOW - (self._ESCALATION_FLOOR + 1.0),
+        )
+
+        for _ in range(worker.RESOURCE_AUDIT_ESCALATION_STREAK):
+            worker._check_resource_audit(self._NOW)
+
+        assert len(fake_eq.submitted) == 1, (
+            f'one second past the {self._ESCALATION_FLOOR}s escalation floor '
+            f'must page, got: {fake_eq.submitted!r}'
+        )
+        assert str(wt.resolve()) in fake_eq.submitted[0].detail

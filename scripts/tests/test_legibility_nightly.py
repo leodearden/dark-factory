@@ -13,11 +13,10 @@ the commit path is genuinely exercised without risking main.
 from __future__ import annotations
 
 import contextlib
-import gzip
 import json
 import logging
 import subprocess
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -113,20 +112,29 @@ def _encode_cwd(cwd: str) -> str:
 
 def _write_transcript(
     path: Path, *, cwd: str, timestamp: str, session_id: str = 'session-1',
+    user_text: str = 'please fix this confusing bug',
 ) -> None:
     """Write a minimal fixture session transcript JSONL with a genuine user
     turn plus a structural tool-error (nonzero confusion signal): a user
     turn, an assistant tool_use, and a user tool_result carrying
     ``is_error: true`` with 'No such file or directory' content (matches
     sampling._NOT_FOUND_PATTERNS too, for a score > 0 on more than one
-    signal class)."""
+    signal class).
+
+    *user_text* overrides the first user turn. It exists so a test can write
+    TWO transcripts that both survive to the digest phase: the sampler's
+    ``dedupe_shapes`` fingerprints on (stratum, signal-shape,
+    ``_normalize_first_turn(first_turn_text)``), so two transcripts differing
+    only in ``session_id`` collapse to one and a multi-record night silently
+    becomes a single-record one. Defaulted, so every existing caller is
+    unchanged."""
     lines = [
         {
             'type': 'user',
             'cwd': cwd,
             'timestamp': timestamp,
             'sessionId': session_id,
-            'message': {'role': 'user', 'content': 'please fix this confusing bug'},
+            'message': {'role': 'user', 'content': user_text},
         },
         {
             'type': 'assistant',
@@ -215,33 +223,6 @@ def _write_quiet_transcript(
     path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n', encoding='utf-8')
 
 
-def _write_transcript_gz(
-    path: Path, *, cwd: str, timestamp: str, session_id: str = 'session-1',
-) -> None:
-    """Gzip variant of :func:`_write_transcript` — the on-disk form of an
-    archived fleet session (``shared.transcript_archive`` writes
-    ``<sid>.jsonl.gz``). Same nonzero-confusion content, gzip-compressed."""
-    lines = [
-        {
-            'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'sessionId': session_id,
-            'message': {'role': 'user', 'content': 'please fix this confusing bug'},
-        },
-        {
-            'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'sessionId': session_id,
-            'message': {
-                'role': 'user',
-                'content': [
-                    {'type': 'tool_result', 'tool_use_id': 'tool-1', 'is_error': True,
-                     'content': 'No such file or directory'},
-                ],
-            },
-        },
-    ]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(path, 'wt', encoding='utf-8') as f:
-        f.write('\n'.join(json.dumps(line) for line in lines) + '\n')
-
-
 # ---------------------------------------------------------------------------
 # step-3/4: select_scored_records (+ the stratified sampler)
 # ---------------------------------------------------------------------------
@@ -262,12 +243,12 @@ def test_select_scored_records_includes_matching_session(tmp_path):
     assert record.stratum
 
 
-def test_select_scored_records_reads_gz_archive_root(tmp_path):
+def test_select_scored_records_reads_archive_root(tmp_path):
     # End-to-end proof that the shipped agent_transcript_roots is LIVE with no
     # operator flip: resolve (cfg.project_root) -> enumerate (walk the archive)
-    # -> gz-read (iter_json_lines) -> classify (encoded worktree parent dir).
+    # -> read (iter_json_lines) -> classify (encoded worktree parent dir).
     # An archived role transcript at the production nested layout
-    # <archive>/<task_id>/<enc>/<sid>.jsonl.gz is enumerated ALONGSIDE an
+    # <archive>/<task_id>/<enc>/<sid>.jsonl is enumerated ALONGSIDE an
     # (empty) ~/.claude/projects tree and classified 'orchestrated-task'.
     main_cwd = '/home/leo/src/dark-factory'
     worktree_cwd = '/home/leo/src/dark-factory/.worktrees/2573'
@@ -276,16 +257,17 @@ def test_select_scored_records_reads_gz_archive_root(tmp_path):
         tmp_path, project_id='dark_factory', cwd_prefixes=[main_cwd],
         agent_transcript_roots=['archive'],
     ))
-    gz_path = tmp_path / 'archive' / '2573' / encoded / 'sess-x.jsonl.gz'
-    _write_transcript_gz(
-        gz_path, cwd=worktree_cwd, timestamp='2026-07-13T10:00:00Z', session_id='sess-x',
+    archived = tmp_path / 'archive' / '2573' / encoded / 'sess-x.jsonl'
+    archived.parent.mkdir(parents=True, exist_ok=True)
+    _write_transcript(
+        archived, cwd=worktree_cwd, timestamp='2026-07-13T10:00:00Z', session_id='sess-x',
     )
     empty_projects_root = tmp_path / 'projects'  # never created — projects tree absent
 
     scored = nightly.select_scored_records(cfg, empty_projects_root, date(2026, 7, 13))
 
     assert len(scored) == 1
-    assert scored[0].session.path == gz_path
+    assert scored[0].session.path == archived
     assert scored[0].stratum == 'orchestrated-task'
 
 
@@ -830,8 +812,25 @@ def test_post_escalation_is_best_effort_on_poster_failure(tmp_path):
 
 
 class _FakeHttpxResponse:
+    """A 200 `application/json` reply with an empty JSON-RPC body.
+
+    `status_code`, `headers` and `json()` were added for task 3644:
+    `_default_poster` now delegates to `census_trigger.post_mcp_envelope`,
+    which reads `status_code` (to detect the stateful escalation server's 400
+    "Missing session ID") and `content-type` (to detect an SSE-framed body)
+    before decoding. Without them this fake would die on an AttributeError
+    and stop exercising the real code path -- so the task-2953 header
+    contract below keeps being asserted against the transport that actually
+    ships, not against a fake the implementation has outgrown."""
+
+    status_code = 200
+    headers = {'content-type': 'application/json'}
+
     def raise_for_status(self):
         pass
+
+    def json(self):
+        return {}
 
 
 def test_default_poster_sends_streamable_http_accept_headers(install_fake_httpx):
@@ -919,6 +918,163 @@ def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
     assert launcher_calls == [1]
 
 
+def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplog):
+    """task 4148 (amendment): the decision line must reach the journal BEFORE
+    the census subprocess starts, and must survive a launcher that dies.
+
+    `launcher()` runs the census SYNCHRONOUSLY -- `_default_census_launcher`
+    subprocess-runs census.py, whose stages carry the 120/900/1800s timeouts
+    in config.py's Timeouts. So a line logged at run_nightly's call site, i.e.
+    after this function has returned, reaches the journal only once the whole
+    census has finished (tens of minutes later) and never at all if the unit
+    is killed, times out, or the box reboots mid-census -- exactly the FIRE
+    case the line exists to make visible. An operator tailing a RUNNING unit
+    would otherwise watch a census start with no logged reason for it.
+    """
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        return census_trigger.Decision(fire=True, reasons=[
+            'tasks-landed: 130 landed since last census (threshold 120) -> FIRE',
+        ])
+
+    # Snapshots the journal as the census subprocess would start, then dies
+    # the way a timed-out/killed census does.
+    logged_at_launch = []
+
+    def _dying_launcher():
+        logged_at_launch.extend(r.getMessage() for r in caplog.records)
+        raise subprocess.TimeoutExpired(cmd='census.py', timeout=1800)
+
+    with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+        line, fire = nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            entrypoint_exists=lambda: True, launcher=_dying_launcher,
+        )
+
+    assert fire is True
+
+    # The reason is on the journal BEFORE the launch, not after it.
+    assert any(
+        'legibility trickle: census trigger: FIRE' in m for m in logged_at_launch
+    ), logged_at_launch
+    assert any('tasks-landed: 130 landed' in m for m in logged_at_launch), logged_at_launch
+
+    # ...and a launcher that never returns cleanly cannot take it away.
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f'legibility trickle: {line}' == m for m in messages), messages
+    # Exactly once: run_nightly no longer logs its own copy at the call site.
+    assert len([m for m in messages if m.startswith('legibility trickle: census trigger:')]) == 1
+
+
+def test_evaluate_census_step_logs_a_failed_evaluation_too(tmp_path, caplog):
+    """task 4148 (amendment): ONE log site covers both paths, so the journal
+    line and the `census_line` returned on NightlyResult cannot drift -- a
+    failed evaluation reports its synthetic NO-FIRE line on the same channel
+    an operator greps for the healthy one."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
+
+    with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+        line, fire = nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            entrypoint_exists=lambda: True, launcher=lambda: None,
+        )
+
+    assert fire is False
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert [m for m in infos if m == f'legibility trickle: {line}'], infos
+    assert 'trigger evaluation failed' in line
+
+
+def test_evaluate_census_step_survives_a_raising_decide(tmp_path, caplog):
+    """task 4085: the docstring's "this function never raises and never fails
+    the run" must hold for the DECIDE call, not only for the launcher call.
+
+    Today it guards only `launcher()` and parenthetically ASSUMES `decide` is
+    fail-safe ("never raises -- fail-safe") -- a promise about a callee it
+    cannot enforce, and `decide` is an injected seam any caller can replace.
+    The exception raised here is the real one task 4085 reports, from an
+    unvalidated `last_census_done_count` baseline reaching
+    `current_done - baseline`.
+
+    Two properties, and the second is a safety property rather than a style
+    one: a failed evaluation has established NOTHING, so it must not be able to
+    start an expensive census -- hence the return happens before
+    `entrypoint_exists` is even consulted."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
+
+    launcher_calls = []
+    entrypoint_calls = []
+
+    def _recording_entrypoint_exists():
+        entrypoint_calls.append(1)
+        return True
+
+    with caplog.at_level('WARNING', logger='legibility.nightly'):
+        line, fire = nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            entrypoint_exists=_recording_entrypoint_exists,
+            launcher=lambda: launcher_calls.append(1),
+        )
+
+    assert fire is False
+    # A downstream reader of NightlyResult.census_line must still see a
+    # well-formed decision line -- the one case an operator most needs to read
+    # is the worst possible place to emit a novel shape.
+    assert 'NO-FIRE' in line
+    assert line.startswith('census trigger: ')
+    assert 'trigger evaluation failed' in line
+    assert 'TypeError' in line
+
+    assert launcher_calls == [], 'a failed evaluation must never launch a census'
+    assert entrypoint_calls == [], 'the failure path must return before the launcher block'
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert 'TypeError' in warnings[0].getMessage()
+
+
+def test_evaluate_census_step_bounds_a_huge_decide_failure(tmp_path, caplog):
+    """task 4085 (amendment): the fail-safe path must keep the module's
+    one-line guarantee. `decide` is an injected seam and an escaping
+    exception's message is arbitrary -- a StatusFetchUnavailable chained from
+    a big get_statuses payload, a multi-line YAML error -- yet BOTH sinks here
+    are single-line: the WARNING is one nightly journal line and `census_line`
+    is a one-line field on NightlyResult. Dumping a whole payload into either
+    is the opposite of the legible failure this trigger exists for."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        raise RuntimeError('boom ' + 'x' * 50_000 + '\nsecond line')
+
+    with caplog.at_level('WARNING', logger='legibility.nightly'):
+        line, fire = nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            entrypoint_exists=lambda: True, launcher=lambda: None,
+        )
+
+    assert fire is False
+    # Bounded, still well-formed, and still names the fault.
+    assert len(line) < 1000
+    assert line.startswith('census trigger: NO-FIRE -- trigger evaluation failed')
+    assert 'RuntimeError' in line
+    assert 'repr truncated' in line
+    # One line means one line: the repr escapes the embedded newline.
+    assert '\n' not in line
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert len(message) < 1000
+    assert '\n' not in message
+
+
 def test_default_census_launcher_logs_loud_on_nonzero_exit(monkeypatch, caplog):
     """A non-zero census subprocess exit must be logged LOUD (naming the
     returncode) rather than silently discarded -- the silent-census incident
@@ -955,6 +1111,123 @@ def test_default_census_launcher_quiet_on_zero_exit(monkeypatch, caplog):
         "census" in r.getMessage()
         for r in caplog.records if r.levelno >= logging.WARNING
     ), "a zero-exit census must not emit a census-failure warning"
+
+
+# ---------------------------------------------------------------------------
+# task 4148: run_nightly must DEFAULT the census status_fetcher seam
+#
+# The production path is the systemd `nightly.py run --project-id %i`
+# ExecStart -> main() -> run_nightly, and main() holds only --config /
+# --project-id -- no project_root to build a fetcher from. So NOTHING on that
+# path ever constructed one, `status_fetcher=None` reached
+# compute_tasks_landed on every real run, and its `status_fetcher is None`
+# fail-safe arm logged "tasks-landed: no status_fetcher configured" instead of
+# a delta: condition (b) could not fire AT ALL. Every OTHER seam in
+# run_nightly already resolves None to its real implementation (committer ->
+# _git_commit_docs_only, recorder -> trickle_state.record_run, poster ->
+# _default_poster); status_fetcher alone resolved to nothing, which is how
+# three prior repairs of this exact code (2953, 3291, 4085) each left the
+# wiring loop open.
+# ---------------------------------------------------------------------------
+
+class TestRunNightlyDefaultsTheCensusStatusFetcher:
+    """Pin run_nightly's status_fetcher seam: None means "build the real
+    MCP-backed fetcher for cfg.project_root", an explicit value is honoured.
+
+    The spy replaces ``evaluate_census_step`` ITSELF rather than the inner
+    ``decide`` seam. That is load-bearing: task 4085 wrapped the inner
+    ``decide`` call in a never-raises try/except (nightly.py:590-606) that
+    converts any failure into a synthetic ``NO-FIRE`` line, so a spy placed
+    inside it could turn a genuine wiring fault into a quiet pass.
+    """
+
+    @staticmethod
+    def _install_spies(monkeypatch):
+        """Record the factory's argument and what evaluate_census_step got.
+
+        Returns ``(sentinel, factory_calls, seen)`` where *sentinel* is the
+        object the stubbed factory hands back -- asserted by IDENTITY, so
+        "some fetcher got built" cannot pass for "the real factory's fetcher
+        got through".
+        """
+        sentinel = object()
+        factory_calls = []
+        seen = {}
+
+        def _recording_factory(project_root):
+            factory_calls.append(project_root)
+            return sentinel
+
+        def _spy_evaluate(cfg, *, now=None, status_fetcher=None):
+            seen['status_fetcher'] = status_fetcher
+            return 'census trigger: NO-FIRE -- stub', False
+
+        monkeypatch.setattr(
+            nightly.census_trigger, 'default_status_fetcher', _recording_factory,
+        )
+        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
+        return sentinel, factory_calls, seen
+
+    @staticmethod
+    def _run_quiet_night(tmp_path, **kwargs):
+        """Drive run_nightly over the light quiet-night path (empty
+        projects_root -> empty sample -> no LLM, no commit) and return the
+        loaded config, so a caller can assert against ``cfg.project_root``."""
+        config_path = _write_config(tmp_path, project_id='proj_a')
+        nightly.run_nightly(
+            config_path=config_path,
+            projects_root=tmp_path / 'projects',
+            target_date=date(2026, 7, 13),
+            invoke=lambda prompt, model: '{"proposals": []}',
+            poster=lambda url, envelope: None,
+            **kwargs,
+        )
+        return load_config(config_path)
+
+    def test_defaults_to_the_real_mcp_backed_fetcher(self, tmp_path, monkeypatch):
+        sentinel, _factory_calls, seen = self._install_spies(monkeypatch)
+
+        # No status_fetcher argument at all -- exactly what main() passes.
+        self._run_quiet_night(tmp_path)
+
+        assert seen['status_fetcher'] is sentinel, (
+            'run_nightly handed evaluate_census_step '
+            f'{seen["status_fetcher"]!r} instead of the fetcher built by '
+            'census_trigger.default_status_fetcher -- with None, '
+            'compute_tasks_landed fails safe and condition (b) can never fire'
+        )
+
+    def test_the_fetcher_is_built_for_the_configs_project_root(self, tmp_path, monkeypatch):
+        _sentinel, factory_calls, _seen = self._install_spies(monkeypatch)
+
+        cfg = self._run_quiet_night(tmp_path)
+
+        assert len(factory_calls) == 1, (
+            'default_status_fetcher must be called exactly once per run, '
+            f'got {len(factory_calls)} call(s)'
+        )
+        # The SAME project_root evaluate_census_step hands to decide()
+        # (nightly.py:591), so the fetcher and the decision can never disagree
+        # about which project they are for.
+        assert factory_calls[0] == cfg.project_root
+        # Absolute is the wire contract task 3291 fixed: fused-memory's
+        # _normalize_project_root hard-rejects any relative path.
+        assert Path(str(factory_calls[0])).is_absolute()
+
+    def test_an_injected_fetcher_is_not_overridden(self, tmp_path, monkeypatch):
+        """DI-seam regression guard: the default must not clobber an explicit
+        fetcher (every run_nightly test that injects one depends on this)."""
+        _sentinel, factory_calls, seen = self._install_spies(monkeypatch)
+
+        def my_fake():
+            return {'statuses': {}}
+
+        self._run_quiet_night(tmp_path, status_fetcher=my_fake)
+
+        assert seen['status_fetcher'] is my_fake
+        assert factory_calls == [], (
+            'an injected status_fetcher must short-circuit the default factory'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1507,6 +1780,384 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
         ['git', 'status', '--porcelain'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout
     assert 'confusion-codebook.yaml' in status
+
+
+# ---------------------------------------------------------------------------
+# task-4144: run_nightly -- one deletion-directive record must not kill the
+# whole night's merge. This is the LIVE trickle path (nothing invokes
+# `codebook.py apply` outside its own tests), and it is worse than the CLI:
+# run_nightly has no enclosing try/except and main() calls it bare, so a
+# NeverDeleteError surfaces as an uncaught traceback -- no NightlyResult, no
+# escalation, dump/commit never reached.
+# ---------------------------------------------------------------------------
+
+def _fake_invoke_deletion_directive(prompt: str, model: str) -> str:
+    """Reachable in production: coder.py rebuilds the record from a fixed key
+    allowlist (stripping a top-level delete/remove/retract/drop key) but
+    copies `matches` VERBATIM, and _MATCH_SCHEMA only requires `entry_id` --
+    so a match-level `action: delete` passes validate_coding_record and lands
+    in run.records."""
+    return json.dumps({
+        'matches': [{
+            'entry_id': 'known-cause',
+            'origin_phase': 'implement',
+            'manifested_phase': 'implement',
+            'action': 'delete',
+        }],
+        'candidates': [],
+    })
+
+
+def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path):
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    before_bytes = codebook_path.read_bytes()
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
+    escalation_calls = []
+
+    # Load-bearing: this RETURNS today only once the merge loop is guarded --
+    # an unguarded NeverDeleteError escapes run_nightly entirely.
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_deletion_directive,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result.exit_code == 0
+    assert result.applied == 0
+    assert result.coder_status == 'ok'
+
+    assert len(escalation_calls) == 1
+    _url, envelope = escalation_calls[0]
+    assert 'deletion directive' in envelope['params']['arguments']['summary'].lower()
+
+    # Nothing applied -> the existing no-change-night path holds.
+    assert codebook_path.read_bytes() == before_bytes
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log == before_log
+    assert result.reason is not None
+    assert 'deletion directive' in result.reason.lower()
+
+
+def test_run_nightly_deletion_directive_does_not_cost_the_rest_of_the_batch(tmp_path):
+    """The headline claim the single-session test above CANNOT make.
+
+    That test seeds one session, so every record in the batch is the
+    deletion-shaped one: turning the merge loop's `continue` into a `break`
+    (or an early `return result`) leaves all of its assertions green. This
+    one seeds TWO sessions and hands the deletion-shaped judgment to the
+    FIRST digest coded -- so a `break` would discard the good record that
+    follows it, and the committed-codebook assertions below go red."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_dir = projects_root / _encode_cwd(work_cwd)
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_dir / 'session-1.jsonl', cwd=work_cwd,
+        timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+    # A DIFFERENT first user turn: sampling.dedupe_shapes fingerprints on
+    # (stratum, signal-shape, normalized first turn), so two byte-similar
+    # transcripts would collapse into one and this would silently become the
+    # single-record test again.
+    _write_transcript(
+        session_dir / 'session-2.jsonl', cwd=work_cwd,
+        timestamp='2026-07-13T11:00:00Z', session_id='session-2',
+        user_text='an entirely different request that also went sideways',
+    )
+
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    # Order-independent: the FIRST digest coded gets the deletion directive,
+    # whichever session the sampler ranked first, so the good record always
+    # sits AFTER the skipped one in run.records.
+    invocations = []
+
+    def _fake_invoke_deletion_then_match(prompt: str, model: str) -> str:
+        invocations.append(prompt)
+        if len(invocations) == 1:
+            return _fake_invoke_deletion_directive(prompt, model)
+        return _fake_invoke_known_cause(prompt, model)
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
+    escalation_calls = []
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_deletion_then_match,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert len(invocations) == 2, 'both sessions must reach the coder'
+    assert result.exit_code == 0
+    assert result.coder_status == 'ok'
+    # The GOOD record still landed: skipped-and-counted, never batch-fatal.
+    assert result.applied == 1
+    assert result.commit_made is True
+
+    committed = codebook.load(codebook_path)
+    entry = next(e for e in committed['entries'] if e['id'] == 'known-cause')
+    assert len(entry['sightings']) == 1
+    sighted = entry['sightings'][0]['session']
+    assert sighted in {'session-1', 'session-2'}
+
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert len(after_log) == len(before_log) + 1
+
+    # ...and the BAD one was still surfaced, naming the OTHER session.
+    assert len(escalation_calls) == 1
+    _url, envelope = escalation_calls[0]
+    arguments = envelope['params']['arguments']
+    assert 'deletion directive' in arguments['summary'].lower()
+    assert f'session={sighted}' not in arguments['detail']
+    assert result.reason is not None
+    assert 'deletion directive' in result.reason.lower()
+
+
+def test_run_nightly_aggregates_deletion_directive_escalations(tmp_path):
+    """A SYSTEMIC cause -- a coder prompt regression, a model that starts
+    emitting `action: delete` for every digest -- makes every record in the
+    night deletion-shaped. That must post ONE escalation naming every
+    skipped session, the shape the extractor-crash and coder-storm triggers
+    already use, not one POST per record."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_dir = projects_root / _encode_cwd(work_cwd)
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_dir / 'session-1.jsonl', cwd=work_cwd,
+        timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+    _write_transcript(
+        session_dir / 'session-2.jsonl', cwd=work_cwd,
+        timestamp='2026-07-13T11:00:00Z', session_id='session-2',
+        user_text='an entirely different request that also went sideways',
+    )
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
+    escalation_calls = []
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_deletion_directive,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result.exit_code == 0
+    assert result.applied == 0
+    assert result.commit_made is False
+    assert result.escalated is True
+
+    assert len(escalation_calls) == 1, 'one aggregated POST, never one per record'
+    _url, envelope = escalation_calls[0]
+    arguments = envelope['params']['arguments']
+    assert '2 coding record(s)' in arguments['summary']
+    assert 'deletion directive' in arguments['summary'].lower()
+    # Both skipped sessions are named, so the aggregate loses no detail.
+    assert 'session=session-1' in arguments['detail']
+    assert 'session=session-2' in arguments['detail']
+    assert result.reason == arguments['summary']
+
+
+def test_run_nightly_records_a_reason_when_the_escalation_post_fails(tmp_path):
+    """With the escalation server down, `post_escalation` returns False --
+    so `escalated` is False and `exit_code` is 0, leaving the returned
+    result structurally identical to a clean night. `reason` is what keeps
+    a never-delete contract violation from surviving as nothing but a
+    WARNING line in the journal."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    def _dead_poster(url, envelope):
+        raise OSError('connection refused')
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        invoke=_fake_invoke_deletion_directive,
+        status_fetcher=None,
+        poster=_dead_poster,
+    )
+
+    assert result.exit_code == 0
+    assert result.escalated is False  # the POST genuinely failed
+    assert result.reason is not None  # ...but the night is still not unremarkable
+    assert '1 coding record(s)' in result.reason
+    assert 'deletion directive' in result.reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# step-9/10: a conflict-only night must PERSIST its recurrence sighting.
+# apply_coding_record's adjudicated-title branch appends the sighting but
+# bumps neither `matched` nor `candidates_applied` -- so a night whose ONLY
+# merge effect is a conflict append would end with applied == 0, skip the
+# `if applied > 0` dump gate, and drop the mutated codebook on the floor.
+# ---------------------------------------------------------------------------
+
+def _fake_invoke_rejected_candidate(prompt: str, model: str) -> str:
+    """Mine a candidate whose title is ALREADY adjudicated in the codebook.
+
+    `matches` is deliberately empty: a single match would bump
+    stats['matched'], push `applied` above 0 for an unrelated reason and mask
+    the defect entirely. coder.py copies `candidates` verbatim from the parsed
+    judgment and _CANDIDATE_RECORD_SCHEMA requires only `title`, so this
+    record passes validate_coding_record and reaches the merger on the live
+    path."""
+    return json.dumps({
+        'matches': [],
+        'candidates': [{
+            'title': 'recurring rejected cause',
+            'cause': 'c',
+            'area': 'a',
+            'origin_phase': 'implement',
+            'manifested_phase': 'implement',
+        }],
+    })
+
+
+def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    # Seed an already-REJECTED candidate and commit it, so the tree is clean
+    # before the run (otherwise _git_status_changed would report true for an
+    # unrelated reason and the commit assertion would pass vacuously). The
+    # seeded sighting carries session 'session-old' -- NOT 'session-1' -- so
+    # apply_coding_record's `already_seen` guard does not short-circuit the
+    # conflict branch, and the later "sightings grew 1 -> 2" assertion
+    # unambiguously proves an APPEND rather than a create.
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    cb = codebook.load(codebook_path)
+    cb['candidates'].append({
+        'id': 'cand-20260722-28',
+        'title': 'recurring rejected cause',
+        'first_seen': '2026-07-22',
+        'disposition': 'rejected',
+        'sightings': [{
+            'date': '2026-07-22',
+            'project': 'testproj',
+            'session': 'session-old',
+            'origin_phase': 'implement',
+            'manifested_phase': 'implement',
+        }],
+    })
+    codebook.dump(cb, codebook_path)
+    subprocess.run(['git', 'add', '-A'], cwd=repo, check=True)
+    subprocess.run(
+        ['git', 'commit', '-q', '-m', 'seed rejected candidate'], cwd=repo, check=True,
+    )
+
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
+    escalation_calls = []
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_rejected_candidate,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result.exit_code == 0
+    assert result.commit_made is True
+    assert result.applied == 1
+    assert result.coder_status == 'ok'
+
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert len(after_log) == len(before_log) + 1
+
+    # The recurrence sighting survived to the COMMITTED file.
+    committed = codebook.load(codebook_path)
+    assert len(committed['candidates']) == 1
+    candidate = committed['candidates'][0]
+    assert candidate['id'] == 'cand-20260722-28'
+    assert candidate['disposition'] == 'rejected'
+    assert len(candidate['sightings']) == 2
+    assert candidate['sightings'][1]['session'] == 'session-1'
+    assert candidate['sightings'][1]['date'] == '2026-07-13'
+
+    # Idempotency: the widened dump gate must not re-commit the same sighting.
+    result_2 = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_rejected_candidate,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result_2.exit_code == 0
+    assert result_2.commit_made is False
+    assert result_2.applied == 0
+
+    after_log_2 = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log_2 == after_log
+
+    committed_2 = codebook.load(codebook_path)
+    assert len(committed_2['candidates'][0]['sightings']) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2427,3 +3078,365 @@ def test_report_sample_outcome_partial_truncation_stays_at_info(tmp_path, caplog
     assert escalated is False
     assert posted == []
     assert _nightly_warnings(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# task 3644: the trickle's fail-loud escalation must survive a STATEFUL server
+# ---------------------------------------------------------------------------
+#
+# `_default_poster` bare-POSTed `tools/call`, which the escalation server
+# (:8103) rejects at the transport layer before the tool ever runs, with
+# `400 Bad Request` / "Missing session ID" (captured live 2026-08-05).
+# `post_escalation` swallows that best-effort and returns False, so EVERY
+# trickle fail-loud escalation -- extractor crash, coder storm, commit
+# failure -- was silently dropped. Identical root cause and identical fix as
+# census.py's poster; the transport lives single-sourced in census_trigger.
+
+
+class _FakeStatefulResponse:
+    """An `httpx.Response` stand-in for the stateful-server handshake."""
+
+    def __init__(self, *, status_code=200, headers=None, payload=None, text=''):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+        self._payload = payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            # A plain RuntimeError, not httpx.HTTPStatusError: the shared
+            # install_fake_httpx stub exposes only `post` and pytest.fails on
+            # any other attribute (task 3376).
+            raise RuntimeError(f'HTTP {self.status_code}')
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError('response has no JSON body')
+        return self._payload
+
+
+def _stateful_escalation_post(recorded, *, session_id='sid-nightly'):
+    """A fake `httpx.post` behaving like the STATEFUL escalation server:
+    session-less `tools/call` -> 400; `initialize` -> 200 + the assigned id
+    as a response header; `notifications/initialized` -> 202; `tools/call`
+    WITH that header -> 200."""
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get('json') or {}
+        method = envelope.get('method')
+        if method == 'initialize':
+            return _FakeStatefulResponse(
+                headers={'mcp-session-id': session_id,
+                         'content-type': 'application/json'},
+                payload={'jsonrpc': '2.0', 'id': 1, 'result': {}},
+            )
+        if method == 'notifications/initialized':
+            return _FakeStatefulResponse(status_code=202)
+        if (kwargs.get('headers') or {}).get('mcp-session-id') != session_id:
+            return _FakeStatefulResponse(
+                status_code=400,
+                headers={'content-type': 'application/json'},
+                payload={'jsonrpc': '2.0', 'id': 'server-error',
+                         'error': {'code': -32600,
+                                   'message': 'Bad Request: Missing session ID'}},
+            )
+        return _FakeStatefulResponse(
+            headers={'content-type': 'application/json'},
+            payload={'jsonrpc': '2.0', 'id': 1,
+                     'result': {'structuredContent': {'id': 'esc-9', 'status': 'queued'}}},
+        )
+
+    return _post
+
+
+def _recording_delete(deleted):
+    """A fake `httpx.delete` recording the MCP session-termination call the
+    transport makes after a handshake, so the long-lived escalation server does
+    not leak a session per trickle escalation."""
+    def _delete(url, **kwargs):
+        deleted.append((url, kwargs))
+        return _FakeStatefulResponse(status_code=200)
+
+    return _delete
+
+
+def test_post_escalation_lands_against_a_stateful_server(tmp_path, install_fake_httpx):
+    """The DEFAULT poster (no `poster=` injection) must handshake and land."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+    recorded = []
+    deleted = []
+    install_fake_httpx(
+        _stateful_escalation_post(recorded), delete=_recording_delete(deleted),
+    )
+
+    assert nightly.post_escalation(cfg, 'summary text', 'detail text') is True
+
+    methods = [(kwargs.get('json') or {}).get('method') for _url, kwargs in recorded]
+    assert methods == [
+        'tools/call', 'initialize', 'notifications/initialized', 'tools/call',
+    ]
+    # The retried call carries the server-assigned session id...
+    assert (recorded[-1][1].get('headers') or {}).get('mcp-session-id') == 'sid-nightly'
+    # ...and is still the escalate_info the trickle meant to file.
+    params = (recorded[-1][1].get('json') or {})['params']
+    assert params['name'] == 'escalate_info'
+    assert params['arguments']['summary'] == 'summary text'
+    # ...and the session opened to file it is released again.
+    assert [(kw.get('headers') or {}).get('mcp-session-id') for _u, kw in deleted] == [
+        'sid-nightly'
+    ]
+
+
+def test_post_escalation_reports_false_on_a_tool_error_envelope(
+    tmp_path, install_fake_httpx, caplog
+):
+    """HTTP 200 is not success. `post_escalation` discards the response body
+    and reports True on "no exception", so a tool-level failure
+    (`result.isError: true`) would otherwise read as a landed escalation --
+    the same green-on-paper/nothing-filed failure task 3644 exists to close,
+    one layer up from the transport."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def _post(url, **kwargs):
+        return _FakeStatefulResponse(
+            headers={'content-type': 'application/json'},
+            payload={'jsonrpc': '2.0', 'id': 1, 'result': {
+                'isError': True,
+                'content': [{'type': 'text', 'text': "unknown category 'nope'"}],
+            }},
+        )
+
+    install_fake_httpx(_post)
+
+    with caplog.at_level(logging.WARNING):
+        assert nightly.post_escalation(cfg, 'summary text', 'detail text') is False
+
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any('escalation post failed' in m for m in warned), warned
+    assert any('isError' in m or 'reported an error' in m for m in warned), warned
+
+
+# ---------------------------------------------------------------------------
+# task 4148: the tasks-landed condition, end to end through the PRODUCTION
+# entrypoint.
+#
+# Every other census test in this file enters at run_nightly or below, and
+# run_nightly has ALWAYS accepted a status_fetcher -- so all of them passed
+# throughout the dead period. The defect was specifically that the systemd
+# ExecStart (`nightly.py run --project-id %i` -> main()) wired nothing, which
+# only a test entering at main() can catch. The journal shows the resulting
+# fail-safe line on 2026-08-10, 2026-08-11 and 2026-08-12:
+# "tasks-landed: no status_fetcher configured -- condition (b) fails safe".
+#
+# HAZARD, now that the fetcher default is live (amendment): ANY run_nightly or
+# main() test that writes a valid non-negative `last_census_done_count` into
+# census-state.json and injects no `status_fetcher` will issue a REAL POST to
+# $FUSED_MEMORY_MCP_URL (default localhost:8002) -- and on a dev box where
+# fused-memory is actually up, a stale fixture baseline against the real
+# done-count can produce a genuine FIRE that subprocess-launches
+# scripts/legibility/census.py, i.e. real LLM spend and real git writes.
+# Such a test MUST both fake httpx (conftest's `install_fake_httpx`) AND stub
+# `nightly._default_census_launcher`. The two tests below are the pattern.
+# ---------------------------------------------------------------------------
+
+def test_main_run_fires_the_tasks_landed_condition_end_to_end(
+    tmp_path, monkeypatch, caplog, install_fake_httpx,
+):
+    """Drive `nightly.main(['run', '--config', ...])` -- the systemd-invoked
+    CLI -- against a project whose census baseline is 8 days and 130 done
+    tasks stale, and assert condition (b) fires, that the absolute
+    project_root crossed the MCP wire, and that the decision reaches the
+    journal.
+
+    8 days is chosen against the shipped config.py:66-77 defaults so ONLY
+    condition (b) can fire: clear of (a) max_interval_days=10, at/above (b)'s
+    tasks_landed_min_days=7, and above the floor_days=5 hard floor. main()
+    exposes no `now` seam, so the anchor is relative to real now.
+    """
+    config_path = _write_config(tmp_path, project_id='proj_a')
+    legibility_dir = tmp_path / 'docs' / 'legibility'
+
+    # A genuine non-negative int baseline: task 4085's validity arm
+    # (census_trigger.py:724-733) returns None BEFORE the fetcher is reached
+    # for a bool/float/str, which would make this test pass for the wrong
+    # reason -- or rather, fail for one.
+    (legibility_dir / 'census-state.json').write_text(
+        json.dumps({
+            'last_census_at': (datetime.now(UTC) - timedelta(days=8)).isoformat(),
+            'last_census_report': 'docs/legibility/census-2026-08-09.md',
+            'last_census_done_count': 1000,
+        }),
+        encoding='utf-8',
+    )
+    # Present-but-empty, so condition (c) sees 0 candidates AND
+    # decide_for_project logs no unreadable-codebook warning.
+    codebook.dump(
+        {'version': 2, 'entries': [], 'candidates': []},
+        legibility_dir / 'confusion-codebook.yaml',
+    )
+
+    # 1130 done - 1000 baseline = 130 landed, over the 120 threshold.
+    recorded = []
+
+    def _fake_post(url, **kwargs):
+        recorded.append((url, kwargs))
+        return _FakeStatefulResponse(
+            headers={'content-type': 'application/json'},
+            payload={
+                'jsonrpc': '2.0',
+                'id': 1,
+                'result': {
+                    'structuredContent': {
+                        'statuses': {f't{i}': 'done' for i in range(1130)},
+                    },
+                },
+            },
+        )
+
+    install_fake_httpx(_fake_post)
+
+    # MANDATORY, not cosmetic: on FIRE the real launcher subprocess-runs
+    # scripts/legibility/census.py (real LLM spend + git writes), and
+    # _default_entrypoint_exists is true in a real checkout -- and reaching
+    # FIRE is the entire point of this test.
+    launcher_calls = []
+    monkeypatch.setattr(
+        nightly, '_default_census_launcher', lambda: launcher_calls.append(1),
+    )
+
+    # Empty -> empty sample -> no digests -> `invoke` is never called and
+    # nothing is committed, so no LLM and no git.
+    projects_root = tmp_path / 'projects'
+    projects_root.mkdir()
+
+    # caplog rather than `_isolated_root_logging`: that helper empties
+    # root.handlers, which is exactly where pytest's own capture handler
+    # lives, so nothing would be captured. It is also unnecessary here --
+    # `configure_logging` goes through `logging.basicConfig`, a documented
+    # no-op while root has handlers, so main()'s call cannot leak root state
+    # for as long as caplog's handler is installed.
+    with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+        exit_code = nightly.main([
+            'run', '--config', str(config_path),
+            '--projects-root', str(projects_root),
+            '--date', '2026-07-13',
+        ])
+
+    messages = [r.getMessage() for r in caplog.records]
+
+    # (i) condition (b) fired all the way through the production entrypoint.
+    assert exit_code == 0
+    assert launcher_calls == [1], (
+        'the census launcher never fired end-to-end. Read the captured log '
+        'BEFORE suspecting the wiring: task 4085 turns any exception out of '
+        '`decide` into a quiet synthetic NO-FIRE line rather than a '
+        f'traceback. messages={messages}'
+    )
+
+    # (ii) task 3291's wire contract, now exercised from the nightly path:
+    # fused-memory's _normalize_project_root hard-rejects a relative path.
+    cfg = load_config(config_path)
+    get_statuses_calls = [
+        kwargs for _url, kwargs in recorded
+        if (kwargs.get('json') or {}).get('params', {}).get('name') == 'get_statuses'
+    ]
+    assert len(get_statuses_calls) == 1, recorded
+    sent_root = get_statuses_calls[0]['json']['params']['arguments']['project_root']
+    assert sent_root == str(cfg.project_root)
+    assert Path(sent_root).is_absolute()
+
+    # (iii) the decision reaches the journal. Without this, a healthy
+    # condition-(b) evaluation is indistinguishable from the still-dead one
+    # in `journalctl --user -u legibility-trickle@dark_factory` -- the very
+    # channel that diagnosed task 4148.
+    assert any(
+        'tasks-landed: 130 landed since last census (threshold 120) -> FIRE' in m
+        for m in messages
+    ), messages
+
+
+def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memory(
+    tmp_path, monkeypatch, caplog, install_fake_httpx,
+):
+    """The twin of the test above, on the FAILURE path (task 4148 amendment).
+
+    Now that `run_nightly` always BUILDS a real MCP-backed fetcher, "the
+    fused-memory server is down" is reachable on every production night --
+    not only when a caller injects a raising fake. The existing fail-safe
+    coverage injects at the `compute_tasks_landed` level, which is exactly
+    the shape of coverage that let the wiring gap survive three prior
+    repairs; this test instead enters at `main()` and lets the DEFAULTED
+    fetcher be the thing that fails. A transport error must degrade to a
+    NO-FIRE line plus warnings -- never a non-zero exit, and never a census
+    launch off an unobserved done-count.
+    """
+    config_path = _write_config(tmp_path, project_id='proj_a')
+    legibility_dir = tmp_path / 'docs' / 'legibility'
+
+    # The same 8-day, valid-int baseline as the happy-path twin: it clears
+    # task 4085's validity arm and (b)'s tasks_landed_min_days=7, so the fetch
+    # is genuinely REACHED and its failure is the only reason (b) goes N/A.
+    # 8d is also under max_interval_days=10, so no OTHER condition fires and
+    # the launcher assertion below cannot pass for the wrong reason.
+    (legibility_dir / 'census-state.json').write_text(
+        json.dumps({
+            'last_census_at': (datetime.now(UTC) - timedelta(days=8)).isoformat(),
+            'last_census_report': 'docs/legibility/census-2026-08-09.md',
+            'last_census_done_count': 1000,
+        }),
+        encoding='utf-8',
+    )
+    codebook.dump(
+        {'version': 2, 'entries': [], 'candidates': []},
+        legibility_dir / 'confusion-codebook.yaml',
+    )
+
+    # fused-memory down. `post_mcp_envelope` touches only `httpx.post` and
+    # `httpx.delete` (task 3376) and lets transport exceptions escape
+    # verbatim, so this reaches `default_status_fetcher`'s wrapper and comes
+    # out as StatusFetchUnavailable -- the real production shape.
+    posts = []
+
+    def _refusing_post(url, **kwargs):
+        posts.append((url, kwargs))
+        raise ConnectionError('[Errno 111] Connection refused')
+
+    install_fake_httpx(_refusing_post)
+
+    launcher_calls = []
+    monkeypatch.setattr(
+        nightly, '_default_census_launcher', lambda: launcher_calls.append(1),
+    )
+
+    projects_root = tmp_path / 'projects'
+    projects_root.mkdir()
+
+    with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+        exit_code = nightly.main([
+            'run', '--config', str(config_path),
+            '--projects-root', str(projects_root),
+            '--date', '2026-07-13',
+        ])
+
+    messages = [r.getMessage() for r in caplog.records]
+
+    # The nightly run is unaffected by a dead fused-memory...
+    assert exit_code == 0
+    assert launcher_calls == [], messages
+
+    # ...but the fetch really was attempted through the DEFAULTED seam, so
+    # this test cannot go green on a fetcher that was never built.
+    get_statuses_calls = [
+        kwargs for _url, kwargs in posts
+        if (kwargs.get('json') or {}).get('params', {}).get('name') == 'get_statuses'
+    ]
+    assert len(get_statuses_calls) == 1, posts
+
+    # The failure is legible on both channels an operator has: the specific
+    # WARNING naming the fetch, and the one-line NO-FIRE decision.
+    assert any('tasks-landed: status_fetcher failed' in m for m in messages), messages
+    assert any(
+        m.startswith('legibility trickle: census trigger: NO-FIRE')
+        and 'tasks-landed: delta unavailable (no baseline/fetcher) -> N/A' in m
+        for m in messages
+    ), messages

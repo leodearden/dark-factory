@@ -4,8 +4,15 @@
 of already-fetched ``MemoryResult`` search hits and a similarity threshold,
 it selects the single best near-duplicate candidate (or ``None``). It does
 no I/O and makes no assumptions about embedding accuracy — callers inject
-explicit ``relevance_score`` values, so these tests exercise pure comparison
-logic only.
+explicit cosine values, so these tests exercise pure comparison logic only.
+
+Task 3658 moved the cosine those callers inject: ``MemoryService.search`` now
+returns an ORDINAL RRF value in ``relevance_score`` (single-store rank-1 is
+1/61 ~ 0.0164) and carries the honest per-store cosine in
+``metadata['store_score']``.  The guard's 0.92 threshold is a cosine
+threshold, so it must read the cosine — hence ``_result`` below builds the
+post-RRF result shape, and every threshold expectation in this module is
+unchanged.
 """
 
 from __future__ import annotations
@@ -27,6 +34,14 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_threshold,
     resolve_topic_guard_clusters,
 )
+from fused_memory.services.memory_service import RRF_K
+
+# The real post-RRF relevance_score for a rank-1 hit on the guard's
+# single-store search(stores=['mem0'], limit=5) path — 1/(RRF_K + 1).
+# RRF_K comes from production rather than being restated as the literal 60, so
+# a retune of the constant carries this fixture with it instead of leaving it
+# silently modelling a shape ``search()`` no longer emits.
+_RRF_RANK1 = 1.0 / (RRF_K + 1)
 
 
 def _result(
@@ -36,13 +51,22 @@ def _result(
     category: MemoryCategory | None = MemoryCategory.procedural_knowledge,
     source_store: SourceStore = SourceStore.mem0,
     content: str = 'some procedural content',
+    relevance_score: float = _RRF_RANK1,
+    store_rank: int = 1,
 ) -> MemoryResult:
+    """Build a POST-RRF ``MemoryResult``: *score* is the cosine, in metadata.
+
+    ``relevance_score`` defaults to the ordinal RRF value a real rank-1 mem0
+    hit now carries, deliberately UNRELATED to *score* — so any test that
+    passes only because the guard still reads ``relevance_score`` fails.
+    """
     return MemoryResult(
         id=id_,
         content=content,
         category=category,
         source_store=source_store,
-        relevance_score=score,
+        relevance_score=relevance_score,
+        metadata={'store_rank': store_rank, 'store_score': score},
     )
 
 
@@ -85,11 +109,15 @@ class TestFindNearDuplicateMemory:
         assert match is None
 
     def test_picks_max_score_among_multiple_qualifying_results(self):
+        # Distinct cosines, IDENTICAL fused scores (all rank-1 ordinals): the
+        # selection must be driven by the cosine, not by relevance_score, which
+        # here cannot discriminate at all.
         results = [
             _result('m1', 0.93),
             _result('m2', 0.99),
             _result('m3', 0.95),
         ]
+        assert len({r.relevance_score for r in results}) == 1
         match = find_near_duplicate_memory(results, 0.92)
         assert match is not None
         assert match.id == 'm2'
@@ -103,6 +131,70 @@ class TestFindNearDuplicateMemory:
         match = find_near_duplicate_memory(results, 0.92)
         assert match is not None
         assert match.id == 'm2'
+
+    # --- task 3658 / esc-3658-1 -------------------------------------------
+
+    def test_post_rrf_result_still_matches_on_its_cosine(self):
+        """The regression this guard would otherwise have suffered silently.
+
+        A real rank-1 mem0 hit on the guard's ``stores=['mem0']`` search path
+        now carries ``relevance_score`` ~ 0.0164.  Comparing THAT against the
+        0.92 cosine threshold can never be true, so the guard would have
+        returned ``None`` for every input — silently disabling the documented
+        write-time soft-block without even entering its own fail-open logging
+        branch.
+        """
+        result = _result('m1', 0.97, relevance_score=_RRF_RANK1)
+        assert result.relevance_score < 0.02, 'fixture must model the real fused value'
+
+        match = find_near_duplicate_memory([result], 0.92)
+
+        assert match is not None, (
+            'The guard must threshold on the cosine in metadata.store_score, '
+            'not on the ordinal RRF relevance_score'
+        )
+        assert match.id == 'm1'
+
+    def test_result_without_store_score_never_qualifies(self):
+        """A missing cosine is "not comparable", never "compared and passed"."""
+        no_metadata = MemoryResult(
+            id='m1',
+            content='some procedural content',
+            category=MemoryCategory.procedural_knowledge,
+            source_store=SourceStore.mem0,
+            relevance_score=0.99,
+        )
+        assert find_near_duplicate_memory([no_metadata], 0.92) is None
+        # ...at ANY threshold, including one a 0.0 default would clear.
+        assert find_near_duplicate_memory([no_metadata], 0.0) is None
+
+    def test_result_with_none_store_score_never_qualifies(self):
+        """The Graphiti shape (store_score=None) can never be a near-duplicate."""
+        none_score = MemoryResult(
+            id='m1',
+            content='some procedural content',
+            category=MemoryCategory.procedural_knowledge,
+            source_store=SourceStore.mem0,
+            relevance_score=0.99,
+            metadata={'store_rank': 1, 'store_score': None},
+        )
+        assert find_near_duplicate_memory([none_score], 0.92) is None
+        assert find_near_duplicate_memory([none_score], 0.0) is None
+
+    def test_non_numeric_store_score_never_qualifies(self):
+        """A bool or string cosine is not a measurement (mirrors the config readers)."""
+        for bogus in (True, '0.99', object()):
+            bad = MemoryResult(
+                id='m1',
+                content='some procedural content',
+                category=MemoryCategory.procedural_knowledge,
+                source_store=SourceStore.mem0,
+                relevance_score=_RRF_RANK1,
+                metadata={'store_rank': 1, 'store_score': bogus},
+            )
+            assert find_near_duplicate_memory([bad], 0.92) is None, (
+                f'{bogus!r} must not be read as a cosine'
+            )
 
 
 def _memory_service_with_reconciliation(**fields) -> types.SimpleNamespace:

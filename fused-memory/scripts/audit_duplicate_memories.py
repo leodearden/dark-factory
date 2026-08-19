@@ -94,8 +94,9 @@ per-category ``scan_truncated``, ``ann_disabled_uncalibrated``, and
 how many categories ran on a cutoff measured on a different population). The
 liveness path adds ``liveness_snapshot_untasked`` (a recognised snapshot that
 resolves to no subject task, so no group can hold it) and
-``liveness_snapshot_unfielded`` (point-in-time framing whose live fields could
-not be read).
+``liveness_snapshot_unfielded`` (point-in-time framing over a live-status
+marker whose fields could not ALL be read — none parsed at all, or one
+recognised field's value could not be read while a sibling's did).
 
 Only chain-free evidence may DELETE
 -----------------------------------
@@ -106,7 +107,9 @@ sub-graph is a CLIQUE. Otherwise a member could be in the cluster purely by
 transitivity — A~B and B~C above the cutoff while A~C is far below it — and
 under ``--apply`` every non-survivor of that chain is an irreversible delete.
 Withheld clusters are reported (``apply_withheld_groups``), never silently
-dropped. See ``restrict_delete_candidates_for_apply``.
+dropped, and their count is also a metric series
+(``apply_withheld_clusters``) so recall loss from the gate is alarmable, not
+just visible in the plan JSON. See ``restrict_delete_candidates_for_apply``.
 
 Scope: all three Mem0 categories (``procedural_knowledge``,
 ``preferences_and_norms``, ``observations_and_summaries``). Clustering runs
@@ -194,6 +197,10 @@ from fused_memory.reconciliation.task_filter import (
     LIVE_TASK_STATUS_RE,
     POINT_IN_TIME_CHECK_RE,
     TASK_REF_RE,
+)
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
 )
 
 logger = logging.getLogger('audit_duplicate_memories')
@@ -400,8 +407,13 @@ _LIVE_FIELD_NAMES: tuple[str, ...] = (
     'pid',
 )
 
-# ``<field> = <value>``, as EITHER a fully-quoted value or a bare token — never
-# a half-read mixture of the two.
+# ``<field>=<value>``, as EITHER a fully-quoted value or a bare token — never
+# a half-read mixture of the two, and never fabricated from thin air: the
+# value group is OPTIONAL, so a recognised field written in assignment form
+# with no value this pattern can read still matches the field alone, with
+# `quoted` AND `bare` both `None`. One pattern with an optional value group
+# is what lets "read whole" and "seen but unreadable" stay one shape instead
+# of two kept in sync by hand.
 #
 # The quoted branch is deliberately all-or-nothing. An earlier single-branch
 # form (``"?([A-Za-z0-9_./:+-]+)"?``) let the value class terminate INSIDE a
@@ -422,9 +434,20 @@ _LIVE_FIELD_NAMES: tuple[str, ...] = (
 # the delimiter into the key; the characters it does admit (`-`, `.`, `/`,
 # `:`, `+`) are the ones real values need — `in-progress`, a path, an ISO
 # timestamp.
-_LIVE_FIELD_ASSIGNMENT_RE = re.compile(
-    r'\b(' + '|'.join(_LIVE_FIELD_NAMES) + r')\s*=\s*'
-    r'(?:"([^"|\n]+)"|([A-Za-z0-9_./:+-]+))',
+#
+# The value must directly ABUT `=` — there is no ``\s*`` between them, unlike
+# the gap before it. A gap there would let the bare branch silently absorb
+# the next word of ordinary prose as though it had been assigned: measured
+# live, ``The pid= field is unset`` would otherwise read as the fabricated
+# pair `pid=field` rather than the unreadable mention it actually is.
+# Requiring the value to start immediately at `=` makes a whitespace-
+# separated following token fail the value group instead of being misread
+# as it, so it falls through to the same unreadable case an absent value
+# produces.
+_LIVE_FIELD_ALT = '|'.join(_LIVE_FIELD_NAMES)
+_LIVE_FIELD_SCAN_RE = re.compile(
+    r'\b(?P<field>' + _LIVE_FIELD_ALT + r')\s*='
+    r'(?:"(?P<quoted>[^"|\n]+)"|(?P<bare>[A-Za-z0-9_./:+-]+))?',
     re.IGNORECASE,
 )
 
@@ -448,9 +471,22 @@ def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
         * ``(False, None)`` — not a liveness snapshot, and not a loss either:
           the content never entered this detector's scope.
         * ``(True, None)`` — point-in-time framing over a live-status marker
-          whose fields could not be read whole. THE counted
-          ``liveness_snapshot_unfielded`` loss; the caller owns that counter,
-          so this function stays a pure classifier.
+          where NO assignment was readable, OR where ANY ONE recognised
+          field's value could not be read whole even though others did. THE
+          counted ``liveness_snapshot_unfielded`` loss; the caller owns that
+          counter, so this function stays a pure classifier. Never a key
+          built from only the readable survivors of the ASSIGNMENT-form
+          fields ``_LIVE_FIELD_SCAN_RE`` recognises, since under ``--apply``
+          a false cluster like that is an irreversible delete. That
+          guarantee is scoped to the assignment form specifically: a status
+          spelled a way the scan does not recognise at all — a ``status:``
+          colon, or a bare ``LIVE_TASK_STATUS_RE`` paraphrase such as
+          "currently running" — is invisible to the scan rather than an
+          unread mention of one, so it can still combine with readable
+          sibling assignments into a survivors-only key. Pre-existing and
+          narrower than the defect this function fixes; pinned as a known
+          limitation, not closed here, by
+          ``test_a_non_assignment_status_can_still_false_group``.
         * ``(True, key)`` — a snapshot, with its canonical key.
 
         ``POINT_IN_TIME_CHECK_RE`` is consulted AT MOST ONCE per call, and not
@@ -464,26 +500,33 @@ def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
     # ``LIVE_TASK_STATUS_RE`` — and a non-match is the overwhelmingly common
     # case: this detector always runs, with no flag to disable it, over a
     # default 5000-records-per-category scan of mostly ordinary prose.
-    # The gate is SOUND because ``_LIVE_FIELD_ASSIGNMENT_RE`` is
-    # ``LIVE_TASK_STATUS_RE``'s first alternative plus extra obligations, so
-    # an assignment hit implies a live-status hit: a record failing this check
-    # could never have yielded a key anyway. A record it rejects reports
-    # ``framed=False`` even if the point-in-time framing would have matched —
-    # which is the intended contract, since such a record is out of scope
-    # rather than a loss.
+    # The gate is SOUND because every ``_LIVE_FIELD_SCAN_RE`` match requires
+    # ``LIVE_TASK_STATUS_RE``'s first alternative (a bare ``<field>=``) as a
+    # prefix, whether or not the optional value group goes on to match, so a
+    # scan hit — read OR unreadable — implies a live-status hit: a record
+    # failing this check could never have yielded a key, nor an unfielded
+    # loss, anyway. A record it rejects
+    # reports ``framed=False`` even if the point-in-time framing would have
+    # matched — which is the intended contract, since such a record is out
+    # of scope rather than a loss.
     if not LIVE_TASK_STATUS_RE.search(content):
         return False, None
     if not POINT_IN_TIME_CHECK_RE.search(content):
         return False, None
 
     pairs: set[str] = set()
-    for field, quoted, bare in _LIVE_FIELD_ASSIGNMENT_RE.findall(content):
-        # Exactly one branch ever participates; `' '.join(split())` normalises
-        # the whitespace a quoted value may now legitimately carry (and is a
-        # no-op on a bare token).
-        cleaned = ' '.join((quoted or bare).split()).rstrip('./:+-').lower()
-        if cleaned:
-            pairs.add(f'{field.lower()}={cleaned}')
+    for m in _LIVE_FIELD_SCAN_RE.finditer(content):
+        if m.group('quoted') is None and m.group('bare') is None:
+            return True, None
+        # Exactly one of `quoted`/`bare` ever participates; `' '.join(split())`
+        # normalises the whitespace a quoted value may now legitimately carry
+        # (and is a no-op on a bare token).
+        cleaned = ' '.join(
+            (m.group('quoted') or m.group('bare')).split(),
+        ).rstrip('./:+-').lower()
+        if not cleaned:
+            return True, None
+        pairs.add(f"{m.group('field').lower()}={cleaned}")
     if not pairs:
         return True, None
     return True, '|'.join(sorted(pairs))
@@ -690,9 +733,13 @@ def find_liveness_snapshot_recurrences(
         ``liveness_snapshot_untasked`` (a recognised snapshot that resolves to
         no subject, so no bucket can hold it) and
         ``liveness_snapshot_unfielded`` (point-in-time framing over a
-        ``LIVE_TASK_STATUS_RE`` marker whose fields could not be read — a
-        paraphrase naming no fields, or a value ``_LIVE_FIELD_ASSIGNMENT_RE``
-        declines to read half-way, such as an unterminated quote).
+        ``LIVE_TASK_STATUS_RE`` marker whose fields could not ALL be read —
+        a paraphrase naming no fields, a value ``_LIVE_FIELD_SCAN_RE``
+        declines to read half-way (such as an unterminated quote), OR a
+        record where ONE recognised field's value could not be read whole
+        while a sibling's did. The verdict is per-field: any one of these
+        makes the WHOLE record a loss rather than a key built from the
+        survivors).
         Both are always present, always ints, always 0 on a clean run.
     """
     swept = set(categories)
@@ -2620,6 +2667,53 @@ async def _run(args: argparse.Namespace) -> int:
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE anything.
+    #
+    # Why THIS line specifically. It sits before ``MemoryService`` is
+    # constructed and before ``memory.initialize()``, so a refused --apply
+    # never opens a client at all -- which is also why it stays OUTSIDE the
+    # ``try:`` below with its ``finally: await memory.close()``. Guarding
+    # inside would entangle the refusal with the teardown of a service that
+    # was never initialized. It likewise precedes the whole scan:
+    # ``fetch_memories``' per-category ``scroll_by_metadata`` with
+    # ``with_vectors=True``, ``fetch_ann_neighbors``' per-record
+    # ``query_points`` fan-out, clustering, metrics, and the artifact write.
+    #
+    # Why run-wide rather than per-record: the delete loop in
+    # ``apply_deletions`` wraps each ``memory.delete_memory`` in an
+    # ``except Exception`` and increments ``delete_errors``, so a write-denied
+    # environment yields N logged errors and N already-destroyed Qdrant points
+    # -- mem0's ``_delete_memory`` removes the point BEFORE writing its SQLite
+    # history. This module's docstring already warns that under --apply every
+    # non-survivor is an irreversible delete; this guard is what makes that
+    # warning enforceable rather than advisory.
+    #
+    # Why it RAISES, unlike the refusal this script already has:
+    # ``_apply_refusal_reason`` refuses --apply on empty-scan/truncation
+    # grounds and returns through the NORMAL path -- a handled outcome an
+    # operator can reasonably read past. A write-capability denial is
+    # categorically different, because proceeding would leave a
+    # half-completed, unrecoverable store mutation. Raising keeps it
+    # un-maskable by, and un-confusable with, that report-shaped refusal.
+    #
+    # ``logging.basicConfig`` already ran above, so this error is emitted.
+    if args.apply:
+        try:
+            assert_store_mutation_allowed(operation='audit_duplicate_memories --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'audit_duplicate_memories: --apply NOT started (fail-closed) -- this '
+                "process cannot write mem0's history directory, so each deletion "
+                'would remove a Qdrant point and then fail to write its history, '
+                'irreversibly destroying the non-survivors of every cluster. '
+                'Nothing was scanned and nothing was mutated, and no client was '
+                'opened. Route the deletions through the fused-memory MCP server '
+                '(the unsandboxed owner of the store), or re-run from an '
+                'unsandboxed operator shell. To obtain the audit report safely from '
+                'anywhere, re-run without --apply.'
+            )
+            raise
+
     # De-duplicate while preserving the caller's order. A repeated
     # --categories value would otherwise ingest the same Qdrant points twice
     # under one id; the two identical copies cluster at ratio 1.0 and
@@ -2720,6 +2814,18 @@ async def _run(args: argparse.Namespace) -> int:
                         c: int(scan_stats.get(c, {}).get('truncated', 0))
                         for c in categories
                     },
+                    # Run-global: the apply gate is one pass over the whole
+                    # plan, not a per-category decision — per-category detail
+                    # for drill-down stays available in
+                    # plan['apply_withheld_groups']. Must be a series because
+                    # the plan JSON carries the number but the plan is not the
+                    # artifact the eval programme reads; without this, a
+                    # growing share of clusters withheld from --apply would be
+                    # un-alarmable recall loss. Direct subscript (not .get):
+                    # build_sweep_plan returns this key unconditionally, and a
+                    # defaulted read would silently emit a fabricated 0.0 if a
+                    # future refactor ever dropped it.
+                    'apply_withheld_clusters': plan['apply_withheld_clusters'],
                 },
                 details_path=details_artifact_path(stamp),
             )

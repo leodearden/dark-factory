@@ -149,7 +149,8 @@ class TestModuleLevelAll:
             'normalize_lock',
             'files_to_modules',
             'modules_conflict',
-            'CODE_EXTENSIONS',
+            'FILE_EXTENSIONS',
+            'EXTENSIONLESS_FILENAMES',
             'is_file_path',
             'directory_locks',
             'strip_directory_locks',
@@ -165,7 +166,7 @@ class TestModuleLevelAll:
         from shared import safe_io
 
         assert hasattr(safe_io, '__all__'), 'safe_io must define __all__'
-        assert set(safe_io.__all__) == {'load_json_or_warn'}
+        assert set(safe_io.__all__) == {'atomic_write_text', 'load_json_or_warn'}
 
     def test_mcp_idempotency_all(self):
         from shared import mcp_idempotency

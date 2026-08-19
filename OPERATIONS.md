@@ -171,6 +171,36 @@ the task tree directly. For status of a *running* orchestrator's live
 state, prefer the fused-memory/escalation MCP reads in [§4](#4-watching-a-run)
 or the dashboard.
 
+### Reading the flake ledger
+
+```bash
+cd <dark-factory-repo>
+uv run --project orchestrator orchestrator flake-ledger --config /path/to/target/dark-factory-orchestrator.yaml
+```
+
+Prints three things: **open flake debt** (each suppressed test with its
+owning task id and how long the debt has been open), **per-test recurrence
+chains** (how many times a test has been re-suppressed, and when and by
+which commit it was last resolved), and **three health counters** — gate
+blind, non-convergence, and systemic. Like `orchestrator status` it reads
+persisted state and needs no running orchestrator.
+
+It is strictly read-only: it opens no debt, files no task, resolves
+nothing and escalates nothing. It will not create a ledger DB for a
+project that has none, and it will not add the flake tables to a
+`runs.db` that lacks them — it prints `NO LEDGER` / `NO FLAKE TABLES`
+and exits 0 instead.
+
+**Read the header line before the counters.** A report only measures
+anything when the ledger was actually readable. If the header says
+`NO LEDGER`, `NO FLAKE TABLES`, or `LEDGER UNREADABLE` (a corrupt,
+truncated, or locked `runs.db`), every counter below it reads
+`status: not measured` and none of the numbers are a reading — that is
+a broken or absent ledger to go fix, not a clean bill of health. A
+`WARNING: … TRUNCATED` line means the opposite problem: the window held
+more occurrences than one read returns, so the counters cover a partial
+window.
+
 ### Stopping gracefully
 
 Send `SIGTERM` to the **innermost `orchestrator` process**, not the shell
@@ -229,6 +259,54 @@ For any project running unattended, keep one long-running
      never auto-resolved.
 4. Waits for the next escalation to fire (or for a spawned sub-agent to
    finish), heartbeats its lease, and repeats.
+
+**Inspecting and repairing a watcher lease.** Use the `lease-show` verb, not
+`cat` — the lease body carries the holder's slug/pid and an immutable
+`start_ts`, but the heartbeat is the file's **mtime**, so `cat` alone cannot
+tell you whether a holder is still beating:
+
+```bash
+python3 orchestrator/src/orchestrator/session_registry.py lease-show --name watcher-df
+```
+
+It prints `key=value` lines — `state`, `holder_slug`, `holder_pid`,
+`holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs`, `reclaimable` —
+computed by the same reader `lease-claim` decides with, and never touches the
+lease. A lease is stale only when the holder pid is dead **and** the heartbeat
+is past `LEASE_HEARTBEAT_TTL` (2h); a live holder is never reclaimable however
+quiet it has been.
+
+`lease-claim`'s `holder_liveness=<none|held|orphaned>` line is a **pid check
+only** — `orphaned` means the pid recorded in the lease body is not running,
+nothing more; `none` means the claim was acquired and there is no contending
+holder at all. Treat `orphaned` as one diagnostic, never as grounds to
+force-release on its own: a quiet-but-live holder that reads as dead is the
+duplicate-spawn incident.
+
+A holder whose lease body says `holder_pid=0` claimed it on the **degraded**
+pid path (`$CLAUDE_PID` unset — the CLI records 0, a never-alive sentinel, and
+logs a WARNING). Such a lease is protected only by its heartbeat and always
+reads `orphaned`; that is deliberate, because recording some other durable pid
+(the shell) instead would make it unreapable forever.
+
+`lease-heartbeat` and `lease-release` require the `--slug` the lease was
+claimed with and **refuse** on a mismatch (`result=refused`, nothing touched),
+so no session can evict another's lease or keep a stranger's alive. `--force`
+is the deliberate operator-recovery override: it acts anyway and logs at
+WARNING naming both the forcing slug and the displaced holder.
+
+`result=absent` differs by verb: on a **release** it is plain idempotence, but
+on a **heartbeat** it means that session's lease is gone (reaped, or
+force-released by you) and the session is now running un-leased — a duplicate
+can claim the name freely. Both watcher skills tell a heartbeating session to
+re-claim on `absent` rather than continue; if you force-release a live
+watcher's lease, expect it to re-claim on its next cycle.
+
+**Rollout note (task 3994).** Any watcher session already running on the
+pre-3994 prescription must be **restarted** so it re-reads its skill: its
+`lease-heartbeat`/`lease-release` calls pass no `--slug` and now exit 2
+(argparse) instead of mutating. Nothing is stranded — such a lease stops being
+heartbeated and ages out normally within `LEASE_HEARTBEAT_TTL`, then is reaped.
 
 Its priority order when triaging is: infra stability first, software
 quality second, task progress third. Clear-cut issues get acted on
@@ -486,13 +564,19 @@ the authoritative list rather than treating this enumeration as exhaustive:
 - `mem0_update.content_amend_allowed_agent_prefixes` and
   `mem0_update.metadata_patch_allowed_agent_prefixes` — two independently
   configurable `agent_id`-prefix allowlists, both shipping as
-  `['recon-stage-']`. They are separate because the arms carry different
-  risk: widening **`metadata_patch_allowed_agent_prefixes` alone** is the
-  supported way to admit an interactive curator-gate tagging flow without
-  granting anyone content-amend authority. A mistagged record is cheap to
-  notice and cheap to correct; a silent content rewrite is neither.
-  (`agent_id` is self-reported, so this is a misuse deterrent for
-  cooperating callers, not a security boundary.)
+  `['recon-stage-', 'curator-']`: `recon-stage-` admits every
+  reconciliation stage agent, and `curator-` admits the interactive
+  memory-consolidation sitting defined by `skills/curate-fused-memories`
+  (esc-3524-1 ruling (b), promoted to an all-deployments schema default on
+  2026-08-12; it deliberately holds both arms because retain-and-tag
+  stamps retained peers via metadata-only patches). The lists are separate
+  because the arms carry different risk: widening
+  **`metadata_patch_allowed_agent_prefixes` alone** remains the supported
+  way to admit a new interactive tagging flow without granting anyone
+  content-amend authority. A mistagged record is cheap to notice and cheap
+  to correct; a silent content rewrite is neither. (`agent_id` is
+  self-reported, so this is a misuse deterrent for cooperating callers,
+  not a security boundary.)
 - `mem0_update.storm_threshold` and `mem0_update.storm_window_seconds` —
   the content-amend burst alarm (escalates, never blocks; metadata-only
   calls do not count toward it). Genuinely reload-safe because the shared
@@ -1080,6 +1164,279 @@ A night that could not run at all logs a `RUN FAILED` line ahead of its
 reach the MCP server` (a transport problem: check the fused-memory unit) vs
 `aborted on an unexpected error` (a bug in the consumer: read the exception
 type on that line). Requests are left in place either way.
+
+---
+
+## 13. One-off: transcript archive gunzip migration
+
+`scripts/migrate_transcript_archive_gunzip.py` converts the agent-transcript
+archive (`data/orchestrator/agent-transcripts/`) from `.jsonl.gz` to one
+plain, greppable `.jsonl` corpus. Task 3618, leaf α of
+`plans/transcript-preservation-seam-prd.md`.
+
+**This is a HUMAN-OPERATED step.** The task's implementer deliberately did not
+run `--apply`: an autonomous agent must not delete thousands of live files
+(the norm from task 1500, with precedents 1939/1945). The repo change and the
+live migration are separate acts, and the second one is yours.
+
+### The contract
+
+| | |
+|---|---|
+| Default | **Dry-run.** A bare invocation changes nothing. |
+| `--apply` | Opts into mutation. Without it, nothing is written or deleted. |
+| `--root` | Archive root (default `data/orchestrator/agent-transcripts`). |
+| Exit 0 | Every file migrated (or was already migrated). |
+| Exit 1 | **At least one file failed** — act on it. Unlike the `gc_agent_transcripts` sweep, which always exits 0 so a watchdog does not alarm, this is a one-off whose failures need a human. |
+| Exit 2 | **At least one conflict needs adjudication** (and nothing failed) — see below. Nothing is damaged; a `.gz` was retained next to a longer plain twin. Exit 1 wins when both are present. |
+
+stdout is a single JSON summary (`scanned` / `migrated` / `skipped` /
+`conflicts` / `conflict_paths` / `failed` / `failed_paths`); the LOUD lines go
+to stderr, so `... --apply | jq` works while failures stay visible.
+
+Per file it decompresses to a staging sibling (`<name>.jsonl.migrate-tmp`),
+**reads the result back**, mirrors the `.gz` mtime, atomically renames it over
+`<name>.jsonl`, and only then unlinks the source. A file it cannot corroborate
+is never destroyed — it is retained, counted and named. The mtime mirror
+matters: `gc_agent_transcripts` derives each task dir's retention age from its
+newest descendant mtime, so stamping `now` would silently reset the whole
+90-day retention window.
+
+Nothing is ever written over a plain `.jsonl` in place, which is what makes the
+re-run in step 5 safe when both forms coexist: if the `.gz` turns out to be
+damaged, the existing plain twin is left whole rather than being truncated by
+the attempt. A hard kill (SIGKILL, power loss) can strand a `.migrate-tmp`
+file; it is inert — no reader's `*.jsonl` glob matches it — and the next
+`--apply` rewrites it, so `find data/orchestrator/agent-transcripts -name
+'*.migrate-tmp' -delete` is cleanup, never recovery.
+
+It is **idempotent and re-runnable**. A `.gz` whose `.jsonl` twin already
+reads back cleanly is skipped and its source dropped, so a run you kill
+half-way resumes correctly — and so you can re-sweep later residue (see
+below).
+
+### The operator sequence
+
+```bash
+cd /home/leo/src/dark-factory
+
+# 1. Baseline.
+find data/orchestrator/agent-transcripts -name '*.gz' | wc -l
+
+# 2. Dry-run first — READ-ONLY, and real validation: it decompresses and
+#    UTF-8-decodes every source without writing anything.
+python3 scripts/migrate_transcript_archive_gunzip.py | jq
+
+#    Gate: `scanned` should equal the baseline count and `failed` MUST be 0.
+#    A non-zero `failed` names the offending files in `failed_paths` —
+#    investigate those before going further.
+#    `conflicts` need NOT be 0 to proceed — the sweep leaves those files
+#    untouched — but read `conflict_paths` first and resolve them per below.
+
+# 3. Migrate.
+python3 scripts/migrate_transcript_archive_gunzip.py --apply | jq
+
+# 4. Confirm.
+find data/orchestrator/agent-transcripts -name '*.gz' | wc -l
+#    expect 0 — or exactly `conflicts + failed` from step 3. BOTH counters
+#    leave their `.gz` on disk: conflicts are the files deliberately retained
+#    for you to resolve, and a failed file retains its source precisely
+#    because it could not be corroborated. Account for the residue against
+#    that sum, not against `conflicts` alone, or a run that develops new
+#    failures during `--apply` reads as an unexplained leftover. Resolve
+#    both, then re-run 3 and 4.
+```
+
+**Run this only AFTER the fleet has redeployed** past the task-3618 merge
+(§8). Until every orchestrator restarts, live units keep writing `.gz`, so a
+migration run before then leaves transition-window residue. Re-run step 3
+after the redeploy to sweep it — that is exactly what idempotency buys.
+
+### Resolving a conflict
+
+That re-run is also what produces conflicts, so expect them on the second
+pass. A session in flight ACROSS the redeploy has BOTH forms on disk: the
+pre-redeploy process archived `<sid>.jsonl.gz`, then the post-redeploy
+producer hook wrote a plain `<sid>.jsonl` for the same session — resumed, and
+therefore **longer**.
+
+A residual `.gz` with a longer plain twin beside it is exactly that shape.
+**The plain file is the authoritative copy.** The sweep refuses to gunzip over
+it (that would overwrite a live transcript with stale content and roll its
+mtime backwards, aging the task dir out early), and refuses to delete the
+`.gz` on its own judgement — being longer proves the twin is not a truncated
+stub, but never proves it *contains* the archived bytes. That last step is
+yours:
+
+```bash
+# For each path in conflict_paths — confirm the plain twin really is a superset
+# before deleting anything.
+(
+  set -o pipefail
+  gzip -t <sid>.jsonl.gz \
+    && n=$(zcat <sid>.jsonl.gz | wc -c) \
+    && zcat <sid>.jsonl.gz | diff - <(head -c "$n" <sid>.jsonl) \
+    && rm <sid>.jsonl.gz
+)
+```
+
+**`gzip -t` and `pipefail` are load-bearing, not decoration.** A bare
+`zcat ... | diff ... && rm` takes its exit status from `diff`, never from
+`zcat`. A *damaged* `.gz` still emits a short prefix before it dies, so `diff`
+would compare that prefix against the same-length head of the twin, succeed,
+and the `&& rm` would delete the only copy of the unrecoverable tail — exactly
+the unverified destruction the sweep refuses to do on its own judgement.
+`gzip -t` rejects such a file up front; `pipefail` makes the comparison itself
+fail loudly if `zcat` dies mid-stream anyway. A `.gz` that fails `gzip -t` is
+not a conflict to resolve — it is a damaged archive copy, and the plain twin
+beside it is all you have.
+
+If the two disagree, do NOT delete: that is a genuinely divergent pair, and
+the archive copy is the only record of the pre-redeploy content.
+
+Expect roughly a 4x expansion (≈485 MB → ≈1.9 GB at the sampled 3.93x ratio),
+a one-off cost against ~2.1 TB free.
+
+### The accepted gap between merge and your run
+
+The reader-side changes in task 3618 land at merge, but this migration runs
+later. In that window the legibility toolchain **under-reports** the archive:
+`_iter_archive_transcripts` now walks `rglob('*.jsonl')`, so a residual `.gz`
+is not enumerated at all — skipped rather than loudly failed.
+
+The gap announces itself rather than relying on you to remember it:
+
+- `inventory._iter_archive_transcripts` counts the residue on every walk and
+  emits one greppable WARNING — `rg 'residual \*.jsonl.gz'` over the nightly
+  logs — naming the count and this runbook.
+- `memory_eval_transcript_corpus`'s coverage JSON carries a `residual_gz`
+  field, and its report says in words how many transcripts the run could not
+  see. That is separate from `transcripts_found` and from `parse_failures`:
+  the residue was never found, and never failed to parse.
+
+Both are counts, not reads — no reader reopens a gzip stream — and both go to
+zero on their own once you have run the sweep.
+
+This is a known, accepted cost of not letting an agent delete live data, not
+a defect. It closes when you complete the sequence above. Validation for the
+migration itself was done at full scale: a dry run over all 4,574 live files
+decompressed and decoded every one of them with zero failures.
+
+---
+
+## 14. Transcript preservation & the archival guard
+
+Agent transcripts are the only durable record of what an agent actually did,
+and the substrate `--resume` reads. Task 3619 (leaf 2 of
+`plans/transcript-preservation-seam-prd.md` §8) changed *when* they are made
+durable. This is the operator-facing surface of that change.
+
+### Archival is a precondition of deletion, not a step before it
+
+Every path that deletes a per-task config dir now goes through
+`shared.transcript_archive.archive_before_delete`, which archives first and
+deletes only what it has made durable. The three sites are
+`TaskWorkflow._cleanup_config_dir`, `_recycle_config_dir`, and the
+`GitOps.cleanup_worktree` backstop.
+
+The call is **synchronous** on purpose. It used to be
+`await asyncio.to_thread(...)`, which meant a SIGTERM arriving mid-teardown
+cancelled the archive and destroyed the transcript anyway — the failure this
+task exists to remove. There is nothing left to cancel: same-filesystem
+archival is an `os.rename` (O(1) metadata), and the cross-device fallback is a
+copy of a file whose median size is 381 KB.
+
+**Consequence for you:** you can no longer lose a transcript by restarting the
+orchestrator at the wrong moment. A transcript is either archived or still on
+disk.
+
+### A failed archive holds the transcript — and only the transcript
+
+When a transcript cannot be made durable (disk full, permissions, read-only
+remount), `archive_before_delete` **holds** that `.jsonl` in place rather than
+deleting it. Everything else in the config dir is deleted **unconditionally**:
+`.credentials.json`, the `~/.claude` settings symlinks (unlinked, never
+followed), `sessions/`, `telemetry/`, and every other non-transcript member.
+
+That scoping is the point. A permanently-failing archive must never convert
+into an unbounded hold on a credential-bearing directory. If the purge itself
+somehow leaves `.credentials.json` behind, that is reported loudly through the
+same archival-failure counter — it is not allowed to be silent.
+
+At the `cleanup_worktree` backstop a held transcript is destroyed moments
+later by `git worktree remove --force`. That is deliberate: the guard's
+promise is that *it* never deletes an un-archived transcript, and blocking
+worktree removal would trade a bounded, counted, escalated transcript loss for
+an unbounded hold on a worktree and its lane slot.
+
+### The boot-time sweeper covers the SIGKILL tail
+
+Nothing above runs when the process is SIGKILLed.
+`Harness._sweep_orphaned_transcripts` runs at startup, inside crash recovery
+(after the pool-storage guard, before any worktree is cleaned up), and
+archives whatever transcripts survive in
+`<worktree>/.task/claude-config-*/`. It also drains the held
+backlog from the previous point — which is what bounds a hold to "until the
+next process start".
+
+It **only ever copies**. The worktrees it walks are the ones recovery is about
+to adopt; moving a transcript out from under a session that is about to
+`--resume` would degrade that resume to a fresh dispatch. Deletion stays with
+the teardown sites, which know the session is finished.
+
+The sweep is deadline-bounded (30s). A truncated pass logs a WARNING naming
+itself `INCOMPLETE` with the examined/archived counts — if you see it, the
+untouched worktrees are simply swept at the next start.
+
+### The archival-storm L1
+
+One failed archive is routine and only increments a counter. A **burst** files
+one L1, deduped so a runaway files once, not hundreds of times:
+
+| | |
+|---|---|
+| Sentinel / role | `__transcript_archival_storm__` / `orchestrator-transcript-archival-storm` |
+| Severity | `blocking`, `category=infra_issue`, level 1 |
+| Knobs | `transcript_archive.storm_threshold` (default 5), `transcript_archive.storm_window_secs` (default 600.0) |
+| Tier | **Green** — both hot-reload via `reload_config`, and are read live on every failure (no restart needed) |
+
+The escalation names the archive root, the failing paths, and the errnos
+symbolically (`ENOSPC(28)`, `EACCES(13)`, …) — that distinction *is* the next
+action. Check, in order: free space and inode headroom on the archive root;
+that the path exists and is writable by this process (a read-only remount
+looks exactly like a permissions failure); and that the archive root is on the
+expected device. Held transcripts are retried automatically by the next
+start's sweeper, so a fixed root self-heals on restart with no manual copy.
+
+### Verifying the fix on your own host
+
+The claim is scoped to the **post-fix cohort** — sessions preserved by a
+restart that ran this code. Archive coverage of sessions preserved by a
+SIGTERM restart should read 100%, against the 12.5% (2 of 16) measured
+2026-08-04 before the guard existed. The historical cohort is not
+retroactively recoverable, so do not expect an all-time number to move.
+
+After a graceful restart with sessions in flight, from `project_root`:
+
+```bash
+for sc in .worktrees/*/.task/agent_session.json; do
+  [ -e "$sc" ] || continue
+  sid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("session_id",""))' "$sc")
+  [ -n "$sid" ] || continue
+  if compgen -G "data/orchestrator/agent-transcripts/*/*/$sid.jsonl" >/dev/null; then
+    echo "OK   $sid"
+  else
+    echo "MISS $sid  ($sc)"
+  fi
+done
+```
+
+Every preserved session should print `OK`. A `MISS` means that session will
+fall back to a fresh dispatch on re-dispatch — check the orchestrator log for
+`transcript_archive:` WARNINGs and for an open archival-storm L1.
+
+Note this task makes the archive *exist*; whether a given session actually
+resumes from it is task 3578's separate eligibility guard.
 
 ---
 

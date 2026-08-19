@@ -303,12 +303,20 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # _discover_module_configs registers a module iff the directory DIRECTLY
 # contains an `orchestrator.yaml` carrying at least one overridable field, and
 # it SKIPS prefix == '.'. A skills/orchestrator.yaml (prefix `skills`, depth 1)
-# is well inside the effective lock_depth of 4 — the package-bundled
-# orchestrator/src/orchestrator/defaults.yaml ships lock_depth: 4, layered over
-# the pydantic Field default of 2 — so it WOULD be discovered. Registering one
-# is feasible. It is declined. And it could never cover conftest.py or
-# df_pytest_isolation.py regardless, so widening the head above was REQUIRED
-# independent of this decision.
+# is inside lock_depth at EVERY layer the config can resolve — the pydantic
+# Field default, the package-bundled defaults.yaml, and this project's own
+# override alike — so it WOULD be discovered. Registering one is feasible. It
+# is declined. And it could never cover conftest.py or df_pytest_isolation.py
+# regardless, so widening the head above was REQUIRED independent of this
+# decision.
+#
+#   CORRECTED IN PLACE (task 3866), same treatment this block gives its own
+#   superseded premises. This used to read "well inside the effective
+#   lock_depth of 4", which stopped being true when `lock_depth` moved 4 -> 12
+#   (line 59 of this file). The conclusion never depended on the number: depth
+#   1 is inside 2, 4 and 12 alike. So it is now stated as the invariant rather
+#   than re-pinned to 12 — the next retune of that knob falsifies nothing here
+#   and needs no edit to this comment.
 #
 # THE DECIDING FACT, which is what turns a deferral into a decision, and which
 # 3485 could not see because the lever did not exist until its own commit
@@ -359,6 +367,8 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #       skills/**/*.py and RUNS ruff over them (the deciding fact above).
 #   scripts/tests/test_legibility_inventory.py    — reads
 #       skills/spawn/spawn-claude.sh to cross-check a bash/Python encoder mirror.
+#   tests/scripts/test_find_escalation_port.py    — LOADS AND EXECUTES the real
+#       skills/factory-init/scripts/find_escalation_port.py (task 3705).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
 # duplicated on every review checkpoint, main-tip sweep and merge full-verify.
 # That is far worse than the single-suite duplication 3485 assumed, and it
@@ -695,8 +705,43 @@ escalation:
 # Per-role turn budgets. Raising the architect budget is a direct response to
 # silent max_turns exits on large-scope tasks: the architect now has headroom
 # to verify premises and produce a plan without the CLI truncating mid-tool-call.
+#
+# reviewer 30 -> 60 (2026-08-17, from the task-3543 /unblock investigation).
+# A cap is a runaway guard, not a throttle on normal operation — and 30 had
+# become the latter. Measured over 475 reviewer_comprehensive invocations
+# since 2026-08-10 (orchestrator journal):
+#   - 19.6% of ALL invocations exceeded 30 turns; 24.0% hit one cap or the other
+#   - of 79 failures, 43 sat at EXACTLY turns=31 and only 11 were anything
+#     other than a cap hit — i.e. 86% of reviewer failures were caps, not faults
+#   - successful reviews have p50=19, p90=31, p95=33, max=43 turns, so the cap
+#     was firing BELOW the 90th percentile of normal successful operation
+# 60 leaves ~40% headroom over the observed max while still catching a runaway.
+# Direct precedent: simple_task was raised 30 -> 50 (task 2797) at 28.6%
+# saturation, described there as "the worst of any role"; reviewer was in the
+# same class. Note the observed maxima are CENSORED by the caps themselves, so
+# true demand may run higher — prefer generosity on the next re-baseline too.
+# The mislabeling that let this hide (cap exhaustion reported as
+# "infrastructure errors after retries") is tracked as task 3321.
 max_turns:
   architect: 120
+  reviewer: 60
+
+# Per-role per-invocation dollar ceilings. reviewer 5.0 -> 12.0, same
+# investigation and same rationale as the max_turns.reviewer raise above.
+#   - 5.3% of the 475 invocations hit the $5.00 ceiling; task 3543 alone burned
+#     ~$48 across ten attempts to obtain ONE usable verdict
+#   - $268 of $908 total reviewer spend (29.5%) went to cap-killed runs that
+#     produced nothing at all
+#   - successful reviews cost p50=$1.46, p95=$3.10, max=$4.92 — the ceiling sat
+#     barely above the largest legitimate review, so it bit the tail hard
+# $12 is ~4x p95 and ~2.4x the observed max, and fits the existing ladder
+# (architect 15, deep_reviewer 15, implementer 10). Cross-check against the
+# 60-turn cap: at the observed ~$0.085/turn mean, 60 turns is ~$5, so neither
+# cap masks the other.
+# EXPECTED TO REDUCE net spend: a cap-killed run burns the FULL ceiling, yields
+# nothing, and is then retried up to 4 more times.
+budgets:
+  reviewer: 12.0
 
 # Trailing-24h spend ceiling. Default $200 was a backstop from before the
 # multi-account failover landed — with Anthropic's per-account caps as the

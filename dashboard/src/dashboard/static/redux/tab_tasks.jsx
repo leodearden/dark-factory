@@ -184,6 +184,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
           <span className="status-pip"></span>
           <span className="id">{window.DF_SHELL.taskId(t.id)}</span>
           {t.train && <span className="train-badge" title={`train ${t.train.id} · order ${t.train.order}`}>🚂 {t.train.id}</span>}
+          {t.stranded && <span className="badge bad" title="stranded: in-progress with no live claimant / stale heartbeat">⚠</span>}
           <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--fg-3)', fontFamily: 'var(--mono)' }}>
             {t.status === 'in-progress' ? rtAge(t.started) : t.status === 'done' ? (t.completed ? window.DF_SHELL.timeago(t.completed) : 'done') : t.status}
           </span>
@@ -528,7 +529,11 @@ function TaskDetail({ task, allTasks }) {
 
       <div className="kv">
         <span className="k">status</span>
-        <span><span className={`badge ${task.status === 'blocked' ? 'bad' : task.status === 'done' ? 'ok' : task.status === 'deferred' ? 'muted' : task.status === 'cancelled' ? 'muted' : task.status === 'pending' ? 'warn' : task.status === 'merge-deferred' ? 'merge-deferred' : 'accent'}`}>{task.status}</span></span>
+        <span><span className={`badge ${task.status === 'blocked' ? 'bad' : task.status === 'done' ? 'ok' : task.status === 'deferred' ? 'muted' : task.status === 'cancelled' ? 'muted' : task.status === 'pending' ? 'warn' : task.status === 'merge-deferred' ? 'merge-deferred' : 'accent'}`}>{task.status}</span>
+          {/* Strand verdict (task 3543). Computed server-side from the claim
+              columns; deliberately INDEPENDENT of `agent` below, which is only
+              worktree presence and stays truthy after the agent dies. */}
+          {task.stranded && <span className="badge bad" style={{ marginLeft: 6 }} title="stranded: in-progress with no live claimant / stale heartbeat">stranded</span>}</span>
         <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{task.agent || <span style={{ color: 'var(--fg-3)' }}>unassigned</span>}</span>
         <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.loops)}</span>
         <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.attempts)}</span>

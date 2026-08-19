@@ -117,6 +117,37 @@ _WATCHDOG_WORKING_POLL_SECS = 60.0
 #                                         is caught and converted to a
 #                                         retryable 'infra_failure' proposal
 #                                         entry instead of raising.
+#
+# orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 1800 s (30 min).
+#   (run_architect_eval invocation)       One cell of a bounded, queue-blocking
+#                                         eval campaign; the 14-day default
+#                                         would park the whole campaign on a
+#                                         single capped cell.
+#                                         AllAccountsCappedException is caught
+#                                         and recorded as a `cap_exhausted:`
+#                                         marker on the cell (tainted, so the
+#                                         cell is EXCLUDED from the reported
+#                                         mean rather than scored a fabricated
+#                                         0.0), never raised.  No
+#                                         max_cap_retries: cooldown doubles per
+#                                         pool cycle, so a fixed count would
+#                                         give a BIGGER account pool LESS
+#                                         wall-clock patience.
+#
+# SCOPE OF EVERY BOUND IN THIS TABLE (task 3630 amendment, reviewer:
+# robustness).  cap_wait_sanity_secs is consulted at exactly one place —
+# _check_cap_wait — which runs in the cap-hit branch AFTER an invocation
+# returned and was classified as a cap.  It therefore bounds cap-RETRY
+# patience.  It does NOT bound the gate's own all-accounts-capped wait: the
+# next loop iteration re-enters usage_gate.invoke_slot -> before_invoke, which
+# ends in an unbounded `await self._open.wait()` (usage_gate.py) released only
+# by a real cap reset or a successful resume probe.  So a caller whose pool is
+# ALREADY frozen when it starts can still block for hours despite a 120 s or
+# 1800 s policy here.  Every caller in this table inherits that gap; none of
+# them currently compensates for it.  Closing it belongs HERE, inside the
+# wrapper, where a wait in before_invoke is definitionally a cap wait and can
+# be attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
+# pool from a slow agent and would misattribute the latter.
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
@@ -210,9 +241,17 @@ class AllAccountsCappedException(Exception):
 #
 # KEEP IN SYNC with the CLI's built-in tool names: a *future new* built-in tool
 # would not be auto-denied by this list.  Accepted because (a) these prompts forbid
-# tool use, (b) no ``mcp_config`` is wired for these callers (MCP tools absent), and
-# (c) a future change to the CLI's tool-exclusion semantics is caught loudly by the
-# ``schema_tool_denied`` detection below rather than degrading silently.
+# tool use, and (b) a future change to the CLI's tool-exclusion semantics is caught
+# loudly by the ``schema_tool_denied`` detection below rather than degrading silently.
+#
+# SCOPE — BUILT-INS ONLY: this list contains no MCP tool pattern, so expanding the
+# ``'*'`` narrows the deny to built-ins and leaves every MCP tool REACHABLE.  That
+# is invisible only while no MCP server is in play; the CLI ambient-merges the
+# project-scoped ``.mcp.json`` found at ``cwd``, so a wildcard-deny caller running
+# at a cwd that carries one (e.g. the project root) silently regains MCP tools —
+# under ``bypassPermissions``, that is unreviewed write access.  Such a caller MUST
+# ALSO pass ``mcp_config=no_mcp_servers_config()`` with ``strict_mcp_config=True``
+# to keep MCP tools out of reach; denying built-ins alone does not do it.
 _SCHEMA_OUTPUT_TOOL = 'StructuredOutput'
 _REAL_BUILTIN_TOOLS_DENYLIST = [
     'Bash',
@@ -234,6 +273,32 @@ _REAL_BUILTIN_TOOLS_DENYLIST = [
     'ExitPlanMode',
     'SlashCommand',
 ]
+
+
+def no_mcp_servers_config() -> dict[str, Any]:
+    """Build a FRESH scoping ``mcp_config`` carrying ZERO MCP servers.
+
+    For callers that pass ``disallowed_tools=['*']`` and must keep MCP tools
+    unreachable even when an ``output_schema`` forces the wildcard expansion
+    above (which denies built-ins ONLY).  Paired with
+    ``strict_mcp_config=True`` this emits ``--mcp-config <file>
+    --strict-mcp-config``, scoping the invocation to the file's server set —
+    i.e. nothing — instead of ambient-merging the ``.mcp.json`` at the
+    caller's ``cwd``.
+
+    MUST STAY TRUTHY.  ``--strict-mcp-config`` is emitted only inside the
+    ``if mcp_config:`` block of ``build_claude_argv``, so "simplifying" the
+    return value to a bare ``{}`` would skip both flags and silently reinstate
+    ambient MCP access while still reading as correct at every call site.
+
+    A FACTORY, deliberately, not a module-level constant: a shared dict hands
+    every caller the same mutable object, so a single in-place
+    ``cfg['mcpServers']['some-server'] = ...`` would silently widen MCP access
+    for every other consumer — under ``bypassPermissions`` — with nothing but a
+    comment forbidding it and no test able to catch it.  Each call returns a
+    fresh, unaliased dict, so no caller can reach shared state.
+    """
+    return {'mcpServers': {}}
 
 
 @dataclass
@@ -1168,7 +1233,12 @@ async def invoke_claude_agent(
 
     *resume_session_id*, when set, resumes an existing session via
     ``--resume <id>`` instead of starting a new one.  The system prompt is
-    skipped on resume (it was already set in the initial session).
+    re-passed on resume via ``--system-prompt-file``: it is a
+    process-invocation parameter that the session does not carry, so a resumed
+    invocation that omits it runs under the stock Claude Code prompt with no
+    role charter.  A resumed session therefore gets the CURRENT role prompt —
+    see ``build_claude_argv`` for the full rationale and the probed CLI
+    behaviour.
 
     *session_id*, when set and *resume_session_id* is not, pre-allocates the
     session UUID via ``--session-id <id>`` so callers can resume the same
@@ -2143,9 +2213,10 @@ def build_claude_argv(
     byte-identical.
 
     Returns ``(cmd, temp_files)``: ``cmd`` is the assembled argv list;
-    ``temp_files`` lists the temp file paths created (empty when resuming and
-    no ``mcp_config`` is set).  The caller owns cleanup of a successful
-    return, typically via
+    ``temp_files`` lists the temp file paths created.  It is never empty — the
+    sysprompt path is always present, on the resume path too (task 3983) —
+    plus the mcp-config path when an ``mcp_config`` is supplied.  The caller
+    owns cleanup of a successful return, typically via
     ``finally: for p in temp_files: Path(p).unlink(missing_ok=True)``.
 
     On exception (e.g. a non-serializable ``mcp_config``), any temp files
@@ -2166,20 +2237,50 @@ def build_claude_argv(
     # back to a clean unlink of everything created so far, leaving no
     # orphaned temp files for the caller to worry about.
     try:
+        # Write system prompt to temp file to avoid ARG_MAX on large payloads.
+        #
+        # UNCONDITIONAL — including on resume (task 3983).  This used to live in
+        # the `else` below, on the belief that --system-prompt-file and --resume
+        # were incompatible.  They are NOT: probed on CLI 2.1.226, the pair is
+        # accepted and fails only on a nonexistent session id, i.e. past argument
+        # validation.  CLI CHANGELOG 2.0.64 — "Fixed --system-prompt being ignored
+        # when using --continue or --resume flags" — makes re-passing the intended
+        # usage.  The system prompt is a process-invocation parameter that is never
+        # persisted with the session, so omitting it on resume dropped the role
+        # charter entirely and the agent silently ran under the stock Claude Code
+        # prompt.
+        #
+        # REPLACE, not append: roles are RESTRICTIVE charters, and
+        # --append-system-prompt-file would layer them over the stock
+        # general-purpose identity that produced the role-disowning behaviour in
+        # the first place.  Replace also keeps fresh and resumed argv
+        # byte-identical.  Re-passing is a prompt-cache HIT; omitting it was a
+        # total cache MISS — this is cheaper than the status quo, not costlier.
+        #
+        # A resumed session gets the CURRENT role prompt, not a byte-replay of the
+        # original.  That is the intended semantics: no role prompt is templated
+        # with per-invocation task context (that lives in the USER prompt), though
+        # a few are built from live inputs that can shift between invocations —
+        # recon Stage 2 branches on `project_id`, reviewer/curator prompts are
+        # model-keyed artifacts, Stage 1/3 introspect live FastMCP signatures, and
+        # recon-verify is tool-list templated.
+        fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
+        temp_files.append(sysprompt_path)
+        with open(fd, 'w') as f:
+            f.write(system_prompt)
+        cmd.extend(['--system-prompt-file', sysprompt_path])
+
         if resume_session_id:
-            # Resume an existing session — skip --system-prompt (incompatible)
+            # Resume an existing session.
             cmd.extend(['--resume', resume_session_id])
-        else:
-            # Write system prompt to temp file to avoid ARG_MAX on large payloads
-            fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
-            temp_files.append(sysprompt_path)
-            with open(fd, 'w') as f:
-                f.write(system_prompt)
-            cmd.extend(['--system-prompt-file', sysprompt_path])
+        elif session_id:
             # Pre-allocate the session UUID so future --resume can find it.
-            # --session-id and --resume are mutually exclusive at the CLI level.
-            if session_id:
-                cmd.extend(['--session-id', session_id])
+            # Unlike --system-prompt-file, --session-id IS genuinely exclusive
+            # with --resume, verbatim from the CLI: "--session-id can only be
+            # used with --continue or --resume if --fork-session is also
+            # specified."  So it stays in the branch while the system prompt
+            # does not.
+            cmd.extend(['--session-id', session_id])
 
         cmd.extend(['--permission-mode', permission_mode])
         cmd.extend(['--max-turns', str(max_turns)])

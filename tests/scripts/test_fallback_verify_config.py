@@ -422,6 +422,136 @@ def test_per_module_merge_verify_raises_per_test_timeout() -> None:
             )
 
 
+#: Shell operators that end one `uv run` invocation and begin another. A
+#: pairing is only self-defeating WITHIN a single clause, so the scan resets
+#: at each of these rather than pooling flags across an `&&`-chain (every
+#: subproject's lint_command chains a `python3 .../check_*.py` sibling gate).
+_CHAIN_OPERATOR_TOKENS = frozenset({"&&", "||", ";", "|"})
+
+#: The two spellings uv accepts for a value-taking long flag. The sibling
+#: parser in ``test_skills_module_config_decision.py`` (``_pytest_collected_dirs``)
+#: already handles ``--directory`` this way; mirrored here for BOTH flags so a
+#: future ``--project=X --directory=X`` cannot slip past the guard.
+_UV_VALUE_FLAGS = ("--project", "--directory")
+
+
+def _uv_same_value_flag_pairings(cmd: str, *, label: str) -> list[str]:
+    """Every value ``V`` for which one clause of *cmd* passes BOTH flags as ``V``.
+
+    Returns the offending values (usually at most one per clause). A clause
+    that sets only one of the two, or sets them to DIFFERENT values, is not
+    reported: ``--project shared --directory scripts`` means "run from
+    ``scripts/`` against ``shared``'s project", which is a genuinely different
+    and legitimate instruction, not the self-defeating same-value pairing.
+    """
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError as exc:
+        raise AssertionError(
+            f"{label} is not shell-parseable ({exc.__class__.__name__}: {exc}); "
+            f"command: {cmd!r}.\nFIX: repair that config. Skipping an unparseable "
+            f"command would silently defeat this guard — an unquoted config would "
+            f"be indistinguishable from a clean one."
+        ) from exc
+
+    pairings: list[str] = []
+    seen: dict[str, str] = {}
+
+    def _end_clause() -> None:
+        project, directory = seen.get("--project"), seen.get("--directory")
+        if project is not None and project == directory:
+            pairings.append(project)
+        seen.clear()
+
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _CHAIN_OPERATOR_TOKENS:
+            _end_clause()
+        else:
+            for flag in _UV_VALUE_FLAGS:
+                if token == flag and index + 1 < len(tokens):
+                    seen[flag] = tokens[index + 1]
+                    index += 1
+                    break
+                if token.startswith(f"{flag}="):
+                    seen[flag] = token[len(flag) + 1 :]
+                    break
+        index += 1
+    _end_clause()
+    return pairings
+
+
+def test_per_module_verify_commands_never_pair_project_with_directory() -> None:
+    """No module verify command may pass ``--project V`` and ``--directory V`` together.
+
+    Task 3830. The pairing is SELF-DEFEATING, not merely redundant: uv applies
+    ``--directory V`` FIRST (the process cwd becomes ``V/``) and only then
+    resolves ``--project V`` — against that NEW cwd — so it looks for ``V/V``,
+    which does not exist. uv 0.11.6 emits::
+
+        warning: Project directory `shared` does not exist. This will become an
+        error in a future release.
+
+    It is a warning today and the command still runs, which is exactly what
+    makes it worth guarding: nothing goes red until the uv release that
+    promotes it to an error, at which point EVERY module verify command breaks
+    simultaneously — and the repo root sets ``merge_verify_breadth: "full"``,
+    so that is a repo-wide merge outage rather than one subproject's problem.
+
+    The set of configs is DISCOVERED (``_discover_per_module_configs`` ->
+    the production walk), so a newly-added subproject is auto-covered at any
+    depth with no edit here. All three command slots are checked, because the
+    defect is per-command, not per-module. No exclusions frozenset: task 3830
+    fixed all 21 sites at once, leaving nothing to carve out.
+    """
+    discovered = _discover_per_module_configs()
+
+    # Same discovery floor as the timeout guard above: if a known config stops
+    # resolving, the loop below would vacuously pass on a shrunken set.
+    missing = KNOWN_PER_MODULE_CONFIG_NAMES - set(discovered)
+    assert not missing, (
+        "dynamic discovery (config._discover_module_configs, filtered to "
+        f"configs defining a test_command) failed to resolve known per-module "
+        f"config(s) {sorted(missing)} (task 3830) — discovery has regressed; "
+        f"discovered: {sorted(discovered)}"
+    )
+
+    offenders: list[str] = []
+    for prefix, module_config in sorted(discovered.items()):
+        for slot in ("test_command", "lint_command", "type_check_command"):
+            cmd = getattr(module_config, slot)
+            if cmd is None:
+                continue
+            label = f"{prefix}/orchestrator.yaml::{slot}"
+            for value in _uv_same_value_flag_pairings(cmd, label=label):
+                offenders.append(f"  {label} pairs --project {value} with --directory {value}")
+
+    assert not offenders, (
+        f"{len(offenders)} module verify command(s) pair `--project V` with "
+        "`--directory V` for the same V (task 3830):\n"
+        + "\n".join(offenders)
+        + "\n\nWHY THIS IS WRONG: uv applies `--directory V` first (cwd becomes "
+        "V/), then resolves `--project V` against that NEW cwd — looking for "
+        "V/V, which does not exist. uv 0.11.6 warns 'This will become an error "
+        "in a future release'; when it does, every one of these breaks at once, "
+        "and the repo root's merge_verify_breadth: \"full\" makes that a "
+        "repo-wide merge outage.\n\n"
+        "FIX: delete the `--project V ` token and KEEP `--directory V`. The "
+        "in-repo worked examples of an unpaired command are "
+        "scripts/orchestrator.yaml and tests/scripts/orchestrator.yaml.\n\n"
+        "Do NOT 'fix' this the other way by deleting `--directory` instead: cwd "
+        "is load-bearing. pyright resolves `[tool.pyright]` from its cwd, and "
+        "each module's own table carries a `venvPath`/`venv` interpreter pin "
+        "that is resolved RELATIVE TO THAT FILE'S DIRECTORY (plus, for "
+        "orchestrator, module-specific extraPaths). Moving cwd to the repo root "
+        "silently substitutes the ROOT pyright config for the module's own — "
+        "which type-checks green against the wrong settings, the false-GREEN "
+        "direction (its own comment records 'measured 496 phantom "
+        "reportMissingImports here, 0 with this pin')."
+    )
+
+
 # Measured per-segment wall-clock of the FALLBACK fleet chain, in seconds.
 #
 # PROVENANCE: task 3062, .task/verify/attempt-2.__fallback__.{summary.json,
@@ -690,7 +820,7 @@ class TestWorkspacePyrightInterpreterPinned:
     covered only the 3 directories ``type_check_command`` happened to ``cd``
     into, leaving the hole one config edit away from reopening: ``shared`` and
     ``escalation`` were type-checked only through their own
-    ``<sub>/orchestrator.yaml`` ``uv run --project X --directory X pyright``
+    ``<sub>/orchestrator.yaml`` ``uv run --directory X pyright``
     commands, where uv (not ``[tool.pyright]``) supplies the interpreter, and
     ``sampler``/``cockpit``/``dashboard`` weren't in the fleet chain at all.
     Task 3397 extended the fleet chain to all 7 workspace members, so today

@@ -6988,6 +6988,55 @@ class TestSweepStalePersistenceMarkers:
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) >= 1
 
+    @pytest.mark.asyncio
+    async def test_kind_only_member_emits_no_drift_warning_single_variant_pool(self, caplog):
+        """The under-tagged-marker drift diagnostic (task 3915 step-8) is
+        gated to `len(filter_variants) > 1` so the two single-dict callers
+        keep byte-for-byte unchanged log output — this pool
+        (_sweep_stale_persistence_markers, enum_filters=None) is one of
+        them. A member carrying only 'kind' with no 'source' key is exactly
+        the drifted shape the diagnostic looks for on the multi-variant
+        stage1_flag_marker pool, but here — reached via the single
+        {'source': 'stage2_persistence_marker'} filter, meaning a real
+        Qdrant scroll could never have returned it in the first place — no
+        drift WARNING must fire regardless. A future refactor that dropped
+        the multi-variant gate would leave the two existing drift tests on
+        TestSweepStaleMem0FlagMarkers green while silently changing this
+        sweep's log output; this test pins that it does not."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_persistence_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'kind-only',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage2_persistence_marker', 'flag_id': 'f1'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_persistence_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now,
+            )
+
+        # The member is still deleted normally (age-GC does not consult
+        # 'source'/'kind' at all) — only the drift diagnostic is at issue.
+        assert result == 1
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'under-tagged' in rec.message.lower()
+            for rec in caplog.records
+        )
+
 
 class TestSweepStaleMem0FlagMarkers:
     """_sweep_stale_mem0_flag_markers age-GCs the legacy stage1_flag_marker Mem0
@@ -7061,10 +7110,15 @@ class TestSweepStaleMem0FlagMarkers:
             assert kwargs.get('causation_id') == 'r1'
             assert kwargs.get('_source') == _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE
 
-        memory_service.get_memories_by_metadata.assert_awaited_once()
-        call = memory_service.get_memories_by_metadata.call_args
-        filters = call.kwargs.get('filters') or {}
-        assert filters == {'source': 'stage1_flag_marker'}
+        # task 3915: enumeration now probes BOTH key spellings — one await
+        # per filter variant, not a single {'source': ...}-only scroll.
+        assert memory_service.get_memories_by_metadata.await_count == 2
+        scrolled_filters = [
+            call.kwargs.get('filters') or {}
+            for call in memory_service.get_memories_by_metadata.call_args_list
+        ]
+        assert {'source': 'stage1_flag_marker'} in scrolled_filters
+        assert {'kind': 'stage1_flag_marker'} in scrolled_filters
 
         # Deterministic scroll only — semantic search must never be used for GC.
         memory_service.search.assert_not_awaited()
@@ -7331,9 +7385,15 @@ class TestSweepStaleMem0FlagMarkers:
         result = await _sweep_stale_mem0_flag_markers(memory_service, 'reify', run_id='r1')
 
         assert result == 0
-        memory_service.count_memories_by_metadata.assert_awaited_once()
-        call = memory_service.count_memories_by_metadata.call_args
-        assert call.kwargs.get('filters') == {'source': 'stage1_flag_marker'}
+        # task 3915: short-circuit requires EVERY variant to confirm zero —
+        # one probe per filter variant, not a single {'source': ...}-only probe.
+        assert memory_service.count_memories_by_metadata.await_count == 2
+        probed_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'source': 'stage1_flag_marker'} in probed_filters
+        assert {'kind': 'stage1_flag_marker'} in probed_filters
         memory_service.get_memories_by_metadata.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -7366,7 +7426,8 @@ class TestSweepStaleMem0FlagMarkers:
         )
 
         assert result == 1
-        memory_service.get_memories_by_metadata.assert_awaited_once()
+        # task 3915: the fail-open scroll still runs once per filter variant.
+        assert memory_service.get_memories_by_metadata.await_count == 2
 
     @pytest.mark.asyncio
     async def test_persistence_markers_sweep_never_probes_count(self):
@@ -7389,6 +7450,500 @@ class TestSweepStaleMem0FlagMarkers:
         assert result == 0
         memory_service.count_memories_by_metadata.assert_not_awaited()
         memory_service.get_memories_by_metadata.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_kind_only_marker_without_source_is_enumerated_and_deleted(self):
+        """Regression pin for task 3915 (measured root cause C): the live
+        leaked marker a5732b3b carries metadata.kind='stage1_flag_marker'
+        with NO 'source' key at all — written by an LLM recon add_memory
+        call that omitted 'source' (the canonical retired writer,
+        flag_dedup.py:849-856, always set BOTH keys; this record did not go
+        through it). Pre-fix, this sweep enumerates ONLY
+        {'source': 'stage1_flag_marker'}, which matches zero records for
+        this marker in know_live; combined with count_short_circuit=True,
+        the scroll never even runs, so the record is invisible forever —
+        present-and-zero, indistinguishable from a clean pool. Fixed
+        behaviour must ALSO probe {'kind': 'stage1_flag_marker'} and delete
+        what it finds there. Uses the exact measured live record shape
+        (memory_id, metadata, 37-day age) from get_memory_by_id."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE,
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        live_marker = {
+            'id': 'a5732b3b-801d-4113-b9e3-ca67f72c822b',
+            'created_at': (fixed_now - timedelta(days=37)).isoformat(),
+            'metadata': {
+                'kind': 'stage1_flag_marker',
+                'task_id': 'dark_factory:1943',
+                'flag_type': 'stale_flag_marker_cleanup',
+                'confidence': 'verified',
+                'agent_id': 'recon-stage-task_knowledge_sync',
+            },
+        }
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return [live_marker]
+            return []
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return 1
+            return 0
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'know_live', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        memory_service.delete_memory.assert_awaited_once()
+        call = memory_service.delete_memory.call_args
+        assert call.kwargs.get('memory_id') == 'a5732b3b-801d-4113-b9e3-ca67f72c822b'
+        assert call.kwargs.get('store') == 'mem0'
+        assert call.kwargs.get('causation_id') == 'r1'
+        assert call.kwargs.get('_source') == _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE
+
+        scrolled_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.get_memories_by_metadata.call_args_list
+        ]
+        assert {'kind': 'stage1_flag_marker'} in scrolled_filters
+
+    @pytest.mark.asyncio
+    async def test_marker_carrying_both_source_and_kind_is_deleted_exactly_once(self):
+        """Union de-duplication pin (task 3915): the canonical flag_dedup
+        writer shape (flag_dedup.py:849-856) sets BOTH 'source' and 'kind'
+        to 'stage1_flag_marker' on the same record, so it is returned by
+        BOTH filter variants' scrolls under the SAME id. The merge must be
+        a union keyed on id — this member must be deleted exactly once, not
+        once per matching variant, or stale_mem0_flag_markers_gc_swept
+        would over-count and the delete/tombstone path would double-fire
+        for the entire pre-2406 canonical (both-keys-present) cohort."""
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        both_keys_member = {
+            'id': 'canonical-both-keys',
+            'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+            'metadata': {
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': 't1',
+                'run_id': 'prior-run',
+            },
+        }
+        memory_service = AsyncMock()
+        # Both filter variants match this record (it carries both keys), so
+        # every scroll call — regardless of which variant's filter it was
+        # issued with — returns the SAME member/id.
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[both_keys_member])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_flag_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now,
+            )
+
+        assert result == 1
+        assert memory_service.delete_memory.await_count == 1
+        tombstone.assert_awaited_once()
+        assert tombstone.await_args is not None
+        victims = tombstone.await_args.args[2]
+        assert len(victims) == 1
+        assert victims[0]['id'] == 'canonical-both-keys'
+
+    @pytest.mark.asyncio
+    async def test_short_circuit_only_when_all_variants_count_zero(self):
+        """dark_factory steady state: once BOTH key spellings are confirmed
+        empty, the sweep must short-circuit cheaply — one count probe per
+        variant, no scroll at all — so a fully-drained pool doesn't
+        re-scroll forever every cycle."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(memory_service, 'dark_factory', run_id='r1')
+
+        assert result == 0
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+        assert memory_service.count_memories_by_metadata.await_count == 2
+        probed_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'source': 'stage1_flag_marker'} in probed_filters
+        assert {'kind': 'stage1_flag_marker'} in probed_filters
+
+    @pytest.mark.asyncio
+    async def test_no_short_circuit_when_any_variant_counts_nonzero(self):
+        """The exact know_live state that leaked marker a5732b3b: the
+        'source' probe confirms zero but the 'kind' probe reports 1 — the
+        short circuit must NOT fire, and the scroll must run for BOTH
+        variants so the kind-only marker is found and deleted."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        kind_only_member = {
+            'id': 'kind-only-stale',
+            'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+            'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't1'},
+        }
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            return 1 if filters == {'kind': 'stage1_flag_marker'} else 0
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            return [kind_only_member] if filters == {'kind': 'stage1_flag_marker'} else []
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'know_live', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        assert memory_service.get_memories_by_metadata.await_count == 2
+        memory_service.delete_memory.assert_awaited_once()
+        assert memory_service.delete_memory.call_args.kwargs.get('memory_id') == 'kind-only-stale'
+
+    @pytest.mark.asyncio
+    async def test_short_circuit_fails_open_when_a_variant_probe_raises(self):
+        """A probe exception on ONE variant must fall through to the full
+        scroll for BOTH variants, never be misread as a confirmed-empty
+        pool — the short circuit may only ever skip work the scroll would
+        itself have found empty."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'genuinely-stale',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+        ]
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                raise RuntimeError('qdrant down')
+            return 0
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert result == 1
+        assert memory_service.get_memories_by_metadata.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_kind_only_members_emit_metadata_drift_warning(self, caplog):
+        """Task 3915 step-8: the union filter now REACHES kind-only,
+        source-less members (root cause C) — records written before (or
+        outside) the task-2596 add_memory gate that now rejects that exact
+        shape for 'recon-stage-*' agent_ids (server/tools.py:2978-2993).
+        Mirroring _warn_on_flag_for_stage2_type_drift's posture (task 2966),
+        the sweep must emit exactly ONE loud, purely-diagnostic WARNING
+        naming the count of under-tagged members and the log_name, so any
+        residual non-'recon-stage-*' writer surfaces instead of silently
+        refilling the pool the fix just drained. The warning must never
+        affect the sweep's own delete/return behaviour — all three members
+        here are stale and unprotected, so all three must still be
+        deleted. get_memories_by_metadata is filter-aware (side_effect)
+        so this pins that the `kind`-only members are actually surfaced by
+        the `{'kind': ...}` variant's scroll, not just present in an
+        unrealistic filter-blind mock return."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'canonical-both-keys',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {
+                    'source': 'stage1_flag_marker',
+                    'kind': 'stage1_flag_marker',
+                    'task_id': 't1',
+                },
+            },
+            {
+                'id': 'kind-only-1',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't2'},
+            },
+            {
+                'id': 'kind-only-2',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't3'},
+            },
+        ]
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            return 1 if filters == {'kind': 'stage1_flag_marker'} else 0
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                return [m for m in members if m['metadata'].get('source') == 'stage1_flag_marker']
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return [m for m in members if m['metadata'].get('kind') == 'stage1_flag_marker']
+            return []
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.stages.task_knowledge_sync'
+        ):
+            result = await _sweep_stale_mem0_flag_markers(
+                memory_service, 'know_live', run_id='r1', now=fixed_now,
+            )
+
+        # Purely diagnostic: normal age-filter/delete behaviour is unaffected —
+        # all three members are stale and none are protected-mirror records,
+        # so all three are still deleted regardless of the drift warning.
+        assert result == 3
+        assert memory_service.delete_memory.await_count == 3
+
+        drift_warnings = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and '_sweep_stale_mem0_flag_markers' in rec.message
+            and 'kind' in rec.message
+            and 'source' in rec.message
+        ]
+        assert len(drift_warnings) == 1, (
+            f'expected exactly one drift WARNING, got: '
+            f'{[(r.name, r.levelno, r.message) for r in caplog.records]}'
+        )
+        assert '2' in drift_warnings[0].message
+
+    @pytest.mark.asyncio
+    async def test_all_source_tagged_members_emit_no_drift_warning(self, caplog):
+        """Complementary case (task 3915 step-7): when every enumerated
+        member carries 'source', there is no under-tagged cohort and the
+        drift WARNING must stay silent — the diagnostic must not fire on
+        the canonical, correctly-tagged shape. get_memories_by_metadata is
+        filter-aware (side_effect) so canonical-2 (source only, no 'kind'
+        key) is returned ONLY by the {'source': ...} variant's scroll —
+        the same realistic per-filter shape a live Qdrant scroll would
+        produce — rather than an unrealistic mock that would return it
+        from a {'kind': ...} filter it could never actually match."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'canonical-1',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {
+                    'source': 'stage1_flag_marker',
+                    'kind': 'stage1_flag_marker',
+                    'task_id': 't1',
+                },
+            },
+            {
+                'id': 'canonical-2',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't2'},
+            },
+        ]
+
+        def _count_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            return 1 if filters == {'source': 'stage1_flag_marker'} else 0
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                return [m for m in members if m['metadata'].get('source') == 'stage1_flag_marker']
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return [m for m in members if m['metadata'].get('kind') == 'stage1_flag_marker']
+            return []
+
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(side_effect=_count_for_filter)
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.stages.task_knowledge_sync'
+        ):
+            result = await _sweep_stale_mem0_flag_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now,
+            )
+
+        assert result == 2
+        assert not any(
+            rec.levelno == logging.WARNING
+            and rec.name == 'fused_memory.reconciliation.stages.task_knowledge_sync'
+            and 'under-tagged' in rec.message.lower()
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_falsy_id_members_are_skipped_and_do_not_mask_across_variants(self):
+        """The merge loop skips a member with a falsy id BEFORE checking
+        seen_ids (task 3915), so a None/'' id surfaced by one variant's
+        scroll can never occupy the seen-ids set and mask a DIFFERENT
+        id-less member surfaced by the other variant. Here each variant
+        contributes one falsy-id member (empty string from 'source', None
+        from 'kind') alongside one validly-id'd member; only the two
+        validly-id'd members must be deleted, and neither falsy-id member
+        may block or be conflated with the other."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        source_members = [
+            {
+                'id': '',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't-empty'},
+            },
+            {
+                'id': 'valid-source',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+        ]
+        kind_members = [
+            {
+                'id': None,
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't-none'},
+            },
+            {
+                'id': 'valid-kind',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': 't2'},
+            },
+        ]
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                return source_members
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return kind_members
+            return []
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+        )
+
+        assert memory_service.get_memories_by_metadata.await_count == 2
+        assert result == 2
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'valid-source', 'valid-kind'}
+
+    @pytest.mark.asyncio
+    async def test_scroll_cap_warning_emitted_once_per_variant_naming_its_filter(self, caplog):
+        """Each filter variant has its own scroll_limit budget (task 3915):
+        when BOTH variants independently hit the cap, two separate
+        scroll-cap WARNINGs must be emitted — one per variant — each
+        naming that variant's own filter dict, so an operator can tell
+        which key spelling is backlogged rather than seeing one
+        undifferentiated warning (or a warning naming the wrong filter)."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        scroll_limit = 2
+        source_members = [
+            {
+                'id': f'src-{i}',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': f's{i}'},
+            }
+            for i in range(scroll_limit)
+        ]
+        kind_members = [
+            {
+                'id': f'kind-{i}',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'kind': 'stage1_flag_marker', 'task_id': f'k{i}'},
+            }
+            for i in range(scroll_limit)
+        ]
+
+        def _members_for_filter(**kwargs):
+            filters = kwargs.get('filters') or {}
+            if filters == {'source': 'stage1_flag_marker'}:
+                return source_members
+            if filters == {'kind': 'stage1_flag_marker'}:
+                return kind_members
+            return []
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_members_for_filter)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.stages.task_knowledge_sync'
+        ):
+            await _sweep_stale_mem0_flag_markers(
+                memory_service, 'reify', run_id='r1', now=fixed_now, scroll_limit=scroll_limit,
+            )
+
+        scroll_cap_warnings = [
+            rec for rec in caplog.records
+            if rec.levelno == logging.WARNING and 'scroll cap reached' in rec.message
+        ]
+        assert len(scroll_cap_warnings) == 2, (
+            f'expected one scroll-cap WARNING per variant, got: '
+            f'{[r.message for r in scroll_cap_warnings]}'
+        )
+        messages = [rec.message for rec in scroll_cap_warnings]
+        assert any("{'source': 'stage1_flag_marker'}" in m for m in messages)
+        assert any("{'kind': 'stage1_flag_marker'}" in m for m in messages)
 
 
 class TestSweepStaleMem0FlagForStage2Markers:
@@ -13016,6 +13571,125 @@ class TestTaskKnowledgeSyncDeterministicCycleSummaryWrite:
             'deterministically now.'
         )
         assert '### Per-Cycle Summary Nonce' not in prompt
+
+    # -- task 3732: the extracted write_stage2_cycle_summary wrapper --------
+    #
+    # Stage 2's write was inlined at a single call site inside run(). The
+    # harness-level backstop (task 3732) is a SECOND call site, so the five
+    # bound Stage-2 values are factored into one wrapper — exactly what
+    # write_stage1_cycle_summary does for Stage 1 (task 2440), and for the
+    # same reason: a future change to any of them can never silently diverge
+    # between the two call sites.
+
+    @pytest.mark.asyncio
+    async def test_write_stage2_cycle_summary_lands_a_real_ledger_row(
+        self, mock_deps, ledger_store,
+    ):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        run_id = 'run-3732-wrapper-row'
+        report = self._base_report(run_id)
+        report.llm_calls = 7
+        report.tokens_used = 777
+
+        written = await write_stage2_cycle_summary(
+            mock_deps['memory_service'], 'reify', report, run_id,
+        )
+
+        assert written is True
+        record = await ledger_store.get_by_identity(
+            'reify', 'cycle_summary', task_id='',
+            flag_type='task_knowledge_sync', run_id=run_id,
+        )
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        assert payload['stage'] == 'task_knowledge_sync'
+        assert payload['llm_calls'] == 7
+        assert payload['tokens_used'] == 777
+
+    @pytest.mark.asyncio
+    async def test_write_stage2_cycle_summary_binds_the_stage2_constants(
+        self, mock_deps,
+    ):
+        """Pins the binding the wrapper exists to centralise."""
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _STAGE2_CYCLE_SUMMARY_RECON_POOL,
+            _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE,
+            STAGE2_CYCLE_SUMMARY_POOL_CAP,
+            write_stage2_cycle_summary,
+        )
+
+        run_id = 'run-3732-wrapper-binding'
+        report = self._base_report(run_id)
+
+        with patch.object(
+            tks, 'write_cycle_summary', new=AsyncMock(return_value=True),
+        ) as mock_write:
+            await write_stage2_cycle_summary(
+                mock_deps['memory_service'], 'reify', report, run_id,
+            )
+
+        mock_write.assert_awaited_once()
+        assert mock_write.await_args is not None
+        kwargs = mock_write.await_args.kwargs
+        assert kwargs['stage'] == 'task_knowledge_sync'
+        assert kwargs['recon_pool'] == _STAGE2_CYCLE_SUMMARY_RECON_POOL
+        assert kwargs['trim_source'] == _STAGE2_CYCLE_SUMMARY_TRIM_SOURCE
+        assert kwargs['cap'] == STAGE2_CYCLE_SUMMARY_POOL_CAP
+        # Defaults to a full cycle unless the caller says otherwise.
+        assert kwargs['remediation'] is False
+
+    @pytest.mark.asyncio
+    async def test_write_stage2_cycle_summary_forwards_remediation(
+        self, mock_deps, ledger_store,
+    ):
+        """`remediation` is the one keyword Stage 1's wrapper does not need —
+        Stage 2's write is unconditional and fires on remediation passes too
+        (task_knowledge_sync.py's "Do not 'fix' this to mirror Stage 1's
+        full-cycle-only gating" note), and get_cycle_summary_presence reads
+        payload['remediation'] to disambiguate expected-missing rows."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        run_id = 'run-3732-wrapper-remediation'
+        report = self._base_report(run_id)
+
+        await write_stage2_cycle_summary(
+            mock_deps['memory_service'], 'reify', report, run_id, remediation=True,
+        )
+
+        record = await ledger_store.get_by_identity(
+            'reify', 'cycle_summary', task_id='',
+            flag_type='task_knowledge_sync', run_id=run_id,
+        )
+        assert record is not None
+        assert json.loads(record.payload_json)['remediation'] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('returned', [True, False])
+    async def test_write_stage2_cycle_summary_returns_verbatim(
+        self, mock_deps, returned,
+    ):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        report = self._base_report('run-3732-wrapper-return')
+
+        with patch.object(
+            tks, 'write_cycle_summary', new=AsyncMock(return_value=returned),
+        ):
+            result = await write_stage2_cycle_summary(
+                mock_deps['memory_service'], 'reify', report,
+                'run-3732-wrapper-return',
+            )
+
+        assert result is returned
 
 
 # ---------------------------------------------------------------------------

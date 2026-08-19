@@ -1,5 +1,6 @@
 """Unit tests for Mem0Backend — filter construction and search delegation."""
 
+import asyncio
 import contextlib
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -84,8 +85,13 @@ class TestMem0BackendSearch:
 class TestMem0BackendScrollByMetadata:
     """scroll_by_metadata builds a Qdrant payload filter and returns normalised point dicts."""
 
-    def _make_mock_point(self, point_id: str, created_at: str | None, extra_meta: dict | None = None):
-        """Create a MagicMock that mimics a Qdrant Record/ScoredPoint."""
+    @staticmethod
+    def _make_mock_point(point_id: str, created_at: str | None, extra_meta: dict | None = None):
+        """Create a MagicMock that mimics a Qdrant Record/ScoredPoint.
+
+        A staticmethod so sibling suites can reuse it directly rather than
+        borrowing it with a foreign ``self``.
+        """
         payload = {}
         if created_at is not None:
             payload['created_at'] = created_at
@@ -255,8 +261,8 @@ class TestMem0BackendScrollByMetadataWithVectors:
     the unit lane alongside the sibling scroll_by_metadata tests above.
     """
 
+    @staticmethod
     def _make_mock_point(
-        self,
         point_id: str,
         created_at: str | None,
         extra_meta: dict | None = None,
@@ -378,6 +384,566 @@ class TestMem0BackendScrollByMetadataWithVectors:
         # The vector-less record keeps its identity so it can be counted/reported.
         assert result[1]['id'] == 'id-missing'
         assert result[1]['created_at'] == '2026-02-01T00:00:00+00:00'
+
+
+class TestMem0BackendPayloadFilterSingleHome:
+    """The Qdrant payload ``Filter`` has exactly ONE construction site (INV-5).
+
+    Motivation (task 3225): the same ``Filter(must=[FieldCondition(key=k,
+    match=MatchValue(value=v)) ...])`` was built independently inside
+    ``count_by_metadata``, ``scroll_by_metadata`` and
+    ``scripts/census_memory_metadata.scroll_all_payloads``.  That is not a
+    tidiness problem: the census's coverage reconciliation cross-checks its
+    SCROLL against ``count_by_metadata``'s COUNT, so if the two constructions
+    ever drift the reconciliation silently compares two DIFFERENT point sets
+    while still reporting ``coverage.complete == true``.
+
+    A comment cannot fail CI, so the drift is pinned by an equality assertion
+    at each entry point instead: the ``count_filter=`` kwarg the count API
+    hands Qdrant must EQUAL the ``scroll_filter=`` kwarg the scroll API hands
+    Qdrant must EQUAL ``_build_payload_filter(filters)``.  qdrant models are
+    pydantic, so ``==`` is structural value equality.
+    """
+
+    @pytest.mark.asyncio
+    async def test_builds_field_conditions_in_dict_order(self, backend):
+        """_build_payload_filter maps each filter item to a FieldCondition/MatchValue."""
+        from qdrant_client.http import models as qmodels
+
+        built = backend._build_payload_filter({'category': 'x', 'kind': 'y'})
+
+        assert isinstance(built, qmodels.Filter)
+        assert isinstance(built.must, list)
+        assert len(built.must) == 2
+        # Narrow to FieldCondition up front: qdrant's `Condition` is a union
+        # and only FieldCondition carries `.key`.  The re-length-check is what
+        # keeps this as strong as asserting on the raw list -- a non-FieldCondition
+        # would be filtered out here and caught by the count, not slip through.
+        fields = [c for c in built.must if isinstance(c, qmodels.FieldCondition)]
+        assert len(fields) == 2
+        # Dict-insertion order is preserved so the filter is deterministic
+        # (two callers passing the same dict produce byte-identical filters).
+        assert [c.key for c in fields] == ['category', 'kind']
+        for cond, expected in zip(fields, ['x', 'y'], strict=True):
+            assert isinstance(cond.match, qmodels.MatchValue)
+            assert cond.match.value == expected
+
+    @pytest.mark.asyncio
+    async def test_count_and_scroll_pass_the_same_filter_object_shape(self, backend):
+        """ANTI-DRIFT: count_filter == scroll_filter == _build_payload_filter(filters).
+
+        This is the whole point of the extraction.  If a future edit changes
+        one construction site and not the other, the census's
+        scroll-vs-count reconciliation starts comparing two different point
+        sets with no error surface — this assertion is what fails first.
+        """
+        filters = {'category': 'procedural_knowledge', 'recon_pool': 'stage2_cycle_summary'}
+        scope = Scope(project_id='dark_factory')
+
+        count_client = AsyncMock()
+        count_client.count = AsyncMock(return_value=MagicMock(count=0))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=count_client)):
+            await backend.count_by_metadata(scope=scope, filters=filters)
+
+        scroll_client = AsyncMock()
+        scroll_client.scroll = AsyncMock(return_value=([], None))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=scroll_client)):
+            await backend.scroll_by_metadata(scope=scope, filters=filters)
+
+        count_filter = count_client.count.call_args.kwargs.get('count_filter')
+        scroll_filter = scroll_client.scroll.call_args.kwargs.get('scroll_filter')
+        built = backend._build_payload_filter(filters)
+
+        assert count_filter == built, (
+            f'count_by_metadata built {count_filter!r}, _build_payload_filter built {built!r}'
+        )
+        assert scroll_filter == built, (
+            f'scroll_by_metadata built {scroll_filter!r}, _build_payload_filter built {built!r}'
+        )
+        assert count_filter == scroll_filter, (
+            'count and scroll must select the same point set for the same filters; '
+            f'got count_filter={count_filter!r} scroll_filter={scroll_filter!r}'
+        )
+
+    def test_empty_filters_raises_value_error(self, backend):
+        """An empty filter dict is rejected at the single home too.
+
+        Every caller already rejects it (an unfiltered Filter would select the
+        WHOLE collection), so the shared builder must not become the hole that
+        lets one through.
+        """
+        with pytest.raises(ValueError, match='at least one filter'):
+            backend._build_payload_filter({})
+
+
+def _paging_client(pages: list[tuple[list, object]]) -> AsyncMock:
+    """AsyncMock Qdrant client whose scroll() replays a scripted sequence of
+    ``(points, next_offset)`` pairs."""
+    client = AsyncMock()
+    client.scroll = AsyncMock(side_effect=list(pages))
+    return client
+
+
+async def _drain(agen) -> list:
+    return [item async for item in agen]
+
+
+class TestMem0BackendScrollCollectionPages:
+    """The low-level pager: collection-addressed, raw points, real pagination.
+
+    Ported from ``scripts/census_memory_metadata.py``'s ``scroll_all_payloads``
+    (task 3225), whose whole reason to exist was that the backend discarded
+    ``next_offset`` and so re-read the same head forever.  The loop now lives
+    here — one home for the offset/next_offset walk, the per-page read bound
+    and the page budget — with the census and
+    ``scripts/consolidate_namespace_families.py`` both sitting on top of it.
+
+    Collection-name-addressed (not Scope-addressed) and filter-optional on
+    purpose: consolidate_namespace_families scrolls LEGACY mis-named
+    collections (``reify_reify``, ``fused_dark-factory``) that a Scope
+    structurally cannot produce, with no filter at all.
+    """
+
+    @staticmethod
+    def _make_mock_point(point_id: str, created_at: str | None = None, extra_meta: dict | None = None):
+        """Reuse the sibling suite's Qdrant Record/ScoredPoint double."""
+        return TestMem0BackendScrollByMetadata._make_mock_point(point_id, created_at, extra_meta)
+
+    @pytest.mark.asyncio
+    async def test_yields_raw_points_across_all_pages_in_order(self, backend):
+        """Raw point objects (not normalised dicts) stream out in page order.
+
+        consolidate_namespace_families' merge_collection reads
+        ``point.id``/``point.vector``/``point.payload`` to build PointStructs,
+        so this layer must not normalise.
+        """
+        p1, p2, p3, p4 = (self._make_mock_point(f'id-{i}') for i in range(1, 5))
+        client = _paging_client([([p1, p2], 'off-1'), ([p3], 'off-2'), ([p4], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_collection_pages('reify_reify', page_size=2))
+
+        assert got == [p1, p2, p3, p4], 'points must stream in order, identity-preserved'
+
+    @pytest.mark.asyncio
+    async def test_passes_previous_next_offset_on_each_subsequent_call(self, backend):
+        """THE defect being fixed: each page is requested at the prior next_offset.
+
+        A non-paging implementation sends offset=None three times and re-reads
+        the same head.
+        """
+        client = _paging_client([
+            ([self._make_mock_point('a')], 'off-1'),
+            ([self._make_mock_point('b')], 'off-2'),
+            ([self._make_mock_point('c')], None),
+        ])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_collection_pages('c', page_size=1))
+
+        offsets = [call.kwargs.get('offset') for call in client.scroll.await_args_list]
+        assert offsets == [None, 'off-1', 'off-2']
+
+    @pytest.mark.asyncio
+    async def test_stops_when_next_offset_is_none(self, backend):
+        client = _paging_client([([self._make_mock_point('a')], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_collection_pages('c', page_size=10))
+
+        assert client.scroll.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_forwards_collection_name_verbatim_and_scroll_kwargs(self, backend):
+        """collection_name is passed through UNCHANGED — never scope-derived.
+
+        ``fused_dark-factory`` is a real legacy collection name from
+        consolidate_namespace_families' COLLECTION_MERGES; prefixing or
+        re-deriving it would address a collection that does not exist.
+        """
+        client = _paging_client([([], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_collection_pages('fused_dark-factory', page_size=25))
+
+        kwargs = client.scroll.await_args_list[0].kwargs
+        assert kwargs['collection_name'] == 'fused_dark-factory'
+        assert kwargs['with_payload'] is True
+        assert kwargs['limit'] == 25
+        assert kwargs['with_vectors'] is False, 'vectors are opt-in, not paid for by default'
+        assert kwargs['scroll_filter'] is None, 'no filter given ⇒ scroll the whole collection'
+
+    @pytest.mark.asyncio
+    async def test_forwards_with_vectors_and_scroll_filter_when_given(self, backend):
+        """Both opt-in kwargs reach Qdrant verbatim."""
+        from qdrant_client.http import models as qmodels
+
+        given_filter = backend._build_payload_filter({'category': 'procedural_knowledge'})
+        client = _paging_client([([], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_collection_pages(
+                'c', scroll_filter=given_filter, page_size=10, with_vectors=True,
+            ))
+
+        kwargs = client.scroll.await_args_list[0].kwargs
+        assert kwargs['with_vectors'] is True
+        assert isinstance(kwargs['scroll_filter'], qmodels.Filter)
+        assert kwargs['scroll_filter'] == given_filter
+
+    @pytest.mark.asyncio
+    async def test_empty_collection_yields_nothing(self, backend):
+        client = _paging_client([([], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_collection_pages('c', page_size=10))
+
+        assert got == []
+
+    @pytest.mark.asyncio
+    async def test_raises_when_page_budget_exhausted_with_live_next_offset(self, backend):
+        """A truncated stream RAISES, never returns short (INV-2 no-silent-fail).
+
+        A pager with no budget loops forever if Qdrant keeps handing back a
+        live next_offset, so the budget travels with the loop — and exhausting
+        it is an error, not a quiet early return.
+        """
+        from fused_memory.backends.mem0_client import ScrollPageBudgetExhausted
+
+        client = _paging_client([
+            ([self._make_mock_point('a')], 'off-1'),
+            ([self._make_mock_point('b')], 'off-2'),
+        ])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPageBudgetExhausted) as excinfo,
+        ):
+            await _drain(backend.scroll_collection_pages('fused_reify', page_size=1, max_pages=2))
+
+        message = str(excinfo.value)
+        assert 'fused_reify' in message, 'the message must name the collection'
+        assert '2' in message, 'the message must name the exhausted page count'
+        assert 'off-2' in message, 'the message must name the still-live offset'
+
+    @pytest.mark.asyncio
+    async def test_does_not_raise_when_budget_is_exactly_enough(self, backend):
+        p1, p2 = self._make_mock_point('a'), self._make_mock_point('b')
+        client = _paging_client([([p1], 'off-1'), ([p2], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_collection_pages('c', page_size=1, max_pages=2))
+
+        assert got == [p1, p2]
+
+    @pytest.mark.asyncio
+    async def test_scroll_page_budget_exhausted_is_an_exception(self):
+        from fused_memory.backends.mem0_client import ScrollPageBudgetExhausted
+
+        assert issubclass(ScrollPageBudgetExhausted, Exception)
+
+    @pytest.mark.asyncio
+    async def test_a_hung_page_request_raises_instead_of_hanging(self, backend):
+        """A wedged socket fails loudly rather than hanging a ~30-page scan forever.
+
+        Same propagate-don't-swallow posture as count_by_metadata /
+        scroll_by_metadata / get_point_by_id.
+        """
+        async def _hang(**kwargs):
+            await asyncio.sleep(3600)
+
+        client = AsyncMock()
+        client.scroll = AsyncMock(side_effect=_hang)
+        backend._read_timeout = 0.01
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(TimeoutError),
+        ):
+            await _drain(backend.scroll_collection_pages('c', page_size=10))
+
+    @pytest.mark.asyncio
+    async def test_timeout_applies_per_page_not_per_scan(self, backend):
+        """Every page gets its OWN full-length bound, not a share of one budget.
+
+        A per-scan bound would abort a long-but-healthy multi-page scan the
+        moment the pages' cumulative time crossed the read timeout.  Asserted
+        by spying on wait_for rather than by sleeping, so it cannot flake
+        under parallel load.
+        """
+        p1, p2, p3 = (self._make_mock_point(c) for c in 'abc')
+        client = _paging_client([([p1], 'off-1'), ([p2], 'off-2'), ([p3], None)])
+        backend._read_timeout = 7.5
+
+        real_wait_for = asyncio.wait_for
+        seen_timeouts: list = []
+
+        async def _spy(awaitable, timeout=None):
+            seen_timeouts.append(timeout)
+            return await real_wait_for(awaitable, timeout)
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            patch('fused_memory.backends.mem0_client.asyncio.wait_for', _spy),
+        ):
+            got = await _drain(backend.scroll_collection_pages('c', page_size=1))
+
+        assert got == [p1, p2, p3]
+        assert seen_timeouts == [7.5, 7.5, 7.5], (
+            'each of the 3 page requests must be wrapped in its own '
+            f'wait_for(timeout=_read_timeout); got {seen_timeouts!r}'
+        )
+
+
+class TestMem0BackendScrollAllByMetadata:
+    """The metadata-addressed full-enumeration generator.
+
+    Same addressing as ``scroll_by_metadata`` (Scope + non-empty filters) and
+    the same per-record shape, but it EXHAUSTS the match set by paging instead
+    of returning one capped list.  ``scroll_by_metadata`` is untouched and
+    keeps its one-shot semantics for callers that want them
+    (``scripts/audit_duplicate_memories.py``).
+    """
+
+    @staticmethod
+    def _make_mock_point(
+        point_id: str, created_at: str | None = None, extra_meta: dict | None = None, vector=_UNSET,
+    ):
+        """Reuse the with-vectors suite's double (it models a missing vector)."""
+        return TestMem0BackendScrollByMetadataWithVectors._make_mock_point(
+            point_id, created_at, extra_meta, vector,
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolves_collection_name_from_scope_and_prefix(self, backend):
+        """Collection resolution matches scroll_by_metadata's exactly."""
+        client = _paging_client([([], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_all_by_metadata(
+                Scope(project_id='dark_factory'), {'category': 'procedural_knowledge'},
+            ))
+
+        prefix = backend.config.mem0.collection_prefix
+        assert client.scroll.call_args.kwargs['collection_name'] == f'{prefix}_dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_scroll_filter_equals_the_count_filter_for_the_same_filters(self, backend):
+        """ANTI-DRIFT at THIS entry point — the census's reconciliation depends on it.
+
+        census_project COUNTs with count_by_metadata and SCROLLs with this
+        API, then compares the two figures to decide coverage.complete.  If
+        their filters drifted, the reconciliation would compare two different
+        point sets and still report complete coverage.
+        """
+        filters = {'category': 'observations_and_summaries'}
+        scope = Scope(project_id='dark_factory')
+
+        count_client = AsyncMock()
+        count_client.count = AsyncMock(return_value=MagicMock(count=0))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=count_client)):
+            await backend.count_by_metadata(scope=scope, filters=filters)
+
+        scroll_client = _paging_client([([], None)])
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=scroll_client)):
+            await _drain(backend.scroll_all_by_metadata(scope, filters))
+
+        count_filter = count_client.count.call_args.kwargs.get('count_filter')
+        scroll_filter = scroll_client.scroll.call_args.kwargs.get('scroll_filter')
+        assert scroll_filter == count_filter == backend._build_payload_filter(filters)
+
+    @pytest.mark.asyncio
+    async def test_record_shape_is_identical_to_scroll_by_metadata(self, backend):
+        """Element-wise equality between the list API and the stream API.
+
+        Both normalise through the same helper, so the two shapes cannot
+        drift — a caller migrating from one to the other sees byte-identical
+        records.
+        """
+        def _points():
+            return [
+                self._make_mock_point('id-1', '2026-01-01T00:00:00+00:00', {'category': 'x'}),
+                self._make_mock_point('id-2', None, {'category': 'x'}),
+            ]
+
+        filters = {'category': 'x'}
+        scope = Scope(project_id='p')
+
+        list_client = AsyncMock()
+        list_client.scroll = AsyncMock(return_value=(_points(), None))
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=list_client)):
+            as_list = await backend.scroll_by_metadata(scope, filters)
+
+        stream_client = _paging_client([(_points(), None)])
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=stream_client)):
+            as_stream = await _drain(backend.scroll_all_by_metadata(scope, filters))
+
+        assert as_stream == as_list
+        # 'metadata' is the FULL payload (created_at included); 'created_at'
+        # is lifted out of it as a convenience, not moved.
+        assert as_stream[0] == {
+            'id': 'id-1',
+            'created_at': '2026-01-01T00:00:00+00:00',
+            'metadata': {'category': 'x', 'created_at': '2026-01-01T00:00:00+00:00'},
+        }
+        assert as_stream[1]['created_at'] is None, 'a payload with no created_at degrades to None'
+
+    @pytest.mark.asyncio
+    async def test_records_stream_across_page_boundaries_in_order(self, backend):
+        """The whole point: the match set is exhausted, not capped at one page."""
+        pages = [
+            ([self._make_mock_point('id-1'), self._make_mock_point('id-2')], 'off-1'),
+            ([self._make_mock_point('id-3')], None),
+        ]
+        client = _paging_client(pages)
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_all_by_metadata(
+                Scope(project_id='p'), {'category': 'x'}, page_size=2,
+            ))
+
+        assert [r['id'] for r in got] == ['id-1', 'id-2', 'id-3']
+        assert [c.kwargs.get('offset') for c in client.scroll.await_args_list] == [None, 'off-1']
+
+    @pytest.mark.asyncio
+    async def test_with_vectors_lifts_vectors_and_degrades_missing_ones(self, backend):
+        """with_vectors=True adds 'vector'; a vector-less point degrades to None, not dropped."""
+        p_ok = self._make_mock_point('id-ok', vector=[0.1, 0.2])
+        p_missing = self._make_mock_point('id-missing', vector=None)
+        client = _paging_client([([p_ok, p_missing], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_all_by_metadata(
+                Scope(project_id='p'), {'category': 'x'}, with_vectors=True,
+            ))
+
+        assert client.scroll.call_args.kwargs['with_vectors'] is True
+        assert len(got) == 2, 'a vector-less point must still be returned, not dropped'
+        assert got[0]['vector'] == [0.1, 0.2]
+        assert got[1]['vector'] is None
+
+    @pytest.mark.asyncio
+    async def test_no_vector_key_when_with_vectors_is_false(self, backend):
+        """Default mode must not add a 'vector' key nor pay to transfer vectors."""
+        client = _paging_client([([self._make_mock_point('id-1')], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(backend.scroll_all_by_metadata(Scope(project_id='p'), {'category': 'x'}))
+
+        assert client.scroll.call_args.kwargs['with_vectors'] is False
+        assert 'vector' not in got[0], f'got keys {sorted(got[0])}'
+
+    @pytest.mark.asyncio
+    async def test_empty_filters_raises_value_error(self, backend):
+        """Empty filters is rejected — it would enumerate the whole collection."""
+        with pytest.raises(ValueError, match='scroll_all_by_metadata requires at least one filter'):
+            await _drain(backend.scroll_all_by_metadata(Scope(project_id='p'), {}))
+
+    @pytest.mark.asyncio
+    async def test_empty_filters_raises_at_call_time_not_first_iteration(self, backend):
+        """The empty-filters guard must fire when the method is CALLED.
+
+        ``async def`` + ``yield`` makes this an async GENERATOR function, so
+        calling it merely builds a generator object and runs no body at all --
+        the ``if not filters`` guard does not execute until the first
+        ``__anext__``. A caller that builds the generator and then
+        conditionally never iterates gets NO error for a mistake the
+        docstring documents as rejected, and the whole-collection
+        enumeration this guard exists to prevent passes silently unflagged.
+
+        The coroutine sibling ``scroll_by_metadata`` fails on await, so the
+        two halves of the same addressing contract disagree about when a bad
+        argument is a bad argument.
+
+        No await and no _drain here: the bare call expression is the entire
+        thing under test.
+        """
+        with pytest.raises(ValueError, match='scroll_all_by_metadata requires at least one filter'):
+            backend.scroll_all_by_metadata(Scope(project_id='p'), {})
+
+    @pytest.mark.asyncio
+    async def test_still_streams_lazily_after_eager_validation(self, backend):
+        """Validating eagerly must not make the SCROLL eager too.
+
+        The argument check moves to call time; the paging stays lazy, so
+        peak memory is still one page rather than the corpus. Mirrors
+        test_streams_rather_than_accumulating, but additionally asserts that
+        merely CONSTRUCTING the stream issues no Qdrant round-trip.
+        """
+        client = _paging_client([
+            ([self._make_mock_point('id-1'), self._make_mock_point('id-2')], 'off-1'),
+            ([self._make_mock_point('id-3')], None),
+        ])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            agen = backend.scroll_all_by_metadata(
+                Scope(project_id='p'), {'category': 'x'}, page_size=2,
+            )
+            assert client.scroll.await_count == 0, (
+                'building the stream must not fetch a page; '
+                f'scroll was awaited {client.scroll.await_count} times'
+            )
+            first = await anext(agen)
+            assert first['id'] == 'id-1'
+            assert client.scroll.await_count == 1, (
+                'consuming one record must fetch exactly one page; '
+                f'scroll was awaited {client.scroll.await_count} times'
+            )
+            await agen.aclose()
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates_out_of_the_generator(self, backend):
+        """A timed-out page must never be mistaken for the end of the stream."""
+        client = AsyncMock()
+        client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(TimeoutError),
+        ):
+            await _drain(backend.scroll_all_by_metadata(Scope(project_id='p'), {'category': 'x'}))
+
+    @pytest.mark.asyncio
+    async def test_page_budget_exhaustion_propagates_out_of_the_generator(self, backend):
+        """A truncated enumeration raises rather than ending short."""
+        from fused_memory.backends.mem0_client import ScrollPageBudgetExhausted
+
+        client = _paging_client([
+            ([self._make_mock_point('id-1')], 'off-1'),
+            ([self._make_mock_point('id-2')], 'off-2'),
+        ])
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
+            pytest.raises(ScrollPageBudgetExhausted),
+        ):
+            await _drain(backend.scroll_all_by_metadata(
+                Scope(project_id='p'), {'category': 'x'}, page_size=1, max_pages=2,
+            ))
+
+    @pytest.mark.asyncio
+    async def test_streams_rather_than_accumulating(self, backend):
+        """Consuming one record fetches ONE page — peak memory is a page, not the corpus.
+
+        This is what a list-returning API structurally cannot offer, and the
+        reason the census can fold a live corpus into counters safely.
+        """
+        client = _paging_client([
+            ([self._make_mock_point('id-1'), self._make_mock_point('id-2')], 'off-1'),
+            ([self._make_mock_point('id-3')], None),
+        ])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            agen = backend.scroll_all_by_metadata(
+                Scope(project_id='p'), {'category': 'x'}, page_size=2,
+            )
+            first = await anext(agen)
+            assert first['id'] == 'id-1'
+            assert client.scroll.await_count == 1, (
+                'consuming one record must not have drained page 2; '
+                f'scroll was awaited {client.scroll.await_count} times'
+            )
+            await agen.aclose()
 
 
 class TestMem0BackendGetPointById:
@@ -1334,3 +1900,291 @@ class TestMem0BackendScanPayloadTextIntegration:
             ))['scanned'] == 1
         finally:
             await backend.close()
+
+
+class TestBuildConfigDictEndpointPlumbing:
+    """_build_config_dict is a pure function of config — no Qdrant, no
+    AsyncMemory, no _get_instance. Greenfield: nothing tested this dict before.
+    """
+
+    # --- default (shipped-config) behaviour: must stay byte-identical ---
+
+    def test_default_omits_embedding_dims_entirely(self, backend):
+        """The load-bearing byte-identical assertion.
+
+        mem0/embeddings/openai.py sets
+        ``_pass_dimensions_to_api = self.config.embedding_dims is not None``.
+        We omit the key today, so ``dimensions`` is NEVER sent on an
+        embeddings request. Emitting the key at all — even as 1536 — would
+        start sending it on every request under the shipped config. Hence the
+        emit-only-when-non-default rule; do not "simplify" it away.
+        """
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert backend.config.embedder.dimensions == 1536
+        assert 'embedding_dims' not in config_dict['embedder']['config']
+
+    def test_default_emits_incumbent_base_urls(self, backend):
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert config_dict['llm']['config']['openai_base_url'] == 'https://api.openai.com/v1'
+        assert (
+            config_dict['embedder']['config']['openai_base_url']
+            == 'https://api.openai.com/v1'
+        )
+
+    def test_default_vector_store_dims_match_mem0s_own_default(self, backend):
+        """Emitting this key is a no-op at the shipped config — mem0's Qdrant
+        default is already 1536 — but it is required for a collection to be
+        CREATED at a non-default dimensionality."""
+        from mem0.configs.vector_stores.qdrant import QdrantConfig
+
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert config_dict['vector_store']['config']['embedding_model_dims'] == 1536
+        assert (
+            QdrantConfig.model_fields['embedding_model_dims'].default == 1536
+        ), 'mem0 changed its Qdrant dims default — the no-op claim above no longer holds'
+
+    def test_preexisting_keys_are_unchanged(self, backend):
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert config_dict['version'] == 'v1.1'
+        assert config_dict['vector_store']['provider'] == 'qdrant'
+        assert config_dict['vector_store']['config']['url'] == backend.config.mem0.qdrant_url
+        assert config_dict['vector_store']['config']['collection_name'] == 'some_collection'
+
+        llm = config_dict['llm']['config']
+        assert config_dict['llm']['provider'] == 'openai'
+        assert llm['model'] == 'gpt-4o-mini'
+        assert llm['temperature'] == 0.1
+        assert llm['max_tokens'] == 4096
+        assert llm['api_key'] == 'test-key'
+
+        embedder = config_dict['embedder']['config']
+        assert config_dict['embedder']['provider'] == 'openai'
+        assert embedder['model'] == 'text-embedding-3-small'
+        assert embedder['api_key'] == 'test-key'
+
+    # --- local-endpoint behaviour ---
+
+    def test_llm_and_embedder_endpoints_are_independent(self, mock_config):
+        """The two provider blocks are read SEPARATELY — one is not reused for
+        both, which is what makes independent LLM/embedder endpoints possible.
+        """
+        mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:1234/v1'
+        mock_config.embedder.providers.openai.api_url = 'http://127.0.0.1:5678/v1'
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert config_dict['llm']['config']['openai_base_url'] == 'http://127.0.0.1:1234/v1'
+        assert (
+            config_dict['embedder']['config']['openai_base_url']
+            == 'http://127.0.0.1:5678/v1'
+        )
+
+    def test_non_default_dims_emitted_under_both_key_names(self, mock_config):
+        """BOTH keys are required for a non-1536 arm, and they are NOT the same
+        key: the embedder key controls what dimensionality is requested from
+        the API, the vector-store key controls what Qdrant creates the
+        collection with. Setting only one silently yields a mismatch.
+        """
+        mock_config.embedder.dimensions = 768
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert config_dict['embedder']['config']['embedding_dims'] == 768
+        assert config_dict['vector_store']['config']['embedding_model_dims'] == 768
+
+    def test_anthropic_llm_block_carries_no_openai_base_url(self, mock_config):
+        """openai_base_url is an OpenAIConfig-only parameter; passing it to the
+        anthropic config class would TypeError out of mem0's factory."""
+        from fused_memory.config.schema import AnthropicProviderConfig
+
+        mock_config.llm.provider = 'anthropic'
+        mock_config.llm.providers.anthropic = AnthropicProviderConfig(api_key='ak')
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert config_dict['llm']['provider'] == 'anthropic'
+        assert 'openai_base_url' not in config_dict['llm']['config']
+
+    # --- key-name guard ---
+
+    def test_every_emitted_key_is_accepted_by_the_installed_mem0(self, mock_config):
+        """The highest-value assertion here.
+
+        An unknown key raises TypeError from mem0/utils/factory.py, and
+        AsyncMemory.from_config only catches pydantic ValidationError — so a
+        misspelling escapes uncaught at instance construction, in production,
+        not here. The names are easy to get wrong: the EMBEDDER takes
+        `embedding_dims`, while `embedding_model_dims` is the VECTOR STORE's
+        key. Validate what we emit against the installed signatures.
+        """
+        import inspect
+
+        from mem0.configs.embeddings.base import BaseEmbedderConfig
+        from mem0.configs.llms.openai import OpenAIConfig
+        from mem0.configs.vector_stores.qdrant import QdrantConfig
+
+        # Non-default dims so every optional key is actually emitted.
+        mock_config.embedder.dimensions = 768
+        mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:1234/v1'
+        mock_config.embedder.providers.openai.api_url = 'http://127.0.0.1:5678/v1'
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        embedder_params = set(inspect.signature(BaseEmbedderConfig.__init__).parameters)
+        llm_params = set(inspect.signature(OpenAIConfig.__init__).parameters)
+        vector_store_params = set(QdrantConfig.model_fields)
+
+        for key in config_dict['embedder']['config']:
+            assert key in embedder_params, (
+                f'embedder key {key!r} is not a BaseEmbedderConfig parameter — '
+                f'mem0 would TypeError. Did you mean one of {sorted(embedder_params)}?'
+            )
+        for key in config_dict['llm']['config']:
+            assert key in llm_params, f'llm key {key!r} is not an OpenAIConfig parameter'
+        for key in config_dict['vector_store']['config']:
+            assert key in vector_store_params, (
+                f'vector_store key {key!r} is not a QdrantConfig field'
+            )
+
+        # And pin the two easily-confused spellings explicitly.
+        assert 'embedding_dims' in embedder_params
+        assert 'embedding_model_dims' not in embedder_params
+        assert 'embedding_model_dims' in vector_store_params
+
+
+class TestNonDefaultDimsAgainstAnExistingCollection:
+    """The migration hazard behind plumbing embedder.dimensions at all.
+
+    Neither dims key was plumbed before, so a deployment already configured
+    with ``embedder.dimensions != 1536`` was running INERT: mem0 created its
+    Qdrant collection at its own 1536 default and requested 1536-wide vectors.
+    Both now follow the config — but only for a collection that does not exist
+    yet. Changing the knob on a live deployment therefore requires recreating
+    and re-embedding the collection; it is not live-migratable.
+    """
+
+    @staticmethod
+    def _fake_qdrant_client(existing: list[str]):
+        collections = MagicMock()
+        collections.collections = [MagicMock(name=n) for n in existing]
+        # MagicMock(name=...) sets the mock's repr name, not a .name attribute.
+        for mock_col, real_name in zip(collections.collections, existing, strict=True):
+            mock_col.name = real_name
+
+        client = MagicMock()
+        client.get_collections.return_value = collections
+        return client
+
+    def test_existing_collection_is_left_at_its_old_dimensionality(self):
+        """Upstream short-circuits, so the new dims never reach Qdrant.
+
+        Measured against the installed mem0: ``Qdrant.create_col`` returns
+        early when the collection is already listed ('Collection ... already
+        exists. Skipping creation.'). The embedder meanwhile DOES start
+        requesting N-wide vectors, so every subsequent upsert fails on a
+        dimension mismatch at runtime. Pinning it here means a future mem0 that
+        learns to migrate — or to fail loudly — turns this red instead of
+        leaving a stale operator note in place.
+        """
+        from mem0.vector_stores.qdrant import Qdrant
+
+        client = self._fake_qdrant_client(['fused_dark_factory'])
+
+        Qdrant(
+            collection_name='fused_dark_factory',
+            embedding_model_dims=768,
+            client=client,
+        )
+
+        client.create_collection.assert_not_called()
+
+    def test_a_fresh_collection_is_created_at_the_configured_dimensionality(self):
+        """Control: the plumbing does work — on a collection that does not yet
+        exist, which is the only case where changing dimensions is safe."""
+        from mem0.vector_stores.qdrant import Qdrant
+
+        client = self._fake_qdrant_client([])
+
+        Qdrant(collection_name='brand_new', embedding_model_dims=768, client=client)
+
+        client.create_collection.assert_called_once()
+        vectors_config = client.create_collection.call_args.kwargs['vectors_config']
+        assert vectors_config.size == 768
+
+
+class TestAmbientBaseUrlPrecedenceIsReported:
+    """Config is now authoritative over OPENAI_BASE_URL / OPENAI_API_BASE.
+
+    That is intended — a written-down endpoint should beat an inherited env
+    var — but for a site that routed OpenAI traffic through a gateway by
+    exporting OPENAI_BASE_URL without OPENAI_API_URL, it silently sends that
+    traffic back to api.openai.com. An egress and billing change must be
+    announced (docs/legibility/design-invariants.md, no-silent-fail-soft).
+    """
+
+    #: Every ambient var ``warn_if_ambient_base_url_is_overridden`` inspects.
+    #: Both are live in the wild (mem0 still honours the deprecated
+    #: ``OPENAI_API_BASE`` spelling), so a test that sets only one is at the
+    #: mercy of whatever the host/CI runner exports for the other.
+    AMBIENT_VARS = ('OPENAI_BASE_URL', 'OPENAI_API_BASE')
+
+    @pytest.fixture(autouse=True)
+    def _clear_warn_cache(self, monkeypatch):
+        """Reset the once-per-process warn cache AND the ambient environment.
+
+        Clearing both vars here (rather than per-test) means every test in
+        this class starts from a known-empty ambient environment and then
+        sets only the var it means to exercise — otherwise an inherited
+        ``OPENAI_API_BASE`` on the runner adds a second pair of warnings and
+        flips the count assertions red.
+        """
+        from fused_memory.config.env_precedence import reset_warning_cache
+
+        for var in self.AMBIENT_VARS:
+            monkeypatch.delenv(var, raising=False)
+        reset_warning_cache()
+        yield
+        reset_warning_cache()
+
+    @pytest.mark.parametrize('var', ['OPENAI_BASE_URL', 'OPENAI_API_BASE'])
+    def test_disagreeing_env_var_is_reported(self, mock_config, monkeypatch, caplog, var):
+        monkeypatch.setenv(var, 'https://gateway.example.invalid/v1')
+
+        with caplog.at_level(logging.WARNING):
+            Mem0Backend(mock_config)._build_config_dict('c')
+
+        messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            var in m and 'https://api.openai.com/v1' in m for m in messages
+        ), f'expected a warning naming {var} and the configured endpoint, got {messages}'
+
+    def test_agreeing_env_var_is_silent(self, mock_config, monkeypatch, caplog):
+        """No warning when the environment and the config already agree —
+        otherwise the signal is noise on a correctly-configured deployment."""
+        monkeypatch.setenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
+
+        with caplog.at_level(logging.WARNING):
+            Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert not [r for r in caplog.records if 'OPENAI_BASE_URL' in r.message]
+
+    def test_unset_env_is_silent(self, mock_config, caplog):
+        # Both ambient vars are already cleared by the autouse fixture.
+        with caplog.at_level(logging.WARNING):
+            Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert not [r for r in caplog.records if 'takes precedence' in r.message]
+
+    def test_repeated_builds_warn_only_once(self, mock_config, monkeypatch, caplog):
+        """_build_config_dict runs once per project instance; an unguarded
+        warning would repeat per project and read as a fresh incident."""
+        monkeypatch.setenv('OPENAI_BASE_URL', 'https://gateway.example.invalid/v1')
+        backend = Mem0Backend(mock_config)
+
+        with caplog.at_level(logging.WARNING):
+            backend._build_config_dict('c1')
+            backend._build_config_dict('c2')
+
+        hits = [r for r in caplog.records if 'takes precedence' in r.message]
+        # One for the llm block, one for the embedder block — not four.
+        assert len(hits) == 2, [r.message for r in hits]

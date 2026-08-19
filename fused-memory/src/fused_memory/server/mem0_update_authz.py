@@ -43,10 +43,12 @@ from typing import Any
 _DEFAULT_ENABLED: bool = False
 _DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = ()
 
-# The recon-stage prefix literal is NOT minted here: it is the same string
-# add_system_record and ~15 other sites in server/tools.py already gate on, and
-# it reaches this module as a config default (Mem0UpdateConfig's
-# default_factory), so there is exactly one spelling of the bar (INV-5).
+# Neither allowlisted prefix literal is minted here: both reach this module as
+# config defaults (Mem0UpdateConfig's default_factory), so there is exactly one
+# spelling of the bar (INV-5). 'recon-stage-' is the same string
+# add_system_record and ~15 other sites in server/tools.py already gate on;
+# 'curator-' is the dedicated opt-in prefix for the interactive consolidation
+# sitting (esc-3524-1, skills/curate-fused-memories).
 
 
 @dataclass(frozen=True)

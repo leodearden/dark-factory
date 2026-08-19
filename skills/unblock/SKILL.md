@@ -38,29 +38,69 @@ just made visible:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-claim \
-  --name "unblock-<project>#<TASK_ID>" --slug "unblock-<project>-<TASK_ID>-$$" --pid $$ \
+  --name "unblock-<project>#<TASK_ID>" \
+  --slug "unblock-<project>-<TASK_ID>-${CLAUDE_PID:-$PPID}" \
   --policy warn-and-proceed
 ```
 
+**Never `$$` — it is both the wrong pid and an unusable slug.** Inside a Claude Code Bash tool call
+`$$` is the transient `/bin/bash -c` wrapper, dead the instant the call returns; the long-lived
+`claude` process is `$CLAUDE_PID` (fall back to `$PPID`) — verify with
+`ps -o comm= -p "${CLAUDE_PID:-$PPID}"`, which prints `claude`. A `$$` pid makes the lease's liveness
+guard inert (every holder reads as dead), and a `$$` slug is unusable as an identity because each
+Bash tool call gets a fresh one — so the release below would present a slug that never matches what
+you claimed with, and be refused. `${CLAUDE_PID:-$PPID}` is stable across tool calls (task 3994).
+`--pid` is now optional and resolves from `$CLAUDE_PID` inside the CLI; pass it only as an explicit
+operator override. With `$CLAUDE_PID` unset the CLI records **pid 0**, a never-alive sentinel that
+degrades the lease to heartbeat-only staleness (loudly logged) instead of recording an unrelated
+durable pid that would leave the lease unreapable forever.
+
 (`<project>` is the same short project token used elsewhere for this task, e.g. the basename of
-`PROJECT_ROOT`.) Parse the two printed lines (`decision=<acquired|proceed>` + message):
+`PROJECT_ROOT`.) Parse the printed lines (`decision=<acquired|proceed>`, message, then
+`holder_liveness=<none|held|orphaned>`):
 
 - **`decision=proceed` with a holder reported in the message**: surface that line verbatim to the
-  user (`lease held by <session> (alive|dead, heartbeat Ns ago) — proceeding anyway`) — this is
-  exactly the near-duplicate second-`/unblock`-on-the-same-task case (reify 06-28) — then continue
-  normally into Step 1. Never stand down or exit; `warn-and-proceed` never blocks this session.
-- **`decision=acquired`**: no prior holder; continue normally.
+  user — this is exactly the near-duplicate second-`/unblock`-on-the-same-task case (reify 06-28) —
+  then continue normally into Step 1. Never stand down or exit; `warn-and-proceed` never blocks this
+  session. The message names the two axes separately, e.g.
+
+  ```
+  lease held by unblock-df-2085-1348600 (pid 1348600 alive, heartbeat 42s ago) — proceeding anyway
+  lease held by unblock-df-2085-1348600 (pid 1348600 is not running, but its heartbeat is FRESH —
+  42s ago; the lease is still held and is NOT reclaimable for another 7158s) — proceeding anyway
+  ```
+
+  A fresh heartbeat means the holder is still held even when its pid reads as not running; a lease is
+  only stale with BOTH a dead pid and a heartbeat past the TTL. `holder_liveness=orphaned` restates
+  the pid half on its own — the pid in the lease body is not running, and that is the whole signal —
+  worth mentioning to the user, but it changes nothing here: `warn-and-proceed` continues either
+  way, and you never force-release someone else's lease to "clean up".
+- **`decision=acquired`**: no prior holder; continue normally. It prints `holder_liveness=none` —
+  there is no contending holder to report, the lease is yours.
+
+To inspect a lease, use `lease-show --name "unblock-<project>#<TASK_ID>"` — never `cat`, which shows
+the holder's immutable `start_ts` but cannot show freshness (the heartbeat is the file's mtime).
 
 **Fail-soft.** A lease-substrate fault also reports `decision=proceed` (fail-open), just with no
 holder to report — note it in passing and continue; a lease fault must never block an `/unblock`
 session.
 
 **Release on exit.** When this `/unblock` session ends (Step 4.5 reflect, or an early stop), release
-the lease so it doesn't linger and falsely report a holder to the next `/unblock` on this task:
+the lease so it doesn't linger and falsely report a holder to the next `/unblock` on this task. The
+slug is **required** and must be the one you claimed with — a mismatch is refused, so one `/unblock`
+session can never release another's lease:
 
 ```bash
-python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release --name "unblock-<project>#<TASK_ID>"
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release \
+  --name "unblock-<project>#<TASK_ID>" \
+  --slug "unblock-<project>-<TASK_ID>-${CLAUDE_PID:-$PPID}"
 ```
+
+It prints `result=<applied|forced|absent|refused|faulted>` first. `applied` = released; `absent` =
+nothing to release (idempotent, not an error); `refused` = you are not the holder, nothing was
+touched — inspect with `lease-show` rather than reflexively re-running with `--force` (`--force` is
+operator recovery and is logged loudly naming both parties); `faulted` = a substrate error, logged
+and swallowed so it cannot break your exit path.
 
 ---
 
@@ -320,7 +360,8 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
    - `status: "done"` or `status: "already_merged"` → **terminal success.** Thread the merge commit SHA:
      - Normal `done`: SHA is in `result["commit"]`.
-     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive with the same exact-subject search the canonical check uses — `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` — or, if that comes back empty, fall back to `done_provenance={"note": "merge already present on main"}`. **Do not eyeball `git log main --oneline | head -5` and pick a SHA**: it is not scoped to this task and you would record an unrelated task's merge as this one's provenance.
+     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive with the same exact-subject search the canonical check uses — `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` — or, if that comes back empty, **do not record a note asserting the merge is present**: an empty search means nothing on main cites this task, which is exactly the signal a branch that never advanced past its creation point produces (it satisfies the worker's ancestry test while carrying none of the work). Run the [canonical ancestry check](#branch-on-main) — rc=128 marker search included — and treat "nothing on main cites the task" as **not done**, rather than stamping a `done_provenance` note. **Do not eyeball `git log main --oneline | head -5` and pick a SHA**: it is not scoped to this task and you would record an unrelated task's merge as this one's provenance.
+     - Whatever the source, stamp the SHA **exactly as the tool returned it**. This applies with full force to a `found_on_main` `merge_sha` from the poll loop below: it is already a verified commit on main, so never substitute the branch tip or a `git merge-base` result for it. (The one exception is a project that sets `git.commit_citation_pattern: ""`, where the tier runs un-gated and `merge_sha` *is* the branch tip — see the polled-done note below.)
 
      Go directly to step 8.
 
@@ -392,7 +433,12 @@ The merge procedure is iterative — don't assume one pass will be enough:
              if poll.get("kind") == "found_on_main":
                  # Tier-3.5 git-authority response — a LIVE probe of main, reached only
                  # because the durable tiers MISSED. Structurally cannot be a stale
-                 # prior-round record, so it is not what this guard defends against.
+                 # prior-round record, and cannot be a branch that only looks landed:
+                 # the tier answers done only when the branch advanced past its
+                 # recorded creation point, AND a commit on main positively cites the
+                 # task, AND that commit's effect is still present at main HEAD
+                 # (the last two are skipped on a project that opts out with
+                 # git.commit_citation_pattern: "").
                  # Accept it directly: re-gating it on ancestry is what deadlocks a
                  # merged-and-cleaned-up branch (see the rc=128 case below).
                  return True
@@ -447,7 +493,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
      After the loop exits:
      - `timed_out` (either unscoped arm's 20-minute deadline reached without an accepted terminal state — i.e. the only `done` on offer never became an ancestor of main) → do NOT resubmit and do NOT direct-merge; run the [canonical ancestry check](#branch-on-main) one final time — **including its rc=128 merge-marker search**, since a branch deleted by a successful merge is the likeliest reason you got here — and stop-and-report to the human only if that too comes back not-landed, per *Polled terminal failures*'s `unknown` bullet below.
-     - `poll["state"] == "done"` → **if the response carries `merge_sha`** (the git-authority tier's `kind: "found_on_main"` shape), thread it as `done_provenance={"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}` — **not** a bare `commit`. `merge_sha` is not always the merge commit: on the live-branch resolution path it's the *branch tip* SHA, a distinct commit from the actual merge commit for a `--no-ff` merge; only the deleted-branch path's `merge_sha` is the true merge-commit SHA (`_found_on_main_response`'s docstring, `escalation/server.py:2290-2305`). **Otherwise** — including on either unscoped arm (`poll_by` `"branch"` or `"task_id"`), where a durable retention-ring/event-store record resolves `done` with only `state`/`request_id`/`generation`/`outcome`/`finished_at` and *no* `merge_sha` (`escalation/server.py:2404-2420`) — `merge_status` gives you no commit hash (`poll["outcome"]` is the raw state string `"done"`), so re-derive the true merge commit from git:
+     - `poll["state"] == "done"` → **if the response carries `merge_sha`** (the git-authority tier's `kind: "found_on_main"` shape), thread it as `done_provenance={"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}` — **not** a bare `commit`. `merge_sha` is always a commit ON main on both of the tier's resolution paths — the citing commit discovered on main on the live-branch path, the merge commit itself on the deleted-branch path — and on both it is checked to still be present at main HEAD before being returned (`_found_on_main_response`), so stamp it **exactly as returned**; never substitute the branch tip or a `git merge-base` result for it. **One exception:** on a project that sets `git.commit_citation_pattern: ""` (an explicit per-project opt-out) the live-branch path skips the citation gate and `merge_sha` is the raw branch tip — neither a commit on main nor effect-present-checked — so confirm it with the exact-subject re-derivation below instead of stamping it. **Otherwise** — including on either unscoped arm (`poll_by` `"branch"` or `"task_id"`), where a durable retention-ring/event-store record resolves `done` with only `state`/`request_id`/`generation`/`outcome`/`finished_at` and *no* `merge_sha` (`escalation/server.py:2404-2420`) — `merge_status` gives you no commit hash (`poll["outcome"]` is the raw state string `"done"`), so re-derive the true merge commit from git:
        ```bash
        git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
            --max-count=1 --format=%H
@@ -459,7 +505,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
    *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `failed`, orchestrator-down — plus the `superseded` absorption edge above, and cancellation, are covered below.)*
 
 8. `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"commit": "<sha>"})`
-   - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main — thread the SHA from `result["commit"]` for an immediate terminal response, or re-derive from `git log main` for a polled terminal response (see polled-done note above). Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
+   - Pass `{"commit": "<sha>"}` when the merge landed a single commit on main — thread the SHA from `result["commit"]` for an immediate terminal response, or re-derive from `git log main` for a polled terminal response (see polled-done note above). A `found_on_main` `merge_sha` is safe to stamp only **as returned by the tool** — do not substitute the branch tip or `git merge-base` output for it. Fall back to `{"note": "<one-sentence explanation>"}` for fast-forward or covered-by-sibling cases where no single commit applies.
 9. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
 
 **Merge-step failure and abandonment edges:**
@@ -479,7 +525,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
 *Polled terminal failures (from `merge_status`):*
 
 - `poll["state"] == "conflict"`, `poll["state"] == "blocked"`, or `poll["state"] == "abandoned"` → same fix-and-resubmit loop: fix in worktree, rebase on main, loop back to step 7. (For `abandoned`, also verify the cancellation was not intentional before resubmitting.)
-- `poll["state"] == "unknown"` (orchestrator restarted or retention ring expired) → `merge_status` now self-resolves a landed merge via its git-authority tier and returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` when the branch is provably on main. If `merge_status` still returns `unknown`, confirm deterministically:
+- `poll["state"] == "unknown"` (orchestrator restarted or retention ring expired) → `merge_status` now self-resolves a landed merge via its git-authority tier and returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` when the branch is provably on main. **`unknown` does not mean "not landed"** — the tier is deliberately silent whenever it cannot *attribute* a landing, which now includes a branch that never advanced past its creation point and a landing that no commit on main cites. If `merge_status` still returns `unknown`, confirm deterministically:
   ```bash
   git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
   # The trailing `echo` is REQUIRED -- see the [canonical ancestry

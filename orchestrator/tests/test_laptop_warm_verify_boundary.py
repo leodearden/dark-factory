@@ -20,20 +20,51 @@ cross-test-module import pattern -- see test_concurrent_verify_boundary.py) and
 from orchestrator.verify_cancel (the SAME /proc walkers the production
 watchdog/cancel kill paths use) -- single source of truth, zero divergent
 ad-hoc process-tree parsing.
+
+That single-source rule holds exactly where it decides anything, and task
+4014 added ONE deliberate, narrow exception on the other side of a
+discovery/assertion split:
+
+* ASSERTIONS -- ``subtree_and_leader_gone``, ``wait_subtree_gone`` -- and the
+  descendant set ``wait_subtree_live`` RETURNS still come only from the
+  production walkers ``collect_descendants``/``read_ppid_map``.
+* the ARRANGE-phase discovery GATE adds a cheap Linux
+  ``/proc/<pid>/task/*/children`` pre-filter (:func:`_read_direct_children`)
+  that decides nothing except whether to spend a full rescan on a given poll
+  tick.
+
+The measurement that motivates it: ``read_ppid_map()`` costs 49.67 ms at 917
+live processes, one ``children`` read costs 0.0183 ms -- ~2700x, against a
+50 ms poll interval.  So the old shape already doubled the effective
+sampling period AT IDLE, and under a full-suite storm (~8000 procs, ~400ms
+per scan) it collapsed ~10x -- while burning ~917 file reads per tick in CPU
+competition with the very leader it was waiting to see fork.  The probe is
+tri-state and degrades to the pre-4014 full walk when it cannot answer, so a
+kernel without CONFIG_PROC_CHILDREN keeps today's exact behaviour.
+
+Division of labour with the sibling de-flake: task 4025 addressed the
+WATCHDOG WINDOW (and its banner below is explicit that this "MOVES the cliff
+from 1.0s to 10s, it does not remove it"); task 4014 addressed the POLLER
+above it -- the per-tick cost, the transient-child race, and the flat 20s
+discovery ceiling that did not track load.
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import fcntl
+import math
 import os
 import re
+import select
 import socket
 import subprocess
 import sys
 import threading
 import time
+import warnings
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
@@ -199,6 +230,19 @@ def subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def stderr_tail(raw: bytes, *, limit: int = 2000) -> str:
+    """Decode *raw* subprocess stderr and keep the TAIL (last *limit* chars).
+
+    The actionable line (a traceback's final ``Error: ...``, a watchdog
+    self-kill message) consistently sits at the END of a subprocess's
+    stderr, so a head slice silently discards it -- task 3318 hit exactly
+    this bug from a head-truncated assertion message.  ``errors='replace'``
+    so a slice landing mid multi-byte UTF-8 sequence can't itself raise and
+    mask the real failure being reported.
+    """
+    return raw.decode(errors='replace')[-limit:]
+
+
 def apply_dispatcher_env(monkeypatch) -> None:
     """Patch THIS process's os.environ for a direct (in-process) real-dispatcher call.
 
@@ -349,8 +393,14 @@ class HeartbeatWriter:
 # ---------------------------------------------------------------------------
 
 
-def wait_for_pgid_file(path: Path, *, timeout: float = 20.0, interval: float = 0.05) -> int:
-    """Poll for a pgid file (written by verify-merge --request-id) and return its int value."""
+def wait_for_pgid_file(path: Path, *, timeout: float | None = None, interval: float = 0.05) -> int:
+    """Poll for a pgid file (written by verify-merge --request-id) and return its int value.
+
+    *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
+    the wait actually STARTS rather than at import, so a row beginning
+    mid-storm gets the load-scaled deadline the storm warrants.
+    """
+    timeout = row_discovery_ceiling_secs() if timeout is None else timeout
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
@@ -360,31 +410,183 @@ def wait_for_pgid_file(path: Path, *, timeout: float = 20.0, interval: float = 0
     raise AssertionError(f'pgid file {path} did not appear within {timeout}s')
 
 
-def wait_subtree_live(pgid: int, *, timeout: float = 20.0, interval: float = 0.05) -> set[int]:
+def _read_direct_children(pid: int) -> set[int] | None:
+    """Cheap probe: the DIRECT children of *pid*, from ``/proc/<pid>/task/*/children``.
+
+    A ~2700x cheaper stand-in for a full ``read_ppid_map()`` rescan, used ONLY
+    to decide whether spending that rescan is worth it on a given poll tick
+    (task 4014).  Measured on this box: 0.0183 ms per ``children`` read vs
+    49.67 ms for one ``read_ppid_map()`` at 917 live processes.
+
+    Every thread of *pid* is iterated (the ``task`` directory), not just the
+    main one, because ``children`` is a PER-THREAD file: a fork issued from a
+    non-main thread is listed only under that thread's tid and would be
+    invisible to a bare ``/proc/<pid>/task/<pid>/children`` read.
+
+    This decides NOTHING about production behaviour -- it is a pre-filter on
+    the arrange-phase discovery gate.  The descendant set actually returned
+    (and every kill assertion in this module) still comes from the production
+    walkers ``collect_descendants``/``read_ppid_map``.
+
+    TRI-STATE, and the third state is load-bearing:
+
+    * ``set()``  -- leader is live and has forked nothing yet.  A cheap
+      NEGATIVE: the caller can skip the expensive walk this tick.
+    * ``{pid, ...}`` -- direct children exist; worth confirming with the
+      production walker.
+    * ``None``   -- CANNOT probe.  Either the ``children`` files are absent
+      (a kernel built without ``CONFIG_PROC_CHILDREN``) or ``/proc/<pid>``
+      itself is gone (the leader exited mid-poll).  The caller must fall back
+      to the full walk for that tick; conflating this with the cheap negative
+      would make the poll spin to its timeout on such a kernel, and letting
+      the OSError escape would turn a leader exiting mid-poll into an
+      unhandled error inside the timeout diagnostic.
+
+    Any OSError anywhere in the read collapses to ``None``.  Distinguishing
+    "no CONFIG_PROC_CHILDREN" from "this thread just exited" would buy
+    nothing: both answers are "don't trust the probe on this tick", and the
+    fallback they select is precisely this helper's pre-4014 behaviour.
+
+    The empty-``task``-listing branch below is DEFENSIVE-ONLY, and therefore
+    deliberately uncovered: a live ``/proc/<pid>/task`` always holds at least
+    one tid, and a dead one makes ``iterdir()`` itself raise OSError, which
+    the handler already maps to ``None``.  It is retained rather than deleted
+    because falling THROUGH it would return the cheap negative ``set()`` --
+    "leader is live and has forked nothing" -- for a listing that in fact told
+    us nothing, and that is the single answer which makes the caller skip its
+    walk every tick and spin to the timeout.
+    """
+    children: set[int] = set()
+    try:
+        tid_dirs = list((Path('/proc') / str(pid) / 'task').iterdir())
+        if not tid_dirs:
+            # Defensive only (see docstring): not reachable on a live or a dead
+            # /proc entry, so never trust an empty listing as a cheap negative.
+            return None
+        for tid_dir in tid_dirs:
+            raw = (tid_dir / 'children').read_text()
+            children.update(int(token) for token in raw.split())
+    except OSError:
+        return None
+    return children
+
+
+def wait_subtree_live(
+    pgid: int,
+    *,
+    proc: subprocess.Popen | None = None,
+    proc_label: str = 'leader',
+    timeout: float | None = None,
+    interval: float = 0.05,
+    _probe_children=None,
+    _ppid_map=None,
+) -> set[int]:
     """Poll until *pgid* has at least one live descendant; return the descendant set.
 
     Raises AssertionError on timeout -- a live sleeper never appearing means
     the harness itself is broken, not a seam defect under test.
 
-    NOTE: "has a live descendant" fires on the FIRST child the CLI forks --
-    for a not-yet-materialised persistent worktree that is a transient ``git``
-    subprocess (``git worktree add`` / ``git reset`` / ``git clean`` inside
-    ``acquire_host_verify_worktree``), not necessarily the eventual build
-    shell.  Callers that need to observe a build-produced artifact (e.g. a
-    marker file the build's shell command touches) must poll for that
-    artifact directly -- see :func:`wait_for_marker` -- rather than treating
-    "subtree live" as a proxy for "build has started".
+    Each tick runs a cheap ``/proc/<pgid>/task/*/children`` probe and pays
+    the ~2700x more expensive ``collect_descendants(pgid, read_ppid_map())``
+    rescan ONLY when that probe reports a direct child -- task 4014; see
+    :func:`_read_direct_children`.  A positive probe whose confirming walk
+    comes back EMPTY does not end the poll: the child the probe saw exited in
+    between, and the loop keeps going.  So the returned set is always
+    NON-EMPTY and, in practice, converges on a child durable enough to
+    survive one rescan.
+
+    NOTE: "has a live descendant" still fires on an EARLY child the CLI forks
+    -- for a not-yet-materialised persistent worktree that is a transient
+    ``git`` subprocess (``git worktree add`` / ``git reset`` / ``git clean``
+    inside ``acquire_host_verify_worktree``), not necessarily the eventual
+    build shell.  The skip-the-vanished rule above biases toward the durable
+    sleeper but does not GUARANTEE it (a transient slow enough to survive a
+    rescan is still returnable).  So callers that need to observe a
+    build-produced artifact (e.g. a marker file the build's shell command
+    touches) must still poll for that artifact directly -- see
+    :func:`wait_for_marker` -- rather than treating "subtree live" as a proxy
+    for "build has started".
+
+    *proc* is the already-spawned leader (or, for a caller observing a
+    SEPARATE dispatcher process, that dispatcher) whose ``stdout``/``stderr``
+    were opened with ``subprocess.PIPE`` -- see :func:`spawn_verify_merge`.
+    It's optional so no existing call site is forced to change semantics.
+    *proc_label* names *proc* in the failure message (default ``"leader"``);
+    pass e.g. ``proc_label="dispatcher"`` when *proc* is a stand-in process
+    rather than the leader itself (e.g. the SSH dispatcher in the Row 1
+    orchestrator-killed test), so a reader doesn't apply the rc taxonomy
+    below to the wrong process.  When *proc* is given, a timeout failure
+    names its exit status (``<proc_label> rc=<n|None>``).  For the LEADER
+    specifically, that rc distinguishes a watchdog self-kill (rc == 1, no
+    ``Error:`` line), an exception exit (rc == 1 WITH an ``Error:`` line),
+    and a merely slow leader (rc is None) -- three causes that were
+    otherwise indistinguishable in every log this timeout has ever
+    produced; a non-leader *proc* follows its own exit-code conventions,
+    not this taxonomy.  ``stderr`` is read ONLY when ``proc.poll()`` is not
+    None, and even then via a ``select()``-bounded raw read (2s ceiling)
+    rather than a buffered ``.read()`` (which blocks to EOF): ``poll()``
+    only reports *proc*'s own exit, and a short-lived helper it spawned
+    with inherited fds could still be holding the pipe's write end open,
+    which would hang this helper (and the rest of the suite) rather than
+    raise.  The tail (not head) is kept -- see :func:`stderr_tail` -- since
+    the actionable line is at the END.
+
+    *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
+    the wait actually STARTS rather than at import, so a row beginning
+    mid-storm gets the load-scaled deadline the storm warrants.
+
+    *_probe_children* / *_ppid_map* are private injectable seams (defaulting
+    to :func:`_read_direct_children` and
+    :func:`~orchestrator.verify_cancel.read_ppid_map`) so this poll loop can
+    be covered deterministically, with no real timing and no real
+    subprocess -- the same pattern :func:`wait_for_marker_stable`'s
+    ``_read_mtime_ns`` seam established (task 2819).
     """
+    timeout = row_discovery_ceiling_secs() if timeout is None else timeout
+    probe = _probe_children or _read_direct_children
+    ppid_map = _ppid_map or read_ppid_map
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        descendants = collect_descendants(pgid, read_ppid_map())
-        if descendants:
-            return descendants
+        # Cheap probe FIRST: pay the ~50ms full-/proc rescan only on the tick
+        # that can actually yield a descendant set (task 4014).  `None` means
+        # the probe could not answer (no CONFIG_PROC_CHILDREN, or the leader
+        # exited) -- fall through to the full walk, i.e. pre-4014 behaviour.
+        direct = probe(pgid)
+        if direct is None or direct:
+            descendants = collect_descendants(pgid, ppid_map())
+            if descendants:
+                return descendants
+            # Positive probe, empty walk: the child the probe saw exited in
+            # between (a transient `git` setup subprocess).  Keep polling
+            # rather than hand back an empty set -- see the NOTE above.
         time.sleep(interval)
-    raise AssertionError(f'pgid {pgid}: no descendant appeared within {timeout}s')
+    message = f'pgid {pgid}: no descendant appeared within {timeout}s'
+    if proc is not None:
+        rc = proc.poll()
+        message += f'; {proc_label} rc={rc}'
+        if rc is not None and proc.stderr is not None:
+            try:
+                chunks = []
+                read_deadline = time.monotonic() + 2.0
+                fd = proc.stderr.fileno()
+                while True:
+                    remaining = read_deadline - time.monotonic()
+                    if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                        break
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                tail = stderr_tail(b''.join(chunks))
+            except Exception as e:  # noqa: BLE001
+                tail = f'<unreadable: {e!r}>'
+            message += f'; stderr tail:\n{tail}'
+    raise AssertionError(message)
 
 
-def wait_for_marker(path: Path, *, timeout: float = 20.0, interval: float = 0.05) -> None:
+def wait_for_marker(
+    path: Path, *, timeout: float | None = None, interval: float = 0.05
+) -> None:
     """Poll for a build-produced marker file to appear; raise AssertionError on timeout.
 
     Unlike :func:`wait_subtree_live` (which only proves the CLI has forked
@@ -392,7 +594,14 @@ def wait_for_marker(path: Path, *, timeout: float = 20.0, interval: float = 0.05
     proves the build's shell command has actually executed its
     ``touch <marker>`` step, which is the real precondition tests need before
     reading the marker's mtime or asserting on its retention.
+
+    *timeout* defaults to :data:`ROW_MARKER_CEILING_SECS`, resolved in the
+    BODY rather than as a default expression because that constant is defined
+    with the other row ceilings further down (same shape as
+    :func:`wait_for_pgid_file`), so the value a row budgets for and the value
+    this helper actually spends cannot drift apart.
     """
+    timeout = ROW_MARKER_CEILING_SECS if timeout is None else timeout
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
@@ -404,7 +613,7 @@ def wait_for_marker(path: Path, *, timeout: float = 20.0, interval: float = 0.05
 def wait_for_marker_stable(
     path: Path,
     *,
-    timeout: float = 20.0,
+    timeout: float | None = None,
     interval: float = 0.02,
     stable_reads: int = 6,
     _read_mtime_ns=None,
@@ -425,7 +634,13 @@ def wait_for_marker_stable(
     a real ``path.stat().st_mtime_ns`` read) until it is unchanged across
     *stable_reads* consecutive reads, and returns that settled value.
     Raises AssertionError if it never stabilizes within *timeout* seconds.
+
+    *timeout* defaults to :data:`ROW_MARKER_CEILING_SECS` and is spent TWICE
+    in the worst case -- once on the existence gate, then a FRESH deadline on
+    the settle loop -- which is why callers budgeting for this helper must
+    count that ceiling twice (see ``_ROW5_WORST_CASE_FIXED_SECS``).
     """
+    timeout = ROW_MARKER_CEILING_SECS if timeout is None else timeout
     wait_for_marker(path, timeout=timeout, interval=interval)
     read = _read_mtime_ns or (lambda p: p.stat().st_mtime_ns)
     deadline = time.monotonic() + timeout
@@ -474,6 +689,765 @@ def worktree_base_for(repo: Path) -> Path:
     """Derive worktree_base exactly as the spawned CLI does: GitOps(config.git, repo).worktree_base."""
     config = OrchestratorConfig(project_root=repo)
     return GitOps(config.git, repo).worktree_base
+
+
+# ---------------------------------------------------------------------------
+# Task 4025 (de-flake beta) -- pinned SS9 Row 1/2/3 watchdog window.
+#
+# ROW_WATCHDOG_ENV carries the SAME numbers as today's production constants
+# -- verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS (10.0) and
+# WATCHDOG_KILL_GRACE_SECS (5.0) -- but as PINNED LITERALS, deliberately NOT
+# imported from verify_cancel: task 4195 will retune those constants
+# (deriving the timeout from SSH_SERVER_ALIVE_INTERVAL *
+# SSH_SERVER_ALIVE_COUNT_MAX, toward ~60s+), and tracking them here would
+# silently multiply this module's runtime (Row 3 from ~17s to ~70s).  The
+# pin is now STRUCTURAL, not just asserted: the literals live on
+# ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS below,
+# and ROW_TREE_KILL_CEILING_SECS / ROW_PER_TEST_TIMEOUT_SECS are computed
+# from those two floats, so they can no longer drift out of step with the
+# window.  Nothing here imports verify_cancel's watchdog timing constants
+# (WATCHDOG_HEARTBEAT_TIMEOUT_SECS / WATCHDOG_KILL_GRACE_SECS) -- the /proc
+# walkers imported at the top of this module (collect_descendants,
+# pgid_file, etc.) are deliberately still shared; a dedicated drift test
+# below imports the two timing constants LOCALLY, on its own, purely to
+# notice if they ever diverge from this pin.
+#
+# This REPLACES a prior test-only 1.0s/0.5s tightening that bought speed and
+# no coverage, and was the measured cause of the "no descendant appeared
+# within 20.0s" flake on wait_subtree_live (6 failures / 490 legs on the
+# 1.0s arm vs 0 on both the 10s arm and the separate-process producer arm).
+#
+# HONEST CAVEAT: this MOVES the cliff from 1.0s to 10s, it does not remove
+# it.  The watchdog deadline is a wall-clock select() in
+# verify_cancel.run_stdin_watchdog -- LOAD-RIGID -- while the producer
+# (HeartbeatWriter._run) is an Event.wait(0.2) -- LOAD-ELASTIC.  Measured
+# producer inter-write gap at loadavg 113-178 was p999 0.386s / max 0.845s:
+# only ~1.2x real margin against a 1.0s deadline, but ~12x against 10.0s.
+# Do not try to buy margin by pre-buffering heartbeats -- run_stdin_watchdog
+# drains with a single read(4096) per select, so a burst resets exactly one
+# window, not N.
+ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = 10.0
+ROW_WATCHDOG_KILL_GRACE_SECS: float = 5.0
+
+#: Worst-case time to fire and finish killing the tree.  Row 3 takes
+#: run_stdin_watchdog's select-TIMEOUT branch and pays the full sum; Rows
+#: 1/2 take the EOF branch and pay only the grace.
+ROW_WATCHDOG_WINDOW_SECS: float = (
+    ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS + ROW_WATCHDOG_KILL_GRACE_SECS
+)  # 15.0
+
+ROW_WATCHDOG_ENV: dict[str, str] = {
+    'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': str(ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS),
+    'ORCH_WATCHDOG_KILL_GRACE_SECS': str(ROW_WATCHDOG_KILL_GRACE_SECS),
+}
+
+#: Ceiling for the rows' child.wait()/wait_subtree_gone() polls: the full
+#: window plus load headroom.  A WEDGE-DETECTOR, not a speed assertion (the
+#: rows assert THAT the tree was killed, never how fast), so on the success
+#: path a wider ceiling costs zero wall-clock and is paid only when the test
+#: is already failing.
+ROW_TREE_KILL_CEILING_SECS: float = ROW_WATCHDOG_WINDOW_SECS + 15.0  # 30.0
+
+#: Ceiling for the marker waits (:func:`wait_for_marker` /
+#: :func:`wait_for_marker_stable`, whose bare defaults resolve to it).  Value
+#: unchanged from the literal it replaces; the point of naming it is that
+#: Row 5's budget below references the SAME symbol those helpers spend, so the
+#: two cannot drift.  NOT load-scaled: unlike descendant discovery, this waits
+#: on a single already-forked build shell reaching one ``touch``, and no
+#: measurement in this repo implicates it in a load flake.
+ROW_MARKER_CEILING_SECS: float = 20.0
+
+#: Base ceiling for the two DISCOVERY waits every row runs BEFORE the
+#: watchdog is even armed -- wait_for_pgid_file and wait_subtree_live.  Rows
+#: 1/2/3 pass the resolved ceiling explicitly at their call sites below
+#: (instead of relying on the bare default) so this value and those defaults
+#: cannot silently drift apart.
+ROW_DISCOVERY_CEILING_BASE_SECS: float = 20.0
+
+#: Task 4014.  Top of the measured per-core dilation envelope, NOT a guess.
+#: Every dilation figure this repo has actually measured is expressed in
+#: loadavg-per-core terms and lands in the 3-6x band: tests/warm-lane's
+#: README records 3-6x at loadavg 124 on 32 cores plus a 6.2x module figure;
+#: this module's own banner records producer gaps at loadavg 113-178; and the
+#: 3689 steward measured THIS test pair stretching 10s -> 51-59s (~5-6x).
+#: Scaling keys on loadavg-per-core rather than PSI because this suite's
+#: autouse _hermetic_psi_reader fixture injects a stub PSI reader suite-wide,
+#: so /proc/pressure readings are deliberately untrustworthy here.
+_DISCOVERY_CEILING_MAX_SCALE: float = 6.0
+
+#: Operator knob: pin the discovery ceiling outright (e.g. to reproduce a
+#: discovery timeout quickly instead of waiting out a load-scaled deadline).
+#: Namespaced ORCH_TEST_*, NOT bare ORCH_*: subprocess_env() copies
+#: os.environ into every spawned verify-merge, and the ORCH_* namespace there
+#: is production knobs the CLI actually reads.
+_DISCOVERY_CEILING_OVERRIDE_ENV: str = 'ORCH_TEST_DISCOVERY_CEILING_SECS'
+
+
+def _resolve_ceiling_override(environ) -> float | None:
+    """Parse :data:`_DISCOVERY_CEILING_OVERRIDE_ENV` out of *environ*.
+
+    Returns None when unset, and warns-then-returns-None on a value that is
+    unparseable, non-finite, or non-positive.  Deliberately does NOT raise:
+    this is resolved at import, so raising would fail COLLECTION for the
+    entire module -- every row and every helper test taken down by one
+    mistyped debugging knob, a strictly worse and far more confusing failure
+    than the one being guarded against.  Silently ignoring it would be worse
+    still, hence the warning.
+
+    NON-FINITE is rejected for exactly that reason, and is not a hypothetical:
+    ``inf`` is the natural spelling an operator reaches for to mean "never
+    time out", and ``float('inf')`` parses cleanly while satisfying every
+    ordering guard (``inf <= 0`` and ``nan <= 0`` are both False).  It would
+    therefore flow into ROW_DISCOVERY_CEILING_MAX_SECS and blow up the very
+    next module-level statement -- ``int(... + 2 * inf)`` raises OverflowError,
+    ``nan`` raises ValueError -- taking down collection of the whole module,
+    i.e. precisely the failure this warn-instead-of-raise contract exists to
+    prevent.
+
+    Takes an environ MAPPING rather than reading ``os.environ`` so it is
+    deterministically testable with no monkeypatch-versus-import-order race.
+    """
+    raw = environ.get(_DISCOVERY_CEILING_OVERRIDE_ENV)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = None
+    if value is None or not math.isfinite(value) or value <= 0:
+        warnings.warn(
+            f'{_DISCOVERY_CEILING_OVERRIDE_ENV}={raw!r} is not a finite positive number; '
+            f'ignoring it and using the load-scaled discovery ceiling instead',
+            stacklevel=2,
+        )
+        return None
+    return value
+
+
+#: Resolved ONCE at import -- see the module's discovery-ceiling notes and
+#: :func:`row_discovery_ceiling_secs`.  A per-call env read could return a
+#: value the already-baked @pytest.mark.timeout below cannot accommodate.
+_DISCOVERY_CEILING_OVERRIDE_SECS: float | None = _resolve_ceiling_override(os.environ)
+
+#: The bound the import-time @pytest.mark.timeout below is derived from.  No
+#: value row_discovery_ceiling_secs() can return may exceed it -- see
+#: test_row_per_test_timeout_still_covers_the_max_discovery_ceiling.  The
+#: override is folded in (rather than sitting outside the bound) so that
+#: invariant holds for every reachable value, pinned or scaled.
+ROW_DISCOVERY_CEILING_MAX_SECS: float = (
+    _DISCOVERY_CEILING_OVERRIDE_SECS
+    if _DISCOVERY_CEILING_OVERRIDE_SECS is not None
+    else ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
+)  # 120.0 unpinned
+
+
+def row_discovery_ceiling_secs(
+    *, _loadavg=None, _cpu_count=None, _override=_DISCOVERY_CEILING_OVERRIDE_SECS
+) -> float:
+    """Resolve the discovery ceiling for a wait that is starting NOW.
+
+    A WEDGE DETECTOR, not a speed assertion: the rows assert THAT a tree was
+    discovered, never how fast, so on the success path a wider ceiling costs
+    ZERO wall clock and is paid only when the test is already failing.  That
+    asymmetry is what makes scaling all the way to
+    :data:`_DISCOVERY_CEILING_MAX_SCALE` safe for suite runtime -- an idle
+    box still pays exactly :data:`ROW_DISCOVERY_CEILING_BASE_SECS`.
+
+    Sampled per CALL rather than at import so a row that starts mid-storm
+    sees the storm, and clamped at both ends: never tighter than base (a
+    quiet box must not get a stricter deadline than it has always had) and
+    never wider than :data:`ROW_DISCOVERY_CEILING_MAX_SECS` (the bound the
+    import-time pytest timeout is derived from).
+
+    An operator pin via :data:`_DISCOVERY_CEILING_OVERRIDE_ENV` is returned
+    VERBATIM, bypassing load scaling in both directions -- otherwise "pin it
+    low to reproduce the timeout quickly" would silently do nothing on a busy
+    box.  It is safe against the clamp invariant because
+    :data:`ROW_DISCOVERY_CEILING_MAX_SECS` folds the same pin in.
+
+    *_loadavg* / *_cpu_count* / *_override* are private injectable seams for
+    deterministic coverage, defaulting to the real readers.
+    """
+    if _override is not None:
+        return _override
+    loadavg = os.getloadavg()[0] if _loadavg is None else _loadavg
+    cpu_count = (os.cpu_count() or 1) if _cpu_count is None else _cpu_count
+    scaled = ROW_DISCOVERY_CEILING_BASE_SECS * (loadavg / max(cpu_count, 1))
+    # Clamp against the UNPINNED bound, not ROW_DISCOVERY_CEILING_MAX_SECS:
+    # the latter folds an operator pin in, and a pin is already returned above.
+    # Reading it here would make a low pin silently re-clamp the scaled branch
+    # too, so the `_override=None` seam would not mean "as if unpinned".
+    unpinned_max = ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
+    return min(unpinned_max, max(ROW_DISCOVERY_CEILING_BASE_SECS, scaled))
+
+
+#: Worst-case BOUNDED work in a row on the failure path, at the WIDEST
+#: discovery ceiling reachable: both discovery waits, then one full watchdog
+#: window, then both ceiling-bounded kill-confirmation waits run to their
+#: full ceiling.  (Deliberately excludes _setup_verify_repo's real git work
+#: and the finally block's ~5s child.kill()/wait() tail -- both small next to
+#: the headroom below.)  Keyed on ROW_DISCOVERY_CEILING_MAX_SECS, not on the
+#: base: task 4014 made the discovery ceiling load-scaled, and a widened wait
+#: the @pytest.mark.timeout below cannot accommodate would be TRUNCATED by
+#: pytest-timeout's thread-mode os._exit() -- reporting as a worker kill
+#: instead of the row's self-diagnosing AssertionError.
+_ROW_WORST_CASE_FIXED_SECS: float = (
+    ROW_WATCHDOG_WINDOW_SECS + 2 * ROW_TREE_KILL_CEILING_SECS
+)  # 75.0
+
+#: Per-test opt-out from this module's inherited `timeout = 60`
+#: (orchestrator/pyproject.toml:103, thread-mode -- os._exit()s the xdist
+#: worker on expiry).  2x the FIXED terms, because this module's own comment
+#: (~:870-879) records ~15x elasticity on `from orchestrator.cli import main`
+#: under a full-suite storm and those terms do not track load themselves.
+#: The discovery term is counted ONCE and exempted from that 2x: it now
+#: scales with loadavg-per-core on its own, so applying the storm factor to
+#: it as well would double-count the same elasticity.
+ROW_PER_TEST_TIMEOUT_SECS: int = int(
+    2 * _ROW_WORST_CASE_FIXED_SECS + 2 * ROW_DISCOVERY_CEILING_MAX_SECS
+)  # 390
+
+#: Row 5's own bounded terms.  It does not share Rows 1-4's shape -- no
+#: watchdog window, no wait_subtree_gone kill confirmation -- so it cannot
+#: share their constant, only their DERIVATION.  Named here (rather than
+#: passed as literals at the call sites) so the budget below and the waits it
+#: is supposed to cover move together.
+ROW5_WAITER_COMPLETION_CEILING_SECS: float = 60.0
+ROW5_HOLDER_TEARDOWN_CEILING_SECS: float = 5.0
+
+#: Worst-case FIXED (non-load-scaled) work in Row 5: the marker wait, the
+#: waiter subprocess's completion ceiling, and the finally block's holder
+#: teardown.  The marker term is counted TWICE because
+#: :func:`wait_for_marker_stable` spends its timeout on the existence gate and
+#: then a FRESH deadline on the settle loop -- worst case 40s, not 20s, a term
+#: the literal mark this replaced hid entirely.  (Deliberately excludes
+#: _setup_verify_repo's real git work and the in-process consumer half -- both
+#: small next to the headroom below, exactly as for Rows 1-4.)
+_ROW5_WORST_CASE_FIXED_SECS: float = (
+    2 * ROW_MARKER_CEILING_SECS
+    + ROW5_WAITER_COMPLETION_CEILING_SECS
+    + ROW5_HOLDER_TEARDOWN_CEILING_SECS
+)  # 105.0
+
+#: Row 5's per-test opt-out from the inherited `timeout = 60`, in the same
+#: shape as ROW_PER_TEST_TIMEOUT_SECS above: 2x the FIXED terms (they do not
+#: track load, and this module records ~15x elasticity on the child's
+#: `from orchestrator.cli import main` under a full-suite storm), plus the two
+#: discovery waits counted ONCE at MAX and exempted from that 2x -- they now
+#: scale with loadavg-per-core themselves, so applying the storm factor to
+#: them as well would double-count the same elasticity.
+ROW5_PER_TEST_TIMEOUT_SECS: int = int(
+    2 * _ROW5_WORST_CASE_FIXED_SECS + 2 * ROW_DISCOVERY_CEILING_MAX_SECS
+)  # 450
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Task 4025 amendment -- drift detector for the pin above.  ROW_WATCHDOG_ENV
+# is pinned to today's production numbers but deliberately does not TRACK
+# verify_cancel's constants (see the banner above); that decoupling means
+# nothing else notices the day the two diverge.  This is the one test whose
+# whole job is to notice, so the import it performs (LOCAL to the test body,
+# not module-level) is a deliberate, narrow exception to "nothing here
+# imports verify_cancel's watchdog timing constants" above -- it exists
+# specifically to compare against them, not to consume them.
+# ---------------------------------------------------------------------------
+
+
+def test_row_watchdog_window_still_matches_production_constants():
+    """Fails the day ROW_WATCHDOG_* stops matching verify_cancel's WATCHDOG_*.
+
+    task 4025 pinned ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS /
+    ROW_WATCHDOG_KILL_GRACE_SECS as literals specifically so Rows 1/2/3's
+    runtime does NOT track verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS /
+    WATCHDOG_KILL_GRACE_SECS -- task 4195 is expected to retune those toward
+    ~60s+.  Today the pinned literals happen to equal production, so this
+    passes; it exists to catch the moment that stops being true.
+
+    If this fails: production changed (task 4195 landing is the expected
+    trigger).  Do NOT "fix" it by importing the pinned literals from
+    verify_cancel -- that reintroduces the silent-runtime-multiplication
+    this task exists to prevent.  Instead update the three Row 1/2/3
+    docstrings' "pinned production-equivalent window" wording (it will no
+    longer be accurate), decide afresh whether
+    ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS
+    should move, and re-baseline this assert against the new production
+    values.
+    """
+    from orchestrator import verify_cancel
+
+    pinned = (ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS, ROW_WATCHDOG_KILL_GRACE_SECS)
+    production = (
+        verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+        verify_cancel.WATCHDOG_KILL_GRACE_SECS,
+    )
+    assert pinned == production, (
+        f'pinned ROW_WATCHDOG_* {pinned} no longer match production '
+        f'verify_cancel.WATCHDOG_* {production} -- the pin intentionally '
+        f'does not track production; update the docstrings\' '
+        f'"production-equivalent" wording and re-baseline this assert.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 4014 -- deterministic coverage for the load-scaled discovery ceiling.
+# Pure function, injected seams: no clock, no /proc, no subprocess.
+# ---------------------------------------------------------------------------
+
+
+def test_row_discovery_ceiling_scales_with_load_and_clamps():
+    """The discovery ceiling widens with per-core load and is bounded at both ends.
+
+    This is a WEDGE DETECTOR, not a speed assertion -- the rows assert THAT
+    a tree was discovered, never how fast -- so on the success path a wider
+    ceiling costs ZERO wall clock and is paid only when the test is already
+    failing.  The four properties that matter:
+
+    (a) an IDLE box must get exactly the base ceiling, so a quiet run is
+        never slowed down;
+    (b) real per-core load must actually widen it (3x per core is the BOTTOM
+        of this repo's measured dilation envelope);
+    (c) an absurd load must clamp, so a runaway box cannot stretch a row
+        past the pytest timeout that is DERIVED from that clamp;
+    (d) the mapping is monotone -- more load never yields a tighter deadline.
+    """
+    idle = row_discovery_ceiling_secs(_override=None, _loadavg=0.1, _cpu_count=32)
+    assert idle == ROW_DISCOVERY_CEILING_BASE_SECS, (
+        f'an idle box must pay exactly the base ceiling '
+        f'({ROW_DISCOVERY_CEILING_BASE_SECS}); got {idle}'
+    )
+
+    loaded = row_discovery_ceiling_secs(_override=None, _loadavg=96.0, _cpu_count=32)
+    assert loaded > ROW_DISCOVERY_CEILING_BASE_SECS, (
+        f'at 3x per-core load -- the BOTTOM of the measured dilation envelope -- '
+        f'the ceiling must widen past base; got {loaded}'
+    )
+
+    unpinned_clamp = ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
+    absurd = row_discovery_ceiling_secs(_override=None, _loadavg=6400.0, _cpu_count=32)
+    assert absurd == unpinned_clamp, (
+        f'a runaway load must clamp to {unpinned_clamp} -- that clamp is what '
+        f'ROW_DISCOVERY_CEILING_MAX_SECS, and in turn the import-time pytest '
+        f'timeout, are derived from; got {absurd}'
+    )
+
+    ladder = [
+        row_discovery_ceiling_secs(_override=None, _loadavg=load, _cpu_count=32)
+        for load in (0.0, 1.0, 32.0, 64.0, 96.0, 200.0, 1000.0, 6400.0)
+    ]
+    assert ladder == sorted(ladder), (
+        f'more load must never yield a TIGHTER deadline; got {ladder}'
+    )
+    assert all(v >= ROW_DISCOVERY_CEILING_BASE_SECS for v in ladder), (
+        f'no reachable value may drop below the base ceiling; got {ladder}'
+    )
+
+
+def test_discovery_ceiling_env_override_parses_and_pins():
+    """ORCH_TEST_DISCOVERY_CEILING_SECS parses safely and beats load scaling.
+
+    Two halves, both deterministic -- the parser takes an environ MAPPING
+    rather than reading os.environ, so neither half monkeypatches import-time
+    state or races import order.
+
+    (a) Parsing.  A good value parses; an absent one is None; a typo'd one is
+        None AND warns.  Warning rather than raising is deliberate: this
+        constant is resolved at IMPORT, so raising would fail COLLECTION for
+        the whole module -- every row and every helper test taken down by one
+        mistyped debugging knob, which is a strictly worse and far more
+        confusing failure than the one being guarded against.  Silently
+        ignoring it would be worse still (the project's no-silent-fail-soft
+        norm), hence the warning.
+
+        NON-FINITE inputs are covered alongside the typo because they defeat
+        that contract in a way a typo does not: 'banana' fails float(), but
+        'inf'/'nan' PARSE, and `inf <= 0` / `nan <= 0` are both False, so
+        without an explicit finiteness guard they sail through into
+        ROW_DISCOVERY_CEILING_MAX_SECS and detonate the next module-level
+        statement (`int(... + 2*inf)` -> OverflowError; nan -> ValueError),
+        failing collection for the whole module.  'inf' is not an exotic
+        input either: it is what an operator writes to mean "never time out".
+
+    (b) Pinning.  An explicit operator pin wins in BOTH directions -- it must
+        override load scaling upward and downward alike, or "pin it to 7.5 to
+        reproduce the timeout quickly" silently does nothing on a busy box.
+
+    The knob is namespaced ORCH_TEST_*, not bare ORCH_*: subprocess_env()
+    copies os.environ into every spawned verify-merge, and the ORCH_*
+    namespace there is production knobs the CLI actually reads.
+    """
+    assert _resolve_ceiling_override({'ORCH_TEST_DISCOVERY_CEILING_SECS': '7.5'}) == 7.5
+    assert _resolve_ceiling_override({}) is None
+
+    for bad in ('banana', 'inf', '-inf', 'nan', '0', '-1'):
+        with pytest.warns(UserWarning, match='ORCH_TEST_DISCOVERY_CEILING_SECS'):
+            assert _resolve_ceiling_override(
+                {'ORCH_TEST_DISCOVERY_CEILING_SECS': bad}
+            ) is None, f'{bad!r} must be rejected, not pinned'
+
+    # The consequence the rejection above exists to prevent, asserted against
+    # the module's OWN import-time constants -- the values THIS process is
+    # actually running under, whatever env it was collected with.  A local
+    # re-derivation would have been vacuous twice over: every value the
+    # resolver accepts is finite and positive by construction, and a copy of
+    # the derivation cannot notice the MODULE's derivation being loosened.
+    assert math.isfinite(ROW_DISCOVERY_CEILING_MAX_SECS) and ROW_DISCOVERY_CEILING_MAX_SECS > 0, (
+        f'ROW_DISCOVERY_CEILING_MAX_SECS resolved to '
+        f'{ROW_DISCOVERY_CEILING_MAX_SECS} -- a non-finite or non-positive '
+        f'ceiling reached import, so the finiteness guard above is being bypassed'
+    )
+    for name, derived in (
+        ('ROW_PER_TEST_TIMEOUT_SECS', ROW_PER_TEST_TIMEOUT_SECS),
+        ('ROW5_PER_TEST_TIMEOUT_SECS', ROW5_PER_TEST_TIMEOUT_SECS),
+    ):
+        assert derived > 0, (
+            f'{name} derived to {derived} -- the per-test timeouts are int() of a '
+            f'sum containing the ceiling, so this is what a non-finite ceiling '
+            f'looks like on the far side of the derivation'
+        )
+
+    assert row_discovery_ceiling_secs(_override=7.5, _loadavg=6400.0, _cpu_count=32) == 7.5
+    assert row_discovery_ceiling_secs(_override=7.5, _loadavg=0.0, _cpu_count=32) == 7.5
+
+
+def test_row_per_test_timeout_still_covers_the_max_discovery_ceiling():
+    """The per-test pytest timeout must cover the WIDEST discovery ceiling reachable.
+
+    Extends task 4025's "the coupling is STRUCTURAL, not merely asserted"
+    property (commit 71a4d37f17) to the now load-scaled discovery ceiling,
+    against the AMBIENT module constants.
+
+    Without (b), a load-widened discovery wait would be silently truncated by
+    the import-time ``@pytest.mark.timeout(...)`` decorator -- and a widened
+    deadline that never gets to run is WORSE than no fix at all, because
+    pytest-timeout's thread mode ``os._exit()``s the xdist worker: the row
+    then reports as a worker kill rather than as the self-diagnosing
+    AssertionError (leader rc taxonomy + stderr tail) task 4025-alpha built
+    precisely so this failure would explain itself.
+    """
+    resolved = row_discovery_ceiling_secs()
+    assert resolved <= ROW_DISCOVERY_CEILING_MAX_SECS, (
+        f'row_discovery_ceiling_secs() returned {resolved}, above the '
+        f'ROW_DISCOVERY_CEILING_MAX_SECS ({ROW_DISCOVERY_CEILING_MAX_SECS}) that '
+        f'ROW_PER_TEST_TIMEOUT_SECS is derived from -- the widened wait would be '
+        f'truncated by @pytest.mark.timeout instead of running'
+    )
+    if _DISCOVERY_CEILING_OVERRIDE_SECS is None:
+        # An operator pin deliberately escapes the base floor (pinning LOW is
+        # how you reproduce a discovery timeout quickly), so the floor is
+        # asserted only for the unpinned, CI-reachable configuration.
+        assert resolved >= ROW_DISCOVERY_CEILING_BASE_SECS, (
+            f'row_discovery_ceiling_secs() returned {resolved}, below the base '
+            f'ceiling ({ROW_DISCOVERY_CEILING_BASE_SECS}) -- load scaling must '
+            f'never hand a quiet box a TIGHTER deadline than it always had'
+        )
+
+    required = (
+        2 * ROW_DISCOVERY_CEILING_MAX_SECS
+        + ROW_WATCHDOG_WINDOW_SECS
+        + 2 * ROW_TREE_KILL_CEILING_SECS
+    )
+    assert required <= ROW_PER_TEST_TIMEOUT_SECS, (
+        f'ROW_PER_TEST_TIMEOUT_SECS ({ROW_PER_TEST_TIMEOUT_SECS}) does not cover '
+        f'the bounded worst case at the MAX discovery ceiling ({required}) -- '
+        f'both discovery waits, one full watchdog window, and both '
+        f'kill-confirmation waits run to their ceiling'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 4014 (review fix) -- widen the coupling guard from "the derived
+# constant is big enough" to "every CALL SITE performing a scaled discovery
+# wait is actually covered by the mark it runs under".
+#
+# The defect this pair exists to catch is not a wrong number, it is a guard
+# whose SCOPE did not include a call site.  The test above pins
+# ROW_PER_TEST_TIMEOUT_SECS against ROW_DISCOVERY_CEILING_MAX_SECS but never
+# looks at WHO performs a discovery wait -- so Row 5, which relies on the bare
+# (now load-scaled) defaults while carrying task 2921's unrelated LITERAL
+# @pytest.mark.timeout(120), was invisible to it.  Two 120s-capable waits
+# inside a 120s mark means a wedged Row 5 discovery gets truncated by
+# pytest-timeout's thread-mode os._exit() of the whole xdist worker instead of
+# raising this module's self-diagnosing AssertionError (leader rc taxonomy +
+# bounded stderr tail) -- the exact silent-truncation class the derivation
+# chain exists to prevent.
+#
+# The sweep is ENUMERATION-FREE: it derives its call-site list from this
+# module's own AST, so a future Row 6 registers itself with the guard simply
+# by calling the helper.  A hand-maintained row list would have the identical
+# failure mode the day one lands.  Self-parsing AST guards are an established
+# idiom in this suite (test_marker_registration_drift.py,
+# test_git_repo_isolation_guard.py, test_lock_release_single_writer_guard.py,
+# test_event_loop_antipattern_guard.py) and cost nothing at runtime -- pure
+# parse, no subprocess, no timing.
+# ---------------------------------------------------------------------------
+
+#: The helpers whose ``timeout`` default now resolves to
+#: :func:`row_discovery_ceiling_secs`, i.e. can spend up to
+#: ROW_DISCOVERY_CEILING_MAX_SECS each.
+_SCALED_DISCOVERY_HELPERS: frozenset[str] = frozenset(
+    {'wait_for_pgid_file', 'wait_subtree_live'}
+)
+
+#: The seams that TOGETHER mean "this call never touches real /proc" -- see
+#: :func:`_scaled_discovery_call_count`.  BOTH are required: either one alone
+#: leaves the other half of the poll tick reading real /proc.
+_DISCOVERY_SEAM_KWARGS: frozenset[str] = frozenset({'_probe_children', '_ppid_map'})
+
+#: Last-resort stand-in for the pytest-timeout budget an unmarked test
+#: inherits, used ONLY when pytest-timeout did not configure this run at all
+#: (``-p no:timeout``, or a version that stops exposing its resolved value).
+#: The live value is read by :func:`_inherited_timeout_budget_secs` --
+#: hardcoding orchestrator/pyproject.toml's ``timeout = 60`` would make this
+#: guard reason from exactly the kind of unreachable literal its closing
+#: assertion bans.
+_INHERITED_TIMEOUT_FALLBACK_SECS: float = 60.0
+
+
+def _inherited_timeout_budget_secs(config) -> float:
+    """The pytest-timeout budget an UNMARKED test in this module inherits.
+
+    Read from ``config._env_timeout`` -- the plugin's OWN resolved value, i.e.
+    literally what ``pytest_timeout._get_item_settings`` hands an item carrying
+    no ``timeout`` marker -- rather than duplicated as a literal, so a change to
+    orchestrator/pyproject.toml cannot leave the sweep below reasoning from, and
+    misreporting, a stale number.
+
+    ``getini('timeout')`` alone will NOT do, MEASURED here on pytest-timeout
+    2.4.0: it returns the STRING ``'60'`` (so float() coercion is mandatory),
+    returns ``''`` on a root-bound run because the repo-root pyproject declares
+    no ``timeout`` key at all, and -- the one that matters -- stays STALE at
+    ``'60'`` under ``--timeout=300``, which this repo's per-module verify
+    commands do pass.  ``get_env_settings()`` resolves ``--timeout`` ->
+    ``PYTEST_TIMEOUT`` -> truthy ini and stores the winner as ``_env_timeout``;
+    reading the winner cannot drift from the plugin's chain the way a local
+    re-implementation of that chain would.
+
+    ``None`` means no timeout was configured anywhere (measured: a root-bound
+    run), so nothing can truncate an unmarked test and its budget really is
+    unbounded.  Reporting the literal there would make this guard fail tests
+    over a truncation that cannot happen.
+    """
+    if not hasattr(config, '_env_timeout'):
+        warnings.warn(
+            'pytest-timeout did not configure this run (no config._env_timeout), '
+            'so the discovery-wait sweep is falling back to the duplicated '
+            f'literal {_INHERITED_TIMEOUT_FALLBACK_SECS}s for unmarked tests',
+            stacklevel=2,
+        )
+        return _INHERITED_TIMEOUT_FALLBACK_SECS
+    resolved = config._env_timeout
+    if resolved is None:
+        return math.inf  # no timeout anywhere: an unmarked test cannot be truncated
+    return float(resolved)
+
+
+#: Anti-vacuity floor for the sweep below: an AST matcher that silently stops
+#: matching is a guard reporting PASS while guarding nothing.
+_KNOWN_DISCOVERY_ROWS: frozenset[str] = frozenset({
+    'test_cancel_verify_tree_kills_under_live_watchdog',                  # Row 4
+    'test_orchestrator_killed_mid_build_tree_killed_via_eof',             # Row 1
+    'test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive',    # Row 2
+    'test_heartbeat_starved_hard_partition_tree_killed_via_timeout',      # Row 3
+    'test_flock_contention_full_two_way_seam_blocks_and_escalates',       # Row 5
+})
+
+
+def _scaled_discovery_call_count(func_node) -> int:
+    """How many LOAD-SCALED discovery waits *func_node* performs.
+
+    A call to one of :data:`_SCALED_DISCOVERY_HELPERS` counts when its
+    ``timeout=`` kwarg is ABSENT (the bare default, which now resolves to
+    ``row_discovery_ceiling_secs()``) or is exactly
+    ``row_discovery_ceiling_secs()``.  An explicit unscaled value (e.g.
+    ``timeout=30.0``) does not count -- it cannot exceed what it names.
+
+    A call passing the FULL private seam set (``_probe_children`` AND
+    ``_ppid_map``) is EXEMPT, and that rule is load-bearing: a fully
+    seam-injected call never touches real /proc and returns in microseconds at
+    ``interval=0``.  Without it the three deterministic helper tests below
+    would each be told to carry a 240s mark -- the guard would push this module
+    toward SLOWER tests rather than safer ones.
+
+    Requiring BOTH is equally load-bearing, in the other direction.  A PARTIAL
+    injection is not exempt, because it still reads real /proc every tick:
+    ``_ppid_map=`` alone still runs the real :func:`_read_direct_children`
+    probe, and ``_probe_children=`` alone still runs the real
+    ``read_ppid_map()`` full walk on every non-negative tick.  Either can also
+    still run the poll loop to the full ``row_discovery_ceiling_secs()``
+    deadline if the injected half never yields a descendant -- exactly the
+    truncatable wait this sweep exists to catch.  No call site does this today;
+    exempting on ANY seam would have left the hole open for the first one that
+    does.
+    """
+    count = 0
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (
+            isinstance(node.func, ast.Name)
+            and node.func.id in _SCALED_DISCOVERY_HELPERS
+        ):
+            continue
+        # Superset, not intersection: the FULL seam set must be injected.
+        if {kw.arg for kw in node.keywords} >= _DISCOVERY_SEAM_KWARGS:
+            continue
+        timeout_arg = next(
+            (kw.value for kw in node.keywords if kw.arg == 'timeout'), None
+        )
+        if timeout_arg is None:
+            count += 1  # bare default -> row_discovery_ceiling_secs()
+        elif (
+            isinstance(timeout_arg, ast.Call)
+            and isinstance(timeout_arg.func, ast.Name)
+            and timeout_arg.func.id == 'row_discovery_ceiling_secs'
+        ):
+            count += 1
+    return count
+
+
+def _timeout_mark_argument(func_node):
+    """The single argument node of *func_node*'s ``@pytest.mark.timeout(...)``.
+
+    Returns None when the function carries no such decorator (it then
+    inherits the run's budget -- see :func:`_inherited_timeout_budget_secs`).
+    """
+    for decorator in func_node.decorator_list:
+        if not isinstance(decorator, ast.Call):
+            continue
+        func = decorator.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == 'timeout'
+            and isinstance(func.value, ast.Attribute)
+            and func.value.attr == 'mark'
+            and isinstance(func.value.value, ast.Name)
+            and func.value.value.id == 'pytest'
+        ):
+            return decorator.args[0] if decorator.args else None
+    return None
+
+
+def test_row5_per_test_timeout_covers_its_own_bounded_work():
+    """Row 5's pytest timeout must cover ITS bounded worst case, and be DERIVED.
+
+    Row 5 does not share Rows 1-4's shape -- no watchdog window, no
+    ``wait_subtree_gone`` kill confirmation -- so it cannot share their
+    constant.  Its bounded terms are: two discovery waits (both on the
+    load-scaled ceiling), the marker wait, the waiter subprocess's completion
+    ceiling, and the ``finally`` block's holder teardown.
+
+    The marker term is counted TWICE on purpose:
+    :func:`wait_for_marker_stable` spends its ``timeout`` on the
+    :func:`wait_for_marker` existence gate and then a FRESH ``timeout`` on the
+    settle loop, so its worst case is 2x, not 1x -- a term the old literal 120
+    hid entirely.
+
+    The second half reads the mark ACTUALLY APPLIED to the live function
+    object rather than trusting the constant in isolation, so the derivation
+    and the decorator cannot diverge.
+    """
+    required = (
+        2 * ROW_DISCOVERY_CEILING_MAX_SECS
+        + 2 * ROW_MARKER_CEILING_SECS
+        + ROW5_WAITER_COMPLETION_CEILING_SECS
+        + ROW5_HOLDER_TEARDOWN_CEILING_SECS
+    )
+    assert required <= ROW5_PER_TEST_TIMEOUT_SECS, (
+        f'ROW5_PER_TEST_TIMEOUT_SECS ({ROW5_PER_TEST_TIMEOUT_SECS}) does not cover '
+        f"Row 5's bounded worst case ({required}) -- both discovery waits at the "
+        f'MAX ceiling, the marker existence gate AND its settle loop, the waiter '
+        f"subprocess's completion ceiling, and the holder teardown"
+    )
+
+    applied = [
+        mark
+        for mark in getattr(
+            test_flock_contention_full_two_way_seam_blocks_and_escalates,
+            'pytestmark',
+            [],
+        )
+        if mark.name == 'timeout'
+    ]
+    assert len(applied) == 1, (
+        f'expected exactly one @pytest.mark.timeout on Row 5, got {applied!r}'
+    )
+    assert applied[0].args[0] == ROW5_PER_TEST_TIMEOUT_SECS, (
+        f'Row 5 runs under a {applied[0].args[0]}s mark but its derivation says '
+        f'{ROW5_PER_TEST_TIMEOUT_SECS}s -- the decorator and the derived constant '
+        f'have diverged, so the derivation is guarding nothing'
+    )
+
+
+def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request):
+    """No test may perform more discovery waiting than its own mark allows.
+
+    Enumeration-free sweep of this module's own AST (see the banner above).
+    For every ``test_*`` function it counts the LOAD-SCALED discovery waits
+    the source actually contains, resolves the EFFECTIVE pytest-timeout
+    budget that test runs under -- from the LIVE config for unmarked tests,
+    never from a duplicated ini literal -- and asserts the budget covers those
+    waits at the widest ceiling they can reach.
+
+    It additionally BANS a literal timeout mark on any test performing such a
+    wait.  That kills the root cause directly rather than the symptom: task
+    2921's ``@pytest.mark.timeout(120)`` was a literal that no re-derivation
+    could reach into, which is precisely why task 4014's load-scaled
+    discovery ceiling could not propagate to Row 5.
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
+    swept: dict[str, tuple[int, ast.AST]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if not node.name.startswith('test_'):
+            continue
+        n_scaled = _scaled_discovery_call_count(node)
+        if n_scaled:
+            swept[node.name] = (n_scaled, node)
+
+    missing = sorted(_KNOWN_DISCOVERY_ROWS - set(swept))
+    assert not missing, (
+        f'the AST sweep matched no scaled discovery wait in {missing} -- a matcher '
+        f'that silently stops matching is a guard reporting PASS while guarding '
+        f'nothing (matched: {sorted(swept)})'
+    )
+
+    inherited = _inherited_timeout_budget_secs(request.config)
+    under_budget: list[str] = []
+    literal_marked: list[str] = []
+    for name, (n_scaled, func_node) in sorted(swept.items()):
+        arg = _timeout_mark_argument(func_node)
+        if arg is None:
+            effective = inherited
+        elif isinstance(arg, ast.Name) and arg.id in globals():
+            effective = float(globals()[arg.id])
+        else:
+            literal_marked.append(f'{name}: @pytest.mark.timeout({ast.unparse(arg)})')
+            effective = (
+                float(arg.value)
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, int | float)
+                else inherited
+            )
+        required = n_scaled * ROW_DISCOVERY_CEILING_MAX_SECS
+        if effective < required:
+            under_budget.append(
+                f'{name}: {n_scaled} scaled discovery wait(s) needing {required}s '
+                f'but running under a {effective}s budget'
+            )
+
+    assert not under_budget, (
+        'these tests can spend more time in discovery waits than their pytest '
+        'timeout allows, so a wedged discovery is truncated by pytest-timeout\'s '
+        'thread-mode os._exit() of the xdist worker instead of raising the '
+        'self-diagnosing AssertionError:\n  ' + '\n  '.join(under_budget)
+    )
+    assert not literal_marked, (
+        'these tests perform a load-scaled discovery wait but pin their pytest '
+        'timeout to a LITERAL, which no re-derivation of the discovery ceiling '
+        'can reach into -- use a module-level derived constant instead:\n  '
+        + '\n  '.join(literal_marked)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +1508,246 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
         wait_for_marker_stable(
             marker, timeout=0.05, interval=0, _read_mtime_ns=fake_read_mtime_ns,
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 4014 -- deterministic unit coverage for wait_subtree_live's descendant
+# discovery poll (the "no descendant appeared within 20.0s" flake).  Every
+# test here injects the two private seams (_probe_children / _ppid_map) and
+# runs with interval=0, so there is ZERO real timing and ZERO real
+# subprocess -- the same task-2819 precedent as the wait_for_marker_stable
+# tests above.  Fixing a flake with a flake is the failure mode to avoid, and
+# the 3689 steward failed to reproduce this one in 19 of 19 attempts
+# (including synthetic pressure at load 100 / ~8000 processes), so a
+# load-based test would be non-deterministic in BOTH directions.  The
+# efficiency property that actually prevents sampling-rate collapse is
+# therefore pinned STRUCTURALLY, by call count, which is exact at any load.
+# ---------------------------------------------------------------------------
+
+
+def test_wait_subtree_live_gates_the_proc_walk_on_a_cheap_probe():
+    """The expensive full /proc rescan runs only once the cheap probe goes positive.
+
+    This is the load-bearing efficiency property of the discovery poll.
+    Measured on this box: ``read_ppid_map()`` costs 49.67 ms at 917 live
+    processes, while one ``/proc/<pid>/task/<tid>/children`` read costs
+    0.0183 ms -- ~2700x.  Against the 50 ms poll interval the full rescan
+    already DOUBLES the effective sampling period at idle, and the poller
+    burns ~917 file reads per tick competing for CPU with the very leader it
+    is waiting to see fork; under a full-suite storm (~8000 procs) the scan
+    is ~400ms+ and the sampling period collapses by ~10x.  So the cost is
+    worst exactly when the test needs the samples most.
+
+    The call-count assertion below pins "the sampling rate cannot collapse
+    under a large process table" as a STRUCTURAL property rather than a
+    timing hope: 26 ticks may cost at most ONE expensive walk.
+    """
+    probe_calls = [0]
+    ppid_map_calls = [0]
+
+    def fake_probe(_pid):
+        # 25 cheap negatives (leader live, hasn't forked yet), then a child.
+        probe_calls[0] += 1
+        return {5678} if probe_calls[0] > 25 else set()
+
+    def fake_ppid_map():
+        ppid_map_calls[0] += 1
+        return {5678: 1234}
+
+    result = wait_subtree_live(
+        1234, interval=0, _probe_children=fake_probe, _ppid_map=fake_ppid_map,
+    )
+
+    assert result == {5678}, (
+        f'expected the production walker\'s descendant set {{5678}}; got {result}'
+    )
+    assert probe_calls[0] == 26, (
+        f'expected the cheap probe on every one of the 26 ticks; '
+        f'got {probe_calls[0]} calls'
+    )
+    assert ppid_map_calls[0] <= 1, (
+        f'the expensive read_ppid_map() walk ran {ppid_map_calls[0]} times across '
+        f'26 ticks -- it must run ONLY on the tick the cheap probe goes positive, '
+        f'or the sampling rate collapses exactly when the process table is largest'
+    )
+
+
+def test_wait_subtree_live_skips_a_vanished_transient_and_returns_the_durable_set():
+    """A transient child that exits between probe and walk is skipped, not returned.
+
+    The first child the CLI forks for a not-yet-materialised worktree is a
+    SHORT-LIVED ``git`` subprocess (``git worktree add`` / ``git reset`` /
+    ``git clean`` inside ``acquire_host_verify_worktree``), not the eventual
+    build shell.  Scripted here deterministically: the probe sees pid 111 on
+    tick 1, nothing on ticks 2-3, then the durable 300s sleeper (222) from
+    tick 4; the paired walk comes back EMPTY on its first call because 111
+    had already exited by the time the rescan ran.
+
+    The helper must keep polling rather than hand back that empty set.  Two
+    reasons: it makes the return contract "a NON-EMPTY descendant set"
+    total, and it biases what the rows observe toward the durable sleeper --
+    a transient that self-exits could otherwise let the ``wait_subtree_gone``
+    assertion each row makes next pass without the watchdog having killed
+    anything.
+    """
+    probe_calls = [0]
+    ppid_map_calls = [0]
+
+    def fake_probe(_pid):
+        probe_calls[0] += 1
+        if probe_calls[0] == 1:
+            return {111}  # transient `git worktree add`
+        if probe_calls[0] <= 3:
+            return set()  # transient has exited; sleeper not forked yet
+        return {222}  # the durable 300s sleeper
+
+    def fake_ppid_map():
+        ppid_map_calls[0] += 1
+        # First walk races the transient's exit and sees nothing.
+        return {} if ppid_map_calls[0] == 1 else {222: 1234}
+
+    result = wait_subtree_live(
+        1234, interval=0, _probe_children=fake_probe, _ppid_map=fake_ppid_map,
+    )
+
+    assert result == {222}, (
+        f'expected the durable sleeper {{222}} -- never the empty set a walk '
+        f'racing the transient git child returns; got {result}'
+    )
+
+
+def test_wait_subtree_live_falls_back_to_the_full_walk_when_children_unreadable():
+    """A probe that returns None degrades to today's exact per-tick full walk.
+
+    ``/proc/<pid>/task/<tid>/children`` requires CONFIG_PROC_CHILDREN, so the
+    probe is TRI-STATE and its third state is load-bearing:
+
+    * ``set()``  -- leader live, no children yet (cheap negative: skip the walk)
+    * ``{...}``  -- worth confirming with the production walker
+    * ``None``   -- CANNOT probe (no ``children`` file, or the ``/proc/<pid>``
+      entry is gone)
+
+    ``None`` must fall through to the full ``collect_descendants(pgid,
+    read_ppid_map())`` walk for that tick.  Conflating it with the cheap
+    negative would make the helper spin until timeout on a kernel where the
+    probe can never go positive -- trading a flake for a hard, universal
+    failure on that platform.
+
+    The second half pins the vanishing-pid case that makes ``None``
+    reachable at all on a normal kernel: the leader can exit mid-poll, and
+    that must yield ``None``, never turn this helper's timeout diagnostic
+    into an unhandled OSError.  A pid above ``pid_max`` cannot exist, so it
+    stands in deterministically with no process to spawn or reap.
+    """
+    ppid_map_calls = [0]
+
+    def fake_probe(_pid):
+        return None  # kernel without CONFIG_PROC_CHILDREN
+
+    def fake_ppid_map():
+        ppid_map_calls[0] += 1
+        return {5678: 1234} if ppid_map_calls[0] > 3 else {}
+
+    result = wait_subtree_live(
+        1234, interval=0, _probe_children=fake_probe, _ppid_map=fake_ppid_map,
+    )
+
+    assert result == {5678}, (
+        f'a None (unprobeable) tick must fall back to the full walk, exactly as '
+        f'this helper behaved before task 4014; got {result}'
+    )
+
+    pid_max = int(Path('/proc/sys/kernel/pid_max').read_text().strip())
+    assert _read_direct_children(pid_max + 1) is None, (
+        'a pid that does not exist must probe as None (cannot probe), not raise -- '
+        'a leader exiting mid-poll must not turn the timeout path into an OSError'
+    )
+
+
+#: A child that stays alive but is never waited on -- killed by the test that
+#: spawns it.  ``sys.executable`` rather than ``sleep`` so nothing depends on
+#: PATH; the probe only needs the fork, not a finished exec.
+_DURABLE_CHILD_ARGV = [sys.executable, '-c', 'import time; time.sleep(30)']
+
+
+def test_read_direct_children_sees_a_real_fork_including_off_main_thread():
+    """The real probe's POSITIVE path, against the real kernel interface.
+
+    The three tests above all inject ``_probe_children``, so they pin
+    :func:`wait_subtree_live`'s gate LOGIC and never execute
+    :func:`_read_direct_children` itself; the only unmocked assertion on it is
+    the negative (``None``) case immediately above.  A regression in the
+    positive path -- a wrong ``/proc`` path segment, iterating only the main
+    tid, a broken ``int(token)`` parse -- would return ``set()`` for a leader
+    that HAS forked.  Every deterministic test in this module would stay green
+    while all five real rows failed with "no descendant appeared within Ns":
+    the exact flake task 4014 exists to remove, made permanent.
+
+    Two halves, both with ZERO real timing -- no sleeps, no polling.
+    ``Popen`` has already forked when it returns and the kernel lists the child
+    from that moment, so there is nothing to wait for (the ``Event`` waits in
+    (b) are handoff barriers, not timing assertions).
+
+    (a) A child forked from THIS thread must be listed.  Pins path
+        construction and token parsing.
+
+    (b) A child forked from a SECONDARY thread, probed while that thread is
+        still alive, must also be listed.  This is the half that pins the
+        per-thread ``task/*/`` iteration the helper's docstring justifies:
+        ``children`` is a PER-THREAD file, so a bare
+        ``/proc/<pid>/task/<pid>/children`` read would MISS this child.  The
+        forking thread is held alive until after the probe precisely because a
+        thread that EXITS has its children re-parented onto the group leader,
+        which would let a main-tid-only implementation pass and make this half
+        vacuous.
+    """
+    child = subprocess.Popen(_DURABLE_CHILD_ARGV)
+    try:
+        probed = _read_direct_children(os.getpid())
+        assert probed is not None, (
+            'probing this live test process must not report "cannot probe" -- '
+            'either the /proc path is built wrong or this kernel lacks '
+            'CONFIG_PROC_CHILDREN (in which case every row silently runs on the '
+            'full-walk fallback and task 4014 buys nothing)'
+        )
+        assert child.pid in probed, (
+            f'just-forked direct child {child.pid} is missing from the probe '
+            f'{sorted(probed)} -- a probe that cannot see a fork returns the cheap '
+            f'NEGATIVE forever, so wait_subtree_live never spends the confirming '
+            f'walk and every real row fails with "no descendant appeared"'
+        )
+    finally:
+        child.kill()
+        child.wait()
+
+    forked: dict[str, subprocess.Popen] = {}
+    spawned = threading.Event()
+    release = threading.Event()
+
+    def fork_off_main_thread() -> None:
+        forked['proc'] = subprocess.Popen(_DURABLE_CHILD_ARGV)
+        spawned.set()
+        release.wait(timeout=30.0)  # stay alive so the child stays MINE
+
+    thread = threading.Thread(target=fork_off_main_thread, daemon=True)
+    thread.start()
+    try:
+        assert spawned.wait(timeout=30.0), 'the helper thread never forked its child'
+        off_main = forked['proc']
+        probed = _read_direct_children(os.getpid())
+        assert probed is not None and off_main.pid in probed, (
+            f'child {off_main.pid}, forked from a still-live secondary thread, is '
+            f'missing from the probe {probed if probed is None else sorted(probed)} '
+            f'-- children is a PER-THREAD file, so this is what a regression to a '
+            f'single /proc/<pid>/task/<pid>/children read looks like'
+        )
+    finally:
+        release.set()
+        thread.join(timeout=30.0)
+        off_main = forked.get('proc')
+        if off_main is not None:
+            off_main.kill()
+            off_main.wait()
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +1957,7 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
 
     assert proc.returncode == 0, (
         f'expected exit 0 (contention result on stdout), got {proc.returncode}; '
-        f'stderr={stderr.decode()[:2000]!r}'
+        f'stderr={stderr_tail(stderr)!r}'
     )
     result = result_from_json(stdout.decode())
     assert result.category == FLOCK_CONTENTION_CATEGORY, (
@@ -763,7 +1977,7 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         'timing bootstrap patches orchestrator.cli.acquire_merge_verify_flock, '
         'so zero observations means the gate is no longer reached through that '
         'name and the ceiling assertion below would be vacuous; '
-        f'stderr={stderr.decode()[:2000]!r}'
+        f'stderr={stderr_tail(stderr)!r}'
     )
     longest = max(w.waited_secs for w in waits)
     assert longest < FLOCK_WAIT_CEILING_SECS, (
@@ -961,6 +2175,7 @@ def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, mo
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025 amendment: shares the derived per-row budget -- same real-subprocess exposure as Rows 1/2/3, previously left on the module's bare 60s ini timeout
 def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
     """SS9 Row 4: cancel-verify leaves no orphan while the stdin watchdog is live.
 
@@ -997,7 +2212,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
         pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val)
+        wait_subtree_live(pgid_val, proc=child)
 
         monkeypatch.setattr(cli_module, 'load_config', lambda _path: config_obj)
         result = CliRunner().invoke(main, [
@@ -1036,6 +2251,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
 def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     """SS9 Row 1: dispatcher process killed -> child sees stdin EOF -> tree-killed.
 
@@ -1047,14 +2263,14 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     when the OS reclaims its file descriptors, ITS end of the child's stdin
     pipe closes, giving the grandchild a clean EOF on fd 0.
 
-    The step-2 env seam is threaded through the dispatcher's own environment
+    ROW_WATCHDOG_ENV is threaded through the dispatcher's own environment
     (:func:`spawn_ssh_heartbeat_dispatcher`'s *extra_env*, ambiently inherited
-    by the grandchild verify-merge) so the assertion window is small and
-    deterministic rather than the 10s+5s production window.  Per
-    ``run_stdin_watchdog``, EOF fires on the very next ``select`` readiness
-    check regardless of *heartbeat_timeout* -- only ``grace_secs`` (the
-    SIGTERM->SIGKILL pause in ``fire_watchdog_kill``) materially bounds this
-    row's timing; both overrides are set for a documented, generous ceiling.
+    by the grandchild verify-merge) -- the pinned 10s+5s production-equivalent
+    window, not a fast one; see ROW_WATCHDOG_ENV's comment above for the pin
+    rationale.  Per ``run_stdin_watchdog``, EOF fires on the very next
+    ``select`` readiness check regardless of *heartbeat_timeout* -- only
+    ``grace_secs`` (the SIGTERM->SIGKILL pause in ``fire_watchdog_kill``)
+    materially bounds this row's timing (~5s, measured ~7.3s end-to-end).
 
     Asserts within a bounded T: the full descendant subtree (including the
     start_new_session sleeper escape) AND the pgid leader are gone.
@@ -1073,19 +2289,21 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     dispatcher = spawn_ssh_heartbeat_dispatcher(
         argv=argv,
         heartbeat_interval=0.2,
-        extra_env={
-            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '1.0',
-            'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.5',
-        },
+        extra_env=ROW_WATCHDOG_ENV,
     )
     try:
-        pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val)
+        pgid_val = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        # Row 1 owns the DISPATCHER process, not the leader -- the leader's
+        # own stdout/stderr aren't piped to this test, so pass the dispatcher.
+        wait_subtree_live(
+            pgid_val, proc=dispatcher, proc_label='dispatcher',
+            timeout=row_discovery_ceiling_secs(),
+        )
 
         dispatcher.kill()
         dispatcher.wait(timeout=10)
 
-        assert wait_subtree_gone(pgid_val, timeout=10.0), (
+        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
             f'pgid {pgid_val}: subtree and/or leader still alive after the '
             f'dispatcher was killed (EOF-triggered watchdog tree-kill did '
             f'not fire)'
@@ -1107,6 +2325,7 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
 def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
     """SS9 Row 2: ssh channel closes but the dispatcher stays alive -> EOF tree-kill.
 
@@ -1119,9 +2338,13 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
     1 and the same ``run_stdin_watchdog`` EOF branch fires; the difference
     from Row 1 is that no dispatcher PROCESS dies here, only the transport.
 
-    Uses the step-2 env seam directly on the spawned verify-merge (already
-    an in-process dispatcher, so no extra remove is needed, unlike Row 1's
-    separate-process case) for a fast, deterministic assertion window.
+    Uses ROW_WATCHDOG_ENV directly on the spawned verify-merge (already an
+    in-process dispatcher, so no extra remove is needed, unlike Row 1's
+    separate-process case) -- the pinned 10s+5s production-equivalent
+    window.  Row 2 is an EOF row like Row 1, not a timeout row:
+    ``close_stdin()`` closes the write end, so only ``grace_secs`` bounds it
+    (~5s, measured ~6.7s end-to-end), NOT the ~15s a reader might assume
+    from the heartbeat timeout.
 
     Asserts within a bounded T: the full descendant subtree AND the pgid
     leader are gone, and the verify-merge process itself self-exits non-zero
@@ -1140,15 +2363,12 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
         spec=sleeper_spec(300.0),
         cfg_file=cfg_file,
         request_id=REQUEST_ID,
-        extra_env={
-            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '1.0',
-            'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.5',
-        },
+        extra_env=ROW_WATCHDOG_ENV,
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val)
+        pgid_val = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        wait_subtree_live(pgid_val, proc=child, timeout=row_discovery_ceiling_secs())
 
         heartbeat.close_stdin()
 
@@ -1160,14 +2380,17 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
         # child.wait() -- confirmed by a manual repro that hung the full
         # poll window with this ordering reversed.
         try:
-            child.wait(timeout=10)
+            child.wait(timeout=ROW_TREE_KILL_CEILING_SECS)
         except subprocess.TimeoutExpired:
-            pytest.fail('verify-merge did not exit within 10s after stdin EOF')
+            pytest.fail(
+                f'verify-merge did not exit within '
+                f'{ROW_TREE_KILL_CEILING_SECS}s after stdin EOF'
+            )
         assert child.returncode != 0, (
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
         )
 
-        assert wait_subtree_gone(pgid_val, timeout=10.0), (
+        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
             f'pgid {pgid_val}: subtree and/or leader still alive after the '
             f'ssh channel EOF (dispatcher alive) -- watchdog tree-kill did '
             f'not fire'
@@ -1188,6 +2411,7 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
 def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     """SS9 Row 3: heartbeat starved, stdin stays OPEN -> select-timeout tree-kill.
 
@@ -1200,9 +2424,11 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     ready set) rather than seeing EOF, taking the branch that calls
     ``on_fire`` directly without ever attempting a read.
 
-    Uses the step-2 env seam directly on the spawned verify-merge for a
-    fast, deterministic assertion window bounded by
-    ``~(heartbeat_timeout + grace_secs)``.
+    Uses ROW_WATCHDOG_ENV -- the pinned production-equivalent window
+    (10.0s heartbeat timeout + 5.0s kill grace) -- directly on the spawned
+    verify-merge, so the assertion window here is ~15s, not fast; see
+    ROW_WATCHDOG_ENV's comment above for the pin rationale and the honest
+    cliff-moved caveat.
 
     Asserts the leader self-exits non-zero and, after reaping it (same
     zombie-avoidance ordering as Row 2 -- ``child`` is again a direct child
@@ -1221,15 +2447,12 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
         spec=sleeper_spec(300.0),
         cfg_file=cfg_file,
         request_id=REQUEST_ID,
-        extra_env={
-            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '1.0',
-            'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.5',
-        },
+        extra_env=ROW_WATCHDOG_ENV,
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val)
+        pgid_val = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        wait_subtree_live(pgid_val, proc=child, timeout=row_discovery_ceiling_secs())
 
         heartbeat.stop_heartbeats()
         assert child.stdin is not None and not child.stdin.closed, (
@@ -1238,17 +2461,18 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
         )
 
         try:
-            child.wait(timeout=10)
+            child.wait(timeout=ROW_TREE_KILL_CEILING_SECS)
         except subprocess.TimeoutExpired:
             pytest.fail(
-                'verify-merge did not self-exit within 10s of heartbeat '
-                'starvation (select-timeout branch did not fire)'
+                f'verify-merge did not self-exit within '
+                f'{ROW_TREE_KILL_CEILING_SECS}s of heartbeat starvation '
+                f'(select-timeout branch did not fire)'
             )
         assert child.returncode != 0, (
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
         )
 
-        assert wait_subtree_gone(pgid_val, timeout=10.0), (
+        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
             f'pgid {pgid_val}: subtree and/or leader still alive after '
             f'heartbeat starvation -- watchdog tree-kill did not fire'
         )
@@ -1274,7 +2498,12 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(120)  # task 2921: two real verify-merge subprocesses (holder + waiter) under full-suite load
+# task 2921: two real verify-merge subprocesses (holder + waiter) under
+# full-suite load -- the module's most storm-exposed row.  Now DERIVED rather
+# than the literal 120 task 2921 wrote: task 4014 made this row's two
+# discovery waits load-scaled (up to ROW_DISCOVERY_CEILING_MAX_SECS each), and
+# a literal cannot track that -- which is exactly what the review caught.
+@pytest.mark.timeout(ROW5_PER_TEST_TIMEOUT_SECS)
 def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     """SS9 Row 5: producer discriminant -> real consumer -> born-at-L2 + blocked.
 
@@ -1325,7 +2554,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     heartbeat_holder = HeartbeatWriter(holder, interval=0.2).start()
     try:
         holder_pgid_val = wait_for_pgid_file(pgf_holder)
-        wait_subtree_live(holder_pgid_val)
+        wait_subtree_live(holder_pgid_val, proc=holder)
 
         persistent_wt = worktree_base / '_merge-verify'
         marker = persistent_wt / 'target' / 'warm.marker'
@@ -1351,14 +2580,14 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         # is NO timing assertion on the waiter here -- the test asserts on the
         # returned FLOCK_CONTENTION_CATEGORY discriminant, not on duration -- so
         # widening the completion ceiling has zero discrimination cost.
-        stdout, stderr = waiter.communicate(timeout=60)
+        stdout, stderr = waiter.communicate(timeout=ROW5_WAITER_COMPLETION_CEILING_SECS)
 
         assert waiter.returncode == 0, (
             f'expected exit 0 (contention result on stdout), got '
             # task 3318: tail-sliced (not head-truncated) -- the actual
             # failure cause (e.g. a watchdog self-kill traceback) is at the
             # END of stderr, and a 2000-char head slice was hiding it.
-            f'{waiter.returncode}; stderr={stderr.decode()[-4000:]!r}'
+            f'{waiter.returncode}; stderr={stderr_tail(stderr, limit=4000)!r}'
         )
         result = result_from_json(stdout.decode())
         assert is_flock_contention_failure(result), (
@@ -1390,7 +2619,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         heartbeat_holder.stop_heartbeats()
         if holder.poll() is None:
             holder.kill()
-            holder.wait(timeout=5)
+            holder.wait(timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
     # --- Consumer side: feed #2's real discriminant through the real beta
     # consumer (_run_post_merge_verify) with a real EscalationQueue. ---

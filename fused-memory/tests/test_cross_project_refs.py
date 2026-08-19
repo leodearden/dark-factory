@@ -15,8 +15,12 @@ Mirrors tests/test_task_naming.py, whose leaf-module shape this module copies.
 
 from __future__ import annotations
 
+import dataclasses
+import re
+
 import pytest
 
+from fused_memory.utils import cross_project_refs
 from fused_memory.utils.cross_project_refs import (
     CrossProjectRef,
     CrossProjectRefScan,
@@ -50,7 +54,7 @@ class TestFindCrossProjectTaskRefsMatches:
         number, so it must not mark 'dark_factory:2500' ambiguous — only a bare
         mention of the SAME number does (see TestAmbiguousRefs)."""
         scan = find_cross_project_task_refs(INCIDENT_CONTENT, group_id='reify')
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
     @pytest.mark.parametrize(
         ('content', 'expected_project', 'expected_number'),
@@ -101,8 +105,8 @@ class TestSelfQualifiedRefsAreDropped:
     )
     def test_self_qualified_ref_yields_nothing(self, content, group_id):
         scan = find_cross_project_task_refs(content, group_id=group_id)
-        assert scan.refs == []
-        assert scan.ambiguous == []
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
 
 
 class TestAmbiguousRefs:
@@ -113,7 +117,7 @@ class TestAmbiguousRefs:
     def test_same_number_qualified_and_bare_is_ambiguous(self):
         content = 'dark_factory:2500 blocks task 2500 here'
         scan = find_cross_project_task_refs(content, group_id='reify')
-        assert scan.refs == []
+        assert scan.refs == ()
         assert [r.entity_name for r in scan.ambiguous] == ['dark_factory:2500']
 
     @pytest.mark.parametrize(
@@ -123,7 +127,7 @@ class TestAmbiguousRefs:
     def test_bare_mention_forms_all_trigger_ambiguity(self, bare_form):
         content = f'dark_factory:2500 relates to {bare_form}'
         scan = find_cross_project_task_refs(content, group_id='reify')
-        assert scan.refs == []
+        assert scan.refs == ()
         assert len(scan.ambiguous) == 1
 
     def test_ambiguity_is_per_number_not_per_content(self):
@@ -147,7 +151,7 @@ class TestAmbiguousRefs:
         refusal to match 'subtask 5')."""
         scan = find_cross_project_task_refs(content, group_id='reify')
         assert [r.entity_name for r in scan.refs] == ['dark_factory:2500']
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
 
 class TestNoFalsePositives:
@@ -180,8 +184,8 @@ class TestNoFalsePositives:
     )
     def test_noise_yields_no_refs(self, content):
         scan = find_cross_project_task_refs(content, group_id='reify')
-        assert scan.refs == []
-        assert scan.ambiguous == []
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
 
     def test_path_shaped_qualifier_never_reaches_canonicalization(self):
         """A path-shaped qualifier must never be silently canonicalized into a
@@ -189,15 +193,15 @@ class TestNoFalsePositives:
         lookbehind rejects the candidate before canonicalization ever sees it,
         so the scan reports nothing rather than raising into the write path."""
         scan = find_cross_project_task_refs('see /home/leo/src/dark-factory:2500', group_id='reify')
-        assert scan.refs == []
-        assert scan.ambiguous == []
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
 
     def test_path_shaped_group_id_yields_an_empty_scan(self):
         """Without a trustworthy local project id, local and foreign refs
         cannot be told apart — repair nothing rather than guess."""
         scan = find_cross_project_task_refs('see dark_factory:2500', group_id='-home-leo-src-reify')
-        assert scan.refs == []
-        assert scan.ambiguous == []
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
 
 
 class TestTaskVocabularyQualifiersAreNotProjectIds:
@@ -241,8 +245,8 @@ class TestTaskVocabularyQualifiersAreNotProjectIds:
         # Deliberately the project named in the incident, so a reader sees the
         # self-qualifier drop genuinely cannot save this.
         scan = find_cross_project_task_refs(content, group_id='dark_factory')
-        assert scan.refs == []
-        assert scan.ambiguous == []
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
 
 
 class TestTaskColonMentionsCreateAmbiguity:
@@ -259,7 +263,7 @@ class TestTaskColonMentionsCreateAmbiguity:
         scan = find_cross_project_task_refs(
             'dark_factory:2500 and Task: 2500', group_id='reify'
         )
-        assert scan.refs == []
+        assert scan.refs == ()
         assert [r.entity_name for r in scan.ambiguous] == ['dark_factory:2500']
 
     def test_word_glued_colon_lookalikes_are_not_bare_mentions(self):
@@ -274,7 +278,7 @@ class TestTaskColonMentionsCreateAmbiguity:
             'dark_factory:2500 and subtask: 2500', group_id='reify'
         )
         assert [r.entity_name for r in scan.refs] == ['dark_factory:2500']
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
 
 class TestShapeValidProseMatchesRelyOnDownstreamGuards:
@@ -293,7 +297,25 @@ class TestShapeValidProseMatchesRelyOnDownstreamGuards:
         scan = find_cross_project_task_refs(
             'Total: 42 items', group_id='reify', known_project_ids={'dark_factory'}
         )
-        assert scan.refs == []
+        assert scan.refs == ()
+
+
+class TestQualifiedRefNeverSpansALineBreak:
+    """Whitespace-tolerant does NOT extend across a line break. The class above
+    accepts the '<word>: <number>' shape on ONE line because that is how humans
+    write a qualified reference; a qualifier and a number separated by a
+    newline is not that shape at all — it is a YAML/'key: value' block or
+    hard-wrapped prose, both routine in episode bodies."""
+
+    def test_colon_followed_by_newline_is_not_a_ref(self):
+        scan = find_cross_project_task_refs('Notes:\n2500 items', group_id='reify')
+        assert scan.refs == ()
+
+    def test_the_same_line_spelling_is_unaffected(self):
+        """Guard: the narrowing is across newlines ONLY, not a tightening of the
+        spacing humans write."""
+        scan = find_cross_project_task_refs('Notes: 2500 items', group_id='reify')
+        assert [r.entity_name for r in scan.refs] == ['notes:2500']
 
 
 class TestKnownProjectIdsAllowlist:
@@ -306,7 +328,7 @@ class TestKnownProjectIdsAllowlist:
             content, group_id='reify', known_project_ids={'dark_factory'}
         )
         assert [r.entity_name for r in scan.refs] == ['dark_factory:2500']
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
     def test_allowlist_entries_are_canonicalized_before_comparison(self):
         scan = find_cross_project_task_refs(
@@ -343,6 +365,23 @@ class TestKnownProjectIdsAllowlist:
         )
         assert [r.entity_name for r in scan.refs] == ['dark_factory:2500']
 
+    def test_all_path_shaped_registry_is_permissive_not_fail_closed(self):
+        """The twin above only proves ONE bad entry is survivable. When EVERY
+        entry is path-shaped nothing survives canonicalization, and an empty
+        allowlist must NOT be read as "allow nothing" — that would silently
+        disable cross-project detection entirely on a registry misconfigured
+        with project ROOTS where project IDs were expected.
+
+        Enforces ``canonical_labels._canonical_allowlist``'s stated contract
+        ("one bad entry never disables the whole allowlist") at the public API,
+        and mirrors ``validate_known_project_id``'s permissive falsy-registry
+        mode.
+        """
+        scan = find_cross_project_task_refs(
+            'see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'}
+        )
+        assert [(r.project_id, r.task_number) for r in scan.refs] == [('dark_factory', '2500')]
+
 
 class TestDigitsPreservedVerbatim:
     """Digits are never int-normalized, mirroring canonicalize_task_node_name —
@@ -361,7 +400,7 @@ class TestDigitsPreservedVerbatim:
             'dark_factory:0250 relates to task 250', group_id='reify'
         )
         assert [r.entity_name for r in scan.refs] == ['dark_factory:0250']
-        assert scan.ambiguous == []
+        assert scan.ambiguous == ()
 
 
 class TestDeterministicAndDeduplicated:
@@ -390,7 +429,7 @@ class TestDeterministicAndDeduplicated:
     def test_ambiguous_refs_are_deduplicated_too(self):
         content = 'dark_factory:2500 blocks task 2500; dark_factory:2500 again'
         scan = find_cross_project_task_refs(content, group_id='reify')
-        assert scan.refs == []
+        assert scan.refs == ()
         assert [r.entity_name for r in scan.ambiguous] == ['dark_factory:2500']
 
 
@@ -400,10 +439,135 @@ class TestCrossProjectRefIsFrozen:
 
     def test_ref_is_immutable(self):
         scan = find_cross_project_task_refs('see dark_factory:2500', group_id='reify')
-        with pytest.raises(Exception):  # noqa: B017 - FrozenInstanceError subclasses AttributeError
+        with pytest.raises(dataclasses.FrozenInstanceError):
             scan.refs[0].project_id = 'other'  # type: ignore[misc]
 
-    def test_scan_is_immutable(self):
+
+class TestCrossProjectRefScanIsFrozen:
+    """CrossProjectRefScan is frozen for the same reason CrossProjectRef is:
+    it is evidence for destructive graph surgery, not a mutable accumulator.
+
+    ``frozen=True`` alone does NOT deliver that: it blocks attribute
+    rebinding only, so list-typed fields would stay freely mutable in place.
+    The fields are tuples, and these tests pin BOTH halves — no rebinding and
+    no in-place mutation — so the class docstring's claim is actually
+    enforced. Mirrors test_canonical_labels.py::TestLabelScanIsFrozen.
+    """
+
+    def test_both_fields_default_empty(self):
+        scan = CrossProjectRefScan()
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    def test_refs_cannot_be_rebound(self):
         scan = find_cross_project_task_refs('see dark_factory:2500', group_id='reify')
-        with pytest.raises(Exception):  # noqa: B017
-            scan.refs = []  # type: ignore[misc]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            scan.refs = ()  # type: ignore[misc]
+
+    @pytest.mark.parametrize('attr', ['refs', 'ambiguous'])
+    def test_fields_cannot_be_mutated_in_place(self, attr):
+        """The half ``frozen=True`` does not cover. With list fields
+        ``scan.refs.append(...)`` silently succeeded, letting a consumer add
+        a ref the scanner deliberately refused to infer."""
+        scan = find_cross_project_task_refs(
+            'dark_factory:2500 blocks task 2500; also see dark_factory:99', group_id='reify'
+        )
+        assert getattr(scan, attr)  # both fields are populated, so this is a real test
+        with pytest.raises(AttributeError):
+            getattr(scan, attr).append(CrossProjectRef(project_id='other', task_number='9'))
+
+    def test_a_scan_is_hashable(self):
+        """A frozen dataclass holding lists is silently unhashable despite its
+        generated __hash__ — a trap for any consumer that sets/dict-keys a
+        scan. Tuple fields make the generated __hash__ actually work."""
+        assert hash(CrossProjectRefScan()) == hash(CrossProjectRefScan())
+        scan = find_cross_project_task_refs('see dark_factory:2500', group_id='reify')
+        assert len(
+            {scan, find_cross_project_task_refs('see dark_factory:2500', group_id='reify')}
+        ) == 1
+
+
+class TestHashSpelledBareMentionsCreateAmbiguity:
+    """A '#'-spelled LOCAL task mention must make a same-numbered foreign ref
+    ambiguous, exactly as the whitespace- and colon-spelled forms already do.
+
+    This is the ONE deliberate behaviour change of task 3667's extraction.
+    Before it, the mention scanner was '_BARE_TASK_MENTION_PATTERN' plus
+    '_BARE_TASK_COLON_PATTERN' — whitespace and colon separators only — so
+    'task #2500' was invisible and this content produced a CONFIDENT split.
+    The unified pattern in canonical_labels sees it, so the content is now
+    correctly refused as ambiguous: strictly a precision gain on a path that
+    performs destructive edge surgery.
+
+    Mirrors TestTaskColonMentionsCreateAmbiguity's framing.
+    """
+
+    def test_hash_spelled_bare_mention_makes_the_foreign_ref_ambiguous(self):
+        scan = find_cross_project_task_refs(
+            'dark_factory:2500 relates to task #2500', group_id='reify'
+        )
+        assert scan.refs == ()
+        assert [r.entity_name for r in scan.ambiguous] == ['dark_factory:2500']
+
+    def test_word_glued_hash_lookalikes_are_not_bare_mentions(self):
+        """The word-glue lookbehind still applies to the '#' form, so
+        'subtask #2500' must not suppress a real foreign ref — the same
+        regression guard the whitespace and colon forms each carry."""
+        scan = find_cross_project_task_refs(
+            'dark_factory:2500 and subtask #2500', group_id='reify'
+        )
+        assert [r.entity_name for r in scan.refs] == ['dark_factory:2500']
+        assert scan.ambiguous == ()
+
+
+class TestSelfQualifiedRefsNeverSuppressForeignRefs:
+    """A self-qualified reference never makes a same-numbered FOREIGN ref
+    ambiguous, because neither reference is unqualified.
+
+    This pins RESTORED pre-3667 behaviour: measured on this branch,
+    'reify:2500 relates to dark_factory:2500' in group reify yielded
+    refs=['dark_factory:2500'], ambiguous=[] at fe89df000d and refs=[],
+    ambiguous=['dark_factory:2500'] at d295f5402e, silently suppressing a real
+    cross-project repair.
+
+    It is also exactly what this module's own surviving narrowing already
+    describes — 'a task number mentioned both qualified and BARE in one episode
+    is ambiguous'. Qualified-and-qualified never was.
+    """
+
+    def test_self_qualified_ref_does_not_suppress_the_foreign_ref(self):
+        scan = find_cross_project_task_refs(
+            'reify:2500 relates to dark_factory:2500', group_id='reify'
+        )
+        assert [r.entity_name for r in scan.refs] == ['dark_factory:2500']
+        assert scan.ambiguous == ()
+
+    def test_an_actual_bare_mention_still_makes_it_ambiguous(self):
+        """The guard against over-correcting: the self-qualified spelling comes
+        first and wins dedup, but the content still says 'task 2500' bare, so
+        the foreign ref remains genuinely ambiguous."""
+        scan = find_cross_project_task_refs(
+            'reify:2500 and task 2500 and dark_factory:2500', group_id='reify'
+        )
+        assert scan.refs == ()
+        assert [r.entity_name for r in scan.ambiguous] == ['dark_factory:2500']
+
+
+class TestNoSecondCopyOfTheLabelPattern:
+    """INV-5 (no lockstep duplication), the invariant task 3667 exists to
+    enforce: the task-label vocabulary lives ONLY in utils/canonical_labels.py,
+    and this module is a thin adapter over it.
+
+    Asserted structurally over the imported module's attributes — not as a
+    source grep and not as a docstring pin — so re-introducing a compiled copy
+    fails the suite rather than merely contradicting a comment. The drift this
+    task fixes ('task #1153' being a label to one module's pattern and not the
+    other's) was invisible for exactly as long as it lived only in prose.
+    """
+
+    def test_module_exposes_no_compiled_pattern(self):
+        compiled = [
+            name for name, value in vars(cross_project_refs).items()
+            if isinstance(value, re.Pattern)
+        ]
+        assert compiled == []

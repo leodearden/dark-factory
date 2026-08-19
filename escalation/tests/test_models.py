@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
+from typing import Any
+
+import pytest
 
 from escalation.models import (
     BORN_AT_L2_SEVERITIES,
+    KNOWN_SEVERITIES,
     RESOLUTION_CLASSES,
+    SEVERITY_RANK,
+    Amendment,
     Escalation,
     EvidenceEntry,
+    IndexHealthState,
     TrainState,
+    max_severity,
 )
 
 
@@ -325,6 +334,135 @@ class TestEscalationTrainState:
         restored = Escalation.from_json(old_json)
         assert restored.train_state is None, (
             f"Expected train_state=None for legacy JSON, got {restored.train_state!r}"
+        )
+
+
+class TestEscalationIndexHealthField:
+    """Escalation carries a structured index_health payload (task 3709, PRD δ D8+D11).
+
+    A `recon_missing_index` escalation must expose the drifted graph and the
+    missing index specs as FIRST-CLASS FIELDS (INV-2), so no consumer parses
+    `summary`/`detail` prose to recover a fact the emitter had in a variable.
+    These three properties are exactly what the additive zero-migration
+    precedent (`train_state`, `granted_files`) relies on.
+    """
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        # Annotated dict[str, Any]: without it the literal infers as
+        # dict[str, str], and the ** unpack then reports every non-str field
+        # (level, index_health, evidence, ...) as a type error.
+        base: dict[str, Any] = {
+            'id': 'esc-graph:dark_factory-0001',
+            'task_id': 'graph:dark_factory',
+            'agent_role': 'reconciliation-index-drift',
+            'severity': 'blocking',
+            'category': 'recon_missing_index',
+            'summary': 'graph dark_factory is missing 3 expected indices',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    # --- (a) default is None ---
+
+    def test_index_health_default_is_none(self):
+        """Escalation constructed without index_health has index_health=None."""
+        esc = self._make_base_esc()
+        assert esc.index_health is None
+
+    def test_index_health_default_is_none_in_to_dict(self):
+        """to_dict() surfaces the None default rather than dropping the key."""
+        esc = self._make_base_esc()
+        d = esc.to_dict()
+        assert 'index_health' in d
+        assert d['index_health'] is None
+
+    # --- (b) round-trip with nested lists preserved ---
+
+    def test_index_health_round_trip_via_to_dict_from_dict(self):
+        """index_health payload is preserved through to_dict() / from_dict()."""
+        ih: IndexHealthState = {
+            'group_id': 'dark_factory',
+            'missing': [['Entity', 'NODE', 'name', 'RANGE']],
+            'unexpected': [],
+            'expected_total': 38,
+        }
+        esc = self._make_base_esc(level=1, index_health=ih)
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.index_health == ih
+
+    def test_index_health_round_trip_via_to_json_from_json(self):
+        """index_health survives JSON serialisation with nested lists intact.
+
+        Specs are carried as JSON LISTS (not tuples) precisely so the on-disk
+        record round-trips identically — a tuple would come back as a list and
+        break equality for any consumer that compares payloads.
+        """
+        ih: IndexHealthState = {
+            'group_id': 'dark_factory',
+            'missing': [['Entity', 'NODE', 'name', 'RANGE']],
+            'unexpected': [],
+            'expected_total': 38,
+        }
+        esc = self._make_base_esc(level=1, index_health=ih)
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.index_health == ih
+        assert restored.index_health is not None
+        assert restored.index_health['missing'] == [['Entity', 'NODE', 'name', 'RANGE']]
+        assert restored.to_json() == esc.to_json()
+
+    def test_index_health_appears_in_to_json_output(self):
+        """index_health is serialised (not silently dropped) when set."""
+        ih: IndexHealthState = {
+            'group_id': 'dark_factory',
+            'missing': [['Entity', 'NODE', 'name', 'RANGE'], ['Episodic', 'NODE', 'uuid', 'RANGE']],
+            'unexpected': [['Entity', 'NODE', 'custom_field', 'RANGE']],
+            'expected_total': 38,
+        }
+        esc = self._make_base_esc(index_health=ih)
+        d = json.loads(esc.to_json())
+        assert 'index_health' in d
+        assert d['index_health'] == ih
+        assert d['index_health']['group_id'] == 'dark_factory'
+        assert len(d['index_health']['missing']) == 2
+
+    # --- (c) legacy JSON backward compat (zero migration) ---
+
+    def test_from_dict_legacy_json_omits_index_health(self):
+        """from_json() on JSON without index_health returns None (backward compat).
+
+        The `__dataclass_fields__` filter in from_dict is what makes the field
+        additive: pre-3709 records on disk deserialise unchanged, no migration.
+        """
+        old_dict = {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without index_health',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'train_state': None,
+            # NOTE: index_health is intentionally absent
+        }
+        restored = Escalation.from_json(json.dumps(old_dict))
+        assert restored.index_health is None, (
+            f'Expected index_health=None for legacy JSON, got {restored.index_health!r}'
         )
 
 
@@ -1120,3 +1258,218 @@ class TestFilingClaimantRunId:
         payload['not_a_real_field'] = 'boom'
         restored = Escalation.from_dict(payload)
         assert not hasattr(restored, 'not_a_real_field')
+
+
+class TestEscalationAmendments:
+    """`amendments` / `amendments_truncated` — the preserved-incoming-framing fields (task 3997).
+
+    `queue.add_members_to_l2` is the SOLE writer: when a fold carries framing
+    (root_cause / evidence / options / summary) that would otherwise be silently
+    discarded, it is APPENDED here instead.  Pinned by exactly the two properties
+    this repo already pins for train_state / members / granted_files: a verbatim
+    round-trip, and legacy JSON without the keys deserialising to the defaults so
+    no on-disk migration is required.
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        """An L2 carrying its own original framing, plus whatever kwargs override."""
+        return Escalation(
+            id='esc-task-1-0001',
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='task_failure',
+            summary='original one-line hypothesis',
+            detail='the ORIGINAL human-facing evidence',
+            root_cause='original root cause',
+            options=['A: rollback', 'B: fix forward'],
+            level=2,
+            **kwargs,
+        )
+
+    def test_amendments_field_roundtrips_and_defaults_empty(self):
+        """Amendments survive to_json/from_json verbatim; legacy JSON defaults to empty."""
+        # --- (a) ROUND-TRIP: the amendment dict and the counter survive verbatim.
+        amendment: Amendment = {
+            'timestamp': '2026-08-11T00:00:00+00:00',
+            'agent_role': 'escalation-watcher-auto',
+            'root_cause': 'rc',
+            'summary': 's',
+            'detail': 'incoming evidence',
+            'options': ['A: x'],
+        }
+        esc = self._seeded(amendments=[amendment], amendments_truncated=2)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.amendments == [amendment], (
+            f'amendment lost or mangled through to_json/from_json: {restored.amendments!r}'
+        )
+        assert restored.amendments_truncated == 2, (
+            f'truncation counter lost: {restored.amendments_truncated!r}'
+        )
+        # The record's OWN framing is a separate thing and is untouched by the
+        # amendment — that separation is the whole point of appending.
+        assert restored.root_cause == 'original root cause'
+        assert restored.detail == 'the ORIGINAL human-facing evidence'
+
+        # --- (b) ZERO MIGRATION: legacy on-disk JSON has neither key.
+        legacy = esc.to_dict()
+        del legacy['amendments']
+        del legacy['amendments_truncated']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.amendments == [], (
+            f'legacy record without the key must default to []: {from_legacy.amendments!r}'
+        )
+        assert from_legacy.amendments_truncated == 0, (
+            f'legacy record without the key must default to 0: '
+            f'{from_legacy.amendments_truncated!r}'
+        )
+
+        # --- (c) PER-INSTANCE default: field(default_factory=list), not a shared
+        # mutable default.  Without this, one L2's amendment would appear on every
+        # other default-constructed record in the process.
+        a = self._seeded()
+        b = self._seeded()
+        a.amendments.append(amendment)
+        assert b.amendments == [], (
+            'default amendments list is SHARED between instances — '
+            'a mutable default leaked one record\'s framing onto another'
+        )
+
+
+class TestTimestampIsStampedFromTheLiveClock:
+    """REGRESSION PIN, not a fix — no timestamp defect exists (task 3236).
+
+    ``Escalation.timestamp`` is stamped by a per-instance
+    ``field(default_factory=...)`` off the live clock, so the backdating the
+    task asked about has no cause in the stamping code.  This pins the two
+    falsifiable regression classes: a stamp hoisted to an import-time
+    ``field(default=...)`` (every record in a process would share one value),
+    and a tz-naive stamp (``datetime.now()`` without UTC).
+    """
+
+    def test_two_constructions_get_distinct_non_decreasing_aware_timestamps(self):
+        """Each construction gets its own tz-aware stamp from the live clock."""
+        import time
+        from datetime import datetime
+
+        first = Escalation(
+            id='esc-1-1', task_id='1', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s',
+        )
+        time.sleep(0.01)
+        second = Escalation(
+            id='esc-1-2', task_id='1', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s',
+        )
+
+        assert first.timestamp != second.timestamp, (
+            'Both Escalations share one timestamp — the stamp looks hoisted to '
+            'an import-time constant rather than a per-instance default_factory'
+        )
+        assert datetime.fromisoformat(first.timestamp).tzinfo is not None, (
+            f'Naive timestamp: {first.timestamp!r}'
+        )
+        assert datetime.fromisoformat(second.timestamp) >= datetime.fromisoformat(
+            first.timestamp,
+        ), 'Timestamps must be non-decreasing across constructions'
+
+
+class TestSeverityRank:
+    """`escalation.models` owns a COMPLETE, public severity ordering (task 3976).
+
+    The ordering `info < blocking < critical < urgent` is not invented here: it
+    mirrors the repo's only other canonical escalation-severity ranking,
+    `cockpit/src/cockpit/priority.py:257` `_ESCALATION_SEVERITIES` and its
+    `severity_weights` (`:98-115`, urgent 6.0 > critical 5.0 > blocking 2.5 >
+    info 0.25).  Keeping the two traceably one decision is the point — two
+    independent guesses would drift.
+
+    These tests exist because `queue._SEVERITY_RANK` was `{'info': 0,
+    'blocking': 1}`: `critical`/`urgent` both fell to the rank-0 unknown
+    fail-soft, making the fold ORDER-DEPENDENT for them.
+    """
+
+    def test_rank_is_total_over_known_severities(self):
+        """(a) SEVERITY_RANK covers exactly KNOWN_SEVERITIES — no gaps, no extras.
+
+        A severity added to the vocabulary without a rank must be a loud test
+        failure, not a silent rank-0 that reads as info-level.
+        """
+        assert set(SEVERITY_RANK) == set(KNOWN_SEVERITIES), (
+            f'SEVERITY_RANK keys {sorted(SEVERITY_RANK)} != '
+            f'KNOWN_SEVERITIES {sorted(KNOWN_SEVERITIES)}'
+        )
+
+    def test_ordering_is_info_blocking_critical_urgent(self):
+        """(b) Ranks ascend info < blocking < critical < urgent."""
+        assert (
+            SEVERITY_RANK['info']
+            < SEVERITY_RANK['blocking']
+            < SEVERITY_RANK['critical']
+            < SEVERITY_RANK['urgent']
+        ), f'Unexpected ordering: {SEVERITY_RANK}'
+
+    def test_born_at_l2_severities_all_outrank_blocking(self):
+        """(b) Every born-at-L2 severity outranks 'blocking'."""
+        for sev in BORN_AT_L2_SEVERITIES:
+            assert SEVERITY_RANK[sev] > SEVERITY_RANK['blocking'], (
+                f'{sev!r} (born-at-L2) must outrank blocking; got {SEVERITY_RANK}'
+            )
+
+    @pytest.mark.parametrize(
+        ('a', 'b', 'expected'),
+        [
+            ('info', 'blocking', 'blocking'),
+            ('info', 'critical', 'critical'),
+            ('info', 'urgent', 'urgent'),
+            ('blocking', 'critical', 'critical'),
+            ('blocking', 'urgent', 'urgent'),
+            ('critical', 'urgent', 'urgent'),
+        ],
+    )
+    def test_max_severity_returns_higher_urgency(self, a: str, b: str, expected: str):
+        """(c) max_severity returns the higher-urgency of the two."""
+        assert max_severity(a, b) == expected
+        assert max_severity(b, a) == expected
+
+    @pytest.mark.parametrize('a', sorted(KNOWN_SEVERITIES))
+    @pytest.mark.parametrize('b', sorted(KNOWN_SEVERITIES))
+    def test_max_severity_is_order_independent(self, a: str, b: str):
+        """(c) max_severity(x, y) == max_severity(y, x) over every known pair."""
+        assert max_severity(a, b) == max_severity(b, a), (
+            f'Order-dependent fold: max_severity({a!r}, {b!r}) != '
+            f'max_severity({b!r}, {a!r})'
+        )
+
+    def test_info_vs_critical_regression(self):
+        """(c) Explicit regression for the live bug in queue._SEVERITY_RANK.
+
+        `queue._max_severity('info', 'critical')` returned `'info'` — both
+        arguments fell to rank 0 and the `>=` tie-break handed the win to `a`.
+        """
+        assert max_severity('info', 'critical') == 'critical'
+        assert max_severity('critical', 'info') == 'critical'
+
+    def test_unknown_severity_fails_soft_to_rank_zero(self, caplog):
+        """(d) An unknown severity is treated as rank 0 and WARNs — never raises."""
+        with caplog.at_level(logging.WARNING, logger='escalation.models'):
+            result = max_severity('warn', 'blocking')
+
+        assert result == 'blocking'
+        warned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'warn' in r.getMessage()
+        ]
+        assert warned, (
+            'Expected a WARNING naming the unrecognised severity; '
+            f'got records: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_unknown_vs_unknown_is_deterministic(self):
+        """(e) Unknown-vs-unknown resolves on the first argument, not arbitrarily."""
+        assert max_severity('warn', 'wat') == 'warn'
+        assert max_severity('wat', 'warn') == 'wat'

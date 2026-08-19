@@ -39,6 +39,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 # (port, systemd unit name) pairs to watch.  Port values match each
 # orchestrator's configured escalation.port (guarded by the drift test in
@@ -211,6 +212,94 @@ except (KeyError, ValueError):
 # overlap guard (a second tick fails to re-register the same unit name while a
 # redeploy is still running), sibling of orch-fleet-staleness-redeploy.service.
 FM_STALENESS_REDEPLOY_UNIT = "fm-staleness-redeploy.service"
+
+
+# --- fm liveness streak + restart cap (task 3764) ---
+# fused_memory_liveness_pass() below used to restart fused-memory on a SINGLE
+# non-healthy verdict, uncapped. The measured evidence says that is wrong: a
+# controlled experiment (2026-08-06 07:14-09:14Z, kill path disconnected)
+# recorded six /health stalls >=8s, four >15s, three exceeding a 25s probe cap
+# — and every one SELF-RECOVERED, with 0 restarts needed over 20 cycles. The
+# knobs below add the missing TEMPORAL dimension to the kill decision in two
+# independent layers: a streak (make a wrong verdict RARE) and a min-interval
+# cap on the restart itself (make a wrong verdict HARMLESS).
+
+# How many CONSECUTIVE non-healthy verdicts are required before a restart.
+# Derivation, not a guess: orchestrator-watchdog.timer is OnUnitActiveSec=60,
+# so N=3 demands ~180s of CONTINUOUS non-response — ~7x the longest observed
+# (25s+) self-recovering stall, so no observed transient can reach it, while a
+# genuinely wedged asyncio loop (which stays wedged by definition) reaches it
+# on the third tick. Env-with-try/except-fallback exactly like
+# FM_RESTART_MIN_INTERVAL_SECS above: a typo'd env var must not crash the
+# oneshot watchdog.
+try:
+    FM_LIVENESS_STREAK_THRESHOLD = int(os.environ["FM_LIVENESS_STREAK_THRESHOLD"])
+except (KeyError, ValueError):
+    FM_LIVENESS_STREAK_THRESHOLD = 3
+# CLAMPED, unlike the two knobs below, and the asymmetry is deliberate. Their
+# <=0 means "disable the cap" — a safe direction, since a disabled cap only
+# removes a restriction on an already-justified restart. Here <=0 would mean
+# "disable the streak", and because _record_fm_liveness_failure always returns
+# >=1 the gate `streak < FM_LIVENESS_STREAK_THRESHOLD` would then never hold:
+# FM_LIVENESS_STREAK_THRESHOLD=0 silently restores the exact
+# one-non-healthy-verdict-per-kill behaviour this task exists to REMOVE. A
+# numeric 0/-1 sails through the try/except above (it parses fine), so the
+# fallback cannot catch it — hence the floor. An operator who genuinely wants
+# unbounded revives can set FM_LIVENESS_RESTART_MIN_INTERVAL_SECS=0 instead.
+FM_LIVENESS_STREAK_THRESHOLD = max(1, FM_LIVENESS_STREAK_THRESHOLD)
+
+# Maximum age of a persisted streak entry before it is treated as expired and
+# the count restarts at 1. 300s = 5x the 60s tick cadence: a larger gap means
+# >=4 ticks were missed (watchdog stopped, timer disabled, host suspended,
+# unit disabled and re-enabled), so the "CONSECUTIVE" claim is no longer true
+# and continuity must be re-established from scratch. This is what stops a
+# streak from hours ago masquerading as a fresh one — and it fails in the safe
+# direction: an unusually slow tick sequence expires the streak and SUPPRESSES
+# a restart rather than manufacturing one.
+try:
+    FM_LIVENESS_STREAK_MAX_AGE_SECS = int(os.environ["FM_LIVENESS_STREAK_MAX_AGE_SECS"])
+except (KeyError, ValueError):
+    FM_LIVENESS_STREAK_MAX_AGE_SECS = 300
+
+# Minimum wall-clock seconds between successive watchdog-initiated fm LIVENESS
+# restarts — the second layer, bounding the blast radius of a verdict that is
+# wrong anyway. 3600s strictly exceeds the 3180s (53 min) worst observed
+# pathological instance lifetime, so even a wrong verdict cannot reproduce that
+# pathology, and it bounds watchdog-initiated fm restarts to <=24/day versus
+# today's unbounded. Deliberately 8x SHORTER than the staleness pass's
+# FM_RESTART_MIN_INTERVAL_SECS (28800s): a brokenness revive must react faster
+# than a scheduled deploy (I5). 0 disables the cap entirely.
+try:
+    FM_LIVENESS_RESTART_MIN_INTERVAL_SECS = int(
+        os.environ["FM_LIVENESS_RESTART_MIN_INTERVAL_SECS"]
+    )
+except (KeyError, ValueError):
+    FM_LIVENESS_RESTART_MIN_INTERVAL_SECS = 3600
+
+# Where the consecutive-failure streak is PERSISTED. Persistence is mandatory
+# rather than stylistic: orchestrator-watchdog.service is Type=oneshot on a 60s
+# timer, so the process EXITS between probes and an in-memory counter could
+# never accumulate. Same env-overridable REPO_DIR/data/fused-memory/ shape as
+# FM_DEPLOY_CLOCK_PATH so tests can point it at a tmp file without touching
+# real data/.
+FM_LIVENESS_STREAK_PATH = os.environ.get(
+    "FM_LIVENESS_STREAK",
+    os.path.join(REPO_DIR, "data", "fused-memory", "fm_liveness_streak.json"),
+)
+
+# The liveness restart cap's OWN clock — a DIFFERENT file from
+# FM_DEPLOY_CLOCK_PATH, preserving I5 in BOTH directions. Sharing one file
+# would mean a liveness revive silences the fm STALENESS backstop for 8h (a
+# merged fm change sitting undeployed because the watchdog once revived a
+# wedge), and conversely a scheduled deploy would license an immediate extra
+# liveness kill. Stamped ONLY by a liveness revive, read ONLY by the liveness
+# pass.
+FM_LIVENESS_RESTART_CLOCK_PATH = os.environ.get(
+    "FM_LIVENESS_RESTART_CLOCK",
+    os.path.join(
+        REPO_DIR, "data", "fused-memory", "last_liveness_restart_fused_memory.json"
+    ),
+)
 
 
 def log(msg: str) -> None:
@@ -765,6 +854,176 @@ def _newest_fm_watched_commit_epoch() -> int | None:
         return None
 
 
+def _atomic_write_json(path: str, payload: dict) -> bool:
+    """Atomically write *payload* as JSON to *path*; return True iff it landed.
+
+    The shared write primitive behind every piece of persisted watchdog state
+    (fm deploy clock, fm liveness streak, fm liveness restart clock) — extracted
+    in task 3764 so the mkdir/mktemp/write/rename dance is defined ONCE rather
+    than copy-pasted per state file. Python analogue of
+    restart-all-orchestrators.sh's stamp_fleet_deploy_clock: mkdir -p, mktemp a
+    sibling in the SAME directory (so os.replace is a same-filesystem atomic
+    rename), write, rename over the target.
+
+    Fail-soft: makedirs / temp-file / rename errors are logged and swallowed
+    (the temp file, if created, is unlinked) rather than raised. A persistence
+    hiccup must never crash the Type=oneshot watchdog or abort the rest of the
+    tick. Every caller's contract must therefore tolerate the write silently
+    not having happened — see _record_fm_liveness_failure, where a failed write
+    means the streak counter cannot accumulate and so fails SAFE (toward never
+    restarting).
+
+    RETURNS True only after the rename succeeded. Fail-soft is not the same as
+    fail-safe: for most callers a missed write is benign, but for one it is
+    not — _stamp_fm_liveness_restart_clock ARMS a cap, so a silently-missed
+    write leaves the liveness revive unbounded. Such callers must inspect this
+    value and say so loudly; the log line here alone is one line among healthy
+    ticks and is not sufficient signal on its own.
+    """
+    tmp_path: str | None = None
+    try:
+        target_dir = os.path.dirname(path)
+        os.makedirs(target_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix="." + os.path.basename(path) + ".", dir=target_dir
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+        os.replace(tmp_path, path)
+        tmp_path = None  # renamed away — nothing to clean up
+        return True
+    except Exception as exc:  # noqa: BLE001
+        if tmp_path is not None:
+            # Best-effort cleanup: if the temp file cannot be removed there is
+            # nothing further to do, and raising here would mask *exc* (the
+            # actual write failure) that the log line below reports.
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+        log(f"_atomic_write_json: failed to write {path}: {exc!r}")
+        return False
+
+
+def _read_json_state(path: str) -> dict | None:
+    """Return the parsed JSON dict at *path*, or None if it cannot be read.
+
+    The shared fail-open read primitive paired with _atomic_write_json
+    (task 3764). Returns None — never raises — when the file is missing,
+    corrupt, truncated (a torn concurrent write), or unreadable.
+
+    A MISSING file is the normal "no state yet" case (fresh checkout, never
+    stamped, streak just cleared) and is deliberately SILENT: logging it would
+    spam the journal on every 60s tick. Corrupt/unreadable files ARE logged —
+    those are genuine degradations, and swallowing them silently is exactly the
+    silent-degradation failure mode the project's norms forbid.
+
+    A well-formed but NON-OBJECT body (``[1, 2]``, ``"hello"``, ``null`` — a
+    partially-overwritten or hand-edited file) is logged for the same reason:
+    it is indistinguishable in consequence from a corrupt one, since every
+    caller then loses its state. Before the task-3764 extraction this case
+    raised TypeError inside _read_last_fm_deploy_epoch and WAS logged; letting
+    it become a silent None would have made the deploy backstop and the
+    liveness cap both vanish with zero journal evidence.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            log(
+                f"ignoring non-object watchdog state at {path}: "
+                f"{type(raw).__name__}"
+            )
+            return None
+        return raw
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError) as exc:
+        log(f"ignoring unreadable/corrupt watchdog state at {path}: {exc!r}")
+        return None
+
+
+def _read_clock_epoch(path: str, label: str) -> float | None:
+    """Return the ``ts`` epoch from the ``{ts, iso}`` clock file at *path*, or None.
+
+    The shared CLOCK-layer read primitive, one level above _read_json_state
+    (which owns the missing/corrupt/non-object branches) — extracted so the
+    three watchdog clocks cannot drift apart in their fail-open contracts.
+    All three write and read the same ``{ts, iso}`` schema that
+    restart-all-orchestrators.sh's ``stamp_fleet_deploy_clock`` and
+    ``StaleServiceRestartCoordinator._load_last_fire_wall`` agree on, so a
+    single ``float(ts)`` extraction serves every tier.
+
+    *label* names the clock in the log line only ("fleet-deploy clock",
+    "fm-deploy clock", ...) so a journal reader can tell WHICH clock
+    degraded; nothing branches on it.
+
+    FAIL-OPEN, uniformly: returns None — never raises — when the file is
+    missing (nothing has ever been stamped, or a fresh checkout with no
+    data/ yet), corrupt, unreadable, or carrying an unusable ``ts``. Every
+    caller must treat None as "the min-interval cap does not apply" (fail
+    toward letting the restart/backstop run, never toward silencing it
+    indefinitely on the strength of one unreadable file).
+    """
+    state = _read_json_state(path)
+    if state is None:
+        return None
+    try:
+        return float(state["ts"])
+    except (KeyError, TypeError, ValueError) as exc:
+        log(f"ignoring {label} at {path} with unusable 'ts': {exc!r}")
+        return None
+
+
+def _stamp_clock(path: str) -> bool:
+    """Atomically stamp *path* with the current ``{ts, iso}`` time; True iff it landed.
+
+    The shared CLOCK-layer write primitive paired with _read_clock_epoch.
+    Python analogue of restart-all-orchestrators.sh's stamp_fleet_deploy_clock,
+    emitting the identical schema: an integer epoch plus a human-readable UTC
+    rendering that exists purely so an operator reading the file by hand does
+    not have to decode a bare number.
+
+    Fail-soft by inheritance from _atomic_write_json: a makedirs/temp/rename
+    error is logged and swallowed rather than raised, and reported back as
+    False. Callers whose SAFETY depends on the stamp landing (rather than
+    merely their convenience) must inspect that value and say so at their own
+    call site — see _stamp_fm_liveness_restart_clock.
+    """
+    now = time.time()
+    return _atomic_write_json(
+        path,
+        {
+            "ts": int(now),
+            "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
+        },
+    )
+
+
+def _within_min_interval(secs: int, read_epoch: Callable[[], float | None]) -> bool:
+    """Return True iff *read_epoch*'s clock is newer than *secs* seconds ago.
+
+    The shared min-interval GATE, extracted so all three caps share one
+    definition of "too soon" rather than three copies that could drift.
+
+    Takes the clock READER rather than a path on purpose: each cap's named
+    reader (_read_last_fleet_deploy_epoch, _read_last_fm_deploy_epoch,
+    _read_last_fm_liveness_restart_epoch) stays the single seam the tests
+    substitute at, so a wrapper can never silently bypass its own reader.
+
+    Two fail directions, both toward LETTING the caller act:
+      - *secs* <= 0 disables the cap outright, and the clock is not even read
+        (a disabled cap must not depend on a readable file);
+      - a None epoch (missing/corrupt/unreadable clock) counts as OUTSIDE the
+        window. Failing the other way would let one unreadable file suppress
+        every future restart indefinitely.
+    """
+    if secs <= 0:
+        return False
+    last = read_epoch()
+    if last is None:
+        return False
+    return (time.time() - last) < secs
+
+
 def _read_last_fleet_deploy_epoch() -> float | None:
     """Return the last verified fleet-deploy epoch from FLEET_DEPLOY_CLOCK_PATH, or None.
 
@@ -773,25 +1032,15 @@ def _read_last_fleet_deploy_epoch() -> float | None:
     ``restart-all-orchestrators.sh``'s ``stamp_fleet_deploy_clock`` writes, so
     all three tiers agree on the shared clock's format.
 
-    Fail-open, mirroring ``_load_last_fire_wall``: returns None (never
-    raises) when the file is missing (no fleet deploy has ever verified
-    fresh, or a fresh checkout with no data/ yet), or when it is corrupt,
-    unreadable, or missing its ``ts`` key. Callers must treat None as
-    "the min-interval cap does not apply" (fail toward restarting, not
-    toward silence).
+    Fail-open via _read_clock_epoch, mirroring ``_load_last_fire_wall``:
+    returns None (never raises) when the file is missing (no fleet deploy has
+    ever verified fresh, or a fresh checkout with no data/ yet), or when it is
+    corrupt, unreadable, or missing its ``ts`` key. Callers must treat None as
+    "the min-interval cap does not apply" (fail toward restarting, not toward
+    silence). Reads FLEET_DEPLOY_CLOCK_PATH at CALL time, not at def time, so
+    tests that monkeypatch the module global still work.
     """
-    try:
-        with open(FLEET_DEPLOY_CLOCK_PATH, encoding="utf-8") as f:
-            raw = json.load(f)
-        return float(raw["ts"])
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError, TypeError, KeyError) as exc:
-        log(
-            f"ignoring unreadable/corrupt fleet-deploy clock at "
-            f"{FLEET_DEPLOY_CLOCK_PATH}: {exc!r}"
-        )
-        return None
+    return _read_clock_epoch(FLEET_DEPLOY_CLOCK_PATH, "fleet-deploy clock")
 
 
 def _within_fleet_deploy_min_interval() -> bool:
@@ -804,14 +1053,11 @@ def _within_fleet_deploy_min_interval() -> bool:
     cap outright (the clock is not even read). A missing/unreadable clock
     (``_read_last_fleet_deploy_epoch`` returns None) is treated as "outside
     the window" — fail toward letting the backstop run, not toward silencing
-    it indefinitely.
+    it indefinitely. Both behaviours live in the shared _within_min_interval.
     """
-    if ORCH_RESTART_MIN_INTERVAL_SECS <= 0:
-        return False
-    last = _read_last_fleet_deploy_epoch()
-    if last is None:
-        return False
-    return (time.time() - last) < ORCH_RESTART_MIN_INTERVAL_SECS
+    return _within_min_interval(
+        ORCH_RESTART_MIN_INTERVAL_SECS, _read_last_fleet_deploy_epoch
+    )
 
 
 def _read_last_fm_deploy_epoch() -> float | None:
@@ -822,24 +1068,15 @@ def _read_last_fm_deploy_epoch() -> float | None:
     restart-all-orchestrators.sh's stamp_fleet_deploy_clock), so ``float(ts)``
     reads it identically.
 
-    Fail-open: returns None (never raises) when the file is missing (no fm
-    deploy has ever verified fresh, or a fresh checkout with no data/ yet), or
-    when it is corrupt, unreadable, or missing its ``ts`` key. Callers must
-    treat None as "the min-interval cap does not apply" (fail toward running
-    the backstop, not toward silence).
+    Fail-open via _read_clock_epoch: returns None (never raises) when the file
+    is missing (no fm deploy has ever verified fresh, or a fresh checkout with
+    no data/ yet), or when it is corrupt, unreadable, or missing its ``ts``
+    key. Callers must treat None as "the min-interval cap does not apply"
+    (fail toward running the backstop, not toward silence). Reads
+    FM_DEPLOY_CLOCK_PATH at CALL time, not at def time, so tests that
+    monkeypatch the module global still work.
     """
-    try:
-        with open(FM_DEPLOY_CLOCK_PATH, encoding="utf-8") as f:
-            raw = json.load(f)
-        return float(raw["ts"])
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError, TypeError, KeyError) as exc:
-        log(
-            f"ignoring unreadable/corrupt fm-deploy clock at "
-            f"{FM_DEPLOY_CLOCK_PATH}: {exc!r}"
-        )
-        return None
+    return _read_clock_epoch(FM_DEPLOY_CLOCK_PATH, "fm-deploy clock")
 
 
 def _within_fm_deploy_min_interval() -> bool:
@@ -853,12 +1090,7 @@ def _within_fm_deploy_min_interval() -> bool:
     window" — fail toward letting the backstop run, not toward silencing it
     indefinitely.
     """
-    if FM_RESTART_MIN_INTERVAL_SECS <= 0:
-        return False
-    last = _read_last_fm_deploy_epoch()
-    if last is None:
-        return False
-    return (time.time() - last) < FM_RESTART_MIN_INTERVAL_SECS
+    return _within_min_interval(FM_RESTART_MIN_INTERVAL_SECS, _read_last_fm_deploy_epoch)
 
 
 def _stamp_fm_deploy_clock() -> None:
@@ -874,33 +1106,231 @@ def _stamp_fm_deploy_clock() -> None:
     restart can never silence the backstop).
 
     Fail-soft: makedirs / temp-file / rename errors are logged and swallowed
-    (the temp file, if created, is unlinked) rather than raised — a stamp
-    failure must not crash the detached unit. The backstop still self-heals via
-    ActiveEnterTimestamp next tick, so the clock is only a secondary flap-guard.
+    by _atomic_write_json (the temp file, if created, is unlinked) rather than
+    raised — a stamp failure must not crash the detached unit. The backstop
+    still self-heals via ActiveEnterTimestamp next tick, so the clock is only a
+    secondary flap-guard.
+
+    Thin wrapper over the shared _stamp_clock helper (task 3764), which owns
+    the ``{ts, iso}`` payload schema and the atomic-write dance. Reads
+    FM_DEPLOY_CLOCK_PATH at CALL time, not at def time, so tests that
+    monkeypatch the module global still work.
     """
-    tmp_path: str | None = None
+    _stamp_clock(FM_DEPLOY_CLOCK_PATH)
+
+
+def _read_last_fm_liveness_restart_epoch() -> float | None:
+    """Return the last watchdog-initiated fm LIVENESS restart epoch, or None.
+
+    Sibling of _read_last_fm_deploy_epoch reading a DIFFERENT file
+    (FM_LIVENESS_RESTART_CLOCK_PATH, task 3764) with the identical ``{ts, iso}``
+    schema and fail-open contract. Fail-open via _read_clock_epoch: a missing
+    clock is the normal "the watchdog has never revived fm" case; a corrupt
+    one is logged. Callers must treat None as "the cap does not apply".
+    """
+    return _read_clock_epoch(
+        FM_LIVENESS_RESTART_CLOCK_PATH, "fm liveness restart clock"
+    )
+
+
+def _within_fm_liveness_restart_min_interval() -> bool:
+    """Return True iff we are still inside the fm LIVENESS restart cap window.
+
+    Line-for-line sibling of _within_fm_deploy_min_interval — same
+    disable-on-<=0 semantics (the clock is not even read) and same
+    fail-open-on-missing-clock semantics, so the two caps behave predictably
+    alike for an operator — but reading its OWN clock against its OWN interval.
+
+    I5 SEPARATION. FM_LIVENESS_RESTART_CLOCK_PATH is stamped ONLY by a liveness
+    revive and read ONLY here, so this cap can neither silence nor be silenced
+    by the fm staleness deploy cadence: reviving a wedge never delays a merged
+    fm change's deploy, and a scheduled deploy never licenses an extra kill.
+
+    Fail direction (inherited from the shared _within_min_interval): an
+    absent/unreadable clock counts as OUTSIDE the window. Failing the other
+    way would let one unreadable file suppress every future revive
+    indefinitely — worse than an extra restart the streak has already
+    justified.
+    """
+    return _within_min_interval(
+        FM_LIVENESS_RESTART_MIN_INTERVAL_SECS, _read_last_fm_liveness_restart_epoch
+    )
+
+
+def _stamp_fm_liveness_restart_clock() -> bool:
+    """Stamp FM_LIVENESS_RESTART_CLOCK_PATH; return True iff the cap was armed.
+
+    Arms the liveness restart cap. Sibling of _stamp_fm_deploy_clock over a
+    DIFFERENT file (task 3764) — writing fm's deploy clock here would silence
+    the fm staleness backstop for its full 8h window every time the watchdog
+    revived a wedge (I5).
+
+    Called from fused_memory_liveness_pass() immediately after restart_unit()
+    issues a revive, so the cap is armed even if the subsequent streak clear
+    fails. Thin wrapper over the shared _stamp_clock helper, which owns the
+    ``{ts, iso}`` payload schema and the atomic-write dance.
+
+    THE RETURN VALUE IS LOAD-BEARING and must not be dropped. This is the one
+    watchdog write whose failure points the WRONG way: _atomic_write_json is
+    fail-soft, so a clock that cannot be written (a stale root-owned file,
+    ENOSPC, exhausted inodes) leaves the cap unarmed while streak writes keep
+    succeeding — and the pass then degrades to a revive roughly every
+    FM_LIVENESS_STREAK_THRESHOLD ticks (~180s at defaults) indefinitely,
+    strictly worse flapping than the one-per-hour bound this layer promises.
+    Unlike the fm deploy clock — a secondary flap-guard that self-heals from
+    ActiveEnterTimestamp on the next tick — nothing else reconstructs this
+    one, so the caller must surface the failure loudly rather than let it
+    disappear into a single routine persistence line among healthy ticks.
+    """
+    return _stamp_clock(FM_LIVENESS_RESTART_CLOCK_PATH)
+
+
+def _write_fm_liveness_streak(count: int, verdict: str, now: float) -> None:
+    """Persist the current consecutive-non-healthy-verdict streak (task 3764).
+
+    Writes ``{count, verdict, ts, iso}`` to FM_LIVENESS_STREAK_PATH via the
+    shared atomic writer. ``verdict`` and ``iso`` are diagnostic only — nothing
+    branches on them; they exist so an operator reading the file (or the
+    ``--report`` row) can see WHAT kind of failure is accumulating and WHEN,
+    rather than a bare integer.
+
+    Fail-soft by inheritance: _atomic_write_json logs and swallows any write
+    error. A write that does not land simply means the streak cannot
+    accumulate, which fails SAFE — the threshold is never reached and
+    fused-memory is left alone.
+    """
+    _atomic_write_json(
+        FM_LIVENESS_STREAK_PATH,
+        {
+            "count": int(count),
+            "verdict": verdict,
+            "ts": now,
+            "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
+        },
+    )
+
+
+def _read_fm_liveness_streak() -> tuple[int, float] | None:
+    """Return the persisted ``(count, ts)`` streak, or None when there is none.
+
+    FAIL-OPEN, and the direction is load-bearing: an unreadable, corrupt,
+    absent or nonsensical streak file means NO STREAK, which means NO RESTART.
+    This task exists precisely because the old code's only bias was toward
+    killing fused-memory on thin evidence — so every ambiguous case here must
+    resolve toward leaving the process alone, never toward "we must already
+    have enough failures".
+
+    A count that is not a positive integer is treated as no streak: zero and
+    negatives are nonsense for a "consecutive failures so far" counter, and
+    silently coercing them could only ever manufacture a restart.
+    """
+    state = _read_json_state(FM_LIVENESS_STREAK_PATH)
+    if state is None:
+        return None
     try:
-        clock_dir = os.path.dirname(FM_DEPLOY_CLOCK_PATH)
-        os.makedirs(clock_dir, exist_ok=True)
-        now = time.time()
-        payload = json.dumps(
-            {
-                "ts": int(now),
-                "iso": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
-            }
+        count = int(state["count"])
+        ts = float(state["ts"])
+    except (KeyError, TypeError, ValueError) as exc:
+        log(
+            f"ignoring fm liveness streak at {FM_LIVENESS_STREAK_PATH} "
+            f"with unusable count/ts: {exc!r}"
         )
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=".last_redeploy_fused_memory.", dir=clock_dir
+        return None
+    if count <= 0:
+        log(
+            f"ignoring fm liveness streak at {FM_LIVENESS_STREAK_PATH} "
+            f"with non-positive count {count}"
         )
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload + "\n")
-        os.replace(tmp_path, FM_DEPLOY_CLOCK_PATH)
-        tmp_path = None  # renamed away — nothing to clean up
-    except Exception as exc:  # noqa: BLE001
-        if tmp_path is not None:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-        log(f"_stamp_fm_deploy_clock: failed to stamp {FM_DEPLOY_CLOCK_PATH}: {exc!r}")
+        return None
+    return count, ts
+
+
+def _clear_fm_liveness_streak() -> None:
+    """Delete the persisted streak file, if any (task 3764).
+
+    Called when a 'healthy' verdict proves continuity is broken, and again
+    after a restart is actually issued so the NEXT kill demands a fresh
+    N-streak rather than one-verdict-per-kill afterwards.
+
+    An already-absent file is a silent no-op — that is the overwhelmingly
+    common case (fused-memory is healthy, so every 60s tick clears nothing) and
+    logging it would bury the journal. Any other OSError is logged and
+    swallowed: failing to clear can only ever leave stale evidence behind,
+    which the max-age expiry in _record_fm_liveness_failure then discards.
+    """
+    try:
+        os.unlink(FM_LIVENESS_STREAK_PATH)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log(f"failed to clear fm liveness streak at {FM_LIVENESS_STREAK_PATH}: {exc!r}")
+
+
+def _record_fm_liveness_failure(
+    verdict: str, unit_elapsed_secs: float | None = None
+) -> int:
+    """Record one non-healthy fm liveness verdict; return the new streak count.
+
+    PERSISTENCE IS MANDATORY, NOT STYLISTIC. orchestrator-watchdog.service is
+    ``Type=oneshot`` triggered by orchestrator-watchdog.timer's
+    ``OnUnitActiveSec=60``: the process EXITS between probes. A module-level
+    in-memory counter could therefore never accumulate past 1, and "N
+    consecutive failures" would silently degrade to "one failure" — the exact
+    behaviour this task removes. The count lives in FM_LIVENESS_STREAK_PATH.
+
+    MAX-AGE EXPIRY. A persisted entry older than
+    FM_LIVENESS_STREAK_MAX_AGE_SECS restarts the count at 1 rather than
+    incrementing it, so an hours-old streak (watchdog stopped, timer disabled,
+    host suspended, unit disabled and re-enabled) can never masquerade as a
+    fresh one. Ticks are ~60s apart, so a larger gap means several were missed
+    and the "consecutive" claim is no longer true.
+
+    INSTANCE-BOUNDARY EXPIRY. *unit_elapsed_secs* is the caller's already-
+    computed ``_unit_start_elapsed_secs(FUSED_MEMORY_UNIT)``. When it is known,
+    an entry whose ``ts`` predates ``now - unit_elapsed_secs`` describes a
+    PREVIOUS fused-memory process and the count restarts at 1. Without this the
+    max-age window alone is not enough, and the gap is reachable with the
+    shipped constants rather than only in principle: two wedged ticks at T-120
+    and T-60 leave count=2 ts=T-60; an EXTERNAL restart (the staleness
+    redeploy, restart-fused-memory.sh, an operator) lands at T; the ticks at
+    T+60 and T+120 return early on STARTUP_GRACE_SECS=120 without clearing
+    anything; and the first post-grace tick at T+180 sees age=240s < 300s,
+    increments to 3, and kills an instance that has been up for three minutes
+    and is merely slow to serve /health during warm-up. Evidence about a
+    process that no longer exists must never count toward killing its
+    successor.
+
+    The comparison deliberately mixes clocks — ``ts`` is wall-clock
+    (time.time) while *unit_elapsed_secs* is a CLOCK_MONOTONIC-derived
+    duration — because only the DURATION is needed and monotonic is the
+    suspend-proof source. The one divergence, a host suspend, makes
+    ``now - unit_elapsed_secs`` later than the true start and so expires MORE
+    streaks: the safe direction.
+
+    WRITE FAILURES ARE SAFE. _write_fm_liveness_streak inherits
+    _atomic_write_json's fail-soft contract, so a write that does not land is
+    logged and swallowed. The returned count is still correct for THIS tick,
+    but nothing persisted — so the next tick starts from 1 again and the
+    counter can never climb to FM_LIVENESS_STREAK_THRESHOLD. A watchdog that
+    cannot persist evidence simply never restarts fused-memory, which is the
+    correct fail direction for this task.
+    """
+    now = time.time()
+    prior = _read_fm_liveness_streak()
+    count = 1
+    if prior is not None:
+        prior_count, prior_ts = prior
+        if (now - prior_ts) > FM_LIVENESS_STREAK_MAX_AGE_SECS:
+            pass  # expired: continuity is unprovable, start over at 1
+        elif unit_elapsed_secs is not None and prior_ts < (now - unit_elapsed_secs):
+            log(
+                f"discarding fm liveness streak of {prior_count}: it predates the "
+                f"current {FUSED_MEMORY_UNIT} instance (up {unit_elapsed_secs:.0f}s)"
+            )
+        else:
+            count = prior_count + 1
+    _write_fm_liveness_streak(count, verdict, now)
+    return count
 
 
 def main() -> None:
@@ -939,15 +1369,59 @@ def fused_memory_liveness_pass() -> None:
     from main(), and _fused_memory_liveness_verdict() (B2) for the combined
     port+/health verdict.
 
-    Both 'port-down' and 'wedged' trigger a restart via restart_unit() called
-    DIRECTLY — uncapped, with no fleet-deploy clock and no delegation to
-    restart-all-orchestrators.sh (I5: brokenness is not a scheduled deploy),
-    exactly like main()'s wedged-orchestrator revive path.
+    THE KILL DECISION IS BOUNDED IN TIME (task 3764). A restart requires
+    FM_LIVENESS_STREAK_THRESHOLD CONSECUTIVE non-healthy verdicts — 'port-down'
+    and 'wedged' both count, streaked on the same counter — and a 'healthy'
+    verdict clears the streak outright. The count is PERSISTED in
+    FM_LIVENESS_STREAK_PATH because this is a ``Type=oneshot`` unit on a 60s
+    timer: the process exits between probes, so an in-memory counter could
+    never accumulate. Independently, restart_unit() is capped to at most one
+    liveness revive per FM_LIVENESS_RESTART_MIN_INTERVAL_SECS via its OWN clock
+    (FM_LIVENESS_RESTART_CLOCK_PATH). The two layers are complementary: the
+    streak makes a wrong verdict RARE, the cap makes a wrong verdict HARMLESS.
+
+    EVIDENCE. The pass previously restarted on a SINGLE non-healthy verdict,
+    uncapped. A controlled experiment (2026-08-06 07:14-09:14Z, kill path
+    disconnected) recorded six /health stalls >=8s, four >15s, three past a 25s
+    probe cap — every one SELF-RECOVERED, with 0 restarts and 0 interrupted
+    runs needed across 20 cycles. N=3 at the 60s cadence demands ~180s of
+    CONTINUOUS non-response, ~7x the longest observed transient, while a
+    genuinely wedged asyncio loop (wedged by definition) still reaches it on
+    the third tick.
+
+    DELIBERATELY UNCHANGED:
+      - probe_health()'s inverted fail-direction — an HTTP response INCLUDING
+        a 503 means alive, since a degraded backing store is not something a
+        restart fixes;
+      - _fused_memory_liveness_verdict()'s port-probe short-circuit, so a
+        fully-dead unit is still classified without waiting on the up-to-15s
+        /health fetch;
+      - the is_unit_enabled and STARTUP_GRACE_SECS gates above, which still
+        return before any streak read or write (operator intent and a
+        not-yet-bound port are neither failure evidence nor recovery);
+      - I5: this pass calls restart_unit() DIRECTLY and never delegates to
+        restart-fused-memory.sh nor touches FM_DEPLOY_CLOCK_PATH, so reviving
+        a wedge can never silence the fm staleness deploy backstop.
+
+    EXTERNAL RESTARTS mid-streak (the staleness redeploy,
+    restart-fused-memory.sh, an operator) leave a persisted entry describing a
+    process that no longer exists. Three defences, in order: the 120s startup
+    grace skips the ticks right after the restart, the INSTANCE-BOUNDARY
+    EXPIRY discards any entry predating the current instance's start (the
+    ``elapsed`` this pass already computes is threaded into
+    _record_fm_liveness_failure for exactly this), and
+    FM_LIVENESS_STREAK_MAX_AGE_SECS expires anything older still. The residual,
+    stated rather than hidden: when _unit_start_elapsed_secs cannot determine a
+    start time (returns None — no recorded PID, an unparseable property, a
+    systemctl failure) the instance boundary is unknown and only the grace
+    window plus the max-age expiry apply. The min-interval cap bounds that
+    consequence to at most one restart per window.
 
     Wrapped in a single try/except Exception (mirroring main()'s per-unit
-    isolation) so a probe/verdict failure is logged and swallowed rather than
-    raising — a hiccup here must never crash the oneshot watchdog or prevent
-    staleness_pass() from running afterward.
+    isolation) so a probe/verdict/persistence failure is logged and swallowed
+    rather than raising — a hiccup here must never crash the oneshot watchdog
+    or prevent staleness_pass() / fused_memory_staleness_pass() from running
+    afterward.
     """
     try:
         if not is_unit_enabled(FUSED_MEMORY_UNIT):
@@ -961,10 +1435,57 @@ def fused_memory_liveness_pass() -> None:
             )
             return
         verdict = _fused_memory_liveness_verdict()
-        if verdict != "healthy":
-            log(f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}'; restarting")
-            restart_unit(FUSED_MEMORY_UNIT)
-            log(f"{FUSED_MEMORY_UNIT} restart issued")
+        if verdict == "healthy":
+            # Continuity is broken: whatever failures preceded this tick were
+            # transient and self-recovered, so they must not accumulate toward
+            # a kill.
+            _clear_fm_liveness_streak()
+            return
+        # `elapsed` is threaded in so evidence recorded against a PREVIOUS
+        # fused-memory process cannot count toward killing its successor —
+        # see _record_fm_liveness_failure's INSTANCE-BOUNDARY EXPIRY.
+        streak = _record_fm_liveness_failure(verdict, elapsed)
+        if streak < FM_LIVENESS_STREAK_THRESHOLD:
+            log(
+                f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}' "
+                f"(streak {streak}/{FM_LIVENESS_STREAK_THRESHOLD}); not restarting yet"
+            )
+            return
+        # ORDERING: the streak was recorded BEFORE this cap check on purpose,
+        # so evidence keeps accumulating during a capped window and the revive
+        # fires promptly the moment the window expires — rather than the count
+        # restarting from scratch every time the cap suppresses a tick.
+        if _within_fm_liveness_restart_min_interval():
+            log(
+                f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}' "
+                f"(streak {streak}/{FM_LIVENESS_STREAK_THRESHOLD}) but a liveness "
+                f"restart is capped to one per {FM_LIVENESS_RESTART_MIN_INTERVAL_SECS}s; "
+                f"skipping"
+            )
+            # Deliberately NOT clearing the streak: the cap means "too soon",
+            # not "it recovered".
+            return
+        log(
+            f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}' "
+            f"(streak {streak}/{FM_LIVENESS_STREAK_THRESHOLD}); restarting"
+        )
+        restart_unit(FUSED_MEMORY_UNIT)
+        log(f"{FUSED_MEMORY_UNIT} restart issued")
+        # Arm the cap immediately after the restart is issued, so it holds even
+        # if the streak clear below fails. The stamp is fail-SOFT but not
+        # fail-safe: an unarmed cap makes the revive unbounded (a revive every
+        # ~N ticks), so its failure gets its own high-signal line rather than
+        # disappearing into _atomic_write_json's routine one.
+        if not _stamp_fm_liveness_restart_clock():
+            log(
+                f"{FUSED_MEMORY_UNIT} liveness restart cap could NOT be armed; "
+                f"further revives are unbounded until "
+                f"{FM_LIVENESS_RESTART_CLOCK_PATH} is writable"
+            )
+        # Consumed: the NEXT kill must earn a fresh N-streak, otherwise the
+        # pass would degrade back to one-verdict-per-kill immediately after
+        # the first restart.
+        _clear_fm_liveness_streak()
     except Exception as exc:  # noqa: BLE001
         log(f"watchdog error for {FUSED_MEMORY_UNIT} (port {FUSED_MEMORY_PORT}): {exc}")
 
@@ -1438,9 +1959,23 @@ def _print_fused_memory_liveness() -> None:
         like report()'s DEPLOY-AGE column, or 'unknown' when the fm clock has
         never been stamped / is unreadable (fail-open);
       - recon-busy via _fused_memory_recon_busy_verdict() (fail-soft
-        'unknown').
-    No systemctl mutation, no clock write, no restart — the DEPLOY-AGE read
-    and the recon-busy /health fetch are both read-only.
+        'unknown');
+      - streak from _read_fm_liveness_streak(), rendered
+        "<count>/<FM_LIVENESS_STREAK_THRESHOLD>" or 'none' (task 3764) — this
+        is what lets an operator answer "why didn't the watchdog restart
+        fused-memory" without hand-reading JSON;
+      - LIVENESS-RESTART-AGE from _read_last_fm_liveness_restart_epoch(),
+        rendered hours-to-one-decimal like DEPLOY-AGE, or 'unknown' when the
+        watchdog has never revived fm — i.e. how much of the min-interval cap
+        window remains.
+    No systemctl mutation, no clock write, no restart — the DEPLOY-AGE read,
+    the recon-busy /health fetch, and both task-3764 reads are read-only. In
+    particular, printing the streak must never create, modify or clear it:
+    running --report would otherwise itself change whether fused-memory gets
+    killed on the next tick.
+
+    Each task-3764 field is wrapped independently, so a failure degrades only
+    its own value rather than costing the operator the whole row.
 
     Informational only: called from _cli's --report branch AFTER report()'s
     own staleness table, and never affects report()'s staleness-only exit
@@ -1466,9 +2001,28 @@ def _print_fused_memory_liveness() -> None:
         else "unknown"
     )
     recon_busy = _fused_memory_recon_busy_verdict()
+    try:
+        streak = _read_fm_liveness_streak()
+        streak_str = (
+            f"{streak[0]}/{FM_LIVENESS_STREAK_THRESHOLD}" if streak is not None else "none"
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"could not read the {FUSED_MEMORY_UNIT} liveness streak for --report: {exc}")
+        streak_str = "unknown"
+    try:
+        restart_epoch = _read_last_fm_liveness_restart_epoch()
+        restart_age_str = (
+            f"{(time.time() - restart_epoch) / 3600:.1f}h"
+            if restart_epoch is not None
+            else "unknown"
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"could not read the {FUSED_MEMORY_UNIT} liveness restart clock: {exc}")
+        restart_age_str = "unknown"
     print(
         f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /health): "
-        f"{verdict} | DEPLOY-AGE: {deploy_age_str} | recon-busy: {recon_busy}"
+        f"{verdict} | DEPLOY-AGE: {deploy_age_str} | recon-busy: {recon_busy} "
+        f"| streak: {streak_str} | LIVENESS-RESTART-AGE: {restart_age_str}"
     )
 
 

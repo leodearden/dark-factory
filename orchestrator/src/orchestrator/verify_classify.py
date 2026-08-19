@@ -192,13 +192,20 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # REIFY_TEST_SEMAPHORE_WAIT=unlimited (lib_test_semaphore.sh:170-173), and
 # that wart is a real emitted shape, so the pattern must cover it.
 #
-# `@@REIFY_SLOT_TIMEOUT@@` is NOT emitted by reify today — verified by grep
-# over reify `scripts/` on 2026-08-05. It is the forward-compatible anchor for
-# reify's companion task (same column-0, first-token `@@REIFY_*@@` emission
-# contract as scripts/lib_clock_stop.sh:141), and a harmless no-op until that
-# lands. It is therefore a COMPLEMENT to the three grounded anchors and never
-# the sole positive — the category is detectable the moment this lands, rather
-# than waiting on another repo.
+# `@@REIFY_SLOT_TIMEOUT@@` is emitted by reify's `slot_acquire` (reify task
+# 6024, LANDED on reify main — scripts/lib_slot_acquire.sh:147):
+#
+#   printf '@@REIFY_SLOT_TIMEOUT@@ reason=%s slots=%s waited=%s disposition=%s lock=%s\n' ...
+#
+# Same column-0, first-token `@@REIFY_*@@` emission contract as
+# scripts/lib_clock_stop.sh:141. It is therefore a COMPLEMENT to the three
+# grounded anchors above and never the sole positive — the category is
+# detectable via either route.
+#
+# `disposition=<fatal|soft>` (task 4212) is the format string's 6th,
+# OPTIONAL field. See `_has_fatal_slot_timeout_sentinel` below — the sole
+# reader of this field — for the fatal/soft gate it feeds and its full
+# grounding.
 #
 # PORTABILITY (task 3679 review). The allowlist above hardcodes three reify
 # script basenames into an otherwise project-generic classifier, which makes
@@ -214,7 +221,63 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # that is the signal to promote the sentinel to the primary contract (or to
 # lift the marker list into per-project `verify_env` config) rather than to
 # extend the alternation again.
-_SLOT_TIMEOUT_SENTINEL_RE = re.compile(r'^[ \t]*@@REIFY_SLOT_TIMEOUT@@', re.MULTILINE)
+# Trailing capture group (task 4212) added IN PLACE rather than via a second
+# line-anchored regex, so there is exactly one `^[ \t]*@@REIFY_SLOT_TIMEOUT@@`
+# literal to keep in sync with the anchoring contract above (task 3679 /
+# reify task 4998 / esc-4791-52 — infra tests quote these lines mid-line in
+# assertion prose). Adding the group changes no match semantics: existing
+# `.search()` presence callers are unaffected, and `_has_fatal_slot_timeout_
+# sentinel` below is the only reader of `group(1)`.
+_SLOT_TIMEOUT_SENTINEL_RE = re.compile(r'^[ \t]*@@REIFY_SLOT_TIMEOUT@@([^\n]*)', re.MULTILINE)
+
+# task 4212 — `disposition=<fatal|soft>` and the `lock=` field boundary these
+# two patterns parse (`lock=` is always the marker's LAST field — reify
+# lib_slot_acquire.sh:124-133 — because it is the sole operator-controlled
+# one). See `_has_fatal_slot_timeout_sentinel` below, the only reader of
+# both, for the full grounding, the fatal/soft distinction, and why the
+# parse stops at `lock=`.
+_SLOT_TIMEOUT_DISPOSITION_RE = re.compile(r'\bdisposition=(\S+)')
+_SLOT_TIMEOUT_LOCK_FIELD_RE = re.compile(r'\slock=')
+
+
+def _has_fatal_slot_timeout_sentinel(output: str) -> bool:
+    """True when *output* carries at least one ``@@REIFY_SLOT_TIMEOUT@@``
+    sentinel line that is NOT ``disposition=soft``.
+
+    Evaluated PER LINE via ``finditer`` — never as a single whole-output
+    ``disposition=soft`` search — because *output* is the ENTIRE aggregated
+    verify-leg output (stderr merged into stdout), and a soft pool deadline
+    and a fatal test-slot deadline CAN co-occur in one leg (reify's
+    ``run_all.sh`` pool worker in one phase, ``lib_test_semaphore.sh`` in
+    another). ANY non-soft sentinel line wins: a soft line must never veto a
+    co-occurring fatal one.
+
+    The disposition is read ONLY from the line's HEAD — the text before the
+    first `` lock=`` — and the FIRST ``disposition=`` match there is taken.
+    Both restrictions exist for the same reason (see the field-order comment
+    above ``_SLOT_TIMEOUT_DISPOSITION_RE``): ``lock=`` is the sole
+    operator-controlled field, so confining the parse to the head means an
+    operator-chosen lock path can neither forge nor suppress the
+    classification.
+
+    FAIL-SAFE DIRECTION: a sentinel line with no ``disposition`` field
+    (older reify — the field is additive and reify's emit stays
+    prefix-compatible with the anchor), an unrecognized future token, or a
+    malformed line are all treated as NOT soft, i.e. this returns ``True``
+    — matching pre-4212 behavior. A missed starvation abort is a silent
+    infra hold nobody sees; an over-classified soft admission is visible
+    and only reachable when the producer explicitly says ``soft``.
+    """
+    for match in _SLOT_TIMEOUT_SENTINEL_RE.finditer(output):
+        tail = match.group(1)
+        lock = _SLOT_TIMEOUT_LOCK_FIELD_RE.search(tail)
+        head = tail[: lock.start()] if lock else tail
+        field = _SLOT_TIMEOUT_DISPOSITION_RE.search(head)
+        if field is None or field.group(1) != 'soft':
+            return True
+    return False
+
+
 _SLOT_ACQUIRE_DEADLINE_RE = re.compile(
     r'^[ \t]*(?:ERROR: )?'
     r'(?:lib_test_semaphore|cargo-test-occt-gated|lib_lane_x_flock)\.sh: '
@@ -407,10 +470,13 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     are line-scoped and both can appear in ONE aggregated leg output — verify
     merges stderr into stdout verbatim, and a single ``bash -c`` chain can
     miss a slot deadline in an early step and lose its worktree in a later
-    one. Measured on this branch: an anchored ``lib_test_semaphore.sh: failed
-    to acquire …`` line concatenated with a ``getcwd`` collateral line
-    classifies ENV_TRANSIENT in EITHER concatenation order, decided entirely
-    by the collateral branch being evaluated first below.
+    one. Measured on this branch and now pinned as a standing property, not
+    a one-off spot-check: every anchored producer line in the grounded
+    slot-timeout corpus, concatenated with ANY of the five documented
+    collateral shapes (``_VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE`` plus
+    the four in ``_VERIFY_WORKTREE_COLLATERAL_PATTERNS``), in EITHER
+    concatenation order, classifies ENV_TRANSIENT — decided entirely by the
+    collateral branch being evaluated first below.
 
     ENV_TRANSIENT is the intended winner there, for the same reason DISK_FULL
     outranks both: the removed worktree is the more specific root cause, and
@@ -418,7 +484,17 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     (``RetryKind.ENV_SERIAL`` versus SEMAPHORE_TIMEOUT's ``RetryKind.NONE``,
     which surfaces to a human). Reading collateral as a slot timeout would
     convert a self-recovering host condition into a blocking escalation.
-    Pinned by ``TestAnchoredSlotTimeoutWithCollateralIsEnvTransient``.
+    Pinned by ``TestAnchoredSlotTimeoutWithCollateralIsEnvTransient``, which
+    parametrizes every anchored producer line in the grounded slot-timeout
+    corpus against every documented collateral shape, in BOTH concatenation
+    orders, at ``ToolKind.OPAQUE`` and one representative non-opaque tool.
+    Guard 3's tool-blindness is already cross-producted over every
+    ``ToolKind`` by ``TestMergeVerifyCollateralEnvGuard`` above, so
+    re-crossing the full axis here would add cases with no added detection
+    power. The same corpus separately pins the recovery path itself —
+    ``CATEGORY_POLICY[result].retry_kind is RetryKind.ENV_SERIAL`` — the
+    consequence named in the paragraph above, not merely the category
+    label, at ``ToolKind.OPAQUE``.
 
     What task 3679 changed is not whether the order matters but WHICH inputs
     reach the tie: before, the arm was a loose co-occurrence that collateral
@@ -429,7 +505,12 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     that ``TestReplayedMergeVerifyCollateralWinsOverSemaphore``'s replayed
     5164/5071 fixtures no longer contain any anchored marker, so those two
     now pass structurally and pin nothing about this tie — which is exactly
-    why the dedicated co-occurrence test above exists alongside them.
+    why the dedicated co-occurrence test above exists alongside them. That
+    disclaimer is itself measured, not inferred: the co-occurrence test's
+    mutation-kill (hoisting the SEMAPHORE_TIMEOUT arm above the
+    ENV_TRANSIENT branches) fails every one of its cases while the replayed
+    5164/5071 fixtures, and the other neighbouring guard classes, stay
+    green.
 
     SEMAPHORE_TIMEOUT — LINE-ANCHORED, producer-grounded marker (task 3679,
     esc-5848-2 / esc-5893-3). The arm fires when *output* contains, AT THE
@@ -439,6 +520,22 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     ``_SLOT_ACQUIRE_DEADLINE_RE`` above for the per-emitter grounding). The
     event is now detected POSITIVELY, by the producer naming itself, instead
     of being inferred from a whole-output token co-occurrence.
+
+    task 4212 — the SENTINEL half of the arm is additionally gated on the
+    marker's ``disposition`` field: a sentinel line marked
+    ``disposition=soft`` (reify's ``run_all.sh`` pool worker is the sole
+    caller — a degraded-but-healthy admission, not an infra hold) does not,
+    by itself, satisfy this arm. The BASENAME half
+    (``_SLOT_ACQUIRE_DEADLINE_RE``) stays UNGATED: all three allowlisted
+    emitters take ``slot_acquire``'s ``fatal`` default and their deadline
+    lines carry no ``disposition`` field to parse. The gate is evaluated PER
+    SENTINEL LINE, not as a whole-output search, so a soft line can never
+    veto a co-occurring fatal one within the same aggregated leg output, and
+    is read only from each line's head so the operator-controlled ``lock=``
+    tail cannot forge or suppress it. See
+    ``_has_fatal_slot_timeout_sentinel`` — the sole implementation of this
+    gate — for the full grounding, the lock-tail rationale, and the
+    fail-safe direction on an absent or unrecognized disposition token.
 
     What this replaced, and why it had to go: the arm previously fired when a
     lock/slot/semaphore token appeared ANYWHERE in *output* together with a
@@ -493,7 +590,8 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     ENV_TRANSIENT — merge-verify restart collateral (task 2831): a WIDER
     class of the same broken-``_merge-verify``-worktree host condition,
     grounded in the reify merge-gate RCA (2026-07-19) — five documented
-    shapes (``_VERIFY_WORKTREE_COLLATERAL_PATTERNS``) emitted when the
+    shapes (``_VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE`` plus the four in
+    ``_VERIFY_WORKTREE_COLLATERAL_PATTERNS``) emitted when the
     ephemeral worktree is removed out from under a running verify: a
     read-failure of some other tracked file, a missing ``verify.sh``
     entrypoint, a failure to write captured output back into the worktree, a
@@ -568,7 +666,10 @@ def _classify_environmental(output: str) -> FailureCategory | None:
         return FailureCategory.ENV_TRANSIENT
     if is_interpreter_missing_workspace_packages(output):
         return FailureCategory.ENV_TRANSIENT
-    if _SLOT_TIMEOUT_SENTINEL_RE.search(output) or _SLOT_ACQUIRE_DEADLINE_RE.search(output):
+    # task 4212: sentinel half is gated on disposition
+    # (`_has_fatal_slot_timeout_sentinel` above has the full grounding);
+    # basename half stays ungated — its emitters carry no `disposition` field.
+    if _has_fatal_slot_timeout_sentinel(output) or _SLOT_ACQUIRE_DEADLINE_RE.search(output):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
 

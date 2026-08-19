@@ -300,6 +300,9 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
         'started': 0, 'loops': 0, 'attempts': 0, 'deps': [],
         'meta_files': [], 'train': None, 'external_deps': [], 'prd': None,
         'lane': None, 'phase': None, 'lane_state': None, 'runtime_offline': False,
+        # Claim projection (task 3543): carried on every row. A 'pending' task
+        # is never stranded — the shared predicate gates on 'in-progress'.
+        'claimant_run_id': None, 'heartbeat_at': None, 'stranded': False,
     }]
 
 

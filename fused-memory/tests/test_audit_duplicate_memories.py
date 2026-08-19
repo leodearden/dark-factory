@@ -82,6 +82,29 @@ _build_parser = _mod._build_parser
 _run = _mod._run
 
 
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``_run(args)`` with ``--apply`` runs a fail-closed capability preflight
+    before it constructs a MemoryService (task 4127). That probe touches the
+    real filesystem, so without this fixture every ``--apply`` test would pass
+    or fail according to whether the machine running pytest happens to be able
+    to write mem0's history directory -- and it genuinely cannot inside an
+    agent sandbox, which is the whole reason the guard exists. This suite is
+    deliberately MOCK-unit (``_FakeMemoryService``, no live Qdrant), so the
+    environment must not be an input to it.
+
+    ``TestApplyStoreMutationPreflight`` re-rigs this per test -- to refuse, to
+    record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+
+    Deliberately NOT ``raising=False``: if the guard is ever removed from the
+    script this fixture must break loudly rather than silently no-op.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -4573,9 +4596,56 @@ class TestRunWiring:
         assert f'near_duplicate_clusters.{_PK}' in ids
         for key in (*_ANN_DISCLOSURE_KEYS, *_PLAN_DISCLOSURE_KEYS,
                     'ann_query_errors', 'ann_disabled_uncalibrated',
-                    'ann_pooled_fallback_categories'):
+                    'ann_pooled_fallback_categories', 'apply_withheld_clusters'):
             assert f'{key}.{_GLOBAL_SCOPE}' in ids, f'{key} must be disclosed'
         assert f'scan_truncated.{_PK}' in ids
+
+    async def test_the_apply_withheld_gate_becomes_a_metric_series(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """A cluster the apply gate withholds must be alarmable, not reported only.
+
+        The plan JSON already carries ``apply_withheld_clusters``, but the plan
+        is not the artifact the eval programme reads — only the metrics series
+        is. Without this metric, a growing share of ``--apply`` coverage
+        silently withheld by the evidence gate would be un-alarmable recall
+        loss.
+        """
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            RUN_STAMP_ENV_VAR,
+            load_metric_series,
+        )
+
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _STAMP)
+        raw = {_OS: [
+            _raw('m1', 'alpha one', '2026-01-01T00:00:00+00:00', category=_OS,
+                 vector=[1.0, 0.0]),
+            _raw('m2', 'beta two', '2026-01-02T00:00:00+00:00', category=_OS,
+                 vector=[0.0, 1.0]),
+        ]}
+        ann_hits = {(1.0, 0.0): [('m2', 0.95)], (0.0, 1.0): [('m1', 0.95)]}
+        _install_run_doubles(
+            monkeypatch, raw, ann_hits=ann_hits, t_high_by_category={_PK: 0.9},
+        )
+
+        rc = await _run(await self._parse(tmp_path, '--threshold', '0.99'))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert rc == 0, 'a dry run (no --apply) returns cleanly'
+        assert plan['apply_withheld_clusters'] == 1, (
+            'observations_and_summaries has no cutoff of its own, so this '
+            'clique runs on the pooled fallback and is withheld'
+        )
+
+        series = load_metric_series(tmp_path / _EVAL_ID / f'metrics-{_STAMP}.json')
+        by_id = _by_id(series.metrics)
+        metric_id = f'apply_withheld_clusters.{_GLOBAL_SCOPE}'
+        assert metric_id in by_id, 'the gate must be alarmable, not just reported'
+
+        metric = by_id[metric_id]
+        assert metric.value == 1.0
+        assert metric.kind == 'count'
+        assert metric.direction == 'higher_is_worse'
 
     async def test_no_metrics_writes_nothing(self, monkeypatch, tmp_path):
         _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
@@ -4831,6 +4901,98 @@ class TestExtractLivenessSnapshotFact:
         assert extract_liveness_snapshot_fact(
             _memory('x', content, category=_OS),
         ) is None
+
+
+# The exact pair the task measured live: identical framing and identical
+# readable `claimant_run_id=`/`heartbeat_at=` pairs, differing only in a
+# status value neither the quoted nor the bare branch can read whole (an
+# unterminated quote). Verbatim from the task's reproduction.
+_UNREADABLE_STATUS_IN_PROGRESS = (
+    'Liveness check performed 2026-08-11: '
+    'status="in progress claimant_run_id=null heartbeat_at=null'
+)
+_UNREADABLE_STATUS_DONE = (
+    'Liveness check performed 2026-08-11: '
+    'status="done, unclosed claimant_run_id=null heartbeat_at=null'
+)
+
+
+class TestLivenessSnapshotUnfieldedVerdictIsPerField:
+    """An unreadable field is a WHOLE-RECORD loss, never a key from survivors.
+
+    `_classify_liveness_snapshot` built its key from whatever fields happened
+    to parse and silently dropped the rest: `pairs` accumulated across every
+    match in the content, and `if not pairs: return True, None` only fired
+    when NO field parsed at all. One unreadable field beside a readable
+    sibling therefore produced a KEY, not a loss -- built from the survivors
+    only, so it groups records that assert DIFFERENT facts. Under `--apply` a
+    false cluster like that is an irreversible delete (the same guarantee
+    `extract_liveness_snapshot_fact`'s own docstring already claims). The
+    verdict must be per-field instead: any recognised field whose value
+    cannot be read whole makes the WHOLE record `(True, None)`, exactly like
+    the no-fields-at-all case already does.
+    """
+
+    def test_two_different_unreadable_statuses_do_not_share_a_key(self):
+        """The measured bug: an in-progress and a done snapshot, one key.
+
+        Measured on base: both classify as
+        `(True, 'claimant_run_id=null|heartbeat_at=null')` -- the SAME
+        partial key for two records asserting opposite statuses.
+        """
+        key_a = _classify_liveness_snapshot(_UNREADABLE_STATUS_IN_PROGRESS)
+        key_b = _classify_liveness_snapshot(_UNREADABLE_STATUS_DONE)
+
+        assert key_a == (True, None)
+        assert key_b == (True, None)
+
+        assert extract_liveness_snapshot_fact(
+            _memory('a', _UNREADABLE_STATUS_IN_PROGRESS, category=_OS),
+        ) is None, 'the extractor is a thin projection of the classifier'
+
+    @pytest.mark.parametrize('value', [
+        '"in progress',  # unterminated quote
+        '(unknown)',  # value starts outside the bare class
+        '"a|b"',  # `|` is the key's own pair delimiter
+    ])
+    def test_an_unreadable_value_beside_a_readable_sibling_is_a_whole_record_loss(
+        self, value,
+    ):
+        """A single unreadable field must poison the whole key, not just itself."""
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            f'status={value} claimant_run_id=null'
+        )
+
+        assert _classify_liveness_snapshot(content) == (True, None)
+
+    def test_a_value_that_cleans_to_nothing_is_a_whole_record_loss(self):
+        """A second, distinct route to the same defect -- survives step-2.
+
+        `.rstrip('./:+-')` can reduce a BARE value the pattern DID read (so
+        `quoted`/`bare` are never both `None`, and no unreadable-value
+        verdict ever fires) to the empty string, and the `if cleaned:` guard
+        then silently drops that field while a readable sibling still
+        contributes -- the same partial-key defect, reached without the
+        value ever being unreadable. A field the author WROTE but whose
+        value the reader cannot recover is exactly the case
+        `liveness_snapshot_unfielded` exists to make visible, not silently
+        fold into a key built from the survivors.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status=--- claimant_run_id=null'
+        )
+        assert _classify_liveness_snapshot(content) == (True, None)
+
+        other = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status=... claimant_run_id=null'
+        )
+        assert _classify_liveness_snapshot(other) == (True, None), (
+            'a second value that also rstrips to empty must not fabricate '
+            'the same survivors-only key as the one above'
+        )
 
 
 class TestLivenessClassifierIsSingleCopy:
@@ -5205,6 +5367,107 @@ class TestFindLivenessSnapshotRecurrencesDisclosure:
         )
 
         assert set(disclosure.values()) == {0}
+
+
+class TestLivenessPartialKeyFalseGroup:
+    """The actual harm, pinned at the level `--apply` acts on.
+
+    `TestLivenessSnapshotUnfieldedVerdictIsPerField` is a unit-level guard on
+    the classifier; this class exercises `find_liveness_snapshot_recurrences`
+    instead, because the concrete damage this task exists to prevent is a
+    false RECURRENCE GROUP over two records asserting different facts -- and
+    a group is exactly what `--apply` would delete.
+    """
+
+    def test_two_records_with_different_unreadable_statuses_form_no_group(self):
+        """On the base commit these two records DO group -- an in-progress
+        snapshot merged with a done one, sharing the survivors-only key
+        `claimant_run_id=null|heartbeat_at=null`. The loss is now visible on
+        a counter instead of forming a silent, irreversible-under-`--apply`
+        false cluster.
+        """
+        corpus = [
+            _dated('ip', _UNREADABLE_STATUS_IN_PROGRESS, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('done', _UNREADABLE_STATUS_DONE, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert groups == [], (
+            'an in-progress snapshot and a done one must never group'
+        )
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0) | {
+            'liveness_snapshot_unfielded': 2,
+        }
+
+    # Recall bound -- the real motivating corpus must keep every key and
+    # count no loss -- is already pinned in full and not re-asserted here:
+    # TestExtractLivenessSnapshotFact.test_all_three_real_snapshots_yield_the_same_key
+    # (the three keys collapse to `_CORE_FACT_STRANDED`),
+    # TestFindLivenessSnapshotRecurrences.test_exactly_the_two_real_groups
+    # (the exact two groups) and TestFindLivenessSnapshotRecurrencesDisclosure
+    # .test_clean_run_zero_fills_every_key (an all-zero disclosure).
+
+    def test_a_quoted_value_containing_a_field_name_is_not_a_loss(self):
+        """The precision guard a naive mention-count fix would fail.
+
+        The inner `claimant_run_id=` sits inside the span already consumed
+        as `status`'s quoted value, so it is a readable value -- not a
+        second, unread mention of a sibling field.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status="foo claimant_run_id=bar"'
+        )
+
+        key = extract_liveness_snapshot_fact(_memory('x', content, category=_OS))
+
+        assert key == 'status=foo claimant_run_id=bar'
+
+    def test_a_non_assignment_status_can_still_false_group(self):
+        """KNOWN LIMITATION, pinned not hidden -- the same discipline
+        `test_divergent_per_task_statuses_do_not_group` already uses.
+
+        This task's fix closes the ASSIGNMENT-form route to a survivors-only
+        key: a `<field>=` written but whose value could not be read. It does
+        not close every route to one. A status spelled `status:` (colon, not
+        `=`) carries no `<field>=` token at all, so `_LIVE_FIELD_SCAN_RE`
+        never matches it there -- it is invisible to the scan rather than an
+        unread mention of it, and the record still keys on whatever OTHER
+        fields parse. Two records asserting opposite statuses through this
+        spelling therefore still share one key and still form one group,
+        pre-existing and unchanged by this task.
+        """
+        done = (
+            'Liveness check performed 2026-08-11 on task 94: status: done, '
+            'claimant_run_id=null, heartbeat_at=null.'
+        )
+        in_progress = (
+            'Liveness check performed 2026-08-11 on task 94: status: '
+            'in-progress, claimant_run_id=null, heartbeat_at=null.'
+        )
+        done_key = _classify_liveness_snapshot(done)
+        in_progress_key = _classify_liveness_snapshot(in_progress)
+
+        assert done_key == in_progress_key, (
+            'the pre-existing gap this task does not close'
+        )
+        assert done_key != (True, None), 'both sides still classify -- no loss'
+
+        corpus = [
+            _dated('done', done, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('ip', in_progress, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
+            ('94', ['done', 'ip']),
+        ], 'still forms a group -- closing it is out of scope for this task'
+        assert set(disclosure.values()) == {0}, 'and not a counted loss either'
 
 
 # The plan keys that existed before task 3098. Pinned so an additive change
@@ -5645,9 +5908,9 @@ class TestLivenessDetectorRegexBudget:
         """The load-bearing case for choosing the BROADER prefilter.
 
         This is the one record class that matches `LIVE_TASK_STATUS_RE` (via
-        the "actively driven by" paraphrase) but NOT
-        `_LIVE_FIELD_ASSIGNMENT_RE`. Prefiltering on the narrower assignment
-        pattern would read as one consult here too, while silently driving
+        the "actively driven by" paraphrase) but produces no match at all
+        against `_LIVE_FIELD_SCAN_RE`. Prefiltering on the narrower scan pattern
+        would read as one consult here too, while silently driving
         `liveness_snapshot_unfielded` to a permanent zero — turning a counted
         loss back into an invisible one.
         """
@@ -5741,3 +6004,263 @@ class TestLivenessDetectorRegexBudget:
             ('96', ['08aa0017', '1eef7df7']),
         ]
         assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+
+
+@pytest.mark.asyncio
+class TestApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``apply_deletions`` wraps each ``delete_memory`` in a per-record
+    ``except Exception`` and increments ``delete_errors``, so in a write-denied
+    environment it would produce N logged errors and N already-destroyed
+    Qdrant points -- mem0's ``_delete_memory`` removes the point BEFORE writing
+    its SQLite history. This module's own docstring warns that "under --apply
+    every non-survivor of that chain is an irreversible delete"; the guard is
+    what makes that warning enforceable rather than advisory.
+    """
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    def _raw(self) -> dict:
+        """A real two-member cluster, so ``--apply`` has work to refuse."""
+        return {_PK: [
+            _raw('m1', _VENV_GOTCHA_A, '2026-01-01T00:00:00+00:00'),
+            _raw('m2', _VENV_GOTCHA_B, '2026-01-02T00:00:00+00:00'),
+        ]}
+
+    async def test_apply_never_even_opens_a_client_when_the_store_is_unwritable(
+        self, monkeypatch, tmp_path,
+    ):
+        """The strongest available zero-mutation proof for this script: it
+        cannot delete because it never constructs a MemoryService at all.
+
+        The guard sits ahead of both the config load and the service
+        construction, so a refused --apply also never reaches the
+        ``finally: await memory.close()`` teardown of a service that was never
+        initialized.
+        """
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            await _run(args)
+
+        assert _FakeMemoryService.instances == [], (
+            'no MemoryService may be constructed once the preflight has refused'
+        )
+
+    async def test_the_guard_sits_before_the_scan_and_the_ann_fan_out(
+        self, monkeypatch, tmp_path,
+    ):
+        """It aborts without a single Qdrant read: neither ``fetch_memories``'
+        per-category scroll (with_vectors=True) nor ``fetch_ann_neighbors``'
+        per-record query fan-out is paid for."""
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, self._raw())
+        called: list[str] = []
+        monkeypatch.setattr(
+            _mod, 'fetch_memories',
+            lambda *a, **kw: called.append('fetch_memories'),
+        )
+        monkeypatch.setattr(
+            _mod, 'fetch_ann_neighbors',
+            lambda *a, **kw: called.append('fetch_ann_neighbors'),
+        )
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _run(args)
+
+        assert called == [], 'the scan must not run once the preflight has refused'
+
+    async def test_a_dry_run_is_never_gated_on_write_capability(
+        self, monkeypatch, tmp_path,
+    ):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate -- the audit report stays obtainable from anywhere."""
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        rc = await _run(args)
+
+        assert rc == 0
+        assert _FakeMemoryService.instances[-1].deleted == []
+
+    async def test_apply_is_unchanged_when_the_preflight_passes(
+        self, monkeypatch, tmp_path,
+    ):
+        """Happy path: a writable environment deletes exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        rc = await _run(args)
+
+        assert rc == 0
+        assert _FakeMemoryService.instances[-1].deleted == ['m2'], 'the oldest survives'
+
+    async def test_the_probe_names_the_operation_being_gated(
+        self, monkeypatch, tmp_path,
+    ):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        await _run(args)
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per delete candidate'
+        assert 'audit_duplicate_memories' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    async def test_the_refusal_raises_and_is_never_confusable_with_the_report_shaped_one(
+        self, monkeypatch, tmp_path,
+    ):
+        """``_apply_refusal_reason`` already refuses ``--apply`` on
+        empty-scan/truncation grounds -- but it returns an integer through the
+        NORMAL path, a handled outcome an operator can reasonably read past.
+
+        A write-capability denial is categorically different: proceeding would
+        leave a half-completed, unrecoverable store mutation. So it RAISES
+        rather than degrading into any of this script's ordinary integer
+        returns.
+
+        Rigged with an EMPTY scan -- the exact condition that drives
+        ``_apply_refusal_reason`` to return 1 -- to prove the write-capability
+        refusal wins over, rather than collapsing into, the report-shaped one.
+
+        Scoped to ``_run``: that the raise also survives the trip out through
+        ``main`` is a separate claim, tested in
+        ``TestApplyStoreMutationPreflightThroughMain``.
+        """
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, {})
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _run(args)
+
+        assert _FakeMemoryService.instances == []
+
+
+class TestApplyStoreMutationPreflightThroughMain:
+    """The refusal must survive the trip out through ``main``, not just ``_run``.
+
+    Deliberately a separate, un-``asyncio``-marked class: ``main`` is sync and
+    calls ``asyncio.run`` itself, so it cannot be driven from inside a running
+    loop. Sibling suites (``purge``, ``sweep``, ``prune``) drive ``main`` the
+    same way.
+    """
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @staticmethod
+    def _fail_closed_records(caplog) -> list:
+        """The guard site's OWN diagnosis.
+
+        ``main`` is three lines with no handler -- the refusal exits the
+        interpreter as an uncaught traceback -- so this ERROR record is the
+        ONLY place the operator is told what was refused and what to do
+        instead. Pinned on the fail-closed marker and the remedy noun ONLY, so
+        every other word of the message stays free to reword.
+
+        Asserting on message CONTENT is deliberate, and is the narrow exception
+        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
+        this test is about is defined BY its content -- mere record-existence
+        would still pass if the whole diagnosis were replaced by "boom",
+        precisely the regression this exists to catch. Verified non-vacuous:
+        mutating the marker in the script turns this assertion red (task 4127
+        amendment).
+        """
+        return [
+            rec for rec in caplog.records
+            if rec.name == 'audit_duplicate_memories'
+            and rec.levelname == 'ERROR'
+            and 'NOT started (fail-closed)' in rec.getMessage()
+            and 'MCP server' in rec.getMessage()
+        ]
+
+    def test_the_refusal_escapes_main_and_is_never_a_report_shaped_return(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        """``main`` is ``asyncio.run(_run(args))`` with no try/except, and
+        ``_run``'s ordinary outcomes are the integers ``0``/``1`` -- including
+        the ``1`` ``_apply_refusal_reason`` returns for an empty scan.
+
+        So the write-capability refusal must propagate all the way out and exit
+        the interpreter non-zero via an uncaught traceback, never collapsing
+        into either integer on the way. Rigged with the EMPTY scan that drives
+        the report-shaped refusal, so the two are in direct competition.
+
+        ``asyncio.run`` is replaced only to keep the real one reachable; the
+        coroutine really is ``_run(args)`` as ``main`` built it, argv parsing
+        included.
+        """
+        import asyncio  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, {})
+        monkeypatch.setattr(sys, 'argv', [
+            'audit_duplicate_memories.py', '--project-id', 'p', '--apply',
+            '--metrics-root', str(tmp_path),
+        ])
+        real_asyncio_run = asyncio.run
+        monkeypatch.setattr(
+            _mod.asyncio, 'run', lambda coro, *_a, **_kw: real_asyncio_run(coro),
+        )
+
+        with caplog.at_level('ERROR'), pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            _mod.main()
+
+        assert self._fail_closed_records(caplog), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
+        assert _FakeMemoryService.instances == [], (
+            'the refusal must precede the client, even driven through main'
+        )

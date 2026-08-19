@@ -1,0 +1,54 @@
+{
+  "id": "df_task_2169",
+  "name": "W1 \u03ba (additive substrate): populate ItemLifecycle registry in lockstep at every put/pop \u2014 register/transition wiring + _live_items index + chokepoint helpers (single-read conversion + field removal moved to follow-on \u03ba-b)",
+  "project": "dark-factory",
+  "project_root": "/home/leo/src/dark-factory",
+  "pre_task_commit": "4c40b7fa230edb4226827d5aae37a76cccda60c1",
+  "post_task_commit": "6525ad7152737aa96a14e60baa3f6c90e7373d3d",
+  "task_definition": {
+    "title": "W1 \u03ba (additive substrate): populate ItemLifecycle registry in lockstep at every put/pop \u2014 register/transition wiring + _live_items index + chokepoint helpers (single-read conversion + field removal moved to follow-on \u03ba-b)",
+    "description": "PRD: plans/merge-queue-reliability-prd.md task \u03ba (scope 4) \u2014 ADDITIVE SUBSTRATE HALF. Depends on \u03b9 (2164, done).\n\n\u26a0\ufe0f SCOPE NARROWED 2026-07-11 (/unblock, esc-2169-4 decompose disposition). \u03ba was over-decomposed into 26 TDD steps and exhausted MAX_TURNS at step 12/26. Following the scope-exhaustion split precedent (cf. task 2357), \u03ba is split at the additive|conversion seam:\n\n  \u2022 THIS TASK (2169) delivers ONLY the ADDITIVE registry-population wiring (completed steps 1-12): ItemLifecycle registry (_lifecycle) instantiated on SpeculativeMergeWorker; a _live_items object index kept in lockstep; chokepoint helpers (_register_item / _note_transition / _retire_item / _note_requeue); and register()/transition() wired at every put/pop across the 5 containers (merger-drain QUEUED\u2192LANE_BUFFERED\u2192MERGING, merger\u2192verifier handoff, verifier dispatch-fill DISPATCHING, verify\u2192finalize FINALIZING/GATE_REVERIFY/TERMINAL, terminal/drain sites). The 4 transient side-fields are RETAINED and still drive all behaviour (additive, behaviour-preserving; _note_transition is best-effort-loud and never raises on the hot path). The registry is PROVEN to agree with the field-based snapshot census (test_merge_queue_lifecycle_registry.py step-11 wiring-completeness proof: full multi-item pipeline + stop-mid-flight, registry non-terminal set == snapshot()['entries'] census, no leaks).\n\n  \u2022 The SINGLE-READ CONVERSION \u2014 repoint snapshot()/liveness onto the registry as single reads, DELETE the 4 transient fields (_inflight_req/_remerging_item/_finalizing_head/_dispatching_item), and add PRD boundary test B8 (snapshot/audit/liveness provably agree) \u2014 moves to a FOLLOW-ON task (\"W1 \u03ba-b: single-read conversion\", depends on this task). \u03ba's ORIGINAL user-observable signal is delivered by \u03ba-b, not this task. Consumer \u03bb's real prereq is \u03ba-b.\n\nNEW SIGNAL (this task): the ItemLifecycle registry is populated in lockstep at every put/pop across the 5 containers; the step-11 wiring-completeness proof is green \u2014 the registry's non-terminal census equals the field-based snapshot census across a full pipeline run + stop-mid-flight (no leaks, no spurious illegal-transition escalations). Landed additively on main (rebased clean onto current main; 828 merge-queue tests green; no field removals, no reader repoints)."
+  },
+  "verify_commands": {
+    "test": "cd orchestrator && uv run pytest tests/ -x",
+    "lint": "cd orchestrator && uv run ruff check src/",
+    "typecheck": "cd orchestrator && uv run pyright src/"
+  },
+  "modules": [
+    "orchestrator/src/orchestrator/merge_queue.py",
+    "orchestrator/src/orchestrator/merge_liveness.py"
+  ],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "6525ad7152737aa96a14e60baa3f6c90e7373d3d",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "merge_first_parent",
+    "task_status": "done",
+    "eval_branch_pinned": false,
+    "eval_branch_pin_error": "pin_eval_branch(evals/df_task_2169) failed: Command git update-ref refs/heads/evals/df_task_2169 6525ad7152737aa96a14e60baa3f6c90e7373d3d failed (rc=128): fatal: update_ref failed for ref 'refs/heads/evals/df_task_2169': cannot lock ref 'refs/heads/evals/df_task_2169': Unable to create '/home/leo/src/dark-factory/.git/refs/heads/evals/df_task_2169.lock': Permission denied",
+    "eval_branch_pin_impact": "None for retrievability. The reference block carries the post SHA directly and materialize_reference_diff works off the pre/post SHAs, not the branch; the pin only holds the commit off the GC path. post_task_commit IS an ancestor of main in this checkout, so it is reachable and not GC-eligible regardless. Re-run --mint from a checkout with write access to restore the belt-and-braces ref."
+  },
+  "reference": {
+    "post_task_commit": "6525ad7152737aa96a14e60baa3f6c90e7373d3d",
+    "diff_stat": {
+      "files": 5,
+      "insertions": 2581,
+      "deletions": 9
+    }
+  },
+  "verify_outcome": {
+    "source": "landed",
+    "passed": true,
+    "commands": {
+      "test": "cd orchestrator && uv run pytest tests/ -x",
+      "lint": "cd orchestrator && uv run ruff check src/",
+      "typecheck": "cd orchestrator && uv run pyright src/"
+    }
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

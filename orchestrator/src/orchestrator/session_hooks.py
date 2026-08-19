@@ -28,6 +28,22 @@ target the SAME record: one record advances
 launching -> running -> idle/awaiting-input -> exited (exited is still
 written by spawn-claude.sh's ``finish()``). Hand-launched sessions (no
 CLAUDE_SPAWN_SESSION_ID) still key on session_id, exactly as before.
+
+IMPORT CONTRACT (documented env: ``PYTHONPATH=<repo>/orchestrator/src``).
+This module is executed BY ABSOLUTE PATH from a plain shell with no venv and
+no install — ``skills/spawn/hooks/{session-start,stop,notification,
+install-hooks}.sh`` export that one PYTHONPATH entry (line 25) and then run
+this file (line 29). So ``from orchestrator import ...`` is fine (that is how
+``session_registry`` above is reached), but a module-scope ``from shared
+import ...`` or any third-party import makes this file unimportable in its own
+production entrypoint — and the failure is quiet, since a hook that dies just
+leaves the session unretitled and its record unrefreshed. Pinned as the
+``session_hooks.py (tier-2: bare shell + PYTHONPATH)`` row of
+``_BARE_SHELL_ENTRYPOINTS`` in
+``orchestrator/tests/test_session_registry.py::TestStdlibOnlySelfContainment``,
+and mutation-tested there rather than merely asserted green. Note
+``session_registry`` itself holds the STRICTER tier-1 contract (no PYTHONPATH
+at all) — see its module docstring.
 """
 
 from __future__ import annotations

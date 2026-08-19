@@ -84,6 +84,53 @@ A run that compared ZERO units can NEVER report parity.  This vocabulary is
 adopted unchanged from ``check_dashboard_unit_parity.py`` so setup-host.sh's
 existing 0/2/other branch shape carries over verbatim.
 
+A consumer that needs to act per UNIT rather than per run wants the
+``--print-verdicts`` channel described next, not these codes.
+
+Machine-readable verdicts
+-------------------------
+The exit code above is a WHOLE-RUN verdict: with nine units, one drifted unit
+collapses the entire run to 1 and tells a consumer nothing about the other
+eight.  That is fine for an operator reading the report, and was not fine for
+``setup-host.sh``, which used it to decline the install of ALL nine units when
+any one of them was unverifiable — so a single deliberate drop-in on
+``orchestrator-reify.service`` also blocked the watchdog pair from being
+reinstalled and re-enabled, which is a supervision regression dressed as
+caution.
+
+``--print-verdicts`` is the per-unit channel that fixes that.  It is OPT-IN
+and purely additive: with the flag absent, the report and every exit code are
+byte-identical.  With it, one extra line per SELECTED unit, in sorted order,
+emitted before the human summary blocks::
+
+    [orchestrator_unit_parity] verdict <unit> <kind>[,<kind>...]
+
+The kind vocabulary is ``VERDICT_KINDS`` below, and that tuple's ORDER is the
+rendering precedence, so a unit that is both directive-drifted and drop-in'd
+always renders ``drift,override`` and never the reverse:
+
+    clean       compared, no directive drift, no drop-in — safe to overwrite
+    absent      no installed copy — nothing to overwrite, safe to install
+    drift       at least one directive differs
+    override    a ``<unit>.d/*.conf`` drop-in is layered over it
+    vanished    no COMMITTED copy — there is no source to install FROM
+    unreadable  the file exists but could not be opened / decoded
+
+``clean`` and ``absent`` are the two install-eligible kinds, and each is
+mutually exclusive with every other kind and with the other.  They are kept
+APART rather than merged because this checker may only claim what it actually
+verified: an absent installed copy was never compared, so reporting it as
+``clean`` would assert a parity measurement that never happened.
+
+The sole consumer is ``scripts/setup-host.sh`` section 5, which installs the
+units whose verdict is ``clean`` or ``absent`` and skips the rest, naming each
+skipped unit and its kind.  A unit with NO verdict line — the checker missing,
+renamed, run without the flag, or simply not knowing that unit — is treated by
+the installer as unverified and is NOT installed.  That is why the lines carry
+the same ``[orchestrator_unit_parity]`` tag as everything else here: the
+installer already refuses to believe any output lacking that tag, so a renamed
+flag exits 2 with no tag, produces no verdicts, and installs nothing.
+
 KNOWN RED on this host
 ----------------------
 As measured 2026-08-02, the five ``orchestrator-*.service`` entries all
@@ -121,6 +168,14 @@ merely warning — a warning in a non-interactive ``set -e`` script scrolls
 past and the next line does the overwrite anyway.  An operator who has read
 the report and decided the committed side is right proceeds with
 ``DF_INSTALL_ORCH_UNITS=1``.  The gate never aborts the installer itself.
+
+Since task 4198 that skip is PER UNIT — the installer reads the verdict
+channel above and declines only the units that did not clear, installing the
+rest on the same run.  The policy is unchanged: a unit with a finding is
+still never overwritten without ``DF_INSTALL_ORCH_UNITS=1``.  So the four
+units in the second bullet are still protected from exactly the overwrite
+this section warns about, while a permanent, deliberate divergence on one
+unit no longer withholds the install from every other.
 
 Fixing all five is OWNED by the follow-up filed from task 3424 as ticket
 ``tkt_0RRZWH0V5F9PPG86A1WDJ3NV2R``.  Task 3424 deliberately converged only
@@ -195,7 +250,12 @@ import pathlib
 import sys
 from collections.abc import Sequence
 
-from systemd_unit_parity import parse_unit_directives
+# Both names live in scripts/systemd_unit_parity.py and are RE-EXPORTED here.
+# find_dropins was forked, code-identical, between this file and
+# check_dashboard_unit_parity.py until check_lms_unit_parity.py would have made
+# it three copies; this suite's existing find_dropins tests still call
+# mod.find_dropins, so they are what proves the lift was behaviour-preserving.
+from systemd_unit_parity import find_dropins, parse_unit_directives
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -204,6 +264,28 @@ from systemd_unit_parity import parse_unit_directives
 # Prefixed onto every line this script prints, so a parity report is greppable
 # the same way the dashboard checker's [dashboard_unit_parity] report is.
 LOG_TAG = "orchestrator_unit_parity"
+
+# The complete vocabulary of ``--print-verdicts`` kinds, in RENDERING
+# PRECEDENCE order: a unit carrying several kinds renders them in this
+# sequence, so ``drift,override`` is deterministic and never
+# ``override,drift``.  A consumer comparing verdict strings across two runs
+# (or diffing one host against another) can only do that if the order is a
+# contract rather than an artifact of set iteration.
+#
+# Public because it IS the contract: setup-host.sh must have a case arm for
+# every member, and a cross-artifact test derives this tuple from here and
+# asserts the installer handles each one.  Adding a kind without teaching the
+# installer about it would land a unit in the shell's ``*)`` fallback — a
+# warning naming no actionable cause, which is the silent degradation these
+# gates exist to prevent.
+VERDICT_KINDS: tuple[str, ...] = (
+    "clean",
+    "absent",
+    "drift",
+    "override",
+    "vanished",
+    "unreadable",
+)
 
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
@@ -333,32 +415,24 @@ def compare_unit(
     return drifts
 
 
-def find_dropins(installed_dir: pathlib.Path, unit_name: str) -> list[pathlib.Path]:
-    """Return the ``.conf`` drop-ins systemd would layer over *unit_name*.
+def _render_kinds(kinds: Sequence[str]) -> str:
+    """Render one unit's verdict kinds in VERDICT_KINDS precedence order.
 
-    ``systemctl --user edit`` does not modify the unit file; it writes
-    ``<unit>.d/override.conf`` beside it, and systemd merges that over the
-    unit at load time.  Reading only ``<installed-dir>/<unit>`` is therefore
-    blind to it: a drop-in setting ``AccuracySec=1min`` or ``Restart=no``
-    leaves every compared directive matching while the RUNNING configuration
-    is not the committed one — the precise claim this gate exists to make
-    checkable.
+    Ordering by the published tuple — rather than by insertion or by set
+    iteration — is what makes ``drift,override`` a CONTRACT: the same findings
+    always render the same string, so a consumer can diff one run's verdicts
+    against another's, or one host's against another's.
 
-    Not hypothetical on this host: no orchestrator unit has a drop-in today,
-    but ``~/.config/systemd/user/orchestrator-reify.service.d/`` exists, so
-    the mechanism is already in live use here.
-
-    Returns the sorted ``.conf`` files, or ``[]`` when the directory is absent
-    or holds none (systemd ignores non-``.conf`` files there, so this counts
-    exactly what would take effect — counting a stray ``override.conf.bak``
-    would report an override that has no effect at all).
-
-    Consulted EVEN WHEN the unit file itself is at parity; see main().
+    A kind outside the vocabulary is APPENDED rather than dropped by the
+    filter.  Dropping it would silently shrink a unit's verdict, and could
+    empty it entirely — which the consumer reads as "no verdict", i.e. a
+    unit skipped with no stated cause.  Surfacing it instead lands it in
+    setup-host.sh's loud ``*)`` arm, which names the kind verbatim.
     """
-    dropin_dir = installed_dir / f"{unit_name}.d"
-    if not dropin_dir.is_dir():
-        return []
-    return sorted(p for p in dropin_dir.glob("*.conf") if p.is_file())
+    present = set(kinds)
+    ordered = [kind for kind in VERDICT_KINDS if kind in present]
+    ordered += sorted(present.difference(VERDICT_KINDS))
+    return ",".join(ordered)
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +506,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "Default: all of " + ", ".join(sorted(UNITS))
         ),
     )
+    parser.add_argument(
+        "--print-verdicts",
+        action="store_true",
+        help=(
+            "Additionally emit one machine-readable "
+            f"'[{LOG_TAG}] verdict <unit> <kind>[,<kind>...]' line per selected "
+            "unit. Purely additive: the human report and every exit code are "
+            "unchanged. Kinds: " + ", ".join(VERDICT_KINDS)
+        ),
+    )
     return parser
 
 
@@ -463,6 +547,26 @@ def main(argv: Sequence[str]) -> int:
     # Units that actually reached compare_unit. The success line reports THIS
     # count, not len(selected): a report may only claim what it verified.
     compared: list[str] = []
+    # unit -> the VERDICT_KINDS members that apply to it, for --print-verdicts.
+    # Populated ALONGSIDE the buckets above, at the same points in the loop, so
+    # the machine channel and the human report can never describe different
+    # runs. Nothing here feeds the exit code or the report.
+    #
+    # The loop's control flow IS the precedence, and it is preserved exactly as
+    # it already stood: a `vanished` or `absent` unit takes a `continue` before
+    # drop-ins are ever consulted, so neither can be combined with anything —
+    # there is nothing installed to override, or nothing committed to compare.
+    # `unreadable` is reached AFTER the drop-in check, so an unreadable unit
+    # can legitimately also be `override`. `clean` requires both no drift and
+    # no drop-in, so it too is mutually exclusive with every other kind: the
+    # two install-eligible kinds (`clean`, `absent`) never appear alongside a
+    # blocking one, which is what lets the consumer decide per unit on the kind
+    # list alone.
+    verdicts: dict[str, list[str]] = {}
+
+    def _mark(unit: str, kind: str) -> None:
+        """Record *kind* for *unit*; order is imposed at render time."""
+        verdicts.setdefault(unit, []).append(kind)
 
     for name in selected:
         repo_path = repo_root / UNITS[name]
@@ -472,10 +576,12 @@ def main(argv: Sequence[str]) -> int:
             # The committed unit is the source of truth; without it there is
             # nothing to compare against, so this unit was NOT checked.
             vanished.append((name, repo_path))
+            _mark(name, "vanished")
             continue
 
         if not installed_path.is_file():
             missing.append((name, installed_path))
+            _mark(name, "absent")
             continue
 
         # Checked even when the unit itself is at parity: a drop-in is layered
@@ -484,6 +590,7 @@ def main(argv: Sequence[str]) -> int:
         dropins = find_dropins(installed_dir, name)
         if dropins:
             overridden.append((name, dropins))
+            _mark(name, "override")
 
         # is_file() above establishes the files EXIST, not that they can be
         # read: either side can be mode 000, or not valid UTF-8. Unguarded,
@@ -502,16 +609,44 @@ def main(argv: Sequence[str]) -> int:
             repo_text = repo_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             unreadable.append((name, repo_path, str(exc)))
+            _mark(name, "unreadable")
             continue
         try:
             installed_text = installed_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             unreadable.append((name, installed_path, str(exc)))
+            _mark(name, "unreadable")
             continue
 
         compared.append(name)
-        for drift in compare_unit(name, repo_text, installed_text):
+        unit_drifts = compare_unit(name, repo_text, installed_text)
+        for drift in unit_drifts:
             drifts.append((drift, repo_path, installed_path))
+
+        if unit_drifts:
+            _mark(name, "drift")
+        elif not dropins:
+            # Neither a directive diff nor a drop-in: this unit was actually
+            # compared and actually matched. `clean` is the only kind that
+            # asserts a positive measurement, so it is the only one gated on
+            # BOTH conditions.
+            _mark(name, "clean")
+
+    if args.print_verdicts:
+        # Emitted BEFORE the human summary blocks so a consumer reading the
+        # stream sees the machine lines first, and in sorted order so two runs
+        # over the same host render identically.
+        #
+        # A unit with no computed kind emits NO line, deliberately: the sole
+        # consumer (setup-host.sh section 5) treats a missing verdict as
+        # "unverified" and declines to install that unit. Skipping is therefore
+        # the SAFE direction — the alternative, a line with an empty kind
+        # field, would be malformed output a consumer might parse as a kind
+        # named "".
+        for name in sorted(selected):
+            kinds = verdicts.get(name)
+            if kinds:
+                _log(f"verdict {name} {_render_kinds(kinds)}")
 
     for name, path in missing:
         _log(f"[skip] {name}: installed unit not found: {path} (not installed on this host)")

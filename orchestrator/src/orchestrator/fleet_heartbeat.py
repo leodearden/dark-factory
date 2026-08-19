@@ -21,6 +21,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from shared import safe_io
+
 # Fleet-common heartbeat directory default.  Matches the stdlib watchdog's
 # hardcoded REPO_DIR (scripts/orchestrator-watchdog.py:70) so this producer
 # and the future reader (γ) agree with zero config coupling — all six units
@@ -75,20 +77,26 @@ def build_heartbeat_payload(
 def write_heartbeat(fleet_dir: Path, unit: str, payload: Mapping[str, Any]) -> Path:
     """Atomically write *payload* to ``<fleet_dir>/<unit>.json``.
 
-    Mirrors ``Scheduler._write_state_snapshot_raw`` (scheduler.py:4749):
-    creates missing parent directories, writes to a ``.json.tmp`` sibling,
-    then ``os.replace``s it into place so concurrent readers (γ, ε) never
-    observe a partial write. An empty/unresolved ``unit`` falls back to a
-    deterministic ``unknown-unit.json`` filename rather than a file
-    literally named ``.json``.
+    Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223), which
+    creates missing parent directories and does the tmp + ``os.replace`` dance
+    so concurrent readers (γ, ε) never observe a partial write. An
+    empty/unresolved ``unit`` falls back to a deterministic
+    ``unknown-unit.json`` filename rather than a file literally named
+    ``.json``.
+
+    ``mode`` is deliberately left at the helper's umask default rather than
+    narrowed: these heartbeats are read by other processes. Exceptions
+    propagate — this site has no fail-open boundary.
 
     Returns the final on-disk ``Path``.
     """
     fleet_dir = Path(fleet_dir)
-    fleet_dir.mkdir(parents=True, exist_ok=True)
     stem = unit if unit else _UNKNOWN_UNIT_STEM
     path = fleet_dir / f'{stem}.json'
-    tmp_path = path.with_suffix('.json.tmp')
-    tmp_path.write_text(json.dumps(payload), encoding='utf-8')
-    os.replace(tmp_path, path)
+    safe_io.atomic_write_text(
+        path,
+        json.dumps(payload),
+        encoding='utf-8',
+        mkdir=True,
+    )
     return path

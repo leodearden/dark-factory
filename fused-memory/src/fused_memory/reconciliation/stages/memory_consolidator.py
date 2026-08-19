@@ -150,6 +150,10 @@ class MemoryConsolidator(BaseStage):
     # None when durable_queue was unavailable or in remediation passes.
     graphiti_queue_health: dict | None = None
 
+    # FalkorDB index-provisioning health record — set by harness (task 3709).
+    # None when the graph was unreadable, absent, or in remediation passes.
+    index_health: dict | None = None
+
     # Cached project_status_correction memory vs. live get_statuses census
     # diff/supersede record — set by harness (task 1938).
     # None when the status map was unavailable or in remediation passes.
@@ -461,6 +465,32 @@ class MemoryConsolidator(BaseStage):
                         'project_id': self.project_id,
                         'run_id': run_id,
                         'dead_count': self.graphiti_queue_health.get('dead_count'),
+                    },
+                )
+
+        # ── FalkorDB index-provisioning health (task 3709 / PRD δ) ────────────
+        # Surface the index drift record so a graph serving queries without the
+        # indices it should have is visible in the Stage 1 report — ζ's
+        # activation verification reads this, so the HEALTHY case is surfaced
+        # too, not just the drifted one.
+        #
+        # Deliberately does NOT file the escalation here, unlike the
+        # HOR/gate-backlog path which is stage-only: the Q3 startup sweep has no
+        # stage, so the filing lives in the harness detector both paths share.
+        # A stage-resident filer would fork δ into two divergent detectors and
+        # leave the startup half unable to escalate at all.  This stage is a
+        # surfacing point only.
+        if self.index_health is not None:
+            report.stats['index_health'] = self.index_health
+            if not self.index_health.get('healthy', True):
+                logger.warning(
+                    'reconciliation.index_drift_stage1',
+                    extra={
+                        'project_id': self.project_id,
+                        'run_id': run_id,
+                        'group_id': self.project_id,
+                        'missing_count': len(self.index_health.get('missing') or []),
+                        'expected_total': self.index_health.get('expected_total'),
                     },
                 )
 

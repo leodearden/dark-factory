@@ -670,6 +670,70 @@ class TestPlanLock:
         assert lock_path.exists()
 
 
+class TestPlanLockRunId:
+    """``lock_plan`` persists the process-level run id (task 3563).
+
+    plan.lock historically carried only ``session_id``/``locked_at``/
+    ``owner_pid``, so ``TaskGroundTruth``'s PLAN_LOCK claimant source had no
+    run_id to compose a full ``compose_claimant_run_id`` identity from.
+    Recording it here makes the lock-derived identity byte-identical to the
+    DB claimant stamp that the SAME incarnation writes.
+
+    The key is written ONLY when the run id is known and non-blank, so an
+    ABSENT ``run_id`` unambiguously means "unknown" — covering both legacy
+    locks already on disk and harness-less (test/eval) workflows.  It must
+    never be written as ``''``, which the resolver could not distinguish from
+    a genuinely empty run_id component.
+    """
+
+    def test_lock_plan_persists_run_id_alongside_existing_keys(
+        self, artifacts: TaskArtifacts
+    ):
+        assert artifacts.lock_plan('sess-x', run_id='run-abc') is True
+        lock_data = artifacts.read_plan_lock()
+        assert lock_data is not None
+        assert lock_data['run_id'] == 'run-abc'
+        # The pre-existing keys are untouched.
+        assert lock_data['session_id'] == 'sess-x'
+        assert lock_data['owner_pid'] == os.getpid()
+        assert 'locked_at' in lock_data
+
+    def test_legacy_positional_call_writes_no_run_id_key(self, artifacts: TaskArtifacts):
+        """The un-widened call site must leave the key ABSENT, not empty."""
+        assert artifacts.lock_plan('sess-x') is True
+        lock_data = artifacts.read_plan_lock()
+        assert lock_data is not None
+        assert 'run_id' not in lock_data
+
+    @pytest.mark.parametrize(
+        'run_id',
+        [None, '', '   ', '\t\n'],
+        ids=['none', 'empty', 'spaces', 'whitespace'],
+    )
+    def test_unknown_or_blank_run_id_omits_the_key_entirely(
+        self, artifacts: TaskArtifacts, run_id
+    ):
+        assert artifacts.lock_plan('sess-x', run_id=run_id) is True
+        lock_data = artifacts.read_plan_lock()
+        assert lock_data is not None
+        assert 'run_id' not in lock_data, (
+            'a blank/unknown run_id must be omitted, never written as a '
+            'falsy value the resolver would mistake for a known component'
+        )
+
+    def test_run_id_does_not_change_acquire_semantics(self, artifacts: TaskArtifacts):
+        """The return contract is untouched: True on acquire, False when held."""
+        first = artifacts.lock_plan('sess-x', run_id='run-abc')
+        second = artifacts.lock_plan('sess-other', run_id='run-other')
+        assert first is True
+        assert second is False
+        # The loser must not have clobbered the winner's record.
+        lock_data = artifacts.read_plan_lock()
+        assert lock_data is not None
+        assert lock_data['session_id'] == 'sess-x'
+        assert lock_data['run_id'] == 'run-abc'
+
+
 class TestAgentSession:
     """Sidecar marker for in-flight agent subprocesses (crash-recovery resume).
 

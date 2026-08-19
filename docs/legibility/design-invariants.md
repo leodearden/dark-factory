@@ -12,7 +12,12 @@ cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
 ids are load-bearing: G7 waivers, `/review`'s `invariant_findings`, and
 the confusion census's optional `invariant_violated` field all reference
-them. Numeric aliases INV-1..INV-8 are prose convenience only.
+them. Numeric aliases are prose convenience only.
+
+Adding or removing an invariant? Append/remove its trigger shape in
+`skills/prd/references/gates.md` §G7 **in the same commit** — that list is
+hand-maintained and has drifted twice (2026-08-02, 2026-08-06); task 3802
+mechanizes the pairing check.
 
 ## INV-1 `contracts-machine-checked`
 
@@ -95,9 +100,9 @@ or prompt text that must stay in agreement with another site? What is the
 shared-helper / render-from-code alternative?
 
 **Survey evidence**: `canonical_queued_branch_name` un-normalized site
-(`server.py:1000`); already-merged guard duplicated until 5026;
-sibling-tool envelope divergence; hand-transcribed prompt text drifted
-twice in one file.
+(`escalation/src/escalation/server.py::merge_request`); already-merged
+guard duplicated until 5026; sibling-tool envelope divergence;
+hand-transcribed prompt text drifted twice in one file.
 
 **House pattern**: Extract helper (`canonical_queued_branch_name`); render
 prompts/examples from live schemas (2559) with drift/pinning tests.
@@ -179,8 +184,13 @@ over an upstream-bounded collection trips neither.
 touches: what is the worst-case wall time it holds the loop thread, and
 what makes that case worst rather than typical? If it iterates a
 collection doing work that can block or is non-trivial per item, who
-bounds that collection's size — "already bounded upstream, by pagination
-or a config cap or a fixed enum" is a complete answer — and which work
+bounds that collection's size — "already bounded upstream" is complete
+on its own only for small bounds (a fixed enum, a single-digit config
+cap); for anything page-sized or configurable, state the numeric bound
+and the worst-case per-item cost, because the product, not the existence
+of a bound, answers the question (this repo's own pagination contract
+permits page_size 2000; 2000 × 30 ms of fully non-blocking per-item CPU
+still holds the loop for ~60 s) — and which work
 inside the body is invariant across iterations? If it shells out, does
 the process spawn itself (fork/exec) run on the loop thread?
 
@@ -207,7 +217,7 @@ heartbeat firing above a threshold (INV-4 applied to scheduling).
 ## Census seam
 
 Incident records MAY carry an optional `invariant_violated: <slug>` field.
-The slug vocabulary is *this* doc — the eight ids above. The coding pipeline
+The slug vocabulary is *this* doc — the ids above. The coding pipeline
 that populates the field is owned by `plans/confusion-reduction-prd.md`,
 which ships the field in its γ task and names this doc reciprocally in its
 §10 (Cross-PRD relationship). A slug violated repeatedly across census

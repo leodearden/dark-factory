@@ -27,8 +27,20 @@ from collections.abc import Mapping
 from pathlib import Path
 
 # Fleet-common heartbeat directory default. Hardcoded mirror of
-# orchestrator.fleet_heartbeat.DEFAULT_FLEET_DIR -- pinned against silent
-# drift by test_drain_check.py's drift test (step-3).
+# orchestrator.fleet_heartbeat.DEFAULT_FLEET_DIR (this module is stdlib-only,
+# so it cannot import the canonical producer) -- pinned against silent drift
+# by test_drain_check.py's drift test (step-3) and, across all four mirrors
+# including the bash one in restart-all-orchestrators.sh, by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_dir_default_matches_across_tiers
+# (task 3799).
+#
+# ABSOLUTE, deliberately: data/fleet/ is a MACHINE-GLOBAL, CROSS-PROJECT
+# rendezvous directory (task 2395's Open-Q2) holding several projects'
+# orchestrator heartbeats, living under dark-factory/data/ only because
+# dark-factory is the fleet HOST. Making it repo-relative would make every
+# worktree read ZERO heartbeats and silently conclude the fleet is absent --
+# a fail-soft in the drain gate. Isolate tests by setting ORCH_FLEET_DIR
+# (df_pytest_isolation._df_fleet_dir_redirect) instead.
 DEFAULT_FLEET_DIR = Path('/home/leo/src/dark-factory/data/fleet')
 
 

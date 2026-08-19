@@ -39,6 +39,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
@@ -60,7 +61,7 @@ MEASURED_OPERATING_BUDGET_GIB = 16.37
 
 #: The non-arm baseline the figure above is the complement of: 4050 MiB
 #: whisper-writer plus ~3312 MiB of KDE/X11 graphics contexts.  Also a
-#: REFERENCE VALUE only -- see :func:`read_baseline`.  Subtracting a frozen
+#: REFERENCE VALUE only -- see :func:`read_baseline_record`.  Subtracting a frozen
 #: baseline from a live reading misattributes desktop drift to the arm, and in
 #: the fabrication-relevant direction: a desktop that shrank since 2026-08-05
 #: would hand the arm a discount it did not earn.
@@ -85,6 +86,28 @@ _NVIDIA_SMI_IDENTITY_QUERY = [
     '--format=csv,noheader',
 ]
 
+#: WHO holds the card, as opposed to HOW MUCH of it is held.  `memory.used`
+#: above cannot distinguish an arm's own allocation from a foreign process
+#: that happened to be resident at the same moment (task 3755).
+_NVIDIA_SMI_COMPUTE_APPS_QUERY = [
+    'nvidia-smi',
+    '--query-compute-apps=pid,process_name,used_memory',
+    '--format=csv,noheader,nounits',
+]
+
+#: What the consumer list is, and — more importantly — what it is not.
+#: Travels into the health artifact beside every inventory so a downstream
+#: reader cannot mistake it for a balance sheet of the card.
+CONSUMER_INVENTORY_NOTE = (
+    'INVENTORY, not an accounting: `nvidia-smi --query-compute-apps` lists only '
+    'CUDA compute applications. It does not list the KDE/X11 graphics contexts '
+    '(Xorg, plasmashell, kwin_x11, and ~40 small KDE clients) that hold the '
+    'remaining ~3.3 GiB on this host — which is exactly why the measured '
+    f'operating budget is ~{MEASURED_OPERATING_BUDGET_GIB} GiB rather than '
+    f'{NOMINAL_CEILING_GIB}. These entries name who else held the card; they do '
+    'not sum to memory.used.'
+)
+
 _INTEGER = re.compile(r'^\d+$')
 
 #: used + free never sums exactly to total (driver/ECC reserve ~450 MiB here),
@@ -105,6 +128,91 @@ class VramProbeError(Exception):
     ``used_mib = 0`` would report a *passing* budget with maximal headroom off
     a broken probe, which is exactly the reading an operator would trust.
     """
+
+
+class PollutedBaselineError(VramProbeError):
+    """A foreign process held the card when a baseline was to be recorded.
+
+    A :class:`VramProbeError` subclass on purpose, so every existing
+    ``except VramProbeError`` handler already catches it and a polluted
+    baseline cannot escape a caller that was written before this guard.
+    Callers that want the distinct exit code catch this one FIRST.
+
+    Carries :attr:`consumers` so a caller can print WHICH process to deal with
+    rather than only that something was wrong.
+    """
+
+    def __init__(self, consumers: Sequence[GpuConsumer], context: str = ''):
+        self.consumers = list(consumers)
+        offenders = '; '.join(
+            f'pid {c.pid} {c.process_name} holding {c.used_mib} MiB '
+            f'({c.used_gib} GiB)'
+            for c in self.consumers
+        )
+        lead = context or 'the GPU baseline is polluted'
+        super().__init__(
+            f'{lead}: {offenders}. Nothing but whisper-writer should hold this '
+            'card before an arm starts, so a baseline taken now would be '
+            "subtracted from the arm's footprint and misattribute another "
+            "process's memory. This tool does not stop or police those "
+            'processes (ollama self-expires on keep_alive); free the card and '
+            'start the arm again'
+        )
+
+
+class StaleBaselineError(VramProbeError):
+    """No usable baseline was recorded before this arm started.
+
+    Covers BOTH an absent file and one written before the consumer inventory
+    existed.  Those are one condition to an operator -- nothing usable was
+    recorded -- differing only in how far back the omission goes, and the remedy
+    never varies: ``lms_ctl start`` the arm again so a baseline is captured.
+
+    A :class:`VramProbeError` subclass for the same reason as
+    :class:`PollutedBaselineError`: every existing handler still catches it.
+    And it exists for the same reason too.  Routed through the generic branch
+    this reads as "the GPU probe failed", which sends someone to debug
+    nvidia-smi on a perfectly healthy card -- the exact operator-misdirection
+    class exit 7 was introduced to end.  The likeliest way to meet it is the
+    most ordinary one: an operator whose ``$XDG_RUNTIME_DIR`` still holds a
+    pre-guard baseline from the CURRENT boot, immediately after this lands.
+
+    Carries :attr:`path` so a caller can name the file, and :attr:`arm_id` so it
+    can name the command, rather than only that something was wrong.
+    """
+
+    def __init__(self, arm_id: str, path: Path, message: str):
+        self.arm_id = arm_id
+        self.path = path
+        super().__init__(message)
+
+
+class PollutedMeasurementError(VramProbeError):
+    """The card changed under the measurement, so the budget arithmetic is void.
+
+    Distinct from :class:`PollutedBaselineError`, which says the card was dirty
+    BEFORE the arm started.  This one says a non-arm consumer moved DURING the
+    run and drove the readings somewhere no subtraction can interpret --
+    typically the SHRINK/VANISH direction, where a baseline holder exits and
+    ``used`` lands below ``baseline``.
+
+    It exists because that case is otherwise indistinguishable, to a caller,
+    from a broken nvidia-smi: :func:`evaluate_budget` raises a plain
+    ``VramProbeError`` for it, and the CLI would report "the GPU probe failed"
+    (exit 4) for a probe that worked perfectly on a card that was polluted
+    (exit 7).  Same operator-misdirection class the ``lms_ctl`` refusal order
+    exists to prevent, and the same remedy: name the condition the operator can
+    actually act on.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(
+            f'the card changed under this measurement, so the budget '
+            f'arithmetic is void rather than merely unflattering: {reason}. '
+            'The GPU probe itself is fine; nothing about the arm was learned, '
+            'so no report was produced'
+        )
 
 
 class GpuReading(BaseModel):
@@ -142,13 +250,163 @@ class GpuIdentity(BaseModel):
     driver_version: str
 
 
+class GpuConsumer(BaseModel):
+    """One CUDA compute application holding VRAM, as nvidia-smi names it.
+
+    The unit of :data:`CONSUMER_INVENTORY_NOTE`.  ``memory.used`` answers how
+    much of the card is held; this answers by whom, which is the only thing
+    that can tell an arm's own allocation apart from a foreign process that
+    happened to be resident at the same moment.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    pid: int
+    process_name: str
+    used_mib: int
+
+    @property
+    def used_gib(self) -> float:
+        return round(self.used_mib / MIB_PER_GIB, 2)
+
+
+class PollutionState(StrEnum):
+    """Whether a VRAM measurement can be attributed to the arm at all.
+
+    A StrEnum so it serialises as a plain string under
+    ``model_dump(mode='json')`` and a downstream filter can match on it without
+    knowing this module.
+    """
+
+    #: Nobody but the expected residents held the card across the measurement.
+    CLEAN = 'CLEAN'
+    #: A foreign process moved on the card. The budget arithmetic is void — not
+    #: merely unflattering. Nothing was learned about the arm.
+    POLLUTED = 'POLLUTED'
+    #: Nobody looked. Emitted by NO code path in this package; it exists only
+    #: so an artifact written before this guard still parses, and reads
+    #: honestly as "unmeasured" rather than defaulting to CLEAN.
+    UNMEASURED = 'UNMEASURED'
+
+
+class ConsumerPattern(BaseModel):
+    """A named process signature, matched against ``process_name``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    name_pattern: str
+
+    def matches(self, process_name: str) -> bool:
+        return re.search(self.name_pattern, process_name) is not None
+
+
+class ExpectedConsumer(ConsumerPattern):
+    """One process this host is KNOWN to run on the GPU at baseline.
+
+    A ceiling, not just a name: an allowlist keyed on the process name alone
+    would let anything calling itself ``python`` sit in a "clean" baseline at
+    any size.
+    """
+
+    ceiling_mib: int
+
+
+#: Below this a consumer cannot move a budget verdict, and flagging it would
+#: make the guard cry wolf until an operator learns to ignore it.  The task's
+#: "~1 GiB".
+POLLUTION_FLOOR_MIB = 1024
+
+#: The ONLY process this host is expected to be running on the GPU when an arm
+#: has not started yet.  PRD D10 requires whisper-writer resident, so it is
+#: the allowlist and not an exception to it.
+#:
+#: The ceiling is DERIVED, not guessed: every whisper-writer reading recorded on
+#: this host is 4050 MiB, and 6144 sits far above that (leaving room for reload
+#: drift) and far below the 10314 MiB ollama holding that motivated this guard.
+#: Its only failure direction is a false REFUSAL, which is loud and gets fixed.
+#:
+#: Deliberately a module constant with NO environment override.  An env var
+#: could silence this guard invisibly, leaving no trace in any diff or
+#: artifact — the same class of hole the frozen baseline esc-3713-6 removed.
+#: Changing what this host is expected to run is a code change with a
+#: reviewable diff.  (`LMS_BASELINE_DIR` is not a counterexample: it redirects
+#: WHERE a measurement is stored, not what counts as a passing one.)
+#:
+#: The NAME pattern admits the versioned interpreter spellings nvidia-smi
+#: actually reports -- `python`, `python3`, `python3.12`, and any of those with
+#: a path -- because whisper-writer under a venv or after a distro interpreter
+#: bump is a ROUTINE event, not an exotic one.  An anchor of `python3?$` alone
+#: would turn each of those restarts into an exit-5 refusal on a perfectly
+#: clean card, pointing the operator at ollama.  A false refusal is the safe
+#: direction for a genuine intruder; it is not a safe direction for the one
+#: process this host is required to be running.  The `$` and the `(?:^|/)`
+#: still hold the line: `pythonish` and `/opt/not-python` match nothing.
+EXPECTED_CONSUMERS: tuple[ExpectedConsumer, ...] = (
+    ExpectedConsumer(
+        label='whisper-writer (PRD D10 requires it resident)',
+        name_pattern=r'(?:^|/)python(?:3(?:\.\d+)?)?$',
+        ceiling_mib=6144,
+    ),
+)
+
+#: Processes known to hold this card that are definitely NOT an arm.  Used only
+#: at probe time, where the positive allowlist above cannot be applied.
+#:
+#: ``ollama.service`` is a persistent unit on this host and holds its model on
+#: ``keep_alive``; on 2026-08-06 it held 10314 MiB through a whole slate run.
+#: The ``/usr/local/lib/ollama/`` path is what makes it decidable -- a
+#: containerised vLLM arm never matches it, so this cannot fire on a healthy
+#: run.  Same no-environment-override discipline as :data:`EXPECTED_CONSUMERS`.
+KNOWN_FOREIGN_CONSUMERS: tuple[ConsumerPattern, ...] = (
+    ConsumerPattern(
+        label='ollama (persistent unit; holds its model on keep_alive)',
+        name_pattern=r'(?:^|/)ollama/',
+    ),
+)
+
+
+class GpuBaseline(BaseModel):
+    """What the card held immediately before one arm started.
+
+    The reading and the inventory travel together as ONE value because they
+    describe one moment.  A reading taken at one instant paired with an
+    inventory from another would describe a card that never existed, and
+    nothing downstream could detect the mismatch.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    reading: GpuReading
+    consumers: list[GpuConsumer]
+    measured_at: datetime
+    #: Arms the operator KNOWINGLY left resident when this baseline was taken
+    #: (`lms_ctl start --no-exclusive`).  Empty means the card was expected to
+    #: hold nothing of ours, which is the strict reading and the default: a
+    #: record that does not say otherwise excuses nobody.  See
+    #: :func:`unexpected_baseline_consumers` for what a non-empty list relaxes.
+    coresident_arms: list[str] = []
+
+
 class GpuSnapshot(BaseModel):
-    """One atomic "what the GPU is and what it currently holds"."""
+    """What the GPU is, what it holds, and who is holding it, from one moment.
+
+    ONE MOMENT, not one instant -- see :func:`probe_gpu_snapshot` for the
+    window this is assembled across and why probe time is deliberately not
+    bracketed the way a baseline capture is.  Calling it atomic would claim a
+    guarantee three separate nvidia-smi invocations cannot give.
+
+    *consumers* is REQUIRED, not optional.  An optional inventory would let a
+    call site build a snapshot carrying no evidence about who else held the
+    card at the moment of the reading, and downstream that absence reads as
+    "nobody else was there".
+    """
 
     model_config = ConfigDict(frozen=True)
 
     identity: GpuIdentity
     reading: GpuReading
+    consumers: list[GpuConsumer]
 
 
 class BudgetVerdict(BaseModel):
@@ -303,14 +561,364 @@ def probe_gpu_identity(runner: GpuRunner | None = None) -> GpuIdentity:
     return parse_nvidia_smi_identity_csv(output)
 
 
-def probe_gpu_snapshot(runner: GpuRunner | None = None) -> GpuSnapshot:
-    """Identity plus a live memory reading, as one value.
+def parse_nvidia_smi_compute_apps_csv(text: str) -> list[GpuConsumer]:
+    """Parse `--query-compute-apps=pid,process_name,used_memory` rows.
 
-    Two nvidia-smi calls rather than one wide query, so the strict three-field
+    EMPTY OUTPUT IS A LEGITIMATE EMPTY LIST, and that is the one place this
+    parser is deliberately laxer than :func:`parse_nvidia_smi_csv`.  A card
+    with no compute application on it prints nothing at all, and that is
+    precisely the reading a clean baseline is supposed to produce; raising
+    there would make the healthiest possible slate the one this tooling
+    refuses to record.  A row that is PRESENT but unreadable is the opposite
+    case and always raises: a blank, ``[N/A]``, non-integer or unit-suffixed
+    field, a header row (the caller dropped ``noheader``), or fewer than three
+    fields.
+
+    One bad row poisons the whole inventory rather than being skipped.  A
+    partial list that reads as complete is exactly what would let an unlisted
+    holder pass for absent — the failure this guard exists to prevent.
+
+    Each row is split on its FIRST and LAST comma, not on every comma: a
+    process path may legitimately contain one, and treating that as a
+    field-count error would turn a real (possibly large) GPU holder into a
+    blanket refusal.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    consumers: list[GpuConsumer] = []
+    for line in lines:
+        first = line.find(',')
+        last = line.rfind(',')
+        if first == -1 or last == first:
+            raise VramProbeError(
+                f'expected 3 comma-separated fields (pid, process_name, '
+                f'used_memory) in compute-apps row {line!r}'
+            )
+
+        pid_field = line[:first].strip()
+        process_name = line[first + 1:last].strip()
+        used_field = line[last + 1:].strip()
+
+        if not _INTEGER.match(pid_field) or not _INTEGER.match(used_field):
+            raise VramProbeError(
+                f'nvidia-smi compute-apps row {line!r} carries a non-integer pid '
+                'or used_memory. A blank, a [N/A], a units suffix (the caller '
+                'dropped `nounits`) or a header row all land here; none may be '
+                'coerced to 0, which would hide a process holding the card'
+            )
+        if not process_name or process_name.startswith('[N/A'):
+            raise VramProbeError(
+                f'nvidia-smi compute-apps row {line!r} names no process; an '
+                'anonymous holder cannot be told apart from the arm itself'
+            )
+
+        consumers.append(GpuConsumer(
+            pid=int(pid_field),
+            process_name=process_name,
+            used_mib=int(used_field),
+        ))
+
+    return consumers
+
+
+def probe_gpu_consumers(runner: GpuRunner | None = None) -> list[GpuConsumer]:
+    """Read who currently holds VRAM on this card.
+
+    Same injected-runner discipline as :func:`probe_gpu`: the subprocess never
+    runs in this suite, and a probe failure raises rather than yielding an
+    empty list.  An empty list means "nobody holds the card", which is a
+    materially different claim from "the probe did not run".
+    """
+    run = runner if runner is not None else _default_runner
+    try:
+        output = run(list(_NVIDIA_SMI_COMPUTE_APPS_QUERY))
+    except Exception as exc:
+        raise VramProbeError(
+            f'could not run {" ".join(_NVIDIA_SMI_COMPUTE_APPS_QUERY)}: {exc}'
+        ) from exc
+    return parse_nvidia_smi_compute_apps_csv(output)
+
+
+def matching_foreign_pattern(consumer: GpuConsumer) -> ConsumerPattern | None:
+    """The :data:`KNOWN_FOREIGN_CONSUMERS` entry this consumer wears, if any.
+
+    Authored once because three call sites need the SAME answer and would
+    otherwise each re-derive it: the baseline guard, the probe-time
+    classifier, and ``lms_ctl.start`` deciding whether a refusal could
+    possibly be a co-resident arm.  A pattern added here must not become
+    decidable in one of them and not the others.
+    """
+    return next(
+        (p for p in KNOWN_FOREIGN_CONSUMERS if p.matches(consumer.process_name)),
+        None,
+    )
+
+
+def unexpected_baseline_consumers(
+    consumers: Sequence[GpuConsumer],
+    *,
+    coresident_arms: Sequence[str] = (),
+) -> list[GpuConsumer]:
+    """Which of these has no business holding the card before an arm starts?
+
+    A POSITIVE ALLOWLIST, and that choice is the crux of the design.
+    ``lms_ctl.start`` records the baseline BEFORE ``systemctl start``, so at
+    that instant nothing of ours is on the card: any consumer over
+    :data:`POLLUTION_FLOOR_MIB` that is not in :data:`EXPECTED_CONSUMERS` is a
+    surprise.  There is no false-positive direction to protect, so the strictest
+    possible rule is also the safest one — it catches ollama and equally
+    catches whatever nobody anticipated.
+
+    *coresident_arms* is the ONE case where that premise does not hold, and it
+    is a documented, supported one: ``lms_ctl start --no-exclusive`` starts an
+    arm while another arm's unit is deliberately left running ("you have
+    checked the arithmetic yourself", README "One arm at a time").  Then
+    something of ours IS legitimately on the card at baseline, and
+    ``--query-compute-apps=pid,process_name,used_memory`` cannot tell that
+    containerised vLLM ``python`` from any other ``python`` -- the same
+    undecidability :func:`classify_pollution` documents.  So a NON-EMPTY
+    *coresident_arms* narrows this to the negative rule that is still decidable:
+    a consumer over the floor offends only if it matches
+    :data:`KNOWN_FOREIGN_CONSUMERS`.  ollama is still refused; an unrecognised
+    holder is excused rather than misdiagnosed as one.
+
+    That relaxation is deliberately NOT free, and the caller pays for it: the
+    excused consumers are recorded verbatim in the baseline inventory, the
+    arm ids that bought the excuse are recorded beside them
+    (:attr:`GpuBaseline.coresident_arms`), and :func:`classify_pollution` still
+    catches any DRIFT in those pids between baseline and probe.  An empty
+    *coresident_arms* -- the default, and what an older baseline file with no
+    such key reads as -- excuses nobody.
+
+    :func:`classify_pollution` deliberately CANNOT use the strict rule at all.
+    At probe time the arm's own container is legitimately a new consumer, so
+    this allowlist there would flag every healthy run.  The asymmetry is
+    intended.
+
+    Size matters as much as name: an allowlist keyed on the process name alone
+    would let a leftover containerised vLLM sit in a "clean" baseline under the
+    name ``python`` and be subtracted from the next arm's footprint.
+    """
+    offenders: list[GpuConsumer] = []
+    for consumer in consumers:
+        if consumer.used_mib < POLLUTION_FLOOR_MIB:
+            continue
+        if coresident_arms:
+            if matching_foreign_pattern(consumer) is not None:
+                offenders.append(consumer)
+            continue
+        expected = any(
+            entry.matches(consumer.process_name)
+            and consumer.used_mib <= entry.ceiling_mib
+            for entry in EXPECTED_CONSUMERS
+        )
+        if not expected:
+            offenders.append(consumer)
+    return offenders
+
+
+def classify_pollution(
+    baseline_consumers: Sequence[GpuConsumer],
+    probe_consumers: Sequence[GpuConsumer],
+) -> tuple[PollutionState, str]:
+    """Can the memory delta between these two readings be attributed to the arm?
+
+    NOT the same rule as :func:`unexpected_baseline_consumers`, and the
+    asymmetry is the crux of the design.  Arms run as docker containers,
+    nvidia-smi reports HOST pids, and
+    ``--query-compute-apps=pid,process_name,used_memory`` cannot tell a
+    containerised vLLM ``python`` from any other ``python``.  So at probe time
+    the arm's own container is an unrecognisable newcomer, and a negative
+    allowlist would mark every healthy run POLLUTED.
+
+    Two things ARE decidable, and this function uses only those:
+
+    1. A NEWCOMER matching :data:`KNOWN_FOREIGN_CONSUMERS` over the floor.
+       ollama's ``/usr/local/lib/ollama/`` path is not something an arm wears.
+    2. Any change over the floor in a consumer PRESENT AT BOTH readings,
+       matched by pid.  Such a consumer is non-arm by construction: the arm was
+       not running when the baseline was taken.
+
+    BOTH DIRECTIONS of (2) are pollution.  Growth over-charges the arm.  A
+    shrink -- or a vanish -- UNDER-charges it, leaving ``used - baseline``
+    smaller than the arm truly took, and that flattering direction is precisely
+    the one a fabricated artifact wants.  Passing for the wrong reason is not a
+    pass.
+
+    THE NAMED RESIDUAL: a newcomer that matches no foreign pattern and is not
+    the arm cannot be discriminated from ``--query-compute-apps`` alone.  It is
+    recorded verbatim in the report's inventory as the audit trail rather than
+    silently attributed to anybody.  Resolving it exactly would need
+    ``docker top`` or cgroup introspection to map host pids back to
+    ``lms-arm-<arm_id>`` containers; that buys a new docker dependency and a
+    resolver whose own failure would mark every real run POLLUTED, so it is
+    deliberately out of scope.  Stating the limit is honest; implying full
+    attribution would not be.
+    """
+    reasons: list[str] = []
+
+    baseline_by_pid = {c.pid: c for c in baseline_consumers}
+    probe_by_pid = {c.pid: c for c in probe_consumers}
+
+    for consumer in probe_consumers:
+        if consumer.pid in baseline_by_pid:
+            continue
+        if consumer.used_mib < POLLUTION_FLOOR_MIB:
+            continue
+        foreign = matching_foreign_pattern(consumer)
+        if foreign is not None:
+            reasons.append(
+                f'{foreign.label} arrived while the arm ran: pid {consumer.pid} '
+                f'{consumer.process_name} holding {consumer.used_mib} MiB '
+                f'({consumer.used_gib} GiB). Its memory is inside the probe '
+                "reading and is charged to the arm by `used - baseline`"
+            )
+
+    for pid, before in baseline_by_pid.items():
+        after = probe_by_pid.get(pid)
+        now_mib = after.used_mib if after is not None else 0
+        drift = now_mib - before.used_mib
+        if abs(drift) < POLLUTION_FLOOR_MIB:
+            continue
+        # Present before the arm started, so by construction not the arm.
+        if drift > 0:
+            reasons.append(
+                f'pid {pid} {before.process_name} GREW from {before.used_mib} to '
+                f'{now_mib} MiB while the arm ran (+{drift} MiB). It was on the '
+                'card before the arm started, so that growth is not the arm, '
+                'but `used - baseline` OVER-CHARGES the arm for it'
+            )
+        else:
+            gone = ' (it is gone from the probe reading entirely)' if after is None else ''
+            reasons.append(
+                f'pid {pid} {before.process_name} SHRANK from {before.used_mib} to '
+                f'{now_mib} MiB while the arm ran ({drift} MiB){gone}. This is the '
+                'FLATTERING direction: `used - baseline` now UNDER-CHARGES the '
+                'arm by that much, so a PASS here would be a pass for the wrong '
+                'reason'
+            )
+
+    if not reasons:
+        return PollutionState.CLEAN, ''
+    return PollutionState.POLLUTED, '; '.join(reasons)
+
+
+def unstable_capture_consumers(
+    before: Sequence[GpuConsumer], after: Sequence[GpuConsumer],
+) -> list[GpuConsumer]:
+    """Who moved on the card WHILE a baseline was being captured.
+
+    A memory reading and a consumer inventory come from separate nvidia-smi
+    invocations, so pairing them is a claim about a WINDOW, not an instant.
+    Sandwiching the reading between two inventories makes that window
+    checkable: if the two disagree, the reading in the middle belongs to
+    neither of them, and the pair describes a card that never existed.
+
+    The direction that motivates this is the FLATTERING one, and it is silent.
+    If ollama allocates before the reading and its keep_alive then expires
+    before the inventory, the baseline carries its ~10 GiB while the inventory
+    looks clean: :func:`assert_clean_baseline` sees nothing wrong, an inflated
+    baseline is recorded, and every later ``used - baseline`` UNDER-charges the
+    arm.  Nothing downstream can detect it -- ``classify_pollution`` finds no
+    foreign newcomer and no drift, because by then the mover is gone from both
+    readings.  A disagreement between the two inventories is the only evidence
+    that survives, so it is treated as pollution in its own right.
+
+    Tolerance is :data:`POLLUTION_FLOOR_MIB`, the same floor as everywhere else:
+    below it a mover cannot move a verdict, and an exact-equality rule would
+    refuse a start over whisper-writer's ordinary jitter.
+
+    Returns the movers themselves -- an arrival and a growth as they appear
+    AFTER, a departure and a shrink as they appeared BEFORE, since that is the
+    memory the reading in the middle may have been charged.  Empty means the
+    two inventories agree to within the floor.
+
+    THE NAMED RESIDUAL: this narrows the window, it does not abolish it.  A
+    process that both arrives and leaves entirely between the first inventory
+    and the reading is invisible to both, and no arrangement of separate
+    nvidia-smi calls can see it.  What is left is a sub-second race against a
+    consumer that vanishes as fast as it appeared, rather than the minutes-long
+    keep_alive holding that motivated the guard.
+    """
+    was = {c.pid: c for c in before}
+    now = {c.pid: c for c in after}
+    movers = [
+        now[pid] for pid in sorted(set(now) - set(was))
+        if now[pid].used_mib >= POLLUTION_FLOOR_MIB
+    ]
+    movers += [
+        was[pid] for pid in sorted(set(was) - set(now))
+        if was[pid].used_mib >= POLLUTION_FLOOR_MIB
+    ]
+    movers += [
+        now[pid] for pid in sorted(set(was) & set(now))
+        if abs(now[pid].used_mib - was[pid].used_mib) >= POLLUTION_FLOOR_MIB
+    ]
+    return movers
+
+
+def probe_baseline_capture(
+    runner: GpuRunner | None = None,
+) -> tuple[GpuReading, list[GpuConsumer]]:
+    """A baseline memory reading and the inventory that explains it.
+
+    Inventory, reading, inventory -- so the reading in the middle is bracketed
+    by two observations of who held the card, and a mover between them is
+    caught rather than silently baked into the number.  See
+    :func:`unstable_capture_consumers` for what that catches, what it costs,
+    and the residual it does not close.
+
+    Raises :class:`PollutedBaselineError` on a mover, which makes this a PROBE
+    that refuses to hand back a self-inconsistent capture -- the same thing
+    :func:`parse_nvidia_smi_csv` does with an incoherent reading -- and NOT a
+    policy refusal composed in ``lms_ctl.start``.  That distinction is
+    load-bearing: every ARM-admission refusal lives in ``lms_ctl.preflight``,
+    in one order, and this must not become a second place that decides them.
+    It cannot fire on a co-resident arm, either: an arm that was already
+    running appears in BOTH inventories and so is not a mover.
+
+    The LATER inventory is returned.  It is the one adjacent to the moment
+    ``record_baseline`` stamps, and by then the two are known to agree.
+    """
+    before = probe_gpu_consumers(runner)
+    reading = probe_gpu(runner)
+    after = probe_gpu_consumers(runner)
+    movers = unstable_capture_consumers(before, after)
+    if movers:
+        raise PollutedBaselineError(
+            movers,
+            context=(
+                'the GPU baseline capture is not self-consistent: the card '
+                'moved while it was being taken, so the memory reading and the '
+                'inventory beside it describe different cards. Moved'
+            ),
+        )
+    return reading, after
+
+
+def probe_gpu_snapshot(runner: GpuRunner | None = None) -> GpuSnapshot:
+    """Identity, a live memory reading, and who is holding it, as one value.
+
+    Three nvidia-smi calls rather than one wide query, so the strict three-field
     memory parser -- the one whose failure would misreport the budget -- keeps
     its exact shape and its existing coverage.
+
+    THE NAMED RESIDUAL: three calls means a window, so this is one capture in
+    the sense that it describes one moment to within a few milliseconds -- not
+    an atomic one.  Deliberately NOT bracketed the way
+    :func:`probe_baseline_capture` is, and the asymmetry is the same one that
+    runs through this module: at baseline nothing of ours is on the card, so
+    any mover is a surprise; at PROBE time the arm itself is legitimately
+    allocating (vLLM may still be growing its KV cache), so refusing on any
+    movement would fail healthy runs.  Probe-time movement is judged against
+    the baseline instead, by :func:`classify_pollution`, which knows which
+    movements mean something.
     """
-    return GpuSnapshot(identity=probe_gpu_identity(runner), reading=probe_gpu(runner))
+    return GpuSnapshot(
+        identity=probe_gpu_identity(runner),
+        reading=probe_gpu(runner),
+        consumers=probe_gpu_consumers(runner),
+    )
 
 
 def gpu_memory_utilization_for(budget_gib: float, total_gib: float) -> float:
@@ -353,7 +961,7 @@ def evaluate_budget(
     so the arm is what gets judged.
 
     *baseline_mib* / *baseline_free_mib* come from an nvidia-smi reading taken
-    immediately BEFORE this arm started (see :func:`read_baseline`), never from
+    immediately BEFORE this arm started (see :func:`read_baseline_record`), never from
     :data:`MEASURED_BASELINE_GIB`.  Both reference figures still travel with the
     verdict as reported, non-gating fields.
 
@@ -453,14 +1061,78 @@ def baseline_path(arm_id: str) -> Path:
     return baseline_dir() / f'{arm_id}.json'
 
 
-def record_baseline(arm_id: str, reading: GpuReading) -> Path:
-    """Persist the pre-start GPU reading for *arm_id*.
+def assert_clean_baseline(
+    consumers: Sequence[GpuConsumer],
+    *,
+    context: str = '',
+    coresident_arms: Sequence[str] = (),
+) -> None:
+    """Raise :class:`PollutedBaselineError` if anything foreign holds the card.
+
+    *coresident_arms* is passed straight through to
+    :func:`unexpected_baseline_consumers`; see there for what a non-empty list
+    narrows the rule to, and why only ``--no-exclusive`` may supply one.
+
+    Exists so the offending-consumer message is authored ONCE and every caller
+    raises the identical, pid-naming error.  There are two callers on purpose,
+    and they are doing different jobs:
+
+    * ``lms_ctl.start`` calls it FIRST, ahead of the pre-flight, to fix
+      operator MISDIRECTION -- see that function for why the order is
+      load-bearing.
+    * :func:`record_baseline` calls it again at the write, as the DATA
+      INTEGRITY backstop: no polluted baseline is ever persisted, whatever a
+      caller did or did not check first.
+    """
+    offenders = unexpected_baseline_consumers(
+        consumers, coresident_arms=coresident_arms,
+    )
+    if offenders:
+        raise PollutedBaselineError(offenders, context=context)
+
+
+def record_baseline(
+    arm_id: str,
+    reading: GpuReading,
+    *,
+    consumers: Sequence[GpuConsumer],
+    coresident_arms: Sequence[str] = (),
+) -> Path:
+    """Persist the pre-start GPU reading AND inventory for *arm_id*.
 
     Called by ``lms_ctl.start`` between the pre-flight and ``systemctl start``.
     Recording it AT THE START EVENT, rather than accepting it as a healthcheck
     flag, is the anti-fabrication property: the number is produced by the act
     of starting the arm and cannot be typed in afterwards to make a report fit.
+
+    REFUSES a polluted baseline, and refuses it BEFORE any write, so no
+    polluted file ever exists for a later reader to pick up and no
+    truncate-then-fail can destroy a good measurement.  This is the same
+    refusal already sited in ``lms_ctl.start`` for a failed pre-flight: a
+    refused arm leaves nothing behind for another arm's report to find.
+    Writing-and-flagging would not do -- the file would still be the number the
+    next healthcheck subtracts, and the flag only helps a reader who thought to
+    look.
+
+    *consumers* is REQUIRED and keyword-only, not optional.  An optional
+    inventory would let a caller record a baseline carrying no evidence about
+    who else held the card, and downstream that absence reads as "clean".
+
+    *coresident_arms* names the arms a ``--no-exclusive`` start knowingly left
+    on the card.  It is PERSISTED, not merely consulted: every later reader of
+    this file -- the healthcheck included -- must apply the same relaxed rule
+    to the same inventory, and a relaxation that lived only in the caller's
+    memory would make the identical file mean two different things depending
+    on who read it.
     """
+    consumers = list(consumers)
+    coresident_arms = list(coresident_arms)
+    assert_clean_baseline(
+        consumers,
+        context=f'refusing to record a baseline for arm {arm_id!r}',
+        coresident_arms=coresident_arms,
+    )
+
     path = baseline_path(arm_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -469,53 +1141,92 @@ def record_baseline(arm_id: str, reading: GpuReading) -> Path:
         'total_mib': reading.total_mib,
         'used_mib': reading.used_mib,
         'free_mib': reading.free_mib,
+        'consumers': [consumer.model_dump(mode='json') for consumer in consumers],
+        'coresident_arms': coresident_arms,
     }
     path.write_text(json.dumps(payload, indent=2) + '\n')
     return path
 
 
-def read_baseline(arm_id: str) -> GpuReading:
-    """The reading taken immediately before *arm_id* started.
+def read_baseline_record(arm_id: str) -> GpuBaseline:
+    """The reading AND inventory taken immediately before *arm_id* started.
 
     Raises rather than falling back to :data:`MEASURED_BASELINE_GIB`.  A default
     here would silently reintroduce the frozen baseline esc-3713-6 ruled out,
     and the artifact would look identical either way -- which is exactly the
     class of wrong answer this package refuses to emit.
+
+    A payload with no ``consumers`` key -- one written before this guard
+    existed -- raises for the same reason.  Defaulting it to ``[]`` would make
+    the one baseline we know NOTHING about look like the cleanest possible
+    reading.  Baselines live in ``$XDG_RUNTIME_DIR`` and are per-boot, so the
+    staleness window is bounded and the fix is one command.
+
+    Both of those raise :class:`StaleBaselineError` specifically, so the CLI can
+    say "re-take the baseline" instead of "the GPU probe failed".  An
+    UNREADABLE file does not: corrupt JSON is a genuine defect in the store, not
+    a missing capture, and telling an operator to re-run the same command that
+    just wrote garbage would be the wrong advice.
     """
     path = baseline_path(arm_id)
     if not path.exists():
-        raise VramProbeError(
+        raise StaleBaselineError(
+            arm_id, path,
             f'no baseline recorded for arm {arm_id!r} at {path}. The budget '
             'verdict needs the nvidia-smi reading taken before this arm '
-            'started; start it through `lms_ctl start` so the baseline is '
-            'captured, and do not substitute the frozen '
-            f'{MEASURED_BASELINE_GIB} GiB reference value'
+            f'started; start it through `lms_ctl start {arm_id}` so the '
+            'baseline is captured, and do not substitute the frozen '
+            f'{MEASURED_BASELINE_GIB} GiB reference value',
         )
     try:
         payload = json.loads(path.read_text())
-        return GpuReading(
-            total_mib=payload['total_mib'],
-            used_mib=payload['used_mib'],
-            free_mib=payload['free_mib'],
+        if 'consumers' not in payload:
+            raise StaleBaselineError(
+                arm_id, path,
+                f'baseline file {path} records no GPU consumer inventory, so '
+                'there is no evidence about who else held the card when it was '
+                'taken. Treating that as an empty (clean) list would flatter '
+                'the one baseline nothing is known about; re-take it with '
+                f'`lms_ctl start {arm_id}`',
+            )
+        return GpuBaseline(
+            reading=GpuReading(
+                total_mib=payload['total_mib'],
+                used_mib=payload['used_mib'],
+                free_mib=payload['free_mib'],
+            ),
+            consumers=[GpuConsumer(**entry) for entry in payload['consumers']],
+            measured_at=datetime.fromisoformat(payload['measured_at']),
+            # Absent means NOBODY was excused, which is the strict reading and
+            # the safe direction: an older file cannot silently acquire an
+            # excuse it never earned.  Unlike `consumers`, whose absence is
+            # fatal, a missing key here cannot flatter anything -- it can only
+            # make the guard stricter than the writer intended.
+            coresident_arms=list(payload.get('coresident_arms', [])),
         )
-    except (json.JSONDecodeError, KeyError, TypeError, ValidationError) as exc:
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError,
+            ValidationError) as exc:
         raise VramProbeError(f'baseline file {path} is unreadable: {exc}') from exc
 
 
-def read_baselines(arm_ids: Sequence[str]) -> GpuReading:
-    """One baseline for a set of arms probed together.
+def read_baseline_records(arm_ids: Sequence[str]) -> GpuBaseline:
+    """One baseline record for a set of arms probed together.
 
     The LOWEST prior usage wins.  With several arms up, that reading attributes
     the MOST memory to them collectively, so the choice can only ever be
     unflattering -- the opposite of the direction a fabricated artifact wants.
+
+    The whole RECORD is chosen, never a reading from one arm and an inventory
+    from another: that pair would describe a card that never existed, and the
+    mismatch would be invisible in the artifact.
     """
     if not arm_ids:
         raise VramProbeError(
             'no arms to read a baseline for; a budget verdict over zero arms '
             'would describe nothing'
         )
-    readings = [read_baseline(arm_id) for arm_id in arm_ids]
-    return min(readings, key=lambda r: r.used_mib)
+    records = [read_baseline_record(arm_id) for arm_id in arm_ids]
+    return min(records, key=lambda record: record.reading.used_mib)
 
 
 def clear_baseline(arm_id: str) -> None:

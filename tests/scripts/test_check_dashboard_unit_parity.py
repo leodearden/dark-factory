@@ -24,11 +24,20 @@ tests/scripts/test_check_fused_memory_unit_parity.py::_load_checker.
 import importlib.util
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import types
 
 import pytest
+from setup_host_sections import (
+    checker_repo,
+    run_section,
+    setup_host_text,
+    slice_section,
+    usage_error_checker,
+    write_checker,
+)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_dashboard_unit_parity.py"
@@ -1228,8 +1237,26 @@ def test_registry_exec_start_flags_are_really_on_the_committed_command():
             )
 
 
-def test_registry_environment_sections_really_declare_environment():
-    """STALENESS GUARD, Environment edition."""
+def test_registry_environment_sections_name_a_section_the_committed_unit_has():
+    """STALENESS GUARD, Environment edition — re-aimed for injection-visibility registrations.
+
+    This guard used to require the committed unit to declare an actual
+    Environment= line in the registered section. That is now the WRONG
+    expectation: the watchdog service registers environment_section="Service"
+    while declaring no Environment= at all, ON PURPOSE — the same "present in
+    neither copy today" shape UnitSpec.override_directives already documents
+    (see that field's comment: "an override directive is expected to exist in
+    NEITHER copy ... Putting it on present_only would fail that staleness
+    test on arrival"). Requiring a declared Environment= here would fail that
+    registration on arrival for the identical reason.
+
+    What still needs guarding did not go away: a typo'd or nonexistent
+    section name — environment_section="Servcie" — would compare against a
+    section the parser never populates, so the branch would compare nothing,
+    forever, while reporting green. Asserting the section EXISTS in the
+    parsed committed unit (regardless of whether it declares Environment= yet)
+    keeps that protection without rejecting a deliberately-empty registration.
+    """
     mod = _load_checker()
 
     for name, spec in mod.UNITS.items():
@@ -1238,10 +1265,56 @@ def test_registry_environment_sections_really_declare_environment():
         parsed = mod.parse_unit_directives(
             (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
         )
-        assert "Environment" in parsed.get(spec.environment_section, {}), (
+        assert spec.environment_section in parsed, (
             f"{name}: registry compares Environment= in "
-            f"[{spec.environment_section}], but the committed unit declares none."
+            f"[{spec.environment_section}], but the committed unit has no "
+            "such section at all — the entry checks nothing. Fix the "
+            "registry or the unit."
         )
+
+
+def test_committed_environment_declarations_are_all_registered():
+    """INVERTED staleness guard: every declared Environment= is registered.
+
+    The sibling guard above
+    (test_registry_environment_sections_name_a_section_the_committed_unit_has)
+    only checks one direction: registration implies the section exists. That
+    left the actual hazard task 4090 fixed completely unchecked — a committed
+    unit can declare Environment= in a section nobody registered, and every
+    directive still compares equal, forever, while the checker reports green.
+    This is the missing direction: for every section a committed unit
+    declares Environment= in, that section must be the spec's registered
+    environment_section — so a future watchdog knob promoted into the
+    committed unit while environment_section stayed None fails loudly here
+    instead of silently going uncompared. That is precisely task 4090's
+    defect, generalized to any unit in the registry, present or future.
+
+    Passes on arrival today: only dashboard.service declares Environment=,
+    and it registers "Service". This is a forward guard, not a second red.
+
+    UnitSpec carries exactly one environment_section, so a unit that ever
+    needs Environment= compared in more than one section cannot be expressed
+    yet; the assertion message says so explicitly rather than failing in a
+    way that reads like a simple typo.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        parsed = mod.parse_unit_directives(
+            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+        )
+        for section, directives in parsed.items():
+            if "Environment" not in directives:
+                continue
+            assert spec.environment_section == section, (
+                f"{name}: the committed unit declares Environment= in "
+                f"[{section}], but environment_section is "
+                f"{spec.environment_section!r} — register "
+                f"environment_section={section!r} (UnitSpec holds only one "
+                "section; extend it if a unit ever needs more than one "
+                "registered) so this directive is actually compared instead "
+                "of silently skipped."
+            )
 
 
 def test_registry_env_matches_directive_entries_are_declared_in_the_committed_units():
@@ -1531,11 +1604,22 @@ def test_environment_file_dropped_from_the_installed_copy_is_drift():
     assert [d.key for d in drifts] == ["EnvironmentFile"], drifts
 
 
-def test_registry_registers_environment_file_on_both_service_units():
-    """The two service units must actually carry the override registration.
+def test_registry_registers_environment_overrides_on_both_service_units():
+    """The two service units must actually carry both override registrations.
 
     A helper-only test would pass while the real registry left the hole open —
-    the same rot the key-staleness tests exist to prevent one level down.
+    the same rot the key-staleness tests exist to prevent one level down. Both
+    EnvironmentFile= and environment_section are pinned here, in one loop over
+    the two service units, rather than as two near-identical loops — either
+    registration going missing on either unit must fail loudly rather than
+    silently reopen the hole its counterpart test in this module measures.
+
+    The timer is pinned the OTHER way, and the message states why: the
+    committed dark-factory-dashboard-watchdog.timer parses to sections Unit /
+    Timer / Install — there is no [Service] section, and Environment= is not a
+    valid directive in a timer unit. Registering a section there would compare
+    absent-to-absent forever, which is exactly the rot the staleness guards
+    elsewhere in this module exist to prevent.
     """
     mod = _load_checker()
 
@@ -1545,6 +1629,70 @@ def test_registry_registers_environment_file_on_both_service_units():
             "would leave the checker reporting parity over an unknown "
             "effective configuration."
         )
+        assert mod.UNITS[name].environment_section == "Service", (
+            f"{name} does not register environment_section='Service', so an "
+            "Environment= line added to the installed copy alone would leave "
+            "the checker reporting parity over an unknown effective "
+            "configuration."
+        )
+
+    assert mod.UNITS[_WATCHDOG_TIMER].environment_section is None, (
+        f"{_WATCHDOG_TIMER} has no [Service] section (it parses to Unit / "
+        "Timer / Install) and Environment= is not valid in a timer unit — "
+        "registering environment_section here would compare absent-to-absent "
+        "forever."
+    )
+
+
+def test_watchdog_environment_injected_on_the_installed_copy_is_drift():
+    """The measured hole: an inline Environment= on the installed copy alone.
+
+    scripts/dashboard-watchdog.py reads nine env knobs — PROBE_URL,
+    PROBE_TIMEOUT, GRACE_SECS, FAIL_STREAK, MAX_RESTARTS, RATE_WINDOW_SECS,
+    STATE_PATH, ESCALATION_QUEUE_DIR, UV_BIN — and those knobs ARE the
+    hysteresis/grace/rate-ceiling supervision policy. An installed copy that
+    picked up ``Environment=DASHBOARD_WATCHDOG_FAIL_STREAK=99`` outside the
+    repo (``systemctl --user edit`` writing a bare Environment= line, or a
+    hand-edit of the installed file) means ~99 consecutive failed probes
+    before any restart — supervision effectively off. Measured: with
+    ``environment_section`` unset on the watchdog spec, this exact input
+    produces zero drift lines — ``compare_unit`` returns ``[]``, a clean
+    "[ok] parity" over a unit whose effective failure tolerance was silently
+    disabled.
+
+    Uses the REAL registry spec and the REAL committed unit, not a fixture
+    UnitSpec — a fixture-only test would pass while the registry left the hole
+    open, the same reason
+    test_registry_registers_environment_overrides_on_both_service_units states
+    in its own docstring. The installed text is the repo text plus one
+    injected line, so this is a REPO-side-only read and stays green on CI and
+    on a host whose installed units are drifted.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_WATCHDOG_SERVICE]
+    repo_text = (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+    # Inserted right after the [Service] header rather than appended at EOF.
+    # The committed unit happens to have no section after [Service] today (no
+    # [Install] stanza), so appending at EOF currently lands in the same
+    # section too — but relying on that would silently couple this fixture to
+    # section order: a future [Install] or [Unit] added after [Service] would
+    # make the appended line land outside it, _environment_map would read an
+    # empty [Service] on both sides, and this test would fail with
+    # `assert [] == [...]`, reading like the checker regressed rather than
+    # like the fixture drifted. [Service] appears exactly once, so inserting
+    # right after its header is unambiguous regardless of what sections exist
+    # before or after it.
+    installed_text = repo_text.replace(
+        "[Service]\n", "[Service]\nEnvironment=DASHBOARD_WATCHDOG_FAIL_STREAK=99\n", 1
+    )
+
+    drifts = mod.compare_unit(spec, repo_text, installed_text)
+
+    assert [d.key for d in drifts] == ["Environment=DASHBOARD_WATCHDOG_FAIL_STREAK"], drifts
+    assert drifts[0].section == "Service"
+    assert drifts[0].installed_value == "99"
+    assert drifts[0].repo_value == mod._ABSENT
+    assert "installed copy" in drifts[0].reason
 
 
 def test_find_dropins_returns_nothing_when_no_dropin_dir_exists(tmp_path: pathlib.Path):
@@ -2179,3 +2327,613 @@ def test_checker_subprocess_unit_flag_narrows_the_run(tmp_path: pathlib.Path):
 
     full = _run_checker(repo, installed)
     assert full.returncode == 1, full.stdout
+
+
+# ---------------------------------------------------------------------------
+# The section-8 PRE-INSTALL gate in setup-host.sh is wired so it can actually
+# stop something
+# ---------------------------------------------------------------------------
+#
+# Everything above tests the CHECKER. This group tests its WIRING — the block
+# in scripts/setup-host.sh section 8 that runs it, decides what its exit status
+# meant, and then installs.
+#
+# The defect these pin: that block believed a bare exit status, and 2 is
+# overloaded three ways — the checker's benign "not yet installed", `python3`
+# refusing to open a missing script, and argparse rejecting an unknown flag. So
+# renaming the checker or one of its flags made the installer print a
+# reassuring "not yet installed in ... (installing below)" and overwrite the
+# units anyway: a gate reporting green because it never ran, which is the exact
+# silent-drift failure the checker exists to catch, reproduced one level up in
+# its own wiring.
+#
+# Nothing here touches ~/.config/systemd/user or real systemd: REPO_ROOT and
+# UNIT_DIR are tmp_path trees and `systemctl` is a PATH stub that exits 0.
+
+# Anchored on the block's hoisted `_dash_parity_script=` assignment — CODE, and
+# unique to this site — so a reworded section comment cannot turn CI red for no
+# behavioural change. The end anchor is the install's own `ok` line, because
+# this slice must cover the render/cp/enable that FOLLOWS the gate: whether the
+# units still land is half of what these tests assert.
+_SECTION_8_START = "_dash_parity_script="
+_SECTION_8_END = 'ok "Dashboard units installed'
+
+# The argparse-shaped stub: exit 2, usage-shaped stderr, and no
+# [dashboard_unit_parity] report — what renaming a flag would actually produce.
+_USAGE_ERROR_CHECKER = usage_error_checker(
+    CHECKER_PATH.name,
+    "[-h] [--installed-dir INSTALLED_DIR] [--repo-root REPO_ROOT]",
+    "--installed-dir",
+)
+
+
+def _gate_repo(
+    tmp_path: pathlib.Path,
+    mod: types.ModuleType,
+    *,
+    checker_body: str | None = None,
+    with_checker: bool = True,
+) -> pathlib.Path:
+    """_fake_repo plus the scripts/ files the installer slice reads.
+
+    The real checker is copied in (with its sibling systemd_unit_parity import)
+    so the gate drives the real one; only the TREE is fake.
+    """
+    repo = _fake_repo(tmp_path, mod)
+    (repo / "scripts").mkdir(parents=True, exist_ok=True)
+    (repo / "scripts" / "dashboard.service.template").write_text(
+        (REPO_ROOT / "scripts" / "dashboard.service.template").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    if with_checker:
+        write_checker(
+            repo,
+            CHECKER_PATH.name,
+            body=checker_body,
+            siblings=("systemd_unit_parity.py",),
+        )
+    return repo
+
+
+def _run_section_8(
+    tmp_path: pathlib.Path, repo: pathlib.Path, unit_dir: pathlib.Path
+) -> subprocess.CompletedProcess:
+    """Run the section-8 slice. UV_PATH is set upstream in the real script."""
+    return run_section(
+        tmp_path,
+        slice_section(_SECTION_8_START, _SECTION_8_END),
+        repo_root=repo,
+        unit_dir=unit_dir,
+        env_extra={"UV_PATH": "/usr/bin/uv"},
+    )
+
+
+def _assert_units_installed(repo: pathlib.Path, unit_dir: pathlib.Path) -> None:
+    """The install ran: template rendered, both watchdog units copied."""
+    rendered = unit_dir / _DASHBOARD_SERVICE
+    assert rendered.is_file(), f"{_DASHBOARD_SERVICE} was not rendered into {unit_dir}"
+    text = rendered.read_text(encoding="utf-8")
+    assert "__REPO_ROOT__" not in text and "__UV_PATH__" not in text, (
+        f"The template placeholders were not substituted:\n{text}"
+    )
+    for name in (_WATCHDOG_SERVICE, _WATCHDOG_TIMER):
+        installed = unit_dir / name
+        assert installed.is_file(), f"{name} was not copied into {unit_dir}"
+        assert installed.read_text(encoding="utf-8") == (
+            repo / "dashboard" / name
+        ).read_text(encoding="utf-8"), f"{name} is not the committed copy"
+
+
+def test_section_8_missing_checker_does_not_read_as_not_yet_installed(
+    tmp_path: pathlib.Path,
+):
+    """EXIT-CODE COLLISION: `python3 <missing script>` also exits 2.
+
+    2 is the checker's benign "not yet installed in $UNIT_DIR (installing
+    below)". If the checker were renamed or moved, python3's own 2 would land
+    in that branch and the operator would be told the host was simply
+    un-provisioned — when in fact nothing was ever checked.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, with_checker=False)
+    unit_dir = _installed_from(
+        tmp_path, mod, repo, edits={_WATCHDOG_TIMER: ("[Timer]", "[Timer]\nAccuracySec=5s")}
+    )
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not yet installed" not in result.stdout, (
+        "A missing checker was reported as the benign 'not yet installed on "
+        f"this host'.\n{result.stdout}"
+    )
+    assert "FAIL " in result.stdout, (
+        f"A gate that did not run must say so loudly.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+    assert "SKIPPING" not in result.stdout, result.stdout
+
+
+def test_section_8_usage_error_does_not_read_as_not_yet_installed(
+    tmp_path: pathlib.Path,
+):
+    """SAME COLLISION, second source: argparse exits 2 on any usage error.
+
+    The [dashboard_unit_parity] tag, not the exit code, is what makes a status
+    believable — and the checker puts that tag on EVERY line it emits
+    (test_main_every_emitted_line_carries_the_log_tag), so its absence is
+    conclusive.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, checker_body=_USAGE_ERROR_CHECKER)
+    unit_dir = _installed_from(
+        tmp_path, mod, repo, edits={_WATCHDOG_TIMER: ("[Timer]", "[Timer]\nAccuracySec=5s")}
+    )
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not yet installed" not in result.stdout, result.stdout
+    assert "FAIL " in result.stdout, (
+        f"A gate that did not run must say so loudly.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+    assert "SKIPPING" not in result.stdout, result.stdout
+
+
+def test_section_8_installs_even_when_the_gate_did_not_run(tmp_path: pathlib.Path):
+    """DELIBERATE DIVERGENCE from the orchestrator gate: the install is UNCONDITIONAL.
+
+    The orchestrator gate makes its install opt-in (DF_INSTALL_ORCH_UNITS=1)
+    because there the COMMITTED side is sometimes the wrong one — two committed
+    units name --config paths that do not exist on this host, so copying them
+    would break those orchestrators on their next restart. Every one of those
+    facts inverts here, so this must NOT grow the same switch:
+
+    1. The install IS the remediation path. setup-host.sh says so directly
+       ("the install below is itself the remediation"), and the checker ships
+       no --fix precisely because re-running this installer is how a fix
+       propagates.
+    2. The checker's own report tells the operator to run setup-host.sh
+       (test_main_report_points_at_the_remediation_command). Refusing to
+       install on a bad verdict would close a circular dead end: the checker
+       says "run setup-host.sh", and setup-host.sh answers "I decline, because
+       of what the checker just reported."
+    3. The incident this checker was built around has the INSTALLED side stale,
+       not the committed side. Gating the install would hold that supervision
+       gap open indefinitely.
+
+    So the fix changes only the EPISTEMICS, never the action: the operator
+    stops being told a check passed when none ran. The units still land.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, with_checker=False)
+    unit_dir = tmp_path / "installed"
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    _assert_units_installed(repo, unit_dir)
+    assert "SKIPPING" not in result.stdout, (
+        "The section-8 install must stay unconditional — see the docstring.\n"
+        f"{result.stdout}"
+    )
+
+
+def test_section_8_reports_parity_and_installs(tmp_path: pathlib.Path):
+    """Happy path — the fix must not degenerate into 'always report failure'."""
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(tmp_path, mod, repo)
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "already at parity" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, result.stdout
+    _assert_units_installed(repo, unit_dir)
+
+
+def test_section_8_reports_drift_and_still_installs(tmp_path: pathlib.Path):
+    """Real drift stays a warning naming the report — and the install proceeds.
+
+    The exit-1 wording deliberately says "drift OR unverifiable state", because
+    1 also covers a vanished committed unit and a drop-in override, which the
+    checker words apart. Naming only DRIFT would collapse that distinction.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "drift or unverifiable state" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, (
+        f"Drift is a real verdict from a gate that RAN.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+
+
+def test_section_8_reports_not_yet_installed_on_a_bare_host(tmp_path: pathlib.Path):
+    """The benign branch must survive: a real exit 2 still reads as 'not yet installed'."""
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = tmp_path / "installed"
+
+    result = _run_section_8(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not yet installed" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, (
+        f"A genuine 'not yet installed' is a real verdict.\n{result.stdout}"
+    )
+    _assert_units_installed(repo, unit_dir)
+
+
+# ---------------------------------------------------------------------------
+# The section-12 POST-INSTALL check in setup-host.sh
+# ---------------------------------------------------------------------------
+#
+# Same checker, second call site. This one runs AFTER the install, so a
+# mismatch does not mean "the host drifted" — it means the install did not
+# take. No install follows it, so these assertions are output-only.
+#
+# It carries the identical exit-2 defect, and here the false green is the
+# strongest of the three: a post-install check that silently never ran is the
+# LAST word the operator reads about whether the install took.
+
+# Anchored on the block's hoisted `_dash_post_parity_script=` assignment, for
+# the same reason as section 8: code, unique to this site, and the same line the
+# sweep below discovers — not the section comment, whose wording is not a
+# behavioural contract.
+_SECTION_12_START = "_dash_post_parity_script="
+_SECTION_12_END = "\nfi\n"
+
+
+def _run_section_12(
+    tmp_path: pathlib.Path, repo: pathlib.Path, unit_dir: pathlib.Path
+) -> subprocess.CompletedProcess:
+    return run_section(
+        tmp_path,
+        slice_section(_SECTION_12_START, _SECTION_12_END),
+        repo_root=repo,
+        unit_dir=unit_dir,
+    )
+
+
+def test_section_12_missing_checker_does_not_read_as_section_8_did_not_run(
+    tmp_path: pathlib.Path,
+):
+    """EXIT-CODE COLLISION: `python3 <missing script>` also exits 2.
+
+    2 here is "not installed in $UNIT_DIR (section 8 did not run?)" — already a
+    diagnosis, and the wrong one. A renamed or moved checker would send the
+    operator to investigate an install that in fact completed, while the thing
+    that actually failed (the check itself) goes unreported.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, with_checker=False)
+    unit_dir = _installed_from(tmp_path, mod, repo)
+
+    result = _run_section_12(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, (
+        "The check is non-fatal — fail() only printfs, so it must not abort the "
+        f"health-check section.\n{result.stdout}\n{result.stderr}"
+    )
+    assert "not installed in" not in result.stdout, result.stdout
+    assert "section 8 did not run" not in result.stdout, (
+        "A missing checker was diagnosed as a failed section-8 install.\n"
+        f"{result.stdout}"
+    )
+    assert "FAIL " in result.stdout, (
+        f"A check that did not run must say so loudly.\n{result.stdout}"
+    )
+
+
+def test_section_12_usage_error_does_not_read_as_section_8_did_not_run(
+    tmp_path: pathlib.Path,
+):
+    """SAME COLLISION, second source: argparse exits 2 on any usage error."""
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod, checker_body=_USAGE_ERROR_CHECKER)
+    unit_dir = _installed_from(tmp_path, mod, repo)
+
+    result = _run_section_12(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "not installed in" not in result.stdout, result.stdout
+    assert "section 8 did not run" not in result.stdout, result.stdout
+    assert "FAIL " in result.stdout, (
+        f"A check that did not run must say so loudly.\n{result.stdout}"
+    )
+
+
+def test_section_12_reports_install_verified_on_parity(tmp_path: pathlib.Path):
+    """Happy path — the fix must not degenerate into 'always report failure'."""
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(tmp_path, mod, repo)
+
+    result = _run_section_12(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "install verified" in result.stdout, result.stdout
+    assert "FAIL " not in result.stdout, result.stdout
+
+
+def test_section_12_reports_the_install_did_not_take_on_drift(
+    tmp_path: pathlib.Path,
+):
+    """Drift AFTER installing is a real verdict — and keeps its drop-in guidance.
+
+    A drop-in override survives reinstallation because setup-host.sh does not
+    touch <unit>.d/ directories, so the operator must be told to remove it by
+    hand. That guidance has to survive the rewrite.
+    """
+    mod = _load_checker()
+    repo = _gate_repo(tmp_path, mod)
+    unit_dir = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+
+    result = _run_section_12(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "AFTER installing" in result.stdout, result.stdout
+    assert "drop-in" in result.stdout, (
+        f"The drop-in guidance must survive the rewrite.\n{result.stdout}"
+    )
+    assert "FAIL " not in result.stdout, (
+        f"Post-install drift is a real verdict from a check that RAN.\n{result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structural sweep: no parity-checker call site may branch on a bare status
+# ---------------------------------------------------------------------------
+#
+# The three tests above pin the three call sites that exist TODAY. This sweep
+# pins the RULE, so a fourth gate added later cannot reintroduce the defect
+# without failing here. Sites are DERIVED from the file text rather than
+# hardcoded, so a new checker is covered the moment it is wired up.
+
+# A site is a line that USES the checker path — hoists it into the block's
+# `_<gate>_parity_script` variable, or hands it straight to `python3`. Both
+# forms are matched, so a future gate wired either way is swept the moment it
+# lands; the prefix must sit IMMEDIATELY before the path, so a `python3 ...`
+# mentioned earlier in a message cannot drag a later prose path in with it.
+#
+# A bare mention is NOT a site, and the distinction is load-bearing rather than
+# cosmetic: `_orch_skip_reason`'s fallback arm names
+# `scripts/check_orchestrator_unit_parity.py` inside a printf as the remedy for
+# an unknown verdict kind. Matching any occurrence read that remediation text as
+# a fifth call site and sliced a block from mid-`case` to the next column-0
+# `fi` — an unbalanced fragment bash rejects with a syntax error, which is a
+# vacuous case: it fails (or would "pass" a no-output assertion) for reasons
+# having nothing to do with the rule under test. This is also the convention
+# setup_host_sections.py's module docstring already states.
+_PARITY_SCRIPT_RE = re.compile(
+    r"(?:parity_script=|python3\s+)"          # the path is USED, not merely named
+    r"\"?(?:\$\{?REPO_ROOT\}?/)?"             # optional "$REPO_ROOT/ prefix
+    r"scripts/(check_\w+_unit_parity\.py)"
+)
+
+# Deliberate, updated by hand when a site is added or removed. Today: the
+# orchestrator gate, the section-8 dashboard pre-install gate, the section-12
+# fused-memory health check, the section-12 dashboard post-install check, and
+# the section-12 lms-arm@ health check.
+#
+# The lms-arm@ site is why this number is 5 and not 4: it landed on main from
+# task 3775 while this change was in flight, carrying the same bare `-eq 2`
+# read, and the sweep DISCOVERED it rather than being told about it. That is
+# the mechanism working, not a surprise to paper over — the count moved in the
+# same commit that fixed the site.
+#
+# An inequality would let the post-install site — the one this change fixes —
+# be deleted outright with the guard still green, and the sweep below runs one
+# case per DISCOVERED site, so there is no cap to keep a new one from being
+# inspected.
+_KNOWN_PARITY_CALL_SITES = 5
+
+
+def _parity_call_sites() -> list[tuple[int, str, str]]:
+    """Every parity-checker call site, as (line number, checker filename, block).
+
+    A site is a NON-COMMENT line that USES a `scripts/check_*_unit_parity.py`
+    path — either the hoisted `_x_parity_script="..."` assignment or a direct
+    `python3 "..."` invocation (see `_PARITY_SCRIPT_RE`). Its block runs to the
+    next column-0 `fi`, which closes the enclosing verdict construct at all
+    sites.
+
+    Lines that merely NAME a checker are excluded, whether or not they are
+    comments: the fused-memory block cites
+    `tests/scripts/test_check_fused_memory_unit_parity.py` by name, and the
+    orchestrator block's unknown-kind arm prints its checker's path as the
+    remedy. A citation is not a call site, and slicing a block from one yields
+    a bash fragment that cannot run.
+    """
+    text = setup_host_text()
+    sites: list[tuple[int, str, str]] = []
+    offset = 0
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        start = offset
+        offset += len(line) + 1
+        if line.lstrip().startswith("#"):
+            continue
+        match = _PARITY_SCRIPT_RE.search(line)
+        if not match:
+            continue
+        end = text.find("\nfi\n", start)
+        assert end != -1, (
+            f"No column-0 `fi` closes the parity block starting at line {lineno}."
+        )
+        sites.append((lineno, match.group(1), text[start : end + len("\nfi\n")]))
+    return sites
+
+
+def test_the_sweep_finds_every_known_parity_call_site():
+    """Guard against a vacuous sweep: matching nothing must not read as passing."""
+    sites = _parity_call_sites()
+
+    assert len(sites) == _KNOWN_PARITY_CALL_SITES, (
+        f"Expected {_KNOWN_PARITY_CALL_SITES} parity call sites (orchestrator, "
+        f"dashboard pre-install, fused-memory, dashboard post-install, lms-arm@); found "
+        f"{len(sites)}: {[(lineno, name) for lineno, name, _ in sites]}. "
+        "Adding or removing a site is a deliberate act — update the count here "
+        "in the same change. If the sweep below stops matching, it silently "
+        "stops guarding anything."
+    )
+
+
+# Collected at import time from the file itself, so a fifth call site becomes a
+# fifth CASE automatically. (The previous shape — a fixed `range(8)` with a
+# skip for out-of-range indices — silently never inspected a ninth site: the
+# same "green because it never ran" failure this whole change is about,
+# reproduced one level up in its own guard.)
+_PARITY_CALL_SITES = _parity_call_sites()
+
+
+# A repo file a block refuses to run without, named literally in one of its
+# `[ -f "$REPO_ROOT/..." ]` guards. The lms-arm@ gate has two such inputs (its
+# checker AND the committed unit template); the other four have only the
+# checker, which they reach through their `_<gate>_parity_script` variable and
+# so never spell here.
+_GUARDED_REPO_INPUT_RE = re.compile(
+    r"\[\s*!?\s*-f\s+\"\$\{?REPO_ROOT\}?/(?P<path>[\w./@+-]+)\"\s*\]"
+)
+
+
+def _materialize_guarded_inputs(repo: pathlib.Path, block: str, checker: str):
+    """Create every OTHER repo input the block's existence guards require.
+
+    Without this, a gate guarding on a second file short-circuits to its
+    "inputs absent" arm and never reaches the status handling under test — a
+    vacuous case. Not silent if this stops matching: the case-1 assertion below
+    demands a loud line, and a short-circuited block emits none.
+
+    The checker itself is deliberately NOT created here; whether it exists is
+    exactly what the two cases vary.
+    """
+    for match in _GUARDED_REPO_INPUT_RE.finditer(block):
+        path = match.group("path")
+        if path.endswith(checker):
+            continue
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()
+
+
+@pytest.mark.parametrize(
+    "lineno,checker,block",
+    _PARITY_CALL_SITES,
+    ids=[f"L{lineno}-{name}" for lineno, name, _ in _PARITY_CALL_SITES],
+)
+def test_every_parity_call_site_refuses_a_status_the_checker_did_not_produce(
+    tmp_path: pathlib.Path, lineno: int, checker: str, block: str
+):
+    """No call site may report a verdict its checker never gave.
+
+    Exit 2 is overloaded three ways — the checker's own benign verdict,
+    `python3` refusing to open a missing script, and argparse rejecting an
+    unknown flag. So each site is RUN here against both non-checker sources of
+    a 2, and neither may end in a verdict about this host.
+
+    ASSERTED PER CASE, because the two differ in what a site can honestly say:
+
+    * The checker EXISTS and exits 2 without reporting (a renamed flag). The
+      block ran something and got back a status it cannot interpret, so it must
+      refuse LOUDLY — a `FAIL ` or a `WARN ` — and may not answer with `OK ` or
+      an `==> ` info, which are the shapes of a verdict about the host. This
+      case is what pins the rule at every site: an existence guard cannot
+      short-circuit it, so the status handling always runs.
+    * The checker is ABSENT. A site with an existence guard never invokes
+      `python3` at all and says so — at whatever severity its gate speaks in,
+      `fail()` for the four that may fail, `info()` for the warn-only lms-arm@
+      gate whose own suite forbids `fail` outright
+      (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
+      Both are honest, and severity alone cannot tell an honest "the checker is
+      not here" from a dishonest "not installed on this host". So this case
+      pins only the outcome no vocabulary makes acceptable: never `OK `, never
+      a claim of parity from a checker that could not even be opened.
+
+    Requiring `fail()` specifically, as this test first did, was a vocabulary
+    assumption rather than a rule: it could not be satisfied by a gate that is
+    deliberately warn-only, which is what the lms-arm@ site is.
+
+    Behavioural on purpose. The predecessor asserted on setup-host.sh's SOURCE
+    SPELLING (a literal `grep -q`, a POSIX `[ -f `), which rejected strictly
+    more robust code: matching the marker with bash's own `[[ ]]`/`case`
+    instead of `printf | grep -q` removes a real SIGPIPE misread, and the
+    lexical form called that a regression. It also checked ordering by textual
+    offset, so a site that validated in dead code and then branched on the bare
+    status would have passed. Running the block answers the question the
+    spelling was standing in for, and leaves a future author free to write the
+    guard however reads best.
+
+    WHAT THIS DOES NOT PIN, measured by mutation: deleting a site's `[ ! -f ]`
+    existence guard does NOT fail here, and correctly so. Without it `python3`
+    reaches a script that is not there, exits 2 with no marker on stdout, and
+    the output validation refuses that status exactly as before — so the
+    epistemics survive and only the operator-facing wording gets worse. The
+    marker check is the load-bearing guard; the existence test is legibility.
+    Deleting the output validation instead (the real defect) does fail here —
+    at every site, in the renamed-flag case.
+    """
+    cases = (
+        ("a renamed or moved checker (python3 itself exits 2)", None, False),
+        (
+            "a renamed flag (argparse exits 2)",
+            usage_error_checker(checker, "[-h] [--some-flag SOME_FLAG]", "--some-flag"),
+            True,
+        ),
+    )
+
+    for index, (label, body, with_checker) in enumerate(cases):
+        work = tmp_path / f"case{index}"
+        work.mkdir()
+        repo = checker_repo(work, checker, body=body, with_checker=with_checker)
+        _materialize_guarded_inputs(repo, block, checker)
+        result = run_section(
+            work,
+            block,
+            repo_root=repo,
+            unit_dir=work / "installed",
+            # Set upstream in the real script; only the section-8 slice reads it.
+            env_extra={"UV_PATH": "/usr/bin/uv"},
+        )
+        out = result.stdout + result.stderr
+
+        assert "OK " not in out, (
+            f"The parity call site at setup-host.sh:{lineno} reported PARITY "
+            f"with {label} — a green verdict on the strength of an exit status "
+            f"its checker never produced.\n{out}\n---\n{block}"
+        )
+
+        if not with_checker:
+            # Nothing was invoked, so saying so at any severity is honest; see
+            # the docstring for why severity cannot separate the two cases here.
+            continue
+
+        assert "FAIL " in out or "WARN " in out, (
+            f"The parity call site at setup-host.sh:{lineno} ran with {label} "
+            f"and never said so. A status the checker did not produce must be "
+            f"reported loudly, not read as a verdict.\n{out}\n---\n{block}"
+        )
+        assert "==> " not in out, (
+            f"The parity call site at setup-host.sh:{lineno} emitted an info() "
+            f"line with {label} — it reported something about this host on the "
+            f"strength of an exit status the checker never produced.\n{out}\n"
+            f"---\n{block}"
+        )
