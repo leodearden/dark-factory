@@ -467,6 +467,25 @@ _SANCTIONED_STEWARD_CONSTRUCTION: dict[str, str] = {
         '`project_root` recipe (task 3551), so the invariant is common even '
         'though the construction is not'
     ),
+    'test_verdict_servers_integration_gate.py': (
+        '`_build_steward_for_triage` (:358). It builds a real `TaskSteward` '
+        'against a REAL `OrchestratorConfig` — the module\'s `config` fixture '
+        '(:111), an actual config rooted on the `git_repo` fixture, not a mock — '
+        'and a REAL on-disk meta-root pre-initialized via '
+        '`_artifacts_for(worktree).init(...)` so `_pre_triage_suggestions`\'s '
+        '"meta-root missing" diagnostic branch never fires. `make_steward` '
+        'instead builds `MagicMock(spec_set=pydantic_spec(OrchestratorConfig))` '
+        'and exposes no `config=` passthrough, only a `config_overrides` dict '
+        'applied to that mock. Folding would mean growing the fixture a '
+        'real-config channel serving exactly one consumer — the same shape of '
+        'argument task 3551 used to leave `_make_steward_config` standing. '
+        'This site was added by task 2488, AFTER the 3514 consolidation, and was '
+        'never examined by the 3461→3514→3551 lineage; this census is what '
+        'surfaced it. Whether `make_steward` should grow that `config=` '
+        'passthrough is deliberately left open, and is filed as a follow-up '
+        '(ticket tkt_0RSMX59FSJ27QWSS9VKBYRFMFG, from task 3647) rather than '
+        'decided here — task 3647 owned the ADJUDICATION, not the redesign'
+    ),
 }
 
 
