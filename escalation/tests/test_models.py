@@ -1473,3 +1473,100 @@ class TestSeverityRank:
         """(e) Unknown-vs-unknown resolves on the first argument, not arbitrarily."""
         assert max_severity('warn', 'wat') == 'warn'
         assert max_severity('wat', 'warn') == 'wat'
+
+
+class TestEscalationRootCauseVariants:
+    """`root_cause_variants` / `root_cause_variants_truncated` — over-fold evidence (task 3998).
+
+    Canonicalising the root-cause match makes MORE promotes fold, so its failure
+    mode is OVER-folding: distinct causes silently merged under one canonical
+    key.  These fields are that failure's only observable signature — the
+    DISTINCT pre-canonical spellings an L2 has been addressed by.
+    `queue.add_members_to_l2` is the SOLE writer and sole trimmer, exactly as for
+    `amendments`, whose shape they mirror one-for-one.
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        return Escalation(
+            id='esc-task-1-0001',
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='original one-line hypothesis',
+            root_cause='Watcher lease stolen.',
+            level=2,
+            **kwargs,
+        )
+
+    def test_variant_fields_default_empty_and_zero(self):
+        """(a) An L2 minted today carries no variants and no truncation."""
+        esc = self._seeded()
+
+        assert esc.root_cause_variants == [], (
+            f'expected an empty variant list, got {esc.root_cause_variants!r}'
+        )
+        assert esc.root_cause_variants_truncated == 0, (
+            f'expected 0, got {esc.root_cause_variants_truncated!r}'
+        )
+
+    def test_legacy_json_without_the_keys_deserialises_to_defaults(self):
+        """(b) ZERO MIGRATION — the from_dict __dataclass_fields__ filter path.
+
+        Every L2 already on disk predates these fields, so a payload missing both
+        keys must hydrate to the defaults rather than raising.
+        """
+        legacy = json.loads(self._seeded().to_json())
+        del legacy['root_cause_variants']
+        del legacy['root_cause_variants_truncated']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.root_cause_variants == [], (
+            f'legacy record must default to []: {from_legacy.root_cause_variants!r}'
+        )
+        assert from_legacy.root_cause_variants_truncated == 0, (
+            f'legacy record must default to 0: {from_legacy.root_cause_variants_truncated!r}'
+        )
+
+    def test_variants_roundtrip_verbatim(self):
+        """(c) Both fields survive to_json -> from_json unchanged.
+
+        The TRUE distinct count is `len(root_cause_variants) +
+        root_cause_variants_truncated`, so the counter is as load-bearing as the
+        list — losing it would make the loss at the cap log-only (INV-8).
+        """
+        variants = ['Watcher lease stolen.', 'watcher  lease STOLEN', 'WATCHER-LEASE-STOLEN']
+        esc = self._seeded(root_cause_variants=variants, root_cause_variants_truncated=4)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.root_cause_variants == variants, (
+            f'variant spellings lost or reordered: {restored.root_cause_variants!r}'
+        )
+        assert restored.root_cause_variants_truncated == 4, (
+            f'truncation counter lost: {restored.root_cause_variants_truncated!r}'
+        )
+        assert len(restored.root_cause_variants) + restored.root_cause_variants_truncated == 7
+
+    def test_default_variant_list_is_not_shared_between_instances(self):
+        """The default_factory guard — a shared mutable default would cross-link records."""
+        a = self._seeded()
+        b = self._seeded()
+
+        a.root_cause_variants.append('a spelling')
+
+        assert b.root_cause_variants == [], (
+            'default root_cause_variants list is SHARED between instances — '
+            f'b saw {b.root_cause_variants!r}'
+        )
+
+    def test_unknown_extra_key_is_still_dropped(self):
+        """(d) from_dict's filter surface is unchanged by the two added fields."""
+        payload = json.loads(self._seeded().to_json())
+        payload['not_a_real_field'] = 'should be dropped, not raise'
+
+        restored = Escalation.from_dict(payload)
+
+        assert not hasattr(restored, 'not_a_real_field')
+        assert restored.root_cause_variants == []
