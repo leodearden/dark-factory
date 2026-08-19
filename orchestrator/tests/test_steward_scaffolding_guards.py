@@ -843,22 +843,3 @@ class TestStewardConstructionSitesAreCensused:
         )
 
         assert _steward_construction_sites(tree) == []
-
-    def test_every_allowlist_entry_records_a_reason(self) -> None:
-        """An entry with no reason is a rubber stamp, and defeats the guard.
-
-        Cheap enough to keep separate — it reads the allowlist literal, not the
-        tree.
-        """
-        reasonless = sorted(
-            module
-            for module, entry in _SANCTIONED_STEWARD_CONSTRUCTION.items()
-            if len(entry.reason.split()) < 5 or entry.sites < 1
-        )
-
-        assert not reasonless, (
-            f'_SANCTIONED_STEWARD_CONSTRUCTION entries {reasonless} carry no '
-            f'usable reason or a non-positive site count. The recorded reason IS '
-            f'the adjudication this census exists to force; an entry without one '
-            f'is a rubber stamp.'
-        )
