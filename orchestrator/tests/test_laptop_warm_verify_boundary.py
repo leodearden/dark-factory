@@ -734,8 +734,40 @@ def kill_holder_tree(
     mirroring :func:`cancel_request`'s own convention, so tests can pin the
     session-escape reap deterministically with zero risk of signalling
     anything unintended.
+
+    ALREADY-REAPED SHORT CIRCUIT: an already-reaped leader means
+    ``proc.pid`` is a FREE pid, so the walk below must never run against
+    it.  Several call sites reap the leader with ``wait()`` inside their
+    ``try`` block BEFORE their ``finally`` runs this helper (:2478, :2668,
+    :2826, :2905) -- on their GREEN path ``proc.pid`` no longer refers to
+    the holder at all.  ``os.getpgid(proc.pid)`` and
+    ``collect_descendants(proc.pid, ...)`` would then describe whatever
+    process happens to OWN that recycled pid now, and every descendant of
+    that stranger would be SIGKILLed (and killpg'd by the backstop above,
+    if it happened to be its own group leader) -- precisely what "zero
+    risk of signalling anything unintended" above promises never happens.
+    pid recycling is observed on this fleet, not theoretical
+    (verify_cancel.py:313-315: pid_max=4194304, and the laptop's own pid
+    counter demonstrably wrapped on 2026-08-11).  So liveness is captured
+    ONCE, at entry, strictly before the pgid read and the ppid-map
+    snapshot below: an already-reaped leader's descendants have already
+    been reparented to init (or the nearest subreaper) and are no longer
+    reachable from ``proc.pid`` anyway, so the early return costs nothing.
     """
     timeout = ROW5_HOLDER_TEARDOWN_CEILING_SECS if timeout is None else timeout
+
+    # An already-reaped leader means proc.pid is a FREE pid -- see the
+    # ALREADY-REAPED SHORT CIRCUIT paragraph above.  Captured once, via
+    # proc.returncode (a pure read of state this Popen already owns, no
+    # waitpid side effect) rather than a fresh proc.poll(), and not
+    # re-read later in this function -- the `if proc.poll() is None:`
+    # leader-kill guard further down stays exactly as it is, since it is
+    # only ever reachable on this (live) path.
+    if proc.returncode is not None:
+        if proc.stdin is not None:
+            with contextlib.suppress(OSError):
+                proc.stdin.close()
+        return
 
     # Pre-kill snapshot phase -- BOTH reads must happen before any signal is
     # sent.  Killing the leader first reparents survivors to init and severs
