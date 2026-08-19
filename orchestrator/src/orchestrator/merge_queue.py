@@ -13026,8 +13026,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         :meth:`speculation_accounting_violations` (I4 permits/caps) and
         :meth:`worktree_ledger_violations` (I6 worktree ledger, given *now*).
 
-        A clean call (no violations) resets
-        :attr:`_resource_audit_violation_streak` to 0 and returns. A
+        A clean call (no violations) resets the log gate, emits the single
+        INFO clear line if a violating run was in progress, resets
+        :attr:`_resource_audit_violation_streak` to 0, and returns. A
         violating call increments the streak and reports.
 
         THE REPORT LINE IS COALESCED (task 3203). Re-logging an UNCHANGING
@@ -13104,6 +13105,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         violations = spec_violations + wt_violations
 
         if not violations:
+            # task 3203: report the END of an episode explicitly. With the
+            # report line coalesced onto an exponential schedule, an absence
+            # of lines no longer means "fixed" — once the interval has backed
+            # off to an hour it is indistinguishable from "still broken, next
+            # report in 50 minutes". The "exactly one line" property comes
+            # from the gate (clear() returns None on an already-cleared gate),
+            # NOT from a streak > 0 guard here, so it holds identically for
+            # every call site that adopts the coalescer.
+            cleared = self._resource_audit_log_gate.clear(now)
+            if cleared is not None:
+                # The streak (total consecutive VIOLATING polls) is the honest
+                # total an operator means by "after N polls"; the gate's own
+                # unchanged_polls counts only the polls at the LAST
+                # fingerprint, which is smaller whenever the set changed
+                # mid-run. Read before the reset below.
+                logger.info(
+                    'merge queue resource-conservation audit clear after %d polls '
+                    '/ %.0fs — the violation set is now empty',
+                    self._resource_audit_violation_streak, cleared.duration_secs,
+                )
             self._resource_audit_violation_streak = 0
             return
 
