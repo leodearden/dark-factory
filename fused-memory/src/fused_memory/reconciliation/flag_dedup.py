@@ -773,9 +773,7 @@ def _union_cited_tasks(current: Any, prior: Any) -> list[dict[str, Any]]:
 _MAX_PERSISTED_CITED_TASKS: int = 32
 
 
-def _persistable_cited_tasks(
-    entries: list[dict[str, Any]] | None,
-) -> list[dict[str, Any]] | None:
+def _persistable_cited_tasks(entries: Any) -> list[dict[str, Any]] | None:
     """Project :func:`_union_cited_tasks`' output down to what may be PERSISTED.
 
     This is the persistence projection of the cross-cycle anchor, applied ONLY
@@ -802,6 +800,14 @@ def _persistable_cited_tasks(
     caller's ``if persistable:`` gate omits the payload key exactly as it does
     for ``deduped_against`` and a citation-less flag keeps the historical
     six-key payload verbatim.
+
+    *entries* is typed ``Any`` for the same reason :func:`_union_cited_tasks`
+    is: although the only production caller hands it that function's
+    ``list[dict]`` return value, the body validates defensively — a non-list,
+    or a list carrying non-dict members, degrades to "nothing to persist"
+    rather than raising — and that contract is pinned by tests.  A narrower
+    annotation would advertise a guarantee the callers of a sanitizer over
+    LLM-authored data cannot make.
 
     Input order is preserved and the input is never mutated (a new list is
     returned).  Pure, sync, no I/O — never raises.
