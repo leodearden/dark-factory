@@ -1831,3 +1831,165 @@ class TestCheckResourceAuditReclaimBandSuppression:
             f'must page, got: {fake_eq.submitted!r}'
         )
         assert str(wt.resolve()) in fake_eq.submitted[0].detail
+
+
+# ---------------------------------------------------------------------------
+# task 3203 step-3 RED / step-4 GREEN: _resource_audit_fingerprint()
+# ---------------------------------------------------------------------------
+
+
+class TestResourceAuditFingerprint:
+    """Unit tests for the module-level
+    ``orchestrator.merge_queue._resource_audit_fingerprint(violations)``
+    (task 3203 step-3).
+
+    This is the value the exponential log coalescer keys on: two polls whose
+    violation sets mean the same thing must produce the SAME fingerprint (so
+    the repeat is coalesced), and any real change must produce a DIFFERENT
+    one (so it re-logs immediately at full detail).
+
+    Every worktree case feeds the fingerprint the REAL output of
+    ``worker.worktree_ledger_violations(now=...)`` rather than a hand-written
+    string, so this class doubles as the drift detector for the emitter's
+    format: if ``worktree_ledger_violations`` ever stops embedding
+    ``(age Ns > grace Ms)``, (a) fails here before anyone notices the
+    regression in production.
+
+    RED until step-4 GREEN adds the helper to merge_queue.py.
+    """
+
+    _NOW = 1_000_000.0
+    _DETECT = 100.0
+    # Far above every age exercised below, so the reclaim disposition stays
+    # 'scheduled' and cannot confound the age-stripping cases. The one test
+    # that WANTS a disposition flip (b) overrides it per-instance.
+    _FAR_REAP_AGE = 100_000.0
+    _IN_BAND_AGE = 150.0
+
+    def _worker(self, git_ops: GitOps):
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue(), speculation_depth=2)
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._DETECT
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._FAR_REAP_AGE
+        return worker
+
+    def test_the_volatile_age_figure_is_stripped(self, git_ops: GitOps) -> None:
+        """(a) The SAME leak audited an hour apart is the same fingerprint.
+
+        The age advances every 30s poll, which is exactly why a naive
+        string-set dedup would never fire — this is the whole reason a
+        normaliser exists.
+        """
+        from orchestrator.merge_queue import _resource_audit_fingerprint
+
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-aging', mtime=self._NOW - self._IN_BAND_AGE)
+
+        early = worker.worktree_ledger_violations(now=self._NOW)
+        later = worker.worktree_ledger_violations(now=self._NOW + 3600.0)
+
+        assert len(early) == 1 and len(later) == 1
+        # Non-vacuous: the raw strings really do differ poll to poll.
+        assert early[0] != later[0], (
+            'precondition: the emitter must embed the volatile age, else this '
+            f'test proves nothing — got {early[0]!r}'
+        )
+        assert _resource_audit_fingerprint(early) == _resource_audit_fingerprint(later)
+
+    def test_the_reclaim_disposition_is_not_stripped(self, git_ops: GitOps) -> None:
+        """(b) Crossing PERIODIC_REAP_MIN_AGE_SECS is a real transition —
+        'scheduled for automatic reclaim' becoming 'reclaim overdue' must
+        force an immediate re-log, not be coalesced away."""
+        from orchestrator.merge_queue import _resource_audit_fingerprint
+
+        worker = self._worker(git_ops)
+        worker.PERIODIC_REAP_MIN_AGE_SECS = 200.0
+        _mkdir_worktree(git_ops, '_merge-crossing', mtime=self._NOW - self._IN_BAND_AGE)
+
+        scheduled = worker.worktree_ledger_violations(now=self._NOW)
+        overdue = worker.worktree_ledger_violations(now=self._NOW + 150.0)
+
+        assert 'scheduled for automatic reclaim' in scheduled[0]
+        assert 'reclaim overdue' in overdue[0]
+        assert _resource_audit_fingerprint(scheduled) != _resource_audit_fingerprint(overdue)
+
+    def test_set_membership_changes_the_fingerprint(self, git_ops: GitOps) -> None:
+        """(c) Adding a leak changes it; removing that leak restores it."""
+        from orchestrator.merge_queue import _resource_audit_fingerprint
+
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-one', mtime=self._NOW - self._IN_BAND_AGE)
+        one = _resource_audit_fingerprint(worker.worktree_ledger_violations(now=self._NOW))
+
+        second = _mkdir_worktree(
+            git_ops, '_merge-two', mtime=self._NOW - self._IN_BAND_AGE,
+        )
+        two = _resource_audit_fingerprint(worker.worktree_ledger_violations(now=self._NOW))
+        assert two != one
+        assert len(two) == 2
+
+        second.rmdir()
+        back = _resource_audit_fingerprint(worker.worktree_ledger_violations(now=self._NOW))
+        assert back == one
+
+    def test_fingerprint_is_order_independent(self, git_ops: GitOps) -> None:
+        """(d) A filesystem scan reordering its entries is not a change."""
+        from orchestrator.merge_queue import _resource_audit_fingerprint
+
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-a', mtime=self._NOW - self._IN_BAND_AGE)
+        _mkdir_worktree(git_ops, '_merge-b', mtime=self._NOW - self._IN_BAND_AGE)
+        violations = worker.worktree_ledger_violations(now=self._NOW)
+        assert len(violations) == 2
+
+        assert _resource_audit_fingerprint(violations) == _resource_audit_fingerprint(
+            list(reversed(violations))
+        )
+
+    def test_empty_violations_yield_an_empty_fingerprint(self) -> None:
+        """(e)"""
+        from orchestrator.merge_queue import _resource_audit_fingerprint
+
+        assert not _resource_audit_fingerprint([])
+
+    def test_speculation_accounting_strings_pass_through_unmodified(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(f) The permit arm's counts ARE the signal — the normaliser must
+        not eat them, and two leak magnitudes must not collide."""
+        from orchestrator.merge_queue import _resource_audit_fingerprint
+
+        worker = self._worker(git_ops)
+        worker._speculation_slot._value -= 1  # forced permit leak
+        small = worker.speculation_accounting_violations()
+        assert len(small) == 1
+        assert _resource_audit_fingerprint(small) == (small[0],), (
+            'a violation carrying no age figure must survive verbatim'
+        )
+
+        worker._speculation_slot._value -= 1  # a bigger leak
+        big = worker.speculation_accounting_violations()
+        assert _resource_audit_fingerprint(big) != _resource_audit_fingerprint(small)
+
+    def test_mixed_violation_set_is_stable_while_only_ages_advance(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(g) The production shape: permit leak + worktree leak, polled
+        repeatedly, with nothing changing but the clock."""
+        from orchestrator.merge_queue import _resource_audit_fingerprint
+
+        worker = self._worker(git_ops)
+        worker._speculation_slot._value -= 1  # forced permit leak
+        _mkdir_worktree(git_ops, '_merge-mixed', mtime=self._NOW - self._IN_BAND_AGE)
+
+        def _fingerprint_at(now: float) -> tuple[str, ...]:
+            return _resource_audit_fingerprint(
+                worker.speculation_accounting_violations()
+                + worker.worktree_ledger_violations(now=now)
+            )
+
+        first = _fingerprint_at(self._NOW)
+        assert len(first) == 2
+        for i in range(1, 100):
+            assert _fingerprint_at(self._NOW + i * 30.0) == first
