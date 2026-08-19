@@ -936,13 +936,13 @@ fi
 # silent-drift failure the checker exists to catch, reproduced one level up in
 # its own wiring.
 #
-# The orchestrator gate above greps the checker's [orchestrator_unit_parity]
-# tag. This checker has no LOG_TAG (and is read-only for this task), so its own
-# bracketed markers stand in for one. That vocabulary is an implicit contract of
-# a file this block does not own, so it is pinned directly by
-# test_gate_markers_appear_on_every_real_exit_path_and_neither_collision in
-# tests/scripts/test_check_fused_memory_unit_parity.py: markers present on all
-# three real exit paths, absent on both collision sources.
+# So no status is believed unless the checker's own [fused_memory_unit_parity]
+# tag appears in the output it produced. That tag is on EVERY line it emits,
+# which test_main_every_emitted_line_carries_the_log_tag pins, so its absence is
+# conclusive rather than a heuristic. The other half — that all three real exit
+# paths emit it and NEITHER collision source does — is pinned by
+# test_gate_tag_appears_on_every_real_exit_path_and_neither_collision, both in
+# tests/scripts/test_check_fused_memory_unit_parity.py.
 _fm_parity_script="$REPO_ROOT/scripts/check_fused_memory_unit_parity.py"
 
 if [ ! -f "$_fm_parity_script" ]; then
@@ -957,18 +957,10 @@ else
        && _fm_parity_exit=0 || _fm_parity_exit=$?
   printf '%s\n' "$_fm_parity_out"
 
-  # The marker is line-ANCHORED (the equivalent of `grep -E '^\[(ok|...)\]'`),
-  # so an argparse usage line's `[--fix]` and python3's mid-line `[Errno 2]`
-  # cannot pass for a report. Prefixing a newline makes the first line match
-  # the same way as any other. Done in bash rather than through a pipe to grep
-  # for the SIGPIPE reason spelled out at the orchestrator gate above.
-  _fm_parity_reported=0
-  case $'\n'"$_fm_parity_out" in
-    *$'\n'"[ok]"*|*$'\n'"[skip]"*|*$'\n'"[drift]"*|*$'\n'"[fixed]"*)
-      _fm_parity_reported=1 ;;
-  esac
-
-  if [ "$_fm_parity_reported" -eq 0 ]; then
+  # Matched in bash, not through a pipe to grep — see the orchestrator gate
+  # above for why a `printf | grep -q` here can report "it did not run" on a
+  # report that carries the tag.
+  if [[ "$_fm_parity_out" != *'[fused_memory_unit_parity]'* ]]; then
     fail "Fused-memory parity check produced no recognizable report"
     fail "  (status $_fm_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
