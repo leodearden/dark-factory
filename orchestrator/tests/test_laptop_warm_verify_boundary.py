@@ -2475,12 +2475,7 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
             )
         fire_delay = time.monotonic() - armed
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
-        if proc.stdin is not None:
-            with contextlib.suppress(OSError):
-                proc.stdin.close()
+        kill_holder_tree(proc, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
     assert proc.returncode != 0, (
         f'expected non-zero exit (watchdog self-kill), got {proc.returncode}'
@@ -2670,9 +2665,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
         )
     finally:
         heartbeat.stop_heartbeats()
-        if child.poll() is None:
-            child.kill()
-            child.wait(timeout=5)
+        kill_holder_tree(child, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
 
 # ---------------------------------------------------------------------------
@@ -2830,9 +2823,7 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
         )
     finally:
         heartbeat.stop_heartbeats()
-        if child.poll() is None:
-            child.kill()
-            child.wait(timeout=5)
+        kill_holder_tree(child, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
 
 # ---------------------------------------------------------------------------
@@ -2911,12 +2902,7 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
         )
     finally:
         heartbeat.stop_heartbeats()
-        if child.poll() is None:
-            child.kill()
-            child.wait(timeout=5)
-        if child.stdin is not None:
-            with contextlib.suppress(OSError):
-                child.stdin.close()
+        kill_holder_tree(child, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
 
 # ---------------------------------------------------------------------------
@@ -3050,9 +3036,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         )
     finally:
         heartbeat_holder.stop_heartbeats()
-        if holder.poll() is None:
-            holder.kill()
-            holder.wait(timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
+        kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
     # --- Consumer side: feed #2's real discriminant through the real beta
     # consumer (_run_post_merge_verify) with a real EscalationQueue. ---
@@ -3170,9 +3154,4 @@ def test_live_verify_merge_holds_lane_lock_real_subprocess(tmp_path):
             f'lane lock mid-build, got {holder_pgid!r}'
         )
     finally:
-        if holder.poll() is None:
-            holder.kill()
-            holder.wait(timeout=5)
-        if holder.stdin is not None:
-            with contextlib.suppress(OSError):
-                holder.stdin.close()
+        kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
