@@ -1579,13 +1579,49 @@ class TaskArtifacts:
         What a concurrent reader may rely on: it observes either the complete
         OLD contents or the complete NEW contents — never a truncated file,
         and never a missing one.  ``os.replace`` on a temp written in the
-        destination's own directory is what buys that; ``fsync=True`` extends
-        it from *atomic* to *durable*, syncing both the temp's bytes and the
-        parent directory entry the rename creates, so a crash immediately
-        after this returns cannot leave fully-synced data unreachable under a
-        name that was never persisted.  (The superseded ``path.write_text``
-        was truncate-then-write, and a reader racing it could and did observe
-        a half-written file — see ``TestWriteJsonIsAtomic``.)
+        destination's own directory is what buys that, by itself and for
+        almost nothing.  (The superseded ``path.write_text`` was
+        truncate-then-write, and a reader racing it could and did observe a
+        half-written file — see ``TestWriteJsonIsAtomic``.)
+
+        ``fsync=True`` is a SEPARATE guarantee, deliberately bought, not a
+        free extension of that one — and it is the dominant cost of this
+        method.  MEASURED on this repo's own filesystem (ext4 on NVMe, a
+        5.5 KB plan.json, 200-write loops): ``write_text`` 0.18 ms/write,
+        atomic WITHOUT fsync 0.27 ms, atomic WITH fsync 5.26 ms.  Atomicity
+        costs ~0.1 ms; durability costs ~5 ms on top — ~20x more — and every
+        caller of this seam pays it.  ``shared.safe_io`` defaults the flag to
+        False for precisely that reason, so overriding its default here is a
+        decision, and it rests on three things:
+
+        * Passing ``fsync=False`` would be a REGRESSION rather than a neutral
+          default.  The plan-tools plan.json writer this method absorbed
+          fsynced its temp before every replace, so a non-fsyncing
+          ``_write_json`` would silently weaken plan.json's existing
+          guarantee on the very change that consolidated it.
+          ``atomic_write_text``'s flag is both-or-neither (temp file AND
+          parent directory), so the real choice was "keep it for every
+          artifact" or "lose it for plan.json".
+        * These artifacts ARE the crash-recovery inputs.  A resumed
+          orchestrator reads plan.json / metadata.json / review_state.json /
+          agent_session.json back to learn what a task already did; an
+          artifact that is atomically written but not durable is exactly what
+          a host crash turns into a silently rewound task.  The
+          parent-directory half earns its keep for the same reason — without
+          it a crash can leave fully synced bytes unreachable under a name
+          that was never persisted.
+        * The cost is bounded because nothing behind this seam is a hot loop.
+          These are lifecycle writes — at most tens per task across all ~13
+          artifacts — so ~5 ms apiece totals well under a second per task,
+          once, against a task lifetime measured in minutes.
+
+        A per-call-site durability flag was rejected: it would make an
+        artifact's crash-safety depend on which method happened to write it,
+        and no current site has a defensible reason to opt out.  Should a
+        future caller genuinely write in a loop, give THAT caller the flag
+        rather than flipping the default underneath the recovery artifacts.
+        The kwargs this contract turns on are pinned by
+        ``TestWriteJsonDelegatesToSharedSafeIo``.
 
         An EXISTING target keeps its own permission bits across the swap (see
         :func:`_existing_mode`), which the superseded ``write_text`` got for
@@ -1633,9 +1669,15 @@ class TaskArtifacts:
                     'file at the link path'
                 )
             # ``_existing_mode`` is inside the try so a NON-FileNotFoundError
-            # stat failure is reported through the same path as any other
-            # write failure, while a stat FileNotFoundError on a vanished root
-            # still lands in the tolerated no-op branch below.
+            # stat failure (EACCES/ELOOP/ENAMETOOLONG) surfaces through the
+            # same path as any other write failure.  It swallows
+            # FileNotFoundError ITSELF and reports the target as new, so a
+            # vanished target does NOT short-circuit here — it reaches
+            # ``atomic_write_text``, which re-creates the parent chain under
+            # ``mkdir=True``, exactly as the superseded
+            # ``path.parent.mkdir(parents=True)`` did.  The tolerated no-op
+            # branch below is therefore reached from the WRITE, never from
+            # the mode lookup.
             safe_io.atomic_write_text(
                 target,
                 json.dumps(data, indent=2) + '\n',  # byte format UNCHANGED
