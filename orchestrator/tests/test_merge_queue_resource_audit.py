@@ -1920,6 +1920,44 @@ class TestResourceAuditFingerprint:
         assert 'reclaim overdue' in overdue[0]
         assert _resource_audit_fingerprint(scheduled) != _resource_audit_fingerprint(overdue)
 
+    def test_the_grace_figure_is_not_stripped(self, git_ops: GitOps) -> None:
+        """The DETECTION FLOOR moving is a real change (reviewer_comprehensive
+        amendment).
+
+        The docstring on ``_resource_audit_fingerprint`` lists ``grace`` under
+        'everything else is deliberately kept' and promises 'a deployment that
+        changes the floor SHOULD re-log' — but the regex once elided the grace
+        figure alongside the age, so a hot reload of
+        ``RESOURCE_AUDIT_WORKTREE_GRACE_SECS`` mid-episode was coalesced away
+        and the operator never learned the floor had moved.  No case held the
+        grace non-constant, which is why the contradiction survived; this is
+        that case.
+        """
+        from orchestrator.merge_queue import _resource_audit_fingerprint
+
+        _mkdir_worktree(git_ops, '_merge-floor', mtime=self._NOW - self._IN_BAND_AGE)
+
+        tight = self._worker(git_ops)
+        tight.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = 50.0
+        loose = self._worker(git_ops)
+        loose.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = 100.0
+
+        # Same tree, same clock, same disposition — ONLY the floor differs.
+        at_tight = tight.worktree_ledger_violations(now=self._NOW)
+        at_loose = loose.worktree_ledger_violations(now=self._NOW)
+        assert len(at_tight) == 1 and len(at_loose) == 1
+        assert 'grace 50s' in at_tight[0], at_tight[0]
+        assert 'grace 100s' in at_loose[0], at_loose[0]
+
+        assert _resource_audit_fingerprint(at_tight) != _resource_audit_fingerprint(at_loose), (
+            'moving the detection floor must force an immediate re-log, not be '
+            f'coalesced away — got {_resource_audit_fingerprint(at_tight)}'
+        )
+        # And the age is still elided even with the grace retained, so (a)'s
+        # coalescence property is not bought back by breaking this one.
+        later = tight.worktree_ledger_violations(now=self._NOW + 3600.0)
+        assert _resource_audit_fingerprint(at_tight) == _resource_audit_fingerprint(later)
+
     def test_set_membership_changes_the_fingerprint(self, git_ops: GitOps) -> None:
         """(c) Adding a leak changes it; removing that leak restores it."""
         from orchestrator.merge_queue import _resource_audit_fingerprint
@@ -2105,7 +2143,11 @@ class TestResourceAuditLogCoalescence:
         )
         assert len(_audit_lines(caplog)) == 10
         # Stated explicitly: NOT linear, by more than an order of magnitude.
-        assert 10 < 512 / 10
+        # Reads the OBSERVED count, not the literal 10 — the previous form
+        # (`assert 10 < 512 / 10`) compared two literals and was true
+        # regardless of what the code under test did (reviewer_comprehensive
+        # amendment).
+        assert len(_audit_lines(caplog)) < 512 / 10
         # The backoff advanced only because the fingerprint held steady even
         # though the tree's age grew by 30s on every one of those polls.
         assert worker.worktree_ledger_violations(now=self._NOW)[0] != (
@@ -2375,6 +2417,45 @@ class TestResourceAuditClearLine:
         assert f'{self._RUN} polls' in message, message
         # The run began at poll 1 (_NOW) and ended at poll 51 (_NOW + 50*30s).
         assert f'{self._RUN * self._POLL_S:.0f}s' in message, message
+
+    def test_the_clear_line_sizes_an_episode_whose_set_changed_midway(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The two numbers in the clear line share ONE measurement basis
+        (reviewer_comprehensive amendment).
+
+        (b) above only ever exercised a constant fingerprint, where a
+        whole-episode poll count and a final-segment duration happen to
+        agree.  They do not agree when the violation set changes mid-episode
+        — the case this test adds.  Reading the count off the streak and the
+        span off the gate produced 'clear after 50 polls / 300s' here, a 5x
+        understatement of a 1500s outage, in the single line whose stated
+        purpose is letting an operator size that outage.
+        """
+        worker = self._worker(git_ops)
+        worker._speculation_slot._value -= 1  # persists for the whole episode
+        change_at = 40
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, change_at)
+            # The set GROWS at poll 41: a leaked worktree joins the permit
+            # leak, restarting the gate's per-fingerprint segment clock while
+            # the episode runs on.
+            leak = _mkdir_worktree(
+                git_ops, '_merge-midway', mtime=self._NOW - self._IN_BAND_AGE,
+            )
+            self._drive(worker, self._RUN - change_at, start_poll=change_at)
+            worker._speculation_slot._value += 1
+            leak.rmdir()
+            self._drive(worker, 1, start_poll=self._RUN)
+
+        message = _clear_lines(caplog)[0].getMessage()
+        assert f'{self._RUN} polls' in message, message
+        # The EPISODE spans all 50 polls, not the 10 at the final fingerprint.
+        assert f'{self._RUN * self._POLL_S:.0f}s' in message, message
+        assert f'{(self._RUN - change_at) * self._POLL_S:.0f}s' not in message, (
+            f'the duration must span the whole episode, not the last segment: {message}'
+        )
 
     def test_a_never_violating_worker_emits_nothing_at_all(
         self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,

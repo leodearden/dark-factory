@@ -11940,8 +11940,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         to :func:`_resource_audit_fingerprint`, the coalescence key for
         :meth:`_check_resource_audit`'s report line.  Its FORMAT is therefore
         load-bearing for log CADENCE, not only for log content.  The
-        normaliser elides the volatile ``(age Ns > grace Ms)`` span and keys
-        on everything else, so re-wording that span makes every poll read as
+        normaliser elides the volatile AGE figure in ``(age Ns > grace Ms)``
+        and keys on everything else — including the ``grace`` figure and the
+        disposition suffix — so re-wording that span makes every poll read as
         a change and degrades to the pre-3203 log-every-poll cadence (loud,
         never silent), while making the disposition suffix volatile would
         make a real transition invisible.  ``TestResourceAuditFingerprint``
@@ -13137,15 +13138,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # every call site that adopts the coalescer.
             cleared = self._resource_audit_log_gate.clear(now)
             if cleared is not None:
-                # The streak (total consecutive VIOLATING polls) is the honest
-                # total an operator means by "after N polls"; the gate's own
-                # unchanged_polls counts only the polls at the LAST
-                # fingerprint, which is smaller whenever the set changed
-                # mid-run. Read before the reset below.
+                # BOTH numbers come from the gate's EPISODE counters, so they
+                # share one measurement basis and the line cannot contradict
+                # itself (reviewer_comprehensive amendment). Reading the poll
+                # count off _resource_audit_violation_streak while taking the
+                # duration off the gate mixed a whole-episode count with a
+                # final-fingerprint-only span: an episode of 50 polls whose
+                # set changed at poll 41 read "50 polls / 300s", when 50 polls
+                # at the 30s heartbeat is 1500s. The two agree exactly when
+                # the set never changed, which is why the mismatch survived.
                 logger.info(
                     'merge queue resource-conservation audit clear after %d polls '
                     '/ %.0fs — the violation set is now empty',
-                    self._resource_audit_violation_streak, cleared.duration_secs,
+                    cleared.polls, cleared.duration_secs,
                 )
             self._resource_audit_violation_streak = 0
             return
@@ -19086,15 +19091,24 @@ sentinel is a single fixed string rather than parameterized.
 """
 
 
-_RESOURCE_AUDIT_AGE_FIGURE_RE = re.compile(
-    r'\(age \d+(?:\.\d+)?s > grace \d+(?:\.\d+)?s\)'
-)
-"""The one VOLATILE span of a worktree-ledger violation string (task 3203).
+_RESOURCE_AUDIT_AGE_FIGURE_RE = re.compile(r'\(age \d+(?:\.\d+)?s > grace ')
+"""The one VOLATILE figure of a worktree-ledger violation string (task 3203).
 
-Emitted by :meth:`SpeculativeMergeWorker.worktree_ledger_violations`; its
+Emitted by :meth:`SpeculativeMergeWorker.worktree_ledger_violations`; the
 ``age`` grows by ``_HEARTBEAT_POLL_S`` on every poll.  Kept module-level and
 pre-compiled because :func:`_resource_audit_fingerprint` runs on every
 heartbeat.
+
+MATCHES THE AGE ONLY.  The trailing ``' > grace '`` is anchoring context, not
+part of what is elided — the substitution puts it back verbatim, so the
+``grace`` FIGURE stays in the fingerprint.  An earlier form of this pattern
+swallowed the grace figure too, silently contradicting
+:func:`_resource_audit_fingerprint`'s documented contract and coalescing away
+a mid-episode change to
+:attr:`SpeculativeMergeWorker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS` — the
+operator would never have seen that the detection floor moved
+(reviewer_comprehensive amendment; pinned by
+``TestResourceAuditFingerprint``'s grace case).
 """
 
 
@@ -19106,11 +19120,13 @@ def _resource_audit_fingerprint(violations: Sequence[str]) -> tuple[str, ...]:
     coalesces the repeat), and any real change must produce a DIFFERENT one
     (so it re-logs immediately at full detail).
 
-    ONLY THE AGE IS ELIDED.  ``(age Ns > grace Ms)`` is the single span of a
-    worktree violation that changes every poll purely because the clock moved;
-    left in, it would defeat any dedup whatsoever — a naive string-set
-    comparison would read every poll as a change and log forever, which is
-    exactly the pathology this task removes.
+    ONLY THE AGE IS ELIDED.  The ``N`` in ``(age Ns > grace Ms)`` is the
+    single figure of a worktree violation that changes every poll purely
+    because the clock moved; left in, it would defeat any dedup whatsoever —
+    a naive string-set comparison would read every poll as a change and log
+    forever, which is exactly the pathology this task removes.  The
+    substitution stops at ``' > grace '`` and puts that text back verbatim,
+    so ``M`` survives into the key.
 
     EVERYTHING ELSE IS DELIBERATELY KEPT:
 
@@ -19120,8 +19136,14 @@ def _resource_audit_fingerprint(violations: Sequence[str]) -> tuple[str, ...]:
         genuine state transition (the reaper was supposed to have destroyed
         it and did not) and must force an immediate full-detail re-log rather
         than being swallowed mid-backoff.
-      * ``grace`` — stable text for a given caller; a deployment that changes
-        the floor SHOULD re-log.
+      * the ``grace`` FIGURE — stable for a given caller, so keeping it costs
+        nothing in steady state, while a deployment or hot reload that moves
+        :attr:`SpeculativeMergeWorker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS`
+        SHOULD re-log at once: the detection floor moving mid-episode is
+        precisely the kind of change an operator reading a coalesced line
+        must not have hidden from them.  ``TestResourceAuditFingerprint``'s
+        grace case pins this, since the regex once swallowed the figure and
+        contradicted this paragraph unnoticed.
       * speculation-accounting strings, which pass through untouched.  Their
         counts (``slot_available(1) + live_permits(0) == 1, expected
         depth=2``) ARE the signal, not noise: a leak that grows from one
@@ -19145,7 +19167,7 @@ def _resource_audit_fingerprint(violations: Sequence[str]) -> tuple[str, ...]:
     :meth:`~SpeculativeMergeWorker.snapshot`.
     """
     return tuple(sorted(
-        _RESOURCE_AUDIT_AGE_FIGURE_RE.sub('(age <elided> > grace <elided>)', v)
+        _RESOURCE_AUDIT_AGE_FIGURE_RE.sub('(age <elided> > grace ', v)
         for v in violations
     ))
 
