@@ -16,6 +16,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -209,6 +210,22 @@ def _make_fake_systemctl(tmp_path, *, running_units, units=None):
 
 
 def _write_heartbeat(fleet_dir, unit, **overrides):
+    """Write <fleet_dir>/<unit>.json, replacing it ATOMICALLY.
+
+    Written to a sibling tempfile in the same directory and moved into place
+    with `os.replace`, mirroring the script's own `stamp_fleet_deploy_clock`
+    mktemp + `mv -f` idiom -- rather than `Path.write_text`, which truncates
+    the target file before writing its new content. That truncate-then-write
+    window is a torn read for any concurrent reader: this function is also
+    called from a background `threading.Timer` thread by `_heartbeat_timeline`
+    (below) WHILE the spawned script polls this same file every
+    ORCH_DRAIN_POLL_INTERVAL_SECS, and a poll landing inside the window would
+    see a zero-length file -- drain_check.py's `_read_heartbeat` turns a
+    `ValueError` from the empty/partial JSON into "absent", a verdict no
+    timeline scheduled. `os.replace` is a same-filesystem rename, atomic on
+    POSIX, so a concurrent reader always observes either the old content or
+    the full new content, never a partial write (reviewer_comprehensive #2).
+    """
     fleet_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "unit": unit,
@@ -218,7 +235,18 @@ def _write_heartbeat(fleet_dir, unit, **overrides):
         "ts_epoch": time.time(),
     }
     payload.update(overrides)
-    (fleet_dir / f"{unit}.json").write_text(json.dumps(payload))
+    target = fleet_dir / f"{unit}.json"
+    fd, tmp_name = tempfile.mkstemp(
+        dir=fleet_dir, prefix=f".{unit}.", suffix=".json.tmp",
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(payload))
+        os.replace(tmp_name, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=20):
@@ -746,7 +774,12 @@ def _heartbeat_timeline(fleet_dir, unit, timeline):
     Cancels and joins every timer on the way out, and asserts that no
     transition raised -- collected into a list rather than left to escape
     silently on a background thread, so a failed rewrite can never masquerade
-    as a passing test.
+    as a passing test. If the with-BODY also raised (e.g. `_run_script`
+    raising `subprocess.TimeoutExpired` during a RED-proof mutant run), that
+    exception is the more diagnostic of the two and is left to propagate
+    as-is -- any collected transition errors are folded into it as a note
+    instead of being raised as a separate `AssertionError` that would bump
+    the body's own failure down to `__context__` (reviewer_comprehensive #3).
 
     Rewriting real heartbeat JSON, rather than shimming a fake `python3` onto
     PATH to script drain_check.py's own output, is deliberate: this module's
@@ -785,9 +818,16 @@ def _heartbeat_timeline(fleet_dir, unit, timeline):
             timer.cancel()
         for timer in timers:
             timer.join(timeout=5)
-        assert not errors, (
-            f"heartbeat timeline transition(s) raised: {errors!r}"
-        )
+        if errors:
+            in_flight = sys.exc_info()[1]
+            if in_flight is not None:
+                in_flight.add_note(
+                    f"ALSO: heartbeat timeline transition(s) raised: {errors!r}"
+                )
+            else:
+                raise AssertionError(
+                    f"heartbeat timeline transition(s) raised: {errors!r}"
+                )
 
 
 def test_busy_unit_that_drains_mid_defer_resumes_and_restarts(tmp_path):
