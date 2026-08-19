@@ -225,7 +225,7 @@ import json
 import logging
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 
 from shared.task_statuses import TaskStatus
 
@@ -680,6 +680,23 @@ def _extract_deduped_against_uuids(flag: dict[str, Any]) -> list[str]:
 #: :func:`_cited_task_corroborated` reads.
 _CITED_TASK_PAYLOAD_KEYS: tuple[str, ...] = ('project_id', 'task_id', 'title')
 
+#: Hard ceiling on the length of any STRING value carried into a
+#: ``stage1_flag_marker`` payload's ``cited_tasks`` (task 4381 amendment).
+#: :data:`_MAX_PERSISTED_CITED_TASKS` bounds the row's ENTRY COUNT; this bounds
+#: its BYTES.  Both are needed because the value round-trips through the
+#: payload every cycle: an LLM emitting a pathologically long ``title`` (a
+#: pasted stack trace, a whole task description) would otherwise produce a
+#: ``payload_json`` that is large from the first cycle and stays large forever
+#: — and the failure would land exactly where sanitisation was introduced to
+#: prevent failure, inside the best-effort try/except where a rejected ledger
+#: write is swallowed as a WARNING and the marker silently stops persisting.
+#: 200 characters comfortably exceeds every real task title in this factory
+#: (the longest are ~130), so truncation only ever fires on junk; when it does,
+#: the truncated title no longer matches the live record, corroboration fails
+#: OPEN (no suppression) and the near-miss INFO log in
+#: :func:`_resolve_live_cross_project_fix_task` makes it observable.
+_MAX_CITED_TASK_STR_CHARS: int = 200
+
 
 def _sanitize_cited_tasks(flag: dict[str, Any]) -> list[dict[str, Any]] | None:
     """Project *flag*'s ``cited_tasks`` down to a payload-safe list, or ``None``.
@@ -688,7 +705,10 @@ def _sanitize_cited_tasks(flag: dict[str, Any]) -> list[dict[str, Any]] | None:
     :data:`_CITED_TASK_PAYLOAD_KEYS`, and only when the value is a scalar
     (``str``/``int``/``float``/``bool``) or ``None``.  Entries that are not
     dicts are skipped entirely, and an entry that projects down to nothing is
-    dropped rather than persisted as an empty dict.
+    dropped rather than persisted as an empty dict.  Every ``str`` value is
+    additionally truncated to :data:`_MAX_CITED_TASK_STR_CHARS` characters, so
+    the persisted row is bounded in BYTES as well as in entry count (task 4381
+    amendment) — see that constant for why a count-only bound was not enough.
 
     Sanitizing is NOT decorative.  The result is embedded in the payload that
     ``dedup_flags`` ``json.dumps``-es inside its best-effort try/except, so an
@@ -717,6 +737,13 @@ def _sanitize_cited_tasks(flag: dict[str, Any]) -> list[dict[str, Any]] | None:
             if key not in entry:
                 continue
             value = entry[key]
+            if isinstance(value, str) and len(value) > _MAX_CITED_TASK_STR_CHARS:
+                logger.debug(
+                    'flag_dedup: cited_tasks %r truncated from %d to %d chars for'
+                    ' the persisted marker payload',
+                    key, len(value), _MAX_CITED_TASK_STR_CHARS,
+                )
+                value = value[:_MAX_CITED_TASK_STR_CHARS]
             if value is None or isinstance(value, (str, int, float, bool)):
                 projected[key] = value
         if projected:
@@ -771,6 +798,53 @@ def _union_cited_tasks(current: Any, prior: Any) -> list[dict[str, Any]]:
 #: :func:`_union_cited_tasks` -> re-persisted), so an LLM emitting fresh
 #: distinct citations every cycle would otherwise grow the row without limit.
 _MAX_PERSISTED_CITED_TASKS: int = 32
+
+#: Payload key carrying the number of CONSECUTIVE cycles a ``stage1_flag_marker``
+#: has been suppressed by a cross-project fix task that is already ``done``
+#: (task 4381 amendment).  Written only while that count is non-zero, so a
+#: marker that has never been suppressed by a done fix task keeps the
+#: historical payload shape verbatim.
+_DONE_SUPPRESSIONS_PAYLOAD_KEY: str = 'cross_project_done_suppressions'
+
+#: How many consecutive cycles a ``done`` cross-project fix task may suppress a
+#: still-recurring finding before the suppression EXPIRES (task 4381
+#: amendment).
+#:
+#: A filed-but-unfinished fix task answers the complaint "no fix task has been
+#: filed" for as long as it stays unfinished, so it suppresses indefinitely.  A
+#: ``done`` one is different: the fix has supposedly LANDED, so a finding that
+#: Stage 1 keeps re-detecting afterwards is evidence the fix did not work — and
+#: because the ledger upsert refreshes the marker's 14-day TTL on every
+#: suppressing cycle, an unbounded rule would silence that finding FOREVER with
+#: no event left to revive it (the same argument the abandoned-status exclusion
+#: rests on).  Past this many cycles the gate stops suppressing and logs at
+#: WARNING, so a fix that demonstrably did not stop the recurrence surfaces
+#: loudly instead of degrading silently.
+#:
+#: Sized as a grace window, not a tripwire: a landed fix legitimately takes a
+#: few cycles to stop showing up in Stage 1's evidence, so the count must be
+#: comfortably above "one or two stale cycles".  The counter resets whenever the
+#: suppressing task is NOT done, and the whole marker ages out after its 14-day
+#: TTL if the finding stops recurring.
+_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES: int = 8
+
+
+def _prior_done_suppression_count(prior_payload: Any) -> int:
+    """Read :data:`_DONE_SUPPRESSIONS_PAYLOAD_KEY` off a prior marker payload.
+
+    Returns 0 for anything that is not a positive ``int`` — an absent key (every
+    marker written before the task 4381 amendment), ``None``, a bool (``True``
+    is an ``int`` in Python and must not be read as the count 1), a string, or a
+    negative value.  Free-form JSON off a ledger row is never trusted for shape.
+
+    Pure, sync, no I/O — never raises.
+    """
+    if not isinstance(prior_payload, dict):
+        return 0
+    value = prior_payload.get(_DONE_SUPPRESSIONS_PAYLOAD_KEY)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def _persistable_cited_tasks(entries: Any) -> list[dict[str, Any]] | None:
@@ -870,6 +944,7 @@ async def dedup_flags(
     *,
     taskmaster: Any = None,
     known_projects: dict[str, str] | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Annotate Stage 1 flagged items against prior ``stage1_flag_marker`` ledger rows.
 
@@ -983,11 +1058,29 @@ async def dedup_flags(
     * **Fail-open in every direction.** Omitting either kwarg degrades to the
       pre-4381 behaviour exactly, which is why every existing positional call
       site is unaffected.
-    * **The upsert still runs first.** Suppression happens AFTER the ledger
-      write, so a suppressed-but-still-recurring signature keeps its row,
-      refreshes its 14-day TTL, and re-persists the merged ``cited_tasks``.
-      Skipping the write would let the marker age out and lose the recurrence
-      history the cancelled-fix-task path depends on.
+    * **The upsert still runs on a suppressed cycle.** The gate's DECISION is
+      computed between the ledger read and the ledger write (so the
+      done-suppression counter below can ride the same write), but the write
+      itself still happens for a suppressed flag: it keeps its row, refreshes
+      its 14-day TTL, and re-persists the merged ``cited_tasks``.  Skipping the
+      write would let the marker age out and lose the recurrence history the
+      abandoned-fix-task path depends on.
+    * **A ``done`` fix task suppresses for a BOUNDED number of cycles** (task
+      4381 amendment).  Each consecutive cycle suppressed by an already-``done``
+      fix task increments ``cross_project_done_suppressions`` in the payload;
+      past :data:`_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES` the gate stops
+      suppressing and logs
+      ``reconciliation.stage1_flag_cross_project_fix_task_suppression_exhausted``
+      at WARNING.  Without that bound, a fix task reaching ``done`` while the
+      finding keeps recurring — i.e. a fix that demonstrably did not work —
+      would silence the finding permanently, since the TTL is refreshed on every
+      suppressing cycle.  A fix task that is filed but NOT done suppresses
+      indefinitely and resets the counter: the complaint "no fix task has been
+      filed" is answered for as long as the work is outstanding.
+    * **Batch-wide lookup memo.** All flags in one call share a single
+      ``(project_id, task_id) -> get_task result`` cache, so a family of
+      findings citing the same remediation task costs ONE round trip, not one
+      per flag.
 
     Args:
         memory_service: Service exposing ``recon_ledger`` (may be absent/None).
@@ -998,6 +1091,15 @@ async def dedup_flags(
             project_root)``, enabling the cross-project suppression gate.
         known_projects: Optional ``project_id -> project_root`` map, enabling
             the same gate.  Both must be truthy for it to run at all.
+        stats: Optional out-dict for per-call counters (task 4381 amendment).
+            When supplied, ``'cross_project_fix_task_suppressed'`` and
+            ``'cross_project_fix_task_suppression_exhausted'`` are incremented
+            (creating the keys as needed) so the caller can publish them as
+            ``report.stats`` entries.  Without it, a cross-project drop is
+            indistinguishable from a ``filter_suppressed`` drop in a cycle
+            report — two very different operator signals — because this
+            function returns only a list.  Never read by this function; safe to
+            omit.
 
     Returns the (possibly annotated) flag list.
     """
@@ -1008,6 +1110,10 @@ async def dedup_flags(
     flags = await filter_suppressed(memory_service, project_id, flags)
 
     result: list[dict[str, Any]] = []
+    # ONE cross-project get_task memo for the whole batch (task 4381
+    # amendment): the gate below runs per carried-forward flag, and findings in
+    # one family routinely cite the same remediation task.
+    fix_task_cache: dict[tuple[str, str], Any] = {}
     for flag in flags:
         sig = compute_flag_signature(flag)
         # Content-fingerprint fallback (task-1654 Fix 2): for null-task_id flags
@@ -1138,6 +1244,9 @@ async def dedup_flags(
         # Free-form JSON off a ledger row — validated by _union_cited_tasks,
         # never trusted for shape.
         prior_cited: Any = None
+        # Consecutive cycles this marker has already been suppressed by an
+        # already-``done`` cross-project fix task (task 4381 amendment).
+        prior_done_suppressions: int = 0
         # The single merged anchor: computed ONCE and used by BOTH the payload
         # written below and the suppression gate further down, so the gate
         # provably resolves against exactly the set that was just persisted.
@@ -1164,6 +1273,13 @@ async def dedup_flags(
         # the whole dedup_flags batch (memory_consolidator.run() calls this
         # with no surrounding try/except, so an unguarded raise here would
         # fail the entire Stage-1 run over a single bad row).
+        # The read and the write are two separate best-effort blocks (task
+        # 4381 amendment) so the cross-project gate's DECISION can be computed
+        # between them and ride the same write.  A read failure still skips the
+        # write entirely, exactly as the single combined block did — otherwise a
+        # marker whose prior row could not be read would be overwritten as if it
+        # were a first sighting, destroying its recurrence history.
+        ledger_read_ok = False
         if ledger is not None:
             try:
                 prior = await ledger.get_by_identity(project_id, 'stage1_flag_marker', tid, ftype, '')
@@ -1171,6 +1287,7 @@ async def dedup_flags(
                     prior_payload = json.loads(prior.payload_json)
                     persisted_from_run = prior_payload.get('run_id') or 'unknown'
                     prior_cited = prior_payload.get('cited_tasks')
+                    prior_done_suppressions = _prior_done_suppression_count(prior_payload)
                     if persisted_from_run == 'unknown':
                         logger.debug(
                             'flag_dedup: prior marker for task=%s flag_type=%s has malformed run_id metadata',
@@ -1180,6 +1297,67 @@ async def dedup_flags(
                 # Outside the `if prior is not None` branch on purpose: a MISS
                 # must still end up with the current-cycle-only union.
                 merged_cited = _union_cited_tasks(cited_tasks, prior_cited)
+                ledger_read_ok = True
+            except Exception as e:
+                logger.warning(
+                    'flag_dedup: recon_ledger read/write failed for marker'
+                    ' task=%s flag_type=%s: %s (best-effort — flag still'
+                    ' returned, no ledger annotation/persistence this cycle)',
+                    tid,
+                    ftype,
+                    e,
+                    exc_info=True,
+                )
+
+        # --- Cross-project fix-task suppression DECISION (task 4381) ---
+        # HIT-only: persisted_from_run is not None means this signature was
+        # carried forward from a prior cycle. A first-cycle finding is never
+        # suppressed.  Computed BEFORE the write (but applied after it) so the
+        # done-suppression counter is persisted by the same upsert; the write
+        # still happens on the suppressing path, which is what keeps a
+        # suppressed-but-still-recurring marker from ageing out.
+        suppress_cross_project = False
+        done_suppressions = 0
+        fix_task: _LiveFixTask | None = None
+        if persisted_from_run is not None and taskmaster and known_projects:
+            fix_task = await _resolve_live_cross_project_fix_task(
+                taskmaster,
+                known_projects,
+                project_id,
+                merged_cited,
+                cache=fix_task_cache,
+            )
+        if fix_task is not None:
+            if fix_task.status != TaskStatus.DONE.value:
+                # Filed and still outstanding — suppresses for as long as it
+                # stays that way, and resets any done-grace already burned (a
+                # reopened fix task earns a fresh window).
+                suppress_cross_project = True
+            elif prior_done_suppressions >= _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES:
+                # The fix landed and the finding STILL recurs — stop silencing
+                # it and say so loudly.  The count is frozen at the ceiling
+                # rather than incremented, so the finding stays surfaced for as
+                # long as this remains true instead of oscillating.
+                done_suppressions = prior_done_suppressions
+                logger.warning(
+                    'reconciliation.stage1_flag_cross_project_fix_task_suppression_exhausted '
+                    'task_id=%s flag_type=%s fix_project_id=%s fix_task_id=%s '
+                    'done_suppressions=%d max=%d — the cited fix task is done yet '
+                    'the finding keeps recurring; surfacing it again',
+                    tid, ftype, fix_task.cited.get('project_id'),
+                    fix_task.cited.get('task_id'), prior_done_suppressions,
+                    _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES,
+                )
+                if stats is not None:
+                    stats['cross_project_fix_task_suppression_exhausted'] = (
+                        stats.get('cross_project_fix_task_suppression_exhausted', 0) + 1
+                    )
+            else:
+                suppress_cross_project = True
+                done_suppressions = prior_done_suppressions + 1
+
+        if ledger is not None and ledger_read_ok:
+            try:
                 # The UNION is what gets persisted — not the current cycle
                 # alone.  Persisting only the current cycle would erase the
                 # anchor on the very cycle it did its job, making it
@@ -1191,6 +1369,10 @@ async def dedup_flags(
                 persistable = _persistable_cited_tasks(merged_cited)
                 if persistable:
                     payload['cited_tasks'] = persistable
+                if done_suppressions:
+                    # Same optional-key idiom: a marker never suppressed by a
+                    # done fix task keeps the historical payload shape.
+                    payload[_DONE_SUPPRESSIONS_PAYLOAD_KEY] = done_suppressions
                 now = datetime.now(UTC)
                 await ledger.upsert(ReconLedgerRecord(
                     project_id=project_id,
@@ -1218,28 +1400,19 @@ async def dedup_flags(
             flag['persisted_from_run'] = persisted_from_run
         flag['last_seen_run_id'] = run_id
 
-        # --- Cross-project fix-task suppression gate (task 4381) ---
-        # Deliberately placed AFTER the upsert above: a suppressed-but-still-
-        # recurring signature must keep its row, refresh its 14-day TTL and
-        # re-persist its cited_tasks, so the marker never ages out and loses
-        # the recurrence history the cancelled-fix-task path depends on.
-        # HIT-only: persisted_from_run is not None means this signature was
-        # carried forward from a prior cycle. A first-cycle finding is never
-        # suppressed.
-        if persisted_from_run is not None and taskmaster and known_projects:
-            fix_cite = await _resolve_live_cross_project_fix_task(
-                taskmaster,
-                known_projects,
-                project_id,
-                merged_cited,
+        if suppress_cross_project and fix_task is not None:
+            logger.info(
+                'reconciliation.stage1_flag_cross_project_fix_task_suppressed '
+                'task_id=%s flag_type=%s fix_project_id=%s fix_task_id=%s '
+                'fix_status=%s done_suppressions=%d',
+                tid, ftype, fix_task.cited.get('project_id'),
+                fix_task.cited.get('task_id'), fix_task.status, done_suppressions,
             )
-            if fix_cite is not None:
-                logger.info(
-                    'reconciliation.stage1_flag_cross_project_fix_task_suppressed '
-                    'task_id=%s flag_type=%s fix_project_id=%s fix_task_id=%s',
-                    tid, ftype, fix_cite.get('project_id'), fix_cite.get('task_id'),
+            if stats is not None:
+                stats['cross_project_fix_task_suppressed'] = (
+                    stats.get('cross_project_fix_task_suppressed', 0) + 1
                 )
-                continue
+            continue
 
         result.append(flag)
     return result
@@ -2214,7 +2387,10 @@ async def filter_terminal_metadata_flags(
     if not check_positions:
         return list(flags)
 
-    async def _safe_get_task(task_id: Any) -> Any:
+    async def _safe_get_task_or_none(task_id: Any) -> Any:
+        # Deliberately NOT the module-level _safe_get_task: this filter fails
+        # SAFE to None (KEEP the flag) rather than to a normalised error dict,
+        # and it binds this filter's single fixed project_root.
         try:
             return await taskmaster.get_task(task_id, project_root)
         except Exception as exc:
@@ -2225,7 +2401,7 @@ async def filter_terminal_metadata_flags(
             return None  # KEEP flag on error (fail-safe)
 
     lookup_results: list[Any] = await asyncio.gather(
-        *[_safe_get_task(tid) for tid in check_task_ids]
+        *[_safe_get_task_or_none(tid) for tid in check_task_ids]
     )
     results_by_pos: dict[int, Any] = dict(zip(check_positions, lookup_results, strict=True))
 
@@ -2492,28 +2668,18 @@ async def filter_false_absence_flags(
     if not taskmaster or not project_root:
         return list(flags)
 
-    async def _safe_get_task(task_id: Any) -> Any:
-        """Fetch task with normalised exception handling.
+    async def _safe_get_task_for_root(task_id: Any) -> Any:
+        """Fetch task with normalised exception handling, for THIS filter's root.
 
-        Returns the raw get_task result on success, or a normalised
-        ``{'error': ..., 'error_type': ...}`` dict on any exception so that
-        ``confirm_task_absent`` can classify both paths identically.
-
-        NOTE: this is structurally the same helper as
-        ``filter_false_phantom_task_creation_flags._safe_get_task``
-        (exception -> ``{'error', 'error_type'}`` normalisation). Keep the
-        two in sync if the normalised-exception shape ever changes — they
-        exist as separate closures (rather than one shared helper) only
-        because each closes over a different fixed positional argument
-        (the single ``project_root`` here vs. a per-call ``project_root``
-        there).
+        Delegates to the module-level :func:`_safe_get_task`, binding the
+        single fixed *project_root* this filter was called with (that binding
+        is the only reason it remains a closure — task 4381 amendment
+        superseded the former "keep the two in sync" NOTE by extracting the
+        shared body, so the normalised ``{'error', 'error_type'}`` shape
+        ``confirm_task_absent`` classifies can no longer drift between call
+        sites).
         """
-        try:
-            return await taskmaster.get_task(task_id, project_root)
-        except Exception as exc:
-            # Normalise: same dict shape as the MCP-wrapper path so
-            # confirm_task_absent can classify the raised-exception path.
-            return {'error': str(exc), 'error_type': type(exc).__name__}
+        return await _safe_get_task(taskmaster, task_id, project_root)
 
     # Split flags into those requiring a get_task lookup and pass-throughs.
     # Track original position so the output list preserves input order.
@@ -2528,7 +2694,7 @@ async def filter_false_absence_flags(
 
     # Issue all get_task calls concurrently (typically only a handful per cycle).
     lookup_results: list[Any] = await asyncio.gather(
-        *[_safe_get_task(tid) for tid in check_task_ids]
+        *[_safe_get_task_for_root(tid) for tid in check_task_ids]
     )
     results_by_pos: dict[int, Any] = dict(zip(check_positions, lookup_results, strict=True))
 
@@ -2686,6 +2852,60 @@ def _cited_task_corroborated(cited: dict[str, Any], get_task_result: object) -> 
     return normalized_cited == normalized_result
 
 
+#: Task statuses that mean the work was ABANDONED rather than merely filed
+#: (task 4381 amendment).  This is the NAMED SEAM the module's two
+#: cross-project guards share, and it exists because the semantics being
+#: encoded are "this status means the work was FILED and not abandoned" —
+#: which a "everything except CANCELLED" derivation gets backwards for any
+#: future abandonment-flavoured member (``rejected``, ``wontfix``,
+#: ``obsolete``).  Such a status would otherwise SILENTLY gain suppression
+#: power over a never-tracked finding, which is exactly the permanent-
+#: silencing failure mode the CANCELLED exclusion exists to prevent.  Adding
+#: one is now a one-line edit here rather than a behavioural change nobody
+#: reviewed.
+_ABANDONED_TASK_STATUSES: frozenset[TaskStatus] = frozenset({TaskStatus.CANCELLED})
+
+#: The raw string values of :data:`_ABANDONED_TASK_STATUSES`, for comparing
+#: against a backend-supplied ``status`` string.  (``TaskStatus`` is a
+#: ``StrEnum``, so this is equality-compatible with the members themselves;
+#: the explicit projection keeps the intent legible at the call site.)
+_ABANDONED_TASK_STATUS_VALUES: frozenset[str] = frozenset(
+    s.value for s in _ABANDONED_TASK_STATUSES
+)
+
+
+async def _safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> Any:
+    """Fetch ONE task with normalised exception handling.
+
+    Returns the raw ``taskmaster.get_task`` result on success, or a normalised
+    ``{'error': ..., 'error_type': ...}`` dict on ANY exception, so that
+    :func:`confirm_task_present` / :func:`_cited_task_corroborated` /
+    :func:`_cited_fix_task_live` classify the raised-exception path exactly as
+    they classify the MCP wrapper's own error-dict path.
+
+    That normalisation is also what lets every caller keep using a PLAIN
+    ``asyncio.gather`` (no ``return_exceptions=True``, which
+    ``tests/test_gather_convention_guard.py`` would otherwise require be routed
+    through ``utils/async_utils``).
+
+    Module-level as of the task 4381 amendment pass: the two cross-project call
+    sites — :func:`_resolve_live_cross_project_fix_task` and
+    :func:`filter_false_phantom_task_creation_flags` — previously carried
+    byte-identical private closures with a "keep the two in sync" NOTE.  Both
+    take a PER-CITATION ``project_root``, so neither was actually closing over
+    anything, and the note had already gone stale at three copies.  The two
+    remaining private variants genuinely differ: they bind one fixed
+    ``project_root`` for a whole filter (and
+    :func:`filter_terminal_metadata_flags`' variant fails SAFE to ``None``
+    rather than to an error dict), so they stay closures — the absence-filter's
+    now delegates here so the normalised shape cannot drift.
+    """
+    try:
+        return await taskmaster.get_task(task_id, project_root)
+    except Exception as exc:
+        return {'error': str(exc), 'error_type': type(exc).__name__}
+
+
 def _cited_fix_task_live(cited: dict[str, Any], get_task_result: object) -> bool:
     """True iff *cited* names a FILED, non-cancelled task confirmed by *get_task_result*.
 
@@ -2699,14 +2919,20 @@ def _cited_fix_task_live(cited: dict[str, Any], get_task_result: object) -> bool
        the structured-output JSON-fallback citation path bypasses that check
        entirely — so a hallucinated or stale entry must never be able to
        suppress a real recurring complaint on a bare id match.
-    2. **The status policy is "filed and not cancelled"** (Leo's ruling,
-       2026-08-17, task 4381 / esc-3841-1).  Any status other than
-       ``'cancelled'`` counts, INCLUDING ``pending`` and ``blocked``: the
-       complaint these findings raise is literally "no fix task has been
-       filed", which a filed-but-unstarted task already answers.  A
-       ``cancelled`` task must NOT count — treating it as satisfying the
-       complaint would silence the finding permanently, with no event left
-       to ever revive it.
+    2. **The status policy is "filed and not abandoned"** (Leo's ruling,
+       2026-08-17, task 4381 / esc-3841-1).  Any status outside
+       :data:`_ABANDONED_TASK_STATUS_VALUES` counts, INCLUDING ``pending`` and
+       ``blocked``: the complaint these findings raise is literally "no fix
+       task has been filed", which a filed-but-unstarted task already answers.
+       An ABANDONED (today: ``cancelled``) task must NOT count — treating it as
+       satisfying the complaint would silence the finding permanently, with no
+       event left to ever revive it.  The check reads the named abandonment set
+       rather than testing ``!= 'cancelled'`` so a future abandonment-flavoured
+       status cannot silently acquire suppression power (task 4381 amendment).
+       A ``done`` fix task DOES satisfy the complaint here — but only for a
+       bounded number of cycles; see
+       :data:`_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES` and ``dedup_flags``, which
+       own that policy because it needs the marker's cross-cycle counter.
     3. **An absent or non-``str`` status is INCONCLUSIVE** and returns False,
        matching this module's suppress-only-on-positive-confirmation posture
        (:func:`confirm_task_present` / :func:`confirm_task_absent`).  In
@@ -2729,7 +2955,23 @@ def _cited_fix_task_live(cited: dict[str, Any], get_task_result: object) -> bool
         return False
     # _cited_task_corroborated already proved get_task_result is a dict.
     status = get_task_result.get('status')  # type: ignore[union-attr]
-    return isinstance(status, str) and status != 'cancelled'
+    return isinstance(status, str) and status not in _ABANDONED_TASK_STATUS_VALUES
+
+
+class _LiveFixTask(NamedTuple):
+    """A corroborated live FOREIGN fix task: the citation, and its live status.
+
+    Returned by :func:`_resolve_live_cross_project_fix_task`.  The *status* is
+    carried alongside the citation because the caller's suppression policy is
+    status-dependent: a ``done`` fix task suppresses only for a bounded number
+    of cycles (:data:`_MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES`), while a filed-
+    but-unfinished one suppresses for as long as it stays that way.  Resolution
+    lives here; the policy lives in ``dedup_flags``, which owns the marker
+    counter the bound is measured against.
+    """
+
+    cited: dict[str, Any]
+    status: str
 
 
 async def _resolve_live_cross_project_fix_task(
@@ -2737,7 +2979,9 @@ async def _resolve_live_cross_project_fix_task(
     known_projects: dict[str, str] | None,
     project_id: str,
     cited_tasks: Any,
-) -> dict[str, Any] | None:
+    *,
+    cache: dict[tuple[str, str], Any] | None = None,
+) -> _LiveFixTask | None:
     """Return the first *cited_tasks* entry naming a live FOREIGN fix task, else ``None``.
 
     Deliberately shaped as a copy of
@@ -2781,33 +3025,24 @@ async def _resolve_live_cross_project_fix_task(
             citations naming it are skipped (see FOREIGN-ONLY above).
         cited_tasks: The finding's ``cited_tasks`` value, in whatever shape an
             LLM emitted it — validated here, never trusted.
+        cache: OPTIONAL ``(str(project_id), str(task_id)) -> get_task result``
+            memo, shared by the caller across every flag in one batch (task
+            4381 amendment).  Findings in one family routinely cite the SAME
+            remediation task, and this gate runs once per carried-forward flag,
+            so without it a batch re-issues the identical lookup per flag.  A
+            normalised error result is cached too: one failed round trip per
+            batch, not one per flag.  Omitting it degrades to a per-call memo
+            (duplicate citations WITHIN one flag are still looked up once).
 
     Returns:
-        The first cited entry for which :func:`_cited_fix_task_live` is True,
-        or ``None``.
+        A :class:`_LiveFixTask` naming the first cited entry for which
+        :func:`_cited_fix_task_live` is True and its live status, or ``None``.
     """
     if not taskmaster or not known_projects or not isinstance(cited_tasks, list):
         return None
 
-    async def _safe_get_task(task_id: Any, project_root: str) -> Any:
-        """Fetch task with normalised exception handling.
-
-        Returns the raw get_task result on success, or a normalised
-        ``{'error': ..., 'error_type': ...}`` dict on any exception, so that
-        :func:`_cited_fix_task_live` classifies both paths identically.  This
-        normalisation is what lets the gather below stay a PLAIN
-        ``asyncio.gather`` (no ``return_exceptions=True``, which
-        ``tests/test_gather_convention_guard.py`` would otherwise route
-        through ``utils/async_utils``) — structurally the same closure as
-        ``filter_false_phantom_task_creation_flags._safe_get_task``.
-        """
-        try:
-            return await taskmaster.get_task(task_id, project_root)
-        except Exception as exc:
-            return {'error': str(exc), 'error_type': type(exc).__name__}
-
-    lookup_cited: list[dict[str, Any]] = []
-    lookup_coros = []
+    # (cited entry, cache key, task_id, project_root) for every resolvable citation.
+    resolvable: list[tuple[dict[str, Any], tuple[str, str], Any, str]] = []
     for cited in cited_tasks:
         if not isinstance(cited, dict):
             continue
@@ -2820,18 +3055,40 @@ async def _resolve_live_cross_project_fix_task(
         root = known_projects.get(cited_project_id)
         if not root:
             continue  # unresolvable project -> not corroborated -> skip lookup
-        lookup_cited.append(cited)
-        lookup_coros.append(_safe_get_task(cited_task_id, root))
+        resolvable.append(
+            (cited, (str(cited_project_id), str(cited_task_id)), cited_task_id, root)
+        )
 
-    if not lookup_coros:
+    if not resolvable:
         return None
 
-    lookup_results: list[Any] = await asyncio.gather(*lookup_coros)
+    if cache is None:
+        cache = {}
+    # Only the citations this batch has NOT already resolved are fetched, and
+    # each distinct identity at most once — insertion-ordered so the gather
+    # keeps the citation order the results are zipped back onto.
+    pending: dict[tuple[str, str], tuple[Any, str]] = {}
+    for _cited, key, cited_task_id, root in resolvable:
+        if key in cache or key in pending:
+            continue
+        pending[key] = (cited_task_id, root)
+
+    if pending:
+        # PLAIN gather — _safe_get_task normalises every exception to an error
+        # dict (see tests/test_gather_convention_guard.py).
+        fetched: list[Any] = await asyncio.gather(
+            *(
+                _safe_get_task(taskmaster, cited_task_id, root)
+                for cited_task_id, root in pending.values()
+            )
+        )
+        cache.update(zip(pending.keys(), fetched, strict=True))
 
     near_misses: list[dict[str, Any]] = []
-    for cited, result in zip(lookup_cited, lookup_results, strict=True):
+    for cited, key, _cited_task_id, _root in resolvable:
+        result = cache[key]
         if _cited_fix_task_live(cited, result):
-            return cited
+            return _LiveFixTask(cited=cited, status=str(result.get('status')))
         if confirm_task_present(result):
             near_misses.append(cited)
 
@@ -2916,27 +3173,6 @@ async def filter_false_phantom_task_creation_flags(
     if not taskmaster or not known_projects:
         return list(flags)
 
-    async def _safe_get_task(task_id: Any, project_root: str) -> Any:
-        """Fetch task with normalised exception handling.
-
-        Returns the raw get_task result on success, or a normalised
-        ``{'error': ..., 'error_type': ...}`` dict on any exception so that
-        ``confirm_task_present`` / ``_cited_task_corroborated`` can classify
-        both paths identically.
-
-        NOTE: this is structurally the same helper as
-        ``filter_false_absence_flags._safe_get_task`` (exception ->
-        ``{'error', 'error_type'}`` normalisation). Keep the two in sync if
-        the normalised-exception shape ever changes — they exist as separate
-        closures (rather than one shared helper) only because each closes
-        over a different fixed positional argument (``project_root`` here vs.
-        the absence gate's single ``project_root``).
-        """
-        try:
-            return await taskmaster.get_task(task_id, project_root)
-        except Exception as exc:
-            return {'error': str(exc), 'error_type': type(exc).__name__}
-
     # Collect resolvable cited-task lookups, grouped by owning flag index.
     # Multiple cited_tasks entries (possibly across different flags) run
     # concurrently in a single flat asyncio.gather batch.
@@ -2962,7 +3198,7 @@ async def filter_false_phantom_task_creation_flags(
                 continue  # unresolvable project -> not corroborated -> skip lookup
             lookup_flag_indices.append(i)
             lookup_cited.append(cited)
-            lookup_coros.append(_safe_get_task(cited_task_id, root))
+            lookup_coros.append(_safe_get_task(taskmaster, cited_task_id, root))
 
     if not lookup_coros:
         return list(flags)
@@ -3011,11 +3247,15 @@ async def filter_false_phantom_task_creation_flags(
 #: forever.
 #:
 #: DERIVED from ``shared.task_statuses.TaskStatus`` (the closed status
-#: vocabulary) rather than hardcoded as a literal, so a status added to that
-#: vocabulary later is included here automatically instead of being silently
-#: excluded from the guard.  Sorted for a stable, assertable ordering.
+#: vocabulary) minus the NAMED abandonment set
+#: :data:`_ABANDONED_TASK_STATUSES`, rather than hardcoded as a literal or
+#: spelled as an inline ``is not CANCELLED`` test.  A status added to the
+#: vocabulary later is therefore included here automatically, while a future
+#: ABANDONMENT status is excluded by a one-line edit at the named seam instead
+#: of silently gaining suppression power over never-tracked findings (task 4381
+#: amendment).  Sorted for a stable, assertable ordering.
 _NON_CANCELLED_TASK_STATUSES: list[str] = sorted(
-    s.value for s in TaskStatus if s is not TaskStatus.CANCELLED
+    s.value for s in TaskStatus if s not in _ABANDONED_TASK_STATUSES
 )
 
 #: Fixed lexicon of phrases that assert an idea/pattern was never converted
@@ -3055,6 +3295,99 @@ _STOPWORDS: frozenset[str] = frozenset({
 #: words, which is what lets them overlap with a done task's prose title/
 #: description.
 _TERM_SPLIT_RE: re.Pattern[str] = re.compile(r'[^a-z0-9]+')
+
+
+class _CoverageMatch(NamedTuple):
+    """The best already-tracked task covering one systemic-pattern candidate."""
+
+    project_id: str
+    task_id: Any
+    coverage: float
+
+
+def _match_already_tracked_candidates(
+    project_ids: list[str],
+    project_task_lists: list[list[Any] | None],
+    candidate_terms: list[set[str]],
+    min_key_terms: int,
+    match_coverage: float,
+    min_task_term_precision: float,
+) -> dict[int, _CoverageMatch]:
+    """Return ``{candidate index -> best covering task}`` for the drops to make.
+
+    The whole CPU-bound half of :func:`filter_already_tracked_systemic_patterns`
+    — key-term extraction over every fetched task's title+description, then the
+    O(candidates x tasks) set-intersection sweep — lives here as ONE pure,
+    synchronous function so the caller can hand it to :func:`asyncio.to_thread`
+    (task 4381 amendment).  Measured against the live dark_factory backlog, term
+    extraction alone is ~0.6s of blocking CPU for ~4.2k tasks / ~8MB of
+    description text, multiplied by the number of known projects now queried;
+    run inline that stalls the whole reconciliation event loop for seconds on
+    any cycle that has a never-tracked candidate.
+
+    It also slims the working set: only ``(project_id, task id, terms)`` is
+    retained per task, never the task dict, so each project's multi-MB payload
+    becomes garbage-collectable as soon as its terms are extracted rather than
+    being held until the matching sweep finishes.
+
+    *project_task_lists* is positionally aligned with *project_ids*; a ``None``
+    entry means that project's lookup FAILED and is skipped (its tasks cannot
+    contribute evidence).  Tasks that are not dicts, that carry an ABANDONED
+    status (:data:`_ABANDONED_TASK_STATUS_VALUES` — belt-and-braces, since the
+    query already excludes them, so that a backend ignoring the ``statuses``
+    kwarg still cannot permanently silence a complaint), or whose title +
+    description yield no key terms at all cannot match and are dropped up front.
+
+    A candidate with fewer than *min_key_terms* distinct terms (or none at all,
+    which would otherwise divide by zero) is never matched — too little signal
+    to trust a coverage match.  A task qualifies only when it covers at least
+    *match_coverage* of the candidate's terms AND at least
+    *min_task_term_precision* of the task's own terms come from that overlap;
+    the highest-coverage qualifying task wins.
+
+    Pure, sync, no I/O, no logging (the caller owns the drop log so it stays on
+    the event loop) — never raises.
+    """
+    tracked: list[tuple[str, Any, set[str]]] = []
+    for project_id, tasks in zip(project_ids, project_task_lists, strict=True):
+        if tasks is None:
+            continue
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            status = task.get('status')
+            if isinstance(status, str) and status in _ABANDONED_TASK_STATUS_VALUES:
+                continue
+            task_terms = _significant_terms(
+                f"{task.get('title') or ''} {task.get('description') or ''}"
+            )
+            if not task_terms:
+                continue
+            tracked.append((project_id, task.get('id'), task_terms))
+
+    matches: dict[int, _CoverageMatch] = {}
+    for index, finding_terms in enumerate(candidate_terms):
+        if not finding_terms or len(finding_terms) < min_key_terms:
+            continue
+        best: _CoverageMatch | None = None
+        for project_id, task_id, task_terms in tracked:
+            overlap = len(finding_terms & task_terms)
+            coverage = overlap / len(finding_terms)
+            if coverage < match_coverage:
+                continue
+            # Precision floor: an overlap that clears match_coverage can still
+            # be incidental if the task's own description is large and generic
+            # (reviewer_comprehensive, task 2416 amendment) — a qualifying task
+            # must also derive a meaningful share of its own terms from the
+            # overlap, not just happen to contain it somewhere in a much
+            # larger, unrelated body of text.
+            if overlap / len(task_terms) < min_task_term_precision:
+                continue
+            if best is None or coverage > best.coverage:
+                best = _CoverageMatch(project_id, task_id, coverage)
+        if best is not None:
+            matches[index] = best
+    return matches
 
 
 def _asserts_never_tracked(text: str) -> bool:
@@ -3288,65 +3621,33 @@ async def filter_already_tracked_systemic_patterns(
         # single-project KEEP-all-on-error contract this filter shipped with.
         return list(flags)
 
-    tracked_tasks_with_terms: list[tuple[str, dict[str, Any], set[str]]] = []
-    for (project_id, _root), tasks in zip(lookup_projects, project_results, strict=True):
-        if tasks is None:
-            continue
-        for task in tasks:
-            if not isinstance(task, dict):
-                continue
-            if task.get('status') == 'cancelled':
-                # Belt-and-braces: the statuses kwarg already excludes
-                # cancelled, but a backend that ignores it must still never be
-                # able to silence the complaint permanently (task 4381).
-                continue
-            tracked_tasks_with_terms.append((
-                project_id,
-                task,
-                _significant_terms(
-                    f"{task.get('title') or ''} {task.get('description') or ''}"
-                ),
-            ))
+    # Term extraction + the coverage sweep are pure CPU over every fetched
+    # task's title+description across every known project — seconds of blocking
+    # work on a big backlog — so they run OFF the event loop (task 4381
+    # amendment).  See _match_already_tracked_candidates for the measurements.
+    matches = await asyncio.to_thread(
+        _match_already_tracked_candidates,
+        [project_id for project_id, _root in lookup_projects],
+        project_results,
+        candidate_terms,
+        min_key_terms,
+        match_coverage,
+        min_task_term_precision,
+    )
+    # Release every project's task payload now that only the slim term sets
+    # inside the matcher were needed — these lists are multi-MB per project.
+    del project_results
 
     drop_positions: set[int] = set()
-    for pos, finding_terms in zip(candidate_positions, candidate_terms, strict=True):
-        if len(finding_terms) < min_key_terms:
-            # Too few distinctive terms to trust a coverage match — KEEP
-            # without attempting a match (task 2416 step-6 min-term floor).
-            continue
-        matched = False
-        best_coverage = 0.0
-        best_task_id: Any = None
-        best_project_id: str | None = None
-        for project_id, task, task_terms in tracked_tasks_with_terms:
-            if not task_terms:
-                continue
-            overlap = len(finding_terms & task_terms)
-            coverage = overlap / len(finding_terms)
-            if coverage < match_coverage:
-                continue
-            # Precision floor: an overlap that clears match_coverage can still
-            # be incidental if the task's own description is large and generic
-            # (reviewer_comprehensive, task 2416 amendment pass) — a
-            # qualifying task must also derive a meaningful share of its own
-            # terms from the overlap, not just happen to contain it somewhere
-            # in a much larger, unrelated body of text.
-            precision = overlap / len(task_terms)
-            if precision < min_task_term_precision:
-                continue
-            if not matched or coverage > best_coverage:
-                matched = True
-                best_coverage = coverage
-                best_task_id = task.get('id')
-                best_project_id = project_id
-        if matched:
-            drop_positions.add(pos)
-            logger.info(
-                'reconciliation.systemic_pattern_already_tracked_dropped '
-                'matched_project_id=%s matched_task_id=%s coverage=%.2f '
-                'finding_terms=%s',
-                best_project_id, best_task_id, best_coverage, sorted(finding_terms),
-            )
+    for index, match in matches.items():
+        drop_positions.add(candidate_positions[index])
+        logger.info(
+            'reconciliation.systemic_pattern_already_tracked_dropped '
+            'matched_project_id=%s matched_task_id=%s coverage=%.2f '
+            'finding_terms=%s',
+            match.project_id, match.task_id, match.coverage,
+            sorted(candidate_terms[index]),
+        )
 
     return [flag for i, flag in enumerate(flags) if i not in drop_positions]
 

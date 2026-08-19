@@ -338,6 +338,7 @@ class MemoryConsolidator(BaseStage):
             # suppression gate (filter_suppressed) as its first step, so suppression
             # drops can be isolated below and excluded from acknowledgment.
             _pre_dedup_flags = list(report.items_flagged)
+            _dedup_stats: dict[str, int] = {}
             report.items_flagged = await dedup_flags(
                 memory_service=self.memory,
                 project_id=self.project_id,
@@ -348,6 +349,24 @@ class MemoryConsolidator(BaseStage):
                 # no-op by design.
                 taskmaster=self.taskmaster,
                 known_projects=self.known_projects,
+                # Out-dict for dedup_flags' own drop counters (task 4381
+                # amendment) — see the report.stats publication below.
+                stats=_dedup_stats,
+            )
+            # Every sibling filter in this chain publishes its drop count; the
+            # cross-project gate now does too, so an operator reading a cycle
+            # report can tell "a foreign fix task resolved this" apart from "a
+            # stage1_flag_suppression record hid this" — two very different
+            # signals that the signature diff below deliberately merges.
+            report.stats['stage1_flag_cross_project_fix_task_suppressed'] = int(
+                _dedup_stats.get('cross_project_fix_task_suppressed', 0)
+            )
+            # Findings whose cited fix task is already done yet which keep
+            # recurring: suppression EXPIRED and they were surfaced again
+            # (dedup_flags logs each at WARNING).  A non-zero value here means
+            # a landed fix did not stop its finding.
+            report.stats['stage1_flag_cross_project_fix_task_suppression_exhausted'] = int(
+                _dedup_stats.get('cross_project_fix_task_suppression_exhausted', 0)
             )
             # One-time completion markers dedup_flags emitted-then-self-deleted this
             # cycle (task-2312) — counts flags annotated completion_marker_self_deleted
@@ -368,10 +387,11 @@ class MemoryConsolidator(BaseStage):
             # the marker must retain its recurrence history for the day that task
             # is cancelled or closed without landing the fix — exactly like "a
             # suppression means the issue is intentionally hidden, not resolved".
-            # The two causes are distinguishable only via the
-            # `reconciliation.stage1_flag_cross_project_fix_task_suppressed` INFO
-            # log, not a report.stats key: dedup_flags returns only a list, so a
-            # pre/post signature diff cannot tell them apart.
+            # The two causes cannot be told apart by this diff — dedup_flags
+            # returns only a list — so the cross-project count is reported
+            # separately above, out of dedup_flags' `stats` out-dict, alongside
+            # the `reconciliation.stage1_flag_cross_project_fix_task_suppressed`
+            # INFO log that names the specific fix task behind each drop.
             _post_dedup_signatures = {
                 sig for f in report.items_flagged
                 if (sig := (compute_flag_signature(f) or compute_content_fingerprint_signature(f)))

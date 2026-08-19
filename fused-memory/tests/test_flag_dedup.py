@@ -3488,8 +3488,12 @@ class TestResolveLiveCrossProjectFixTask:
             taskmaster, self.KNOWN, 'know_live', [self.SAME, self.FOREIGN]
         )
 
-        assert result == self.FOREIGN, (
+        assert result is not None and result.cited == self.FOREIGN, (
             f'must return the corroborating foreign cited entry; got {result!r}'
+        )
+        assert result.status == 'pending', (
+            f'the resolved entry must carry the live status the caller\'s '
+            f'done-suppression policy keys on; got {result!r}'
         )
         taskmaster.get_task.assert_called_once_with('3839', '/df')
 
@@ -3671,7 +3675,7 @@ class TestResolveLiveCrossProjectFixTask:
             ],
         )
 
-        assert result == self.FOREIGN, (
+        assert result is not None and result.cited == self.FOREIGN, (
             f'malformed entries must be skipped, not abort the resolve; got {result!r}'
         )
         taskmaster.get_task.assert_called_once_with('3839', '/df')
@@ -3698,7 +3702,7 @@ class TestResolveLiveCrossProjectFixTask:
             taskmaster, self.KNOWN, 'know_live', [cancelled, self.FOREIGN]
         )
 
-        assert result == self.FOREIGN, (
+        assert result is not None and result.cited == self.FOREIGN, (
             f'the second, live foreign citation must resolve; got {result!r}'
         )
         assert taskmaster.get_task.call_count == 2, (
