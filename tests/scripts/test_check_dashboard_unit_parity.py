@@ -2701,6 +2701,103 @@ def test_section_12_reports_the_install_did_not_take_on_drift(
 
 
 # ---------------------------------------------------------------------------
+# The shared `_parity_verdict` classifier
+# ---------------------------------------------------------------------------
+#
+# The five gate blocks each answered the same two questions by hand: is the
+# checker's own tag in what it printed, and what did its exit status mean.
+# setup-host.sh answers them ONCE, in a bash helper, and each site keeps its own
+# wording and severity. This is the behavioural table for that helper.
+#
+# Sliced and run rather than read as text: the classification is the thing under
+# test, and a `[[ ]]` pattern that reads correctly can still match wrongly.
+
+_VERDICT_START = "_parity_verdict() {"
+_VERDICT_END = "\n}\n"
+
+_VERDICT_TAG = "[dashboard_unit_parity]"
+
+# The two real exit-2 imposters, verbatim in shape. Both carry BRACKETED
+# lookalikes -- argparse's flag spellings, python3's errno -- which is why they
+# are inputs here and not merely in the per-site tests: a classifier that
+# matched brackets loosely would hand the gate a verdict the checker never gave.
+_ARGPARSE_IMPOSTER = (
+    "usage: check_dashboard_unit_parity.py [-h] [--repo-root REPO_ROOT] [--fix]\n"
+    "check_dashboard_unit_parity.py: error: unrecognized arguments: --bogus"
+)
+_MISSING_SCRIPT_IMPOSTER = (
+    "python3: can't open file '/repo/scripts/check_dashboard_unit_parity.py': "
+    "[Errno 2] No such file or directory"
+)
+
+_TAGGED_REPORT = f"{_VERDICT_TAG} [ok] units match the committed copies"
+
+
+@pytest.mark.parametrize(
+    "out,status,expected",
+    [
+        # Tagged: the checker RAN and its status is a verdict about the host.
+        (_TAGGED_REPORT, 0, "parity"),
+        (_TAGGED_REPORT, 2, "absent"),
+        (_TAGGED_REPORT, 1, "finding"),
+        # Any other status is still a finding, never silently benign: 127 is
+        # `command not found` and 3 is a status no checker documents, and both
+        # mean something happened that the caller must not wave through.
+        (_TAGGED_REPORT, 127, "finding"),
+        (_TAGGED_REPORT, 3, "finding"),
+        # UNTAGGED — the load-bearing half. A status the checker never produced
+        # must not be classifiable as a verdict about the host, and that holds
+        # for EVERY status including the two that would otherwise read benign.
+        ("", 0, "unreported"),
+        ("", 1, "unreported"),
+        ("", 2, "unreported"),
+        ("[ok] parity — all required directives present.", 0, "unreported"),
+        (_ARGPARSE_IMPOSTER, 2, "unreported"),
+        (_MISSING_SCRIPT_IMPOSTER, 2, "unreported"),
+    ],
+    ids=[
+        "tagged-0-parity", "tagged-2-absent", "tagged-1-finding",
+        "tagged-127-finding", "tagged-3-finding",
+        "untagged-empty-0", "untagged-empty-1", "untagged-empty-2",
+        "untagged-legacy-marker-0",
+        "imposter-argparse-2", "imposter-missing-script-2",
+    ],
+)
+def test_parity_verdict_classifies(
+    tmp_path: pathlib.Path, out: str, status: int, expected: str
+):
+    """One classifier, four tokens: unreported | parity | absent | finding.
+
+    `unreported` outranks the status entirely — a checker whose tag is absent
+    did not report, so nothing it exited with says anything about this host.
+    Only after the tag is seen does the status get read.
+
+    The helper is sliced explicitly rather than relied on from the shared
+    preamble, so this test names its own subject and would still fail loudly if
+    the preamble stopped carrying it.
+    """
+    section = slice_section(_VERDICT_START, _VERDICT_END) + (
+        f'_parity_verdict "$OUT" "$STATUS" {_VERDICT_TAG!r}\n'
+    )
+
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    result = run_section(
+        tmp_path,
+        section,
+        repo_root=repo,
+        unit_dir=tmp_path / "units",
+        env_extra={"OUT": out, "STATUS": str(status)},
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert result.stdout.strip() == expected, (
+        f"out={out!r} status={status} -> {result.stdout.strip()!r}, "
+        f"expected {expected!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Structural sweep: no parity-checker call site may branch on a bare status
 # ---------------------------------------------------------------------------
 #
