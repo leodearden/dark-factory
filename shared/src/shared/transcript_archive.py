@@ -52,6 +52,7 @@ growing a second glob.
 from __future__ import annotations
 
 import errno
+import gzip
 import logging
 import os
 import shutil
@@ -788,8 +789,26 @@ def restore_archived_transcript(
     config_dir = Path(config_dir)
     rel = archived.relative_to(Path(archive_root) / str(task_id))
     dest = config_dir / 'projects' / rel
+    # Pre-task-3618 archives are still `.jsonl.gz` on disk and
+    # durable_archive_path locates them (I-C, format-agnostic), so the restore
+    # must span both shapes or it silently no-ops on the OLDEST corpus — the
+    # one most likely to need a rehydrate. The destination drops the `.gz`:
+    # the CLI parses plain JSONL and rejects a gzip blob named `.jsonl`
+    # exactly as it rejects a zero-byte one, and transcript_exists globs
+    # `*.jsonl`, so a `.gz`-suffixed destination would not even be seen.
+    gzipped = dest.name.endswith('.jsonl.gz')
+    if gzipped:
+        dest = dest.with_name(dest.name[: -len('.gz')])
     dest.parent.mkdir(parents=True, exist_ok=True)
     st = archived.stat()
-    shutil.copyfile(archived, dest)
+    if gzipped:
+        # STREAMED, not read()-then-write: agent-session JSONL runs to many MB
+        # and only grows on resume, so peak RSS stays flat regardless of
+        # transcript size — the same bound _archive_one's comment records for
+        # shutil.copyfile's platform fast-copy path.
+        with gzip.open(archived, 'rb') as src_fh, dest.open('wb') as dest_fh:
+            shutil.copyfileobj(src_fh, dest_fh)
+    else:
+        shutil.copyfile(archived, dest)
     os.utime(dest, (st.st_atime, st.st_mtime))
     return dest
