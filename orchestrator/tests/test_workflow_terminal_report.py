@@ -696,6 +696,56 @@ class TestLastBlockSideChannelDeleted:
         assert report.reason == 'warm_lane_pool_hard_down'
 
 
+async def _run_stubbed_slot(
+    tmp_path: Path, report: TerminalReport, *, task_id: str,
+) -> TaskReport:
+    """Drive ``Harness._run_slot`` with ``TaskWorkflow`` stubbed to
+    return ``report`` directly from ``run()`` (no real agent/git work).
+
+    Module-level (task 3315) so both the block-phase regression class below
+    and ``TestApiErrorStatusThreadedToTaskReport`` can drive the real
+    ``_run_slot`` through the identical stub; the class method is retained as
+    a one-line delegator so every pre-existing call site is untouched.
+    """
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    await _init_git_repo(repo)
+    config = OrchestratorConfig(project_root=repo, max_concurrent_tasks=1)
+    harness = _build_harness(config)
+    # `_build_harness` leaves `Scheduler` a bare MagicMock (only the
+    # liveness accessors are wired) — `is_deterministic` must be pinned
+    # False or the MagicMock auto-mock (truthy) would route this through
+    # `_run_deterministic_slot` instead of the TaskWorkflow path below.
+    harness.scheduler.is_deterministic.return_value = False  # type: ignore[attr-defined]
+    # `_apply_retry_cap` compares these against real ints from `config`
+    # (`count >= self.config.requeue_cap`) whenever outcome==REQUEUED —
+    # an unconfigured MagicMock return value would raise TypeError on
+    # that comparison and mask the finally block's real work.
+    harness.scheduler.record_requeue.return_value = 0  # type: ignore[attr-defined]
+    harness.scheduler.transient_requeue_count.return_value = 0  # type: ignore[attr-defined]
+
+    with patch('orchestrator.harness.build_workflow') as MockWorkflow:
+        mock_wf = MagicMock()
+        mock_wf.run = AsyncMock(return_value=report)
+        mock_wf._steward = None
+        mock_wf.metrics = WorkflowMetrics()
+        MockWorkflow.return_value = mock_wf
+
+        assignment = TaskAssignment(
+            task_id=task_id,
+            task={
+                'id': task_id, 'title': 'Test task', 'status': 'pending',
+                'metadata': {}, 'dependencies': [],
+            },
+            modules=[],
+        )
+        sem = asyncio.Semaphore(1)
+        result = await harness._run_slot(assignment, sem)
+
+    assert result is not None
+    return result
+
+
 @pytest.mark.asyncio
 class TestHarnessBlockPhaseFromWorkingPhase:
     """REVIEW-CYCLE-1 regression (steps 13-14): the harness must map
@@ -716,46 +766,7 @@ class TestHarnessBlockPhaseFromWorkingPhase:
     async def _run_stubbed_slot(
         self, tmp_path: Path, report: TerminalReport, *, task_id: str,
     ) -> TaskReport:
-        """Drive ``Harness._run_slot`` with ``TaskWorkflow`` stubbed to
-        return ``report`` directly from ``run()`` (no real agent/git work).
-        """
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_git_repo(repo)
-        config = OrchestratorConfig(project_root=repo, max_concurrent_tasks=1)
-        harness = _build_harness(config)
-        # `_build_harness` leaves `Scheduler` a bare MagicMock (only the
-        # liveness accessors are wired) — `is_deterministic` must be pinned
-        # False or the MagicMock auto-mock (truthy) would route this through
-        # `_run_deterministic_slot` instead of the TaskWorkflow path below.
-        harness.scheduler.is_deterministic.return_value = False  # type: ignore[attr-defined]
-        # `_apply_retry_cap` compares these against real ints from `config`
-        # (`count >= self.config.requeue_cap`) whenever outcome==REQUEUED —
-        # an unconfigured MagicMock return value would raise TypeError on
-        # that comparison and mask the finally block's real work.
-        harness.scheduler.record_requeue.return_value = 0  # type: ignore[attr-defined]
-        harness.scheduler.transient_requeue_count.return_value = 0  # type: ignore[attr-defined]
-
-        with patch('orchestrator.harness.build_workflow') as MockWorkflow:
-            mock_wf = MagicMock()
-            mock_wf.run = AsyncMock(return_value=report)
-            mock_wf._steward = None
-            mock_wf.metrics = WorkflowMetrics()
-            MockWorkflow.return_value = mock_wf
-
-            assignment = TaskAssignment(
-                task_id=task_id,
-                task={
-                    'id': task_id, 'title': 'Test task', 'status': 'pending',
-                    'metadata': {}, 'dependencies': [],
-                },
-                modules=[],
-            )
-            sem = asyncio.Semaphore(1)
-            result = await harness._run_slot(assignment, sem)
-
-        assert result is not None
-        return result
+        return await _run_stubbed_slot(tmp_path, report, task_id=task_id)
 
     async def test_mark_blocked_exit_maps_block_phase_to_working_phase(
         self, tmp_path: Path,
@@ -848,3 +859,61 @@ class TestHarnessBlockPhaseFromWorkingPhase:
             'auto-eval redo must dispatch when the real _run_slot report '
             'carries block_phase derived from the pre-block WORKING phase'
         )
+
+
+@pytest.mark.asyncio
+class TestApiErrorStatusThreadedToTaskReport:
+    """Task 3315 (PRD contract C2): the harness must carry
+    ``TerminalReport.api_error_status`` onto ``TaskReport`` so
+    ``_apply_retry_cap`` can hand the STRUCTURED 5xx evidence to
+    ``Scheduler.record_requeue`` instead of leaving the transient-requeue
+    decision to a regex over the block reason (INV-1).
+
+    ``_run_slot`` is the SOLE TerminalReport-fed ``TaskReport`` construction
+    site; the seven synthetic sites (cross-repo, substrate, cancelled,
+    slot-exception, deterministic) have no TerminalReport in hand and
+    correctly inherit the ``None`` default.
+    """
+
+    async def test_task_report_defaults_to_none(self):
+        """Additive: a TaskReport built without the field reports ``None`` —
+        every synthetic construction site is unchanged."""
+        report = TaskReport(task_id='t', title='T', outcome=WorkflowOutcome.DONE)
+
+        assert report.api_error_status is None
+
+    async def test_run_slot_maps_api_error_status_from_terminal_report(
+        self, tmp_path: Path,
+    ):
+        """A REQUEUED TerminalReport carrying 529 surfaces
+        ``TaskReport.api_error_status == 529``.  The reason string is
+        deliberately MARKER-FREE, so nothing but the field could carry it.
+        """
+        report = TerminalReport(
+            outcome=WorkflowOutcome.REQUEUED,
+            reason='implementer produced zero output',
+            phase=WorkflowState.EXECUTE,
+            detail='d',
+            category=None,
+            blocked_from_phase=WorkflowState.EXECUTE,
+            api_error_status=529,
+        )
+        task_report = await _run_stubbed_slot(tmp_path, report, task_id='81')
+
+        assert task_report.outcome == WorkflowOutcome.REQUEUED
+        assert task_report.api_error_status == 529
+
+    async def test_run_slot_maps_none_when_absent(self, tmp_path: Path):
+        """The same drive with the field omitted keeps ``None`` — the harness
+        maps the field through, it does not synthesize one."""
+        report = TerminalReport(
+            outcome=WorkflowOutcome.REQUEUED,
+            reason='implementer produced zero output',
+            phase=WorkflowState.EXECUTE,
+            detail='d',
+            category=None,
+            blocked_from_phase=WorkflowState.EXECUTE,
+        )
+        task_report = await _run_stubbed_slot(tmp_path, report, task_id='82')
+
+        assert task_report.api_error_status is None
