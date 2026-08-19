@@ -257,6 +257,13 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     )
 
 
+def _bound_names_start_with_test(node: ast.Import | ast.ImportFrom) -> bool:
+    """True iff any alias in *node* binds a name starting with ``Test`` (``asname`` wins)."""
+    return any(
+        (alias.asname or alias.name.split('.')[0]).startswith('Test') for alias in node.names
+    )
+
+
 def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | None:
     """One guaranteed (lower-bound) marker set per top-level test item in *source*.
 
@@ -270,12 +277,31 @@ def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | No
     Kleene reading in :func:`expression_definitely_deselects` — a name outside
     the set is UNKNOWN, never False — carries over unchanged.
 
-    None means "cannot enumerate every item this module collects" — refuse, no
-    proof.  ``()`` means "enumerated, and there are zero top-level test
-    functions" — a distinct, still-refused answer (see
-    :func:`deselecting_expression_for_targets`, which treats both alike).
+    Refuses (returns None) whenever the module contains a shape whose
+    collected items this walk cannot exhaustively see:
 
-    ``source is None``, a ``SyntaxError``, or a ``ValueError`` yields None.
+    * any ``class`` anywhere in the module (``ast.walk``, not just the module
+      body) — pytest's collected class names are configurable, and a class is
+      an item shape this tier does not model at all;
+    * a ``test*``-named function found anywhere that is NOT a direct child of
+      the module body — e.g. one defined inside a top-level ``if`` — which
+      would otherwise hide an undecorated, still-SELECTED sibling from this
+      walk and let the module widen unsoundly;
+    * a star import (``from x import *``), whose bound names are statically
+      unknowable;
+    * any import (plain or ``from``) that binds a name starting with ``Test``
+      (honouring ``asname``) — a test class imported from elsewhere, which
+      pytest collects in THIS module;
+    * a top-level ``pytest_*`` hook function (e.g.
+      ``pytest_collection_modifyitems``, ``pytest_generate_tests``), which can
+      add items this walk never sees.
+
+    FAIL-SAFE IN EXACTLY ONE DIRECTION, matching the module docstring: every
+    refusal above is a None, i.e. no proof, i.e. today's FILE_SCOPED
+    behaviour.  None also covers ``source is None``, a ``SyntaxError``, and a
+    ``ValueError``.  ``()`` is a distinct, still-refused answer: "enumerated,
+    and there are zero top-level test functions" (see
+    :func:`deselecting_expression_for_targets`, which treats both alike).
     Never raises.
     """
     if not source:
@@ -284,6 +310,24 @@ def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | No
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return None
+
+    body_ids = {id(statement) for statement in tree.body}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            return None
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            is_top_level = id(node) in body_ids
+            if node.name.startswith('test') and not is_top_level:
+                return None
+            if node.name.startswith('pytest_') and is_top_level:
+                return None
+        elif isinstance(node, ast.ImportFrom):
+            if any(alias.name == '*' for alias in node.names):
+                return None
+            if _bound_names_start_with_test(node):
+                return None
+        elif isinstance(node, ast.Import) and _bound_names_start_with_test(node):
+            return None
 
     module_markers = module_level_marker_names(source)
     items: list[frozenset[str]] = []
