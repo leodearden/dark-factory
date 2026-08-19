@@ -38,11 +38,8 @@ import pytest
 from orchestrator.agents.roles import METADATA_VOCABULARY_INSTRUCTIONS
 
 from fused_memory.memory_metadata import (
-    EXPERIMENTAL_KEY_PREFIX,
     KIND_REGISTRY,
     RESERVED_VOCABULARY_KEYS,
-    TOPIC_SLUG_MAX_LEN,
-    is_valid_topic_slug,
 )
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import (
@@ -59,14 +56,6 @@ from fused_memory.reconciliation.recon_self_model import render_cycle_summary_se
 # still extracted (and then fails the comparison) instead of vanishing from the
 # extracted set and passing as "not documented, not required".
 _KEY_BULLET_RE = re.compile(r'^- `([^`]+)` —', re.MULTILINE)
-
-# Slug exemplars advertised to writers. Pinned SEMANTICALLY: the test asserts
-# both strings appear in the instruction text AND that `is_valid_topic_slug`
-# still agrees about them, so a change to TOPIC_SLUG_RE that invalidates the
-# advertised example fails here. Pinning `TOPIC_SLUG_RE.pattern` as a string
-# instead would force the literal `\Z` into agent-facing prose.
-_GOOD_SLUG = 'memory-write-path'
-_BAD_SLUG = 'Memory Write Path'
 
 
 def _documented_vocabulary_keys(text: str) -> set[str]:
@@ -111,25 +100,24 @@ class TestReservedKeysPinnedToRegistry:
         assert _pin_keys(METADATA_VOCABULARY_INSTRUCTIONS, set(RESERVED_VOCABULARY_KEYS))
 
 
-class TestEscapeHatchAndSlugRulesPinned:
-    """The non-key parts of the vocabulary the instructions also advertise."""
-
-    def test_experimental_prefix_is_verbatim(self) -> None:
-        """The `x_` escape agents are told to use is the registry's actual
-        prefix, not a lookalike."""
-        assert EXPERIMENTAL_KEY_PREFIX in METADATA_VOCABULARY_INSTRUCTIONS
-
-    def test_slug_exemplars_are_present_and_semantically_correct(self) -> None:
-        """Both exemplars appear verbatim in the prose AND the validator still
-        agrees with what the prose claims about them."""
-        assert _GOOD_SLUG in METADATA_VOCABULARY_INSTRUCTIONS
-        assert _BAD_SLUG in METADATA_VOCABULARY_INSTRUCTIONS
-        assert is_valid_topic_slug(_GOOD_SLUG) is True
-        assert is_valid_topic_slug(_BAD_SLUG) is False
-
-    def test_slug_length_cap_is_verbatim(self) -> None:
-        """A plain integer is safe to string-pin (unlike the regex)."""
-        assert str(TOPIC_SLUG_MAX_LEN) in METADATA_VOCABULARY_INSTRUCTIONS
+# DELIBERATE NON-ASSERTION — do not "complete" ARM 1 by pinning the section's
+# PROSE.  A `TestEscapeHatchAndSlugRulesPinned` class doing exactly that was
+# removed in review (task 3202) and must not come back:
+#   * `EXPERIMENTAL_KEY_PREFIX in text` pins the 2-char substring `x_`, which
+#     matches incidentally anywhere in the prompt — it is green whether or not
+#     the escape hatch is actually explained.
+#   * `str(TOPIC_SLUG_MAX_LEN) in text` was worse than decorative: a bare `in`
+#     on a decimal rendering stays green against STALE text (lower the cap to
+#     10 and `'10' in '100 characters at most'` still holds), so it reported
+#     success in precisely the drift case it existed to catch.  Do not replace
+#     it with a stricter regex over the prompt either — the registry-derived
+#     key pin above is the guard that catches real vocabulary drift.
+#   * The slug-exemplar assertions (`is_valid_topic_slug('memory-write-path')
+#     is True` / `'Memory Write Path' is False`) were validator unit tests
+#     wearing a prose pin as a costume; they hold with no reference to the
+#     prompt at all and are already covered, case-for-case, by `_SLUG_CASES` in
+#     `test_topic_slug_namespace.py` ('a-good-slug', 'Bad-Slug',
+#     'bad topic-slug').
 
 
 class TestPinFiresOnDrift:
