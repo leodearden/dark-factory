@@ -22,6 +22,7 @@ from escalation.queue import (
     _MAX_AMENDMENT_LINE_CHARS,
     _MAX_AMENDMENT_OPTIONS,
     _MAX_AMENDMENTS,
+    _MAX_ROOT_CAUSE_VARIANTS,
     AmendmentOutcome,
     EscalationQueue,
     iter_all_escalation_paths,
@@ -5461,8 +5462,6 @@ class TestAddMembersToL2RootCauseVariants:
         The TRUE distinct count stays `len(variants) + truncated`, so the loss is
         a structured fact on the record rather than log-only (INV-8).
         """
-        from escalation.queue import _MAX_ROOT_CAUSE_VARIANTS
-
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = self._make_l2(queue)
 
@@ -5492,8 +5491,6 @@ class TestAddMembersToL2RootCauseVariants:
 
     def test_long_spelling_is_elided_with_the_in_band_marker(self, tmp_path: Path):
         """(e cont.) Each stored spelling is capped by the existing `_elide` helper."""
-        from escalation.queue import _MAX_AMENDMENT_LINE_CHARS
-
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = self._make_l2(queue)
         long_cause = 'x' * (_MAX_AMENDMENT_LINE_CHARS + 250)
@@ -5516,8 +5513,6 @@ class TestAddMembersToL2RootCauseVariants:
         computed — a caller re-deriving them from a pre-read would be wrong in
         both directions under the cross-process folds this queue is built for.
         """
-        from escalation.queue import AmendmentOutcome
-
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = self._make_l2(queue)
 
@@ -5567,8 +5562,6 @@ class TestAddMembersToL2RootCauseVariants:
         Past the cap the list stops growing, so reporting `len(list)` would make
         the over-fold signal plateau exactly when it matters most.
         """
-        from escalation.queue import _MAX_ROOT_CAUSE_VARIANTS, AmendmentOutcome
-
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = self._make_l2(queue)
         for i in range(_MAX_ROOT_CAUSE_VARIANTS + 2):
@@ -5603,8 +5596,6 @@ class TestAddMembersToL2VariantConcurrency:
         would silently under-count exactly under the concurrent load that makes
         an over-fold likely.
         """
-        from escalation.queue import _MAX_ROOT_CAUSE_VARIANTS
-
         queue_dir = tmp_path / 'queue'
         queue = EscalationQueue(queue_dir)
         l2 = Escalation(
