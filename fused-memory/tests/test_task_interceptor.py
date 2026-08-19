@@ -14097,3 +14097,108 @@ class TestSoftScopeTriggerLeavesExistingExitsAlone:
         assert marker['suggested_project'] == 'dark_factory'
         assert len(interceptor._scope_violation_escalator.calls) == 1
         stub.adjudicate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestSoftScopeCensusWarnOnly:
+    """Warn-only is the DEFAULT disposition; the census line is its product.
+
+    The enforce-flip decision needs precision = confirmations / firings.  The
+    firing rate is already known from corpus measurement; what is not known is
+    the CONFIRMATION rate, and only actually running the adjudicator produces
+    it.  So the census line is emitted on every adjudication — allow,
+    uncertain and failed included — or the census would have a numerator and
+    no denominator.
+    """
+
+    def _kwargs(self, df_root):
+        return {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': f'ALL of the asked work is in {df_root}',
+        }
+
+    async def _run(self, interceptor, tmp_path, caplog, verdict):
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        _stub_adjudicator(interceptor, verdict)
+        interceptor._scope_violation_escalator = _SpyEscalator()
+        kwargs: dict[str, Any] = self._kwargs(registry.root_for_project('dark_factory'))
+        with caplog.at_level(logging.WARNING):
+            result = await interceptor._path_guard_or_skip(
+                kwargs, str(tmp_path / 'reify'), 'reify',
+            )
+        census = [
+            r.getMessage()
+            for r in caplog.records
+            if 'soft_scope_lint.flagged' in r.getMessage()
+        ]
+        return result, kwargs, census
+
+    async def test_confirmed_misroute_logs_census_but_acts_on_nothing(
+        self, interceptor, tmp_path, caplog, monkeypatch,
+    ):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.delenv('FUSED_SOFT_SCOPE_ENFORCE', raising=False)
+        result, kwargs, census = await self._run(
+            interceptor,
+            tmp_path,
+            caplog,
+            AdjudicationVerdict(verdict='reject', reason='all dark-factory side'),
+        )
+
+        assert result is None
+        assert len(census) == 1, f'expected exactly one census line, got {census!r}'
+        line = census[0]
+        assert 'title_project_prefix' in line
+        assert 'absolute_foreign_root' in line
+        assert 'dark_factory' in line
+        assert 'reject' in line
+        # Warn-only: observed, not acted on.
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert interceptor._scope_violation_escalator.calls == []
+
+    @pytest.mark.parametrize(
+        ('verdict', 'failed'),
+        [('allow', False), ('uncertain', False), ('reject', True)],
+    )
+    async def test_census_records_the_denominator_too(
+        self, interceptor, tmp_path, caplog, monkeypatch, verdict, failed,
+    ):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.delenv('FUSED_SOFT_SCOPE_ENFORCE', raising=False)
+        result, kwargs, census = await self._run(
+            interceptor,
+            tmp_path,
+            caplog,
+            AdjudicationVerdict(verdict=verdict, failed=failed, reason='r'),
+        )
+
+        assert result is None
+        assert len(census) == 1
+        assert verdict in census[0]
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert interceptor._scope_violation_escalator.calls == []
+
+    async def test_weak_only_emits_no_census_line(
+        self, interceptor, tmp_path, caplog, monkeypatch,
+    ):
+        """No adjudication ran, so there is nothing to census."""
+        monkeypatch.delenv('FUSED_SOFT_SCOPE_ENFORCE', raising=False)
+        _soft_scope_registry(interceptor, tmp_path)
+        _stub_adjudicator(interceptor)
+
+        with caplog.at_level(logging.WARNING):
+            result = await interceptor._path_guard_or_skip(
+                {
+                    'title': 'wire the recurring timer',
+                    'description': 'dark-factory-side context only',
+                },
+                str(tmp_path / 'reify'),
+                'reify',
+            )
+
+        assert result is None
+        assert not [
+            r for r in caplog.records if 'soft_scope_lint.flagged' in r.getMessage()
+        ]
