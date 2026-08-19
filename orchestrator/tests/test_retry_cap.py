@@ -597,6 +597,25 @@ def _build_529_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float
     )
 
 
+def _build_field_only_529_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float = 2.5):
+    """Task 3315: a REQUEUED report whose ONLY 5xx evidence is the structured
+    ``api_error_status`` field — ``block_reason`` is deliberately MARKER-FREE,
+    so the legacy ``agent API error: HTTP <n>`` regex cannot classify it."""
+    from orchestrator.harness import TaskReport
+
+    return TaskReport(
+        task_id='t1',
+        title='T1',
+        outcome=outcome,
+        cost_usd=cost_usd,
+        steward_cost_usd=steward_cost_usd,
+        block_reason='implementer produced zero output',
+        block_detail='see iteration log',
+        block_phase='execute',
+        api_error_status=529,
+    )
+
+
 def _make_harness(config: OrchestratorConfig):
     """Minimal Harness instance for calling _apply_retry_cap directly."""
     from orchestrator.harness import Harness
@@ -831,3 +850,79 @@ class TestHarnessDualCeiling:
         assert call is not None
         # genuine_exhausted=True takes priority; cap must be requeue_cap (3), not transient (2)
         assert call.kwargs.get('cap') == 3
+
+
+class TestHarnessThreadsApiErrorStatus:
+    """Task 3315 (PRD contract C2): the whole chain — ``TerminalReport ->
+    TaskReport -> record_requeue -> is_transient_api_requeue ->
+    _transient_requeue_counts`` — driven through the real ``_apply_retry_cap``
+    with a real Scheduler, on a report whose reason carries NO marker.
+    """
+
+    def _make(self, tmp_path):
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            max_per_module=1,
+            requeue_cap=3,
+            transient_requeue_cap=2,
+        )
+        return _make_harness(cfg)
+
+    @pytest.mark.asyncio
+    async def test_field_only_report_lands_in_transient_bucket(self, tmp_path):
+        from orchestrator.workflow import WorkflowOutcome
+
+        harness = self._make(tmp_path)
+        trigger = AsyncMock()
+        harness.scheduler.trigger_retry_cap_exhausted = trigger  # type: ignore[method-assign]
+
+        requeued = await harness._apply_retry_cap(
+            't1', _build_field_only_529_report(WorkflowOutcome.REQUEUED), True,
+        )
+
+        assert requeued is True
+        assert trigger.await_count == 0
+        assert 't1' not in harness.scheduler._requeue_counts
+        assert harness.scheduler._transient_requeue_counts['t1'] == 1
+
+    @pytest.mark.asyncio
+    async def test_field_only_report_fires_transient_ceiling_not_genuine(self, tmp_path):
+        """The second such requeue trips the TRANSIENT ceiling (cap=2), not
+        the genuine one (cap=3) — proving the field alone drove the bucket."""
+        from orchestrator.workflow import WorkflowOutcome
+
+        harness = self._make(tmp_path)
+        trigger = AsyncMock()
+        harness.scheduler.trigger_retry_cap_exhausted = trigger  # type: ignore[method-assign]
+
+        await harness._apply_retry_cap(
+            't1', _build_field_only_529_report(WorkflowOutcome.REQUEUED), True,
+        )
+        assert trigger.await_count == 0
+
+        r2 = await harness._apply_retry_cap(
+            't1', _build_field_only_529_report(WorkflowOutcome.REQUEUED), True,
+        )
+
+        assert r2 is False
+        assert trigger.await_count == 1
+        call = trigger.await_args
+        assert call is not None
+        assert call.kwargs.get('cap') == 2
+
+    @pytest.mark.asyncio
+    async def test_marker_free_report_without_field_stays_genuine(self, tmp_path):
+        """Control case isolating the field as the causal signal: the SAME
+        marker-free reason with ``api_error_status=None`` counts genuine."""
+        from orchestrator.workflow import WorkflowOutcome
+
+        harness = self._make(tmp_path)
+        harness.scheduler.trigger_retry_cap_exhausted = AsyncMock()  # type: ignore[method-assign]
+
+        report = _build_field_only_529_report(WorkflowOutcome.REQUEUED)
+        report.api_error_status = None
+
+        await harness._apply_retry_cap('t1', report, True)
+
+        assert harness.scheduler._requeue_counts['t1'] == 1
+        assert 't1' not in harness.scheduler._transient_requeue_counts
