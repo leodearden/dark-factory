@@ -3621,6 +3621,43 @@ def _run_write_decision(
                     # item stays parked, and reap_answered_decisions skips a
                     # non-open record, so nothing would ever close it again.
                     record = merge_same_queue_refile(existing, incoming)
+                    if existing.state != DecisionState.OPEN:
+                        # THE ONE PLACE THIS VERB DECLINES WHAT THE FILER
+                        # ASKED FOR: the filing carries state=open (the
+                        # default above) and the row stays closed. Loud, per
+                        # this repo's loud-over-silent-degradation norm, and
+                        # because the watcher SKILLs' own rule is to
+                        # ADJUDICATE such a divergence rather than assume the
+                        # re-file landed -- which needs it to be visible.
+                        #
+                        # Guarded on non-open so the COMMON path stays quiet:
+                        # a same-queue re-file against an open record is every
+                        # watcher restart for every still-parked item, nothing
+                        # is declined there, and a warning on each one is how
+                        # this one gets tuned out.
+                        #
+                        # stdout is deliberately untouched (the id is still
+                        # printed below): both SKILLs document "no id on
+                        # stdout means your filing did not land" as the
+                        # did-it-work signal, and this filing DID land.
+                        logger.warning(
+                            'write-decision kept decision %s in state %r rather than '
+                            're-opening it: this re-file came from the SAME queue (%s) '
+                            'as the record it matched, so it is the same gate a human '
+                            'already answered or dropped, not a new ask. Your text, '
+                            'severity and ids DID land, but the row stays CLOSED and '
+                            'will NOT reappear in the cockpit decision queue, which '
+                            'shows only state=open rows. Re-opening it would make an '
+                            'operator\'s cockpit disposition impossible to ever make '
+                            'stick, since a watcher re-files its stable id on every '
+                            'restart while an item stays parked. ADJUDICATE this rather '
+                            'than re-filing blindly: if the gate is genuinely a NEW ask, '
+                            'file it under a new id, or have the operator re-open this '
+                            'row.',
+                            decision_id,
+                            str(existing.state),
+                            stamp,
+                        )
                 elif existing.state == DecisionState.OPEN:
                     # A DIFFERENT queue filing against a live record: this is
                     # the MODE-2 cross-queue collapse, so enrich rather than
