@@ -32,6 +32,9 @@ module.
 """
 from __future__ import annotations
 
+import ast
+import functools
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -156,3 +159,278 @@ class TestAssertSandboxedProjectRoot:
         """
         with pytest.raises(AssertionError):
             assert_sandboxed_project_root('/tmp/project', tmp_path)
+
+
+# ===========================================================================
+# Recurrence guard: nobody re-implements the sandbox block inline (task 3647)
+# ===========================================================================
+
+_TESTS_DIR = Path(__file__).parent
+_HELPER_NAME = 'assert_sandboxed_project_root'
+
+# The canonical OWNER of the pattern, excluded from the sweep by construction:
+# `_orch_helpers.py` is where the block is supposed to live, so matching it
+# there would be the guard flagging the fix.  Same shape as
+# `test_git_repo_isolation_guard.py`'s single `_TARGET_MODULE` scoping.
+_CANONICAL_OWNER = '_orch_helpers.py'
+
+# A sweep that silently parses nothing reads as "zero recurrences".  The tests
+# tree currently holds ~530 modules (~138 `_orch_helpers` importers alone), so
+# a floor of 100 catches a broken glob without being a churn magnet.
+_MIN_MODULES_SWEPT = 100
+
+
+def _mentions(node: ast.AST, name: str) -> bool:
+    """True if *name* appears anywhere under *node* as a Name id or attribute."""
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name) and n.id == name:
+            return True
+        if isinstance(n, ast.Attribute) and n.attr == name:
+            return True
+    return False
+
+
+def _asserts_isinstance_path(func: ast.AST) -> bool:
+    """Signal (ii): an ``assert isinstance(X, Path)`` somewhere in *func*.
+
+    This is the DISCRIMINATING conjunct — see `_inline_sandbox_asserts`.
+    """
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assert):
+            continue
+        for call in ast.walk(node.test):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == 'isinstance'
+                and len(call.args) >= 2
+                and isinstance(call.args[1], ast.Name)
+                and call.args[1].id == 'Path'
+            ):
+                return True
+    return False
+
+
+def _asserts_is_relative_to_tmp_path(func: ast.AST) -> bool:
+    """Signal (iii): a NON-NEGATED ``assert ....is_relative_to(<...tmp_path...>)``.
+
+    Both qualifiers are load-bearing, not incidental strictness:
+
+    * non-negated — ``assert not x.is_relative_to(y)`` asserts the OPPOSITE
+      invariant (that two paths are disjoint), which this helper does not own;
+    * ``tmp_path`` inside the call — a containment assertion against some other
+      root (``worktree_base``, ``xdg_home``, …) is a different invariant.
+    """
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Assert):
+            continue
+        test = node.test
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            continue
+        for call in ast.walk(test):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == 'is_relative_to'
+                and _mentions(call, 'tmp_path')
+            ):
+                return True
+    return False
+
+
+def _inline_sandbox_asserts(tree: ast.Module) -> list[str]:
+    """Functions in *tree* that re-implement the sandboxed-project-root block.
+
+    A hit satisfies ALL THREE signals:
+
+    (i)   mentions ``project_root``;
+    (ii)  asserts ``isinstance(X, Path)``;
+    (iii) has a non-negated ``is_relative_to(...tmp_path...)`` assert.
+
+    The CONJUNCTION is the design, and signal (ii) is what discriminates.
+    Measured over the whole tests tree at the time this guard landed:
+
+    * all three signals → exactly 2 hits, both the real copies, zero false
+      positives;
+    * dropping signal (ii) → 3 hits, re-admitting
+      ``test_scheduler_state.py::test_bare_config_project_root_isolated_to_tmp``,
+      which asserts a DERIVED snapshot path is under ``tmp_path`` and checks
+      ``project_root`` itself by ``==``, not containment.  It is a genuinely
+      different assertion and must not be flagged.
+
+    Two further near-misses are excluded by signal (iii) rather than (ii), and
+    are recorded here so a future reader does not "simplify" that signal either:
+
+    * ``test_mcp_lifecycle.py::test_neither_path_is_under_a_sample_project_root``
+      — ``assert not queue_dir.is_relative_to(project_root)``: NEGATED, and
+      against ``project_root`` / ``xdg_home`` rather than ``tmp_path``;
+    * ``test_verify_preexisting_main_break.py::test_real_git_probe_lifecycle``
+      — ``worktree_arg.is_relative_to(git_ops.worktree_base)``: a different
+      containment root, no ``tmp_path`` in the call.
+
+    A guard with false positives gets weakened or deleted by the next author, so
+    every relaxation of this rule costs one of those exclusions.
+    """
+    offenders: list[str] = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not _mentions(func, 'project_root'):
+            continue
+        if not _asserts_isinstance_path(func):
+            continue
+        if not _asserts_is_relative_to_tmp_path(func):
+            continue
+        offenders.append(f'{func.name}:{func.lineno}')
+    return offenders
+
+
+def _swept_modules() -> list[Path]:
+    """Every ``*.py`` under this tests tree except the canonical owner."""
+    return [
+        p for p in sorted(_TESTS_DIR.rglob('*.py'))
+        if p.name != _CANONICAL_OWNER
+    ]
+
+
+@functools.cache
+def _parsed_swept_modules() -> tuple[tuple[Path, ast.Module], ...]:
+    """``(path, tree)`` for every swept module, parsed ONCE per session.
+
+    Reading and parsing the ~530-module tree costs ~25s, and both AST guards in
+    this file sweep the same set; caching keeps the second one free.  Modules
+    that will not parse are skipped rather than reported — a syntax error is
+    already its own loud failure everywhere else in the suite, and swallowing it
+    here would misattribute it to a scaffolding guard.
+    """
+    parsed: list[tuple[Path, ast.Module]] = []
+    for path in _swept_modules():
+        try:
+            parsed.append((path, ast.parse(path.read_text(encoding='utf-8'))))
+        except SyntaxError:  # pragma: no cover - a broken module is its own failure
+            continue
+    return tuple(parsed)
+
+
+class TestNoInlineSandboxedProjectRootAsserts:
+    """No module re-implements the sandboxed-``project_root`` block inline.
+
+    The whole point of task 3647: task 3551 propagated the block by COPY, and by
+    3647 the two copies had drifted apart (one had lost the ``.is_dir()``
+    clause; neither had the strictness clause).  Documenting "use the helper"
+    is what the lineage already tried three times.  This makes it checkable.
+    """
+
+    def test_no_module_reimplements_the_block(self) -> None:
+        offenders: list[str] = []
+        for path, tree in _parsed_swept_modules():
+            offenders.extend(
+                f'{path.relative_to(_TESTS_DIR)}::{hit}'
+                for hit in _inline_sandbox_asserts(tree)
+            )
+
+        assert not offenders, (
+            'Inline re-implementation(s) of the sandboxed-project_root block.\n'
+            'Each of these asserts by hand that a project_root is a real Path '
+            'under tmp_path. That block has drifted before: task 3551 spread it '
+            'by copy, and by task 3647 one copy had lost its .is_dir() clause '
+            'and NEITHER carried the strictly-below clause (Path.is_relative_to '
+            'returns True for a path against itself).\n'
+            f'Fix: call {_HELPER_NAME}(<root>, tmp_path) from _orch_helpers, '
+            'which owns all four clauses and their rationale. If your assertion '
+            'is genuinely a different invariant, it should not be matching all '
+            "three of this guard's signals — see _inline_sandbox_asserts.\n"
+            f'Offenders: {offenders}'
+        )
+
+    def test_the_sweep_is_live(self) -> None:
+        """A broken glob must not pass as "zero recurrences".
+
+        Same failure mode ``test_git_repo_isolation_guard.py`` guards with its
+        session-ceiling liveness assertion: a structural check that silently
+        inspects nothing reads as coverage.
+        """
+        swept = _swept_modules()
+
+        assert len(swept) >= _MIN_MODULES_SWEPT, (
+            f'the recurrence sweep found only {len(swept)} modules under '
+            f'{_TESTS_DIR} — expected at least {_MIN_MODULES_SWEPT}. A guard '
+            f'that parses nothing reports zero recurrences and reads as coverage.'
+        )
+
+    def test_the_canonical_owner_is_excluded_from_the_sweep(self) -> None:
+        """``_orch_helpers.py`` is where the block is SUPPOSED to live."""
+        assert (_TESTS_DIR / _CANONICAL_OWNER).is_file(), (
+            f'{_CANONICAL_OWNER} must exist — it owns {_HELPER_NAME}'
+        )
+        assert all(p.name != _CANONICAL_OWNER for p in _swept_modules()), (
+            f'{_CANONICAL_OWNER} must be excluded: it is the canonical owner of '
+            f'the pattern, so flagging it there would be the guard flagging the fix'
+        )
+
+    # -- detector self-tests: synthetic sources, so this module never self-trips --
+    #
+    # Kept inside string literals deliberately. The sweep above parses THIS
+    # module too; real assert statements here would make the guard flag itself.
+
+    def test_the_detector_matches_the_full_three_signal_shape(self) -> None:
+        """Positive sample: a detector that silently stops matching is worse
+        than no detector, because it reads as coverage."""
+        tree = ast.parse(
+            'def test_copy(make_steward, tmp_path):\n'
+            '    project_root = make_steward().config.project_root\n'
+            '    assert isinstance(project_root, Path)\n'
+            '    assert project_root.resolve().is_relative_to(tmp_path.resolve())\n'
+        )
+
+        assert _inline_sandbox_asserts(tree) != []
+
+    def test_the_detector_ignores_a_function_without_project_root(self) -> None:
+        """Negative sample for signal (i)."""
+        tree = ast.parse(
+            'def test_worktree(steward, tmp_path):\n'
+            '    wt = steward.worktree\n'
+            '    assert isinstance(wt, Path)\n'
+            '    assert wt.resolve().is_relative_to(tmp_path.resolve())\n'
+        )
+
+        assert _inline_sandbox_asserts(tree) == []
+
+    def test_the_detector_ignores_a_function_without_the_isinstance_assert(self) -> None:
+        """Negative sample for signal (ii) — the discriminating conjunct.
+
+        This is the shape of the real near-miss in ``test_scheduler_state.py``:
+        a DERIVED path asserted under ``tmp_path``, with ``project_root``
+        checked by equality rather than containment.
+        """
+        tree = ast.parse(
+            'def test_derived(config, tmp_path):\n'
+            '    assert config.project_root == tmp_path.resolve()\n'
+            '    snapshot = Path(config.project_root) / "data" / "state.json"\n'
+            '    assert snapshot.is_relative_to(tmp_path.resolve())\n'
+        )
+
+        assert _inline_sandbox_asserts(tree) == []
+
+    def test_the_detector_ignores_a_negated_is_relative_to(self) -> None:
+        """Negative sample for signal (iii), negation half — the real near-miss
+        in ``test_mcp_lifecycle.py`` asserts the OPPOSITE invariant."""
+        tree = ast.parse(
+            'def test_disjoint(project_root, tmp_path):\n'
+            '    assert isinstance(project_root, Path)\n'
+            '    assert not project_root.is_relative_to(tmp_path)\n'
+        )
+
+        assert _inline_sandbox_asserts(tree) == []
+
+    def test_the_detector_ignores_containment_against_another_root(self) -> None:
+        """Negative sample for signal (iii), ``tmp_path`` half — the real
+        near-miss in ``test_verify_preexisting_main_break.py`` checks
+        containment under ``worktree_base``."""
+        tree = ast.parse(
+            'def test_other_root(project_root, git_ops, tmp_path):\n'
+            '    assert isinstance(project_root, Path)\n'
+            '    assert project_root.is_relative_to(git_ops.worktree_base)\n'
+        )
+
+        assert _inline_sandbox_asserts(tree) == []
