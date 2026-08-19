@@ -978,7 +978,6 @@ class Mem0Backend:
         )
 
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
-        client = await self._get_async_qdrant()
 
         # Built at the shared home so an exhaustive scan and the count it is
         # divided by cannot select different point sets (INV-5).  The call is
@@ -997,24 +996,18 @@ class Mem0Backend:
         matches: list[dict[str, Any]] = []
         scanned = 0
         truncated = False
-        offset: Any = None
-        while True:
-            page_limit = page_size
-            if limit is not None:
-                page_limit = min(page_size, limit - scanned)
-            points, next_offset = await asyncio.wait_for(
-                client.scroll(
-                    collection_name=collection_name,
-                    scroll_filter=scroll_filter,
-                    with_payload=True,
-                    with_vectors=False,
-                    limit=page_limit,
-                    offset=offset,
-                ),
-                timeout=self._read_timeout,
-            )
-
-            for point in points:
+        try:
+            # The caller's `limit` rides on the pager's points cap, so the walk
+            # itself has ONE home.  Never `break` out of this loop: the raise is
+            # the only exit, which keeps the async generator closed promptly
+            # instead of leaving it to the GC.
+            async for point in self.scroll_collection_pages(
+                collection_name,
+                scroll_filter=scroll_filter,
+                page_size=page_size,
+                max_points=limit,
+                with_vectors=False,
+            ):
                 scanned += 1
                 payload: dict[str, Any] = dict(point.payload) if point.payload else {}
                 hits = find_toolcall_xml_leak(_extract_payload_text(payload))
@@ -1028,22 +1021,24 @@ class Mem0Backend:
                     'excerpt': text[:_EXCERPT_LEN] + ('…' if len(text) > _EXCERPT_LEN else ''),
                     'metadata': payload,
                 })
-
-            if next_offset is None:
-                break
-            if limit is not None and scanned >= limit:
-                truncated = True
-                logger.warning(
-                    'Mem0 scan_payload_text stopped at limit=%d (collection=%s, '
-                    'exhaustive=%s) with more pages available — results are '
-                    'TRUNCATED and any incidence rate derived from them is an '
-                    'undercount. Re-run without --limit for the true rate.',
-                    limit,
-                    collection_name,
-                    exhaustive,
-                )
-                break
-            offset = next_offset
+        except ScrollPointBudgetExhausted:
+            # THIS caller's posture, chosen here rather than at the primitive:
+            # being stopped by a limit the caller itself passed is an expected
+            # outcome, so it is disclosed as a flag + WARNING instead of an
+            # error.  The clause names exactly ONE exception: a broad except
+            # would fold a timed-out or page-budget-exhausted walk into a
+            # clean-looking capped result.  `scanned` is exact — the pager
+            # raises only after the cap-th point has been yielded and consumed.
+            truncated = True
+            logger.warning(
+                'Mem0 scan_payload_text stopped at limit=%d (collection=%s, '
+                'exhaustive=%s) with more pages available — results are '
+                'TRUNCATED and any incidence rate derived from them is an '
+                'undercount. Re-run without --limit for the true rate.',
+                limit,
+                collection_name,
+                exhaustive,
+            )
 
         return {'matches': matches, 'scanned': scanned, 'truncated': truncated}
 
