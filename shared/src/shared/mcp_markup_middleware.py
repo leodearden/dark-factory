@@ -615,7 +615,8 @@ class MarkupGuardMiddleware(Middleware):
         ``get_tool`` round-trip is paid only by the 0.26% of calls that
         actually carry a leak.
         """
-        fix = repair(value, param, await self._schema_params(context, name), tuple(arguments))
+        properties = await self._schema_properties(context, name)
+        fix = repair(value, param, tuple(properties), tuple(arguments))
 
         # All three emissions sit SIDE BY SIDE, and every one of them runs
         # BEFORE its outcome is delivered. Two reasons. The detection is a fact
@@ -633,6 +634,20 @@ class MarkupGuardMiddleware(Middleware):
             )
             storm = await self._record_storm(_OUTCOME_UNREPAIRABLE, identity[1])
             await self._refuse_unrepairable(name, identity, param, value, pattern, storm)
+
+        # ONE application point, serving BOTH tiers. The recovered map is typed
+        # against the invoked tool's live schema here, before either policy
+        # branch sees it, so ``_forward``'s ``arguments.update`` and
+        # ``_reject``'s ``repaired_call`` cannot disagree about what a recovered
+        # value IS. Two sites that must agree byte-for-byte is exactly the
+        # lock-step duplication this PRD exists to end (INV-5).
+        #
+        # Rebinding ``fix`` rather than threading a second map downstream: every
+        # existing consumer — ``repaired_call``, and the ``sorted(fix.recovered)``
+        # in the fact and in both the meta and error payloads — picks the coerced
+        # map up automatically, and those ``sorted`` calls read the map's KEYS,
+        # so they stay type-agnostic and still emit NAMES only, never values.
+        fix = fix._replace(recovered=_coerce_recovered(fix.recovered, properties))
 
         # Identity from the REPAIRED view. If the leak ate the caller's own
         # ``agent_id`` — PRD section 2.1's first specimen does exactly that —
@@ -1038,16 +1053,12 @@ class MarkupGuardMiddleware(Middleware):
         invisible must not also be the one tier that is never told.
         """
         arguments[param] = fix.clean_value
-        # Typed against the invoked tool's LIVE schema before it lands. A
-        # verbatim str slice forwarded into a list-typed parameter does not
-        # coerce — pydantic raises ``list_type`` and the tool body never runs.
-        # See :func:`_coerce_recovered`.
-        arguments.update(
-            _coerce_recovered(
-                fix.recovered,
-                await self._schema_properties(context, context.message.name),
-            )
-        )
+        # Already typed against the invoked tool's live schema by
+        # :meth:`_handle_markup`, which applies :func:`_coerce_recovered` ONCE
+        # for both tiers. A verbatim str slice landing in a list-typed
+        # parameter does not coerce — pydantic raises ``list_type`` and the
+        # tool body never runs, which for this tier is worse than no guard.
+        arguments.update(fix.recovered)
 
         result = await call_next(context)
 
