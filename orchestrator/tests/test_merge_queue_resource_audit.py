@@ -2292,3 +2292,158 @@ class TestResourceAuditLogCoalescence:
         self._drive(worker, 512)
 
         assert worker._resource_audit_violation_streak == 512
+
+
+# ---------------------------------------------------------------------------
+# task 3203 step-7 RED / step-8 GREEN: the clear-transition line
+# ---------------------------------------------------------------------------
+
+
+def _clear_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The violating → clean transition line, at any level."""
+    return [r for r in caplog.records if r.getMessage().startswith(_CLEAR_PREFIX)]
+
+
+class TestResourceAuditClearLine:
+    """The END of a resource-conservation episode must be greppable, not
+    inferred from an absence of lines (task 3203 detail item 4).
+
+    Coalescence makes this mandatory rather than merely nice: once the repeat
+    interval has backed off to an hour, "no audit line since 14:02" no longer
+    distinguishes 'fixed' from 'still broken, next report at 15:02'.
+
+    RED until step-8 GREEN adds the clear line to _check_resource_audit's
+    clean arm.
+    """
+
+    _NOW = 1_000_000.0
+    _POLL_S = 30.0
+    _DETECT = 100.0
+    _FAR_REAP_AGE = 10_000_000.0
+    _IN_BAND_AGE = 150.0
+    _RUN = 50
+
+    def _worker(self, git_ops: GitOps):
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(),
+            escalation_queue=_FakeEscalationQueue(open_l1=True),  # never pages
+            speculation_depth=2,
+        )
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._DETECT
+        worker.PERIODIC_REAP_MIN_AGE_SECS = self._FAR_REAP_AGE
+        return worker
+
+    def _drive(self, worker, polls: int, *, start_poll: int = 0) -> None:
+        for i in range(start_poll, start_poll + polls):
+            worker._check_resource_audit(self._NOW + i * self._POLL_S)
+
+    def test_exactly_one_clear_line_on_the_first_clean_poll(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(a) One line, not one per clean poll — the inverse spam bug."""
+        worker = self._worker(git_ops)
+        worker._speculation_slot._value -= 1  # forced, PERSISTING permit leak
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, self._RUN)
+            worker._speculation_slot._value += 1  # the leak is repaired
+            caplog.clear()
+            self._drive(worker, 1, start_poll=self._RUN)          # first clean poll
+            after_first = list(_clear_lines(caplog))
+            self._drive(worker, 20, start_poll=self._RUN + 1)     # 20 more clean polls
+
+        assert len(after_first) == 1, 'the clear must fire on the FIRST clean poll'
+        assert len(_clear_lines(caplog)) == 1, (
+            f'exactly one clear line, got {[r.getMessage() for r in _clear_lines(caplog)]}'
+        )
+
+    def test_the_clear_line_names_the_run_it_ended(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(b) An operator must be able to size the outage from this one line."""
+        worker = self._worker(git_ops)
+        worker._speculation_slot._value -= 1
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, self._RUN)
+            worker._speculation_slot._value += 1
+            self._drive(worker, 1, start_poll=self._RUN)
+
+        message = _clear_lines(caplog)[0].getMessage()
+        assert f'{self._RUN} polls' in message, message
+        # The run began at poll 1 (_NOW) and ended at poll 51 (_NOW + 50*30s).
+        assert f'{self._RUN * self._POLL_S:.0f}s' in message, message
+
+    def test_a_never_violating_worker_emits_nothing_at_all(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(c) THE inverse regression: a healthy idle worker must not spam
+        the journal with clear lines — the exact mirror of the bug 3203
+        fixes."""
+        worker = self._worker(git_ops)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            self._drive(worker, 10)
+
+        assert _clear_lines(caplog) == []
+        assert _audit_records(caplog) == []
+
+    def test_a_fresh_episode_after_a_clear_is_not_a_continuation(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(d) The gate is reset by the clear, so the same leak returning is a
+        new episode at streak=1 with full detail."""
+        worker = self._worker(git_ops)
+        worker._speculation_slot._value -= 1
+        self._drive(worker, self._RUN)
+        worker._speculation_slot._value += 1
+        self._drive(worker, 1, start_poll=self._RUN)
+
+        worker._speculation_slot._value -= 1  # the same leak returns
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            caplog.clear()
+            self._drive(worker, 1, start_poll=self._RUN + 1)
+
+        lines = _audit_lines(caplog)
+        assert len(lines) == 1
+        message = lines[0].getMessage()
+        assert 'consecutive streak=1' in message, message
+        assert 'unchanged for ' not in message, 'a fresh episode is not a coalesced repeat'
+        assert 'speculation' in message.lower(), 'full detail, not the summary form'
+
+    def test_a_worktree_arm_clear_also_reports(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(e) Same property when the run is a leaked worktree that is reaped."""
+        worker = self._worker(git_ops)
+        wt = _mkdir_worktree(git_ops, '_merge-reaped', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, self._RUN)
+
+        wt.rmdir()
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            caplog.clear()
+            self._drive(worker, 1, start_poll=self._RUN)
+
+        lines = _clear_lines(caplog)
+        assert len(lines) == 1, f'got {[r.getMessage() for r in caplog.records]}'
+        assert f'{self._RUN} polls' in lines[0].getMessage()
+
+    def test_a_partial_clear_is_not_a_clear(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(f) The clear fires only when the violation SET is empty; removing
+        one of two leaks is a change line, never a clear."""
+        worker = self._worker(git_ops)
+        _mkdir_worktree(git_ops, '_merge-kept', mtime=self._NOW - self._IN_BAND_AGE)
+        gone = _mkdir_worktree(git_ops, '_merge-gone', mtime=self._NOW - self._IN_BAND_AGE)
+        self._drive(worker, self._RUN)
+
+        gone.rmdir()
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.merge_queue'):
+            caplog.clear()
+            self._drive(worker, 1, start_poll=self._RUN)
+
+        assert _clear_lines(caplog) == [], 'one leak remains — the set is not empty'
+        assert len(_audit_lines(caplog)) == 1, 'but the shrinkage is still reported at once'
