@@ -6682,20 +6682,13 @@ async def _wait_for_child_pid(
     ``TestRunCancellationReapsChild``. ``timeout`` here is a diagnostic
     CEILING, not a deadline that must be beaten: the loop returns the
     instant ``pid_file`` exists, so the value is paid only when the child
-    genuinely never starts. Widening it therefore costs nothing in the green
-    path while removing the last load-sensitive number from the class.
-    Budget: worst case is this 30s arrange ceiling plus
-    ``_assert_child_reaped``'s 5s assertion window plus the contract guard's
-    0.5s startup delay ~= 35.5s, comfortably inside the 60s
+    genuinely never starts. It is kept well under the 60s
     ``timeout``/``timeout_method = "thread"`` cap configured in
-    ``orchestrator/pyproject.toml``. That headroom matters: a genuine
-    never-started child still surfaces as this function's own ``pytest.fail``
-    message below rather than being replaced by a generic thread-method
-    timeout kill. Contrast ``_assert_child_reaped``'s 5.0s, which is
+    ``orchestrator/pyproject.toml``, so a genuine never-started child surfaces
+    as this function's own ``pytest.fail`` message below, not a generic
+    thread-method kill. Contrast ``_assert_child_reaped``'s 5.0s, which is
     deliberately left unwidened — that is an ASSERTION window (prompt
-    reaping is the property under test), not an arrange wait, and widening
-    it would weaken the assertion rather than merely cost more in the
-    diagnostic-only path.
+    reaping is the property under test), not an arrange wait.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -6728,10 +6721,18 @@ async def _assert_child_reaped(
 # TestRunCancellationReapsChild. NOT a tuned threshold: the child sleeps 60s
 # AFTER publishing its pid, and _start_hung_child does not return until that
 # pid is on disk, so this value only has to be SHORTER than 60s (a ~1200x
-# margin) and never has to outlast interpreter startup. It fails safe — a
-# slower box makes the timeout MORE likely to fire, never less. Contrast the
-# single 5.0s deadline this replaced, which had to do both jobs at once and
-# was tuned down to 0/40 misses on one box rather than eliminated (task 4109).
+# margin). It fails safe — a slower box makes the timeout MORE likely to
+# fire, never less. Contrast the single 5.0s deadline this replaced, which
+# had to do both jobs at once and was tuned down to 0/40 misses on one box
+# rather than eliminated (task 4109).
+#
+# One narrow parent-side window is covered probabilistically rather than by
+# construction: the child's pid can land on disk while _run's own coroutine
+# is still inside create_subprocess_exec's pipe/transport setup rather than
+# the try block that owns kill+reap. That window is covered by
+# _wait_for_child_pid's 0.1s poll interval giving the parent time to reach
+# the owning await point before cancellation lands, not eliminated
+# structurally.
 _CANCEL_TIMEOUT = 0.05
 
 
@@ -6776,7 +6777,7 @@ async def _start_hung_child(
 
 @pytest.mark.asyncio
 class TestHungChildHelperContract:
-    """Contract for the not-yet-defined ``_start_hung_child`` arrange helper.
+    """Contract for the ``_start_hung_child`` arrange helper.
 
     Pins that the helper's arrange phase is deadline-independent: it waits
     for the observable fact of the child's pid landing on disk, however long
@@ -6787,13 +6788,13 @@ class TestHungChildHelperContract:
         self, tmp_path: Path
     ) -> None:
         pid_file = tmp_path / 'child.pid'
-        # 10x _CANCEL_TIMEOUT (0.05s) — the discriminating leg. A helper that
+        # 4x _CANCEL_TIMEOUT (0.05s) — the discriminating leg. A helper that
         # folded the spawn into any sub-second fixed deadline, or that
         # returned before the pid was published, fails the assertions below
         # here. This is the slow-interpreter-startup condition the old fixed
         # 5.0s deadline could only cover probabilistically, applied
         # deterministically instead of hoped for.
-        task, child_pid = await _start_hung_child(pid_file, startup_delay=0.5)
+        task, child_pid = await _start_hung_child(pid_file, startup_delay=0.2)
 
         try:
             assert pid_file.read_text().strip() == str(child_pid), (
@@ -6851,7 +6852,7 @@ class TestRunCancellationReapsChild:
         # The wait_for-shaped caller this test exists to model
         # (delivered_checks._run_script_check) — but driven against an
         # ALREADY-STARTED future. The child is confirmed alive before the clock
-        # starts, so _CANCEL_TIMEOUT never has to outlast interpreter startup;
+        # starts, so _CANCEL_TIMEOUT does not have to cover interpreter startup;
         # it only has to be shorter than the child's 60s sleep. That removed a
         # fixed 5.0s from every run and the load-sensitive miss with it (task 4109).
         with pytest.raises(asyncio.TimeoutError):
