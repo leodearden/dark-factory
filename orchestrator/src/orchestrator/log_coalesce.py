@@ -38,10 +38,19 @@ I/O.  The caller decides what to emit and at what level; this only decides
 isolation, with exact line-count assertions and no sleeping.
 
 TOTAL.  Neither :meth:`observe` nor :meth:`clear` raises for any input: a
-non-positive ``cap_polls`` is clamped to 1 at use time, and fingerprints are
+non-positive ``cap_polls`` is clamped to 1 at use time (degrading to
+log-every-poll rather than wedging or raising), and fingerprints are
 compared with ``!=`` only (never hashed into a dict), so any value a caller
 can construct is acceptable.  A gate that could raise inside a heartbeat
 sub-check would be strictly worse than the repetition it replaces.
+
+``None`` IS A LEGAL FINGERPRINT.  "No run in progress" is a private
+module-level sentinel object, not ``None`` — so an adopter whose finding
+reduces to a single optional value (plausible for the sweeps named below)
+can pass ``None`` and still be coalesced, instead of silently getting
+``changed=True`` on every poll and a :meth:`clear` that never fires.  That
+overload would have reproduced the exact pathology this module removes, in
+the one caller least likely to notice.
 
 PRECEDENT.  This generalises the ``_reprobe_last_info`` /
 ``REPROBE_STILL_DOWN_INFO_SWEEPS`` rate-limiter already in
@@ -64,7 +73,16 @@ adoption cheap; doing it is a separate task.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Hashable
+
+_UNSET: object = object()
+"""Private "no run in progress" marker (never observed, or already cleared).
+
+Deliberately NOT ``None``: ``None`` is a value a caller may legitimately pass
+as a fingerprint, and overloading it as the sentinel would make such a caller
+report ``changed=True`` on every poll while :meth:`ExponentialLogCoalescer.clear`
+never fired — the pathology this module exists to remove.  Identity-compared
+(``is``) so it can never collide with a caller value.
+"""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -98,13 +116,24 @@ class CoalescedLogDecision:
 
 @dataclasses.dataclass(frozen=True)
 class ClearedRun:
-    """The run of consecutive observations that a :meth:`clear` ended.
+    """The EPISODE of consecutive observations that a :meth:`clear` ended.
+
+    Both fields are measured over the WHOLE episode — every observation since
+    the coalescer last left the cleared state — and not over the final
+    fingerprint's segment alone.  The two differ whenever the fingerprint
+    changed mid-episode, and a caller that mixed the bases would emit a
+    self-contradicting line: an episode of 50 polls whose set changed at poll
+    41 would have reported "50 polls / 300s" when 50 polls at a 30s cadence is
+    1500s, a 5x understatement of the outage (reviewer_comprehensive
+    amendment, task 3203).  Reporting both from here keeps
+    ``polls * poll_interval == duration_secs`` true for a fixed-cadence
+    caller, which is what makes the single clear line usable for sizing.
 
     Attributes:
-        polls: How many polls the just-ended run lasted (the count at the
-            final fingerprint).
-        duration_secs: Wall-clock span of the run, from the first observation
-            of the final fingerprint to the ``now`` passed to ``clear``.
+        polls: How many polls the just-ended EPISODE lasted, across every
+            fingerprint it passed through.
+        duration_secs: Wall-clock span of the EPISODE, from its first
+            observation to the ``now`` passed to :meth:`clear`.
     """
 
     polls: int
@@ -127,14 +156,21 @@ class ExponentialLogCoalescer:
 
     def __init__(self, *, cap_polls: int) -> None:
         self.cap_polls: int = cap_polls
-        # None == no run in progress (never observed, or cleared).
-        self._fingerprint: Hashable | None = None
+        # _UNSET == no run in progress (never observed, or cleared). NOT
+        # None — see that sentinel's docstring; None is a legal fingerprint.
+        self._fingerprint: object = _UNSET
+        # Per-SEGMENT (current fingerprint only) — drives the backoff and the
+        # `unchanged for N polls / Ss` context on a repeat line.
         self._since: float = 0.0
         self._unchanged_polls: int = 0
         self._interval: int = 0
         self._next_due: int = 0
+        # Per-EPISODE (spans every fingerprint since the cleared state) —
+        # drives ClearedRun, so the clear line can size the whole outage.
+        self._episode_since: float = 0.0
+        self._episode_polls: int = 0
 
-    def observe(self, fingerprint: Hashable, now: float) -> CoalescedLogDecision:
+    def observe(self, fingerprint: object, now: float) -> CoalescedLogDecision:
         """Record one poll carrying *fingerprint* and report whether to log.
 
         *fingerprint* is compared to the previous one by VALUE (``!=``), so a
@@ -146,11 +182,20 @@ class ExponentialLogCoalescer:
         use :meth:`clear` for that, so the end of a run is reported once and
         only once.
         """
-        if self._fingerprint is None or fingerprint != self._fingerprint:
+        if self._fingerprint is _UNSET:
+            # First observation since the cleared state: the episode starts
+            # here. Kept distinct from the segment reset below so a mid-run
+            # fingerprint change does not restart the episode clock.
+            self._episode_since = now
+            self._episode_polls = 0
+        self._episode_polls += 1
+
+        if self._fingerprint is _UNSET or fingerprint != self._fingerprint:
             # A change (or the first observation of an episode) always logs,
-            # at full detail, and restarts the schedule from interval=1. It
-            # never resumes the previous fingerprint's backoff — a set that
-            # just grew or shrank is new information.
+            # at full detail, and restarts the SEGMENT schedule from
+            # interval=1. It never resumes the previous fingerprint's backoff
+            # — a set that just grew or shrank is new information. The
+            # EPISODE counters above are deliberately untouched here.
             self._fingerprint = fingerprint
             self._since = now
             self._unchanged_polls = 1
@@ -182,24 +227,31 @@ class ExponentialLogCoalescer:
         )
 
     def clear(self, now: float) -> ClearedRun | None:
-        """End the current run, if any, and report what it was.
+        """End the current EPISODE, if any, and report what it was.
 
-        Returns a :class:`ClearedRun` exactly once per run: the first call
-        after a run ends describes it, and every further call returns None
-        until :meth:`observe` starts a new run.  That single-shot property
-        lives HERE rather than in the caller so that "exactly one clear line"
-        falls out of the gate for every call site that adopts it, instead of
-        each one re-deriving it from its own bookkeeping.
+        Returns a :class:`ClearedRun` exactly once per episode: the first
+        call after an episode ends describes it, and every further call
+        returns None until :meth:`observe` starts a new one.  That
+        single-shot property lives HERE rather than in the caller so that
+        "exactly one clear line" falls out of the gate for every call site
+        that adopts it, instead of each one re-deriving it from its own
+        bookkeeping.
+
+        The reported counts span the WHOLE episode, not just the final
+        fingerprint's segment — see :class:`ClearedRun` for why mixing the
+        two bases produced a self-contradicting clear line.
         """
-        if self._fingerprint is None:
+        if self._fingerprint is _UNSET:
             return None
         cleared = ClearedRun(
-            polls=self._unchanged_polls,
-            duration_secs=now - self._since,
+            polls=self._episode_polls,
+            duration_secs=now - self._episode_since,
         )
-        self._fingerprint = None
+        self._fingerprint = _UNSET
         self._since = 0.0
         self._unchanged_polls = 0
         self._interval = 0
         self._next_due = 0
+        self._episode_since = 0.0
+        self._episode_polls = 0
         return cleared
