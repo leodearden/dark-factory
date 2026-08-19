@@ -115,10 +115,14 @@ _SEG: str = rf'{_SEG_CHARS}+'
 
 # A file-extension-bearing token.  The stem is DOT-INCLUSIVE (_SEG_CHARS*)
 # so a multi-dot filename ('a.b.txt') can backtrack the stem to 'a.b' and
-# still expose '.txt'; the extension itself must be 2-6 ALPHABETIC chars.
-# NOTE: {{2,6}} is doubled because this is an f-string; braces in the
+# still expose '.txt'; the extension itself must be 2-6 chars whose LEADING
+# char is alphabetic (rules out a purely-numeric "extension" like 'v1.2' /
+# '0.5', and a single dotted-initial letter like 'A.I.'), with the
+# remaining chars alphanumeric so a genuinely digit-bearing extension
+# ('.mp3', '.h5', '.sha256') still matches.
+# NOTE: {{1,5}} is doubled because this is an f-string; braces in the
 # RENDERED value are not re-processed when it is interpolated below.
-_EXT: str = rf'{_SEG_CHARS}*\.[A-Za-z]{{2,6}}(?![A-Za-z0-9])'
+_EXT: str = rf'{_SEG_CHARS}*\.[A-Za-z][A-Za-z0-9]{{1,5}}(?![A-Za-z0-9])'
 
 _RIGHT_CONTEXT: str = rf'(?={_SEG}/|{_EXT})'
 
@@ -152,14 +156,22 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
     THREE-OR-MORE-element one ("the ``client/``server/db split") still
     satisfies the ``_SEG/`` alternative and survives as known false-positive
     residue (task 4160, see below).  The extension alternative
-    (:data:`_EXT`) requires a 2-6 char ALPHABETIC extension over a
-    DOT-INCLUSIVE stem (task 4160): the previous ``[A-Za-z0-9]{1,6}``
-    accepted a purely numeric or single-character token, so a version
-    string (``backend/v1.2``), a decimal (``corpus/0.5``), and dotted
-    initials (``backend/A.I.``) all lexed as paths.  The stem is
-    dot-inclusive specifically so a multi-dot filename (``gui/a.b.txt``)
-    still survives the 2-char floor — the engine backtracks the stem past
-    the first dot to expose ``.txt``.
+    (:data:`_EXT`) requires a 2-6 char extension whose LEADING character is
+    ALPHABETIC, with the remaining chars ALPHANUMERIC, over a DOT-INCLUSIVE
+    stem (task 4160): the previous ``[A-Za-z0-9]{1,6}`` let the extension
+    START with a digit, so a two-component version string
+    (``backend/v1.2``), a decimal (``corpus/0.5``), and dotted initials
+    (``backend/A.I.``) all lexed as paths.  Anchoring only the LEADING
+    character — rather than banning digits outright — keeps a genuinely
+    digit-bearing extension matching (``crates/x.mp3``, ``crates/x.h5``,
+    ``crates/x.sha256``), since a purely-numeric or single-letter token can
+    never satisfy a mandatory leading letter followed by >=1 more
+    character.  The stem is dot-inclusive specifically so a multi-dot
+    filename (``gui/a.b.txt``) still survives the 2-char floor — the engine
+    backtracks the stem past the first dot to expose ``.txt`` — but the
+    same backtracking re-admits a THREE-OR-MORE-component version string
+    whose FINAL component is alphabetic (``backend/v1.2.final``); known
+    false-positive residue, see below.
 
     A bare trailing ``<prefix>/`` at end-of-token deliberately does NOT match,
     because that is the bare-MENTION class ("see ``fused-memory/``", "the
@@ -206,9 +218,7 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
       ``backend/A.I.`` are structurally identical to the matcher (stem, dot,
       one letter), so closing the dotted-initials FALSE positive necessarily
       costs the single-letter extension — no rule closes one while keeping
-      the other;
-    - digit-bearing extensions (task 4160) — ``crates/x.mp3``, ``crates/x.h5``
-      fail the now-alphabetic-only extension alternative.
+      the other.
 
     (ii) FALSE POSITIVES (fail-loud) — prose is WRONGLY recognised as a path:
 
@@ -220,14 +230,25 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
       stop detecting genuine EXTENSIONLESS directory paths
       (``fused-memory/src/fused_memory/middleware/``, ``crates/reify/src``),
       a strictly larger and more common real-prose class in this repo than
-      the shape it would close, so closing it would be a net detection loss.
-      Blast radius is bounded: the prose advisory this feeds NEVER rejects a
-      submission outright (the module docstring's outcome (3)) and is
-      suppressed entirely by :func:`local_attesting_signals` (task 3106)
-      whenever the declared deliverables attest local work, so a false
-      positive only reaches a submission with no locally-attesting declared
-      files, where it stamps ``metadata.possible_scope_mismatch`` and files
-      an info-severity ``scope_violation`` escalation.
+      the shape it would close, so closing it would be a net detection loss;
+    - multi-component version string with an alphabetic final component
+      (task 4160) — ``backend/v1.2.final``, ``gui/1.0.beta`` still match:
+      the DOT-INCLUSIVE stem (:data:`_EXT`, needed to keep ``gui/a.b.txt``
+      matching) backtracks past the earlier dots and offers the trailing
+      word as the extension, while an all-numeric final component
+      (``backend/v1.2.3``) is still closed.  NOT closed for the same reason
+      as the entry above: nothing in the regex distinguishes this shape
+      from the genuine multi-dot filename ``gui/a.b.txt`` — both are a
+      dot-inclusive stem followed by a 2-6 char alphabetic-led tail.
+
+    Blast radius is bounded for both entries above: the prose advisory this
+    feeds NEVER rejects a submission outright (the module docstring's
+    outcome (3)) and is suppressed entirely by
+    :func:`local_attesting_signals` (task 3106) whenever the declared
+    deliverables attest local work, so a false positive only reaches a
+    submission with no locally-attesting declared files, where it stamps
+    ``metadata.possible_scope_mismatch`` and files an info-severity
+    ``scope_violation`` escalation.
 
     The MISSED-detection direction is the same conservative one
     ``project_prefix_registry`` already takes for ``../other-repo/x.py`` and

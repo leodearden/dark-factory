@@ -390,31 +390,62 @@ class TestFindPathsRightBoundary:
         # CONTRAST: the TWO-element shape task 3120 closed is still closed.
         assert find_paths('not a backend/timeout error', ('backend/',)) == []
 
+    def test_known_false_positive_residue_multi_component_version_string(self):
+        """FALSE POSITIVE — a version-like string with an alphabetic final
+        component still lexes as a path, pinned so the gap stays visible.
+
+        Task 4160 closed the TWO-component version-string shape
+        ('backend/v1.2', 'corpus/0.5') by requiring the extension's LEADING
+        character to be alphabetic.  A THREE-OR-MORE-component version
+        string whose FINAL component happens to be alphabetic still
+        satisfies the extension alternative: the DOT-INCLUSIVE stem (needed
+        to keep 'gui/a.b.txt' matching, see :data:`_EXT`) backtracks past
+        the earlier dots and offers the trailing word as the "extension".
+        Deliberately NOT closed, for the same reason as the
+        three-segment-slash residue above: nothing in the regex
+        distinguishes this shape from the genuine multi-dot filename
+        'gui/a.b.txt' — both are a dot-inclusive stem followed by a 2-6
+        char alphabetic-led tail.  Live impact is bounded the same way: the
+        prose advisory never rejects and is suppressed by
+        ``local_attesting_signals`` (task 3106) whenever the declared
+        deliverables attest local work.
+        """
+        # DELIBERATE: asserts the WRONG answer, so the gap is executable.
+        assert find_paths('shipping backend/v1.2.final today', ('backend/',)) == [
+            'backend/'
+        ]
+        assert find_paths('see gui/1.0.beta notes', ('gui/',)) == ['gui/']
+        # CONTRAST: an all-numeric final component is still closed.
+        assert find_paths('backend/v1.2.3 changelog', ('backend/',)) == []
+
     # ------------------------------------------------------------------
     # task 4160: numeric/single-letter "extension" false positives
     # ------------------------------------------------------------------
 
     def test_numeric_extension_is_not_an_extension(self):
-        """Task 4160: a DIGIT-BEARING "extension" no longer lexes as a path.
+        """Task 4160: an extension whose LEADING character is a digit no
+        longer lexes as a path.
 
         The WIN fixtures below are MEASURED false positives from the
-        gatekeeper reproduction, not synthetic: ``[A-Za-z0-9]{1,6}`` accepted
-        a purely numeric extension, so a version string ('v1.2') or a decimal
-        ('0.5') satisfied the right-context extension alternative and the
-        registered prefix in front of it lexed as a path.
+        gatekeeper reproduction, not synthetic: ``[A-Za-z0-9]{1,6}`` let the
+        extension START with a digit, so a version string ('v1.2') or a
+        decimal ('0.5') satisfied the right-context extension alternative
+        and the registered prefix in front of it lexed as a path.  Only the
+        LEADING character is anchored to be alphabetic — a digit elsewhere
+        in the extension ('.mp3', '.h5') is unaffected, so those keep
+        matching rather than becoming new missed-detection residue.
         """
-        # WIN — the reported false positives (all currently return the
-        # matched prefix instead of []).
+        # WIN — the reported false positives, now correctly rejected.
         assert find_paths('upgrade backend/v1.2 protocol', ('backend/',)) == []
         assert find_paths('threshold corpus/0.5 value', ('corpus/',)) == []
-        # generalisation: proves this is the DIGIT rule, not merely a length rule
+        # generalisation: proves the LEADING character must be alphabetic —
+        # a length-only floor would accept '10' (2 chars) as an extension.
         assert find_paths('backend/v1.10 protocol', ('backend/',)) == []
 
-        # COST: NEW missed-detection residue — a digit-bearing extension is
-        # no longer an extension.  Accepted — the safe direction, matching
-        # the module's stance.
-        assert find_paths('crates/x.mp3', ('crates/',)) == []
-        assert find_paths('crates/x.h5', ('crates/',)) == []
+        # RETENTION — a digit elsewhere in the extension is not banned;
+        # only a digit in the LEADING position is.
+        assert find_paths('crates/x.mp3', ('crates/',)) == ['crates/']
+        assert find_paths('crates/x.h5', ('crates/',)) == ['crates/']
 
         # RETENTION companions — must stay matching through this change.
         assert find_paths('gui/package.json', ('gui/',)) == ['gui/']
