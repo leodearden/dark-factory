@@ -770,12 +770,21 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
     USAGE_MARKER = 'Usage:'
 
     #: Positive control for the ``--reseed`` case, which takes no ``--help`` and
-    #: so cannot use ``USAGE_MARKER``.  ``thin-warm-lane.sh`` emits this via
-    #: ``info`` (to stderr, which that case captures) on the line IMMEDIATELY
-    #: BEFORE it executes ``$SEED_SCRIPT``, i.e. after seed-script resolution has
-    #: already happened.  Seeing it proves the run reached the resolution the
-    #: case names; the script needs no change to provide it.
-    RESEED_MARKER = 'Re-seeding thin base clone via '
+    #: so cannot use ``USAGE_MARKER``.  This is the seed script's own RESOLVED,
+    #: ABSOLUTE path — not the prose around it.  ``thin-warm-lane.sh``
+    #: interpolates ``$SEED_SCRIPT`` into an ``info`` line (to stderr, which
+    #: that case captures) on the line IMMEDIATELY BEFORE it executes it, i.e.
+    #: after seed-script resolution has already happened, so seeing the
+    #: CORRECTLY-resolved path proves both that the run reached resolution (an
+    #: early exit never prints it) and that resolution landed beside this
+    #: script rather than under the caller's CWD (the decoy, or any other
+    #: mis-resolution) — one assertion covering both, not two.  Matching only
+    #: the path rather than the ``'Re-seeding thin base clone via '`` prose
+    #: around it keeps this control from breaking on an unrelated log-message
+    #: reword: unlike ``USAGE_MARKER``, which pins ``--help``'s documented
+    #: output, that prose is an incidental progress message with no contract
+    #: behind it.  The script needs no change to provide it.
+    RESEED_MARKER = f'{WARM_LANE_SCRIPT_DIR}/seed-warm-lane.sh'
 
     @staticmethod
     def _help_under_a_hidden_dirname(
@@ -895,17 +904,14 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
         combined = proc.stdout + proc.stderr
 
         assert self.RESEED_MARKER in combined, (
-            f'thin-warm-lane.sh never printed {self.RESEED_MARKER!r}, so it '
-            f'never reached seed-script resolution and the absence assertion '
-            f'below would hold vacuously — this run proves nothing about '
-            f'sibling resolution.  Any earlier exit (a rejected flag, a '
-            f'missing lane dir, a failed thinning) lands here.\n'
+            f'thin-warm-lane.sh never referenced the correctly-resolved seed '
+            f'script ({self.RESEED_MARKER!r}) anywhere in its output.  Either '
+            f'it never reached seed-script resolution at all — an early exit '
+            f'(a rejected flag, a missing lane dir, a failed thinning) proves '
+            f'nothing about sibling resolution — or it resolved to a '
+            f'DIFFERENT path, e.g. one under the CALLER\'S CWD instead of '
+            f'beside itself in {WARM_LANE_SCRIPT_DIR}.\n'
             f'rc={proc.returncode}\noutput:\n{combined}'
-        )
-        assert _DECOY_MARKER not in combined, (
-            'thin-warm-lane.sh --reseed EXECUTED a seed script from the '
-            f'CALLER\'S CWD instead of resolving one beside itself in '
-            f'{WARM_LANE_SCRIPT_DIR}.\noutput:\n{combined}'
         )
 
 
