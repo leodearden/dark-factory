@@ -972,6 +972,16 @@ _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS: tuple[dict, ...] = (
 # drift population, which was already a known, separately-tracked gap
 # (task 2966 amendment) before this change and remains one after it —
 # not something this interim mitigation widens or narrows.
+#
+# That boolean pool is itself over-broad — the sweep's own docstring
+# (_sweep_stale_mem0_flag_for_stage2_markers) notes
+# {'flag_for_stage2': True} has no kind/source/record_type discriminator,
+# so it also matches any non-marker record (e.g. a cycle_summary mirror)
+# an LLM writer happened to stamp flag_for_stage2=True on. Shortening the
+# TTL makes that pre-existing collateral-deletion exposure materialize 7
+# days sooner rather than 14. The task-3041 protected-mirror invariant in
+# _sweep_stale_mem0_pool is unchanged by this change and remains the only
+# structural guard against it (measured: zero mirrors present in the pool).
 _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS: int = 7
 _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE = 'flag_for_stage2_gc_sweep'
 _FLAG_FOR_STAGE2_ENUM_FILTERS: dict = {'flag_for_stage2': True}
