@@ -1661,3 +1661,156 @@ class TestCrossLevelDedupeIsolation:
 
         assert result['status'] == 'dedup_skipped', f'Expected a fold, got: {result}'
         assert result['parent_id'] == 'esc-42-1'
+
+
+class TestNormalisationLiftedToCanonical:
+    """The casefold/strip/collapse pipeline lives in ONE place: escalation.canonical.
+
+    dedupe.py had THREE uses of the two regexes — ``_normalize_description``
+    (feeding ``compute_content_fingerprint``) and ``summary_dedupe_key``'s direct
+    ``_NON_WORD_PATTERN.sub`` (feeding ``find_dedupe_parent``).  Both now delegate
+    to the lifted helper under an explicitly-pinned ``punctuation='strip'``
+    policy, which is what makes the "exactly one implementation" claim structural
+    rather than conventional (INV-5).
+
+    The digests and key tuples below are CHARACTERISATION pins, not aspirations:
+    every value was obtained by RUNNING the pre-lift implementation.  They are
+    load-bearing because both outputs are already persisted across the live
+    corpus — a fingerprint digest that changes silently un-dedupes every recon
+    finding already on disk, and a ``summary_dedupe_key`` tuple that changes
+    silently re-partitions every dedupe cluster already keyed fleet-wide.
+    """
+
+    # (escalation_category, finding_category, description) -> sha256 hex digest,
+    # computed by running the PRE-LIFT dedupe implementation.
+    _FINGERPRINT_REFERENCE = {
+        ('infra_issue', 'flaky-test', 'Fused-memory  CONNECTION timeout!'):
+            '29d2adc399cddb4369e5ad754c054e0f6f595f43ba375846c3f6741e40f59ad4',
+        ('risk_identified', 'perf', 'cpu+memory leak in the sweep loop'):
+            '393e47310ab5186a41cd3554e656e52c7686aa7bb28e22dd3e61ac95896d52fc',
+        ('design_concern', 'coupling', '  Watcher lease STOLEN.  '):
+            '26b8b9918444def709c36684a7e1f1edce11a41bec7dab1169c04cf2278d460f',
+        ('cleanup_needed', 'dead-code', 'starvation:2370:persistent-lock-contention'):
+            '45538de967982d58f3aafd64bcfae927f51a41cbb445c2115134b927cb076dd2',
+    }
+
+    def test_dedupe_no_longer_owns_the_regexes(self):
+        """INV-5: no second copy of the transform survives in dedupe.py.
+
+        A lifted helper plus a surviving inline copy of the same pipeline is the
+        lockstep duplication the lift exists to prevent, so the module-level
+        constants must be GONE rather than merely unused.
+        """
+        from escalation import dedupe
+
+        assert not hasattr(dedupe, '_NON_WORD_PATTERN'), (
+            'dedupe must not keep its own copy of the non-word regex — '
+            'import canonical_text from escalation.canonical instead'
+        )
+        assert not hasattr(dedupe, '_WHITESPACE_PATTERN'), (
+            'dedupe must not keep its own copy of the whitespace regex — '
+            'import canonical_text from escalation.canonical instead'
+        )
+
+    def test_normalize_description_delegates_to_the_strip_policy(self):
+        """_normalize_description IS canonical_text(..., punctuation='strip')."""
+        from escalation.canonical import canonical_text
+        from escalation.dedupe import _normalize_description
+
+        for text in [
+            'a.b, c',
+            'Fused-memory  CONNECTION timeout!',
+            '  Watcher lease STOLEN.  ',
+            'risk:3184',
+            '',
+            '::',
+        ]:
+            assert _normalize_description(text) == canonical_text(
+                text, punctuation='strip'
+            ), f'delegation diverged for {text!r}'
+
+    def test_normalize_description_keeps_its_measured_outputs(self):
+        """Characterisation of the pipeline itself, independent of the delegation."""
+        from escalation.dedupe import _normalize_description
+
+        assert _normalize_description('a.b, c') == 'ab c'
+        assert _normalize_description('Fused-memory  CONNECTION timeout!') == (
+            'fusedmemory connection timeout'
+        )
+        assert _normalize_description('  Watcher lease STOLEN.  ') == 'watcher lease stolen'
+        # STRIP, not separator: the fingerprint policy must stay deletion-flavoured.
+        assert _normalize_description('risk:3184') == 'risk3184'
+
+    def test_content_fingerprint_digests_are_byte_identical(self):
+        """The digests already on disk must not move.
+
+        If this fails, the strip policy was changed (or the delegation is not
+        byte-identical) and every already-fingerprinted recon finding has stopped
+        matching its own past self — a large, invisible regression.
+        """
+        from escalation.dedupe import compute_content_fingerprint
+
+        for (esc_cat, find_cat, description), expected in self._FINGERPRINT_REFERENCE.items():
+            actual = compute_content_fingerprint(esc_cat, find_cat, [], description)
+            assert actual == expected, (
+                f'fingerprint digest changed for {description!r}: '
+                f'{actual} != {expected} — the live recon corpus would silently un-dedupe'
+            )
+
+    def test_content_fingerprint_ignores_description_when_affected_ids_present(self):
+        """Unchanged contract, re-pinned because the lift touched its only helper."""
+        from escalation.dedupe import compute_content_fingerprint
+
+        with_ids = compute_content_fingerprint(
+            'infra_issue', 'flaky-test', ['task-1', 'task-2'], 'one description'
+        )
+        other_description = compute_content_fingerprint(
+            'infra_issue', 'flaky-test', ['task-1', 'task-2'],
+            'a COMPLETELY different description!!',
+        )
+        assert with_ids == other_description
+        assert with_ids == '3d46b1b1c93febe00abf8d28be40c8c30db39d0a6136e04dce8532a5228666f9'
+
+    def test_summary_dedupe_key_matches_its_documented_examples(self):
+        """The five docstring doctests, promoted to real assertions.
+
+        ``summary_dedupe_key`` feeds ``find_dedupe_parent`` and its tuples are
+        persisted fleet-wide, so the rewire onto the lifted helper has to be
+        byte-identical.  These cases already cover the interesting shapes:
+        internal punctuation, a symbol join, a doubled space, a trailing '!',
+        the empty string, and the >3-token truncation.
+        """
+        from escalation.dedupe import summary_dedupe_key
+
+        assert summary_dedupe_key('Fused-memory  CONNECTION timeout!') == (
+            'fusedmemory', 'connection', 'timeout',
+        )
+        assert summary_dedupe_key('fused-memory connection timeout on port 8002') == (
+            'fusedmemory', 'connection', 'timeout',
+        )
+        assert summary_dedupe_key('lost link') == ('lost', 'link')
+        assert summary_dedupe_key('') == ()
+        assert summary_dedupe_key('cpu+memory leak') == ('cpumemory', 'leak')
+
+    def test_summary_dedupe_key_equals_the_strip_policy_expression(self):
+        """The rewire is exactly ``canonical_text(s, 'strip').split()[:3]``.
+
+        Verified during planning over all 2796 real summaries in the live queue
+        (0 mismatches): the helper's extra whitespace-collapse-and-strip is
+        absorbed by the subsequent ``.split()``.
+        """
+        from escalation.canonical import canonical_text
+        from escalation.dedupe import summary_dedupe_key
+
+        for summary in [
+            'Fused-memory  CONNECTION timeout!',
+            'cpu+memory leak',
+            '  leading and trailing  ',
+            '\t\n',
+            '::',
+            'one two three four five',
+            'ロック競合 が 発生',
+        ]:
+            assert summary_dedupe_key(summary) == tuple(
+                canonical_text(summary, punctuation='strip').split()[:3]
+            ), f'summary_dedupe_key diverged from the lifted helper for {summary!r}'
