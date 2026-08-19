@@ -1400,3 +1400,41 @@ class TestRestoreArchivedTranscript:
         assert archive_task_transcripts(
             config_dir, task_id, sid, archive_root=root
         ) == 0
+
+    def test_a_gzipped_pre_3618_archive_is_restored_decompressed(self, tmp_path):
+        """I-C: the ``.jsonl.gz`` corpus restores as plain, usable JSONL.
+
+        :func:`durable_archive_path` is deliberately format-agnostic because
+        archives written BEFORE task 3618's flag day are still ``.jsonl.gz`` on
+        disk, so a restore that only handled plain files would silently no-op
+        on the older corpus — the exact population most likely to need a
+        rehydrate, since it is the oldest.
+
+        The destination DROPS the ``.gz``: the CLI parses plain JSONL and would
+        reject a gzip blob named ``.jsonl`` exactly as it rejects a zero-byte
+        one (measured — a zero-byte file and a preamble-only file both yield
+        ``No conversation found with session ID`` on CLI 2.1.236), and
+        ``transcript_exists`` globs ``*.jsonl``, so a ``.gz``-suffixed
+        destination would not even be seen.
+        """
+        import gzip
+
+        from shared.cli_invoke import transcript_exists
+
+        sid = 'sess-restore-gz'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        payload = b'{"type":"user"}\n{"type":"assistant"}\n'
+        # Hand-placed rather than produced: today's producer emits only plain
+        # .jsonl, so the pre-3618 shape can only be reconstructed directly.
+        _write(root / task_id / ENC / f'{sid}.jsonl.gz', gzip.compress(payload))
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        restored = restore_archived_transcript(root, task_id, sid, config_dir)
+
+        assert restored is not None
+        assert restored == config_dir / 'projects' / ENC / f'{sid}.jsonl'
+        assert restored.read_bytes() == payload
+        assert transcript_exists(config_dir, sid) is True
