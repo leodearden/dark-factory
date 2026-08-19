@@ -57,6 +57,7 @@ from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from fastmcp import FastMCP
+from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
 from shared.toolcall_markup import detect, repair
 
 from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
@@ -1551,6 +1552,31 @@ def _mark_step_committed(
 def create_server(artifacts: TaskArtifacts) -> FastMCP:
     """Create the plan-tools MCP server with all tools registered."""
     mcp = FastMCP('plan-tools')
+
+    # THE WRITE-TIME BOUNDARY GUARD (task 4457, PRD contract C2). Every INBOUND
+    # string argument of every tool on this server is scanned for leaked
+    # tool-call envelope markup before pydantic ever validates it — which is
+    # what lets a repair recover a parameter this server declares as REQUIRED:
+    # the loudest leak shape here is add_design_decision.decision absorbing its
+    # rationale sibling, and no read-time surface can see it at all.
+    #
+    # BOTH ARGUMENTS ARE DECLARED EXPLICITLY (INV-1), never left to a default:
+    #
+    # * The POLICY is PRD section 4 C2's table row for plan-tools. A plan is
+    #   authored once and read for the life of the task, so bouncing the caller
+    #   costs one mechanical retry while forwarding a repair would write a
+    #   guessed-at document that every later reader inherits.
+    # * The empty EXEMPTION SET is an answer, not an omission: no plan-tools
+    #   tool has searching for envelope literals as its job, the way
+    #   fused-memory's scan_memory_content does. An architect legitimately
+    #   QUOTING the literals — planning a task about this very leak — uses the
+    #   deliberate-quoting override instead, which works here even though no
+    #   plan-tools tool declares a `metadata` parameter: the middleware drops
+    #   the flag before dispatch rather than forwarding it as an unexpected
+    #   argument.
+    mcp.add_middleware(
+        MarkupGuardMiddleware(RepairPolicy.REJECT_WITH_REPAIR, exempt_tools=frozenset())
+    )
 
     @mcp.tool()
     def create_plan(
