@@ -5338,3 +5338,324 @@ class TestAddMembersToL2SeverityFloor:
             'Expected a WARNING naming the unrecognised severity; got: '
             f'{[r.getMessage() for r in caplog.records]}'
         )
+
+
+class TestAddMembersToL2RootCauseVariants:
+    """`root_cause_variants` — the distinct PRE-canonical spellings a cluster folded (task 3998).
+
+    Canonicalising the root-cause match makes MORE promotes fold by design, so
+    the failure it introduces is OVER-folding: distinct causes silently merged
+    under one canonical key.  The only observable signature is the set of
+    mutually-distinct spellings one L2 has been addressed by, which is what
+    `add_members_to_l2` — the SOLE writer — accumulates here.
+    """
+
+    def _make_l2(
+        self, queue: EscalationQueue, task_id: str = 'task-1',
+        root_cause: str = 'Watcher lease stolen.',
+    ) -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster',
+            level=2,
+            root_cause=root_cause,
+            members=['esc-l1-0'],
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_first_fold_seeds_the_records_own_spelling_then_appends(self, tmp_path: Path):
+        """(a) The record's OWN spelling is seeded first, then the incoming one.
+
+        Seeding matters: the distinct count must reflect every spelling the
+        cluster has EVER been addressed by, not only the post-mint ones —
+        otherwise the first fold reads as "1 variant" when two distinct spellings
+        have already reached this L2.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN')
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert record.root_cause_variants == [
+            'Watcher lease stolen.', 'watcher  lease STOLEN',
+        ], f'expected own-then-incoming, got {record.root_cause_variants!r}'
+        assert record.root_cause_variants_truncated == 0
+
+    def test_byte_identical_respelling_adds_nothing_and_does_not_bump_updated_at(
+        self, tmp_path: Path,
+    ):
+        """(b) A repeat of an already-listed spelling is not a new variant.
+
+        It must also not manufacture a spurious `updated_at` bump, which would
+        re-trigger the watcher's re-assess protocol on a true no-op.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN')
+        before = queue.get(l2.id)
+        assert before is not None
+
+        # Same members, same spelling — nothing new on any axis.
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN')
+
+        after = queue.get(l2.id)
+        assert after is not None
+        assert after.root_cause_variants == before.root_cause_variants, (
+            f'a repeated spelling must not be listed twice: {after.root_cause_variants!r}'
+        )
+        assert after.updated_at == before.updated_at, (
+            f'no-op fold must not bump updated_at: '
+            f'{before.updated_at!r} -> {after.updated_at!r}'
+        )
+
+    def test_two_spellings_of_one_canonical_key_produce_two_variants(
+        self, tmp_path: Path,
+    ):
+        """(c) THE POINT: canonically-equal spellings are separately recorded.
+
+        The match folded them together; the pre-canonical spellings are the only
+        evidence that the fold happened at all.
+        """
+        from escalation.canonical import canonical_root_cause
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN')
+        queue.add_members_to_l2(l2.id, ['esc-l1-2'], root_cause='WATCHER-LEASE-STOLEN')
+
+        record = queue.get(l2.id)
+        assert record is not None
+        # All three canonicalise to ONE key — that is exactly why they must be
+        # kept apart on the record.
+        canonical = {canonical_root_cause(v) for v in record.root_cause_variants}
+        assert len(canonical) == 1, f'expected one canonical class, got {canonical!r}'
+        assert len(record.root_cause_variants) == 3, (
+            f'expected 3 distinct spellings, got {record.root_cause_variants!r}'
+        )
+
+    def test_framing_free_fold_touches_neither_field(self, tmp_path: Path):
+        """(d) A plain member append carries no spelling and records none."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'])
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert record.root_cause_variants == [], (
+            f'a framing-free fold must not seed variants: {record.root_cause_variants!r}'
+        )
+        assert record.root_cause_variants_truncated == 0
+
+    def test_cap_sheds_oldest_and_counts_every_drop(self, tmp_path: Path):
+        """(e) Oldest-shed at `_MAX_ROOT_CAUSE_VARIANTS`, each drop counted durably.
+
+        The TRUE distinct count stays `len(variants) + truncated`, so the loss is
+        a structured fact on the record rather than log-only (INV-8).
+        """
+        from escalation.queue import _MAX_ROOT_CAUSE_VARIANTS
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        overshoot = 5
+        total_spellings = _MAX_ROOT_CAUSE_VARIANTS + overshoot
+        # -1 because the record's own spelling is seeded by the first fold.
+        for i in range(total_spellings - 1):
+            queue.add_members_to_l2(l2.id, [f'esc-l1-{i}'], root_cause=f'cause number {i}')
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert len(record.root_cause_variants) == _MAX_ROOT_CAUSE_VARIANTS, (
+            f'list must be capped, got {len(record.root_cause_variants)}'
+        )
+        assert record.root_cause_variants_truncated == overshoot, (
+            f'expected {overshoot} drops counted, got {record.root_cause_variants_truncated}'
+        )
+        assert (
+            len(record.root_cause_variants) + record.root_cause_variants_truncated
+            == total_spellings
+        ), 'the true distinct count must stay recoverable from the record'
+        # OLDEST shed: the record's own seeded spelling is the first to go.
+        assert 'Watcher lease stolen.' not in record.root_cause_variants
+        assert f'cause number {total_spellings - 2}' in record.root_cause_variants, (
+            'the most recent spelling must survive'
+        )
+
+    def test_long_spelling_is_elided_with_the_in_band_marker(self, tmp_path: Path):
+        """(e cont.) Each stored spelling is capped by the existing `_elide` helper."""
+        from escalation.queue import _MAX_AMENDMENT_LINE_CHARS
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+        long_cause = 'x' * (_MAX_AMENDMENT_LINE_CHARS + 250)
+
+        queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause=long_cause)
+
+        record = queue.get(l2.id)
+        assert record is not None
+        stored = record.root_cause_variants[-1]
+        assert stored != long_cause, 'an over-long spelling must be elided'
+        assert stored.startswith('x' * _MAX_AMENDMENT_LINE_CHARS)
+        assert 'elided' in stored, (
+            f'elision must be MARKED IN-BAND, not silent: {stored[-120:]!r}'
+        )
+
+    def test_outcome_reports_variant_facts_on_every_return_path(self, tmp_path: Path):
+        """(f) `variant_added` / `variants` are complete on every return, like recorded/dropped.
+
+        Reported from INSIDE `escalation_id_lock` where they are already
+        computed — a caller re-deriving them from a pre-read would be wrong in
+        both directions under the cross-process folds this queue is built for.
+        """
+        from escalation.queue import AmendmentOutcome
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+
+        # (i) NOT-FOUND early return — every key still present.
+        missing: AmendmentOutcome = {
+            'recorded': True, 'dropped': 9, 'variant_added': True, 'variants': 99,
+        }
+        assert queue.add_members_to_l2('esc-nope-1', ['x'], outcome=missing) is None
+        assert missing['variant_added'] is False, f'not-found must reset: {missing}'
+        assert missing['variants'] == 0, f'not-found must reset: {missing}'
+
+        # (ii) NO-OP early return (no members, no floor, no framing).
+        noop: AmendmentOutcome = {
+            'recorded': True, 'dropped': 9, 'variant_added': True, 'variants': 99,
+        }
+        assert queue.add_members_to_l2(l2.id, [], outcome=noop) is not None
+        assert noop['variant_added'] is False, f'no-op must reset: {noop}'
+        assert noop['variants'] == 0, f'no-op must reset: {noop}'
+
+        # (iii) a real variant-adding fold.
+        first: AmendmentOutcome = {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
+        queue.add_members_to_l2(
+            l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN', outcome=first,
+        )
+        assert first['variant_added'] is True, f'expected a new variant: {first}'
+        assert first['variants'] == 2, (
+            f'own spelling + incoming = 2 distinct: {first}'
+        )
+
+        # (iv) a REPEAT fold adds nothing but still reports the running total.
+        repeat: AmendmentOutcome = {
+            'recorded': False, 'dropped': 0, 'variant_added': True, 'variants': 0,
+        }
+        queue.add_members_to_l2(
+            l2.id, ['esc-l1-1'], root_cause='watcher  lease STOLEN', outcome=repeat,
+        )
+        assert repeat['variant_added'] is False, f'a repeat adds no variant: {repeat}'
+        assert repeat['variants'] == 2, (
+            f'the running DISTINCT total is still reported: {repeat}'
+        )
+
+    def test_variants_count_includes_truncated_drops(self, tmp_path: Path):
+        """(f cont.) `variants` is the TRUE distinct total, not just the list length.
+
+        Past the cap the list stops growing, so reporting `len(list)` would make
+        the over-fold signal plateau exactly when it matters most.
+        """
+        from escalation.queue import _MAX_ROOT_CAUSE_VARIANTS, AmendmentOutcome
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue)
+        for i in range(_MAX_ROOT_CAUSE_VARIANTS + 2):
+            queue.add_members_to_l2(l2.id, [f'esc-l1-{i}'], root_cause=f'cause number {i}')
+
+        outcome: AmendmentOutcome = {
+            'recorded': False, 'dropped': 0, 'variant_added': False, 'variants': 0,
+        }
+        queue.add_members_to_l2(
+            l2.id, ['esc-l1-last'], root_cause='a brand new spelling', outcome=outcome,
+        )
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert outcome['variants'] == (
+            len(record.root_cause_variants) + record.root_cause_variants_truncated
+        ), f'reported total must match the record: {outcome}'
+        assert outcome['variants'] > _MAX_ROOT_CAUSE_VARIANTS, (
+            f'the count must keep climbing past the cap: {outcome}'
+        )
+
+
+class TestAddMembersToL2VariantConcurrency:
+    """Two-OS-process test: concurrent variant-carrying folds must lose no spelling."""
+
+    @pytest.mark.timeout(30)
+    def test_concurrent_variant_folds_preserve_the_union(self, tmp_path: Path):
+        """Variants accumulate inside the SAME `escalation_id_lock` as members.
+
+        Without that, each process reads the same pre-mutation snapshot and the
+        second write clobbers the first's spelling — and the over-fold signal
+        would silently under-count exactly under the concurrent load that makes
+        an over-fold likely.
+        """
+        from escalation.queue import _MAX_ROOT_CAUSE_VARIANTS
+
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        l2 = Escalation(
+            id=queue.make_id('task-1'),
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='info',
+            category='design_concern',
+            summary='Concurrent variant test',
+            level=2,
+            root_cause='seeded spelling',
+            members=[],
+        )
+        queue.submit(l2)
+
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing}' if existing else src_path
+
+        # Kept well under the cap so the assertion is about the LOCK, not the
+        # trimmer: 2*count + 1 seeded spelling must all fit.
+        count = (_MAX_ROOT_CAUSE_VARIANTS - 1) // 2
+        child_args = [sys.executable, str(_CHILD_SCRIPT), str(queue_dir)]
+        proc_a = subprocess.Popen(
+            child_args + ['add_members_with_variant', l2.id, 'a', str(count)], env=env,
+        )
+        proc_b = subprocess.Popen(
+            child_args + ['add_members_with_variant', l2.id, 'b', str(count)], env=env,
+        )
+        rc_a = rc_b = None
+        try:
+            rc_a = proc_a.wait(timeout=25)
+            rc_b = proc_b.wait(timeout=25)
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc_a == 0, f'Child process A exited with rc={rc_a}'
+        assert rc_b == 0, f'Child process B exited with rc={rc_b}'
+
+        record = queue.get(l2.id)
+        assert record is not None
+        assert record.root_cause_variants_truncated == 0, (
+            'this scenario must stay under the cap so it tests the lock'
+        )
+        expected = {'seeded spelling'} | {
+            f'cause {prefix} {i}' for prefix in ('a', 'b') for i in range(count)
+        }
+        assert set(record.root_cause_variants) == expected, (
+            'concurrent folds lost spellings — missing: '
+            f'{sorted(expected - set(record.root_cause_variants))}'
+        )
