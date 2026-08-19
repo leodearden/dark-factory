@@ -14,9 +14,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from fused_memory.middleware.path_scope_guard import find_paths
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
 from fused_memory.middleware.soft_scope_signals import (
     SoftScopeSignal,
+    find_absolute_foreign_roots,
     find_title_project_prefix,
     project_name_aliases,
 )
@@ -229,3 +231,127 @@ class TestFindTitleProjectPrefix:
         assert signal.project_id == 'reify'
         assert signal.strength == 'strong'
         assert signal.evidence == 'Reify first census:'
+
+
+# ---------------------------------------------------------------------------
+# step-3: signal (b1) — an ABSOLUTE path under a foreign project root
+# ---------------------------------------------------------------------------
+
+
+class TestFindPathsIsBlindToAbsolutePaths:
+    """PREMISE PIN: the structural gap signal (b1) exists to close.
+
+    ``find_paths``' left-boundary class (path_scope_guard.py, the
+    ``[^A-Za-z0-9_\\-/.]`` class) excludes ``/`` deliberately, so that
+    ``vendor/corpus/expr.txt`` does not match the bare prefix ``corpus/``.
+    Absolute paths are collateral damage of that exclusion: a prefix
+    preceded by ``/`` can never match.  Asserted here rather than asserted
+    ABOUT, so the day someone widens that class this pin says so.
+    """
+
+    def test_absolute_spelling_is_invisible(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        df_root = registry.root_for_project('dark_factory')
+        assert (
+            find_paths(
+                f'Modify {df_root}/orchestrator/scheduler.py',
+                registry.all_prefixes(),
+            )
+            == []
+        )
+
+    def test_repo_relative_spelling_is_visible(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        assert find_paths(
+            'Modify orchestrator/scheduler.py', registry.all_prefixes()
+        ) == ['orchestrator/']
+
+
+class TestFindAbsoluteForeignRoots:
+    def test_fires_on_foreign_root_with_path_segment(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        df_root = registry.root_for_project('dark_factory')
+        signals = find_absolute_foreign_roots(
+            f'ALL of the asked work is in {df_root}/orchestrator/scheduler.py',
+            project_id='reify',
+            registry=registry,
+        )
+        assert len(signals) == 1
+        assert signals[0].kind == 'absolute_foreign_root'
+        assert signals[0].project_id == 'dark_factory'
+        assert signals[0].strength == 'strong'
+        assert signals[0].evidence == df_root
+
+    def test_fires_on_bare_root_with_no_trailing_segment(self, tmp_path):
+        """An absolute root ALONE is already unambiguous ownership evidence.
+
+        Unlike a bare relative prefix (which ``_RIGHT_CONTEXT`` deliberately
+        refuses without a following path segment), nothing else spells a
+        project's absolute root.
+        """
+        registry = _two_project_registry(tmp_path)
+        df_root = registry.root_for_project('dark_factory')
+        signals = find_absolute_foreign_roots(
+            f'all of this lives under {df_root}',
+            project_id='reify',
+            registry=registry,
+        )
+        assert [s.project_id for s in signals] == ['dark_factory']
+
+    def test_sibling_root_near_miss_does_not_fire(self, tmp_path):
+        """Component boundary — the rule ``_owner_for_absolute_path`` applies."""
+        registry = _two_project_registry(tmp_path)
+        df_root = registry.root_for_project('dark_factory')
+        assert (
+            find_absolute_foreign_roots(
+                f'see {df_root}-old/x.py', project_id='reify', registry=registry
+            )
+            == []
+        )
+        assert (
+            find_absolute_foreign_roots(
+                f'see {df_root}ish', project_id='reify', registry=registry
+            )
+            == []
+        )
+
+    def test_dotted_suffix_near_miss_does_not_fire(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        df_root = registry.root_for_project('dark_factory')
+        assert (
+            find_absolute_foreign_roots(
+                f'see {df_root}.bak/x.py', project_id='reify', registry=registry
+            )
+            == []
+        )
+
+    def test_filing_projects_own_root_does_not_fire(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        reify_root = registry.root_for_project('reify')
+        assert (
+            find_absolute_foreign_roots(
+                f'work in {reify_root}/crates/foo.rs',
+                project_id='reify',
+                registry=registry,
+            )
+            == []
+        )
+
+    def test_repeated_mentions_deduplicate_to_one_signal(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        df_root = registry.root_for_project('dark_factory')
+        signals = find_absolute_foreign_roots(
+            f'{df_root}/a.py and {df_root}/b.py and also {df_root}',
+            project_id='reify',
+            registry=registry,
+        )
+        assert len(signals) == 1
+        assert signals[0].project_id == 'dark_factory'
+
+    def test_empty_text_and_empty_registry_return_empty(self, tmp_path):
+        registry = _two_project_registry(tmp_path)
+        assert find_absolute_foreign_roots('', 'reify', registry) == []
+        assert find_absolute_foreign_roots(None, 'reify', registry) == []
+        empty = ProjectPrefixRegistry.from_roots([])
+        assert find_absolute_foreign_roots('/home/leo/src/x/y.py', 'reify', empty) == []
+        assert find_absolute_foreign_roots('/home/leo/src/x/y.py', 'reify', None) == []
