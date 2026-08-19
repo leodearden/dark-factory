@@ -698,8 +698,10 @@ def kill_holder_tree(
 
     Mirrors :func:`orchestrator.verify_cancel.cancel_request`'s algorithm --
     snapshot the ``/proc`` PPID map before sending any signal, collect
-    descendants, SIGKILL them, then SIGKILL+reap the leader -- but walks
-    descendants from ``proc.pid`` rather than a recorded pgid.
+    descendants, SIGKILL them, SIGKILL+reap the leader, then fire a GUARDED
+    ``killpg`` backstop for same-group stragglers -- but walks descendants
+    from ``proc.pid`` rather than a recorded pgid, and the ``killpg``
+    backstop only fires when the holder is provably its own group leader.
 
     Walking from ``proc.pid`` (rather than
     ``os.killpg(os.getpgid(proc.pid), SIGKILL)``, the obvious one-liner) is
@@ -712,9 +714,10 @@ def kill_holder_tree(
     holder started without ``--request-id`` stays in the CALLER's (this
     test process's) own process group -- ``os.getpgid(holder.pid) ==
     os.getpgid(0)``.  An unconditional ``killpg`` there would SIGKILL the
-    pytest worker running this very test.  The descendant walk has no such
-    hazard: the caller is always an ANCESTOR of the holder, never a
-    descendant -- the same argument
+    pytest worker running this very test -- see
+    ``test_kill_holder_tree_never_signals_the_callers_own_process_group``.
+    The descendant walk has no such hazard: the caller is always an
+    ANCESTOR of the holder, never a descendant -- the same argument
     :func:`~orchestrator.verify_cancel.start_own_process_group` makes for
     ``sshd`` never being a descendant of the pgid ``cancel_request`` walks.
 
@@ -734,10 +737,17 @@ def kill_holder_tree(
     """
     timeout = ROW5_HOLDER_TEARDOWN_CEILING_SECS if timeout is None else timeout
 
-    # Snapshot BEFORE sending any signal -- killing the leader first
-    # reparents survivors to init and severs the /proc parent chain, making
-    # a session-escaped descendant unfindable (the same invariant
-    # cancel_request documents at verify_cancel.py:246-250).
+    # Pre-kill snapshot phase -- BOTH reads must happen before any signal is
+    # sent.  Killing the leader first reparents survivors to init and severs
+    # the /proc parent chain, making a session-escaped descendant unfindable
+    # (the same invariant cancel_request documents at
+    # verify_cancel.py:246-250).  The pgid is read only to gate the killpg
+    # backstop below; a leader already gone by now makes getpgid raise
+    # ProcessLookupError, treated as "no group to backstop".
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = None
     ppid_map = _ppid_map_provider()
     descendants = collect_descendants(proc.pid, ppid_map)
 
@@ -752,6 +762,19 @@ def kill_holder_tree(
         with contextlib.suppress(ProcessLookupError, PermissionError):
             _kill(proc.pid, signal.SIGKILL)
     proc.wait(timeout=timeout)
+
+    # Guarded killpg backstop for same-group stragglers -- fires ONLY when
+    # the holder is PROVABLY its own group leader (setsid ran, i.e. the CLI
+    # was invoked with --request-id) AND that group is PROVABLY not the
+    # caller's own.  Both checks are required, not either alone: cli.py's
+    # os.setsid is gated on --request-id and spawn_verify_merge never passes
+    # start_new_session=, so a holder that never setsid'd (e.g. the
+    # lane-lock site) shares this process's own group -- an unguarded
+    # killpg there would SIGKILL the pytest worker itself (see
+    # test_kill_holder_tree_never_signals_the_callers_own_process_group).
+    if pgid is not None and pgid == proc.pid and pgid != os.getpgid(0):
+        with contextlib.suppress(ProcessLookupError, OSError):
+            _killpg(pgid, signal.SIGKILL)
 
     if proc.stdin is not None:
         with contextlib.suppress(OSError):
