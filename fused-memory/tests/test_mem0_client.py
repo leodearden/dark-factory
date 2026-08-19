@@ -750,6 +750,48 @@ class TestMem0BackendScrollCollectionPages:
         assert issubclass(ScrollPageBudgetExhausted, Exception)
 
     @pytest.mark.asyncio
+    async def test_scroll_point_budget_exhausted_is_an_exception(self):
+        from fused_memory.backends.mem0_client import ScrollPointBudgetExhausted
+
+        assert issubclass(ScrollPointBudgetExhausted, Exception)
+
+    @pytest.mark.asyncio
+    async def test_the_two_budget_exhaustions_are_unrelated_by_inheritance(self):
+        """Neither budget exception may be a sub- or superclass of the other.
+
+        The two are DIFFERENT events: ``max_points`` is a cap the caller asked
+        for, ``max_pages`` is a safety backstop against an endless walk.  The
+        whole point of splitting them is that a caller can catch exactly one
+        and let the other propagate — which is how ``scan_payload_text`` keeps
+        its flag-and-warn posture for its own ``limit`` while still failing
+        loudly on the backstop.  An inheritance link would silently collapse
+        that choice back into one.
+
+        Load-bearing beyond this class:
+        ``scripts/census_memory_metadata.CensusScanIncomplete`` is a
+        module-level ALIAS of ScrollPageBudgetExhausted, so its ``except
+        CensusScanIncomplete`` would start catching (or, in the other
+        direction, leaking) a points-cap event the census has no cap for.
+        ``scripts/consolidate_namespace_families`` catches the page budget
+        directly and has the same exposure.
+        """
+        from fused_memory.backends.mem0_client import (
+            ScrollPageBudgetExhausted,
+            ScrollPointBudgetExhausted,
+        )
+
+        assert ScrollPointBudgetExhausted is not ScrollPageBudgetExhausted
+        assert not issubclass(ScrollPointBudgetExhausted, ScrollPageBudgetExhausted), (
+            'a points-cap event must not be catchable as a page-budget event; '
+            'census_memory_metadata.CensusScanIncomplete aliases the latter'
+        )
+        assert not issubclass(ScrollPageBudgetExhausted, ScrollPointBudgetExhausted), (
+            'a page-budget event must not be catchable as a points-cap event; '
+            "scan_payload_text catches only the points cap and relies on the "
+            'page budget propagating past it'
+        )
+
+    @pytest.mark.asyncio
     async def test_a_hung_page_request_raises_instead_of_hanging(self, backend):
         """A wedged socket fails loudly rather than hanging a ~30-page scan forever.
 
