@@ -1087,6 +1087,45 @@ class TestStage1LedgerWriteMissingPredicate:
         )
         assert _stage1_ledger_write_missing(report) is False
 
+    def test_confirmed_write_recovery_is_excluded(self):
+        """A CONFIRMED write-recovery must not re-fire the arm (task 4186).
+
+        `_reattempt_cycle_summary_write` stamps
+        `stage1_cycle_summary_write_recovered_backstop = True` on the live
+        report only once its writer returned truthy — i.e. a row demonstrably
+        landed for this identity. It deliberately leaves
+        `stage1_cycle_summary_ledger_written` at its in-stage value of 0, so
+        without this exclusion the driver's `finally` would re-fire the arm
+        after task 4186's pre-Stage-3 flush already recovered it: duplicating
+        the best-effort Mem0 mirror write and the pool-cap trim, and logging a
+        second, misleading `reconciliation.stage1_cycle_summary_write_recovered`
+        WARNING for one real recovery.
+        """
+        from fused_memory.reconciliation.harness import _stage1_ledger_write_missing
+
+        report = self._report(
+            stage1_cycle_summary_ledger_written=0,
+            stage1_cycle_summary_write_recovered_backstop=True,
+        )
+        assert _stage1_ledger_write_missing(report) is False
+
+    def test_unconfirmed_write_recovery_still_fires(self):
+        """The exclusion keys on `is True`, never on mere marker presence.
+
+        A `False` marker means an earlier re-attempt did NOT confirm (its
+        writer returned falsy or raised), so the row may well still be
+        missing. The driver's `finally` must therefore keep its last-chance
+        re-attempt — now separated from the flush attempt by a whole Stage-3
+        turn, which is a materially better retry than a back-to-back one.
+        """
+        from fused_memory.reconciliation.harness import _stage1_ledger_write_missing
+
+        report = self._report(
+            stage1_cycle_summary_ledger_written=0,
+            stage1_cycle_summary_write_recovered_backstop=False,
+        )
+        assert _stage1_ledger_write_missing(report) is True
+
     def test_non_stagereport_object_returns_false(self):
         """A plain dict — the shape run.stage_reports['_error'] entries use —
         has no .stats attribute at all and must not raise."""
@@ -1150,6 +1189,45 @@ class TestStage2LedgerWriteMissingPredicate:
             stage2_cycle_summary_degraded_backstop=True,
         )
         assert _stage2_ledger_write_missing(report) is False
+
+    def test_confirmed_write_recovery_is_excluded(self):
+        """A CONFIRMED write-recovery must not re-fire the arm (task 4186).
+
+        `_reattempt_cycle_summary_write` stamps
+        `stage2_cycle_summary_write_recovered_backstop = True` on the live
+        report only once its writer returned truthy — i.e. a row demonstrably
+        landed for this identity. It deliberately leaves
+        `stage2_cycle_summary_ledger_written` at its in-stage value of 0, so
+        without this exclusion the driver's `finally` would re-fire the arm
+        after task 4186's pre-Stage-3 flush already recovered it: duplicating
+        the best-effort Mem0 mirror write and the pool-cap trim, and logging a
+        second, misleading `reconciliation.stage2_cycle_summary_write_recovered`
+        WARNING for one real recovery.
+        """
+        from fused_memory.reconciliation.harness import _stage2_ledger_write_missing
+
+        report = self._report(
+            stage2_cycle_summary_ledger_written=0,
+            stage2_cycle_summary_write_recovered_backstop=True,
+        )
+        assert _stage2_ledger_write_missing(report) is False
+
+    def test_unconfirmed_write_recovery_still_fires(self):
+        """The exclusion keys on `is True`, never on mere marker presence.
+
+        A `False` marker means an earlier re-attempt did NOT confirm (its
+        writer returned falsy or raised), so the row may well still be
+        missing. The driver's `finally` must therefore keep its last-chance
+        re-attempt — now separated from the flush attempt by a whole Stage-3
+        turn, which is a materially better retry than a back-to-back one.
+        """
+        from fused_memory.reconciliation.harness import _stage2_ledger_write_missing
+
+        report = self._report(
+            stage2_cycle_summary_ledger_written=0,
+            stage2_cycle_summary_write_recovered_backstop=False,
+        )
+        assert _stage2_ledger_write_missing(report) is True
 
     def test_non_stagereport_object_returns_false(self):
         """A plain dict — the `_error` / journal-round-trip shape
