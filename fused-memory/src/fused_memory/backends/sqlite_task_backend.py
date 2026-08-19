@@ -1922,6 +1922,7 @@ class SqliteTaskBackend:
     async def _write_status_and_verify(
         self,
         conn: aiosqlite.Connection,
+        *,
         set_columns: list[str],
         set_values: list[Any],
         tag: str,
@@ -1955,7 +1956,16 @@ class SqliteTaskBackend:
         far, including a metadata merge on the atomic writer) and mapped to
         an explicit ``{'success': False, 'error': 'status_write_not_persisted',
         ...}`` error dict.
+
+        Does not mutate the caller's ``set_columns``/``set_values`` lists —
+        the claimant tri-state columns are appended to local copies.
         """
+        # Copy rather than append in place: callers build these lists fresh
+        # per call today, but the helper should not rely on that — mutating
+        # caller-owned lists in place is a surprising contract for a shared
+        # tail to hold.
+        set_columns = [*set_columns]
+        set_values = [*set_values]
         if claimant_run_id is not _UNSET or heartbeat_at is not _UNSET:
             if self._claimant_columns_cache.get(project_root, False):
                 if claimant_run_id is not _UNSET:
@@ -2075,9 +2085,19 @@ class SqliteTaskBackend:
                 set_columns = ['status = ?', 'updated_at = ?']
                 set_values: list[Any] = [status, _now()]
                 persisted_status = await self._write_status_and_verify(
-                    conn, set_columns, set_values, tag, tid, task_id, status,
-                    row_candidate_key, claimant_run_id, heartbeat_at, project_root,
-                    caller_name='set_task_status', write_desc='status',
+                    conn,
+                    set_columns=set_columns,
+                    set_values=set_values,
+                    tag=tag,
+                    tid=tid,
+                    task_id=task_id,
+                    status=status,
+                    row_candidate_key=row_candidate_key,
+                    claimant_run_id=claimant_run_id,
+                    heartbeat_at=heartbeat_at,
+                    project_root=project_root,
+                    caller_name='set_task_status',
+                    write_desc='status',
                 )
         except _StatusWriteNotPersisted as exc:
             return exc.to_error_dict()
@@ -2162,9 +2182,19 @@ class SqliteTaskBackend:
                 set_columns = ['status = ?', 'metadata = ?', 'updated_at = ?']
                 set_values: list[Any] = [status, new_metadata, _now()]
                 persisted_status = await self._write_status_and_verify(
-                    conn, set_columns, set_values, tag, tid, task_id, status,
-                    row_candidate_key, claimant_run_id, heartbeat_at, project_root,
-                    caller_name='set_status_and_stamp_audit', write_desc='status+metadata',
+                    conn,
+                    set_columns=set_columns,
+                    set_values=set_values,
+                    tag=tag,
+                    tid=tid,
+                    task_id=task_id,
+                    status=status,
+                    row_candidate_key=row_candidate_key,
+                    claimant_run_id=claimant_run_id,
+                    heartbeat_at=heartbeat_at,
+                    project_root=project_root,
+                    caller_name='set_status_and_stamp_audit',
+                    write_desc='status+metadata',
                 )
         except _StatusWriteNotPersisted as exc:
             return exc.to_error_dict()
