@@ -882,6 +882,7 @@ class Mem0Backend:
         exhaustive: bool = False,
         page_size: int = 256,
         limit: int | None = None,
+        max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
     ) -> dict[str, Any]:
         """Literal substring scan over Qdrant payload TEXT for leaked tool-call XML.
 
@@ -941,6 +942,9 @@ class Mem0Backend:
             limit: Maximum number of points to WALK. Must be strictly positive
                 when given. When the walk stops early, ``truncated`` is True
                 and a WARNING is logged — the truncation is never silent.
+            max_pages: Page budget for the underlying walk, forwarded to
+                :meth:`scroll_collection_pages`. Unlike *limit*, exhausting it
+                RAISES (see below).
 
         Raises:
             ValueError: If *limit* is non-positive. A ``limit`` of 0 would make
@@ -964,6 +968,20 @@ class Mem0Backend:
                 PROPAGATED (never swallowed into an empty result), matching
                 count_by_metadata/scroll_by_metadata/get_point_by_id. A
                 timed-out scan must never be mistaken for a clean corpus.
+            ScrollPageBudgetExhausted: If *max_pages* is consumed with more
+                pages still available. PROPAGATED rather than folded into
+                ``truncated``, which is deliberate: *limit* is a cap the
+                caller asked for, so being stopped by it is a normal capped
+                result, but the page budget is a safety backstop nobody asked
+                for. Reporting a backstop truncation as if the caller had
+                requested it would hand a sweep a plausible-looking undercount
+                carrying a flag it was not told to expect.
+
+                The numbers plainly: at the default ``page_size=256`` and
+                ``max_pages=200`` the ceiling is 51,200 points, against a
+                ~19,321-point live corpus — 2.6x headroom, so it is not
+                reachable today. *max_pages* is the escape hatch for when the
+                corpus outgrows it.
         """
         if limit is not None and limit <= 0:
             raise ValueError(
@@ -1005,6 +1023,7 @@ class Mem0Backend:
                 collection_name,
                 scroll_filter=scroll_filter,
                 page_size=page_size,
+                max_pages=max_pages,
                 max_points=limit,
                 with_vectors=False,
             ):
