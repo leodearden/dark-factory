@@ -224,7 +224,7 @@ class TestGroupIdsFilterAgreement:
 # path-shaped constant) for every public group-arg GraphitiBackend method
 # NOT already covered by the step-1/3/5 positive-path tests
 # (get_nodes_by_exact_name, find_duplicate_entity_nodes, add_episode,
-# search, search_nodes, build_communities). Together these 37 + 6 = 43
+# search, search_nodes, build_communities). Together these 40 + 6 = 46
 # cover GraphitiBackend's full public group-arg surface (excluding
 # _driver_for/_graph_for/_ensure_indices/_resolve_or_create_entity/
 # node_count, which are deliberately undecorated, and _identity_lock_for,
@@ -235,6 +235,11 @@ class TestGroupIdsFilterAgreement:
 # the decorator is load-bearing there, and leaving it out would have left this
 # class's "EVERY remaining public group-arg method" claim silently false while
 # the suite stayed green.
+#
+# `enumerate_all_valid_edges` and `enumerate_entity_nodes` (task 4340) joined
+# for the same reason: both resolve a FalkorDB graph key via _graph_for, so the
+# decorator is load-bearing for them exactly as it is for the get_all_valid_edges
+# / list_entity_nodes shims they back.
 _ALL_GROUP_ARG_SWEEP_CASES = [
     ('get_episode_by_uuid', ('ep1',), {'group_id': _PATH_SHAPED}),
     ('remove_episode', ('ep1',), {'group_id': _PATH_SHAPED}),
@@ -246,6 +251,7 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('get_valid_edges_for_node', ('n1',), {'group_id': _PATH_SHAPED}),
     ('get_connected_entity_uuids', ('n1',), {'group_id': _PATH_SHAPED}),
     ('get_all_valid_edges', (), {'group_id': _PATH_SHAPED}),
+    ('enumerate_all_valid_edges', (), {'group_id': _PATH_SHAPED}),
     ('bulk_remove_edges', (['e1'],), {'group_id': _PATH_SHAPED}),
     ('dedup_valid_edges_for_node', ('n1',), {'group_id': _PATH_SHAPED}),
     ('redirect_node_edges', ('d1', 's1'), {'group_id': _PATH_SHAPED}),
@@ -258,6 +264,7 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('set_entity_summary', ('n1', 's'), {'group_id': _PATH_SHAPED}),
     ('rename_entity_node', ('n1', 'NewName'), {'group_id': _PATH_SHAPED}),
     ('list_entity_nodes', (), {'group_id': _PATH_SHAPED}),
+    ('enumerate_entity_nodes', (), {'group_id': _PATH_SHAPED}),
     ('detect_stale_with_edges', (), {'group_id': _PATH_SHAPED}),
     ('detect_stale_dry_run', (), {'group_id': _PATH_SHAPED}),
     ('detect_stale_summaries', (), {'group_id': _PATH_SHAPED}),
@@ -271,12 +278,17 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('list_indices', (), {'group_id': _PATH_SHAPED}),
     ('ensure_indices', (), {'group_id': _PATH_SHAPED}),
     ('drop_index', ('Entity', 'name'), {'group_id': _PATH_SHAPED}),
+    (
+        'drop_vector_index',
+        ('Entity', 'name_embedding'),
+        {'entity_type': 'NODE', 'group_id': _PATH_SHAPED},
+    ),
     ('drop_vector_indices', (), {'group_id': _PATH_SHAPED}),
     ('retrieve_episodes', (), {'group_ids': [_PATH_SHAPED]}),
 ]
 
-assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 37, (
-    'Sweep must cover exactly the 37 public group-arg GraphitiBackend methods '
+assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 40, (
+    'Sweep must cover exactly the 40 public group-arg GraphitiBackend methods '
     'not already covered by the step-1/3/5 positive-path tests — update this '
     'table if the decorated surface ever changes.'
 )

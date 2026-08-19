@@ -948,6 +948,200 @@ def test_shape_burndown_ragged_input_is_passed_through_unnormalized():
 
 
 # ---------------------------------------------------------------------------
+# shape_burndown — live/stranded split + parity alarm (task 3543)
+# ---------------------------------------------------------------------------
+
+
+def _split_series(
+    labels: list[str],
+    in_progress: list[int],
+    live: list[int],
+    stranded: list[int],
+    caps: list[int | None],
+) -> dict:
+    """A burndown series in the post-split shape ``get_burndown_series`` emits."""
+    n = len(labels)
+    return {
+        'labels': labels,
+        'done': [0] * n,
+        'in_progress': in_progress,
+        'in_progress_live': live,
+        'in_progress_stranded': stranded,
+        'blocked': [0] * n,
+        'pending': [0] * n,
+        'concurrency_cap': caps,
+    }
+
+
+def test_burndown_keys_include_the_live_stranded_split():
+    """The split rides the summed-key loop, so both blocks carry it.
+
+    ``concurrency_cap`` must stay OUT of that loop — it is a per-project
+    scalar series, not an additive count, and summing caps across projects
+    produces a denominator no single orchestrator ever enforced.
+    """
+    assert 'in_progress_live' in redux_api._BURNDOWN_KEYS
+    assert 'in_progress_stranded' in redux_api._BURNDOWN_KEYS
+    assert 'concurrency_cap' not in redux_api._BURNDOWN_KEYS
+
+
+def test_shape_burndown_carries_split_and_conserves_in_progress():
+    """live + stranded == in_progress on every label, per-project AND aggregate.
+
+    This is the load-bearing invariant: the split exists to be trusted, and a
+    stacked chart whose two bands do not add up to the band they replaced is
+    worse than no split at all.
+    """
+    labels = ['2026-08-01T00:00:00', '2026-08-02T00:00:00']
+    series = {
+        'dark_factory': _split_series(labels, [5, 4], [3, 4], [2, 0], [24, 24]),
+        'reify': _split_series(labels, [2, 7], [2, 5], [0, 2], [12, 12]),
+    }
+    body = redux_api.shape_burndown(series)
+
+    df = body['BURNDOWN_BY_PROJECT']['dark_factory']
+    assert df['in_progress_live'] == [3, 4]
+    assert df['in_progress_stranded'] == [2, 0]
+
+    agg = body['BURNDOWN']
+    assert agg['in_progress'] == [7, 11]
+    assert agg['in_progress_live'] == [5, 9]
+    assert agg['in_progress_stranded'] == [2, 2]
+    for live, stranded, total in zip(
+        agg['in_progress_live'], agg['in_progress_stranded'], agg['in_progress'], strict=True
+    ):
+        assert live + stranded == total
+
+
+def test_shape_burndown_split_defaults_to_all_live_when_absent():
+    """A series with no split (un-migrated DB) degrades to all-live, not to zeros.
+
+    ``get_burndown_series`` already degrades an un-migrated peer DB this way;
+    shaping must not re-break conservation by contributing 0 to both bands
+    while the ``in_progress`` band it splits stays fully populated.
+    """
+    series = {
+        'legacy': {
+            'labels': ['D-1', 'D-0'],
+            'done': [1, 2], 'in_progress': [4, 6], 'blocked': [0, 0], 'pending': [3, 2],
+        },
+    }
+    body = redux_api.shape_burndown(series)
+
+    legacy = body['BURNDOWN_BY_PROJECT']['legacy']
+    assert legacy['in_progress_live'] == [4, 6]
+    assert legacy['in_progress_stranded'] == [0, 0]
+
+    agg = body['BURNDOWN']
+    assert agg['in_progress_live'] == [6, 4]  # labels sort to ['D-0', 'D-1']
+    assert agg['in_progress_stranded'] == [0, 0]
+    for live, stranded, total in zip(
+        agg['in_progress_live'], agg['in_progress_stranded'], agg['in_progress'], strict=True
+    ):
+        assert live + stranded == total
+
+
+def test_shape_burndown_per_project_carries_parity_block():
+    """Every per-project block carries compute_parity_alarm's four fields."""
+    labels = ['2026-08-01T00:00:00', '2026-08-02T00:00:00']
+    series = {
+        'dark_factory': _split_series(labels, [33, 20], [30, 20], [3, 0], [24, 24]),
+        'reify': _split_series(labels, [2, 3], [2, 3], [0, 0], [100, 100]),
+    }
+    body = redux_api.shape_burndown(series)
+
+    df = body['BURNDOWN_BY_PROJECT']['dark_factory']
+    assert df['parity_alarm'] is True
+    assert df['parity_cap'] == 24
+    assert df['parity_peak'] == 33
+    assert df['parity_breach_count'] == 1
+
+    ri = body['BURNDOWN_BY_PROJECT']['reify']
+    assert ri['parity_alarm'] is False
+    assert ri['parity_breach_count'] == 0
+
+
+def test_shape_burndown_aggregate_parity_ors_projects_not_summed_counts():
+    """A real breach must survive aggregation — summing would hide it.
+
+    dark_factory peaks at 33 against a cap of 24 (the live E12 shape).  reify
+    idles at 3 against a cap of 100.  Summed, that is 35 in-progress against a
+    124 "cap" — comfortably healthy, and the breach vanishes.  The aggregate
+    alarm is therefore an OR over per-project alarms, and it names which
+    project breached so an operator is not left hunting.
+    """
+    labels = ['2026-08-01T00:00:00', '2026-08-02T00:00:00']
+    series = {
+        'dark_factory': _split_series(labels, [33, 20], [30, 20], [3, 0], [24, 24]),
+        'reify': _split_series(labels, [2, 3], [2, 3], [0, 0], [100, 100]),
+    }
+    agg = redux_api.shape_burndown(series)['BURNDOWN']
+
+    assert agg['parity_alarm'] is True
+    assert agg['parity_projects'] == ['dark_factory']
+    assert agg['parity_breach_count'] == 1
+    # peak and cap travel as a matched pair from the breaching project — a peak
+    # from one project beside a cap from another explains nothing.
+    assert agg['parity_peak'] == 33
+    assert agg['parity_cap'] == 24
+
+
+def test_shape_burndown_aggregate_parity_ignores_capless_projects():
+    """A NULL-cap project must not deflate a summed denominator into a fake alarm.
+
+    Nothing breaches here: dark_factory runs 20 under a cap of 24, and reify's
+    30 is uncapped (unknown, not a breach).  A summed comparison would read 50
+    in-progress against the only known cap, 24, and alarm on fiction.
+    """
+    labels = ['2026-08-01T00:00:00']
+    series = {
+        'dark_factory': _split_series(labels, [20], [20], [0], [24]),
+        'reify': _split_series(labels, [30], [30], [0], [None]),
+    }
+    body = redux_api.shape_burndown(series)
+
+    assert body['BURNDOWN_BY_PROJECT']['reify']['parity_cap'] is None
+    assert body['BURNDOWN_BY_PROJECT']['reify']['parity_alarm'] is False
+
+    agg = body['BURNDOWN']
+    assert agg['parity_alarm'] is False
+    assert agg['parity_projects'] == []
+    assert agg['parity_breach_count'] == 0
+    # No breach to describe — peak/cap are None rather than a healthy-looking
+    # pair that implies the aggregate was measured against a cap it never had.
+    assert agg['parity_peak'] is None
+    assert agg['parity_cap'] is None
+
+
+def test_shape_burndown_aggregate_parity_reports_the_worst_breach():
+    """With two breaching projects the aggregate names both and shows the worst."""
+    labels = ['2026-08-01T00:00:00', '2026-08-02T00:00:00']
+    series = {
+        'dark_factory': _split_series(labels, [33, 30], [33, 30], [0, 0], [24, 24]),
+        'reify': _split_series(labels, [9, 4], [9, 4], [0, 0], [8, 8]),
+        'quiet': _split_series(labels, [1, 1], [1, 1], [0, 0], [16, 16]),
+    }
+    agg = redux_api.shape_burndown(series)['BURNDOWN']
+
+    assert agg['parity_alarm'] is True
+    assert agg['parity_projects'] == ['dark_factory', 'reify']  # sorted, quiet excluded
+    assert agg['parity_breach_count'] == 3  # 2 from dark_factory + 1 from reify
+    assert agg['parity_peak'] == 33  # widest margin (33 - 24 = 9, vs reify's 9 - 8 = 1)
+    assert agg['parity_cap'] == 24
+
+
+def test_shape_burndown_aggregate_has_no_summed_concurrency_cap():
+    """The aggregate must not publish a summed cap — no orchestrator enforces it."""
+    labels = ['2026-08-01T00:00:00']
+    series = {
+        'dark_factory': _split_series(labels, [1], [1], [0], [24]),
+        'reify': _split_series(labels, [1], [1], [0], [12]),
+    }
+    agg = redux_api.shape_burndown(series)['BURNDOWN']
+    assert 'concurrency_cap' not in agg
+
+
+# ---------------------------------------------------------------------------
 # shape_escalations
 # ---------------------------------------------------------------------------
 

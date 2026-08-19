@@ -14,6 +14,12 @@ from unittest.mock import patch
 import aiosqlite
 import httpx
 import pytest
+from _dashboard_helpers import (
+    cold_session_responses,
+    mcp_init_response,
+    mcp_notify_response,
+    mcp_tool_response,
+)
 
 import dashboard.data.merge_queue as _mqmod
 
@@ -2707,36 +2713,8 @@ class TestNormalizeLiveEntry:
 # TestFetchLiveMergeQueues — success path (task-1606 step-3)
 # ---------------------------------------------------------------------------
 
-# Shared MCP mock helpers (mirrored from test_merge_halt.py)
-
-def _mcp_response(inner: dict, request_id: int = 1) -> httpx.Response:  # type: ignore[name-defined]
-    return httpx.Response(
-        200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'content': [{'type': 'text', 'text': json.dumps(inner)}],
-            },
-        },
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _init_response(request_id: int = 1) -> httpx.Response:  # type: ignore[name-defined]
-    return httpx.Response(
-        200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'protocolVersion': '2025-03-26',
-                'capabilities': {'tools': {}},
-                'serverInfo': {'name': 'test', 'version': '0.1'},
-            },
-        },
-        headers={'mcp-session-id': 'test-session-id'},
-    )
+# MCP mock envelopes come from _dashboard_helpers (task 3952) — see the
+# imports at the top of this module.
 
 
 class _PerPortHandler:
@@ -2769,12 +2747,12 @@ class _PerPortHandler:
         method = body.get('method', '')
         request_id = body.get('id', 1)
         if method == 'initialize':
-            return _init_response(request_id)
+            return mcp_init_response(request_id)
         if method.startswith('notifications/'):
-            return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
+            return mcp_notify_response()
         # tools/call → return snapshot
         inner = self.snapshot_responses.get(port, {'entries': [], 'depth': 0})
-        return _mcp_response(inner, request_id)
+        return mcp_tool_response(inner, request_id)
 
 
 @pytest.fixture(autouse=False)
@@ -3487,17 +3465,6 @@ class TestProbeLiveOneTimeoutBudget:
     surfaces the ``timeout`` kwarg to its handler.
     """
 
-    @staticmethod
-    def _cold_session_responses(inner: dict, url: str) -> list[httpx.Response]:
-        responses = [
-            _init_response(),
-            httpx.Response(202, headers={'mcp-session-id': 'test-session-id'}),
-            _mcp_response(inner),
-        ]
-        for resp in responses:
-            resp.request = httpx.Request('POST', f'{url.rstrip("/")}/mcp')
-        return responses
-
     @pytest.mark.asyncio
     async def test_budget_reaches_every_post(self, _clean_live_sessions):
         from unittest.mock import AsyncMock
@@ -3506,7 +3473,7 @@ class TestProbeLiveOneTimeoutBudget:
 
         url = 'http://127.0.0.1:8200'
         mock_client = AsyncMock()
-        mock_client.post.side_effect = self._cold_session_responses(
+        mock_client.post.side_effect = cold_session_responses(
             _snapshot([]), url,
         )
 

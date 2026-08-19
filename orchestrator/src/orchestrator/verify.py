@@ -67,6 +67,7 @@ from orchestrator.verify_cmd import (
     govern_cpu,
     has_unpreserved_chain_clauses,
     parse_config_command,
+    promote_cwd_to_project,
     render,
     reproject,
     scope_to,
@@ -241,7 +242,7 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     # the ones this call discards — which is what makes the count right.
     if has_unpreserved_chain_clauses(cmd, tail):
         verify_plan.log_dropped_chain_clauses(logger, cmd, keyword, retained)
-    rendered = render(strip_cwd(scope_to(parsed, files)))
+    rendered = render(strip_cwd(promote_cwd_to_project(scope_to(parsed, files))))
     return f'{rendered} {tail}' if tail else rendered
 
 
@@ -609,7 +610,44 @@ _CARGO_SCOPE_SAFE_NON_RS_NAMES = frozenset({'Cargo.lock', 'rust-toolchain'})
 # doesn't surface "...." dots as the cause hint.
 _PYTEST_FAILED_LINE_RE = re.compile(r'^FAILED .+$', re.MULTILINE)
 _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
-_PYTEST_FAILURE_SUMMARY_RE = re.compile(r'^=+ \d+ failed.*=+$', re.MULTILINE)
+# The ``=+`` decoration is OPTIONAL (task 4066): pytest prints the tally line
+# with no ``=`` bars in two real, observed situations — (1) when an
+# ``INTERNALERROR`` aborts the session before the terminal reporter can write
+# its decorated stats line, which is exactly what verify-log 2829 captured
+# (``8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)``), and (2)
+# under ``-q`` (verbosity < 0), where the reporter writes the stats line
+# without a separator (``1 failed, 1 passed in 0.02s``). Requiring the bars is
+# what made this pattern decoration-dependent, so the trailing ``=+$`` is
+# dropped too: a line opening ``=== N failed`` is a failure summary whether or
+# not its bars are balanced.
+#
+# What replaces ``=+$`` as the discriminator is pytest's OWN tally SHAPE, not
+# ``.*$``: comma-joined ``<N> <word>`` parts (terminal.py's
+# build_summary_stats_line) followed by a ``in <N>s`` duration. Dropping the
+# bars WITHOUT keeping that shape would make rung 3 of _extract_cause_hint
+# match any line opening ``<digits> failed`` — e.g. a chained
+# ``cargo … && uv run pytest`` command's retry chatter
+# (``2 failed to fetch dependencies; retrying in 30s``) — which would pre-empt
+# the more informative rungs 4-8 below it. Two further deliberate details:
+# ``\b`` after ``failed`` rejects ``0 failedcases``, and the optional
+# decoration group uses ``[ \t]`` rather than ``\s`` because ``\s`` matches a
+# NEWLINE — under re.MULTILINE that let the group span a bar-only separator
+# line into the tally below it, and _extract_cause_hint returns group(0), so a
+# hint it documents as single-line would have arrived with a line break in it.
+#
+# Two consumers, both of which benefit — kept as ONE constant deliberately, a
+# parallel undecorated-only pattern would recreate the very
+# two-places-that-must-stay-in-sync drift task 4066 exists to fix:
+#   * _is_bare_xdist_worker_crash's no-FAILED-lines fallback, where a wider
+#     match strictly INCREASES strictness (it can only flip True -> False,
+#     never mask more).
+#   * _extract_cause_hint's ladder rung 3, where it upgrades an undecorated
+#     tally from the generic last-non-blank-line fallback to a real rung-3
+#     match.
+_PYTEST_FAILURE_SUMMARY_RE = re.compile(
+    r'^(?:=+[ \t]+)?\d+ failed\b(?:, \d+ \w+)* in \d+(?:\.\d+)?s\b.*$',
+    re.MULTILINE,
+)
 _PYTEST_TRACEBACK_E_RE = re.compile(r'^E   .+$', re.MULTILINE)
 _PYTEST_PROGRESS_BARE_RE = re.compile(r'^[\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
 _PYTEST_PROGRESS_FILE_RE = re.compile(r'^\S+\.py [\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
@@ -683,9 +721,20 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     flake, AND no such ERROR/INTERNALERROR surface is present, are the
     accompanying ``^E   `` traceback lines and ``=== N failed ===`` summary
     treated as attributable to those flakes and this returns ``True``. When
-    there are NO ``FAILED`` lines at all, this falls back to the original
-    strict guard: any ``^E   ``/failure-summary marker suppresses
+    there are NO ``FAILED`` lines at all, the fallback vetoes on the SAME
+    set of surfaces as the branch above — an ``^E   `` traceback line, a
+    failure summary, an ``INTERNALERROR>`` line, or either ``ERROR``
+    short-summary form (node-id or bare-file) — any one of which suppresses
     reclassification.
+
+    That last sentence used to name only the first two (task 4066): the two
+    branches had drifted apart, since tasks 3514/3597 added the
+    INTERNALERROR/ERROR veto to the FAILED-lines branch alone. verify-log
+    2829 is the real captured run that billed for the drift — 8 genuine
+    failures, 47 ``^INTERNALERROR>`` lines, and (because the INTERNALERROR
+    aborted the session before pytest could print its short-summary and
+    decorated stats lines) zero ``^FAILED `` lines and zero ``^E   ``
+    lines, which the old fallback reclassified as transient infra.
 
     Accepted fail-safe tradeoff: a genuine regression IN an allow-listed
     known-flake test, co-occurring with a crash, is discounted here and
@@ -693,6 +742,27 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     doesn't self-heal, unlike a load flake) the retry window is exhausted
     and it lands in infra_hold + escalate_to_human instead of the debugger
     — a human sees it, nothing is silently greened.
+
+    Second accepted tradeoff, in the OPPOSITE direction, deliberately
+    taken by task 4066: the ``INTERNALERROR>`` veto keys on a surface the
+    worker crash can itself PRODUCE. Under ``--max-worker-restart=0`` a
+    node-down can trip xdist's own scheduler — verify-log 2829's is
+    ``xdist/scheduler/loadscope.py … KeyError: <WorkerController gwNN>``,
+    an artefact of the node-down handling, not of any test. So a truly
+    bare crash carrying zero real failures, which happens to trip that
+    same loadscope KeyError, now returns ``False`` and routes to the
+    debugger rather than to the bounded infra-retry — i.e. the very case
+    this helper exists to recognize. That cost is accepted, not
+    overlooked. The veto is deliberately NOT narrowed to exclude
+    xdist-scheduler-origin frames, because 2829's INTERNALERROR *is*
+    scheduler-origin: narrowing would leave the motivating case resting
+    on the failure-summary marker alone, which is exactly the
+    single-point-of-failure that billed for this bug. The failure
+    direction is also the safe one — an infra crash sent to the debugger
+    is loud and self-correcting (the debugger re-runs and finds nothing),
+    whereas the bug being fixed sent 8 real failures to a silent retry.
+    ``test_crash_induced_loadscope_internalerror_is_false_by_design``
+    pins this verdict so a future reader knows it is a decision.
 
     The opposite-direction case — an UNLISTED co-occurring load flake that
     defeats this veto (esc-3514-2 / task 3514) — is deliberately NOT fixed
@@ -722,9 +792,16 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
             if match is None or not _is_known_load_flake_nodeid(match.group(1)):
                 return False
         return True
+    # Same three surfaces the FAILED-lines branch vetoes on above. They
+    # produce no FAILED line of their own — which is precisely why they land
+    # in THIS branch, so omitting them here (as this fallback did until task
+    # 4066) leaves the very outputs the veto exists for unguarded.
     return not (
         _PYTEST_TRACEBACK_E_RE.search(output)
         or _PYTEST_FAILURE_SUMMARY_RE.search(output)
+        or _PYTEST_INTERNALERROR_RE.search(output)
+        or _ERROR_LINE_NODEID_RE.search(output)
+        or _ERROR_LINE_FILE_RE.search(output)
     )
 
 

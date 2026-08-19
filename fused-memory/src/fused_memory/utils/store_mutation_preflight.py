@@ -33,6 +33,74 @@ two-phase mutation atomic -- it would only have lowered the probability. Only
 an application-level refusal BEFORE the first mutation bounds the blast radius,
 which is what :func:`assert_store_mutation_allowed` does.
 
+WHERE THIS IS ENFORCED (a rule, and a dated audit of where it holds)
+--------------------------------------------------------------------
+THE RULE, for authors: if you write a code path in ``fused-memory/scripts/``
+that mutates the shared store in-process -- it constructs its own
+``MemoryService``, or reaches Qdrant or the graph directly -- call
+:func:`assert_store_mutation_allowed` before the first mutation AND before the
+scan.
+
+COVERAGE IS PARTIAL. That rule is a norm, not an invariant: nothing enforces
+it mechanically yet, and task 4280 is where the static conformance check that
+would lands. What follows is a dated audit, not a live guarantee.
+
+GUARDED, as of task 4127 -- ``audit_duplicate_memories``,
+``clear_malformed_empty_memory``, ``prune_recon_cycle_summaries``,
+``purge_knowlive_namespace``, ``sweep_orphan_flag_markers``,
+``sweep_toolcall_xml_leak``. This column IS exhaustive, because calling this
+function is what "guarded" MEANS: ``grep -rln assert_store_mutation_allowed
+fused-memory/scripts/`` re-derives it, and re-dates it, in one line.
+
+KNOWN UNGUARDED, same date -- ``cgl_eta_auto_apply_impl``,
+``cleanup_count_snapshots``, ``clear_false_dependency_invalidations``,
+``consolidate_namespace_families``, ``invalidate_fabricated_shipping_edges``,
+``migrate_cross_graph_leak``, ``retro_stamp_topics``,
+``tag_cgl_eta_rehome_scope``. Note ``cgl_eta_auto_apply_impl`` in particular:
+it has NO argparse at all -- it builds ``SimpleNamespace(apply=True)`` and
+drives ``migrate_cross_graph_leak.run()``'s three-phase graph write in
+process, so "under ``--apply``" does not even describe it.
+
+That second column is NOT provably exhaustive, and must not be restated as
+though it were. Two reasons, both measured:
+
+  * mutation reaches the store under too many spellings to sweep for --
+    ``delete_memory``, ``update_edge``, ``delete_collection``, a raw
+    ``qdrant_client.delete``, a graph ``DETACH DELETE``/``SET``, and in
+    ``tag_cgl_eta_rehome_scope`` a bare ``memory.mem0.update`` that no pattern
+    search finds and that cannot be grepped for safely, because ``.update(``
+    also matches every dict update in the repo;
+  * membership needs judgement a grep cannot make -- ``bake_off_storage_shape``
+    and ``cleanup_test_collections`` also mutate unguarded, but only ever touch
+    scratch ``_test_*`` substrate and never the shared store, so they are
+    deliberately in neither column.
+
+Task 4280 is the mechanism that derives that column mechanically instead of by
+hand; this list is the interim, hand-checked stand-in.
+
+Two placement rules, which are the non-obvious part:
+
+  * ONE probe per run, before the scan -- never one per record. MOST of the
+    guarded scripts fan their deletes out through either
+    ``asyncio.gather(..., return_exceptions=True)`` or a per-record
+    ``except Exception``, so a per-record probe converts a run-wide denial into
+    N irreversible deletions plus N log lines instead of an abort.
+    (``clear_malformed_empty_memory`` is the single-target exception -- one
+    required ``--memory-id``, one delete, no fan-out -- where the rule holds
+    trivially.)
+  * A refusal RAISES; it does not return a report-shaped refusal. Several of
+    these scripts already refuse ``--apply`` through their normal return path
+    on other grounds (an empty scan, a truncated scan, a safety cap). Those are
+    handled outcomes an operator can reasonably read past. A half-completed
+    store mutation is not, so this refusal must not be mistakable for one.
+
+On this section's own history, which is why it is shaped this way: an earlier
+draft stated the rule as a universal, and a one-line grep disproved it -- the
+policy at the top of this file had outrun the code by five call sites for a
+whole task cycle, and the section written to close that gap reopened it. A
+dated snapshot with a named gap survives a new script; a universal does not.
+Do not tidy this back into one.
+
 WHY A CAPABILITY PROBE, NOT AN "AM I SANDBOXED?" INFERENCE
 ----------------------------------------------------------
 A process cannot reliably introspect its own confinement from the inside, and

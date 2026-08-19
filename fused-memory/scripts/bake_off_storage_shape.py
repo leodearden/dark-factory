@@ -1362,13 +1362,26 @@ def as_memory_results(hits: list[ScoredHit]) -> list[Any]:
     """Adapt arm hits to the ``MemoryResult`` objects the selector takes.
 
     ``find_near_duplicate_memory`` reads ``.category`` and ``.source_store``
-    as ENUMS and ``.relevance_score`` as a float.  Dicts would raise; dicts
-    of plain strings would be worse — every enum comparison would silently
-    fail and the report would state "the guard never fires" for every arm.
+    as ENUMS and the per-store cosine from ``.metadata['store_score']``.
+    Dicts would raise; dicts of plain strings would be worse — every enum
+    comparison would silently fail and the report would state "the guard never
+    fires" for every arm.
+
+    Since task 3658 the cosine's home is ``metadata['store_score']``:
+    ``MemoryService.search`` puts an ORDINAL Reciprocal Rank Fusion value in
+    ``relevance_score`` (rank-1 is 1/61 ~ 0.0164), so the guard thresholds on
+    the metadata field instead.  This adapter therefore reproduces the real
+    post-fusion shape — the arm's cosine in ``store_score``, the fused ordinal
+    in ``relevance_score`` — rather than the pre-3658 shape.  Putting the
+    cosine anywhere else here would make guard_adequacy report
+    ``guard_matched: False`` for every arm in the program: the same silent
+    "the guard never fires" corruption this docstring already warns about,
+    arrived at by a different route.
 
     Rank order is preserved: the selector takes the max by score, but the
     report quotes the matched id back against the ranked window, and a
     reordering adapter would make that evidence point at the wrong record.
+    ``store_rank`` is the 1-based position in that same window.
 
     A category the enum does not know becomes ``None`` rather than a guess —
     that record is exactly what the selector's defensive filter exists to
@@ -1379,9 +1392,10 @@ def as_memory_results(hits: list[ScoredHit]) -> list[Any]:
     """
     from fused_memory.models.enums import MemoryCategory, SourceStore  # noqa: PLC0415
     from fused_memory.models.memory import MemoryResult  # noqa: PLC0415
+    from fused_memory.services.memory_service import RRF_K  # noqa: PLC0415
 
     results = []
-    for hit in hits:
+    for rank, hit in enumerate(hits, start=1):
         raw_category = hit.record.metadata.get('category')
         try:
             category = MemoryCategory(raw_category)
@@ -1392,7 +1406,8 @@ def as_memory_results(hits: list[ScoredHit]) -> list[Any]:
             content=hit.record.content,
             category=category,
             source_store=SourceStore.mem0,
-            relevance_score=hit.relevance_score,
+            relevance_score=1.0 / (RRF_K + rank),
+            metadata={'store_rank': rank, 'store_score': hit.relevance_score},
         ))
     return results
 

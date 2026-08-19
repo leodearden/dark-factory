@@ -16,7 +16,7 @@ import _hold_history_fixtures as F
 import pytest
 
 from orchestrator.event_store import EventStore
-from orchestrator.hold_history import HoldHistory, HoldSpan, iter_hold_spans
+from orchestrator.hold_history import HoldHistory, HoldSpan, iter_hold_spans, modules_of
 
 
 def _offset(posix_seconds: float) -> float:
@@ -706,6 +706,85 @@ def test_default_min_samples_is_three():
     assert three.predicted_hold(['m/src']) == pytest.approx(20.0)
 
 
+def test_min_samples_may_be_a_provider_resolved_at_read_time():
+    """A callable floor is re-resolved on EVERY ``predicted_hold`` call.
+
+    Task 3823 review fix 1.  ``backfill_min_samples`` is declared green-tier
+    hot-reloadable, but its only consumer builds the predictor once at
+    Scheduler construction — a floor captured by value there is frozen for the
+    process era, so an operator's reload lands in ``applied`` and changes
+    nothing.  Accepting a zero-argument provider lets the owner of a
+    reloadable leaf keep the floor live WITHOUT this module ever learning what
+    a config object is.
+
+    Resolution must happen at READ time, not once at construction: the whole
+    point is that the same ``HoldHistory`` instance answers differently after
+    the value behind the provider moves.
+    """
+    floor = {'value': 4}
+    history = _history_of(
+        {'orchestrator/src': [10.0, 20.0, 30.0]},
+        min_samples=lambda: floor['value'],
+    )
+
+    _assert_refuses(history, ['orchestrator/src'], 'provider floor 4, 3 samples')
+    assert history.min_samples == 4
+
+    # Loosen — the operator scenario that made the finding: the SAME instance,
+    # no reconstruction, must now answer.
+    floor['value'] = 3
+    assert history.min_samples == 3
+    assert history.predicted_hold(['orchestrator/src']) == pytest.approx(20.0)
+
+    # Tighten — the direction that matters for safety: a floor raised past the
+    # evidence must start refusing again, immediately.
+    floor['value'] = 10
+    assert history.min_samples == 10
+    _assert_refuses(history, ['orchestrator/src'], 'provider floor raised to 10')
+
+
+def test_a_non_numeric_min_samples_literal_still_fails_at_construction():
+    """Widening to accept a provider must not make a bad literal quiet.
+
+    ``int('later')`` raises today; the provider branch must be selected on
+    ``callable(...)`` alone, so every non-callable keeps the eager coercion and
+    its loud failure at the construction site rather than surfacing as a
+    confusing comparison error inside ``predicted_hold``.
+    """
+    with pytest.raises((TypeError, ValueError)):
+        HoldHistory(min_samples='later')  # type: ignore[arg-type]
+
+
+def test_the_module_still_stands_alone_without_config():
+    """Importing ζ must not drag in ``orchestrator.config``.
+
+    The provider is a bare ``Callable[[], int]`` precisely so this stays true:
+    the alternative — taking the config object — would trade ζ's stand-alone
+    property (hold_history.py:591-593) for the same liveness.  Checked against
+    the real import graph in a fresh interpreter rather than by reading the
+    source, so an indirect import through a new dependency is caught too.
+    """
+    import subprocess
+    import sys
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            'import sys, orchestrator.hold_history; '
+            'print("orchestrator.config" in sys.modules)',
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert probe.returncode == 0, f'probe failed to import ζ at all: {probe.stderr}'
+    assert probe.stdout.strip() == 'False', (
+        'orchestrator.hold_history now pulls in orchestrator.config — ζ was '
+        'meant to stand alone and take a bare callable instead'
+    )
+
+
 def test_zero_length_holds_still_count_as_samples():
     """A 0.0 sample is an OBSERVATION; a 0.0 *prediction* from no samples is a
     fabrication.  The gate must not conflate them — three instant holds are
@@ -1084,7 +1163,7 @@ def test_predicted_remaining_is_scoped_to_the_asking_task():
 # Each branch below exists to keep bad data out of the window rather than to
 # implement a feature, so none of them is reachable from the canonical trace.
 # Left untested, a regression that made one of them swallow REAL data (say
-# ``_modules_of`` returning [] for a well-formed payload) would pass the whole
+# ``modules_of`` returning [] for a well-formed payload) would pass the whole
 # suite — the failure is silent by construction, which is exactly why it needs
 # a direct test rather than incidental coverage.
 
@@ -1151,9 +1230,10 @@ def test_a_lock_row_with_an_unusable_payload_opens_nothing(data):
 
 
 def test_a_bare_string_modules_payload_is_read_as_one_module():
-    """analyze_modules.py:135-136 tolerates the same shape.  It is coerced, not
-    dropped: a string is unambiguous about which single module it names, so
-    discarding it would throw away a real hold."""
+    """It is coerced, not dropped: a string is unambiguous about which single
+    module it names, so discarding it would throw away a real hold.  (Both
+    consumers now get this from ``modules_of``; analyze_modules carried its own
+    copy of the coercion until task 3869.)"""
     rows = [
         dict(F.row(1, 0, 'lock_acquired', task_id='T1'), data={'modules': 'orchestrator/src'}),
         F.release(2, 60, 'T1', ['orchestrator/src']),
@@ -1192,6 +1272,116 @@ def test_record_ignores_an_empty_module_key():
     history.record('', 100.0)
 
     assert history.sample_count(['']) == 0
+
+
+# ===========================================================================
+# modules_of — the ONE "which modules does this event name" rule
+# ===========================================================================
+#
+# Public (task 3869) because ``analyze_modules`` needs the same answer for its
+# dispatch/skip counters, which ``iter_hold_spans`` does not supply.  The
+# alternative — a second copy of the coercion in the CLI — is the lockstep
+# duplication INV-5 exists to forbid, so the rule is pinned directly here
+# rather than only through the spans it feeds.
+
+
+def test_modules_of_returns_the_payload_list_verbatim_and_in_order():
+    """Order is part of the contract: ``analyze_modules`` renders these keys."""
+    row = F.acquire(1, 0, 'T1', ['shared/src', 'orchestrator/src'])
+
+    assert modules_of(row) == ['shared/src', 'orchestrator/src']
+
+
+def test_modules_of_coerces_a_bare_string_to_a_one_element_list():
+    """A string is unambiguous about which single module it names, so coercing
+    keeps a real hold that dropping would throw away."""
+    row = dict(F.row(1, 0, 'lock_acquired', task_id='T1'), data={'modules': 'orchestrator/src'})
+
+    assert modules_of(row) == ['orchestrator/src']
+
+
+@pytest.mark.parametrize(
+    'row',
+    [
+        pytest.param({'event_type': 'lock_acquired'}, id='no-data-key'),
+        pytest.param({'data': None}, id='data-is-None'),
+        pytest.param({'data': 'orchestrator/src'}, id='data-is-not-a-dict'),
+        pytest.param({'data': ['orchestrator/src']}, id='data-is-a-list'),
+        pytest.param({'data': {'modules': 42}}, id='modules-is-not-a-list-or-str'),
+        pytest.param({'data': {'modules': None}}, id='modules-is-None'),
+        pytest.param({'data': {}}, id='modules-key-absent'),
+    ],
+)
+def test_modules_of_returns_empty_for_every_unusable_payload(row):
+    """No modules means no keys — never a phantom '' or 'None' module."""
+    assert modules_of(row) == []
+
+
+def test_modules_of_drops_non_string_and_empty_entries_inside_the_list():
+    """``modules`` is reconstructed from a JSON payload, so the annotation
+    cannot enforce its element type.  An empty-string key would collect samples
+    under a module no lock event can ever name again."""
+    row = dict(F.row(1, 0, 'lock_acquired', task_id='T1'), data={'modules': ['ok', '', 3, None]})
+
+    assert modules_of(row) == ['ok']
+
+
+def test_modules_of_survives_an_unhashable_entry():
+    """De-duplication must not turn junk into a crash.
+
+    ``modules`` is reconstructed from JSON, so it can carry a nested list —
+    unhashable, and therefore fatal to ``dict.fromkeys`` if the de-dup ran
+    before the type filter.  It is dropped like any other non-string.
+    """
+    row = dict(F.row(1, 0, 'lock_acquired', task_id='T1'),
+               data={'modules': ['ok/src', ['nested'], {'k': 'v'}]})
+
+    assert modules_of(row) == ['ok/src']
+
+
+def test_modules_of_de_duplicates_a_repeated_module():
+    """One event names a module once, however many times its payload repeats it.
+
+    Not cosmetic: ``_apply_acquire`` reads the second occurrence as a
+    DOUBLE-ACQUIRE against the span the first just opened (see the next test).
+    """
+    row = F.acquire(1, 0, 'T1', ['shared/src', 'orchestrator/src', 'shared/src'])
+
+    assert modules_of(row) == ['shared/src', 'orchestrator/src'], \
+        'de-duplicated, and in FIRST-seen order'
+
+
+def test_a_repeated_module_in_one_acquire_yields_no_phantom_span():
+    """The end-to-end consequence of the de-dup, pinned on the spans themselves.
+
+    Without it the second ``shared/src`` force-closes the span the first opened
+    at the very same timestamp, so a clean 60s pair reported TWO samples — a
+    0.0s ``truncated`` one and the real one — halving the mean and inventing a
+    censoring signal out of nothing.
+    """
+    rows = [
+        F.acquire(1, 0, 'T1', ['shared/src', 'shared/src']),
+        F.release(2, 60, 'T1', ['shared/src']),
+    ]
+
+    spans = list(iter_hold_spans(rows))
+
+    assert len(spans) == 1
+    assert spans[0].duration == pytest.approx(60.0)
+    assert spans[0].truncated is False
+
+
+def test_the_live_feed_de_duplicates_a_repeated_module_too():
+    """``observe_acquired`` shares ``_clean_modules`` with the durable seed, so
+    the live feed cannot drift into recording the phantom span the seed no
+    longer produces."""
+    history = HoldHistory(min_samples=1)
+
+    history.observe_acquired('T1', ['shared/src', 'shared/src'], at=_at(0))
+    history.observe_released('T1', ['shared/src'], at=_at(60))
+
+    assert history.sample_count(['shared/src']) == 1
+    assert history.predicted_hold(['shared/src']) == pytest.approx(60.0)
 
 
 # ===========================================================================

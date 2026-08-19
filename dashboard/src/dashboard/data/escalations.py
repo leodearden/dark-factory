@@ -1,6 +1,6 @@
 """Backend data layer for the Escalations dashboard section.
 
-Provides three public functions:
+Provides four public functions:
 
 - ``load_queue_escalations`` — root-only *.json reader for a single escalation
   queue directory (no archive traversal), with an opt-in ``skipped``
@@ -10,14 +10,25 @@ Provides three public functions:
 - ``build_escalation_queues`` — enumerates per-project escalation dirs plus the
   fused-memory reconciliation queue, returning a structured ``{subsections, summary}``
   dict for the API layer to serve.
+- ``fetch_pins_recovery`` — the one ASYNC function here: fans
+  ``get_pending_escalations`` out across every configured escalation MCP and
+  returns each project's per-record ``pins_recovery`` annotation.
+
+The first three are pure filesystem readers; only ``fetch_pins_recovery``
+touches the network.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
 from typing import Any
+
+import httpx
+
+from dashboard.data.memory import mcp_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -335,3 +346,173 @@ def build_escalation_queues(config) -> dict:
 
     top_summary = _merge_summaries([s['summary'] for s in subsections])
     return {'subsections': subsections, 'summary': top_summary}
+
+
+# ---------------------------------------------------------------------------
+# pins_recovery fan-out (task 3543, spec S8)
+# ---------------------------------------------------------------------------
+
+_PINS_DEFAULT_PER_CALL_TIMEOUT = 2.0
+
+
+def _pins_map_from_records(records: list, base_url: str) -> dict[str, list[str]]:
+    """Project a ``get_pending_escalations`` list into ``{esc_id: pins_recovery}``.
+
+    A record is included ONLY when it carries a usable ``pins_recovery`` list.
+    Three kinds of record are dropped, all for the same reason:
+
+    * no ``pins_recovery`` key — a pre-3543 escalation server that never
+      computed the annotation, or a server that computed it and deliberately
+      OMITTED it because the task-status read was unavailable (the omission
+      contract in ``get_pending_escalations``' docstring);
+    * a non-list ``pins_recovery`` (including ``None``) — malformed;
+    * a non-dict record, or a record with no ``id`` — ragged input.
+
+    Dropping is not the same as defaulting to ``[]``.  An id absent from the
+    returned map is UNKNOWN, and every consumer must render it as nothing.
+    Defaulting would manufacture a confident "this record pins nothing" out of
+    a server that never said so — the exact false negative (esc-3163) the
+    escalation side refuses to emit.
+    """
+    pins: dict[str, list[str]] = {}
+    dropped = 0
+    for rec in records:
+        if not isinstance(rec, dict):
+            dropped += 1
+            continue
+        esc_id = rec.get('id')
+        if not isinstance(esc_id, str) or not esc_id:
+            dropped += 1
+            continue
+        if 'pins_recovery' not in rec:
+            # Deliberately absent (unknown) — not an error, not a zero.
+            continue
+        value = rec['pins_recovery']
+        if not isinstance(value, list):
+            dropped += 1
+            continue
+        pins[esc_id] = [str(t) for t in value]
+    if dropped:
+        logger.debug(
+            'get_pending_escalations from %s: dropped %d malformed record(s)',
+            base_url, dropped,
+        )
+    return pins
+
+
+async def _fetch_pins_one(
+    client: httpx.AsyncClient,
+    base_url: str,
+    timeout: float,
+) -> dict[str, list[str]] | None:
+    """Read one escalation server's pins_recovery annotations.
+
+    Returns ``None`` for UNKNOWN (transport failure, timeout, or a result that
+    is not the tool's declared ``list`` shape) and a dict — possibly empty —
+    for a successful read.
+    """
+    try:
+        result = await asyncio.wait_for(
+            mcp_tool_call(
+                client, base_url, 'get_pending_escalations', {'compact': True},
+            ),
+            timeout=timeout,
+        )
+    except (TimeoutError, httpx.HTTPError, OSError, ValueError) as exc:
+        logger.debug('get_pending_escalations failed for %s: %s', base_url, exc)
+        return None
+
+    if isinstance(result, list):
+        return _pins_map_from_records(result, base_url)
+
+    # Not a list.  The one benign case is an EMPTY dict: fastmcp encodes an
+    # empty list return as an empty ``content`` array (tools/base.py
+    # ``_convert_to_content`` — the ``all(isinstance(...))`` guard is vacuously
+    # true for ``[]``), and the shared ``_extract_tool_result`` collapses empty
+    # content to ``{}``.  So a project with zero pending escalations arrives
+    # here as ``{}`` and is an authoritative empty read, not an unknown one.
+    #
+    # Caveat, recorded rather than papered over: ``_extract_tool_result`` also
+    # returns ``{}`` when the inner text fails to parse.  That path logs its own
+    # WARNING from dashboard.data.memory, so the loss is visible; disambiguating
+    # it would mean widening that shared helper's return contract, which is out
+    # of scope here.
+    if isinstance(result, dict) and not result:
+        return {}
+    logger.debug(
+        'get_pending_escalations from %s returned %s, not a list — treating as '
+        'unknown', base_url, type(result).__name__,
+    )
+    return None
+
+
+async def fetch_pins_recovery(
+    client: httpx.AsyncClient,
+    escalation_urls: dict[str, str],
+    *,
+    per_call_timeout: float = _PINS_DEFAULT_PER_CALL_TIMEOUT,
+) -> dict[str, dict[str, list[str]] | None]:
+    """Fan ``get_pending_escalations`` out to every escalation URL concurrently.
+
+    Returns ``{project_label: {escalation_id: [task_ids]} | None}``, with the
+    labels taken verbatim from *escalation_urls* (project basenames, matching
+    ``shape_merge_queue`` and ``get_merge_halt_status``).  Every configured
+    label is always present in the result: one project's failure never sinks
+    another's, because each probe is isolated.
+
+    The value is THREE-state, mirroring
+    :attr:`escalation.pins.PinReport.store_unavailable`:
+
+    * ``None`` — this project could not be read (transport error, timeout, a
+      non-list result such as an error envelope, or an unanticipated exception
+      escaping the probe).  UNKNOWN.
+    * ``{}`` — the read succeeded and no record carried an annotation (zero
+      pending escalations, or a pre-3543 server).
+    * ``{id: [task_ids]}`` — the read succeeded and these records are annotated.
+
+    Callers must not collapse the first into the second.  An empty map reads as
+    "nothing pins this", which is precisely the failure (esc-3163) that routes
+    a genuinely-pinned strand down the wrong branch.  The same discipline holds
+    per RECORD: an id absent from a non-``None`` map is unknown, never "does
+    not pin" — see :func:`_pins_map_from_records`.
+
+    ``compact=True`` is requested because ``_COMPACT_PENDING_FIELDS`` on the
+    escalation side exists for this caller: it re-adds ``pins_recovery`` on top
+    of the shared compact projection so the heavy free-text fields this
+    function never reads stay off the wire on every poll.
+
+    The default ``mcp_tool_call`` timeout is 10s — too slow for a polling loop —
+    so each call is wrapped in ``asyncio.wait_for`` and worst-case latency stays
+    close to *per_call_timeout* even when every orchestrator is down.
+    """
+    if not escalation_urls:
+        return {}
+    labels = list(escalation_urls.keys())
+    urls = [escalation_urls[lbl] for lbl in labels]
+    base_urls = [u.removesuffix('/mcp').rstrip('/') for u in urls]
+    # return_exceptions=True is what makes the per-project isolation promised
+    # above actually hold.  `_fetch_pins_one` catches the transport family it
+    # can anticipate ((TimeoutError, httpx.HTTPError, OSError, ValueError)), but
+    # `mcp_tool_call` reaches `McpSession.call_tool`, whose failure modes are
+    # not contractually narrowed to those — a RuntimeError from session-state
+    # handling, say, or a TypeError while unwrapping an envelope.  With
+    # return_exceptions=False such an escape propagates out of the gather and
+    # app.py's outer `except Exception` blanks the annotation for EVERY
+    # project at once, which is precisely the sinking-the-whole-fleet failure
+    # this fan-out exists to prevent.  Mapped to None, it degrades exactly one
+    # project to UNKNOWN instead.
+    settled = await asyncio.gather(
+        *(_fetch_pins_one(client, base, per_call_timeout) for base in base_urls),
+        return_exceptions=True,
+    )
+    results: list[dict[str, list[str]] | None] = []
+    for label, outcome in zip(labels, settled, strict=True):
+        if isinstance(outcome, BaseException):
+            logger.debug(
+                'pins_recovery probe for %s raised %s: %s — treating that '
+                'project as unknown', label, type(outcome).__name__, outcome,
+            )
+            results.append(None)
+        else:
+            results.append(outcome)
+    return dict(zip(labels, results, strict=True))

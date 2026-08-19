@@ -107,9 +107,11 @@ Phase enum everywhere: `prd | decompose | architect | implement | verify | revie
 
 ### 7.2 Digest (extractor output)
 
-One markdown file per session: YAML frontmatter `{session, cwd, encoded_dir, agent_class, date, size_bytes, score, instrument_version, signal_counts: {tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome}}` + sections: user turns (non-sidechain), error neighborhoods (is_error tool_result + preceding attempt, genuine failures only), self-corrections with context, retry loops, designed outcomes. Soft cap 15KB (truncate lowest-signal sections last).
+One markdown file per session: YAML frontmatter `{session, cwd, encoded_dir, agent_class, date, size_bytes, score, n_user_turns, truncated_items, instrument_version, signal_counts: {tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome}}` + sections: user turns (non-sidechain), error neighborhoods (is_error tool_result + preceding attempt, genuine failures only), self-corrections with context, retry loops, designed outcomes. Soft cap 15KB (truncate lowest-signal sections last).
 
-`instrument_version` and `designed_outcome` are **appended last** to their respective key lists, so the pre-existing prefix order stays byte-stable for anything diffing rendered frontmatter.
+`designed_outcome` is **appended last** to `signal_counts`, and `n_user_turns` / `truncated_items` (task 3614) are appended after `score` while `instrument_version` stays **last** of the top-level keys, so the pre-existing prefix order stays byte-stable for anything diffing rendered frontmatter.
+
+`n_user_turns` makes `score` reconstructible from the frontmatter alone — it is the count behind the score's dominant `user_turn`-weighted component, which `signal_counts` (the *detector hit-counts*) does not and should not carry. `truncated_items` reports how many rendered items in the *shipped* body were byte-capped, so a reader weighing the digest can see that substance was dropped rather than inferring it from a marker buried in the body. Both were added by the 2026-07-31 confusion census (R2 and R1 respectively, discharging its §3.4 finding that rendered surfaces omit their own basis).
 
 #### 7.2.1 Designed outcomes (task 3610)
 
@@ -135,7 +137,7 @@ Motivation: `plans/confusion-census-2026-07-31.md:97` (cluster 1.3) found sessio
 
 This is the pre-fix-trace vs live-regression discriminator that `plans/confusion-census-2026-07-31.md:151` (§6) asked the next census for.
 
-**07-31 census R1–R3 (`plans/confusion-census-2026-07-31.md:129-135`)**: R3 (exit-code / designed-outcome awareness) is discharged here, together with the R6 gold-turn filter relaxation. **R1** (pasted-report-content and mid-field truncation marking) and **R2** (`n_user_turns` frontmatter itemization) remain **open**, tracked under **task 3614** — they are named in task 3610's title but absent from its FIX list, so they were deliberately not folded in here.
+**07-31 census R1–R3 (`plans/confusion-census-2026-07-31.md:129-135`)**: R3 (exit-code / designed-outcome awareness) was discharged by task 3610, together with the R6 gold-turn filter relaxation. **R1** (pasted-report-content and mid-field truncation marking) and **R2** (`n_user_turns` frontmatter itemization) were named in task 3610's title but absent from its FIX list, so they were deliberately not folded in there; both are discharged by **task 3614** — R2 as the `n_user_turns` key above, R1 as `truncated_items` plus the gold-turn filter's pasted-report coverage.
 
 ### 7.3 Coding record (coder output → merger input)
 

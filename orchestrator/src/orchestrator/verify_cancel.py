@@ -430,6 +430,18 @@ def acquire_merge_verify_flock(
     :func:`release_merge_verify_flock`.  Returns ``None`` on timeout (the fd
     is closed before returning).
 
+    Raises ``OSError`` if the lock file cannot be prepared at all: the
+    ``path.parent.mkdir(...)`` and ``os.open(path, O_RDWR | O_CREAT)``
+    below run BEFORE the bounded-wait loop's own ``try``, so ENOSPC,
+    EACCES, EMFILE or EROFS propagate to the caller rather than returning
+    the ``None`` that means "contended".  That distinction is deliberate
+    and must not be collapsed here — :meth:`GitOps.merge_verify_lease`
+    converts ``None`` into ``MergeVerifyLeaseContended``, so swallowing
+    the ``OSError`` would misreport a disk-full as another process holding
+    the lane.  Callers on never-raise teardown paths must guard the call
+    themselves (see :meth:`GitOps.remove_merge_worktree_guarded`, which
+    degrades it to ``'skipped_lock_error'``).
+
     *monotonic* / *sleep* are injectable (default ``time.monotonic`` /
     ``time.sleep``) so tests can run the bounded wait fast and deterministically.
     """

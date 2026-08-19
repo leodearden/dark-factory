@@ -1,0 +1,42 @@
+{
+  "id": "reify_task_3845",
+  "name": "KCC-\u03b6: stdlib kinematic.ri first-class types + trait DrivingJoint; retire kinematic_query_result_type per-name hooks (gated on SIR-\u03b1)",
+  "project": "reify",
+  "project_root": "/home/leo/src/reify",
+  "pre_task_commit": "2ceaf9ec17c849ba0402009b0de5d698eabb2597",
+  "post_task_commit": "",
+  "task_definition": {
+    "title": "KCC-\u03b6: stdlib kinematic.ri first-class types + trait DrivingJoint; retire kinematic_query_result_type per-name hooks (gated on SIR-\u03b1)",
+    "description": "KCC-\u03b6: declare stdlib kinematic.ri first-class types (DrivingJoint marker trait + per-joint-kind structures). [RELAXED TWICE 2026-05-30 \u2014 full audit trail + rationale in details (esc-3845-77 + esc-3845-91). The original KCC-\u03b6 scope assumed a SIR-\u03b1 typed-joint substrate that PRD \u00a77.1 explicitly rejects (\"Value::Map representations remain\"); both premise-dependent sub-goals are removed below.]\n\nSCOPE (trimmed to the achievable deliverable): Add stdlib type declarations in a NEW crates/reify-compiler/stdlib/kinematic.ri registering `trait DrivingJoint {}` (marker trait) + per-joint-kind structures conforming via the `: DrivingJoint` clause (Prismatic/Revolute/Cylindrical/Planar/Spherical conform; Coupling/Fixed declared WITHOUT the clause). Also declare top-level Mechanism/Snapshot/BodyId/SweepDim structures. Conformance is nominal (declared at structure-def site \u2014 the only mechanism Reify's grammar supports; G3-confirmed against materials_fea.ri's `structure def X : Trait`).\n\nUSER-OBSERVABLE SIGNAL: nominal STRUCTURE-INSTANTIATION conformance compiles \u2014 the kinematic.ri declarations type-check (materials_fea.ri-style `structure def X : Trait`). NOT a runtime/compile type-error test.\n\nEXPLICITLY OUT OF SCOPE (both false-premised given joints stay Value::Map per PRD \u00a77.1):\n- NOT the bind-coupling compile error (type_error_on_bind_coupling) \u2014 bind/couple are bare eval_builtins with no compiler-visible signature \u2192 owned by task 4081 (function-call-arg trait conformance), where it re-enables against a real .ri DrivingJoint-bounded fn param.\n- NOT retiring kinematic_query_result_type/KINEMATIC_FUNCTION_OVERRIDES (units.rs) or driving_joint_kind (sweep.rs) \u2014 they KEEP providing runtime range-dimension validation (prismatic\u2192LENGTH/revolute\u2192ANGLE) + compile-time result typing of bare eval_builtins (interferes/interferes_with/min_clearance) that SIR-\u03b1 cannot replace while joints are Value::Map; retirement is contingent on a future joints\u2192SIR-\u03b1-StructureInstance migration (latent PRD-\u00a77.1-reversal question, no owner).\n\nConsumer: KCC-\u03b8 (supersession), KCC-\u03b9 (integration gate). Crates touched: crates/reify-compiler/stdlib/kinematic.ri (NEW) only. Prereq: SIR-\u03b1 task 3540 (done)."
+  },
+  "verify_commands": {
+    "test": "cargo test --workspace",
+    "lint": "cargo clippy --workspace",
+    "typecheck": ""
+  },
+  "modules": [],
+  "complexity": null,
+  "cohort": "fable-trial-v2-hard",
+  "provenance": {
+    "merge_sha": "",
+    "sampled_at": "2026-08-08T00:00:00+00:00",
+    "seed": 3631,
+    "plan_source": "unavailable",
+    "baseline_source": "timestamp_walk",
+    "task_status": "done",
+    "reference_unavailable": "No single \"Merge task/3845 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'timestamp_walk'."
+  },
+  "verify_outcome": {
+    "source": "unavailable",
+    "passed": null,
+    "commands": {
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --workspace",
+      "typecheck": ""
+    },
+    "reason": "No landed post-commit is available for task 3845 (terminal status 'done'), so there is no commit at which these gates can be claimed to have passed. This fixture is planRate-only and is never scored against a landed verify outcome; the commands are carried for provenance only."
+  },
+  "plan": null,
+  "max_architect_turns": 120,
+  "timeout_minutes": 180
+}

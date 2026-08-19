@@ -3402,6 +3402,51 @@ class TestMemoryConsolidatorGateBacklogWiring:
         assert report.stats['stage1_gate_backlog_escalated'] == 1
 
     @pytest.mark.asyncio
+    async def test_two_cycles_fold_into_one_record(self, tmp_path, monkeypatch):
+        """(a2) Two consecutive run() cycles over the same stale gate → ONE record.
+
+        End-to-end proof of the signal this task exists to produce: a gate that
+        stays past its threshold accumulates ``dedupe_count`` on a single pending
+        escalation instead of vanishing after cycle 1 (old has_open_l1 skip) or
+        minting a fresh record every cycle.  ``stage1_gate_backlog_stalled`` keeps
+        reporting the gate every cycle; ``stage1_gate_backlog_escalated`` keeps its
+        NEW-filings-only meaning and drops to 0 on the fold cycle.
+        """
+        from escalation.queue import EscalationQueue
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        queue = EscalationQueue(tmp_path / 'gate_esc')
+        stage._escalation_queue = queue
+        stage.filtered_task_tree = self._make_tree([_blocked_gate_task('645', hours_ago=49)])
+
+        report1 = await self._run(stage, monkeypatch, 'run-gate-cycle-1')
+        pending = queue.get_pending()
+        assert len(pending) == 1
+        parent_id = pending[0].id
+        assert report1.stats['stage1_gate_backlog_stalled'] == 1
+        assert report1.stats['stage1_gate_backlog_escalated'] == 1
+
+        report2 = await self._run(stage, monkeypatch, 'run-gate-cycle-2')
+
+        pending = [
+            e for e in queue.get_pending()
+            if e.category == 'reconciliation_stale_gate_backlog'
+        ]
+        assert len(pending) == 1, (
+            'cycle 2 must fold, not mint a second record; got '
+            f'{[e.id for e in pending]}'
+        )
+        assert pending[0].id == parent_id, 'the fold target must be the SAME record'
+        assert pending[0].dedupe_count == 1
+
+        # The gate is still stalled and still reported as such...
+        assert report2.stats['stage1_gate_backlog_stalled'] == 1
+        # ...but nothing NEW was filed, so the escalated stat stays new-filings-only.
+        # Counting folds here would make it identically equal to _stalled every
+        # cycle, destroying the new-vs-recurring distinction for operators.
+        assert report2.stats['stage1_gate_backlog_escalated'] == 0
+
+    @pytest.mark.asyncio
     async def test_fresh_gate_no_escalation_stats_zero(self, tmp_path, monkeypatch):
         """(b) control: gate aged 1h (< 48h) → no gate-backlog L1; both stats 0."""
         from escalation.queue import EscalationQueue

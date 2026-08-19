@@ -112,6 +112,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fused_memory.models.scope import Scope
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 
 logger = logging.getLogger('prune_recon_cycle_summaries')
 
@@ -669,6 +673,58 @@ async def run(
     cap.
     """
     generated_at = datetime.now(UTC).isoformat()
+
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE the scan.
+    #
+    # This must be the FIRST thing that can stop an --apply, and the two
+    # nearer-the-mutation slots are both wrong:
+    #
+    #   * Inside ``apply_prune`` (before its gather) is too late. The entire
+    #     multi-project scan loop, the truncation guard and the safety cap have
+    #     already run by then, and that gather uses
+    #     ``return_exceptions=True`` with a per-result tally, so a write-denied
+    #     environment would destroy Qdrant points one at a time and report them
+    #     as individual failures instead of aborting -- mem0's
+    #     ``_delete_memory`` removes the point BEFORE writing its SQLite
+    #     history, so each of those "failures" is an already-destroyed record.
+    #
+    #   * After ``check_scan_completeness`` or ``check_limit_cap`` is worse
+    #     than too late. Both return a report-shaped abort payload through the
+    #     NORMAL return path, so a refusal placed downstream of either could be
+    #     masked by an ordinary handled outcome. A write-capability denial is
+    #     categorically different from those: it must RAISE, so it can never be
+    #     read past as a handled refusal.
+    #
+    # Placing it here also saves the dominant cost of a doomed run: the scan
+    # loop issues one ``scroll_by_metadata`` plus a conditional
+    # ``count_by_metadata`` PER PROJECT, and ``--project-id`` is optional.
+    # That saving is scoped to ``run``, and the message below is worded to
+    # match rather than claiming a doomed --apply costs nothing: ``main`` has
+    # already constructed the MemoryService and awaited ``initialize()`` before
+    # this function is entered. Neither mutates, so what is claimed -- no
+    # project scanned, nothing mutated -- is exactly what is guaranteed.
+    #
+    # Gated on ``args.apply`` (there is no ``dry_run`` local -- the script
+    # writes ``not args.apply`` inline) so a read-only run needs no write
+    # capability at all. Note ``--yes-i-am-sure`` is NOT a dry-run switch: it
+    # only overrides the per-project deletable-count cap, so it must not gate
+    # this.
+    if args.apply:
+        try:
+            assert_store_mutation_allowed(operation='prune_recon_cycle_summaries --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'prune_recon_cycle_summaries: --apply NOT started (fail-closed) -- '
+                "this process cannot write mem0's history directory, so a prune "
+                'would delete Qdrant points and then fail to write their history, '
+                'destroying cycle summaries that would survive nowhere but this '
+                'run\'s log. No project was scanned and nothing was mutated. Route the '
+                'prune through the fused-memory MCP server (the unsandboxed owner '
+                'of the store), or re-run from an unsandboxed operator shell. To '
+                'obtain the prune report safely from anywhere, re-run without '
+                '--apply.'
+            )
+            raise
 
     if known_projects_map is None:
         from fused_memory.config.schema import FusedMemoryConfig as _FMC  # noqa: PLC0415

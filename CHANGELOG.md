@@ -118,6 +118,52 @@ entry, bounding but not closing it), and `x_memory_citation_tombstones` on citin
 
 ### Changed
 
+#### `migrate_task_metadata_to_x_namespace.py`: a snapshot per run, and a recovery pointer on every post-write exit (task 4125)
+
+**Behaviour change, operator-visible.** Two changes to the pre-write snapshot
+`--apply` takes, and one to what a failed run tells you.
+
+**The default `--backup-path` is now stamped per run** —
+`/tmp/task-<id>-metadata-before-<UTC-stamp>.json` (`%Y%m%dT%H%M%SZ`, the stamp
+the rest of the repo already uses) rather than one fixed
+`/tmp/task-<id>-metadata-before.json`. It is resolved at write time, so a dry
+run now prints that shape and `(resolved at write time)` instead of a concrete
+name the later `--apply` — running in a different second — would never write. `docs/task-authoring.md` §8 prescribes a
+mechanical per-task re-run of this script with different `--keys`, and under
+the fixed path run 2 wrote its already-partially-migrated row straight over run
+1's TRUE pre-migration row — silently destroying the one artifact the SAFETY
+section exists to produce, at the only moment it is wanted.
+
+**`write_backup` now REFUSES an occupied path** instead of overwriting it (an
+exclusive create, so the existence check and the create are one atomic
+operation with no window for a concurrent run). This is the behaviour change to
+flag: an operator reusing an explicit `--backup-path` across runs now gets the
+run refused — `FileExistsError`, which the existing `except OSError` turns into
+"Refusing to write without a recoverable snapshot" and exit 1 *before*
+`update_task` is called — where previously the earlier snapshot was lost with
+no sign. Move the file aside, or pass a different `--backup-path`. A collision
+on the *default* path (only reachable from two `--apply` runs inside one
+second) is not an operator error and does not abort: the run steps aside to
+`...-2.json`. The create is exclusive either way, so no existing snapshot is
+ever replaced.
+
+**Every exit that leaves the stored row unverified now names that snapshot** —
+the read-back that crashed, and the write call that never returned. Both used
+to unwind out of `main_async` as a bare stack trace: `_fetch_task` on an
+unexpected payload (or `_coerce_metadata` on a non-dict blob), and — the
+likelier one in practice — a transport timeout on the `update_task` POST
+itself, where the client is an `httpx.AsyncClient(timeout=30.0)` and the
+payload is a whole-blob replace of a row that runs to tens of KB, so no reply
+means no way to tell landed from lost. The recovery pointer was printed only on
+the reported-drift exit, so it was absent from exactly the paths where the
+operator has least to go on. The sentence now has a single source
+(`recovery_pointer`) that every such exit prints verbatim, and the traceback is
+kept and printed first: the diagnosis is not traded for the instruction. An
+explicit server REJECTION is deliberately excluded — the server replied and
+refused, nothing committed, and there is nothing to recover.
+
+Extends the SAFETY section added with the script itself in task 3697 (below).
+
 #### `record_mem0_deletion_tombstone(s)` gained an optional `absorbed_by` keyword (task 3133)
 
 Additive and keyword-only, defaulting to `None`. It records the surviving canonical id

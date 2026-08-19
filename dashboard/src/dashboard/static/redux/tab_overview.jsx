@@ -347,6 +347,18 @@ function OverviewTab({ paused }) {
               const v = D.RECON_STATE.verdict;
               const sev = v?.severity || 'none';
               const action = v?.action_taken || 'none';
+              // A PHANTOM verdict is a fabricated placeholder for a review
+              // that never happened — produced by Judge._parse_verdict's
+              // except block when the judge's own output could not be parsed,
+              // and classified by shared.phantom_verdict. It is stored with
+              // severity='serious', so without this branch the row below
+              // paints a red `bad` dot reading "verdict: serious · halt" for a
+              // finding no judge ever made. Rendered `warn` (yellow) rather
+              // than `bad`: the run genuinely went unreviewed, which is
+              // degraded, but nothing serious was actually found.
+              if (v?.is_phantom) {
+                return { l: 'Reconciliation', sub: `verdict: unreviewed (unparseable judge output) · ${action}`, ok: true, warn: true };
+              }
               return { l: 'Reconciliation', sub: `verdict: ${sev} · ${action}`, ok: sev !== 'serious', warn: sev === 'minor' };
             })(),
             (() => {

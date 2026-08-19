@@ -11,9 +11,9 @@ wired it into anything that actually runs it, so the backlog only grew
 script into an automated, recurring systemd-timer drain so the backlog
 stays non-growing without any human running it by hand.
 
-### Scope: which pool this timer actually drains (task 3897)
+### Scope: which pool this timer actually drains (tasks 3897, 3923)
 
-> **This section is the single home for the task-3897 rationale and its
+> **This section is the single home for the task-3897/3923 rationale and its
 > measurements.** The sweep script's module docstring, its `--fail-on-blind-spot`
 > help text, `scripts/fused-memory-flag-marker-check.sh`'s header and the
 > `TestFlagForStage2IsNeverDeleted` docstring all carry a one-line summary
@@ -22,19 +22,36 @@ stays non-growing without any human running it by hand.
 > unable to tell which is current. Update the counts here, not there.
 
 This timer's scope is the **legacy `source`-tagged pool** —
-`{'source': 'stage1_flag_marker'}` — and nothing else. As measured on
-2026-08-09 that filter matches **0 records in both `dark_factory` and
-`reify`**, so the nightly run is currently a no-op by construction. The
-`{'kind': 'stage1_flag_marker'}` predicate measures 0 in `dark_factory`
-too. Those predicates are deliberately **retained, not retired**: they are
+`{'source': 'stage1_flag_marker'}` — and nothing else. Dated census, as
+re-measured on **2026-08-17** (task 3923; the 2026-08-09 figures from task
+3897 are shown for trend):
+
+| project | `{source: stage1_flag_marker}` | `{kind: stage1_flag_marker}` | `{flag_for_stage2: True}` |
+|---|---:|---:|---:|
+| `dark_factory` | 0 | 0 | 60 (was 65 on 08-08, 61 on 08-09) |
+| `reify` | 0 | 0 | 27 (was 80 on 08-09) |
+| `know_live` | 0 | 1 | not probed |
+
+The `source` filter — the one `--check`'s verdict actually reads — matches
+**0 records in all three projects probed**, now including `know_live`, which
+neither task 3897 nor the task-2902 watch had probed. So the nightly run is
+a no-op by construction and `backlog_verdict(0, N)` holds for every
+non-negative ceiling. The single `know_live` record matching `kind` only is
+marker `a5732b3b`, owned by open task **3915** — do not hand-delete it (see
+the RCA's Marker Lifecycle policy); it is invisible to `total_source` and so
+cannot move the verdict either way.
+
+Those predicates are deliberately **retained, not retired**: they are
 still the script's delete-set contract, still reachable via `--delete-ids`,
 still the only collector for any project not yet probed, and the blind-spot
 cross-check below is *defined* as the comparison between that `source`
 enumeration and the adjacent population.
 
 It is **not** the collector for the live Stage-1 → Stage-2 relay pool
-(`{'flag_for_stage2': True}`, 61 records in `dark_factory` and 80 in
-`reify` at the same measurement). That pool is drained in-cycle by
+(`{'flag_for_stage2': True}`, 60 records in `dark_factory` and 27 in
+`reify` as of 2026-08-17). Both are draining correctly across the
+measurements above while new markers are minted per run — a rolling window,
+not a backlog trending to zero. That pool is drained in-cycle by
 `_sweep_stale_mem0_flag_for_stage2_markers` (task 2966,
 `fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py`),
 which runs unconditionally per-project every reconciliation cycle and
@@ -86,7 +103,7 @@ its JSON report:
 ```json
 "cross_check": {
   "source_total": 0,
-  "flag_for_stage2_total": 61,
+  "flag_for_stage2_total": 60,
   "blind_spot": true,
   "probe_failed": false
 }
@@ -104,21 +121,82 @@ its JSON report:
   sweep is unaffected: the probe is count-only and can never alter the
   delete set or abort a run.
 
-`--fail-on-blind-spot` (opt-in, default off) escalates an observed blind
-spot to exit 1 so a `before_done` predicate can gate on it. It is off by
-default for the same reason `--check` is absent from the recurring service
-(see below): the `flag_for_stage2` pool is a healthy rolling window that is
-legitimately never empty, so a gate keyed on its non-emptiness would fail
-forever and teach operators to ignore it. A failed probe never trips it.
+**An observed blind spot fails `--check` BY DEFAULT (task 3923).** A verdict
+rendered from an enumeration that matched nothing must not read as a pass,
+so `--check` exits 1 on `blind_spot: true` with no flag required.
+`--fail-on-blind-spot` remains accepted as an explicit affirmation of that
+default. `--no-fail-on-blind-spot` is the escape hatch: it returns `--check`
+to a plain backlog verdict, for an ad-hoc census where you want the residual
+count without the vacuity veto. The opt-out relaxes **only** the vacuity
+check — a residual backlog over `--max-backlog` still exits 1. A failed
+census probe never trips the escalation in either mode, so a transient
+Qdrant blip cannot flap the verdict.
 
-**`--fail-on-blind-spot` requires `--check`.** The flag resolves an exit
-code only through the `--check` verdict path, so on its own it would exit 0
-even on an observed blind spot — a gate that cannot fail, which is the very
-defect this task exists to eliminate. The sweep therefore rejects the
-combination at parse time (exit 2) rather than honouring it as a no-op.
+**Both spellings require `--check`.** They resolve an exit code only through
+the `--check` verdict path, so on their own either would silently no-op —
+exiting 0 even on an observed blind spot, a gate that cannot fail. The sweep
+rejects the combination at parse time (exit 2) rather than honouring it.
 `scripts/fused-memory-flag-marker-check.sh` already hardcodes `--check` in
-its `exec` line, so passing the flag through that wrapper is all a
-`before_done.script` predicate needs.
+its `exec` line. The nightly `--apply --terminal-drain` service passes
+neither spelling and is unaffected — the armed default is resolved *after*
+that validation precisely so the service keeps parsing cleanly.
+
+## Decision (task 3923): the `--check` gate is retired
+
+**Task 2902 — the esc-2866-1 O2 watch — was the only task ever wired to
+`scripts/fused-memory-flag-marker-check.sh` as a `before_done.script`
+predicate.** It was a one-shot *dated* milestone (`2026-07-29T12:00Z`), not
+a recurring gate: it fired, exited 0, and is `status=done` with
+`done_provenance.kind=deterministic-milestone`. A scan of the live task
+store found no other `before_done` wiring of the wrapper anywhere in the
+project (sixteen other tasks mention the sweep in metadata; all carry
+`before_done: null`). **The gate has zero consumers.**
+
+Three options were considered for the watch task, and two are refuted by the
+measurements above, not merely declined:
+
+- **(a) Retire it — chosen.** Already true de facto in the task store; the
+  work was to make the retirement stick.
+- **(b) Rewire it live with `--fail-on-blind-spot` — rejected.** Keeping a
+  *live recurring* gate and arming it would fail forever and train operators
+  to ignore it. It is also moot: there is no live gate to rewire.
+- **(c) Re-point the gate at a population that varies and is meant to trend
+  to zero — refuted; no such population exists.** Per the census table
+  above: the `source` filter is 0 in every project probed, and `kind` is 0
+  except for the single `know_live` record (`a5732b3b`, open task 3915) —
+  which `total_source` cannot see, so it cannot move the verdict either. The
+  only varying population, `{flag_for_stage2: True}`, is a healthy rolling
+  window drained in-cycle by task 2966 while new markers are minted per run
+  — legitimately never zero, so a `--max-backlog 0` gate on it would fail
+  forever. The DELETE path must never be pointed at it either (see "Why the
+  relay pool is censused, never deleted").
+
+**Why arming the default is not option (b).** Arming a verdict path with
+*zero consumers* means nothing fails forever, because nothing runs it. Its
+only effect is that anyone re-wiring this gate in six months gets a loud
+failure on day one instead of a silent pass forever. Recording the
+retirement in prose alone would have been a prompt-level fix, and this
+subsystem's own RCA (`plans/reify-flag-marker-backlog-rca-2026-07-22.md`
+§3) records that 8 prior prompt-level fixes failed here while every fix that
+held was deterministic — hence a code-level guard rather than a comment. A
+gate that reads as passing from a census that saw nothing is exactly the
+silent fail-soft the repo's loud-over-silent-degradation and
+no-silent-fail-soft invariants forbid.
+
+**If you trip it — the remediation path.** An rc=1 citing
+`cross_check.blind_spot` is not a backlog finding; it says the gate is
+keyed on a filter that sees nothing, so **fix the `source`/`kind`
+enumeration to match how markers are actually tagged (or drop the gate, as
+here) before wiring anything on it** — with `source` structurally 0 and
+`flag_for_stage2` legitimately never empty, that failure is permanent until
+the enumeration is corrected. Silencing it with `--no-fail-on-blind-spot`
+restores exactly the vacuous pass this change exists to eliminate: that
+flag is **census-only, never a gate configuration**.
+
+Whether `sweep_orphan_flag_markers.py` should survive at all remains **task
+3498**'s call; this decision answers its stated precondition ("check for
+live consumers of the `--check` gate before removing anything") with: there
+are none, and 2902 was the only one there ever was.
 
 ## Install / enable
 
@@ -225,11 +303,14 @@ means the timer isn't actually firing — check `systemctl --user
 list-timers` and `journalctl --user -u fused-memory-flag-marker-sweep.service`
 on the host.
 
-**Caveat (task 3897): as of 2026-08-09 this probe returns 0**, and a 0 here
-does not distinguish "the drain worked" from "the timer never fired" —
-both render identically against an already-empty pool. To confirm the timer
-is actually firing, check `systemctl --user list-timers` and the journal
-directly rather than inferring it from this count. To see the adjacent
+**Caveat (tasks 3897, 3923): as of 2026-08-17 this probe still returns 0**
+in every project probed, and a 0 here does not distinguish "the drain
+worked" from "the timer never fired" — both render identically against an
+already-empty pool. To confirm the timer is actually firing, check
+`systemctl --user list-timers` and the journal directly rather than
+inferring it from this count. Running the check wrapper is the other way to
+surface it: since task 3923 armed the default, an rc=1 citing a blind spot
+means "saw nothing", which is the honest reading of that 0. To see the adjacent
 relay pool the timer does **not** drain (and must not), probe it
 explicitly:
 

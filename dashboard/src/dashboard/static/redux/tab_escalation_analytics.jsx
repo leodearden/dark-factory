@@ -411,6 +411,21 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
                 <td className="num mono">
                   {fmtUptime(item.age_secs)}
                   {item.breach_6h && <span className="badge bad" style={{ marginLeft: 6, fontSize: 9 }}>6h+</span>}
+                  {/* Truthiness, deliberately: the backend OMITS pins_recovery
+                      when the annotation is unknown (that project's escalation
+                      MCP was unreadable, or the record carried none), so this
+                      draws nothing for both false and undefined. There is no
+                      negated arm — "does not pin" over an unclassified record
+                      would be a claim nobody made. */}
+                  {item.pins_recovery && (
+                    <span
+                      className="badge bad"
+                      style={{ marginLeft: 6, fontSize: 9 }}
+                      title={`PINNING recovery of task ${(item.pins_recovery_task_ids || []).join(', ')} — this escalation is what stops it being redispatched`}
+                    >
+                      PINNING
+                    </span>
+                  )}
                 </td>
               </tr>
             ))}

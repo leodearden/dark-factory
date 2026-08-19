@@ -590,34 +590,36 @@ class TestEndToEndAgainstTheRealRepo:
 class TestManifestScriptCoherence:
     """A manifest naming a script that cannot be exec'd is ERRORED forever.
 
-    Complements rather than duplicates
-    `shared/tests/test_capability_manifest.py::TestCheckedInManifestCorpus`,
-    whose docstring states it deliberately "Does NOT assert delivered_check
-    `script:` targets exist on disk". That exclusion is exactly the silent
-    un-gating this task exists to remove, so it is the one thing worth pinning.
+    Complements rather than duplicates the corpus guards in
+    `shared/tests/test_capability_manifest.py`: `TestCheckedInManifestCorpus`
+    sweeps manifest SHAPE and `TestCheckedInScriptCheckTargets` sweeps script
+    LIFECYCLE (exists + executable + committed 100755) for every checked-in
+    `kind: script` capability; this class pins what only THIS capability's
+    author knows — its argv and its check semantics.
 
-    NOTE (task 3364 review): the exists+executable property is generic to EVERY
-    `kind: script` check in every checked-in sidecar, and pinning it per
-    capability leaves the others uncovered — the repo's only other one,
+    NOTE (task 3649): that exclusion is GONE, and with it this class's copy of
+    the exists+executable assertion. The property is generic to EVERY
+    `kind: script` check in every checked-in sidecar, so pinning it per
+    capability left the others uncovered — the repo's only other one,
     `plans/agent-transcript-archival-prd.capability-manifest.yaml` ->
-    `scripts/gc_agent_transcripts.py`, is committed at mode 100644 (measured)
-    and would ERROR forever today. The corpus guard's stated reason for
-    excluding this ("n=1 in the corpus at planning time") no longer holds: n=2
-    as of this task. Generalizing it there needs `shared/tests/`, outside this
-    task's locks — filed as ticket `tkt_0RS3PJJZFSJRJERYB11FNNKF5W`
-    (escalation `esc-3364-2`), which also retires this class's copy.
+    `scripts/gc_agent_transcripts.py`, was committed at mode 100644 and had
+    been ERRORing forever. Task 3649 (ticket `tkt_0RS3PJJZFSJRJERYB11FNNKF5W`,
+    escalation `esc-3364-2`) fixed that mode and generalized the assertion into
+    `shared/tests/test_capability_manifest.py::TestCheckedInScriptCheckTargets`,
+    which now sweeps every checked-in `kind: script` capability for both the
+    working-tree executable bit and the committed index mode — and pins
+    `scripts/check_method_param_wiring.py` there BY NAME via its
+    both-known-anchors test, so this capability keeps that coverage. Hence
+    `test_declared_script_exists_and_is_executable` was deleted here rather
+    than duplicated: the assertion MOVED. The methods below stay deliberately
+    capability-SPECIFIC (kind, timeout_secs, forbidden grep-only fields, args
+    semantics, exact argv) — the things a corpus-wide sweep cannot know. And
+    `TestEndToEndAgainstTheRealRepo` still execs the real script, so the
+    executable bit stays covered end-to-end for this capability too.
     """
 
     def test_check_is_the_script_kind(self, delivered_check):
         assert delivered_check['kind'] == 'script'
-
-    def test_declared_script_exists_and_is_executable(self, delivered_check):
-        target = REPO_ROOT / delivered_check['script']
-        assert target.is_file(), f'{target} does not exist'
-        assert os.access(target, os.X_OK), (
-            f'{target} is not executable; _run_script_check execs it as argv[0], '
-            'so a non-executable target ERRORs forever'
-        )
 
     def test_timeout_secs_is_set_and_positive(self, delivered_check):
         """The schema requires it for kind: script."""

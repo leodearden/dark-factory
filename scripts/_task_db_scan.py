@@ -43,6 +43,53 @@ no-silent-fail-soft rule is honoured by every tier here. Tiers 2 and 3 spell
 the exit-3 GATE differently on purpose — see :func:`run_audit_cli`'s docstring
 for why the audit spelling does not port to Tier 2 and vice versa.
 
+THE THIRD COPY OF THE TIER-3 SKELETON, AND WHY IT STAYS OUT (task 3817).
+``repair_wiped_metadata_files.py`` — the WRITE counterpart to
+``audit_wiped_metadata_files.py`` — keeps its own ``EXIT_*`` ladder and its own
+per-root ``sqlite3.Error`` loop inside ``main_async`` instead of adopting
+:func:`run_audit_cli`. That is a decision, not an oversight. It reaches Tier 1
+discovery only second-hand, through the ``discover_project_roots`` re-export in
+``audit_wiped_metadata_files.py``, and holds NO direct import of this module at
+all. Four things Tier 3 cannot express, each measured in the source:
+
+1. ``main_async`` is ``async`` and awaits ``repair_project`` (itself
+   ``async def``), while :func:`run_audit_cli` and :func:`sweep_project_roots`
+   are synchronous — so adoption means adding an async TWIN of this whole tier
+   HERE, growing the shared module in order to shrink one caller, which inverts
+   task 3286's goal.
+2. On ``--apply`` an MCP client entered via ``contextlib.AsyncExitStack``
+   brackets the entire roots loop and can short-circuit with a FIFTH code,
+   ``EXIT_SERVER_UNREACHABLE``, in the window between root resolution and the
+   sweep; the only hook in that window, *on_roots*, returns None, so it can
+   neither supply that resource, nor abort with a caller-chosen code, nor tear
+   it down afterwards.
+3. Exit 1 collides SEMANTICALLY: :data:`AUDIT_EXIT_FINDINGS` means "the
+   read-only sweep found something dirty", ``EXIT_WRITE_FAILED`` means "a write
+   was attempted and REJECTED" — a distinction that script's epilog and its
+   ``test_main_apply_is_the_only_way_to_write`` both pin. The predicate's SHAPE
+   is not the obstacle (its ``bool(failed)`` maps onto an is-dirty check fine);
+   the MEANING is, and routing through one would make this tier's own
+   documented sense of 1 false for that adopter.
+4. :func:`run_audit_cli` prints its rendered report UNCONDITIONALLY, whereas the
+   repair suppresses it on a non-JSON empty run (its ``elif results:`` guard),
+   and the repair's exit-2/exit-3 stderr carry write-flavoured suffixes
+   ("NOTHING was examined" / "examined or written") that this tier's strings do
+   not.
+
+Because the write script stays out, no write-script control flow and no
+write-script dependency enters this module — so the "READ-ONLY tasks.db sweep
+scripts" framing this docstring opens with is CORRECT AS WRITTEN, a consequence
+of the decision rather than an oversight left standing. Nothing here needs
+rewording to accommodate a write caller, because there is none.
+
+The duplication that decision accepts is WATCHED, not merely tolerated. The
+numeric lockstep between this tier's ``AUDIT_EXIT_*`` codes and the repair's
+``EXIT_*`` codes is enforced by tests in
+``tests/scripts/test_repair_wiped_metadata_files.py``, so renumbering either
+copy fails CI instead of drifting silently. A reviewer who notices the third
+copy should land HERE rather than re-file the question: 3817 asked it,
+measured all four blockers, and closed it.
+
 IMPORT-RESOLUTION CONTRACT — read before moving this file.
 This module MUST stay a flat sibling at ``scripts/_task_db_scan.py``. The
 sweep scripts' CLI tests drive ``main()`` by shelling out
@@ -186,6 +233,29 @@ def discover_db_paths(
 NO_DB_RESOLVED_MESSAGE = (
     "no tasks.db resolvable (checked --db / --project-root / "
     "DASHBOARD_KNOWN_PROJECT_ROOTS / the dark-factory default)"
+)
+
+# The shared --help epilog for both leak scanners' argparse parsers, spelling
+# out the same 0/1/2/3 contract run_scan_cli() actually returns (see its
+# docstring below). Hoisted here (task 3744, a follow-up to 3547's in-scope
+# mitigation) so the two scanners' _build_parser() import one copy instead of
+# each carrying its own byte-parallel prose that nothing kept in lockstep.
+#
+# THE HOIST DEDUPLICATED THE EPILOGS, NOT THE WHOLE CONTRACT. This constant is
+# the only --help-visible copy, but the same 0/1/2/3 numbers are still restated
+# in prose in THREE other places, and nothing enforces the lockstep -- edit
+# them together: run_scan_cli()'s docstring below, and each scanner's main()
+# docstring (scan_task_toolcall_leaks.py, scan_provenance_note_log_leaks.py).
+#
+# Preserve the wording verbatim if this ever needs editing: exit 3 is "EVERY
+# resolved tasks.db was unreadable" -- a single unreadable db among several is
+# NOT exit 3, it is a warn-and-continue skip (see run_scan_cli below).
+SCAN_EXIT_CODE_EPILOG = (
+    "exit codes: 0 = clean, no leaks found; 1 = at least one leak found; "
+    "2 = no tasks.db could be resolved from --db / --project-root / "
+    "DASHBOARD_KNOWN_PROJECT_ROOTS / the dark-factory default; 3 = every "
+    "resolved tasks.db was unreadable, so NOTHING was scanned (never treat "
+    "3 as a clean run)."
 )
 
 

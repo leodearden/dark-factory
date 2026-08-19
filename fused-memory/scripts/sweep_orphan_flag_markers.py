@@ -135,8 +135,11 @@ matches nothing. Two consequences an operator must not misread:
 
 :func:`run` therefore issues a count-only census probe on
 ``FLAG_FOR_STAGE2_FILTERS`` and emits a ``cross_check`` report block plus a
-WARNING when :func:`enumeration_blind_spot` fires. Use ``--fail-on-blind-spot``
-(with ``--check``) to escalate that divergence to a non-zero exit code.
+WARNING when :func:`enumeration_blind_spot` fires. Since task 3923 that
+divergence escalates ``--check`` to a non-zero exit code BY DEFAULT — a
+verdict rendered from an enumeration that matched nothing must not read as a
+pass. Pass ``--no-fail-on-blind-spot`` (with ``--check``) to opt out and get
+the plain backlog verdict for an ad-hoc census.
 
 The adjacent pool is CENSUSED, NEVER DELETED here: the probe counts it and stops,
 never enumerating it, never running a predicate over it, never adding it to the
@@ -147,10 +150,11 @@ the ``is_protected_mirror_record`` guard nor the tombstone write that the in-cyc
 pool correctly.
 
 SINGLE SOURCE OF TRUTH for the dated census (which filter matched how many
-records, in which project, when) and for the full censused-never-deleted
-rationale: ``docs/flag-marker-sweep-recurring.md``. Those are point-in-time
-measurements of live data; they are deliberately NOT restated here, so there is
-only one copy to keep current.
+records, in which project, when), for the full censused-never-deleted
+rationale, and for the task-3923 retirement ruling plus what an operator must
+do if the armed verdict trips: ``docs/flag-marker-sweep-recurring.md``. Those
+are point-in-time measurements of live data; they are deliberately NOT restated
+here, so there is only one copy to keep current.
 
 Usage
 -----
@@ -176,6 +180,10 @@ from functools import partial
 from typing import Any
 
 from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -637,6 +645,63 @@ async def run(
     max_age_days: int = getattr(args, 'max_age_days', 14)
     delete_ids: set[str] = set(getattr(args, 'delete_ids', None) or [])
 
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE every read.
+    #
+    # This slot precedes all four of THIS function's backend round-trips --
+    # the two before-counts, the flag_for_stage2 census probe, and the scroll
+    # enumeration -- so a doomed --apply enumerates no marker and mutates
+    # nothing.
+    #
+    # Scoped deliberately to what ``run`` controls, because a doomed --apply is
+    # NOT free end-to-end: ``main`` has already constructed the MemoryService,
+    # awaited ``initialize()``, and -- under ``--terminal-drain``, the mode the
+    # committed nightly wrapper (scripts/fused-memory-flag-marker-sweep.sh)
+    # runs -- awaited ``_resolve_terminal_task_ids()``, a full task-status
+    # resolution round-trip, before ``run`` is entered. Of the scripts guarded
+    # in task 4127 only ``audit_duplicate_memories`` refuses before any client
+    # exists at all, and only its comment claims that. The comment and the
+    # message below therefore say "no marker was enumerated and nothing was
+    # mutated" rather than "nothing happened": both are true here, and only the
+    # first is checkable from inside this function.
+    #
+    # Guarding inside ``delete_orphan_markers`` (before its gather) would be
+    # too late: that gather uses ``return_exceptions=True`` and tallies
+    # per-record results, so in a write-denied environment it would delete
+    # Qdrant points one at a time and record each history-write failure as an
+    # individual error rather than aborting the run. mem0's ``_delete_memory``
+    # removes the point BEFORE writing its SQLite history, so every one of
+    # those "errors" is an already-destroyed record. A per-record probe detects
+    # a run-wide condition one destroyed record too late.
+    #
+    # The refusal reaches ``main``'s blanket ``except Exception``
+    # (StoreMutationUnavailable subclasses RuntimeError), which logs and
+    # returns 2. That is loud and non-zero, but the generic handler will label
+    # it a fatal sweep error -- which is exactly why the ``logger.error`` below
+    # must carry the fail-closed diagnosis (what was refused, that no marker
+    # was enumerated and nothing was mutated, and the remedy) BEFORE the raise. This also holds
+    # under the ``--apply --check --max-backlog N`` predicate mode: a refused
+    # run exits 2, so it can never be mistaken for a satisfied backlog gate.
+    #
+    # Gated on ``args.apply`` (there is no ``dry_run`` local -- the report
+    # builds ``'dry_run': not args.apply`` inline) so a read-only run stays
+    # pure-read and needs no write capability at all.
+    if args.apply:
+        try:
+            assert_store_mutation_allowed(operation='sweep_orphan_flag_markers --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'sweep_orphan_flag_markers: --apply NOT started (fail-closed) -- '
+                "this process cannot write mem0's history directory, so deleting a "
+                'marker would remove its Qdrant point and then fail to write the '
+                'history, destroying records that survive nowhere but this log. '
+                'No marker was enumerated, nothing was mutated, and no backlog '
+                'predicate was evaluated. Route the sweep through the fused-memory '
+                'MCP server (the unsandboxed owner of the store), or re-run from an '
+                'unsandboxed operator shell. To obtain the sweep report safely from '
+                'anywhere, re-run without --apply.'
+            )
+            raise
+
     # --- Before counts (deterministic Qdrant payload-filter, not semantic) ---
     source_filter = {'source': MARKER_SOURCE}
     kind_filter = {'source': MARKER_SOURCE, 'kind': MARKER_KIND}
@@ -715,8 +780,11 @@ async def run(
             '(task 2966, reconciliation/stages/task_knowledge_sync.py) on a '
             'rolling 14-day window — those records are not uncollected, and '
             'this script deliberately censuses them rather than deleting '
-            'them. Pass --fail-on-blind-spot to escalate this divergence to '
-            'a non-zero --check exit code.',
+            'them. Since task 3923 this divergence FAILS --check by default. '
+            'To remediate, fix the source/kind enumeration so it sees the '
+            'real marker population before wiring any gate on it; '
+            '--no-fail-on-blind-spot is census-only and must not be used as '
+            'a gate configuration. See docs/flag-marker-sweep-recurring.md.',
             MARKER_SOURCE, total_source, flag_for_stage2_total, project_id,
         )
     cross_check = {
@@ -867,7 +935,7 @@ def _resolve_check_exit_code(
     report: dict,
     max_backlog: int,
     *,
-    fail_on_blind_spot: bool = False,
+    fail_on_blind_spot: bool = True,
 ) -> int:
     """Resolve --check's exit code from a sweep report.
 
@@ -878,23 +946,28 @@ def _resolve_check_exit_code(
     ``report['before']['total_source']`` otherwise (a dry-run/``--check``-only
     invocation, which never populates ``'after'``).
 
-    Task 3897 adds the optional blind-spot escalation. It is OPT-IN so the
-    already-wired ``scripts/fused-memory-flag-marker-check.sh`` predicate
-    keeps its exact current contract: by default a blind spot is loud in the
-    log and in the report, but does not by itself change the exit code.
+    The blind-spot escalation was opt-in when task 3897 added it and is
+    ARMED BY DEFAULT since task 3923 (the gate's only consumer, task 2902,
+    is done): a verdict rendered from an enumeration that matched NOTHING
+    must not read as a pass. Ruling, dated census and the remediation path
+    when it trips: ``docs/flag-marker-sweep-recurring.md`` §"Decision (task
+    3923)".
 
     Pure, sync, no I/O.
 
     Args:
         report: The dict returned by :func:`run`.
         max_backlog: Ceiling forwarded to :func:`backlog_verdict`.
-        fail_on_blind_spot: When ``True``, an OBSERVED enumeration blind spot
+        fail_on_blind_spot: Defaults to ``True`` (task 3923). When ``True``,
+            an OBSERVED enumeration blind spot
             (``report['cross_check']['blind_spot']``) resolves to ``1``
             regardless of the backlog verdict. A failed probe never triggers
             this — ``blind_spot`` is ``False`` whenever the adjacent
             population could not be observed (see :func:`run`), so the gate
             escalates on observed divergence only and a transient backend
             blip cannot flap a deterministic ``before_done`` predicate.
+            ``False`` (via ``--no-fail-on-blind-spot``) relaxes ONLY this
+            vacuity check; the backlog verdict still applies.
 
     Returns:
         ``0`` if the resolved count holds, else ``1`` — see
@@ -1027,7 +1100,10 @@ def _build_parser() -> argparse.ArgumentParser:
         '--check', action='store_true', default=False,
         help="Exit 0 if the residual backlog is within --max-backlog, else "
              "1 — usable as a task_kind='deterministic' before_done "
-             'predicate (mirrors scripts/check_merge_flakiness.sh).',
+             'predicate (mirrors scripts/check_merge_flakiness.sh). Also '
+             'exits 1 on an OBSERVED enumeration blind spot, so a verdict '
+             'rendered from a census that matched nothing does not read as '
+             'a pass; opt out with --no-fail-on-blind-spot.',
     )
     parser.add_argument(
         '--max-backlog', dest='max_backlog',
@@ -1046,19 +1122,31 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--fail-on-blind-spot', dest='fail_on_blind_spot',
-        action='store_true', default=False,
+        action='store_true', default=None,
         help=(
             'REQUIRES --check (rejected at parse time without it). Escalate '
             'an OBSERVED enumeration blind spot (this sweep matched 0 records '
             "while an adjacent {'flag_for_stage2': True} population is "
-            'non-empty) to exit 1, so a before_done predicate can gate on '
-            'it. OFF by default because that pool is a healthy rolling '
-            '14-day window drained in-cycle by task 2966 — a gate keyed on '
-            'its mere non-emptiness would fail forever, the same footgun '
-            'documented above for --max-backlog 0 against undated markers. '
-            'Without this flag the blind spot is still reported: loudly in '
-            "the log and in the JSON report's cross_check block. Full "
-            'rationale and dated census: docs/flag-marker-sweep-recurring.md.'
+            'non-empty) to exit 1. This is the DEFAULT since task 3923; the '
+            'flag remains accepted as an explicit affirmation of it. A '
+            'failed census probe never trips it, so a transient backend blip '
+            'cannot flap the verdict, and the blind spot is reported either '
+            "way (log WARNING + the JSON report's cross_check block). "
+            'Ruling, dated census and remediation: '
+            'docs/flag-marker-sweep-recurring.md.'
+        ),
+    )
+    parser.add_argument(
+        '--no-fail-on-blind-spot', dest='fail_on_blind_spot',
+        action='store_false', default=None,
+        help=(
+            'REQUIRES --check (rejected at parse time without it). Opt OUT '
+            'of the blind-spot escalation, returning --check to a plain '
+            'backlog verdict. CENSUS-ONLY, never a gate configuration: it '
+            'restores the vacuous pass task 3923 armed the default to '
+            'eliminate. Relaxes ONLY the vacuity check — a residual backlog '
+            'over --max-backlog still exits 1. Ruling and remediation: '
+            'docs/flag-marker-sweep-recurring.md.'
         ),
     )
     return parser
@@ -1071,43 +1159,70 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     testable without invoking :func:`main` (which builds a live
     ``MemoryService``).
 
-    ``--fail-on-blind-spot`` reaches an exit code only through
-    :func:`_resolve_check_exit_code`, which :func:`main` consults ONLY under
-    ``--check``. Left un-validated, ``--apply --fail-on-blind-spot`` — or a
-    bare ``--fail-on-blind-spot`` dry run — would therefore exit 0 even on an
-    observed blind spot: an operator wiring it as a ``before_done.script``
-    predicate without ``--check`` would get a gate that STRUCTURALLY CANNOT
-    FAIL, which is the exact defect class task 3897 exists to eliminate.
-    Honouring the flag as a silent no-op would also violate the repo's
-    loud-over-silent-degradation norm, so the combination is rejected at
-    parse time (argparse exit code 2) instead.
+    ``--fail-on-blind-spot`` / ``--no-fail-on-blind-spot`` reach an exit code
+    only through :func:`_resolve_check_exit_code`, which :func:`main` consults
+    ONLY under ``--check``. Left un-validated, ``--apply
+    --fail-on-blind-spot`` — or a bare dry run with either spelling — would
+    therefore silently no-op: an operator wiring the opt-in as a
+    ``before_done.script`` predicate without ``--check`` would get a gate
+    that STRUCTURALLY CANNOT FAIL (the exact defect class task 3897 exists to
+    eliminate), and one passing the opt-out would believe they had relaxed a
+    gate that was never running. Honouring either as a silent no-op would
+    violate the repo's loud-over-silent-degradation norm, so the combination
+    is rejected at parse time (argparse exit code 2) instead.
 
     ``scripts/fused-memory-flag-marker-check.sh`` already hardcodes
-    ``--check`` in its ``exec`` line, so passing ``--fail-on-blind-spot``
-    through that wrapper is unaffected.
+    ``--check`` in its ``exec`` line, so passing either spelling through that
+    wrapper is unaffected.
+
+    Task 3923 makes the blind-spot policy a TRI-STATE: argparse leaves it
+    ``None`` when neither spelling is passed, and this function resolves that
+    sentinel to ``True`` (armed) only AFTER the validation above. THE
+    ORDERING IS LOAD-BEARING — it keys the rejection on the flag having been
+    passed EXPLICITLY, so the nightly ``--apply --terminal-drain`` service
+    (which passes neither, and never reaches the verdict path) keeps parsing
+    cleanly instead of failing with exit 2 under a default it never asked
+    for. Pinned by
+    ``test_nightly_sweep_argv_still_parses_under_the_armed_default``.
 
     Args:
         argv: Argument list to parse; ``None`` reads ``sys.argv[1:]``.
 
     Returns:
-        The parsed namespace.
+        The parsed namespace, with ``fail_on_blind_spot`` resolved to a
+        concrete ``bool`` (never the ``None`` sentinel).
 
     Raises:
-        SystemExit: Code 2, via ``parser.error``, when
-            ``--fail-on-blind-spot`` is passed without ``--check``.
+        SystemExit: Code 2, via ``parser.error``, when either
+            ``--fail-on-blind-spot`` or ``--no-fail-on-blind-spot`` is passed
+            without ``--check``.
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if args.fail_on_blind_spot and not args.check:
-        parser.error(
-            '--fail-on-blind-spot requires --check: it resolves an exit code '
-            'only through the --check verdict path, so on its own it would '
-            'silently exit 0 even on an observed blind spot — a gate that '
-            'cannot fail. Pass --check as well (the '
-            'scripts/fused-memory-flag-marker-check.sh wrapper already does), '
-            'or drop --fail-on-blind-spot: the blind spot is reported in the '
-            "log and in the JSON report's cross_check block either way."
+    # `is not None` — not truthiness — so BOTH spellings are validated
+    # (task 3923). Keying on the value would silently accept
+    # --no-fail-on-blind-spot without --check, which is just as inert as
+    # the opt-in spelling: an operator would believe they had relaxed a
+    # gate that was never running.
+    if args.fail_on_blind_spot is not None and not args.check:
+        passed = (
+            '--fail-on-blind-spot' if args.fail_on_blind_spot
+            else '--no-fail-on-blind-spot'
         )
+        parser.error(
+            f'{passed} requires --check: --fail-on-blind-spot / '
+            '--no-fail-on-blind-spot resolve an exit code only through the '
+            '--check verdict path, so on its own either spelling would '
+            'silently no-op — exiting 0 even on an observed blind spot, a '
+            'gate that cannot fail. Pass --check as well (the '
+            'scripts/fused-memory-flag-marker-check.sh wrapper already does), '
+            f'or drop {passed}: the blind spot is reported in the log and in '
+            "the JSON report's cross_check block either way."
+        )
+    # Resolve the tri-state sentinel AFTER the validation above — see the
+    # load-bearing-ordering paragraph in this function's docstring.
+    if args.fail_on_blind_spot is None:
+        args.fail_on_blind_spot = True
     return args
 
 

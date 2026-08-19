@@ -60,6 +60,123 @@ def test_census_config_from_mapping_empty_dict_returns_defaults():
 
 
 # ---------------------------------------------------------------------------
+# task 4085 (amendment pass, review finding #1): the `census:` block is
+# hand-edited -- the same operator-authored-input class as the hand-seeded
+# `last_census_done_count` baseline this task hardens -- so an unusable
+# threshold VALUE is an expected input. Unvalidated, a quoted `'10'` reaches
+# `evaluate()`'s `days_since >= config.max_interval_days` and raises
+# TypeError straight out of `load_census_config` and `decide_for_project`,
+# both of which document a never-raises contract, and into `census.main`,
+# which calls the latter unguarded.
+#
+# Same rule as the baseline guard: VALIDATE, never coerce. `int('10')` would
+# silently bless a malformed config and could arm a ~$100 census on an
+# unaudited number.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "field,key,mapping_key",
+    [
+        ("max_interval_days", "max_interval_days", None),
+        ("tasks_landed_threshold", "tasks_landed_threshold", None),
+        ("tasks_landed_min_days", "tasks_landed_min_days", None),
+        ("floor_days", "floor_days", None),
+        ("novelty_spike_count", "count", "novelty_spike"),
+        ("novelty_spike_window_hours", "window_hours", "novelty_spike"),
+    ],
+)
+@pytest.mark.parametrize("bad", ["10", "", 10.0, 1.5, True, False, -1, None, [10], {"n": 10}])
+def test_census_config_from_mapping_rejects_unusable_threshold_values(
+    field, key, mapping_key, bad, caplog
+):
+    """Each of the six §7.4 thresholds falls back to its OWN default, alone,
+    with one WARNING naming the value and its type. `True`/`False` are in the
+    parameter list deliberately: `bool` is an `int` subclass, so an unquoted
+    YAML `true` would otherwise mean 1 -- a daily census -- in total silence.
+    A negative is definitionally impossible for a day/count threshold."""
+    override = {key: bad} if mapping_key is None else {mapping_key: {key: bad}}
+
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping(override)
+
+    # The bad field fell back; nothing else moved.
+    assert config == ct.CensusConfig()
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert key in message
+    assert type(bad).__name__ in message
+
+
+def test_census_config_from_mapping_rejects_a_non_mapping_novelty_spike(caplog):
+    """`census: {novelty_spike: [4, 72]}` used to raise AttributeError from
+    the `.get` on a list -- a raise from inside the config reader, which is
+    the one place that must not have one."""
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping({"novelty_spike": [4, 72], "floor_days": 3})
+
+    assert config.novelty_spike_count == ct.CensusConfig().novelty_spike_count
+    assert config.novelty_spike_window_hours == ct.CensusConfig().novelty_spike_window_hours
+    # ...and the sibling override alongside it is still honoured.
+    assert config.floor_days == 3
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "novelty_spike" in warnings[0].getMessage()
+
+
+def test_census_config_from_mapping_reports_every_bad_value_in_one_warning(caplog):
+    """Per-FIELD fallback, per-BLOCK warning. The six thresholds are
+    independent, so one typo must not disarm the other five; but a single
+    hand-edited block is a single operator fault, and this WARNING is one
+    nightly journal line, so all of them are named in one message."""
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping(
+            {
+                "max_interval_days": "10",
+                "floor_days": -1,
+                "tasks_landed_threshold": 200,  # the one good override
+                "novelty_spike": {"window_hours": None},
+            }
+        )
+
+    assert config.tasks_landed_threshold == 200
+    assert config.max_interval_days == ct.CensusConfig().max_interval_days
+    assert config.floor_days == ct.CensusConfig().floor_days
+    assert config.novelty_spike_window_hours == ct.CensusConfig().novelty_spike_window_hours
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    for named in ("max_interval_days", "floor_days", "window_hours"):
+        assert named in message
+    assert "tasks_landed_threshold" not in message
+
+
+def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
+    """Over-rejection guard. `0` is aggressive but legal (fire every day) and
+    must not be mistaken for a missing value, and there is no upper bound."""
+    with caplog.at_level(logging.WARNING):
+        config = ct.CensusConfig.from_mapping(
+            {
+                "max_interval_days": 0,
+                "floor_days": 0,
+                "tasks_landed_threshold": 10_000,
+                "novelty_spike": {"count": 0, "window_hours": 1},
+            }
+        )
+
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    assert config.max_interval_days == 0
+    assert config.floor_days == 0
+    assert config.tasks_landed_threshold == 10_000
+    assert config.novelty_spike_count == 0
+    assert config.novelty_spike_window_hours == 1
+
+
+# ---------------------------------------------------------------------------
 # amendment pass (review finding #3): CensusConfig defaults must not
 # silently drift from task β's legibility.config.Census model, now that β
 # has landed and lives alongside this module in scripts/legibility/.
@@ -567,6 +684,226 @@ def test_compute_tasks_landed_empty_project_computes_a_real_zero_delta(caplog):
     assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
+# ---------------------------------------------------------------------------
+# task 4085: the BASELINE side of the same fail-safe contract.
+#
+# task 3291 (above) made an unusable get_statuses PAYLOAD fail safe. The other
+# input to the same subtraction -- the `last_census_done_count` baseline read
+# off disk -- was left unvalidated, and it is the one an operator hand-edits
+# (skills/census/SKILL.md documents seeding it by hand), so malformed values
+# are an expected input rather than a hypothetical. Three measured behaviours,
+# all from the single unguarded `current_done - baseline`:
+#
+#   * `"2872"` (a quoted JSON int) raises TypeError out of a function whose
+#     docstring promises a fail-safe None. Via the `evaluate` CLI, main()'s
+#     catch-all swallows it into NO-FIRE + exit 0, which discards the ENTIRE
+#     evaluation -- so conditions (a) max-interval and (c) novelty-spike are
+#     suppressed by a fault in (b), taking out the very backstop that exists
+#     to survive a broken (b);
+#   * `true` returns `current_done - 1` with ZERO warnings, because
+#     `isinstance(True, int)` is True in Python -- arming (b) with essentially
+#     every done task ever. Strictly more dangerous than the crash: nothing
+#     signals it at all;
+#   * `1.5` returns a fractional delta that flows into evaluate()'s
+#     `>= threshold` comparison as a real number.
+#
+# The contract pinned here: a baseline that is not a non-negative int fails
+# SAFE (return None, condition (b) inert, (a)/(c) unaffected) with exactly one
+# WARNING naming the value and its type. VALIDATE, never coerce -- `int("2872")`
+# would silently bless a malformed state file and arm a ~$100 census run on an
+# unaudited number, which is precisely the defect class task 3291 closed on the
+# fetch side.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "baseline",
+    ["2872", "", 2872.0, 1.5, True, False, [2872], {"n": 2872}, object()],
+    ids=["str-int", "str-empty", "float-whole", "float-frac", "bool-true", "bool-false",
+         "list", "dict", "object"],
+)
+def test_compute_tasks_landed_non_int_baseline_fails_safe_with_one_warning(baseline, caplog):
+    """Every non-int baseline lands in the same "one WARNING, return None"
+    branch the fetch and payload faults already use.
+
+    `True`/`False`/`2872.0` are the interesting parameters: they are not
+    TypeErrors, they are SILENT wrong answers today (`True` == 1, so the delta
+    is `current_done - 1`), which is why a bare `except TypeError` would not
+    have been a fix."""
+    state = {"last_census_done_count": baseline}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher(_done_statuses(3000))
+        )
+
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    # Both facts, because either alone is ambiguous in a journal line: the
+    # repr says WHICH value is wrong, the type name says WHY it is wrong
+    # (`"2872"` and `2872` are visually near-identical without it).
+    assert repr(baseline) in message
+    assert type(baseline).__name__ in message
+
+
+def test_compute_tasks_landed_negative_baseline_fails_safe_with_one_warning(caplog):
+    """A done-count cannot be negative. Today `-5` silently inflates the delta
+    in the FIRE-ward direction (`current_done + 5`), so it belongs in the same
+    guard as the type faults rather than being treated as a usable int."""
+    state = {"last_census_done_count": -5}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher(_done_statuses(600))
+        )
+
+    assert result is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_compute_tasks_landed_bad_baseline_warns_before_touching_the_fetcher(caplog):
+    """Pins the guard's POSITION, not just its existence.
+
+    The baseline is a state-side fault and must be reported BEFORE the
+    `status_fetcher is None` branch and before any fetch. That ordering is what
+    makes a mis-seeded baseline visible on the DEFAULT nightly trickle wiring,
+    where `run_nightly` passes `status_fetcher=None` (nightly.py) and the
+    fetcher guard would otherwise return first -- leaving a corrupt state file
+    unreported in total silence for as long as it sits there."""
+    calls = []
+
+    def _recording_fetcher():
+        calls.append(1)
+        return {"statuses": {"1": "done"}}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state={"last_census_done_count": "2872"}, status_fetcher=_recording_fetcher
+        )
+
+    assert result is None
+    assert calls == []
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+    # ...and with no fetcher at all, the single warning is still the specific
+    # baseline complaint, not the generic "no status_fetcher configured" one.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state={"last_census_done_count": "2872"}, status_fetcher=None
+        )
+
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "last_census_done_count" in warnings[0].getMessage()
+
+
+def test_compute_tasks_landed_bad_baseline_warning_is_bounded(caplog):
+    """The WARNING is re-emitted into the nightly systemd journal as ONE line,
+    and census-state.json is hand-editable, so an arbitrarily large value must
+    not dump itself into the log (`_bounded_repr`'s whole reason to exist)."""
+    state = {"last_census_done_count": "9" * 5000}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher(_done_statuses(10))
+        )
+
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert len(message) < 1000
+    assert "repr truncated" in message
+
+
+@pytest.mark.parametrize("baseline,expected", [(0, 600), (500, 100), (2872, -2272)])
+def test_compute_tasks_landed_int_baseline_still_computes_delta(baseline, expected, caplog):
+    """Over-rejection guard: a real non-negative int -- including a real 0 and a
+    baseline larger than the current count -- still computes its delta and warns
+    nothing. Complements
+    `test_compute_tasks_landed_empty_project_computes_a_real_zero_delta`, which
+    pins the same property from the payload side."""
+    state = {"last_census_done_count": baseline}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=_wrapped_fetcher(_done_statuses(600))
+        )
+
+    assert result == expected
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+# ---------------------------------------------------------------------------
+# task 4085: `_bounded_repr` / `_bounded_keys` — direct coverage.
+#
+# CHARACTERIZATION, with no paired implementation change: both helpers are
+# already correct. They had no direct tests at all (exercised only indirectly
+# through `extract_done_count`'s messages), and the baseline guard above
+# promotes `_bounded_repr` from an incidental helper to the mechanism that
+# keeps a malformed hand-seeded baseline -- an arbitrarily large hand-edited
+# value -- to ONE nightly journal line.
+#
+# Scope, per the amendment pass (review finding #3): these pin the PROPERTY
+# each helper exists for -- output stays bounded, the elision is marked, and
+# the true size is still reported -- not the exact wording of a private
+# format string, and not the `<=`/`>` boundary arithmetic, which would only
+# re-derive the implementation. The end-to-end guarantee that a malformed
+# baseline cannot dump itself into a journal line is pinned separately and
+# behaviourally by
+# `test_compute_tasks_landed_bad_baseline_warning_is_bounded` above; these
+# three are the unit-level backstop for the helpers it leans on.
+#
+# The two constants are read from the module rather than hard-coded, so
+# retuning 200/20 does not produce a false failure here.
+# ---------------------------------------------------------------------------
+
+def test_bounded_repr_bounds_an_arbitrarily_large_value():
+    """The point of the helper: census-state.json and a get_statuses payload
+    are both arbitrarily large, and neither may dump itself into a journal
+    line. A value small enough to print in full is left alone."""
+    assert "repr truncated" not in ct._bounded_repr({"n": 1})
+
+    value = "x" * 100_000
+    result = ct._bounded_repr(value)
+
+    # Bounded, marked as elided, and the TRUE size still stated -- that number
+    # is how an operator tells "slightly over" from "a whole payload".
+    assert len(result) < ct._MAX_REPR_CHARS + 100
+    assert "repr truncated" in result
+    assert str(len(repr(value))) in result
+
+
+def test_bounded_keys_bounds_an_arbitrarily_wide_mapping():
+    """Same property for the key list: a get_statuses payload over a big
+    project has thousands of keys, and the shape is all diagnosis needs."""
+    count = ct._MAX_REPORTED_KEYS + 5
+    mapping = {f"k{i:02d}": i for i in range(count)}
+
+    result = ct._bounded_keys(mapping)
+
+    shown = sum(1 for i in range(count) if f"'k{i:02d}'" in result)
+    assert shown == ct._MAX_REPORTED_KEYS
+    # The suffix reports the TRUE key count, not the number shown.
+    assert str(count) in result
+
+
+def test_bounded_keys_survives_mixed_type_keys():
+    """The invariant the `key=str` sort exists to protect. A bare
+    `sorted({1: ..., "b": ..., None: ...})` raises TypeError comparing int to
+    str -- i.e. the error path would fail while reporting a failure, which is
+    the worst possible place for it. get_statuses payloads are server-supplied,
+    so a mixed-key dict is exactly the malformed shape this reports on."""
+    result = ct._bounded_keys({1: "a", "b": "c", None: "d"})
+
+    assert "1" in result
+    assert "'b'" in result
+    assert "None" in result
+
+
 def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(
     tmp_path, install_fake_httpx
 ):
@@ -961,6 +1298,136 @@ def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, c
 
     assert decision.fire is False
     assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_decide_for_project_survives_a_raising_compute_tasks_landed(
+    tmp_path, caplog, monkeypatch
+):
+    """`decide_for_project` must never propagate — and must degrade condition
+    (b) ALONE, keeping (a) and (c) alive.
+
+    The callee is monkeypatched to raise rather than fed a bad baseline, and
+    that is deliberate: a bad baseline no longer raises, so a state-file-driven
+    test would silently become a duplicate of the compute_tasks_landed tests
+    above and this guard would ship untested. Injecting a raising callee pins
+    the contract independently of which inner fault happens to be possible
+    today.
+
+    The stakes are in the degradation granularity. Today the whole call chain
+    is unguarded, so via the `evaluate` CLI a single fault in (b) is caught only
+    by main()'s outermost catch-all, which discards the ENTIRE evaluation — the
+    max-interval backstop that exists precisely to survive a broken (b) is taken
+    out by the same fault."""
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=9)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        last_census_done_count=500,
+    )
+
+    def _boom(*, state, status_fetcher):
+        raise RuntimeError("baseline exploded")
+
+    monkeypatch.setattr(ct, "compute_tasks_landed", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        decision = ct.decide_for_project(
+            tmp_path, now=NOW, status_fetcher=_wrapped_fetcher(_done_statuses(550))
+        )
+
+    assert isinstance(decision, ct.Decision)
+    assert decision.fire is False
+
+    # Degraded to a fail-safe None delta, NOT to a fabricated number: this is
+    # the exact line evaluate() emits for `tasks_landed=None`.
+    assert any("tasks-landed: delta unavailable" in r for r in decision.reasons)
+    # ...while conditions (a) and (c) still evaluated — the whole point of
+    # degrading (b) alone.
+    assert any("max-interval" in r for r in decision.reasons)
+    assert any("novelty-spike" in r for r in decision.reasons)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "RuntimeError" in warnings[0].getMessage()
+    assert "baseline exploded" in warnings[0].getMessage()
+
+
+def test_decide_for_project_survives_a_quoted_max_interval_days(tmp_path, caplog):
+    """task 4085 (amendment): the end-to-end pin for the config guard, and the
+    one that shows why per-field fallback is the right degradation.
+
+    `census: {max_interval_days: '10'}` in a hand-edited legibility.yaml used
+    to reach `evaluate()`'s `days_since >= config.max_interval_days` and raise
+    `TypeError: '>=' not supported between instances of 'float' and 'str'`
+    straight out of this function -- verified live before the fix -- defeating
+    its documented never-raises contract and, via the `evaluate` CLI's
+    outermost catch-all, discarding the WHOLE evaluation.
+
+    Here the state is day-11, so with the rejected field back at its default
+    of 10 the (a) max-interval backstop still FIRES. That is the property that
+    matters: a typo in one threshold must not disarm the backstop that exists
+    precisely to survive everything else being broken."""
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=11)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        last_census_done_count=500,
+    )
+    (tmp_path / "docs" / "legibility" / "legibility.yaml").write_text(
+        "census:\n  max_interval_days: '10'\n", encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING):
+        decision = ct.decide_for_project(
+            tmp_path, now=NOW, status_fetcher=_wrapped_fetcher(_done_statuses(550))
+        )
+
+    assert isinstance(decision, ct.Decision)
+    assert decision.fire is True
+    assert any("max-interval" in r for r in decision.reasons)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "max_interval_days" in message
+    assert "str" in message
+
+
+def test_decide_for_project_bounds_a_huge_tasks_landed_failure(
+    tmp_path, caplog, monkeypatch
+):
+    """task 4085 (amendment): the guard above must keep this module's
+    one-WARNING-one-line discipline. A `StatusFetchUnavailable` chained from a
+    big get_statuses payload carries an arbitrarily large message, and this
+    WARNING lands in the nightly journal as a single line."""
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=9)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        last_census_done_count=500,
+    )
+
+    def _boom(*, state, status_fetcher):
+        raise ct.StatusFetchUnavailable("payload " + "x" * 50_000 + "\nsecond line")
+
+    monkeypatch.setattr(ct, "compute_tasks_landed", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        decision = ct.decide_for_project(
+            tmp_path, now=NOW, status_fetcher=_wrapped_fetcher(_done_statuses(550))
+        )
+
+    assert decision.fire is False
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert len(message) < 1000
+    assert "\n" not in message
+    assert "StatusFetchUnavailable" in message
+    assert "repr truncated" in message
 
 
 # ---------------------------------------------------------------------------

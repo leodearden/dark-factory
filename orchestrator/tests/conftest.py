@@ -148,10 +148,19 @@ async def _reap_leaked_aiosqlite_connections():
     future via ``future.get_loop().call_soon_threadsafe(...)`` it raises
     ``RuntimeError: Event loop is closed`` from inside the thread. pytest's
     threadexception plugin surfaces this as a
-    ``PytestUnhandledThreadExceptionWarning`` (promoted to a hard error by this
-    project's ``filterwarnings``) and attributes it to whatever unrelated test
-    happens to be running when the thread fires — under ``-n auto`` on an
-    oversubscribed host that is reliably a *different*, innocent test.
+    ``PytestUnhandledThreadExceptionWarning`` and attributes it to whatever
+    unrelated test happens to be running when the thread fires — under
+    ``-n auto`` on an oversubscribed host that is reliably a *different*,
+    innocent test. That warning is promoted to a hard error by the
+    ``error::pytest.PytestUnhandledThreadExceptionWarning`` entry in
+    orchestrator/pyproject.toml's ``[tool.pytest.ini_options] filterwarnings``
+    (task 4075), which governs the ORCHESTRATOR-BOUND invocation the
+    merge-verify harness uses (``cd orchestrator && uv run pytest tests/``,
+    dark-factory-orchestrator.yaml:142); a root-bound run resolves the
+    repo-root inifile instead — pytest reads exactly one, never merging across
+    workspace members — and does NOT promote. Pinned by
+    tests/test_aiosqlite_leak_isolation.py's
+    "PytestUnhandledThreadExceptionWarning promotion" section.
 
     Reaping here — in the test's own loop, before it is closed — closes and
     joins any live aiosqlite connection so its worker thread is guaranteed
@@ -801,14 +810,37 @@ def _drain_async_mock_coroutines():
 def make_steward(tmp_path: Path):
     """Build a minimal ``TaskSteward`` on a fixture-OWNED, ``tmp_path``-rooted worktree.
 
-    This is the suite's ONLY steward factory.  Task 3461 merged the two
-    near-identical ``_make_steward`` copies from ``test_suggestion_triage.py``
-    and ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two
-    that remained — ``test_out_of_band_routing.py``'s ``_steward_config`` /
-    ``_build_steward``, and ``test_steward.py``'s five-fixture graph (whose
-    ``worktree`` / ``mock_config`` / ``mock_queue`` / ``mock_mcp`` /
-    ``mock_briefing`` names survive there as one-line views onto this factory's
-    build).  If you are here to add another, EXTEND this one instead.
+    This is the suite's steward factory, with ONE documented exception (below).
+    Task 3461 merged the two near-identical ``_make_steward`` copies from
+    ``test_suggestion_triage.py`` and ``test_workflow_state_machine_boundary.py``;
+    task 3514 folded in the two that remained —
+    ``test_out_of_band_routing.py``'s ``_steward_config`` / ``_build_steward``,
+    and ``test_steward.py``'s five-fixture graph (whose ``worktree`` /
+    ``mock_config`` / ``mock_queue`` / ``mock_mcp`` / ``mock_briefing`` names
+    survive there as one-line views onto this factory's build).  If you are here
+    to add another, EXTEND this one instead.
+
+    The exception, examined and left standing by task 3551:
+    ``test_workflow_escalated_steward_stall.py``'s ``_make_steward_config``.  It
+    structurally cannot fold in, for three independent reasons — recorded here so
+    the next reader does not re-litigate it:
+
+    1. it feeds ``_CapFiringSteward``, a ``TaskSteward`` SUBCLASS that module
+       declares inside ``_make_real_steward_factory``, whereas this fixture
+       returns a constructed ``TaskSteward``;
+    2. that construction passes ``config_dir=``, a parameter this fixture does
+       not accept;
+    3. ``_make_real_steward_factory`` returns a CALLBACK the workflow invokes
+       later, with a worktree the *workflow* chooses — it is not a fixture and
+       cannot request ``tmp_path`` at the moment of construction, whereas this
+       one owns its worktree by design.
+
+    Absorbing all three would mean adding ``steward_cls=`` / ``config_dir=``
+    surface AND relaxing the strictly-below-``tmp_path`` worktree assertion below
+    (which task 3514 promoted from convention to an enforced invariant) to serve
+    exactly one consumer.  That factory instead adopted this one's ``project_root``
+    recipe directly (task 3551), so the sandbox invariant is shared even though
+    the construction is not.
 
     Lives in conftest.py — rather than ``_orch_helpers.py``, which is scoped to
     non-fixture helpers — because it must close over ``tmp_path`` to own the

@@ -900,20 +900,136 @@ identity-less templates (build_reviewer_prompt :998, build_merger_prompt
 :1109), which then shows only '# Context' + '# Action' -- a shape the
 pre-3610 all-of-three rule did not catch either, so nothing regresses."""
 
+RECON_RUN_REVIEW_HEADINGS: tuple[str, ...] = (
+    '## reconciliation run review', '### run metadata', '### stage reports',
+)
+"""Injected reconciliation run-review PROMPT heading literals
+(fused_memory/reconciliation/judge.py:411 ``ReconciliationJudge.
+_build_review_prompt`` emits '## Reconciliation Run Review', '### Run
+Metadata', '### Stage Reports', '### MCP Actions (N total)' and '###
+Journal Entries (N total)' as a single f-string). The three
+parenthesis-free headings are used so the marker is an exact line match;
+all must co-occur as line-anchored headings (all(), not any() -- the same
+false-positive guard as HARNESS_BRIEFING_HEADINGS).
+
+Harness-injected, NOT a human paste, verified by transcript forensics on
+all five confusion-census-2026-07-31 §1.1 facet-(b) sightings (2b93092c,
+5871ae29, 47c7fd98, ccf68b39, 47e690d3): the judge dispatches this prompt
+through ``shared.cli_invoke`` -> ``claude --print`` (schema.py:871
+``judge_llm_provider`` defaults to 'claude_cli'), which records it as the
+session's sole user-role record. In each of the five, the run-review block
+is the FIRST user record, preceded only by harness bookkeeping
+(queue-operation enqueue/dequeue, an ``entrypoint: sdk-cli`` attachment),
+with no ordinary human turn anywhere in the transcript. The census's
+"pasted into a turn for review/discussion" reading is refuted: facets (a)
+and (b) are one source class (harness injection) with two injectors
+(orchestrator briefing vs. judge prompt), which is why these headings live
+here rather than behind a separate 'pasted report' predicate."""
+
+HARNESS_HEADING_SETS: tuple[tuple[str, ...], ...] = (
+    HARNESS_BRIEFING_HEADINGS,
+    RECON_RUN_REVIEW_HEADINGS,
+)
+"""Every known harness-injected heading set, matched independently: a turn
+is harness-injected when ALL headings of ANY one set co-occur. Adding a
+newly-sighted injector shape is a one-line addition here, the same way
+HARNESS_PROMPT_MARKERS invites one-line additions for prose preambles.
+
+HARNESS_BRIEFING_HEADINGS is retained as a member even though task 3610's
+anchor+corroborator rule (see :func:`is_harness_injected_turn`) SUBSUMES
+the all-of match for it -- three anchors clear that rule's >=2 threshold
+by themselves -- so the two rules agree by construction and this stays the
+one inventory of known injector heading sets. The relaxation is NOT
+extended to the other members: it was justified by forensics on the
+briefing shape specifically, and a newly-sighted injector earns one only
+on its own evidence."""
+
 HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
     'you are the trickle coder for the dark-factory agent-confusion codebook',
+    'your previous run was interrupted by a usage limit',
+    'you were interrupted by an orchestrator restart',
 )
 """Harness-authored PROSE preamble literals, matched as plain
 case-insensitive substrings (unlike the line-anchored heading markers
 above): the trickle coder's system prompt
-(scripts/legibility/coder.py:174 ``build_prompt``). Extend with future
-harness prompt literals as one-line additions."""
+(scripts/legibility/coder.py:174 ``build_prompt``), and the harness's two
+resume prompts -- ``shared.cli_invoke.CAP_HIT_RESUME_PROMPT`` (cap-hit)
+and ``shared.cli_invoke.CRASH_RECOVERY_RESUME_PROMPT`` (orchestrator
+restart), the canonical sources of the two literals above. Both resume
+prompts are one defect class -- harness-injected continuation boilerplate
+typed into the transcript as an ordinary isMeta=False user turn -- even
+though cli_invoke deliberately keeps the two strings separate because
+their causes differ (a usage-cap interrupt vs. an orchestrator restart).
+Each marker is deliberately its constant's stable FIRST SENTENCE, not the
+whole string: a future rewording of a later sentence must not silently
+un-cover the marker. Held in lockstep with the canonical constants by
+``TestHarnessInjectedTurnFilter.test_resume_prompt_is_excluded_lockstep``
+in scripts/tests/test_legibility_digest.py, which asserts
+``is_harness_injected_turn(<constant>) is True`` for each rather than
+restating the literal -- a harness rewording turns that test red instead
+of silently regressing coverage. Extend with future harness prompt
+literals as one-line additions."""
+
+HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = (
+    '_this context was recalled from the ',
+    '_memory unavailable — proceed with codebase exploration',
+    '_no memory context available',
+)
+"""Body literals ``_get_memory_context`` renders right after its
+'# Context' heading (orchestrator/src/orchestrator/agents/briefing.py):
+the standing provenance caveat's prefix
+(``orchestrator.agents.briefing.MEMORY_CONTEXT_CAVEAT``, when a memory
+section was actually recalled), and its two no-recalled-sections literal
+families (memory-unavailable / no-memory-context-available). The caveat
+marker deliberately stops BEFORE its ``{project_id}`` interpolation
+point: a marker spanning it would be project-specific and would fail for
+every non-dark_factory project the census runs against (this module has
+no knowledge of which project a transcript belongs to). These three
+markers are EXHAUSTIVE over ``_get_memory_context``'s FIVE return paths
+as of this commit: the four no-recalled-sections paths (each of the two
+literal families has a plain and a drop_note-bearing variant, both
+covered by the same family marker), PLUS the recalled-sections path
+(briefing.py:1339-1350) -- covered by the caveat marker ALONE, including
+its own drop_note suffix (``'\n\n_In total, {drop_note}._'``) and the
+trailing "_Memory unavailable for the remaining queries..._" note a
+later-failing query appends, since both are appended AFTER the caveat
+prefix this marker matches on, never before it. That exhaustiveness
+claim is what
+``TestHarnessInjectedTurnFilter.test_no_recalled_sections_variant_is_excluded``
+(the four no-recalled-sections paths) and
+``test_recalled_sections_with_trailing_unavailable_note_is_excluded``
+(the fifth, composite path) together check, so a new return path added
+to that function should arrive with a fourth marker here. Matched only in CONJUNCTION with
+a line-anchored '# context' heading (see :func:`is_harness_injected_turn`),
+never as a relaxation of the briefing anchor+corroborator guard -- that
+guard is load-bearing and its two negative tests
+(test_single_heading_alone_is_not_excluded,
+test_context_heading_mentioned_mid_sentence_is_not_excluded) must keep
+passing unchanged."""
+
+
+def _has_all_heading_lines(text: str, headings: tuple[str, ...]) -> bool:
+    """True when every entry of *headings* occurs in *text* as its own
+    stripped, lowercased line.
+
+    The single normalization used by every line-anchored heading-set
+    match. Shared rather than repeated per call site so a future change to
+    the anchoring rule (stripping trailing '#', handling '\\r\\n', ...)
+    lands in one place instead of silently diverging between two copies.
+    """
+    lines = {line.strip() for line in text.lower().splitlines()}
+    return all(heading in lines for heading in headings)
 
 
 def is_harness_injected_turn(text: str) -> bool:
     """True when *text* is harness-injected rather than genuine human-typed
-    input: either the orchestrator's briefing preamble or a harness prose
-    preamble (any HARNESS_PROMPT_MARKERS substring).
+    input: the orchestrator's briefing preamble, any OTHER injected
+    preamble whose whole heading set co-occurs each as its own stripped
+    line (any :data:`HARNESS_HEADING_SETS` entry -- notably the
+    reconciliation judge's run-review prompt), a harness prose preamble
+    (any HARNESS_PROMPT_MARKERS substring), or a lone memory-context
+    block (a line-anchored '# context' heading together with any
+    HARNESS_CONTEXT_BLOCK_MARKERS substring).
 
     The briefing rule is ANCHOR + CORROBORATOR: at least one
     HARNESS_BRIEFING_HEADINGS anchor must appear as its own stripped line,
@@ -935,6 +1051,26 @@ def is_harness_injected_turn(text: str) -> bool:
     NO corroborator, so it falls below the >=2 threshold; and a '# Context'
     quoted mid-prose is not a stripped line at all, so it is never a
     heading -- matching stays line-anchored and never substring.
+
+    The memory-context rule is the residual the briefing rule declines: a
+    '# Context' block whose memory sections were recalled but which carries
+    no second heading is caught by its standing provenance caveat
+    (HARNESS_CONTEXT_BLOCK_MARKERS) instead of by a corroborator.
+
+    Every OTHER known injector keeps the strict all-of-set rule, applied
+    over :data:`HARNESS_HEADING_SETS` (task 3614): the relaxation above is
+    justified by forensics on the BRIEFING shape specifically, and a
+    newly-sighted injector earns a relaxation only on its own evidence.
+    HARNESS_BRIEFING_HEADINGS stays listed in that inventory as the
+    canonical example of a heading set, where it is subsumed -- three
+    anchors clear the >=2 threshold by themselves -- never contradicted.
+
+    All of it stays deliberately literal and line-anchored rather than a
+    structural "looks machine-generated" heuristic: user corrections are
+    gold (PRD Sec 5) and the highest-priority digest section, so
+    over-excluding a genuine human turn -- e.g. a long, well-formatted
+    human bug report with headings and a pasted log excerpt -- is strictly
+    the worse error.
     """
     lowered = text.lower()
     lines = {line.strip() for line in lowered.splitlines()}
@@ -943,7 +1079,11 @@ def is_harness_injected_turn(text: str) -> bool:
         corroborators = [h for h in HARNESS_BRIEFING_SUBHEADINGS if h in lines]
         if len(anchors) + len(corroborators) >= 2:
             return True
-    return any(marker in lowered for marker in HARNESS_PROMPT_MARKERS)
+    if any(_has_all_heading_lines(text, headings) for headings in HARNESS_HEADING_SETS):
+        return True
+    if any(marker in lowered for marker in HARNESS_PROMPT_MARKERS):
+        return True
+    return '# context' in lines and any(m in lowered for m in HARNESS_CONTEXT_BLOCK_MARKERS)
 
 
 def classify_agent_class(
@@ -984,14 +1124,19 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Excludes: non-'user' records, isSidechain=True (subagent) turns,
     isMeta=True (system-injected) turns, user records whose content is
-    entirely tool_result blocks, and harness-injected briefing/prompt turns
-    (see :func:`is_harness_injected_turn`) -- these are typed into the
-    transcript as ordinary user-role text (isMeta=False), so isMeta alone
-    cannot exclude them. This function is the SINGLE source for both the
-    gold user_corrections section and render_digest's n_user_turns score
-    component, so this one filter excludes a harness-injected turn from
-    both. User corrections are gold (PRD Sec 5) -- this is the
-    highest-priority digest section.
+    entirely tool_result blocks, and harness-injected briefing/prompt/
+    report/context-block turns -- the orchestrator briefing, the
+    trickle-coder and resume prompts, the reconciliation judge's
+    run-review prompt and a lone memory-context block alike (see
+    :func:`is_harness_injected_turn`). Every one of those injected shapes
+    lands in the transcript as ordinary user-role text (isMeta unset), so
+    isMeta alone cannot exclude any of them. This function is the SINGLE
+    source for both the gold user_corrections section and render_digest's
+    n_user_turns score component, so this one filter excludes such a turn
+    from the body AND the score together -- which is exactly what
+    confusion-census-2026-07-31 §3.1 asks for, its clusters 1.1(b) and 1.2
+    being one event observed from two surfaces. User corrections are gold
+    (PRD Sec 5) -- this is the highest-priority digest section.
     """
     turns = []
     for index, record in enumerate(records):
@@ -1049,14 +1194,49 @@ next census must be able to tell a pre-fix trace from a live regression.
 
 FRONTMATTER_KEYS: tuple[str, ...] = (
     'session', 'cwd', 'encoded_dir', 'agent_class', 'date', 'size_bytes', 'score',
-    'instrument_version',
+    'n_user_turns', 'truncated_items', 'instrument_version',
 )
 """Top-level frontmatter keys in the exact PRD Sec 7.2 order (everything
 before ``signal_counts``, which is rendered as its own nested block).
 
-``instrument_version`` is APPENDED last (task 3610) rather than inserted,
-so the pre-existing prefix stays byte-identical and downstream
-frontmatter diffs remain stable."""
+``n_user_turns`` follows ``score`` so the block reads score -> its dominant
+5.0-weighted basis -> the remaining weighted counts. Rationale
+(confusion-census-2026-07-31 R2 / Sec 1.2): :func:`score_signals` adds
+``SIGNAL_WEIGHTS['user_turn'] * n_user_turns`` on top of the weighted
+``signal_counts``, so rendering only the counts left the score
+unreconstructible from the digest -- a session whose sole "user turn" was a
+pasted report showed ``score: 5.0`` beside an all-zero ``signal_counts``.
+It is deliberately NOT a sixth ``signal_counts`` entry: that block is
+specifically :func:`signal_counts`' five detector hit-counts (mirrored by
+``sampling.SignalCounts``, and read by :func:`_warn_if_body_evicted`'s
+``any(counts.values())`` guard), and a user-turn tally is neither.
+
+``truncated_items`` follows it (confusion-census-2026-07-31 R1): the
+per-item :data:`ITEM_TRUNCATION_MARKER` is legible only to a reader who
+gets that far into the body, so the count is surfaced up front -- a reader
+weighing the digest knows how many of its items have had substance capped
+out of them. It counts what :func:`_cap_item` actually truncated (tracked
+at source by :func:`_build_sections`, never re-derived by scanning the
+rendered body for :data:`ITEM_TRUNCATION_MARKER`, which item content can
+quote on its own), maintained over the POST-trim sections (see
+:func:`_truncate_sections`), so it describes the body that actually
+ships.
+
+``instrument_version`` (task 3610) stays LAST of the top-level keys, and
+that position is pinned by its own test: a generation marker belongs after
+the measurements it describes, and appending rather than inserting is what
+keeps downstream frontmatter diffs stable as the contract grows. Task
+3614's two keys were added ahead of it, so the byte-identical prefix that
+commit claimed now ends at ``score`` -- the append discipline it was
+protecting is unchanged, only the prefix it applies to is longer."""
+
+BARE_FRONTMATTER_KEYS: frozenset[str] = frozenset(
+    {'size_bytes', 'score', 'n_user_turns', 'truncated_items', 'instrument_version'}
+)
+"""Top-level frontmatter keys rendered as bare YAML scalars; every other
+key in FRONTMATTER_KEYS is double-quoted via :func:`_yaml_dquote`. Named
+rather than inlined into :func:`render_frontmatter` so a further numeric
+key is a one-word addition here instead of a growing inline literal."""
 
 SIGNAL_COUNT_KEYS: tuple[str, ...] = (
     'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
@@ -1077,12 +1257,13 @@ def render_frontmatter(meta: dict[str, Any]) -> str:
     and stable downstream diffs, and avoids a dumper's default surprises
     (key sorting, quoting, anchors, float formatting). String-valued fields
     are explicitly double-quoted (see :func:`_yaml_dquote`); numeric fields
-    (size_bytes, score, and every signal_counts value) are emitted bare.
+    (:data:`BARE_FRONTMATTER_KEYS` and every signal_counts value) are
+    emitted bare.
     """
     lines = ['---']
     for key in FRONTMATTER_KEYS:
         value = meta[key]
-        if key in ('size_bytes', 'score', 'instrument_version'):
+        if key in BARE_FRONTMATTER_KEYS:
             lines.append(f'{key}: {value}')
         else:
             lines.append(f'{key}: {_yaml_dquote(value)}')
@@ -1271,10 +1452,28 @@ SECTION_HEADINGS/SECTION_PRIORITY.
 render in separate sections, so each neighborhood appears exactly once
 in the body (task 3610)."""
 
-ITEM_TRUNCATION_MARKER = '... [item truncated]'
-"""Appended to a per-item line that exceeded its byte cap. Explicit and
-ASCII (so its own byte length equals its character length), keeping
-degradation legible rather than silently lossy."""
+ITEM_TRUNCATION_MARKER = '... [item truncated'
+"""Stable, greppable PREFIX of the tail appended to a per-item line that
+exceeded its byte cap; :func:`_truncation_suffix` completes it with the
+quantified loss. Explicit and ASCII (so its own byte length equals its
+character length), keeping degradation legible rather than silently lossy.
+
+Deliberately a PREFIX rather than the whole literal: a fixed opaque marker
+told a reader that something was dropped but never how much, so a 20KB
+pasted turn capped to 2KB looked identical to one capped by 40 bytes
+(confusion-census-2026-07-31 R1, and §3.4 "rendered surfaces that omit
+their own basis"). Keeping the constant a prefix preserves every existing
+``ITEM_TRUNCATION_MARKER in ...`` grep, test and scan while the tail
+carries the numbers.
+
+NOT a detection predicate: because it is now an open prefix it matches
+strictly more text than the old closed literal, and the literal occurs
+verbatim in this repo's own data (docs/legibility/confusion-codebook.yaml
+evidence quotes, plans/confusion-census-2026-07-31.md), so a session that
+merely reads or greps those files renders items containing the marker
+without having been capped. ``truncated_items`` is therefore tracked from
+what :func:`_cap_item` actually did (see :func:`_build_sections`), never
+re-derived by scanning the rendered body."""
 
 MAX_ITEM_BYTES = 2048
 """Hard ceiling on a single rendered item's UTF-8 byte length, regardless
@@ -1307,27 +1506,73 @@ def _item_byte_cap(max_bytes: int) -> int:
     return max(MIN_ITEM_BYTES, min(MAX_ITEM_BYTES, max_bytes - FRONTMATTER_RESERVE_BYTES))
 
 
+def _truncation_suffix(dropped: int, original: int) -> str:
+    """Render the full item-truncation tail: the stable
+    :data:`ITEM_TRUNCATION_MARKER` prefix plus how much of the item was
+    discarded, so the degradation reports its own magnitude rather than
+    only its existence."""
+    return f'{ITEM_TRUNCATION_MARKER}: {dropped} of {original} bytes dropped]'
+
+
 def _cap_item(line: str, cap: int) -> str:
     """Return *line* unchanged when its UTF-8 byte length is within *cap*;
     otherwise byte-truncate (never splitting a multi-byte codepoint) and
-    append :data:`ITEM_TRUNCATION_MARKER`.
+    append a :func:`_truncation_suffix` quantifying the loss.
+
+    The within-cap return is the SAME object (``return line``, never a
+    copy) -- a contract, not an accident: it makes ``capped is not line``
+    the ground truth for "this item was actually truncated", which is how
+    :func:`_build_sections` tallies ``truncated_items`` without re-deriving
+    truncation by scanning rendered text for :data:`ITEM_TRUNCATION_MARKER`
+    (which item content can contain on its own).
 
     Byte-wise because the whole digest budget is measured in UTF-8 bytes
     (:func:`_resolve_size_bytes`); ``decode(..., 'ignore')`` drops a
     partial trailing codepoint instead of emitting a U+FFFD replacement
     character, so a truncated item never introduces mojibake into text a
     downstream LLM coder reads verbatim.
+
+    The suffix is self-referential -- its own byte length depends on the
+    digit counts of the numbers it reports, which depend on how many bytes
+    the suffix leaves room for -- so it is resolved by the same short
+    bounded fixed point :func:`_resolve_size_bytes` already documents for
+    ``size_bytes``: render against a guess (dropped=0), measure, re-render.
+    Suffix length is monotone non-decreasing across passes (a longer suffix
+    retains fewer bytes, which drops more, whose digit count can only grow)
+    and is bounded by the digit count of *original*, so this converges in a
+    couple of passes; the loop bound is a defensive cap, not a claim that
+    more passes are ever needed.
+
+    The result is ``<= cap`` bytes for any ``cap >= len(suffix)``: the
+    retained slice is capped at ``cap - len(suffix)`` and decoding can only
+    shorten it. :data:`MIN_ITEM_BYTES` (the floor :func:`_item_byte_cap`
+    never returns below) comfortably exceeds the longest possible suffix,
+    which is what makes that precondition structural.
     """
     encoded = line.encode('utf-8')
-    if len(encoded) <= cap:
+    original = len(encoded)
+    if original <= cap:
         return line
-    keep = max(0, cap - len(ITEM_TRUNCATION_MARKER))
-    return encoded[:keep].decode('utf-8', 'ignore') + ITEM_TRUNCATION_MARKER
+
+    suffix = _truncation_suffix(0, original)
+    for _ in range(4):
+        keep = max(0, cap - len(suffix.encode('utf-8')))
+        kept = encoded[:keep].decode('utf-8', 'ignore')
+        resolved = _truncation_suffix(original - len(kept.encode('utf-8')), original)
+        if resolved == suffix:
+            return kept + suffix
+        suffix = resolved
+
+    # Unreached in practice (see the convergence argument above); recompute
+    # the retained slice against the final suffix so the `<= cap` bound
+    # holds even if the loop bound were somehow exhausted.
+    keep = max(0, cap - len(suffix.encode('utf-8')))
+    return encoded[:keep].decode('utf-8', 'ignore') + suffix
 
 
 def _build_sections(
     records: list[dict[str, Any]], *, item_max_bytes: int = _item_byte_cap(15360),
-) -> dict[str, list[str]]:
+) -> tuple[dict[str, list[str]], set[tuple[str, int]]]:
     """Run every detector once and render its hits to markdown bullet
     lines, keyed by section key, capping each rendered line to
     *item_max_bytes* (see :func:`_cap_item`) at this single choke point --
@@ -1340,17 +1585,38 @@ def _build_sections(
     The two neighborhood partitions (_NEIGHBORHOOD_PARTITIONS) are fed one
     shared scan instead of scanning *records* once each: which detector
     serves which section still comes from _SECTION_RENDERERS alone, only
-    HOW it is invoked differs."""
+    HOW it is invoked differs.
+
+    Returns ``(sections, truncated)``, where *truncated* is the set of
+    ``(section_key, item_index)`` positions :func:`_cap_item` actually
+    byte-capped. Recording it HERE, at the only place truncation happens,
+    is what makes ``truncated_items`` ground truth: re-deriving it by
+    scanning rendered lines for :data:`ITEM_TRUNCATION_MARKER` would also
+    count an item whose own content merely quotes the marker (this repo's
+    codebook and census files both contain it verbatim, so any session
+    that reads them produces such an item), inflating a frontmatter field
+    whose whole purpose is to report its own basis honestly
+    (confusion-census-2026-07-31 §3.4). Positions stay valid under
+    :func:`_truncate_sections` because it only ever pops the TRAILING item
+    of a section, never reindexes a surviving one.
+    """
     neighborhoods = iter_error_neighborhoods(records)
-    sections = {}
+    sections: dict[str, list[str]] = {}
+    truncated: set[tuple[str, int]] = set()
     for key, (detector, renderer) in _SECTION_RENDERERS.items():
         items = (
             detector(neighborhoods=neighborhoods)
             if detector in _NEIGHBORHOOD_PARTITIONS
             else detector(records)
         )
-        sections[key] = [_cap_item(line, item_max_bytes) for line in renderer(items)]
-    return sections
+        lines = []
+        for index, line in enumerate(renderer(items)):
+            capped = _cap_item(line, item_max_bytes)
+            if capped is not line:  # _cap_item's documented identity contract
+                truncated.add((key, index))
+            lines.append(capped)
+        sections[key] = lines
+    return sections, truncated
 
 
 def _render_body(sections: dict[str, list[str]]) -> str:
@@ -1390,7 +1656,11 @@ def _resolve_size_bytes(meta: dict[str, Any], body: str) -> str:
 
 
 def _truncate_sections(
-    meta: dict[str, Any], sections: dict[str, list[str]], max_bytes: int,
+    meta: dict[str, Any],
+    sections: dict[str, list[str]],
+    max_bytes: int,
+    *,
+    truncated: set[tuple[str, int]],
 ) -> tuple[str, dict[str, list[str]]]:
     """Trim *sections* in ASCENDING SECTION_PRIORITY order (lowest-signal
     first) until the fully-rendered digest fits within *max_bytes*, or
@@ -1407,20 +1677,51 @@ def _truncate_sections(
     the loop stops even if the (now section-free) digest is still over
     the cap -- a soft cap can't shrink the frontmatter itself.
 
+    *truncated* is :func:`_build_sections`' ground-truth set of
+    ``(section_key, item_index)`` positions it byte-capped. It is
+    maintained INCREMENTALLY here -- seeded once, and discarded from when
+    a pop removes a position in it -- so ``truncated_items`` always
+    describes the body being rendered rather than a pre-trim snapshot
+    (popping a truncated item would otherwise leave the frontmatter
+    claiming the shipped body contains a truncated item it does not).
+
+    Incremental rather than recomputed per iteration for cost: this trim
+    loop is already documented as super-linear in signal-item count
+    (nightly.build_digests, sampling.digest_byte_cost_fn: "seconds to
+    minutes per multi-MB session"), and rescanning every rendered line of
+    every section on each of O(items) iterations would add a second
+    Python-level quadratic term on top -- unlike :func:`_render_body` /
+    :func:`_resolve_size_bytes`, whose per-iteration work is C-level
+    join/encode. Discarding one set member per pop is O(1).
+
+    The termination argument is unchanged: popping an item can only lower
+    the count (never raise it), so the frontmatter never grows across
+    iterations and the digest still shrinks monotonically.
+
     Returns the rendered digest AND the post-trim section dict, so a
     caller can inspect final section state (e.g. render_digest's
     :func:`_warn_if_body_evicted` consistency guard) without re-parsing
     the rendered markdown body.
     """
     sections = {key: list(lines) for key, lines in sections.items()}
-    digest = _resolve_size_bytes(meta, _render_body(sections))
+    remaining = set(truncated)
+
+    def _render(current: dict[str, list[str]]) -> str:
+        return _resolve_size_bytes(
+            {**meta, 'truncated_items': len(remaining)}, _render_body(current),
+        )
+
+    digest = _render(sections)
 
     while len(digest.encode('utf-8')) > max_bytes:
         target_key = next((key for key in SECTION_PRIORITY if sections.get(key)), None)
         if target_key is None:
             break
+        # pop() removes the TRAILING item, so the popped position is the
+        # last index -- and no surviving item is reindexed.
+        remaining.discard((target_key, len(sections[target_key]) - 1))
         sections[target_key].pop()
-        digest = _resolve_size_bytes(meta, _render_body(sections))
+        digest = _render(sections)
 
     return digest, sections
 
@@ -1475,19 +1776,32 @@ def render_digest(
     """
     cwd = _derive_cwd(records)
     counts = signal_counts(records)
+    # Bound ONCE and used for both the rendered key and the scored
+    # argument, so the frontmatter's stated basis and the score computed
+    # from it can never diverge (confusion-census-2026-07-31 R2).
+    n_user_turns = len(iter_user_turns(records))
     meta = {
         'session': _derive_session(records),
         'cwd': cwd,
         'encoded_dir': _derive_encoded_dir(records, cwd, path),
         'agent_class': agent_class,
         'date': _derive_date(records),
-        'score': score_signals(counts, len(iter_user_turns(records))),
+        'score': score_signals(counts, n_user_turns),
+        'n_user_turns': n_user_turns,
+        # Seeded so render_frontmatter is never called on a meta missing
+        # the key; _truncate_sections resolves the real value against the
+        # POST-trim sections it is about to render.
+        'truncated_items': 0,
         'instrument_version': DIGEST_INSTRUMENT_VERSION,
         'signal_counts': counts,
     }
 
-    sections = _build_sections(records, item_max_bytes=_item_byte_cap(max_bytes))
-    digest, trimmed_sections = _truncate_sections(meta, sections, max_bytes)
+    sections, truncated = _build_sections(
+        records, item_max_bytes=_item_byte_cap(max_bytes),
+    )
+    digest, trimmed_sections = _truncate_sections(
+        meta, sections, max_bytes, truncated=truncated,
+    )
     _warn_if_body_evicted(meta, trimmed_sections, max_bytes)
     return digest
 

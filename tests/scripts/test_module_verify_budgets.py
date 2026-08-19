@@ -172,11 +172,21 @@ def _min_budget(worst: float) -> int:
 
     The EXACT expression task 3458 uses for
     ``test_scripts_module_config.MIN_MODULE_BUDGET_SECS``, reused verbatim so
-    the two guards cannot silently drift in SHAPE. DERIVED from the
-    measurement rather than hand-set, because that exact pair has already
-    rotted once undetected: the tests/scripts sibling still hard-codes its
-    floor against a 127.0s worst run while its own yaml has since recorded
-    233.50s, and nothing caught it.
+    the guards cannot silently drift in SHAPE. DERIVED from the measurement
+    rather than hand-set, because that exact pair HAD already rotted once
+    undetected: the tests/scripts sibling hard-coded its floor at 300s against
+    a 127.0s worst run while its own yaml had since recorded 233.50s, and
+    nothing in the repo could fail on it — a reviewer caught it, which is not a
+    mechanism.
+
+    That rot is FIXED (task 3703):
+    ``test_tests_scripts_module_config.py`` now holds
+    ``MEASURED_SUITE_WORST_SECS = 233.50`` with its floor derived by this same
+    expression, and pins the shape with ``_min_budget(930.59) == 1800`` against
+    the sibling's published pair. All three guards in the family now derive.
+    The history is kept rather than deleted because it is the REASON for the
+    derivation, and a reader who finds only the rule learns nothing about why
+    a hand-set floor is not an acceptable substitute.
 
     DEGENERATES TO ZERO for cheap suites — see the parametrized test's
     docstring, where the consequence is spelled out rather than left for a
@@ -453,8 +463,9 @@ KNOWN_MODULE_CONFIG_PREFIXES = frozenset(
 #
 # These entries are NOT a statement that the owning guard is CURRENT. They
 # record only WHERE a module's provenance lives, so this file does not become a
-# second home for it; see the tests/scripts entry, which names a known staleness
-# in its own owner rather than papering over it.
+# second home for it. When an owner IS known to be stale, say so in its entry
+# rather than papering over it — the tests/scripts entry did exactly that until
+# task 3703 fixed the owner, and now records the repair as history instead.
 MEASURED_BY_SIBLING_GUARD: dict[str, str] = {
     'scripts': (
         'MEASURED_SUITE_WORST_SECS = 930.59 in '
@@ -464,16 +475,19 @@ MEASURED_BY_SIBLING_GUARD: dict[str, str] = {
         'uses.'
     ),
     'tests/scripts': (
-        'MEASURED worst run 233.50s recorded in tests/scripts/orchestrator.yaml. '
-        'NOTE THE OWNING GUARD IS STALE: '
-        'tests/scripts/test_tests_scripts_module_config.py (task 3350) still '
-        'pins MEASURED_SUITE_WORST_SECS = 127.0 with a HAND-SET '
-        'MIN_MODULE_BUDGET_SECS = 300, so the 233.50s figure in the yaml is '
-        'gated by nothing — this is the exact rot _min_budget\'s docstring '
-        'names, and it is why task 3458 made the floor derived rather than '
-        'hand-set. Excluded here to avoid creating a SECOND copy of the '
-        'measurement, NOT because the sibling floor is current. Fixing that '
-        'guard is not task 3473\'s scope (it does not hold the lock).'
+        'MEASURED worst run 233.50s recorded in tests/scripts/orchestrator.yaml, '
+        'whose provenance block also carries that module\'s later runs; the '
+        'owning guard is tests/scripts/test_tests_scripts_module_config.py, '
+        'which pins MEASURED_SUITE_WORST_SECS = 233.50 with '
+        'MIN_MODULE_BUDGET_SECS DERIVED from it by the same expression '
+        '_min_budget uses. HISTORY, kept because it is why this family derives '
+        'rather than hand-sets: that guard USED to pin 127.0 with a hand-set '
+        '300s floor (task 3350), so the yaml\'s 233.50s figure was gated by '
+        'nothing and only a reviewer caught it; task 3703 refreshed the '
+        'constant and made the floor derived, so it is now gated. Excluded '
+        'here to avoid creating a SECOND copy of the measurement — a copy that '
+        'would have to be raised in lockstep, which is the drift this dict '
+        'exists to avoid.'
     ),
 }
 

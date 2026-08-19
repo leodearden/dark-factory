@@ -42,6 +42,7 @@ import argparse
 import json
 import math
 import sys
+import textwrap
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
@@ -851,7 +852,36 @@ def probe_arm(arm: ArmEntry) -> ProbeResult:
 #: floor was widened to count attribute values: the widening is right for
 #: alpha's question but discards a real signal, and eta needs to see whether an
 #: arm promoted entities to nodes or buried them in attributes.
-REPORT_SCHEMA_VERSION = 4
+#: v5 (2026-08-15, task 3755): the vram block carries WHO ELSE held the card at
+#: each reading, and whether the arithmetic can be attributed to the arm at all.
+#: `used - baseline` is the arm's footprint only if nothing else moved between
+#: the two readings; up to v4 nothing recorded whether that held, so a slate run
+#: with ollama resident (measured 2026-08-06: 10314 MiB on keep_alive) produced
+#: an artifact indistinguishable from a clean one.
+REPORT_SCHEMA_VERSION = 5
+
+#: Appended to a POLLUTED block's reason.  The observation alone is not enough:
+#: `arm_footprint_mib` is the headline number of this very block, and a reader
+#: who took it at face value would attribute another process's memory to the
+#: arm.  Spelling the field name means a grep for it finds this caveat too.
+POLLUTED_FOOTPRINT_NOTE = (
+    'arm_footprint_mib in this block is therefore NOT attributable to the arm '
+    'and neither is the verdict computed from it: the measurement is void, not '
+    'merely unflattering, and nothing was learned about this arm. Free the card '
+    'and measure again'
+)
+
+#: The body of the terminal banner `render_table` prints under
+#: `*** VRAM MEASUREMENT POLLUTED ***`.  ONE string, wrapped at render time by
+#: `_wrapped`, rather than pre-broken literals: hand-placed line breaks make
+#: every future edit to this text a re-wrapping chore, and a careless one leaves
+#: ragged output in the single place an operator most needs to read.
+POLLUTED_BANNER_BODY = (
+    'Another process moved on the card between the two readings, so every VRAM '
+    'figure above — and the OVERALL verdict, which is computed partly from '
+    'them — is void. This says NOTHING about whether the arm fits; measure '
+    'again on a quiet card.'
+)
 
 #: The delivered-check literal for task 3713.  Spelled once, here, and carried
 #: into the JSON artifact as a field.
@@ -874,6 +904,23 @@ EXIT_NO_ACTIVE_ARMS = 5
 #: `--merge` refused to combine the inputs.  Distinct from an arm failure: the
 #: arms may all be fine and the ASSEMBLY wrong, which is a different fix.
 EXIT_MERGE_ERROR = 6
+#: Another process moved on the card, so `used - baseline` is not the arm's
+#: footprint and NOTHING was learned about the arm (task 3755).  Distinct from
+#: EXIT_VRAM_FAILED for the usual reason — they have opposite fixes.  3 says the
+#: arm is genuinely too big and something should be stopped; 7 says the
+#: measurement is void, and stopping an arm in response would be acting on a
+#: number nobody measured.  ONE code covers both pollution routes (a polluted
+#: recorded baseline and a probe-time intruder) because they carry one meaning:
+#: the VRAM numbers cannot be trusted.
+EXIT_VRAM_POLLUTED = 7
+#: No usable baseline was recorded before the arm started — the file is absent,
+#: or it predates the consumer inventory.  Distinct from EXIT_PROBE_ERROR for
+#: exactly the reason 7 is distinct from 3: the GPU is fine and nvidia-smi
+#: answered, so sending an operator to debug the probe is the wrong errand.  The
+#: fix is `lms_ctl start <arm>`, and the likeliest way to meet this is the most
+#: ordinary one — a pre-guard baseline still sitting in $XDG_RUNTIME_DIR from
+#: the current boot.
+EXIT_STALE_BASELINE = 8
 
 
 class GpuBlock(BaseModel):
@@ -957,6 +1004,34 @@ class VramBlock(BaseModel):
     verdict: Verdict
     reason: str
 
+    # -- v5 (task 3755): who else held the card, and is the arithmetic sound? --
+    #
+    # EVERY field below carries a default, and the defaults exist for exactly
+    # ONE reason: the committed v4 artifact is evidence of a real past run and
+    # must keep validating through this model.  They are NOT a fallback for a
+    # live run -- `run_healthcheck` populates all five on every path, and
+    # `test_this_producer_never_emits_the_unmeasured_sentinel` holds it to that.
+    #
+    # The sentinels are chosen so an unmeasured artifact reads as unmeasured
+    # rather than as clean.  `pollution` is the load-bearing one: an empty
+    # consumer list is genuinely AMBIGUOUS (this host's baseline really does
+    # hold 3312 MiB with zero CUDA compute apps, because graphics contexts are
+    # invisible to `--query-compute-apps`), so "was anyone looked for?" is
+    # answered by UNMEASURED and never by list emptiness.
+
+    #: Compute apps holding the card at the pre-start baseline reading.
+    baseline_consumers: list[lms_vram.GpuConsumer] = []
+    #: Compute apps holding it at the probe reading, the arm's own container
+    #: included -- it is indistinguishable from any other `python` here.
+    probe_consumers: list[lms_vram.GpuConsumer] = []
+    #: What those two lists are and are not.  Carried as a FIELD because JSON
+    #: has no comments and the lists do not sum to `used_mib`.
+    consumer_inventory_note: str = ''
+    #: Whether the delta between the two readings can be attributed to the arm.
+    pollution: lms_vram.PollutionState = lms_vram.PollutionState.UNMEASURED
+    #: Empty when CLEAN.  Names the offending process and the consequence.
+    pollution_reason: str = ''
+
 
 class HealthReport(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -984,7 +1059,7 @@ def run_healthcheck(
     arms: Sequence[ArmEntry],
     gpu_probe: Callable[[], lms_vram.GpuSnapshot] | None = None,
     probe: Callable[[ArmEntry], ProbeResult] | None = None,
-    baseline: lms_vram.GpuReading | None = None,
+    baseline: lms_vram.GpuBaseline | None = None,
 ) -> HealthReport:
     """Probe every arm and assemble the report.
 
@@ -993,6 +1068,17 @@ def run_healthcheck(
     reads `used 0 MiB, headroom 19.5 GiB` -- a passing budget with maximal
     headroom off a dead probe, which is the most trustworthy-looking wrong
     answer this rig can emit.  No report at all is strictly better.
+
+    A POLLUTED BASELINE propagates for the same reason (task 3755).  If a
+    foreign process held the card when the baseline was taken, its memory is
+    built into the number every footprint is subtracted from, and no arithmetic
+    downstream can undo that.  ``lms_ctl.start`` already refuses to record such
+    a baseline; this catches one that predates that guard or was written by
+    hand, because the resulting report would be shaped exactly like a good one.
+
+    Probe-time pollution is different and is NOT fatal: the report is still the
+    honest record of what was seen, so it is emitted with `pollution` POLLUTED
+    and a reason, and the exit code carries the refusal.
 
     Individual arm failures, by contrast, are recorded and the sweep continues:
     aborting on the first dead arm would drop verdicts already measured for the
@@ -1007,14 +1093,52 @@ def run_healthcheck(
     # the same reason a dead GPU probe does: without the reading taken before
     # these arms started, the report cannot say what the arms took, only what
     # the card holds -- and that was the miscalibrated subject esc-3713-6 fixed.
-    base = baseline if baseline is not None else lms_vram.read_baselines(
+    base = baseline if baseline is not None else lms_vram.read_baseline_records(
         [arm.arm_id for arm in arms]
     )
+    # The SAME rule the baseline was written under, read off the record itself
+    # (`coresident_arms`) rather than re-derived here: a `--no-exclusive` start
+    # legitimately records another arm in its inventory, and re-applying the
+    # strict rule now would refuse to report on a run that was never polluted.
+    # Empty -- including for a file written before that key existed -- is the
+    # strict rule unchanged.
+    polluted_baseline = lms_vram.unexpected_baseline_consumers(
+        base.consumers, coresident_arms=base.coresident_arms,
+    )
+    if polluted_baseline:
+        raise lms_vram.PollutedBaselineError(
+            polluted_baseline,
+            context=(
+                'refusing to report against a polluted baseline recorded at '
+                f'{base.measured_at.isoformat()}'
+            ),
+        )
+    # POLLUTION IS CLASSIFIED BEFORE THE BUDGET IS EVALUATED, and that order is
+    # load-bearing.  `evaluate_budget` raises a plain VramProbeError when
+    # `baseline > used` -- which is exactly the SHRINK/VANISH direction
+    # `classify_pollution` diagnoses, reachable whenever a baseline holder
+    # (whisper-writer at 4050 MiB) exits mid-run while the arm takes less than
+    # it released.  Evaluated first, that raise reached the CLI's generic
+    # branch and reported "the GPU probe failed" (exit 4) for a probe that
+    # worked perfectly on a card that was polluted (exit 7), and the shrink
+    # diagnosis this function had already computed was never printed.
+    pollution, pollution_reason = lms_vram.classify_pollution(
+        base.consumers, snapshot.consumers
+    )
+    if pollution is lms_vram.PollutionState.POLLUTED:
+        pollution_reason = f'{pollution_reason}. {POLLUTED_FOOTPRINT_NOTE}'
+        if base.reading.used_mib > reading.used_mib:
+            # Void, not merely unflattering: there is no footprint to report.
+            # Probe-time pollution is otherwise NOT fatal -- the report is the
+            # honest record of what was seen and is still emitted, POLLUTED,
+            # with the refusal carried by the exit code.  This narrow case is
+            # different only because the arithmetic cannot be performed at all.
+            raise lms_vram.PollutedMeasurementError(pollution_reason)
     budget = lms_vram.evaluate_budget(
         reading.used_mib,
         reading.total_mib,
-        baseline_mib=base.used_mib,
-        baseline_free_mib=base.free_mib,
+        baseline_mib=base.reading.used_mib,
+        baseline_free_mib=base.reading.free_mib,
     )
 
     measured_at = _now_iso()
@@ -1056,6 +1180,11 @@ def run_healthcheck(
         headroom_gib=budget.headroom_gib,
         verdict=budget.verdict,
         reason=budget.reason,
+        baseline_consumers=base.consumers,
+        probe_consumers=snapshot.consumers,
+        consumer_inventory_note=lms_vram.CONSUMER_INVENTORY_NOTE,
+        pollution=pollution,
+        pollution_reason=pollution_reason,
     )
 
     everything_passed = (
@@ -1077,6 +1206,12 @@ def run_healthcheck(
 
 class ReportMergeError(Exception):
     """Two per-arm reports cannot be combined into one slate artifact."""
+
+
+def _arm_ids(report: HealthReport) -> str:
+    """The arms a report speaks for, for a message that must attribute a
+    measurement to one of several inputs."""
+    return ', '.join(sorted(row.arm_id for row in report.arms))
 
 
 def merge_reports(
@@ -1102,10 +1237,49 @@ def merge_reports(
       nothing in this function noticed.  Absence is the one failure a report
       cannot describe, which is exactly why the check belongs here and not only
       in the commit-time gate.
-    * The surviving vram block is the FIRST FAILING one if any input failed, and
-      otherwise the one with the LARGEST arm footprint -- the binding
-      measurement.  Keeping only a passing block while an input failed would put
-      `overall` out of reach of its own evidence.
+    * The surviving vram block is the FIRST FAILING one if any input failed;
+      failing outranks everything because `overall` is computed from the block
+      that survives, so keeping a passing block while an input failed would put
+      `overall` out of reach of its own evidence.  Failing next to POLLUTED
+      would be worse still: a POLLUTED-but-PASS block promoted over a budget
+      FAIL flips a failing slate green.
+    * Otherwise the FIRST POLLUTED one, and only then the LARGEST arm footprint.
+      Pollution ranks above footprint because on a contended card the largest
+      footprint is the least meaningful number in the file, while the polluted
+      input is the one carrying the EVIDENCE -- the consumer lists an operator
+      needs in order to see who else held the card.
+    * A report carrying `pollution == UNMEASURED` does not merge AT ALL.  It is
+      not a measurement, so there is nothing to union it into: a v5-shaped
+      slate assembled partly from runs that never looked at the card is an
+      ASSEMBLY defect, which is exactly what EXIT_MERGE_ERROR means, and it
+      matches the refuse-and-write-nothing stance for a partial slate.  This
+      producer never emits UNMEASURED; the only way in is `--merge` reading a
+      pre-v5 file off disk.  Refusing also avoids inventing an eighth exit code
+      for a state that cannot otherwise exist.  POLLUTED is the opposite case
+      and PROPAGATES instead: it IS a measurement, exit 7 exists to report it,
+      and refusing a 7-arm slate because arm 5 was contended would throw away
+      six good measurements and downgrade a measurement fact into an assembly
+      error.
+
+    POLLUTION IS UNIONED ACROSS EVERY INPUT, not taken from the binding block:
+    POLLUTED if any input is POLLUTED, else CLEAN.  The union is applied with
+    `model_copy` so the merged block stays ONE input's real measurement rather
+    than a Frankenstein of two arms' readings -- this module's standing rule is
+    that a report describes a card that actually existed at one instant.
+
+    That leaves a residual the merged `pollution_reason` has to close: when a
+    FAILING block binds while a DIFFERENT arm was polluted, the block's
+    consumer lists belong to one arm and `pollution` to another, and
+    `render_table` prints the banner from `pollution` while printing the lists
+    from the block.  So each polluted input's reason is prefixed with the arm
+    id(s) it belongs to -- never by splicing one report's consumer lists into
+    another's block.  The prefix is dropped when there is only ONE input, where
+    there is no other arm to disambiguate from and `merge_reports([r])` must be
+    the identity on `r`'s pollution.
+
+    `overall` is deliberately untouched by pollution, matching the single-report
+    case: a polluted run yields verdict PASS / overall PASS / exit 7, and the
+    exit code is what a CI caller reads.
 
     Per-arm footprints survive on each row, so collapsing to one vram block
     loses no measurement.
@@ -1128,6 +1302,20 @@ def merge_reports(
         raise ReportMergeError(
             f'reports were measured on different GPUs {sorted(gpus)}; every '
             'verdict is relative to specific hardware'
+        )
+
+    # BEFORE any assembly: a report that never looked at the card cannot be
+    # combined into one that claims to know who held it.
+    blind = [r for r in reports if r.vram.pollution == lms_vram.PollutionState.UNMEASURED]
+    if blind:
+        raise ReportMergeError(
+            f'report(s) for arms [{"; ".join(_arm_ids(r) for r in blind)}] carry '
+            f'pollution={lms_vram.PollutionState.UNMEASURED.value}: nothing '
+            'recorded who else held the card while they were measured, so their '
+            'VRAM arithmetic cannot be combined into a slate artifact that '
+            'reads as knowing. This producer never emits it, so these were '
+            'written before schema v5 (task 3755). Re-run the arms rather than '
+            'merging a slate that is silent about a question it appears to answer'
         )
 
     rows: list[ArmRow] = []
@@ -1157,10 +1345,33 @@ def merge_reports(
             )
 
     failing = [r for r in reports if r.vram.verdict == 'FAIL']
-    binding = (
-        failing[0] if failing
-        else max(reports, key=lambda r: r.vram.arm_footprint_mib)
-    )
+    polluted = [
+        r for r in reports
+        if r.vram.pollution == lms_vram.PollutionState.POLLUTED
+    ]
+    # failing > polluted > largest footprint. See the docstring: the order is
+    # what keeps `overall` reachable from its own evidence AND still puts the
+    # pollution evidence in front of an operator whenever nothing failed.
+    if failing:
+        binding = failing[0]
+    elif polluted:
+        binding = polluted[0]
+    else:
+        binding = max(reports, key=lambda r: r.vram.arm_footprint_mib)
+
+    if not polluted:
+        merged_pollution = lms_vram.PollutionState.CLEAN
+        merged_reason = ''
+    else:
+        merged_pollution = lms_vram.PollutionState.POLLUTED
+        merged_reason = (
+            # One input: no other arm to disambiguate from, and merging one
+            # report must leave its pollution exactly as it found it.
+            polluted[0].vram.pollution_reason if len(reports) == 1
+            else ' | '.join(
+                f'{_arm_ids(r)}: {r.vram.pollution_reason}' for r in polluted
+            )
+        )
 
     everything_passed = (
         all(row.verdict == 'PASS' for row in rows)
@@ -1171,19 +1382,71 @@ def merge_reports(
         measured_at=max(r.measured_at for r in reports),
         gpu=binding.gpu,
         arms=rows,
-        vram=binding.vram,
+        # The binding block's OWN measurement, with only the unioned pollution
+        # overlaid -- never a splice of two arms' readings.
+        vram=binding.vram.model_copy(update={
+            'pollution': merged_pollution,
+            'pollution_reason': merged_reason,
+        }),
         overall='PASS' if everything_passed else 'FAIL',
     )
 
 
 def exit_code_for(report: HealthReport) -> int:
-    """An arm failure outranks a budget failure: it is the more actionable of
-    the two, and the budget block is right there in the artifact either way."""
+    """Arm failure > pollution > budget failure.
+
+    An arm failure outranks both: it is the most actionable of the three, and
+    the budget block is right there in the artifact either way.  Pollution
+    cannot explain a WRONG answer -- it only voids the VRAM arithmetic.
+
+    Pollution outranks a budget failure because a budget FAIL measured on a
+    contended card is not a budget failure at all.  Returning EXIT_VRAM_FAILED
+    there would send an operator to shrink an arm that may fit perfectly well
+    once the intruder releases the card.  And a POLLUTED block is never
+    EXIT_OK, however sound the arithmetic looks: `verdict` is computed from a
+    subtraction whose subject moved, so a PASS there is a pass for the wrong
+    reason, and the exit code is the only thing a CI caller reads.
+    """
     if any(row.verdict == 'FAIL' for row in report.arms):
         return EXIT_ARM_FAILED
+    if report.vram.pollution == lms_vram.PollutionState.POLLUTED:
+        return EXIT_VRAM_POLLUTED
     if report.vram.verdict == 'FAIL':
         return EXIT_VRAM_FAILED
     return EXIT_OK
+
+
+def _wrapped(text: str) -> list[str]:
+    """Wrap a report string for the terminal without ever splitting a token.
+
+    `break_long_words` and `break_on_hyphens` are both OFF on purpose.  These
+    strings carry process names and paths -- `/usr/local/lib/ollama/llama-server`
+    is one hyphenated 38-character token -- and the operator's next move is to
+    search for that exact string. A wrap that split it at the hyphen would leave
+    a name in the output that matches nothing on the machine. An over-long line
+    is a far smaller cost than an unsearchable one.
+    """
+    return textwrap.wrap(
+        text, width=88, initial_indent='  ', subsequent_indent='  ',
+        break_long_words=False, break_on_hyphens=False,
+    )
+
+
+def _consumer_lines(label: str, consumers: Sequence[lms_vram.GpuConsumer]) -> list[str]:
+    """One inventory, as terminal lines.
+
+    An empty list renders as an explicit `(none)` rather than nothing at all:
+    a silently absent section is indistinguishable from a section this build
+    does not render, and "no CUDA compute apps beside a 3312 MiB baseline" is a
+    real, explainable reading on this host -- the graphics contexts holding it
+    are invisible to `--query-compute-apps`.
+    """
+    if not consumers:
+        return [f'  {label}: (none)']
+    return [f'  {label}:'] + [
+        f'    pid {c.pid} {c.process_name} — {c.used_mib} MiB ({c.used_gib} GiB)'
+        for c in consumers
+    ]
 
 
 def render_table(report: HealthReport) -> str:
@@ -1191,7 +1454,9 @@ def render_table(report: HealthReport) -> str:
 
     Takes the report and NOTHING else -- no arms, no manifest, no GPU -- so
     there is nothing left for it to recompute and the text can never contradict
-    the JSON beside it.
+    the JSON beside it.  That extends to the pollution banner: it is printed on
+    the block's own `pollution` field, never re-derived from the consumer lists
+    printed beside it, so the two cannot drift apart.
     """
     headers = ('ARM', 'AXIS', 'STACK', 'ENDPOINT', 'VERDICT', 'REASON', 'MS')
     rows = [
@@ -1236,13 +1501,38 @@ def render_table(report: HealthReport) -> str:
             f'{report.vram.nominal_ceiling_gib} GiB, measured operating budget '
             f'on this host {report.vram.operating_budget_gib} GiB',
             f'  {report.vram.reason}',
-            '',
-            f'OVERALL: {report.overall}',
         ]
     )
+
+    # Who else held the card.  Printed under the VRAM lines because it is what
+    # decides whether those lines mean anything at all.
+    out.append('')
+    out.append('non-arm GPU consumers')
+    out.extend(_consumer_lines('at baseline, before the arm started',
+                               report.vram.baseline_consumers))
+    out.extend(_consumer_lines('at the probe reading (the arm included)',
+                               report.vram.probe_consumers))
+    if report.vram.consumer_inventory_note:
+        out.extend(_wrapped(report.vram.consumer_inventory_note))
+
+    out.extend(['', f'OVERALL: {report.overall}'])
     for row in report.arms:
         if row.verdict == 'FAIL':
             out.append(f'  {row.arm_id}: {row.reason} — {row.detail}')
+
+    # LAST, so it is the final thing on the screen -- and deliberately BELOW the
+    # OVERALL line rather than above it.  `overall` is computed from the row
+    # verdicts and the vram verdict (which render_table must not recompute), so
+    # a polluted run can and does print `OVERALL: PASS`.  Left unqualified above
+    # the banner that is a flat contradiction; underneath it, the banner is the
+    # last word and says exactly which verdicts it voids.
+    #
+    # Printed from the block's own `pollution` field, NOT re-derived from the
+    # consumer lists above, so the banner and the JSON cannot drift apart.
+    if report.vram.pollution == lms_vram.PollutionState.POLLUTED:
+        out.extend(['', '*** VRAM MEASUREMENT POLLUTED ***'])
+        out.extend(_wrapped(POLLUTED_BANNER_BODY))
+        out.extend(_wrapped(report.vram.pollution_reason))
     return '\n'.join(out)
 
 
@@ -1318,6 +1608,30 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         report = run_healthcheck(arms)
+    except (lms_vram.PollutedBaselineError, lms_vram.PollutedMeasurementError) as exc:
+        # BEFORE the VramProbeError branch below, which they subclass.  In the
+        # other order this refusal would be reported as "the GPU probe failed"
+        # and blame nvidia-smi for a perfectly healthy card.  Nothing is written
+        # on refusal, for the same reason as the merge and no-active-arms paths:
+        # a file on disk would later read as "the slate was checked".
+        print(
+            f'lms_healthcheck: no report was produced: {exc}',
+            file=sys.stderr,
+        )
+        return EXIT_VRAM_POLLUTED
+    except lms_vram.StaleBaselineError as exc:
+        # ALSO before the VramProbeError branch it subclasses, and for the same
+        # reason as the pollution branch above: through the generic handler this
+        # prints "GPU probe failed" and sends an operator to debug nvidia-smi
+        # on a card that answered perfectly.  The exception's own message names
+        # the file and the `lms_ctl start <arm>` that fixes it; this branch only
+        # has to stop the wrong prefix being stapled to the front of it.
+        print(
+            f'lms_healthcheck: no usable baseline, so no report was produced: '
+            f'{exc}',
+            file=sys.stderr,
+        )
+        return EXIT_STALE_BASELINE
     except lms_vram.VramProbeError as exc:
         print(
             f'lms_healthcheck: GPU probe failed, so no report was produced: {exc}',

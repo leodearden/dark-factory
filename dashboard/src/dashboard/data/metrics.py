@@ -29,7 +29,12 @@ from dashboard.data.cap_history import (
     compute_overlap_ms,
     read_cap_intervals,
 )
-from dashboard.data.mcp_fanout import describe_exc, first_success
+from dashboard.data.mcp_fanout import (
+    PreformattedFanoutError,
+    describe_exc,
+    fanout_label,
+    first_success,
+)
 from dashboard.data.memory import (
     get_curator_state,
     get_memory_status,
@@ -151,6 +156,10 @@ async def fan_out_list_tickets(
             # cause at all. Reporting is left to first_success — logging a
             # WARNING here too gave one failure two identical-level lines.
             except TimeoutError:
+                # Plain ValueError, deliberately: this message carries no
+                # pre-rendered type, so first_success's single 'ValueError: '
+                # prefix is correct rather than doubled. The two branches
+                # below DO pre-render, hence PreformattedFanoutError there.
                 raise ValueError(
                     f'timed out after {timeout:.1f}s (project_root={root_str})'
                 ) from None
@@ -164,7 +173,7 @@ async def fan_out_list_tickets(
                     root_str,
                     exc_info=True,
                 )
-                raise ValueError(
+                raise PreformattedFanoutError(
                     f'{describe_exc(exc)} (project_root={root_str})'
                 ) from None
             except Exception as exc:
@@ -183,14 +192,14 @@ async def fan_out_list_tickets(
                     root_str,
                     exc_info=True,
                 )
-                raise ValueError(
+                raise PreformattedFanoutError(
                     f'unexpected {describe_exc(exc)} (project_root={root_str})'
                 ) from None
 
         return await first_success(
             config.fused_memory_urls,
             _call,
-            log_label='list_tickets',
+            log_label=fanout_label('list_tickets', root_str),
             offline_result=lambda errs: (0, []),
         )
 

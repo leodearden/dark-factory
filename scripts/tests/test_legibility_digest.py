@@ -23,11 +23,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
+from orchestrator.agents.briefing import MEMORY_CONTEXT_CAVEAT
+from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT
 
 
 def _assistant(*blocks):
@@ -308,7 +311,16 @@ class TestAsUnreadableFileError:
         # OSError. A shape wrongly added here would be caught and re-wrapped
         # rather than propagating, and an OSError in particular must
         # keep reaching callers by its own inheritance.
-        assert (UnicodeDecodeError,) == inventory_mod.UNREADABLE_FILE_ERRORS
+        #
+        # Being a tuple is itself load-bearing and asserted separately: it
+        # is used directly as an `except UNREADABLE_FILE_ERRORS` clause in
+        # digest.load_transcript, and Python rejects a list there with
+        # "catching classes that do not inherit from BaseException is not
+        # allowed" -- only on the rare corrupt-file path. The comparison
+        # below wraps in tuple() to satisfy ruff SIM300, which would
+        # otherwise let a list-valued constant pass unnoticed.
+        assert isinstance(inventory_mod.UNREADABLE_FILE_ERRORS, tuple)
+        assert tuple(inventory_mod.UNREADABLE_FILE_ERRORS) == (UnicodeDecodeError,)
         assert not any(
             issubclass(exc_type, OSError)
             for exc_type in inventory_mod.UNREADABLE_FILE_ERRORS
@@ -1295,10 +1307,21 @@ class TestClassifyAgentClass:
 # ---------------------------------------------------------------------------
 # render_frontmatter — hand-rendered '---'-delimited YAML block, PRD Sec 7.2
 # key order verbatim (session, cwd, encoded_dir, agent_class, date,
-# size_bytes, score, signal_counts), signal_counts nested in order
-# (tool_error, self_correct, not_found, df_guard, interrupt). Must round-trip
-# via yaml.safe_load -- NOT yaml.safe_dump (design decision: fixed key order,
-# explicit formatting, deterministic byte-stable output).
+# size_bytes, score, n_user_turns, signal_counts), signal_counts nested in
+# order (tool_error, self_correct, not_found, df_guard, interrupt). Must
+# round-trip via yaml.safe_load -- NOT yaml.safe_dump (design decision: fixed
+# key order, explicit formatting, deterministic byte-stable output).
+#
+# n_user_turns is present because of confusion-census-2026-07-31 R2 / §1.2:
+# score_signals adds SIGNAL_WEIGHTS['user_turn'] * n_user_turns on top of the
+# weighted signal_counts, but the frontmatter used to render only the five
+# counts -- so a session whose single "user turn" was a pasted report showed
+# `score: 5.0` beside an all-zero `signal_counts` and a reader could not
+# reconstruct the score from the rendered fields. It is a top-level key, NOT
+# a sixth signal_counts entry: signal_counts is specifically signal_counts()'s
+# five detector hit-counts (mirrored by sampling.SignalCounts and read by
+# _warn_if_body_evicted's any(counts.values()) guard), and n_user_turns is
+# neither produced by that function nor a detector hit count.
 # ---------------------------------------------------------------------------
 
 def _frontmatter_meta():
@@ -1310,6 +1333,8 @@ def _frontmatter_meta():
         'date': '2026-07-14',
         'size_bytes': 512,
         'score': 12.5,
+        'n_user_turns': 3,
+        'truncated_items': 0,
         'signal_counts': {
             'tool_error': 1,
             'self_correct': 2,
@@ -1341,7 +1366,8 @@ class TestRenderFrontmatter:
 
         assert top_level_keys == [
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
-            'size_bytes', 'score', 'instrument_version', 'signal_counts',
+            'size_bytes', 'score', 'n_user_turns', 'truncated_items',
+            'instrument_version', 'signal_counts',
         ]
 
     def test_signal_counts_nested_in_contract_order(self):
@@ -1366,6 +1392,32 @@ class TestRenderFrontmatter:
 
         assert loaded == meta
 
+    def test_n_user_turns_renders_as_bare_numeric(self):
+        # Mirrors the size_bytes/score treatment: numeric frontmatter fields
+        # are emitted as BARE YAML scalars (every other top-level key is
+        # double-quoted via _yaml_dquote), so they load back as numbers
+        # rather than strings.
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        assert 'n_user_turns: 3' in block.splitlines()
+
+        inner = '\n'.join(block.splitlines()[1:-1])
+        loaded = yaml.safe_load(inner)
+
+        assert loaded['n_user_turns'] == 3
+        assert isinstance(loaded['n_user_turns'], int)
+
+    def test_truncated_items_renders_as_bare_numeric(self):
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        assert 'truncated_items: 0' in block.splitlines()
+
+        inner = '\n'.join(block.splitlines()[1:-1])
+        loaded = yaml.safe_load(inner)
+
+        assert loaded['truncated_items'] == 0
+        assert isinstance(loaded['truncated_items'], int)
+
     def test_instrument_version_constant_is_an_int_at_or_past_two(self):
         # 1 is the implicit pre-3610 baseline (never emitted); this change
         # is generation 2.
@@ -1373,12 +1425,16 @@ class TestRenderFrontmatter:
         assert mod.DIGEST_INSTRUMENT_VERSION >= 2
 
     def test_instrument_version_is_appended_last_to_the_key_tuple(self):
-        # Appended, never inserted: the PRD Sec 7.2 prefix must stay
-        # byte-identical so downstream frontmatter diffs stay stable.
+        # Appended, never inserted: a generation marker belongs after the
+        # measurements it describes, so downstream frontmatter diffs stay
+        # stable as the contract grows. Task 3614's n_user_turns /
+        # truncated_items were themselves appended ahead of it (see
+        # TestFrontmatterKeyOrder), which lengthens the prefix without
+        # displacing this key from last.
         assert mod.FRONTMATTER_KEYS[-1] == 'instrument_version'
         assert mod.FRONTMATTER_KEYS[:-1] == (
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
-            'size_bytes', 'score',
+            'size_bytes', 'score', 'n_user_turns', 'truncated_items',
         )
 
     def test_instrument_version_emits_as_a_bare_numeric_scalar(self):
@@ -1479,17 +1535,21 @@ def _split_frontmatter(digest):
 
 # ---------------------------------------------------------------------------
 # is_harness_injected_turn / iter_user_turns exclusion -- R1 (confusion
-# census 2026-07-24 Sec 4): a harness-injected briefing turn (the
-# orchestrator's '# Context' + '## Agent Identity' + '# Task' preamble, or
-# the trickle coder's system-prompt preamble) is typed into the transcript
-# as ordinary user-role text (isMeta=False -- it really is the first "user"
-# turn Claude Code sees), so it was previously indistinguishable from a
-# genuine human correction: it inflated both the gold user_corrections
-# section and score's n_user_turns component. Exclusion is by CONTENT (all
-# three headings must co-occur, line-anchored, mirroring
+# census 2026-07-24 Sec 4): a harness-injected turn -- the orchestrator's
+# '# Context' + '## Agent Identity' + '# Task' briefing preamble, the
+# trickle coder's system-prompt preamble, or the harness's
+# post-interruption resume prompt (e.g. after a usage-limit cap) -- is
+# typed into the transcript as ordinary user-role text (isMeta=False -- it
+# really is the first "user" turn Claude Code sees), so it was previously
+# indistinguishable from a genuine human correction: it inflated both the
+# gold user_corrections section and score's n_user_turns component. Three
+# shapes are covered, not two: the briefing preamble is excluded by CONTENT
+# co-occurrence (all three headings must co-occur, line-anchored, mirroring
 # ORCHESTRATED_TASK_MARKERS' all() guard) so an ordinary human turn that
 # merely mentions one heading, or quotes one mid-sentence, is never
-# over-excluded.
+# over-excluded; the trickle-coder preamble and the resume prompt are each
+# excluded by a plain case-insensitive substring match
+# (HARNESS_PROMPT_MARKERS).
 # ---------------------------------------------------------------------------
 
 def _briefing_text(body_filler='Project overview and recent decisions go here.'):
@@ -1532,6 +1592,81 @@ _TRICKLE_CODER_PREAMBLE = (
 )
 """Literal prefix of scripts/legibility/coder.py:174 build_prompt's
 harness-authored preamble."""
+
+
+def _memory_context_block(body='## Project Context\n\n{...}'):
+    """Build the real shape of a LONE '# Context' memory-context block --
+    ``_get_memory_context``'s recalled-sections return path
+    (orchestrator/src/orchestrator/agents/briefing.py) WITHOUT its
+    '## Agent Identity' / '# Task' siblings. This is exactly the shape
+    HARNESS_BRIEFING_HEADINGS' all()-co-occurrence guard admits today:
+    only one of its three headings is present."""
+    return '# Context\n\n' + MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory') + '\n\n' + body
+
+
+_DROP_NOTE_EXAMPLE = (
+    '2 memory result slot(s) across 1 query were tagged to another project '
+    'and filtered out'
+)
+"""Representative drop_note text -- the shape
+``_get_memory_context`` builds it in
+(``f'{foreign_dropped} memory result slot(s) across {queries_fired} '
+f'{query_word} were tagged to another project and filtered out'``)."""
+
+_NO_RECALLED_SECTIONS_VARIANTS = (
+    '# Context\n\n_Memory unavailable — proceed with codebase exploration._',
+    (
+        '# Context\n\n_Memory unavailable — proceed with codebase '
+        f'exploration. Note: {_DROP_NOTE_EXAMPLE} before the failure._'
+    ),
+    '# Context\n\n_No memory context available._',
+    f'# Context\n\n_No memory context available ({_DROP_NOTE_EXAMPLE})._',
+)
+"""The four literal shapes ``_get_memory_context`` returns when
+``recalled_sections`` is empty
+(orchestrator/src/orchestrator/agents/briefing.py:1321-1331) -- two
+literal families (memory-unavailable / no-memory-context available), each
+with a plain and a drop_note-bearing variant. Not lockstep-importable
+like MEMORY_CONTEXT_CAVEAT: these are inlined string literals in
+``_get_memory_context``'s body, not a module-level constant."""
+
+
+def _recalled_sections_with_trailing_unavailable_note():
+    """The recalled-sections return path's fullest composite shape
+    (orchestrator/src/orchestrator/agents/briefing.py:1339-1350) -- the
+    fifth of ``_get_memory_context``'s five return paths, distinct from
+    the four ``_NO_RECALLED_SECTIONS_VARIANTS`` shapes above (those all
+    have recalled_sections EMPTY; this one has it non-empty). Builds a
+    caveat carrying its own drop_note suffix (a foreign-tagged result was
+    filtered from an earlier query), a genuinely recalled section, AND
+    the trailing "_Memory unavailable for the remaining queries..._"
+    note appended when a LATER query then fails. LOCKSTEP via
+    MEMORY_CONTEXT_CAVEAT -- pins that HARNESS_CONTEXT_BLOCK_MARKERS'
+    caveat-prefix marker alone still covers this composite, not just the
+    plain caveat-only shape _memory_context_block() builds."""
+    caveat = MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory')
+    caveat += f'\n\n_In total, {_DROP_NOTE_EXAMPLE}._'
+    return (
+        '# Context\n\n' + caveat + '\n\n## Project Context\n\nSome overview.'
+        '\n\n---\n\n_Memory unavailable for the remaining queries — proceed '
+        'with codebase exploration for anything not covered above._'
+    )
+
+
+def _resume_and_context_block_records():
+    """The confusion-census sighting shape (session b976febe), minus its
+    one genuine correction: a turn-0 lone '# Context' memory block,
+    followed by the usage-limit resume prompt at two separate later
+    turns, and nothing else -- no tool_use/tool_result/assistant record
+    at all, so every one of the five signal detectors reports zero hits
+    regardless of the R1 exclusion filter. Used to pin that once R1
+    excludes all three turns, a session like this no longer presents as
+    gold-bearing."""
+    return [
+        _with_session_meta(_user_text(_memory_context_block())),
+        _with_session_meta(_user_text(CAP_HIT_RESUME_PROMPT)),
+        _with_session_meta(_user_text(CAP_HIT_RESUME_PROMPT)),
+    ]
 
 
 class TestHarnessInjectedTurnFilter:
@@ -1720,6 +1855,355 @@ class TestHarnessInjectedTurnFilter:
 
         assert mod.signal_counts(with_briefing) == mod.signal_counts(base)
 
+    @pytest.mark.parametrize(
+        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
+        ids=['usage_limit', 'crash_recovery'],
+    )
+    def test_resume_prompt_is_excluded_lockstep(self, resume_prompt):
+        # LOCKSTEP: asserted against each canonical constant, not a
+        # restated literal, so a harness rewording of either resume prompt
+        # turns this suite red instead of silently drifting out of
+        # coverage. One parametrize row per resume prompt -- a future
+        # resume prompt is covered by adding one more row.
+        assert mod.is_harness_injected_turn(resume_prompt) is True
+
+    def test_crash_recovery_resume_prompt_excluded_from_iter_user_turns(self):
+        # The sibling of the usage-limit resume prompt: same defect class
+        # (harness-injected continuation boilerplate typed into the
+        # transcript as an ordinary user turn), different cause
+        # (orchestrator restart, not a usage-cap interrupt).
+        records = [_user_text(CRASH_RECOVERY_RESUME_PROMPT)]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_usage_limit_resume_prompt_excluded_from_iter_user_turns(self):
+        # Reproduces the sighting verbatim: the resume prompt appears both
+        # before and after a genuine correction. Neither occurrence must
+        # surface, while the genuine correction survives with its original
+        # record index preserved.
+        records = [
+            _user_text(CAP_HIT_RESUME_PROMPT),
+            _user_text('please fix the bug'),
+            _user_text(CAP_HIT_RESUME_PROMPT),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [t['text'] for t in turns] == ['please fix the bug']
+        assert [t['index'] for t in turns] == [1]
+
+    def test_usage_limit_mentioned_in_passing_is_not_excluded(self):
+        # Must NOT regress: a genuine human turn that merely MENTIONS a
+        # usage limit in passing -- not the harness's exact resume prompt
+        # -- stays in the gold bucket.
+        records = [_user_text('we keep hitting a usage limit, can you shorten the run?')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == 'we keep hitting a usage limit, can you shorten the run?'
+
+    def test_lone_memory_context_block_is_excluded(self):
+        # LOCKSTEP: built from the imported MEMORY_CONTEXT_CAVEAT constant,
+        # not a restated copy, so a caveat rewording turns this suite red.
+        records = [_user_text(_memory_context_block())]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_bare_context_heading_over_human_prose_is_not_excluded(self):
+        # Pins that the co-occurrence guard is NOT being weakened by the
+        # new arm: a genuine human turn that merely opens with a
+        # '# Context' heading, with none of the memory-context body
+        # markers, stays in the gold bucket.
+        records = [_user_text('# Context\n\nwe discussed this yesterday; please redo it')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+
+    def test_caveat_mid_prose_without_heading_is_not_excluded(self):
+        # Pins that the new arm is still a CONJUNCTION with the
+        # line-anchored heading: quoting the caveat mid-prose, with no
+        # '# Context' heading of its own, must not trigger exclusion.
+        records = [_user_text(
+            'Someone pasted this: ' + MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory')
+        )]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+
+    @pytest.mark.parametrize(
+        'text', _NO_RECALLED_SECTIONS_VARIANTS,
+        ids=[
+            'memory_unavailable', 'memory_unavailable_with_drop_note',
+            'no_memory_context', 'no_memory_context_with_drop_note',
+        ],
+    )
+    def test_no_recalled_sections_variant_is_excluded(self, text):
+        # Exhaustive over _get_memory_context's four no-recalled-sections
+        # return paths, not just the caveat-bearing happy path covered
+        # above -- the marker set must cover every output of that
+        # function, not merely its most common case.
+        records = [_user_text(text)]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_recalled_sections_with_trailing_unavailable_note_is_excluded(self):
+        # The fifth _get_memory_context return path (recalled_sections
+        # non-empty), at its fullest composite: a drop_note folded into
+        # the caveat PLUS a trailing memory-unavailable note from a later
+        # failed query. Both suffixes are appended AFTER the caveat
+        # prefix HARNESS_CONTEXT_BLOCK_MARKERS matches on, so the caveat
+        # marker alone must still cover this shape -- not just the plain
+        # caveat-only shape _memory_context_block() builds.
+        records = [_user_text(_recalled_sections_with_trailing_unavailable_note())]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_render_digest_zero_signal_session_has_no_gold_section(self):
+        # Acceptance test at the render_digest level, reproducing the
+        # sighting verbatim (session b976febe) minus its one genuine
+        # correction: a zero-signal session that used to present as
+        # gold-bearing (3 harness-injected turns, every signal_counts
+        # bucket 0) must no longer do so once R1's exclusion covers all
+        # three shapes. Asserted as "every bucket is 0" rather than
+        # against a hardcoded key set: the bucket vocabulary grows
+        # independently of this filter (task 4027 added
+        # 'designed_outcome'), and pinning the key set here would turn
+        # every such addition into a spurious failure of an R1 test.
+        records = _resume_and_context_block_records()
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert set(meta['signal_counts']) >= {
+            'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
+        }
+        assert all(count == 0 for count in meta['signal_counts'].values())
+        assert '## User Corrections' not in digest
+        # n_user_turns inflation is gone: score_signals(all-zero counts, 0).
+        assert meta['score'] == 0.0
+        assert 'previous run was interrupted' not in body
+        assert '# Context' not in body
+
+    def test_render_digest_retains_only_genuine_correction_alongside_excluded_turns(self):
+        # Non-regression half of the acceptance test: a genuine human
+        # correction added to the same zero-signal session must still
+        # surface, and ONLY it -- the excluded turns contribute nothing to
+        # either the gold section or the score.
+        records = _resume_and_context_block_records() + [
+            _with_session_meta(_user_text('This is wrong, please redo it.')),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Corrections' in digest
+        correction_lines = [line for line in body.splitlines() if line.startswith('- (turn')]
+        assert correction_lines == ['- (turn 3) This is wrong, please redo it.']
+        assert 'previous run was interrupted' not in body
+        assert '# Context' not in body
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 1)
+
+    def test_signal_counts_unaffected_by_resume_and_context_block_turns(self):
+        # Mirrors test_signal_counts_unaffected_by_signal_free_briefing_turn,
+        # but for the two NEW exclusion arms this task adds (resume prompt,
+        # lone context block): prepending both to a records list that
+        # already trips every detector must not perturb any of the five
+        # signal_counts -- the filter must not leak into
+        # _signal_text_sources.
+        base = _all_signals_records()
+        augmented = [
+            _user_text(CAP_HIT_RESUME_PROMPT),
+            _user_text(_memory_context_block()),
+        ] + base
+
+        assert mod.signal_counts(augmented) == mod.signal_counts(base)
+
+    def test_classify_agent_class_still_detects_markers_inside_resume_turn(self):
+        # Sibling of test_classify_agent_class_still_detects_markers_inside_
+        # excluded_turn, for the resume-prompt exclusion arm specifically:
+        # classify_agent_class reads _signal_text_sources, a carrier never
+        # filtered by iter_user_turns, so orchestrated-task markers living
+        # inside an otherwise-excluded resume turn must still be found.
+        text = (
+            CAP_HIT_RESUME_PROMPT
+            + '\nTask ID: 4275\nWorktree: /home/leo/src/dark-factory/.worktrees/4275\n'
+        )
+        records = [_user_text(text)]
+
+        assert mod.iter_user_turns(records) == []
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
+
+
+# ---------------------------------------------------------------------------
+# Run-review-prompt exclusion via is_harness_injected_turn -- R1 (confusion
+# census 2026-07-31 §1.1 facet (b), :81/:85): 5 sightings across 5 sessions
+# where the flagged "User Correction" is a full Reconciliation Run Review.
+# The generator is a literal f-string,
+# fused-memory/src/fused_memory/reconciliation/judge.py:411
+# (``_build_review_prompt``), so the shape is greppable rather than guessed.
+#
+# The census called this "pasted into a turn for review/discussion", i.e. a
+# genuine human turn. Transcript forensics on all five sightings refutes
+# that: the judge dispatches the prompt through shared.cli_invoke ->
+# `claude --print` (judge_llm_provider defaults to 'claude_cli'), and in each
+# transcript the run-review block is the FIRST user record, preceded only by
+# harness bookkeeping (queue-operation enqueue/dequeue, an
+# `entrypoint: sdk-cli` attachment), with no ordinary human turn anywhere.
+# So it is harness-INJECTED, exactly like facet (a)'s briefing block -- one
+# source class, two injectors -- which is why the heading set lives in
+# HARNESS_HEADING_SETS rather than behind a separate "pasted report"
+# predicate that would assert a human typed it.
+#
+# Exclusion is by line-anchored heading CO-OCCURRENCE (all(), not any()),
+# the same false-positive guard HARNESS_BRIEFING_HEADINGS and
+# ORCHESTRATED_TASK_MARKERS already use: user corrections are gold (PRD Sec
+# 5) and the highest-priority digest section, so over-excluding a genuine
+# human turn is strictly the worse error.
+# ---------------------------------------------------------------------------
+
+def _recon_run_review_text():
+    """Build the text of an injected reconciliation-run-review user turn --
+    the literal shape ``ReconciliationJudge._build_review_prompt`` emits
+    (fused-memory/src/fused_memory/reconciliation/judge.py:411-476): a
+    '## Reconciliation Run Review' heading, a '### Run Metadata' block whose
+    first bullet is '- Run ID: {run.id}', a '### Stage Reports' block of
+    ``json.dumps`` output, and '### MCP Actions (N total)' / '### Journal
+    Entries (N total)' blocks. The run id matches the one the census quotes
+    verbatim at §1.1 (:85).
+
+    Deliberately free of every detector literal (NOT_FOUND_PATTERNS,
+    DF_GUARD_PATTERNS, INTERRUPT_PATTERN, SELF_CORRECTION_PATTERNS) so
+    test_signal_counts_unaffected_by_pasted_report_turn isolates the
+    iter_user_turns filter rather than an incidental pattern hit.
+    """
+    return (
+        '## Reconciliation Run Review\n\n'
+        '### Run Metadata\n'
+        '- Run ID: 84e6ce03-1f2a-4c7b-9d84-6b0f1a2e35cc\n'
+        '- Project: dark_factory\n'
+        '- Type: targeted\n'
+        '- Trigger: task_status_change\n'
+        '- Events processed: 12\n'
+        '- Status: completed\n\n'
+        '### Stage Reports\n'
+        '[\n  {\n    "stage": 1,\n    "status": "completed",\n'
+        '    "summary": "consolidated 4 memories"\n  }\n]\n\n'
+        '### MCP Actions (2 total)\n'
+        '[\n  {\n    "tool": "add_memory",\n    "created_at": "2026-07-31T09:00:00Z"\n  }\n]\n\n'
+        '### Journal Entries (5 total)\n'
+        '[\n  {\n    "kind": "stage_start",\n    "created_at": "2026-07-31T09:00:00Z"\n  }\n]\n\n'
+        'Review this run and provide your verdict as JSON.\n'
+    )
+
+
+class TestRunReviewPromptTurnFilter:
+    def test_recon_run_review_turn_is_excluded(self):
+        records = [_user_text(_recon_run_review_text())]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_ordinary_correction_after_pasted_report_retained_with_index(self):
+        records = [
+            _user_text(_recon_run_review_text()),
+            _user_text('This is wrong, please redo it.'),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [t['text'] for t in turns] == ['This is wrong, please redo it.']
+        assert [t['index'] for t in turns] == [1]
+
+    def test_single_report_heading_alone_is_not_excluded(self):
+        # Only ONE of the co-occurring headings, and the rest of the turn is
+        # a genuine human question -- must not alone trigger exclusion
+        # (all()-not-any(), mirroring test_single_heading_alone_is_not_excluded).
+        text = '## Reconciliation Run Review\n\nwhat happened in this run?'
+        records = [_user_text(text)]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == text
+
+    def test_report_heading_mentioned_mid_sentence_is_not_excluded(self):
+        # Line-anchored matching: the headings appearing mid-sentence (not
+        # each as its own stripped line) never count as headings, even when
+        # every one of them is mentioned.
+        records = [_user_text(
+            'The ## Reconciliation Run Review prompt emits ### Run Metadata '
+            'and ### Stage Reports — please document that in the runbook.'
+        )]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+
+    def test_render_digest_excludes_pasted_report_from_body_and_n_user_turns(self):
+        records = [
+            _with_session_meta(_user_text(_recon_run_review_text())),
+            _with_session_meta(_user_text('This is wrong, please redo it.')),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert 'This is wrong, please redo it.' in body
+        assert 'Run ID:' not in body
+        assert '### Stage Reports' not in body
+        # Census §3.1: clusters 1.1(b) and 1.2 are one event seen from two
+        # surfaces, so the single iter_user_turns filter must fix the body
+        # AND the score together (today: n_user_turns would be 2).
+        assert meta['n_user_turns'] == 1
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 1)
+
+    def test_signal_counts_unaffected_by_pasted_report_turn(self):
+        # The filter must not leak into _signal_text_sources: prepending a
+        # signal-free pasted report must not perturb any of the five counts.
+        base = _all_signals_records()
+        with_report = [_user_text(_recon_run_review_text())] + base
+
+        assert mod.signal_counts(with_report) == mod.signal_counts(base)
+
+    def test_run_review_prompt_is_classified_as_harness_injected(self):
+        # The run-review block IS harness-injected -- the judge's own prompt,
+        # recorded as the session's sole user record by `claude --print`
+        # (verified on all five census sightings) -- so it belongs to
+        # is_harness_injected_turn rather than to a separate predicate whose
+        # name would assert a human typed it.
+        assert mod.is_harness_injected_turn(_recon_run_review_text()) is True
+        assert mod.is_harness_injected_turn(_briefing_text()) is True
+
+    def test_each_harness_heading_set_is_matched_independently(self):
+        # HARNESS_HEADING_SETS is an any()-over-sets fan-out with two real
+        # entries: a turn carrying ONE set's headings is excluded without
+        # needing the other's. Cross-set heading mixtures are not a match.
+        assert mod.HARNESS_BRIEFING_HEADINGS in mod.HARNESS_HEADING_SETS
+        assert mod.RECON_RUN_REVIEW_HEADINGS in mod.HARNESS_HEADING_SETS
+
+        crossed = '\n\n'.join(
+            ('# Context', '### Stage Reports', 'so what should I do here?'),
+        )
+        assert mod.is_harness_injected_turn(crossed) is False
+
+    def test_both_heading_sets_use_the_same_line_anchoring(self):
+        # One shared normalization (_has_all_heading_lines), so the two sets
+        # cannot silently diverge on what counts as a heading line: leading
+        # and trailing whitespace and case are stripped for both alike.
+        for headings in mod.HARNESS_HEADING_SETS:
+            padded = '\n'.join(f'  {heading.upper()}  ' for heading in headings)
+
+            assert mod.is_harness_injected_turn(padded) is True
+            assert mod.is_harness_injected_turn(' | '.join(headings)) is False
+
 
 class TestRenderDigest:
     def test_includes_heading_for_each_present_signal_class(self):
@@ -1770,6 +2254,24 @@ class TestRenderDigest:
         meta = yaml.safe_load(frontmatter_yaml)
 
         assert meta['encoded_dir'] == 'custom-encoded-dir-name'
+
+    def test_frontmatter_score_is_reconstructible_from_rendered_fields(self):
+        # confusion-census-2026-07-31 R2 / §1.2: score_signals' dominant
+        # component is SIGNAL_WEIGHTS['user_turn'] * n_user_turns, which the
+        # frontmatter used to omit entirely -- so `score` could not be
+        # checked against `signal_counts` by a reader of the digest alone.
+        # With n_user_turns rendered, the score is fully reconstructible.
+        records = _all_signals_records()
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['n_user_turns'] == len(mod.iter_user_turns(records))
+        assert meta['score'] == mod.score_signals(
+            meta['signal_counts'], meta['n_user_turns'],
+        )
 
     def test_size_bytes_equals_actual_rendered_byte_length(self):
         digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
@@ -1896,7 +2398,63 @@ class TestPerItemByteCap:
         capped = mod._cap_item(line, cap)
 
         assert len(capped.encode('utf-8')) <= cap
-        assert capped.endswith(mod.ITEM_TRUNCATION_MARKER)
+        # 'in', not endswith: the marker is a stable greppable PREFIX with
+        # a variable quantified tail (see the R1 tests below).
+        assert mod.ITEM_TRUNCATION_MARKER in capped
+
+    def test_truncation_marker_is_a_stable_greppable_prefix(self):
+        # confusion-census-2026-07-31 R1: the marker gains a quantified
+        # tail, but the constant itself stays a fixed ASCII PREFIX so every
+        # existing `MARKER in digest` grep/test keeps working unchanged.
+        assert mod.ITEM_TRUNCATION_MARKER == '... [item truncated'
+
+    def test_truncation_marker_reports_bytes_dropped_and_original_size(self):
+        # census §3.4, "rendered surfaces that omit their own basis": a
+        # fixed opaque marker says something was dropped but never how
+        # much, so a 20KB pasted turn capped to 2KB looks identical to one
+        # capped by 40 bytes. The two numbers must be internally
+        # consistent, not decorative.
+        line = '- (turn 0) ' + ('x' * 5000)
+        cap = 2048
+
+        capped = mod._cap_item(line, cap)
+
+        match = re.search(
+            r'\.\.\. \[item truncated: (\d+) of (\d+) bytes dropped\]$', capped,
+        )
+        assert match is not None, capped[-120:]
+
+        original_bytes = len(line.encode('utf-8'))
+        suffix_bytes = len(match.group(0).encode('utf-8'))
+        kept_bytes = len(capped.encode('utf-8')) - suffix_bytes
+
+        assert int(match.group(2)) == original_bytes
+        assert int(match.group(1)) == original_bytes - kept_bytes
+
+    def test_quantified_marker_still_respects_the_byte_cap(self):
+        # The suffix's own byte length depends on the digit counts of the
+        # numbers it reports, which depend on how many bytes the suffix
+        # leaves room for -- the cap must hold anyway, for ASCII and
+        # multi-byte alike, with no mojibake.
+        for line in (
+            '- (turn 0) ' + ('x' * 5000),
+            '- (turn 0) ' + ('é→' * 2000),
+        ):
+            for cap in (256, 500, 1024, 2048):
+                capped = mod._cap_item(line, cap)
+
+                assert len(capped.encode('utf-8')) <= cap, (cap, line[:20])
+                assert '�' not in capped
+                assert mod.ITEM_TRUNCATION_MARKER in capped
+
+    def test_truncation_suffix_fits_within_min_item_bytes(self):
+        # Makes the `<= cap` guarantee structural rather than incidental:
+        # _item_byte_cap never returns below MIN_ITEM_BYTES, so as long as
+        # the longest possible suffix fits inside MIN_ITEM_BYTES there is
+        # always room for it plus at least some retained content.
+        longest = mod._truncation_suffix(999_999_999_999, 999_999_999_999)
+
+        assert len(longest.encode('utf-8')) < mod.MIN_ITEM_BYTES
 
     def test_cap_item_truncates_multibyte_text_without_mojibake(self):
         # The cap is a BYTE cap -- naive slicing on a multi-byte-character
@@ -1941,6 +2499,115 @@ class TestPerItemByteCap:
         assert '## User Corrections' in digest
         assert '## Error Neighborhoods' in digest
         assert digest.index('## User Corrections') < digest.index('## Error Neighborhoods')
+
+
+# ---------------------------------------------------------------------------
+# truncated_items frontmatter key -- R1 (confusion census 2026-07-31, second
+# truncation-marking surface): the per-item marker makes a truncated item
+# legible only to someone reading that far into the body. The frontmatter
+# reports the count up front, so a reader (or the downstream trickle coder)
+# knows the body it is about to weigh has had substance capped out of it.
+#
+# The count describes the POST-trim body: _truncate_sections pops trailing
+# items until the digest fits, so a truncated item can be removed entirely
+# and a pre-trim count would claim the shipped body contains a truncated
+# item it does not -- a fresh instance of the very defect being fixed
+# (census §3.4).
+# ---------------------------------------------------------------------------
+
+def _multiple_oversized_items_records():
+    """One oversized gold user turn plus three oversized error
+    neighborhoods. Every rendered item exceeds the per-item cap, so all
+    four carry a truncation marker BEFORE trimming; at a small max_bytes
+    the three lower-priority error items (SECTION_PRIORITY index 2) are
+    popped while the gold turn (index 6, trimmed last) survives. That gap
+    is what makes test_truncated_items_never_counts_items_the_soft_cap_evicted
+    discriminating: a pre-trim count would report 4 for a body containing 1.
+    """
+    records = [
+        _with_session_meta(_user_text('This is wrong, please redo it properly. ' * 500)),
+    ]
+    for n in range(3):
+        records.append(_with_session_meta(
+            _assistant(_tool_use('Bash', {'command': 'false'}, id=f'tu-err-{n}')),
+        ))
+        records.append(_with_session_meta(
+            _tool_result(f'tu-err-{n}', 'Exit code 1: ' + ('e' * 4000), is_error=True),
+        ))
+    return records
+
+
+class TestTruncatedItemsFrontmatter:
+    def test_truncated_items_is_zero_when_nothing_was_truncated(self):
+        # _all_signals_records() is well under the 15360 default cap, so
+        # nothing is truncated and the key must say so rather than be absent.
+        digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['truncated_items'] == 0
+        assert mod.ITEM_TRUNCATION_MARKER not in digest
+
+    def test_truncated_items_matches_marker_count_in_final_body(self):
+        digest = mod.render_digest(
+            _oversized_user_correction_records(), agent_class='interactive',
+        )
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['truncated_items'] >= 1
+        assert meta['truncated_items'] == body.count(mod.ITEM_TRUNCATION_MARKER)
+
+    def test_truncated_items_never_counts_items_the_soft_cap_evicted(self):
+        # Four truncated items pre-trim; at max_bytes=1200 the three
+        # lower-priority ones are popped. The count must describe the body
+        # that actually ships, never over-report what was evicted.
+        max_bytes = 1200
+        records = _multiple_oversized_items_records()
+
+        digest = mod.render_digest(
+            records, agent_class='interactive', max_bytes=max_bytes,
+        )
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        _, pre_trim_truncated = mod._build_sections(
+            records, item_max_bytes=mod._item_byte_cap(max_bytes),
+        )
+        pre_trim = len(pre_trim_truncated)
+
+        assert pre_trim > meta['truncated_items'], (
+            'fixture must actually evict a truncated item for this test to '
+            f'discriminate (pre_trim={pre_trim})'
+        )
+        assert meta['truncated_items'] == body.count(mod.ITEM_TRUNCATION_MARKER)
+        assert len(digest.encode('utf-8')) <= max_bytes
+
+    def test_truncated_items_ignores_a_marker_the_item_content_merely_quotes(self):
+        # truncated_items counts what _cap_item actually truncated, not
+        # occurrences of ITEM_TRUNCATION_MARKER in the rendered body. The
+        # marker is an OPEN prefix and its literal lives in this repo's own
+        # data (docs/legibility/confusion-codebook.yaml evidence quotes,
+        # plans/confusion-census-2026-07-31.md), so any session that greps
+        # or reads those files renders items containing it. Counting by
+        # substring would inflate the field above the true count -- the
+        # exact "surface omits/misreports its own basis" defect (census
+        # §3.4) this key exists to fix.
+        quoting_turn = f'Why does the digest say "{mod.ITEM_TRUNCATION_MARKER}]" here?'
+        assert len(quoting_turn.encode('utf-8')) < mod.MIN_ITEM_BYTES  # never capped
+
+        digest = mod.render_digest(
+            [_with_session_meta(_user_text(quoting_turn))], agent_class='interactive',
+        )
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert mod.ITEM_TRUNCATION_MARKER in body  # the quote survived verbatim
+        assert meta['truncated_items'] == 0
 
 
 # ---------------------------------------------------------------------------

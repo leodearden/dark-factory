@@ -86,6 +86,7 @@ from fused_memory.server.consolidation import (
     build_consolidation_result,
     validate_consolidate_args,
 )
+from fused_memory.server.grouped_read import group_memory_document, group_search_results
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
 from fused_memory.server.markup_tripwire import (
     MarkupStormCounter,
@@ -1177,7 +1178,8 @@ def create_mcp_server(
     # Task 3141 (PRD memory-write-path-convergence §9 leaf o): reject writes
     # carrying raw MCP envelope markup at all four write boundaries. Per-server
     # (not module-global) so no counter state bleeds between servers or tests.
-    # DF 3083 owns the root cause and the retroactive corpus sweep.
+    # plans/toolcall-markup-containment-prd.md owns the live root-cause work;
+    # DF 3083 (done, 7899eef17b) is the closed predecessor evidence log.
     _markup_storm = MarkupStormCounter()
 
     def _markup_gate(
@@ -1215,7 +1217,8 @@ def create_mcp_server(
                 'markup_tripwire_storm: %d markup writes rejected in %.0fs '
                 '(threshold=%d agent_id=%r field=%r matched_pattern=%r '
                 'project_root=%r) — the upstream serialization leak is ACTIVE; '
-                'DF 3083 owns the root cause',
+                'plans/toolcall-markup-containment-prd.md owns the live work '
+                '(DF 3083 is done and closed to appends)',
                 storm.get('count', -1), storm.get('window_seconds', -1.0),
                 storm.get('threshold', -1), agent_id, field, pattern, project_root,
             )
@@ -2753,7 +2756,8 @@ def create_mcp_server(
         # recon-stage content guards below, so a partly-serialized payload can
         # never be run through is_mixed_temporal_framing / the batch-plan and
         # proposed-resolution auto-taggers and come back as some other, more
-        # misleading verdict. DF 3083 owns the root cause + corpus sweep.
+        # misleading verdict. plans/toolcall-markup-containment-prd.md owns the
+        # live work; DF 3083 is the closed predecessor.
         if block := _markup_gate({'content': content}, agent_id, metadata, _kp.get(project_id)):
             return block
         # DEFENSIVE ONLY — nothing observes this today: add_episode reads metadata
@@ -2986,8 +2990,9 @@ def create_mcp_server(
         # Task 3141 / PRD leaf o: reject leaked MCP envelope markup BEFORE the
         # recon-stage content guards below, so a partly-serialized payload can
         # never be run through is_count_snapshot / is_mixed_temporal_framing and
-        # come back as some other, more misleading verdict. DF 3083 owns the root
-        # cause + corpus sweep.
+        # come back as some other, more misleading verdict.
+        # plans/toolcall-markup-containment-prd.md owns the live work; DF 3083 is
+        # the closed predecessor.
         if block := _markup_gate({'content': content}, agent_id, metadata, _kp.get(project_id)):
             return block
         metadata = strip_markup_override(metadata)
@@ -3278,6 +3283,40 @@ def create_mcp_server(
             agent_id: Filter by authoring agent (optional, auto-derived from MCP context)
             session_id: Filter by session (optional, auto-derived from MCP context)
             include_planned: Include planning-episode edges (default: False)
+
+        Returns:
+            {'results': [...]} — plus 'degraded'/'failed_stores'/
+            'failed_store_diagnostics' ONLY when a selected store failed.
+
+            Results are GROUPED (task 3129): an amendment or sighting (a record
+            whose metadata carries parent_id) does not appear as its own
+            top-level hit — it folds into the hit for the canonical it attaches
+            to, and a child-only match is replaced by that canonical. So a
+            search with limit=10 can legitimately return FEWER than 10 top-level
+            results, and a matched child's id/body is found INSIDE its parent's
+            entry, not beside it.
+
+            A result carrying children gains a 'grouped' block:
+            {'amendments': [{'id','digest','created_at','kind'}],
+             'amendment_count': int, 'sighting_count': int} — the counts are
+            EXACT while the digest list is bounded and TRUNCATED to a cap
+            (marked 'truncated': True, and each digest body is itself
+            truncated), so never read the list as the whole set.  Any child that
+            was folded away is pinned into 'grouped'['matched_children'] as
+            {'id','content','created_at','kind','matched': True} carrying its
+            FULL body — that is where a matched child's text lives.  A digest
+            already listing the matched child is marked 'matched': True in
+            place instead and gains a 'content' key carrying that same FULL
+            body alongside its truncated 'digest', so a matched child's text is
+            never shortened by grouping wherever it ends up.
+
+            Loud-fault keys, present only when something is genuinely unknown:
+            'grouped'['children_unavailable'] (+ 'error_type') means the child
+            reads FAILED — not that there are no children — and such a hit
+            suppresses nothing; a top-level 'parent_unresolved': True means the
+            hit is a child whose parent_id no store could resolve, and it stays
+            a top-level hit.  A record that is neither a child nor has children
+            carries no 'grouped' key at all.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -3303,7 +3342,32 @@ def create_mcp_server(
                 session_id=session_id,
                 include_planned=include_planned,
             )
-            response: dict[str, Any] = {'results': [r.model_dump() for r in results]}
+            # Grouping lives in server/grouped_read.py and is applied HERE, at
+            # the MCP boundary — never inside MemoryService.search.  Pushing it
+            # down a layer would strip amendment/sighting rows from
+            # reconciliation/mem0_dedup.py::find_prior_memories, whose
+            # per-record task_id/kind post-filter iterates raw service results,
+            # hiding duplicates from the dedup detector and candidates from the
+            # near-duplicate write guard (task 3129 / PRD V2 bullet 4).
+            #
+            # degraded/failed_stores/failure_diagnostics are read BELOW off
+            # `results` (the SearchResults object), never off the grouped list —
+            # that metadata does not survive a list transform.
+            try:
+                grouped_results = await group_search_results(
+                    memory_service, project_id, results
+                )
+            except Exception:
+                # A grouping fault must never turn a working search into an
+                # error dict; degrade to the ungrouped list and say so loudly.
+                logger.warning(
+                    'search: grouped read FAILED for project=%s; returning ungrouped results',
+                    project_id,
+                    exc_info=True,
+                    extra={'project_id': project_id},
+                )
+                grouped_results = [r.model_dump() for r in results]
+            response: dict[str, Any] = {'results': grouped_results}
             # Fault-only loudness: surface degraded/failed_stores only when the
             # search was degraded (a selected store timed out or raised).  Uses
             # getattr so a plain list return (back-compat callers) is harmless.
@@ -3677,6 +3741,22 @@ def create_mcp_server(
             and the field that answers "where did its content go?" from the
             dead id alone. It is ``None`` for a GC/trim sweep, which absorbs
             nothing into anything.
+
+            A hit additionally carries an optional ``grouped`` key (task 3129)
+            when the record participates in a parent/child group: a CANONICAL
+            gains ``{'amendments': [digests], 'amendment_count', 'sighting_count'}``
+            (plus ``'truncated': True`` when the digest listing is bounded, or
+            ``{'children_unavailable': True, 'error_type'}`` when the child
+            reads failed); a CHILD gains ``{'parent': {'id', ...same block...}}``
+            while keeping its OWN ``content``/``metadata``/``memory_id``.  On
+            that child branch the parent pointer is VERIFIED, so
+            ``grouped['parent_unresolved'] is True`` marks a dangling
+            ``parent_id`` (the parent does not exist) and
+            ``grouped['parent_unavailable'] is True`` (+ ``error_type``) marks a
+            probe that FAILED — i.e. the pointer is unverified, which is not the
+            same claim as unresolved.  The key is OMITTED entirely when the
+            record has no children and is not itself a child, so an ungrouped
+            response is unchanged.
         """
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:
@@ -3722,13 +3802,37 @@ def create_mcp_server(
             if tombstone:
                 miss['tombstone'] = tombstone
             return miss
-        return {
+        hit: dict[str, Any] = {
             'found': True,
             'memory_id': memory_id,
             'project_id': project_id,
             'content': record['content'],
             'metadata': record['metadata'],
         }
+        # ADDITIVE ONLY (task 3129): a canonical gains its group; a CHILD keeps
+        # its own content/metadata/memory_id and gains only grouped.parent —
+        # replacing a child's body with its parent's would make a citation
+        # verify against different text.  Guarded and never run on the miss
+        # branch, so — exactly like the tombstone lookup above — it can only add
+        # information to an already-correct answer, never convert a correct
+        # found:True into an error dict.
+        try:
+            grouped = await group_memory_document(
+                memory_service, project_id, memory_id, record
+            )
+        except Exception:
+            logger.warning(
+                'get_memory_by_id: grouped read FAILED for memory_id=%s in project=%s; '
+                'returning the (correct) hit without a grouped block',
+                memory_id,
+                project_id,
+                exc_info=True,
+                extra={'project_id': project_id, 'memory_id': memory_id},
+            )
+            grouped = None
+        if grouped:
+            hit['grouped'] = grouped
+        return hit
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -4308,6 +4412,28 @@ def create_mcp_server(
         silently dropped: a mem0-owned key in either metadata list, the same key
         in both lists, and `metadata_mode='replace'` without a non-empty
         `metadata_patch` (an empty replace would delete every custom key).
+
+        A well-formed argument set can still be turned away, by a SECOND and
+        later rejection class (task 3523): `metadata_patch` is validated
+        against the Mem0 metadata vocabulary at the service seam — the same
+        one `add_memory` and `add_system_record` go through — so an
+        off-vocabulary `topic` spelling, or a second `canonical` for a topic
+        already taken, is refused there rather than written. The checks above
+        are decided BEFORE dispatch; this one after, and only for a metadata
+        arm (a content-only amend is exempt, and an existing violation the
+        patch does not touch is not re-judged).
+
+        Both surface the way every other failure of this tool does — as an
+        `{'error', 'error_type'}` envelope, never as a `status='updated'`
+        success — because `@mcp_tool_errors()` converts the service seam's
+        `MemoryMetadataValidationError` / `CanonicalUniquenessViolation` for
+        us. It wraps `add_memory` and `add_system_record` identically, so a
+        seam rejection reads the same on every write path. `error_type` names
+        the exact class and is the whole of that distinction at this layer: a
+        caller cannot `except` an envelope, so collapsing either into a shared
+        'ValidationError' would erase a difference PRD V1 requires — malformed
+        metadata is fixable by reshaping the patch, a canonical collision is
+        not, and its message names the incumbent record to go look at.
 
         Args:
             memory_id: The memory ID (from search results)

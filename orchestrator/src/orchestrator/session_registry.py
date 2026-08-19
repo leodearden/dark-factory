@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import fcntl
 import json
 import logging
@@ -371,18 +372,23 @@ class DecisionRecord:
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
     file may be mutated by SEVERAL different subsystems: a C8 watcher (via
-    update_decision_state), the C5 cockpit (via set_manual_boost), and -- for
+    update_decision_state), the C5 cockpit (via set_manual_boost), -- for
     task 3640's back-fill, running against live records while the watchers
     are up -- scripts/backfill_decision_queue_stamp.py (via
-    set_decision_escalations_dir). All three helpers serialize their
+    set_decision_escalations_dir), and the ``write-decision`` verb itself
+    (task 3559), whose enrichment path folds a SECOND watcher's filing into
+    an existing open record. That fourth one is the only mutator that may
+    CREATE the record rather than merely mutate an existing one, so it races
+    on a path where nothing exists on disk yet. All four serialize their
     read-modify-write span per-decision-id via
     decision_id_lock (a stable ``<id>.json.lock`` sidecar, mirroring task
-    1609's escalation_id_lock), so a concurrent state-update, boost-update
-    or queue-stamp racing on the same id no longer drops any of the
-    mutations -- each write remains individually atomic AND the
+    1609's escalation_id_lock), so a concurrent state-update, boost-update,
+    queue-stamp or cross-queue filing racing on the same id no longer drops
+    any of the mutations -- each write remains individually atomic AND the
     read+mutate+write span is serialized against other callers on the same
     id. See update_decision_state/set_manual_boost/
-    set_decision_escalations_dir for the caller-facing note.
+    set_decision_escalations_dir/_run_write_decision for the caller-facing
+    note.
     """
 
     id: str
@@ -475,6 +481,9 @@ def sanitize_slug(raw: str) -> str:
     untouched.
     """
     cleaned = _SLUG_SANITIZE_RE.sub('-', raw)
+    # Deleting this branch is now caught: test_sanitize_slug_collapses_all_dots_slug
+    # (orchestrator/tests/test_session_registry.py) pins it, mutation-verified under
+    # task 4112 -- before that, removing it shipped green.
     if _ALL_DOTS_RE.match(cleaned):
         cleaned = cleaned.replace('.', '-')
     return cleaned
@@ -624,9 +633,27 @@ def _atomic_write_text(path: Path, text: str) -> None:
     is strictly better than a module that cannot be imported by its own
     documented entrypoint.
 
-    ``os.fdopen(fd, 'w')`` is locale-dependent rather than utf-8. That is a
-    latent bug — JSON written under a non-UTF-8 locale — but it is the
-    behaviour this module has always had, and changing it is out of scope here.
+    ``os.fdopen(fd, 'w')`` with no explicit encoding defaults to the ambient
+    locale's encoding, which is host-dependent. Task 3387 fixed the resulting
+    latent bug: the payload is always JSON (``record.to_json()``), and RFC 8259
+    requires JSON on disk to be UTF-8 — under a non-UTF-8 locale this wrote
+    bytes that THIS MODULE'S OWN READERS then reject. Name them precisely, so
+    the next investigator does not go looking in the wrong module:
+    ``read_record`` raises ``CorruptSessionRecord`` (the decode error is a
+    ``UnicodeDecodeError``, a ``ValueError`` subclass, so it lands in that
+    function's ``except`` clause), ``list_decisions`` and ``reap_stale_leases``
+    log and SKIP the file, and ``_mutate_decision`` returns ``None``. (An
+    earlier version of this paragraph cited
+    ``shared.safe_io.load_json_or_warn``. That helper never reads session,
+    decision or lease records — its callers are ``b3_gate``, ``chronic_flake``,
+    ``landed_outbox`` and ``merge_queue_store``.)
+
+    The encoding is now pinned ``'utf-8'`` explicitly at both halves of the
+    round-trip — here on write, and on every ``read_text()`` in this module —
+    so neither half follows the ambient locale. The literal is preferred over
+    ``locale.getpreferredencoding(False)`` because it is locale-INDEPENDENT,
+    which is the entire point; ``locale`` is stdlib and importing it would not
+    have violated this module's stdlib-only constraint above.
 
     Error policy stays with the callers: write_record lets a failure propagate
     (its sole caller, the CLI main(), provides the outer fail-soft boundary);
@@ -640,7 +667,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
         dir=str(path.parent),
     )
     try:
-        with os.fdopen(fd, 'w') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(text)
         os.replace(tmp_path_str, str(path))
     except Exception:
@@ -670,7 +697,7 @@ def read_record(slug: str, root: Path | str | None = None) -> SessionRecord:
     if not path.is_file():
         raise FileNotFoundError(str(path))
     try:
-        return SessionRecord.from_json(path.read_text())
+        return SessionRecord.from_json(path.read_text(encoding='utf-8'))
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise CorruptSessionRecord(f'unparseable session record at {path}') from exc
 
@@ -795,7 +822,7 @@ def list_decisions(root: Path | str | None = None) -> list[DecisionRecord]:
     decisions: list[DecisionRecord] = []
     for path in sorted(base.glob('*.json')):
         try:
-            decisions.append(DecisionRecord.from_json(path.read_text()))
+            decisions.append(DecisionRecord.from_json(path.read_text(encoding='utf-8')))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             logger.error('list_decisions: skipping unreadable %s', path, exc_info=True)
             continue
@@ -836,7 +863,7 @@ def _mutate_decision(
     path = decision_path_for_id(decision_id, root=root)
     try:
         with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
+            record = DecisionRecord.from_json(path.read_text(encoding='utf-8'))
             mutate(record)
             if not write_decision(record, root=root):
                 return None
@@ -941,6 +968,196 @@ def set_decision_escalations_dir(
     )
 
 
+def _merge_queue_and_escalation_id(
+    existing: DecisionRecord,
+    incoming: DecisionRecord,
+) -> tuple[str, str | None]:
+    """Pick ONE ``(escalations_dir, escalation_id)`` PAIR for the merged record.
+
+    THE INVARIANT, and the only reason this is a helper rather than two
+    lines inside merge_decision_enrichment: the returned pair is ALWAYS one
+    an INPUT record could vouch for. Never one filer's queue joined to the
+    other filer's id.
+
+    Merging the two fields by independent rules is what makes that possible
+    to get wrong -- adopt the incoming queue while keeping the existing id
+    and the survivor carries a pair that existed on neither record.
+    ``_run_reap_decisions._status`` is a JOIN on exactly that pair: axis 2
+    compares the stamp, then ``read_escalation_status(escalations_dir,
+    escalation_id)`` resolves the id INSIDE that queue. Since
+    ``esc-<taskid>-<n>`` ids are unique only WITHIN a queue (task 3528), a
+    synthesized pair resolves against an UNRELATED escalation that merely
+    shares the id -- and if that one has resolved, the decision closes.
+
+    That is the fail-CLOSED direction, which _run_reap_decisions' own
+    docstring rules out: "an over-held decision is a human-triageable row,
+    while a falsely closed one is invisible". It is also not hypothetical --
+    it is the incident that docstring records, a RESOLVED orchestrator
+    escalation closing a still-PENDING recon blocking gate that then sat
+    invisible in the cockpit for ~7 days. Holding a record we cannot place
+    is always the cheaper mistake.
+
+    BOTH sides are normalized before comparison, never raw-string-compared:
+    that is the fail-open mistake normalize_escalations_dir's own docstring
+    exists to prevent, and the reaper's axis-2 guard normalizes both sides
+    for exactly this reason.
+    """
+    existing_queue = normalize_escalations_dir(existing.escalations_dir)
+    incoming_queue = normalize_escalations_dir(incoming.escalations_dir)
+
+    # (1) SAME queue -- including both-'' and both-UNKNOWN_QUEUE. One shared
+    # id namespace, so the two ids are comparable and no pair can be forged:
+    # the ordinary fill-if-empty enrichment applies.
+    if existing_queue == incoming_queue:
+        return existing_queue, existing.escalation_id or incoming.escalation_id
+
+    # (2) Queues DIFFER and the first filer's is usable -- FIRST-WRITER-WINS,
+    # as a PAIR. Note the deliberate consequence: an empty
+    # existing.escalation_id is NOT filled from incoming here, because
+    # incoming's id belongs to INCOMING's namespace. Filling it would take a
+    # record reap_answered_decisions safely skips outright (`if not
+    # escalation_id: continue`) and make it resolvable against the wrong
+    # queue -- manufacturing the fail-CLOSED join out of nothing.
+    if existing_queue and existing_queue != UNKNOWN_QUEUE:
+        if incoming_queue and incoming_queue != UNKNOWN_QUEUE:
+            logger.warning(
+                'decision %s was filed from TWO different escalation queues: keeping the '
+                'first filer\'s stamp %s and DISCARDING %s. escalations_dir is a scalar '
+                '(task 3640), so a cross-queue collapse can record only one queue -- this '
+                'record is reapable only by the first one.',
+                existing.id,
+                existing_queue,
+                incoming_queue,
+            )
+        return existing_queue, existing.escalation_id
+
+    # (3) The first filer's queue is undetermined ('' or UNKNOWN_QUEUE) but it
+    # already holds a DIFFERENT escalation id -- so we cannot tell whose
+    # namespace that id lives in, and adopting the incoming queue would pair
+    # it with an id from an undetermined one. REFUSE the upgrade, loudly.
+    if existing.escalation_id and existing.escalation_id != incoming.escalation_id:
+        logger.warning(
+            'decision %s already holds escalation id %s under an undetermined queue (%r), '
+            'so it will NOT adopt the incoming queue %s: pairing that stamp with an id '
+            'from an unknown namespace could close this decision against an unrelated '
+            'escalation. The record deliberately stays fail-OPEN (unreapable, a visible '
+            'cockpit row); the remedy is the back-fill path '
+            '(scripts/backfill_decision_queue_stamp.py / set_decision_escalations_dir, '
+            'task 3640), which actually investigates provenance.',
+            existing.id,
+            existing.escalation_id,
+            existing_queue,
+            incoming_queue,
+        )
+        return existing_queue, existing.escalation_id
+
+    # (4) Genuine enrichment -- the post-3640 case this whole merge exists
+    # for: a legacy ``escalations_dir=''`` record becoming queue-scoped. The
+    # first filer holds no id of its own, or both filers claim the SAME one,
+    # so adopting the incoming record's own SELF-CONSISTENT pair clobbers
+    # nothing. (The `or existing.escalation_id` fallback is reachable only
+    # when BOTH ids are unset -- guard (3) above already returned for every
+    # case where existing holds an id incoming does not share.)
+    #
+    # ADOPTION REQUIRES A *REAL* QUEUE, never UNKNOWN_QUEUE. The sentinel is
+    # not an ordinary stamp that happens to be non-empty: '' still closes
+    # under the reaper's project-only fallback, while ``<unknown>`` is
+    # refused by EVERY reaper by name, so '' -> ``<unknown>`` is a strict
+    # DOWNGRADE of reapability that no reaper could ever undo -- exactly the
+    # loss the '' -> real direction above exists to repair, run backwards.
+    # The sentinel means "investigated, could not determine" and may only be
+    # SET by the back-fill path that did the investigating
+    # (set_decision_escalations_dir, task 3640); a merge never gets to
+    # ACQUIRE it from the other filer. Symmetric with the CLI verb, which
+    # refuses the sentinel on input for the same reason.
+    if incoming_queue and incoming_queue != UNKNOWN_QUEUE:
+        return incoming_queue, incoming.escalation_id or existing.escalation_id
+    # Incoming offers no adoptable queue -- none at all, or only the
+    # sentinel -- so there is nothing to take and no id to take with it:
+    # keep our own pair rather than trading a stamp for something worse.
+    return existing_queue, existing.escalation_id
+
+
+def merge_decision_enrichment(
+    existing: DecisionRecord,
+    incoming: DecisionRecord,
+) -> DecisionRecord:
+    """Fold a SECOND watcher's filing into an existing OPEN decision (task 3559).
+
+    Implements the MODE-2 rule verbatim: a second watcher observing the same
+    underlying human gate through a DIFFERENT escalation queue must ENRICH
+    the existing open record -- never overwrite, clobber, or downgrade what
+    the first watcher wrote. That shape is not hypothetical: task 3528
+    requirement (b) records ``esc-5914-1`` surfacing the same reify gate on
+    both dark_factory queues at once, and the cockpit must show it as ONE
+    row, carrying the best information either watcher has.
+
+    Field policy:
+
+    - ``id`` / ``project``   -- from *existing*. The id is the JOIN KEY: it
+      is the whole reason these two records are being merged.
+    - ``filed_at`` / ``state`` / ``manual_boost`` -- from *existing*
+      (CUSTODY). A second watcher must not restamp queue age, re-open or
+      close the record (that is update_decision_state's job), or reset an
+      operator's C5 cockpit boost.
+    - ``text`` / ``task_id`` / ``session_id`` / ``options`` -- keep
+      *existing* where it is non-empty; take *incoming* ONLY to fill a field
+      the first filer left empty/None. That fill is what makes this
+      enrichment rather than a no-op.
+    - ``severity``           -- ``_max_decision_severity``: never downgrade.
+    - ``escalations_dir`` + ``escalation_id`` -- NOT independent fields, and
+      ``escalation_id`` is deliberately NOT a plain fill-if-empty one: the
+      two move together as a PAIR via _merge_queue_and_escalation_id, whose
+      docstring carries the reasoning. In outline: same queue -> one id
+      namespace, so ordinary fill-if-empty; different queues with the first
+      filer's usable -> keep BOTH of the first filer's (FIRST-writer-wins),
+      with a WARNING naming the id and both queues when the discarded one is
+      real; first filer's queue undetermined ('' / ``UNKNOWN_QUEUE``) but
+      already carrying a different id -> refuse the upgrade, loudly; and
+      otherwise adopt the incoming record's own self-consistent pair PROVIDED
+      its queue is REAL, which is the genuine post-3640 enrichment (a legacy
+      unstamped record becoming queue-scoped, or an ``UNKNOWN_QUEUE`` one
+      becoming reapable). A merge never ACQUIRES ``UNKNOWN_QUEUE`` from the
+      other filer: reapability only ever moves upwards here.
+
+    WHY THIS FIELD STAYS A SCALAR rather than becoming a list of queues,
+    despite the cross-queue case obviously wanting one: (1) it would break
+    SILENTLY. normalize_escalations_dir does ``str(value).strip()``, so a
+    list stringifies to ``"['/a', '/b']"`` with no exception and no log, and
+    the reaper's axis-2 guard would then skip EVERY list-stamped decision on
+    EVERY queue -- permanently unreapable, invisibly. from_dict's
+    ``data.get(...) or ''`` likewise admits a list past a str-annotated
+    field unguarded. (2) Task 3640 (merged) hard-commits the field to a
+    scalar, adding UNKNOWN_QUEUE as a THIRD scalar state plus a back-fill
+    that stamps the live population as scalars; a list would contradict
+    shipped, tested behaviour. (3) Widening it needs a SCHEMA_VERSION minor
+    bump (fleet-cockpit-prd.md:180) and belongs to its own task.
+
+    First-writer-wins therefore leaves the known MODE-2 reap gap that
+    test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_
+    its_stamped_queue already pins and accepts -- unchanged in KIND, but now
+    DETERMINISTIC (the first filer's queue) instead of racy (whichever
+    watcher wrote last). The WARNING is what surfaces it.
+
+    PURE and side-effect-free apart from the two queue warnings: it returns
+    a NEW record via dataclasses.replace and mutates neither argument, so it
+    stays trivially testable in isolation from the CLI verb and a caller
+    holding the pre-merge record still sees what it read.
+    """
+    merged_queue, merged_escalation_id = _merge_queue_and_escalation_id(existing, incoming)
+
+    return dataclasses.replace(
+        existing,
+        text=existing.text or incoming.text,
+        task_id=existing.task_id or incoming.task_id,
+        escalation_id=merged_escalation_id,
+        session_id=existing.session_id or incoming.session_id,
+        options=existing.options or incoming.options,
+        severity=_max_decision_severity(existing.severity, incoming.severity),
+        escalations_dir=merged_queue,
+    )
+
+
 @contextlib.contextmanager
 def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterator[None]:
     """Per-decision-id exclusive advisory lock using a stable sidecar file.
@@ -974,7 +1191,7 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
     Usage::
 
         with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
+            record = DecisionRecord.from_json(path.read_text(encoding='utf-8'))
             record.some_field = new_value
             write_decision(record, root=root)
     """
@@ -1033,6 +1250,44 @@ population.
 The angle brackets are load-bearing rather than decorative: a resolved queue
 path always begins with ``'/'``, so this sentinel can never collide with a
 real queue no matter what a project is named or where it is checked out."""
+
+
+_DECISION_SEVERITY_RANK: dict[str, int] = {'': 0, 'info': 1, 'blocking': 2, 'critical': 3, 'urgent': 4}
+"""Total order over DecisionRecord.severity, for the never-downgrade rule (task 3559).
+
+Mirrors escalation.models.KNOWN_SEVERITIES (``frozenset({'info','blocking'})
+| BORN_AT_L2_SEVERITIES``) and the cockpit's ordering comment in
+cockpit/src/cockpit/priorities.default.yaml ("ordered
+urgent>=critical>blocking>info") BY CONVENTION, not by import -- the same
+hand-sync idiom ESCALATION_ARCHIVE_SUBDIR documents above. This module is
+deliberately stdlib-only with no intra-orchestrator imports (see the module
+docstring) so spawn-claude.sh can invoke it by absolute path with no
+venv/PYTHONPATH. ``''`` (severity unset) is the floor.
+
+Deliberately NOT escalation.queue._SEVERITY_RANK, even though that map
+exists and looks reusable: it is ``{'info': 0, 'blocking': 1}`` only, so
+'critical' and 'urgent' fall to its ``.get(x, 0)`` default and rank
+INFO-tier. Copying it here would make _max_decision_severity perform the
+exact downgrade it exists to prevent."""
+
+
+def _max_decision_severity(existing: str, incoming: str) -> str:
+    """Return whichever of two severities ranks higher; never downgrade.
+
+    Used when a second watcher enriches an open DecisionRecord it did not
+    file (see merge_decision_enrichment): the record must end up carrying
+    the MOST urgent view any watcher has of the underlying human gate.
+
+    An unrecognised value (a typo, or a case variant -- KNOWN_SEVERITIES is
+    lowercase-only) resolves via ``.get(value, 0)`` to the same rank as the
+    unset sentinel, so it can never displace a recognised severity, and this
+    never raises: it sits on a watcher's filing path and must not crash the
+    watch loop. Ties -- and the ambiguous both-unrecognised case -- return
+    ``existing``, so an equal re-file never churns the stored value.
+    """
+    if _DECISION_SEVERITY_RANK.get(incoming, 0) > _DECISION_SEVERITY_RANK.get(existing, 0):
+        return incoming
+    return existing
 
 
 def normalize_escalations_dir(value: str | Path) -> str:
@@ -1122,7 +1377,7 @@ def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> s
     if candidate is None:
         return None
     try:
-        data = json.loads(candidate.read_text())
+        data = json.loads(candidate.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError, ValueError):
         return None
     status = data.get('status') if isinstance(data, dict) else None
@@ -2226,7 +2481,7 @@ def _read_lease_holder_state(
         return None, False, LEASE_HEARTBEAT_TTL.total_seconds() + 1.0
     age_secs = (now - datetime.fromtimestamp(mtime, tz=UTC)).total_seconds()
     try:
-        holder = LeaseHolder.from_json(path.read_text())
+        holder = LeaseHolder.from_json(path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None, False, age_secs
     return holder, _pid_alive(holder.pid), age_secs
@@ -2633,7 +2888,7 @@ def reap_stale_leases(
         stale = age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
 
         try:
-            holder = LeaseHolder.from_json(lease_path.read_text())
+            holder = LeaseHolder.from_json(lease_path.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             reason = 'corrupt' if stale else None
         else:
@@ -3049,14 +3304,61 @@ def _run_write_decision(
     passes the SAME queue dir it later reaps with, so this fleet-global
     decision can be joined back to the right per-queue escalation-id
     namespace: ids are unique only within one queue, and a project may run
-    several (task 3528). Omitting it stores '' and keeps today's
-    project-only-scoped reaper behaviour, so no existing caller breaks.
+    several (task 3528). It is MANDATORY (task 3559), on two layers: the
+    parser marks it ``required=True`` so an OMITTED flag exits 2, and this
+    verb additionally refuses a stamp that NORMALIZES to nothing -- which
+    argparse cannot see, since ``--escalations-dir ''`` satisfies a required
+    flag. An unstamped fleet-global record is cross-queue-ambiguous, and is
+    exactly the legacy population task 3640 had to back-fill; it must not be
+    allowed to regrow through this verb.
+
+    ``UNKNOWN_QUEUE`` is likewise refused HERE, even though it normalizes
+    non-empty. It is a back-fill-only sentinel (set_decision_escalations_dir,
+    task 3640) meaning "investigated, could not determine", and every reaper
+    refuses a decision so stamped -- so a record filed with it could only
+    ever be closed by hand, which is strictly worse than the '' record this
+    verb already refuses. A watcher always knows its own queue by
+    construction (it is the same dir it passes to reap-decisions), so there
+    is no legitimate write-path caller.
+
+    UPSERT, NOT A BLIND OVERWRITE (task 3559). Against an OPEN record at the
+    same id, three cases are told apart:
+
+    - DIFFERENT project -- an id COLLISION, not one gate seen twice, since
+      DecisionRecords are fleet-global while ``esc-<taskid>-<n>`` task
+      numbering restarts per project. REFUSED (loud, fail-soft, nothing
+      written): merging would hide this ask inside the other project's row
+      and overwriting would delete that row.
+    - DIFFERENT queue stamp -- the second watcher observing the same human
+      gate through another queue (the observed esc-5914-1 MODE-2 shape), so
+      the filing is folded in via merge_decision_enrichment rather than
+      clobbering or downgrading what the first watcher wrote.
+    - MATCHING queue stamp -- the SAME watcher re-filing across a restart,
+      which both SKILL.md files promise is idempotent, so its whole view
+      lands (including fields going down or empty). Only ``filed_at`` and
+      ``manual_boost`` are held back, as CUSTODY: a restart is not news
+      about queue age and says nothing about the operator's C5 boost, which
+      belongs to set_manual_boost. Same rule merge_decision_enrichment
+      applies cross-queue -- custody does not depend on which queue re-filed.
+
+    Everything else keeps today's full overwrite: no existing record (the
+    normal first-filing case), an unreadable/corrupt one, or a NON-open one
+    (a question the human already dealt with -- a new filing there starts a
+    new ask, boost and age included).
 
     On success, prints the filed record's id (mirrors `launching` printing
     the record dir and `lease-claim` printing `decision=`) so the caller can
     cross-link it into its in-session note or afk-digest line. write_decision
     is itself self-guarding fail-soft (never raises), so a fault there is
     silently skipped here rather than printed as a false confirmation.
+
+    Concurrency NOTE (see DecisionRecord's docstring): the read -> merge ->
+    write span above is serialized per-decision-id via decision_id_lock (a
+    stable ``<id>.json.lock`` sidecar), so two watchers filing the SAME id
+    from two queues at the same moment cannot drop either one's
+    contribution. That matters more here than for the field setters: this is
+    the only mutator that may CREATE the record, so an unserialized span
+    races on a path where nothing exists on disk yet.
 
     Intentionally omits DecisionRecord's ``options`` field: C8 watchers only
     ever file plain open/text decisions, and the peer `update_decision_state`
@@ -3065,7 +3367,39 @@ def _run_write_decision(
     an optional repeatable ``--option`` flag here rather than widening this
     verb's other args.
     """
-    record = DecisionRecord(
+    # CRITICAL: both stamp guards live HERE, in the CLI verb, and NOT in
+    # write_decision() -- do not "helpfully" push them down into the writer.
+    # write_decision() is the single atomic path the C8 watcher and the C5
+    # cockpit share by PRD design (fleet-cockpit-prd.md:177-179), and it has
+    # direct in-repo callers that legitimately write queue-less records:
+    # cockpit/tests/test_app.py, and tests/scripts/test_backfill_decision_
+    # queue_stamp.py, which must be able to CONSTRUCT the unstamped legacy
+    # population in order to test back-filling it. The contract being
+    # enforced is "how a WATCHER invokes write-decision", which is this
+    # verb's boundary, not the writer's.
+    stamp = normalize_escalations_dir(escalations_dir)
+    if not stamp:
+        logger.error(
+            'write-decision refusing to file %s: --escalations-dir is mandatory and '
+            'normalized to nothing. A DecisionRecord is fleet-global but an '
+            'esc-<taskid>-<n> id is unique only within one queue, so a queue-less '
+            'record is cross-queue-ambiguous. Pass the SAME queue dir you reap with.',
+            decision_id,
+        )
+        return
+    if stamp == UNKNOWN_QUEUE:
+        logger.error(
+            'write-decision refusing to file %s: --escalations-dir %s is a '
+            'back-fill-only sentinel (set_decision_escalations_dir, task 3640) and no '
+            'reaper will ever close a decision stamped with it -- only a human could. '
+            'A watcher knows its own queue by construction; pass the real queue dir '
+            'you also reap with.',
+            decision_id,
+            UNKNOWN_QUEUE,
+        )
+        return
+
+    incoming = DecisionRecord(
         id=decision_id,
         project=project,
         text=text,
@@ -3074,10 +3408,111 @@ def _run_write_decision(
         escalation_id=escalation_id,
         session_id=session_id,
         severity=severity,
-        escalations_dir=normalize_escalations_dir(escalations_dir),
+        escalations_dir=stamp,
     )
-    if write_decision(record):
-        print(record.id)
+
+    # WHY THIS IS NOT ROUTED THROUGH _mutate_decision, despite sharing its
+    # read-modify-write shape: _mutate_decision is a STRICT read-modify-write
+    # -- it does DecisionRecord.from_json(path.read_text()) and fail-softs to
+    # None when the file is absent. Here, absent is the NORMAL case (the first
+    # filing of a new decision), so delegating would make CREATING a record
+    # impossible. This verb is an UPSERT: read-or-construct, merge, write.
+    # What genuinely must not diverge are the invariants that helper's
+    # docstring identifies as load-bearing, so they are mirrored verbatim:
+    # its exact (OSError, json.JSONDecodeError, KeyError, TypeError,
+    # ValueError) read/parse/write fault set, and (step-14) the lock sitting
+    # INSIDE the try/except so an acquisition fault is absorbed rather than
+    # raised at a watcher.
+    # The lock is taken HERE, after the stamp guards, so a refused
+    # invocation never creates an orphan `<id>.json.lock` sidecar for an id
+    # that will never be written (the ORPHAN SIDECARS caveat in
+    # decision_id_lock's own docstring), and INSIDE the try/except so a
+    # lock-acquisition fault is absorbed rather than raised at a watcher.
+    try:
+        with decision_id_lock(decision_id):
+            record = incoming
+            try:
+                existing = DecisionRecord.from_json(
+                    decision_path_for_id(decision_id).read_text()
+                )
+            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+                # Absent (the common first-filing case), unreadable, or
+                # corrupt: all fall through to writing fresh.
+                existing = None
+            if existing is not None and existing.state == DecisionState.OPEN:
+                if existing.project != project:
+                    # SAME id, DIFFERENT project: an id COLLISION, not a
+                    # MODE-2 collapse. Both SKILL.md files tell a watcher to
+                    # use the escalation id as the decision id, and
+                    # esc-<taskid>-<n> task numbering RESTARTS per project,
+                    # so 'esc-42-1' in dark_factory and 'esc-42-1' in reify
+                    # are two unrelated gates. Two projects also always have
+                    # different queue dirs, so without this guard every such
+                    # collision lands in the enrichment branch below and gets
+                    # folded into the OTHER project's row -- one cockpit row
+                    # claiming to be project A's ask while B's human gate is
+                    # invisible and unreapable by B's reaper.
+                    #
+                    # Refuse rather than overwrite: overwriting would DELETE a
+                    # live row (with any operator boost and state on it),
+                    # which is the clobber this whole task exists to stop, and
+                    # leaves exactly one of the two gates visible either way.
+                    # Refusing is the non-destructive, deterministic choice --
+                    # the same first-writer-wins policy _merge_queue_and_
+                    # escalation_id applies to a conflicting queue stamp.
+                    # Scoped to an OPEN record for the same reason the rest of
+                    # this branch is: a non-open row is a question already
+                    # dealt with, and a new filing there starts a new ask.
+                    logger.error(
+                        'write-decision refusing to file %s for project %s: an OPEN '
+                        'decision already exists at that id for a DIFFERENT project '
+                        '(%s). DecisionRecords are fleet-global while esc-<taskid>-<n> '
+                        'ids restart per project, so this is an id COLLISION, not a '
+                        'MODE-2 cross-queue collapse of one human gate -- merging '
+                        'would hide this ask inside the other project\'s cockpit row '
+                        'and overwriting would delete that row, so neither is safe. '
+                        'The existing row is left intact and THIS ask did not reach '
+                        'the cockpit; it is still carried by the in-session note / '
+                        'afk-digest line this filing accompanies. Re-file it under an '
+                        'id that is unique fleet-wide.',
+                        decision_id,
+                        project,
+                        existing.project,
+                    )
+                    return
+                if normalize_escalations_dir(existing.escalations_dir) != stamp:
+                    # A DIFFERENT queue filing against a live record: this is
+                    # the MODE-2 cross-queue collapse, so enrich rather than
+                    # overwrite.
+                    record = merge_decision_enrichment(existing, incoming)
+                else:
+                    # A MATCHING stamp is the SAME watcher re-filing across a
+                    # restart, which both SKILL.md files promise is a plain
+                    # idempotent overwrite -- text, severity and task_id are
+                    # its own to revise, including downwards.
+                    #
+                    # But filed_at and manual_boost are CUSTODY fields, and
+                    # custody does not depend on which queue the re-file came
+                    # from: merge_decision_enrichment already keeps both on
+                    # the cross-queue path, and the same reasoning binds here.
+                    # A watcher restart is not new information about queue AGE
+                    # (filed_at drives the cockpit's ordering), and it is not
+                    # information about the OPERATOR's C5 boost at all -- that
+                    # is set_manual_boost's field, written by a different
+                    # subsystem. Without this, an operator who boosts a row to
+                    # the top of the queue silently loses it on the next
+                    # watcher restart, which is precisely the "second writer
+                    # downgrades an open record" shape this task removes.
+                    record = dataclasses.replace(
+                        incoming,
+                        filed_at=existing.filed_at,
+                        manual_boost=existing.manual_boost,
+                    )
+
+            if write_decision(record):
+                print(record.id)
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.error('write-decision: failed to file %s', decision_id, exc_info=True)
 
 
 def _run_reap_decisions(project: str, escalations_dir: str) -> None:
@@ -3271,13 +3706,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     write_decision_p.add_argument(
         '--escalations-dir',
-        default='',
+        required=True,
         help=(
-            "the escalation queue dir this decision's --escalation-id belongs to; "
-            'scopes the reaper (see reap-decisions)'
+            "MANDATORY: the escalation queue dir this decision's --escalation-id "
+            'belongs to; scopes the reaper (see reap-decisions). Required because a '
+            'DecisionRecord is fleet-global while an esc-<taskid>-<n> id is unique '
+            'only WITHIN one queue (task 3528), so an unstamped record is '
+            'cross-queue-ambiguous -- the legacy population task 3640 back-filled '
+            'out of. Pass the SAME queue dir you later reap with.'
         ),
     )
 
+    # NOTE: --escalations-dir is required on BOTH halves of the file/reap
+    # pair. reap-decisions has always required it; write-decision joined it
+    # in task 3559, so the two are symmetric rather than each inventing a
+    # convention.
     reap_decisions_p = sub.add_parser(
         'reap-decisions',
         help='close OPEN decisions whose escalation has resolved/dismissed (Fleet Cockpit C8)',
@@ -3295,6 +3738,18 @@ def main(argv: list[str] | None = None) -> int:
     loudly (stderr, via the standard logging machinery) and swallowed here
     rather than raised, so a registry fault can never change the exit code
     of the bash caller (spawn-claude.sh) that invokes this script.
+
+    That contract has always covered runtime FAULTS only -- never a
+    malformed INVOCATION. argparse's own required-argument path raises
+    SystemExit(2) from parse_args() BELOW, i.e. before (and outside) the
+    try/except that implements the rule, and has done so since this parser
+    existed: `write-decision` with no --id/--project/--text exits 2 today.
+    Task 3559 deliberately put --escalations-dir in that same louder class
+    rather than swallowing it, because a queue-less DecisionRecord is
+    cross-queue-ambiguous and silently filing one is worse than a hard stop.
+    A runtime refusal (e.g. an explicitly EMPTY stamp, which argparse cannot
+    distinguish from a supplied one) stays fail-soft: ERROR log, nothing
+    written, nothing printed, rc 0.
     """
     parser = _build_parser()
     args = parser.parse_args(argv)

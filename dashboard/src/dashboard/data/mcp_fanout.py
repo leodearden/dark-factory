@@ -37,8 +37,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
 from typing import Generic, TypeVar
 
 import httpx
@@ -67,6 +69,29 @@ _FANOUT_REWARN_EVERY = 500
 _failure_streaks: dict[tuple[str, str], int] = {}
 
 
+class PreformattedFanoutError(ValueError):
+    """A fan-out failure whose message is ALREADY a rendered ``'Type: message'``.
+
+    :func:`first_success` renders every caught exception through
+    :func:`describe_exc`, which unconditionally prepends
+    ``type(exc).__name__``. A call site that has already formatted the *real*
+    cause — because it caught it, logged it, and re-raised to signal
+    fall-through — therefore reached the operator doubled:
+    ``'ValueError: ConnectError: refused'`` in the ``cancel_ticket`` 502
+    ``detail`` and in the dashboard's offline pill. Raise this instead of a
+    bare ``ValueError`` when the message you pass is final.
+
+    Subclassing ``ValueError`` (rather than adding a new type to
+    ``first_success``'s catch tuple) keeps control flow and every caller's own
+    ``except ValueError`` unchanged. A marker type is used rather than having
+    ``describe_exc`` sniff the message for an existing ``'Type: message'``
+    shape because sniffing is a heuristic on operator-visible text: any
+    legitimate message whose first token happened to look like an identifier
+    followed by ``': '`` would be silently stripped of its real type name,
+    with no way for a call site to opt out.
+    """
+
+
 def describe_exc(exc: BaseException) -> str:
     """Render *exc* as ``'Type: message'``, or just ``'Type'`` when empty.
 
@@ -76,9 +101,81 @@ def describe_exc(exc: BaseException) -> str:
     bare ``str(exc)`` turns those into content-free log lines ("failed for
     <url>: ") and content-free offline pills; always naming the type keeps
     client-side saturation distinguishable from a genuinely dead endpoint.
+
+    A non-empty :class:`PreformattedFanoutError` is the one exception: its
+    message is already a rendered cause, so it is returned verbatim rather
+    than gaining a second prefix. An *empty* one still falls through to the
+    generic path above, so opting in can never reintroduce the content-free
+    line this function exists to prevent.
     """
     text = str(exc)
+    if isinstance(exc, PreformattedFanoutError) and text:
+        return text
     return f'{type(exc).__name__}: {text}' if text else type(exc).__name__
+
+
+def project_label(project_root: str | os.PathLike[str]) -> str:
+    """Render *project_root* as the short project name the UI labels it with.
+
+    The basename, falling back to the full string for a root with no basename
+    (``'/'``) so a label can never degrade to empty. This is the single
+    definition of that rule for the fan-out cluster — :func:`fanout_label`
+    composes it rather than re-deriving it.
+
+    ``active_tasks._project_label`` and ``redux_api._project_label`` are
+    independent hand-rolled copies of the same rule. They are not imported here
+    (``active_tasks`` imports from ``tasks``, which imports this module), which
+    also means the delegation can only run the other way: those two can
+    eventually call *this*, collapsing three copies onto one. That cross-module
+    edit is out of task 4133's module lock and is filed as follow-up work; until
+    it lands, the three definitions must be kept string-identical by hand.
+    """
+    root_str = str(project_root)
+    return Path(root_str).name or root_str
+
+
+def fanout_label(base: str, project_root: str | os.PathLike[str]) -> str:
+    """Compose a per-project-root fan-out log label, ``'base[project-name]'``.
+
+    **Every fan-out caller parameterized by project_root MUST compose its
+    ``log_label`` through this helper.** The contract is not cosmetic — it is
+    what makes the transition-only policy above hold at all:
+
+    - the throttle key is ``(log_label, url)``;
+    - ONE fused-memory URL serves *every* project_root, so a fixed literal
+      label collapses all roots onto a single key;
+    - :func:`note_fanout_success` **pops** that key, so a healthy root's
+      success in the same UI poll cycle clears a broken root's open streak.
+      The broken root's next failure is therefore ``streak == 1`` again,
+      re-arming the opening WARNING *and* adding a 'recovered' WARNING —
+      every cycle, indefinitely. That is precisely the sustained flood the
+      transition-only policy exists to prevent (task 3871), reintroduced
+      through the key rather than the level.
+
+    A collapsed key also erases the diagnosis: the message names only the
+    shared URL, so the operator cannot tell *which* project_root is down.
+
+    The discriminator is :func:`project_label` — the basename, deliberately
+    string-identical to ``active_tasks._project_label`` /
+    ``redux_api._project_label`` so operator log labels match the project chips
+    the UI already renders. ``mcp_fanout``, the leaf of this cluster, is the
+    helper's home (see :func:`project_label`) and this docstring is the single
+    place the convention is written down.
+
+    **The guarantee above assumes project-root basenames are distinct.** Two
+    configured roots sharing one (``/srv/team-a/app`` and ``/srv/team-b/app``,
+    or two checkouts both named ``dark-factory``) collapse back onto a single
+    key and reintroduce both failure modes described above. That assumption is
+    pre-existing and system-wide rather than introduced here —
+    ``scheduler``'s ``label_to_root = {_project_label(r): r for r in ...}``
+    already silently drops one of two same-basename roots, and ``redux_api``
+    keys its whole per-project payload on the same basename — so this helper
+    inherits it deliberately instead of diverging from every other project
+    label the dashboard renders. For ``list_tickets`` the unambiguous full root
+    is in any case still in the message body (metrics appends
+    ``(project_root=...)``).
+    """
+    return f'{base}[{project_label(project_root)}]'
 
 
 def log_fanout_failure(log_label: str, url: str, exc: BaseException) -> None:

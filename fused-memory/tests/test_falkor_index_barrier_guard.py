@@ -56,7 +56,7 @@ AST (not string grep) for the assertions themselves so a docstring or comment
 that merely *describes* the barrier — e.g. "see
 _fm_helpers.await_index_operational" — cannot satisfy the check; only real
 ImportFrom / Call / FunctionDef nodes count. The parse and node-search
-machinery is shared with the sibling guards via ``_fm_helpers``
+machinery is shared with the sibling guards via ``_ast_guard``
 (``parse_python_module`` / ``calls_named`` / ``imported_names_from``), so the
 three agree on those semantics by construction rather than by copy. The
 selection criteria below stay local: they are this guard's own policy, and it
@@ -74,7 +74,7 @@ import pathlib
 import re
 
 import pytest
-from _fm_helpers import calls_named, imported_names_from, parse_python_module
+from _ast_guard import calls_named, imported_names_from, parse_python_module
 
 TESTS_ROOT = pathlib.Path(__file__).parent
 SELF = pathlib.Path(__file__).resolve()

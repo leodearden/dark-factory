@@ -200,6 +200,38 @@ _DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
 
+# Task 3049 amendment: hard ceiling on the EFFECTIVE value of
+# config.max_backlog_remediation_deferrals, derived from the threshold above so
+# the two can never desynchronise.
+#
+# Derivation.  A deferred cycle produces ONE completed run (the parent) instead
+# of the usual two (parent + remediation), and _finding_persistence_count counts
+# completed runs that re-flag a finding.
+#
+# The count the gate reads must include the remediation run's OWN re-flag.
+# _run_remediation_pass calls journal.complete_run(run_id, 'completed') and
+# journal.update_run_stage_reports(run_id, ...) BEFORE reaching the persistence
+# gate, and the findings still actionable at that gate are by construction the
+# ones in that same run's integrity_check.items_flagged.  So the cycle that
+# finally remediates after D consecutive deferrals reads
+#
+#     persistence = D (deferred parents) + 1 (this cycle's parent)
+#                     + 1 (this cycle's own remediation run)
+#                 = D + 2
+#
+# The un-deferred baseline (D = 0) is therefore 2 — pinned by
+# test_harness.py::...unresolved_after_remediation_suppressed, which asserts
+# persistence == 2 with no prior runs seeded — and escalation fires on the
+# SECOND failed remediation, matching the module note above that a threshold of
+# 4 'fires after 2 complete reconciliation cycles'.
+#
+# Requiring D + 2 < _INTEGRITY_FINDING_RECURRENCE_THRESHOLD, i.e.
+# D <= THRESHOLD - 3, preserves what that counter MEANS: 'this finding recurs
+# DESPITE remediation'.  Above the ceiling, a backlogged project would escalate
+# recon_integrity_issue on the FIRST failed remediation instead of the second —
+# a throughput lever silently changing escalation semantics.
+_MAX_BACKLOG_REMEDIATION_DEFERRALS = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 3
+
 # Task 1669: suppress re-firing of a finding whose matching escalation was
 # resolved within this window.  Beyond it, a recurrence re-escalates so a
 # re-emerging problem is not hidden forever.  Value is a policy threshold —
@@ -338,6 +370,32 @@ class TierConfig:
     model: str = 'sonnet'
     episode_limit: int = 125
     memory_limit: int = 250
+
+
+def is_backlog_size(buffer_size: int, config) -> bool:
+    """True iff ``buffer_size`` puts a project in backlog mode.
+
+    Task 3049 — the SINGLE definition of the backlog-mode threshold.  Three
+    behaviours key off 'is this project backlogged': BacklogIterator's decision
+    to drain in chunks, the opus/sonnet tier selection, and ``_maybe_remediate``'s
+    decision to defer its inline remediation pass.  All three call this, so a
+    retune of either knob moves them together and they cannot desynchronise.
+
+    Deliberately a module-level PURE function over (size, config) rather than a
+    harness method: ``BacklogIterator`` holds its own injected ``config`` and
+    ``buffer``, and reaching through to the harness would silently compute the
+    answer against the harness's objects instead of the iterator's.
+
+    Args:
+        buffer_size: Buffered event count for the project.
+        config: Any object exposing ``buffer_size_threshold`` and
+            ``opus_threshold_ratio``.
+
+    Returns:
+        ``size > buffer_size_threshold * opus_threshold_ratio``, strictly: at
+        exactly the threshold the project is NOT in backlog mode.
+    """
+    return buffer_size > config.buffer_size_threshold * config.opus_threshold_ratio
 
 
 def build_stale_run_diagnostics(
@@ -609,6 +667,15 @@ class ReconciliationHarness:
         # ONE loud recon_resume_failure_storm escalation instead of silent churn.
         self._resume_failures: deque[tuple[datetime, str]] = deque()
         self._last_resume_failure_storm_escalation_at: datetime | None = None
+
+        # Task 3049 lever 1: per-project count of CONSECUTIVE full cycles whose
+        # inline remediation tail was deferred because the project was still in
+        # backlog mode (see _maybe_remediate).  Reset to 0 the moment a
+        # remediation pass actually dispatches, so it measures the current
+        # deferral streak, not lifetime deferrals.  Deliberately in-memory:
+        # a restart resets every streak to 0, which only makes remediation run
+        # SOONER than the bound would have — the fail-safe direction.
+        self._remediation_deferrals: dict[str, int] = {}
 
         # Usage gate (multi-account cap failover)
         self.usage_gate: UsageGate | None = None
@@ -2441,7 +2508,9 @@ class ReconciliationHarness:
     async def _select_tier(self, project_id: ProjectId) -> TierConfig:
         """Choose model tier based on buffer size."""
         buffer_count = (await self.buffer.get_buffer_stats(project_id)).get('size', 0)
-        use_opus = buffer_count > (self.config.buffer_size_threshold * self.config.opus_threshold_ratio)
+        # Same predicate as BacklogIterator.should_iterate and the remediation
+        # deferral gate (task 3049): 'backlogged' means one thing here.
+        use_opus = is_backlog_size(buffer_count, self.config)
 
         if use_opus:
             return TierConfig(
@@ -3402,11 +3471,18 @@ class ReconciliationHarness:
         resolves the module-level ``write_stage{1,2}_cycle_summary`` global at
         call time, so tests patching that name still intercept the write.
 
-        Marker discipline (task 2734, corrected task 3732 amendment): the
-        writer serializes ``report.stats`` into the ledger row's
-        ``payload_json`` synchronously at call time (see ``write_cycle_summary``'s
-        docstring), so the ``<prefix>_cycle_summary_write_recovered_backstop``
-        marker has to already be on whatever report the writer sees. It is
+        Marker discipline (task 2734, corrected task 3732 amendment):
+        *writer* resolves to an ``async def`` (``write_stage{1,2}_cycle_summary``)
+        — calling it only creates a coroutine, so it serializes
+        ``report.stats`` into the ledger row's ``payload_json`` only once the
+        shielded task below takes its first step, never synchronously at call
+        time (see ``write_cycle_summary``'s docstring). Because that
+        serialization is deferred, the
+        ``<prefix>_cycle_summary_write_recovered_backstop`` marker has to
+        already be on whatever report object the writer was handed when it
+        was called — mutating the live *report* in place instead would not be
+        observed until that later first step, by which point this method may
+        already have "corrected" it back to ``False``. So the writer is
         handed a COPY stamped ``True`` rather than this method mutating the
         live *report* across the ``asyncio.shield`` boundary. That distinction
         is load-bearing on exactly the path the shield exists for: if the
@@ -3486,45 +3562,68 @@ class ReconciliationHarness:
         raises propagates to the caller's swallow, so a ledger fault means no
         degraded row rather than a possible clobber.
 
+        The read runs INSIDE the ``asyncio.shield`` below, never ahead of it:
+        ``asyncio.shield`` only protects work once its coroutine exists as its
+        own Task, so an unshielded read ahead of the shield would raise
+        ``CancelledError`` on exactly the already-being-cancelled path the
+        shield exists for — landing no row at all, silently, since the
+        caller swallows ``BaseException``. The shield therefore covers the
+        read and the write as one uninterruptible unit; a caller passing
+        *skip_if_row_exists=False* still performs no read at all, shielded or
+        not.
+
         Finally, when the run already carries an ``_error`` record, the arm
         stamps its outcome there as a breadcrumb rather than adding a new
         top-level ``stage_reports`` key — the same place operators already look
         for a failed cycle's diagnosis.
         """
-        # The read-back is skipped when no ledger is wired: there is then no row
-        # to clobber (and the upsert itself is a no-op). Both callers that pass
+        # ledger may be None (no ReconLedgerStore wired): there is then no row
+        # to clobber, and the upsert itself is a no-op. Both callers that pass
         # skip_if_row_exists already gate on the ledger being present, so this
         # is a type-narrowing belt-and-braces, not a live path.
         ledger = getattr(self.memory, 'recon_ledger', None)
-        if skip_if_row_exists and ledger is not None:
-            existing = await ledger.get_by_identity(
-                project_id,
-                'cycle_summary',
-                task_id='',
-                flag_type=stage_id.value,
-                run_id=run_id,
-            )
-            if existing is not None:
-                logger.info(
-                    f'reconciliation.{stage_prefix}_cycle_summary_backstop_row_present',
-                    extra={'run_id': run_id, 'project_id': project_id},
-                )
-                return
 
-        degraded_report = StageReport(
-            stage=stage_id,
-            # Whole-cycle anchor, not the stage's real start (see docstring).
-            started_at=cycle_start_time,
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={f'{stage_prefix}_cycle_summary_degraded_backstop': True},
-            # Zeroed means "unrecoverable", NOT "no work happened" (see docstring).
-            llm_calls=0,
-            tokens_used=0,
-        )
-        # Shielded against a second cancellation arriving mid-write; the write
-        # keeps running to completion in its own Task.
-        ledger_written = await asyncio.shield(writer(degraded_report))
+        async def _read_then_write() -> tuple[bool, bool | None]:
+            """Returns ``(skipped, ledger_written)``. Run as ONE shielded unit
+            (see the call site below) so a second cancellation arriving while
+            the clobber-guard read is in flight cannot separate the read from
+            the write it gates — see the skip_if_row_exists docstring
+            paragraph above.
+            """
+            if skip_if_row_exists and ledger is not None:
+                existing = await ledger.get_by_identity(
+                    project_id,
+                    'cycle_summary',
+                    task_id='',
+                    flag_type=stage_id.value,
+                    run_id=run_id,
+                )
+                if existing is not None:
+                    return True, None
+
+            degraded_report = StageReport(
+                stage=stage_id,
+                # Whole-cycle anchor, not the stage's real start (see docstring).
+                started_at=cycle_start_time,
+                completed_at=datetime.now(UTC),
+                items_flagged=[],
+                stats={f'{stage_prefix}_cycle_summary_degraded_backstop': True},
+                # Zeroed means "unrecoverable", NOT "no work happened" (see docstring).
+                llm_calls=0,
+                tokens_used=0,
+            )
+            return False, await writer(degraded_report)
+
+        # Shielded against a second cancellation arriving mid-read or
+        # mid-write; the read-then-write keeps running to completion in its
+        # own Task even if this method's own task is cancelled again.
+        skipped, ledger_written = await asyncio.shield(_read_then_write())
+        if skipped:
+            logger.info(
+                f'reconciliation.{stage_prefix}_cycle_summary_backstop_row_present',
+                extra={'run_id': run_id, 'project_id': project_id},
+            )
+            return
         logger.warning(
             f'reconciliation.{stage_prefix}_cycle_summary_backstop_fired',
             extra={
@@ -4245,6 +4344,28 @@ class ReconciliationHarness:
             )
             return False
 
+    async def _backlog_state(self, project_id: str) -> tuple[bool, int]:
+        """``(in_backlog, buffer_size)`` from ONE buffer read.
+
+        Task 3049: the pair is returned together so a caller that both gates on
+        the answer and reports the depth (``_maybe_remediate``'s deferral log)
+        uses the SAME number for both.  Two separate reads could straddle an
+        arrival or a drain and log a depth at or below the threshold next to a
+        'deferred because backlogged' message.
+
+        The read is deliberately FRESH rather than a flag threaded down from
+        BacklogIterator: that makes the gate stateless and self-terminating —
+        as the backlog drains the buffer falls back under the threshold and
+        remediation resumes on its own, notably on the
+        ``backlog_final_consolidation`` pass which runs after the chunks with
+        a drained buffer. It also correctly covers the non-iterator path, where
+        a plain full cycle whose buffer has meanwhile grown past the threshold
+        defers too. Cost is one indexed COUNT(*) against a ~945s cycle.
+        """
+        stats = await self.buffer.get_buffer_stats(project_id)
+        size = stats.get('size', 0)
+        return is_backlog_size(size, self.config), size
+
     async def _maybe_remediate(
         self,
         project_id: str,
@@ -4255,7 +4376,17 @@ class ReconciliationHarness:
         scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
-        """Extract Stage 3 findings from the parent run and trigger remediation if needed."""
+        """Extract Stage 3 findings from the parent run and trigger remediation if needed.
+
+        Task 3049 lever 1 — this runs as an INLINE TAIL of every completed
+        run_full_cycle, so in backlog mode every BacklogIterator chunk drags its
+        own zero-event remediation pass along behind it (measured at ~44% of
+        backlog-mode drain wall-clock on reify, 2026-07-25).  The gate just
+        before the _run_remediation_pass dispatch below defers that tail while
+        the project is still in backlog mode, bounded by
+        config.max_backlog_remediation_deferrals.  See the comment at the gate
+        for why deferring is lossless and self-terminating.
+        """
         try:
             s3_report = parent_run.stage_reports.get('integrity_check')
             if s3_report is None:
@@ -4394,6 +4525,68 @@ class ReconciliationHarness:
 
             if not to_remediate:
                 return
+
+            # Task 3049 lever 1: while the project is still in backlog mode,
+            # DEFER this inline remediation pass rather than running it now.
+            #
+            # Placed here — after the non-actionable, placeholder and
+            # open-escalation filters — so a deferral is only ever recorded for
+            # findings that would genuinely have been remediated; the earlier
+            # filters' logging/escalation side effects still happen every cycle.
+            #
+            # WHY THIS IS LOSSLESS: the parent run's Stage-3 findings were
+            # already persisted by update_run_stage_reports (in run_full_cycle,
+            # BEFORE this method is called) and are forward-fed into the next
+            # cycle's S1/S2 by _get_prior_s3_findings.  Deferring therefore
+            # delays remediation; it never drops a finding.
+            #
+            # WHY IT SELF-TERMINATES: _backlog_state re-reads the buffer, so
+            # as the backlog drains the answer flips on its own — notably on
+            # BacklogIterator's backlog_final_consolidation pass, which runs
+            # against a drained buffer.  No flag has to be threaded down, and
+            # the non-iterator path (a plain cycle whose buffer meanwhile grew
+            # past the threshold) is covered by the same predicate.
+            #
+            # WHY THE BOUND: without it, a project whose buffer never falls
+            # below the threshold would starve remediation indefinitely.
+            # max_backlog_remediation_deferrals caps the consecutive streak; 0
+            # disables deferral entirely (exact pre-3049 behaviour).
+            #
+            # WHY THE CEILING: the streak also has to leave the persistence
+            # counter's meaning intact — see _MAX_BACKLOG_REMEDIATION_DEFERRALS.
+            # The config field is schema-bounded to the same ceiling; the min()
+            # here is what ENFORCES it at the point of use, so a duck-typed or
+            # hand-patched config cannot quietly buy more rope than the
+            # escalation semantics can absorb.
+            configured_deferrals = getattr(
+                self.config, 'max_backlog_remediation_deferrals', 0)
+            max_deferrals = min(configured_deferrals, _MAX_BACKLOG_REMEDIATION_DEFERRALS)
+            deferred_so_far = self._remediation_deferrals.get(project_id, 0)
+            if max_deferrals > 0 and deferred_so_far < max_deferrals:
+                # ONE buffer read, on the defer path only: the depth that gates
+                # is the depth that gets logged.  Two reads could straddle an
+                # arrival or a drain and print a size at or below the threshold
+                # next to a 'deferred because backlogged' message.
+                in_backlog, buffer_size = await self._backlog_state(project_id)
+                if in_backlog:
+                    self._remediation_deferrals[project_id] = deferred_so_far + 1
+                    logger.info(
+                        'reconciliation.remediation_deferred_backlog',
+                        extra={
+                            'project_id': project_id,
+                            'parent_run_id': parent_run_id,
+                            'deferred_finding_count': len(to_remediate),
+                            'buffer_size': buffer_size,
+                            'consecutive_deferrals': self._remediation_deferrals[project_id],
+                            'max_backlog_remediation_deferrals': max_deferrals,
+                            'configured_max_backlog_remediation_deferrals':
+                                configured_deferrals,
+                        },
+                    )
+                    return
+
+            # Dispatching (or the bound was reached) — the streak is over.
+            self._remediation_deferrals[project_id] = 0
 
             logger.info(
                 f'Remediation: {len(to_remediate)} actionable findings from run {parent_run_id}, '
@@ -5025,11 +5218,18 @@ class BacklogIterator:
         self.time_provider = time_provider
 
     async def should_iterate(self, project_id: str) -> bool:
-        """Buffer count > 150% of trigger threshold."""
+        """Buffer count > 150% of trigger threshold.
+
+        Task 3049: the threshold has exactly ONE definition — the pure
+        module-level :func:`is_backlog_size`, which the harness's
+        ``_backlog_state`` (and through it ``_maybe_remediate``'s deferral
+        gate) and ``_select_tier`` call too.  Evaluated here against THIS
+        iterator's own injected ``config`` and ``buffer`` rather than reaching
+        through to the harness's, so a caller that constructs an iterator with
+        different collaborators gets an answer computed from them.
+        """
         stats = await self.buffer.get_buffer_stats(project_id)
-        count = stats.get('size', 0)
-        threshold = self.config.buffer_size_threshold * self.config.opus_threshold_ratio
-        return count > threshold
+        return is_backlog_size(stats.get('size', 0), self.config)
 
     async def run(self, project_id: str) -> None:
         """Process backlog in token-budgeted chunks, oldest-first.

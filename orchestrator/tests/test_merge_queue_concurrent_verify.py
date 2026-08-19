@@ -37,7 +37,12 @@ from typing import Any, Literal, TypeGuard
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import MERGE_RESULT_TIMEOUT
+from _orch_helpers import (
+    MERGE_GATE_BARRIER_TIMEOUT,
+    MERGE_RESULT_TIMEOUT,
+    RESPONSIVE_WAIT_STRETCH,
+    RESPONSIVE_WAIT_WALL_CAP,
+)
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
@@ -201,7 +206,34 @@ HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
 _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
     'MERGE_RESULT_TIMEOUT': float(MERGE_RESULT_TIMEOUT),
     'HEAVY_BARRIER_TEST_TIMEOUT': float(HEAVY_BARRIER_TEST_TIMEOUT),
+    # task 3980: `wait_responsive`'s hard wall backstop and the merge-pipeline
+    # gate-barrier nominal, so a scanned call site spelling either one
+    # resolves rather than silently contributing 0.0 (which would let the
+    # late-arrival gate barriers vanish from the audited budget entirely).
+    'RESPONSIVE_WAIT_WALL_CAP': float(RESPONSIVE_WAIT_WALL_CAP),
+    'MERGE_GATE_BARRIER_TIMEOUT': float(MERGE_GATE_BARRIER_TIMEOUT),
 }
+
+# task 3980: a wait routed through `_orch_helpers.wait_responsive` charges its
+# budget in loop-responsive time, so its worst-case WALL clock is the nominal
+# `timeout` stretched by RESPONSIVE_WAIT_STRETCH and hard-bounded by
+# RESPONSIVE_WAIT_WALL_CAP.  IMPORTED, not re-derived: the helper computes its
+# own per-call default cap from the very same constant, so the RATIO cannot
+# drift and this bill is an EXACT upper bound for any site that leaves
+# `max_wall_s` at its default.
+#
+# The exactness is NOT unconditional: an explicit `max_wall_s=` wins over the
+# scaled default inside the helper and the branch below does not scan for it,
+# so such a site would be under-billed.  No scanned site passes `max_wall_s`
+# (only the hermetic unit tests do, and they carry no mark obligation), so the
+# claim holds over the audited corpus today; closing that gap structurally is
+# tracked as follow-up.
+#
+# Fixing the ratio at 2 is what lets a reviewer check the paired-mark
+# arithmetic instead of trusting a number: the worst per-method budget this
+# scan computes for test_merge_speculation.py is 240s, clearing
+# HEAVY_BARRIER_TEST_TIMEOUT (300s).
+_RESPONSIVE_WAIT_STRETCH = RESPONSIVE_WAIT_STRETCH
 
 
 def _resolve_wait_value(node: ast.expr | None) -> float:
@@ -222,11 +254,14 @@ def _resolve_wait_value(node: ast.expr | None) -> float:
 def _call_wait_budget(call: ast.Call) -> float:
     """Return the wait-budget contribution of a single ``ast.Call`` node.
 
-    Recognises exactly two call shapes -- ``asyncio.wait_for(..., timeout=N)``
+    Recognises exactly three call shapes -- ``asyncio.wait_for(..., timeout=N)``
     (the attribute's value must itself be the ``asyncio`` name, so
-    ``gate.wait_for(...)`` or ``self.wait_for(...)`` do NOT match) and
+    ``gate.wait_for(...)`` or ``self.wait_for(...)`` do NOT match),
     ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
-    when no ``timeout=`` kwarg is given). Every other call shape --
+    when no ``timeout=`` kwarg is given), and ``wait_responsive(...)``
+    (task 3980; same hidden default, but its worst-case WALL clock is the
+    nominal budget stretched by ``_RESPONSIVE_WAIT_STRETCH`` and hard-bounded
+    by ``RESPONSIVE_WAIT_WALL_CAP`` -- see below). Every other call shape --
     ``asyncio.sleep``, ``.wait()``, ``.result()``, ``.join()``, a
     non-``asyncio`` ``.wait_for(...)``, attribute access, arithmetic,
     unknown names -- contributes 0.0 and is skipped silently (this is a
@@ -253,6 +288,24 @@ def _call_wait_budget(call: ast.Call) -> float:
             if kw.arg == 'timeout':
                 return _resolve_wait_value(kw.value)
         return _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
+    if isinstance(func, ast.Name) and func.id == 'wait_responsive':
+        # task 3980: the nominal `timeout` is charged in loop-responsive
+        # time, so real wall clock can run past it under starvation. Bill
+        # the stretched worst case, hard-bounded by the wall cap the helper
+        # itself enforces -- a wait_responsive call that leaves `max_wall_s`
+        # at its default can never consume more wall clock than
+        # RESPONSIVE_WAIT_WALL_CAP, whatever its nominal budget.  A site
+        # passing an explicit `max_wall_s` is NOT covered by that bound and is
+        # not scanned here; see the RESPONSIVE_WAIT_STRETCH comment above.
+        nominal = _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
+        for kw in call.keywords:
+            if kw.arg == 'timeout':
+                nominal = _resolve_wait_value(kw.value)
+                break
+        return min(
+            nominal * _RESPONSIVE_WAIT_STRETCH,
+            _KNOWN_WAIT_CONSTANTS['RESPONSIVE_WAIT_WALL_CAP'],
+        )
     return 0.0
 
 
@@ -488,6 +541,69 @@ def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
     for key, value in overrides.items():
         setattr(fake, key, value)
     return fake
+
+
+# ---------------------------------------------------------------------------
+# Disposition fail-open predicate (task 3980 amendment) — the companion guard
+# to _fake_verify_result above, and deliberately colocated with it.
+#
+# The classifier has TWO fail-open sites, on two different loggers, both
+# emitting the same substring:
+#   1. merge_disposition.py:710-719 — the classifier's own internal fail-open,
+#      logger 'orchestrator.merge_disposition'.
+#   2. merge_queue.py:994-1001 — `_classify_disposition_for_outcome`'s
+#      belt-and-suspenders catch for anything site 1 re-raises past, logger
+#      'orchestrator.merge_queue'.
+# Keying on the shared substring catches both; filtering by a single logger
+# name silently excludes site 2.
+#
+# Lives HERE rather than in test_merge_speculation.py so there is exactly one
+# predicate for one production invariant. Task 3980 first wrote a second copy
+# over there, and the two had already diverged before the amendment pass: this
+# file's older inline version keyed on a longer substring that matched only
+# site 1. Two copies of a drift-detector is how the drift gets back in.
+_FAIL_OPEN_SUBSTRING = 'degrading to INDETERMINATE (fail-open, I3)'
+_FAIL_OPEN_LOGGERS = ('orchestrator.merge_disposition', 'orchestrator.merge_queue')
+
+
+def _fail_open_records(
+    records: list[logging.LogRecord],
+) -> list[logging.LogRecord]:
+    """Return the disposition fail-open WARNINGs among *records* (both sites).
+
+    NOT symmetric with "the classifier ran": a classifier that SUCCEEDS emits
+    NOTHING at WARNING (it logs only on the degrade paths,
+    merge_disposition.py:695 and :711), so an empty return here means "no
+    fail-open", never "the classifier was reached". Proving the classifier was
+    reached needs a delegating SPY on the callable — see
+    test_merge_speculation.py's ``TestLateArrivalFailCascade`` for the live one
+    and ``TestDispositionDoubleFidelity`` for the isolated two-sided proof.
+    Do not read log silence here as evidence the classifier never ran: a
+    successful classification is precisely the silent case.
+
+    Deliberately does NOT match merge_disposition.py:695's *other* degrade
+    ('degrading implicated landings to INDETERMINATE (...)'), which is a
+    legitimate evidence-absent verdict rather than a swallowed exception.
+    """
+    return [
+        r for r in records
+        if r.name in _FAIL_OPEN_LOGGERS and _FAIL_OPEN_SUBSTRING in r.getMessage()
+    ]
+
+
+def _format_fail_open_records(records: list[logging.LogRecord]) -> str:
+    """Render fail-open records for an assertion message, naming the underlying
+    exception (the actionable part — the WARNING text alone never says WHY)."""
+    return '\n'.join(
+        f'  - [{r.name}] {r.getMessage()}'
+        + (
+            f'\n    underlying: {r.exc_info[1]!r}\n'
+            + ''.join(traceback.format_exception(*r.exc_info))
+            if r.exc_info
+            else ''
+        )
+        for r in records
+    )
 
 
 def _mock_verify_pass() -> AsyncMock:
@@ -5464,25 +5580,25 @@ class TestRedispatchSpeculativeConservation:
         # task 3477: A's VerifyResult double (passed=False) reaches
         # classify_merge_failure_disposition via the real post-merge-verify
         # path. That classifier must complete honestly, not silently degrade
-        # to its fail-open path (merge_disposition.py:710-719) because the
-        # double's cause_hint/test_output shape confused
-        # _extract_failing_tests_and_candidate_files. This guard is what
-        # proves the (b) fidelity fix actually reached this call site — any
-        # future double built without a real cause_hint re-trips it.
-        fail_open_records = [
-            r for r in caplog.records
-            if 'internal error; degrading to INDETERMINATE (fail-open, I3)' in r.message
-        ]
+        # to its fail-open path because the double's cause_hint/test_output
+        # shape confused _extract_failing_tests_and_candidate_files. This guard
+        # is what proves the (b) fidelity fix actually reached this call site —
+        # any future double built without a real cause_hint re-trips it.
+        #
+        # task 3980 amendment: routed through the shared `_fail_open_records`
+        # predicate above. The inline version this replaces keyed on a longer
+        # substring ('internal error; degrading to ...') that matched only
+        # merge_disposition.py:711, so the second fail-open site
+        # (merge_queue.py:1000, logger 'orchestrator.merge_queue') could swallow
+        # the same defect here undetected.
+        fail_open_records = _fail_open_records(caplog.records)
         assert fail_open_records == [], (
             'classify_merge_failure_disposition degraded to the silent '
             'fail-open path while classifying A\'s failing verify — the '
             'VerifyResult double reached _extract_failing_tests_and_'
             'candidate_files and raised instead of returning a real '
-            'disposition. Offending record(s):\n' + '\n'.join(
-                ''.join(traceback.format_exception(*r.exc_info))
-                if r.exc_info else r.message
-                for r in fail_open_records
-            )
+            'disposition. Offending record(s):\n'
+            + _format_fail_open_records(fail_open_records)
         )
 
 

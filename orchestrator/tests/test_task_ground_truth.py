@@ -32,9 +32,10 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from escalation.models import Escalation
-from escalation.pins import PinRecord, classify_pins
+from escalation.pins import PinRecord, _norm_id, classify_pins
 from escalation.queue import EscalationQueue
 from shared.deploy_state import DeployPhase
+from shared.task_claimant import compose_claimant_run_id
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
@@ -85,6 +86,16 @@ class TestFrozenValueObjects:
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
             claimant.run_id = 'other'  # type: ignore[misc]
+
+    def test_claimant_session_id_is_defaulted_and_frozen(self) -> None:
+        """``session_id`` (task 3563) is defaulted, so every existing
+        construction site keeps working, and shares the frozen contract."""
+        claimant = Claimant(
+            run_id='run-1/sess-1/pid=1', heartbeat_at=None, source=ClaimantSource.DB,
+        )
+        assert claimant.session_id is None
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            claimant.session_id = 'other'  # type: ignore[misc]
 
     def test_escalation_ref_is_frozen(self) -> None:
         ref = EscalationRef(id='esc-1-1', level=1)
@@ -704,8 +715,11 @@ class TestDeriveTruthLiveClaimant:
     async def test_no_db_claimant_live_plan_lock_returns_plan_lock_claimant(
         self, tmp_path: Path,
     ) -> None:
+        # task 3563: the lock records the process run_id, so the resolved
+        # identity is the FULL composed shape — not the bare session id it
+        # used to return.  The raw session id survives under session_id.
         TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        TaskArtifacts(tmp_path).lock_plan('sess-13-abc123')
+        TaskArtifacts(tmp_path).lock_plan('sess-13-abc123', run_id='run-13')
         lock_data = TaskArtifacts(tmp_path).read_plan_lock()
         assert lock_data is not None
         locked_at = lock_data['locked_at']
@@ -716,9 +730,10 @@ class TestDeriveTruthLiveClaimant:
         report = await resolver.derive_truth('13')
 
         assert report.live_claimant == Claimant(
-            run_id='sess-13-abc123',
+            run_id=compose_claimant_run_id('run-13', 'sess-13-abc123', os.getpid()),
             heartbeat_at=locked_at,
             source=ClaimantSource.PLAN_LOCK,
+            session_id='sess-13-abc123',
         )
 
     async def test_stale_db_claimant_returns_none_even_with_live_plan_lock(
@@ -943,6 +958,233 @@ class TestDeriveTruthLiveClaimant:
 
 
 # ---------------------------------------------------------------------------
+# task 3563 — Claimant.run_id is homogeneous across all three sources
+# ---------------------------------------------------------------------------
+
+
+def _write_plan_lock(root: Path, payload: dict) -> Path:
+    """Write a raw plan.lock literal (bypassing lock_plan) under *root*.
+
+    Used for the malformed/legacy shapes ``lock_plan`` itself can no longer
+    produce — exactly the locks already sitting on disk from before this
+    change, which the resolver must still degrade safely on.
+    """
+    artifacts = TaskArtifacts(root)
+    artifacts.root.mkdir(parents=True, exist_ok=True)
+    lock_path = artifacts.root / 'plan.lock'
+    lock_path.write_text(json.dumps(payload))
+    return lock_path
+
+
+@pytest.mark.asyncio
+class TestClaimantRunIdIsComposedOrNone:
+    """``Claimant.run_id`` is a full composed identity, or None (task 3563).
+
+    The contract: ``run_id`` is either a complete
+    ``shared.task_claimant.compose_claimant_run_id`` string, or ``None``
+    meaning UNKNOWN.  NEVER a bare ``session_id``, and never partially
+    composed.  Before this task the three sources were heterogeneous — DB
+    yielded the composed identity, plan.lock a bare session id, in-memory
+    ``None`` — which is why ``escalation.pins._norm_id`` had to reject
+    non-composed values outright rather than compare them.
+
+    A partially-composed value would be WORSE than the bare session id it
+    replaces: ``'/{session_id}/pid={pid}'`` contains the ``/pid=`` marker, so
+    it PASSES ``_norm_id``'s shape guard and then string-mismatches every
+    DB-composed filing identity — which ``classify_pins`` link 4 reads as "a
+    DIFFERENT incarnation is live", converting a genuinely LIVE filer's L0 to
+    DEAD_L0.  Hence: compose only when EVERY component is known, else None.
+    """
+
+    @staticmethod
+    def _unclaimed_task() -> dict:
+        return {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+
+    async def _resolve(self, tmp_path: Path, tid: str = '13') -> Claimant | None:
+        scheduler = _fake_scheduler(is_actively_held=False, task=self._unclaimed_task())
+        resolver = _make_ground_truth(
+            scheduler=scheduler, worktree_resolver=lambda _tid: tmp_path,
+        )
+        return (await resolver.derive_truth(tid)).live_claimant
+
+    async def test_lock_with_run_id_resolves_to_composed_identity(
+        self, tmp_path: Path,
+    ) -> None:
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        TaskArtifacts(tmp_path).lock_plan('sess-13-abc123', run_id='run-abc')
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        # The REAL composer, not a hand-formatted string — the point is that
+        # this is byte-identical to what the DB stamp produces.
+        assert claimant.run_id == compose_claimant_run_id(
+            'run-abc', 'sess-13-abc123', os.getpid(),
+        )
+        # The raw session id is preserved rather than dropped.
+        assert claimant.session_id == 'sess-13-abc123'
+
+    async def test_legacy_lock_without_run_id_resolves_to_none_not_bare_session(
+        self, tmp_path: Path,
+    ) -> None:
+        """The pre-3563 shape still on disk must degrade to UNKNOWN."""
+        _write_plan_lock(tmp_path, {
+            'session_id': 'sess-legacy-abc123',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+        })
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        assert claimant.run_id is None
+        # Explicit: the old bare-session_id shape can never silently return.
+        assert claimant.run_id != 'sess-legacy-abc123'
+        assert claimant.session_id == 'sess-legacy-abc123'
+
+    @pytest.mark.parametrize(
+        'run_id',
+        ['', '   ', 42, None, ['run-abc']],
+        ids=['empty', 'blank', 'int', 'null', 'list'],
+    )
+    async def test_blank_or_non_str_run_id_resolves_to_none(
+        self, tmp_path: Path, run_id,
+    ) -> None:
+        _write_plan_lock(tmp_path, {
+            'session_id': 'sess-13-abc123',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+            'run_id': run_id,
+        })
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.run_id is None
+        assert claimant.session_id == 'sess-13-abc123'
+
+    async def test_string_owner_pid_composes_from_the_PARSED_int(
+        self, tmp_path: Path,
+    ) -> None:
+        """The composed identity embeds the PARSED int, not the raw JSON value.
+
+        Pins the ``parsed_pid`` hoist in ``_resolve_live_claimant`` against a
+        refactor back to composing from ``lock_data.get('owner_pid')`` (or to
+        re-parsing it separately from the liveness check).
+
+        The fixture uses a ZERO-PADDED pid string deliberately: it is the
+        cheapest spelling that survives ``int()`` as the live pid yet differs
+        under ``f'{...}'``.  A plain ``str(os.getpid())`` would NOT discriminate
+        — ``compose_claimant_run_id`` is an f-string, so ``'12345'`` and
+        ``12345`` format identically and the assertion would hold either way.
+        Here the raw value would compose ``.../pid=012345`` while the DB stamp,
+        built from ``os.getpid()``, composes ``.../pid=12345``: a byte mismatch
+        that ``classify_pins`` would read as a DIFFERENT live incarnation.
+        """
+        padded_pid = f'0{os.getpid()}'
+        assert int(padded_pid) == os.getpid()  # same process...
+        assert padded_pid != str(os.getpid())  # ...different byte sequence
+
+        _write_plan_lock(tmp_path, {
+            'session_id': 'sess-13-abc123',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': padded_pid,
+            'run_id': 'run-abc',
+        })
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        assert claimant.run_id is not None
+        assert claimant.run_id == compose_claimant_run_id(
+            'run-abc', 'sess-13-abc123', os.getpid(),
+        )
+        assert f'/pid={padded_pid}' not in claimant.run_id
+
+    @pytest.mark.parametrize(
+        'session_id',
+        ['', '   ', 42, None, ['sess']],
+        ids=['empty', 'blank', 'int', 'null', 'list'],
+    )
+    async def test_valid_run_id_with_bad_session_id_resolves_to_none(
+        self, tmp_path: Path, session_id,
+    ) -> None:
+        """No PARTIALLY-composed identity — every component or nothing."""
+        _write_plan_lock(tmp_path, {
+            'session_id': session_id,
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+            'run_id': 'run-abc',
+        })
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.run_id is None
+        assert claimant.session_id is None
+
+    async def test_db_branch_is_unchanged_and_carries_no_session_id(self) -> None:
+        """DB already yields the composed identity; it is NOT decomposed.
+
+        ``shared.task_claimant`` ships a composer and DELIBERATELY no parser
+        (the identity is compared verbatim, never parsed), so the resolver
+        must not split a composed identity to back-fill ``session_id``.
+        """
+        fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
+        composed = compose_claimant_run_id('run-1', 'session-1', 123)
+        task = {
+            'status': 'in-progress',
+            'claimant_run_id': composed,
+            'heartbeat_at': '2026-07-12T11:55:00+00:00',
+        }
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(
+            scheduler=scheduler, now_fn=lambda: fixed_now, heartbeat_ttl=timedelta(minutes=10),
+        )
+
+        report = await resolver.derive_truth('12')
+
+        assert report.live_claimant is not None
+        assert report.live_claimant.source == ClaimantSource.DB
+        assert report.live_claimant.run_id == composed  # verbatim
+        assert report.live_claimant.session_id is None
+
+    async def test_in_memory_branch_yields_unknown_identity(self) -> None:
+        scheduler = _fake_scheduler(is_actively_held=True)
+        resolver = _make_ground_truth(scheduler=scheduler)
+
+        report = await resolver.derive_truth('11')
+
+        assert report.live_claimant is not None
+        assert report.live_claimant.source == ClaimantSource.IN_MEMORY
+        assert report.live_claimant.run_id is None
+        assert report.live_claimant.session_id is None
+
+    async def test_composed_identity_survives_escalation_pins_shape_guard(
+        self, tmp_path: Path,
+    ) -> None:
+        """Cross-module shape agreement — the whole point of the change.
+
+        Whatever the resolver emits must be comparable by
+        ``escalation.pins``, i.e. survive ``_norm_id`` rather than collapse
+        to unknown.  ``None`` is the honest unknown and is allowed; any
+        NON-None value must carry the ``/pid=`` marker.
+        """
+        TaskArtifacts(tmp_path).root.mkdir(parents=True)
+        TaskArtifacts(tmp_path).lock_plan('sess-13-abc123', run_id='run-abc')
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.run_id is not None
+        assert '/pid=' in claimant.run_id
+        assert _norm_id(claimant.run_id) == claimant.run_id
+
+
+# ---------------------------------------------------------------------------
 # step-11 — derive_truth's remaining TruthReport fields
 # ---------------------------------------------------------------------------
 
@@ -1003,12 +1245,16 @@ class TestDeriveTruthRemainingFields:
 
         report = await resolver.derive_truth('20')
 
+        # ``created_at`` travels from the row's ``timestamp`` (task 3535), so
+        # a veto site can age a hold without a second store read.
         assert report.open_escalations == [
             EscalationRef(
                 id='esc-20-1', level=1, category='scope_violation', severity='blocking',
+                created_at=rows[0].timestamp,
             ),
             EscalationRef(
                 id='esc-20-2', level=0, category='cleanup_needed', severity='info',
+                created_at=rows[1].timestamp,
             ),
         ]
         escalation_queue.get_by_task.assert_called_once_with('20', status='pending')
@@ -1045,7 +1291,12 @@ class TestDeriveTruthRemainingFields:
 
         report = await resolver.derive_truth('30')
 
-        assert sorted(report.open_escalations, key=lambda r: r.id) == [
+        # ``created_at`` is stamped by the queue at submit time, so it is
+        # stripped for this identity comparison and asserted on its own below.
+        assert [
+            dataclasses.replace(ref, created_at=None)
+            for ref in sorted(report.open_escalations, key=lambda r: r.id)
+        ] == [
             EscalationRef(
                 id='esc-30-1', level=0, category='infra_issue', severity='blocking',
                 filing_claimant_run_id='run-A/sess-A/pid=1',
@@ -1055,6 +1306,9 @@ class TestDeriveTruthRemainingFields:
                 filing_claimant_run_id=None,
             ),
         ]
+        assert all(ref.created_at for ref in report.open_escalations), (
+            'the filing time must survive the JSON round-trip (task 3535)'
+        )
 
     async def test_legacy_on_disk_record_without_filing_identity_resolves_to_none(
         self, tmp_path: Path,
@@ -1072,7 +1326,9 @@ class TestDeriveTruthRemainingFields:
 
         report = await resolver.derive_truth('31')
 
-        assert report.open_escalations == [
+        assert [
+            dataclasses.replace(ref, created_at=None) for ref in report.open_escalations
+        ] == [
             EscalationRef(
                 id='esc-31-1', level=0, category='infra_issue', severity='blocking',
                 filing_claimant_run_id=None,
@@ -1094,7 +1350,9 @@ class TestDeriveTruthRemainingFields:
 
         report = await resolver.derive_truth('32')
 
-        assert report.open_escalations == [
+        assert [
+            dataclasses.replace(ref, created_at=None) for ref in report.open_escalations
+        ] == [
             EscalationRef(id='esc-32-1', level=0, category='infra_issue', severity=''),
         ]
 
@@ -1292,3 +1550,331 @@ class TestRecoveryFor:
         assert report.branch_state == BranchState(BranchStateKind.GONE_NO_MARKER, None)
         assert report.deploy_phase == DeployPhase.RAN
         assert action == RecoveryAction.RE_FILE_ESCALATION
+
+
+# ---------------------------------------------------------------------------
+# task 3535 (beta) — the store-correctness THIRD state, and the ages source.
+#
+# The canonical WHY for the emission mechanism these fields feed lives in
+# orchestrator/src/orchestrator/recovery_emission.py (module docstring).
+# ---------------------------------------------------------------------------
+
+
+class TestEscalationRefCreatedAt:
+    """``created_at`` is the only ages source available at the veto site."""
+
+    def test_created_at_defaults_to_none_meaning_unknown(self):
+        """Defaulted, so every existing construction site keeps working."""
+        ref = EscalationRef(id='esc-1', level=1)
+        assert ref.created_at is None
+
+    def test_created_at_is_carried_verbatim(self):
+        ref = EscalationRef(id='esc-1', level=1, created_at='2026-08-10T12:00:00+00:00')
+        assert ref.created_at == '2026-08-10T12:00:00+00:00'
+
+
+class TestTruthReportStoreUnavailable:
+    """The third state closes the KNOWN GAP the docstrings hand to this task."""
+
+    def test_escalation_store_unavailable_defaults_to_false(self):
+        report = TruthReport(
+            db_status='in-progress',
+            live_claimant=None,
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'abc'),
+            worktree_present=False,
+            open_escalations=[],
+            deploy_phase=None,
+        )
+        assert report.escalation_store_unavailable is False
+
+
+@pytest.mark.asyncio
+class TestResolveOpenEscalationsThirdState:
+    """"no open records" and "could not read the store" must be distinguishable.
+
+    A false ``[]`` routes a genuinely-pinned strand into the plain revert
+    branch — the esc-3163 collapse ``classify_pins(records=None)`` exists to
+    make impossible.
+    """
+
+    async def test_absent_queue_is_unavailable_not_empty(self):
+        resolver = _make_ground_truth()  # escalation_queue defaults to None
+
+        report = await resolver.derive_truth('3535')
+
+        assert report.open_escalations == []
+        assert report.escalation_store_unavailable is True, (
+            'an absent queue means the read was never PERFORMED — it is not '
+            'evidence that the task carries no open escalation'
+        )
+
+    async def test_a_read_that_succeeds_with_no_rows_is_available(self):
+        resolver = _make_ground_truth(escalation_queue=_fake_escalation_queue(rows=[]))
+
+        report = await resolver.derive_truth('3535')
+
+        assert report.open_escalations == []
+        assert report.escalation_store_unavailable is False
+
+    @pytest.mark.parametrize(
+        'exc', [OSError('disk gone'), RuntimeError('queue wedged')],
+    )
+    async def test_a_raising_read_degrades_loudly_without_propagating(self, exc, caplog):
+        """A store fault must never abort the whole ground-truth sweep.
+
+        Same degradation shape as the plan.lock and deploy-state resolvers in
+        this class, and logged at WARNING so the outage is visible.
+        """
+        import logging
+
+        queue = MagicMock()
+        queue.get_by_task = MagicMock(side_effect=exc)
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.task_ground_truth'):
+            report = await resolver.derive_truth('3535')
+
+        assert report.open_escalations == []
+        assert report.escalation_store_unavailable is True
+        assert any('3535' in r.getMessage() for r in caplog.records), (
+            'the outage must name the task it degraded'
+        )
+
+    async def test_created_at_is_populated_from_the_row_timestamp(self):
+        """So a veto site can age a hold without a second store read."""
+        row = Escalation(
+            id='esc-3535-1', task_id='3535', agent_role='implementer',
+            severity='blocking', category='risk_identified', summary='s', level=1,
+        )
+        resolver = _make_ground_truth(escalation_queue=_fake_escalation_queue(rows=[row]))
+
+        report = await resolver.derive_truth('3535')
+
+        assert report.open_escalations[0].created_at == row.timestamp
+
+
+class TestStoreUnavailableChangesNoDisposition:
+    """ZERO-DISPOSITION-CHANGE regression pin (task 3535's whole contract)."""
+
+    @pytest.mark.asyncio
+    async def test_store_unavailable_off_main_strand_still_reverts_to_pending(self):
+        """The fold that must NOT happen.
+
+        Folding ``escalation_store_unavailable`` into ``_shape``'s table key
+        would flip this shape from REVERT_TO_PENDING to LEAVE — a genuine
+        disposition change during a store outage, and precisely what tasks
+        delta/eta own behind the operator flip.  Emission-before-behavior means
+        the third state becomes VISIBLE now while the decision stays put.
+        """
+        task = {'status': 'in-progress', 'claimant_run_id': None, 'heartbeat_at': None}
+        git_ops = _fake_git_ops(is_ancestor=False, branch_sha='deadbeef', marker_sha=None)
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(  # no escalation_queue => store unavailable
+            git_ops=git_ops, scheduler=scheduler,
+        )
+
+        report, action = await resolver.recovery_for('3535')
+
+        assert report.escalation_store_unavailable is True
+        assert action == RecoveryAction.REVERT_TO_PENDING, (
+            'a store outage must not silently start pinning strands'
+        )
+
+    def test_shape_output_ignores_the_new_flag_entirely(self):
+        """``_shape``'s key must be byte-identical with the flag either way."""
+        from orchestrator.task_ground_truth import _shape
+
+        base = {
+            'db_status': 'in-progress',
+            'live_claimant': None,
+            'branch_state': BranchState(BranchStateKind.ON_MAIN, 'abc'),
+            'worktree_present': False,
+            'open_escalations': [],
+            'deploy_phase': None,
+        }
+        available = TruthReport(**base, escalation_store_unavailable=False)
+        unavailable = TruthReport(**base, escalation_store_unavailable=True)
+
+        assert _shape(available) == _shape(unavailable)
+        assert classify_recovery(available) == classify_recovery(unavailable)
+
+
+def _leave_report(**overrides) -> TruthReport:
+    """A TruthReport that classifies LEAVE unless an override says otherwise."""
+    base = {
+        'db_status': 'in-progress',
+        'live_claimant': None,
+        'branch_state': BranchState(BranchStateKind.ON_MAIN, 'abc'),
+        'worktree_present': False,
+        'open_escalations': [EscalationRef(id='esc-1', level=1, severity='blocking')],
+        'deploy_phase': None,
+        'escalation_store_unavailable': False,
+    }
+    base.update(overrides)
+    return TruthReport(**base)
+
+
+class TestLeaveReason:
+    """The pure description of a LEAVE — never a new decision (task 3535).
+
+    ``leave_reason`` adds a DESCRIPTION of what ``classify_recovery`` already
+    decided.  Its precedence chain is documented at the implementation; these
+    tests pin it as a contract rather than an implementation accident.
+    """
+
+    def test_returns_none_for_every_non_leave_action(self):
+        """A caller must never be able to mislabel an ACTION as a hold."""
+        from orchestrator.task_ground_truth import leave_reason
+
+        acted = [
+            # (a) MARK_DONE_WITH_PROVENANCE
+            _leave_report(open_escalations=[]),
+            # (c) REVERT_TO_PENDING
+            _leave_report(
+                open_escalations=[],
+                branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN, None),
+            ),
+            # (g) RE_FILE_ESCALATION
+            _leave_report(
+                db_status='blocked', open_escalations=[],
+                branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+            ),
+        ]
+        for report in acted:
+            assert classify_recovery(report) != RecoveryAction.LEAVE, 'fixture drift'
+            assert leave_reason(report) is None
+
+    def test_a_live_claimant_leave_is_reported_as_such(self):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            live_claimant=Claimant(run_id='r', heartbeat_at=None, source=ClaimantSource.DB),
+        )
+        assert leave_reason(report) == LeaveReason.live_claimant
+
+    def test_recovery_row_f_is_escalation_pinned(self):
+        """Boundary #9's classification half.
+
+        IN_PROGRESS + no claimant + ON_MAIN + an open record: the MARK_DONE
+        that row (a) would otherwise take is VETOED by the record.
+        """
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report()
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+    def test_any_other_leave_with_open_records_is_escalation_pinned(self):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            db_status='blocked',
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+    def test_store_unavailable_outranks_unmapped_shape(self):
+        """"we could not read the store" is a strictly better explanation."""
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            open_escalations=[],
+            db_status='cancelled',  # a shape the table does not map
+            escalation_store_unavailable=True,
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_store_unavailable
+
+    @pytest.mark.parametrize(
+        'phase',
+        [
+            DeployPhase.VERIFIED, DeployPhase.FAILED, DeployPhase.SCHEDULED,
+            DeployPhase.ESCALATED, DeployPhase.DONE,
+        ],
+    )
+    def test_a_deliberately_unmapped_deploy_phase_is_reported_as_in_flight(self, phase):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            open_escalations=[],
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+            deploy_phase=phase,
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.deploy_phase_in_flight
+
+    def test_every_remaining_leave_is_unmapped_shape(self):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(open_escalations=[], db_status='cancelled')
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.unmapped_shape
+
+    def test_live_claimant_outranks_an_open_escalation(self):
+        """A pinned-AND-held task is HELD: there is nothing to recover yet.
+
+        Load-bearing for emission volume — a live-claimant LEAVE emits nothing,
+        and it is the healthy majority of every sweep.
+        """
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            live_claimant=Claimant(
+                run_id='r', heartbeat_at=None, source=ClaimantSource.IN_MEMORY,
+            ),
+        )
+        assert leave_reason(report) == LeaveReason.live_claimant
+
+    def test_an_open_escalation_outranks_a_deploy_phase(self):
+        """A RAN deploy holding an open record is PINNED, not merely in flight."""
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+            deploy_phase=DeployPhase.RAN,
+        )
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+    def test_store_unavailable_outranks_a_deploy_phase(self):
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = _leave_report(
+            open_escalations=[],
+            branch_state=BranchState(BranchStateKind.GONE_NO_MARKER, None),
+            deploy_phase=DeployPhase.FAILED,
+            escalation_store_unavailable=True,
+        )
+        assert leave_reason(report) == LeaveReason.escalation_store_unavailable
+
+
+class TestRecoveryShapeStr:
+    """The emitted shape and the ``_RECOVERY`` table key must never drift."""
+
+    def test_matches_render_shape_over_the_same_five_elements(self):
+        from orchestrator.recovery_emission import render_shape
+        from orchestrator.task_ground_truth import _shape, recovery_shape_str
+
+        report = _leave_report()
+        key = _shape(report)
+        assert recovery_shape_str(report) == render_shape(*key)
+
+    @pytest.mark.parametrize(
+        'report',
+        [
+            _leave_report(),
+            _leave_report(open_escalations=[]),
+            _leave_report(
+                live_claimant=Claimant(
+                    run_id='r', heartbeat_at=None, source=ClaimantSource.DB,
+                ),
+            ),
+            _leave_report(db_status='blocked', deploy_phase=DeployPhase.RAN),
+        ],
+    )
+    def test_stays_bound_to_the_table_key_across_shapes(self, report):
+        from orchestrator.recovery_emission import render_shape
+        from orchestrator.task_ground_truth import _shape, recovery_shape_str
+
+        assert recovery_shape_str(report) == render_shape(*_shape(report))

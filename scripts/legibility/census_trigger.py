@@ -29,6 +29,15 @@ THREE-VALUED (task 3291):
   * absent — never censused, or η not yet writing it. Condition (b) fails
     SAFE.
 
+ANY other on-disk value is a fourth, MALFORMED case (task 4085): the state
+file is hand-seedable (skills/census/SKILL.md), so a quoted `"2872"`, a float,
+a JSON `true` or a negative count are all expected operator-authored inputs.
+Those also fail SAFE — one WARNING naming the value and its type, condition
+(b) inert, conditions (a)/(c) unaffected — rather than crashing (`"2872"`
+raised `TypeError` out of the subtraction) or silently computing a nonsense
+delta (`true` is an `int` subclass, so it meant a baseline of 1). The value is
+VALIDATED, never coerced: see `compute_tasks_landed`.
+
 Only a real int ever arms condition (b). A FABRICATED `0` used to be the
 fourth case, and it was the dangerous one: `census.py` wrote 0 whenever the
 get_statuses call failed, and that 0 was persisted as a real baseline on
@@ -43,9 +52,11 @@ codebook from `3e462e1b56^`):
     delta was `0 - 0 = 0` — far under the 120 threshold. Replay of the real
     pre-fix census.py gate reports `tasks-landed: 0 landed since last
     census (threshold 120)`: condition (b) did NOT fire. In the nightly
-    trickle it could not fire at all, since `run_nightly` defaults
-    `status_fetcher=None` (nightly.py:727 -> :901) and (b) is structurally
-    N/A there;
+    trickle of the day it could not fire at all, since `run_nightly`
+    defaulted `status_fetcher` to nothing and (b) was structurally N/A
+    there. That hole is CLOSED: task 4148 made the seam default to
+    `default_status_fetcher(cfg.project_root)`, so (b) is live on the
+    nightly path and the sentence above is history, not current behaviour;
   * but it ARMS (b) the moment the fetch is repaired: with a working
     fetcher the same replay reports `tasks-landed: 2872 landed since last
     census (threshold 120) -> FIRE`, ~24x over. So the root-cause fix below
@@ -88,12 +99,15 @@ it keeps the pure decision core fully unit-testable and makes "a failing
 get_statuses fails SAFE" testable with a raising fake regardless of what is
 listening. (No MCP client library is available in that env either, so a
 hardcoded MCP client could not be exercised there at all.)
-`default_status_fetcher` provides a best-effort glue implementation for the
-standalone CLI, unwrapping the real MCP `tools/call` JSON-RPC envelope via
+`default_status_fetcher` provides the best-effort glue implementation, and
+since task 4148 it is the SHARED production factory for all three
+consumers -- the standalone `evaluate` CLI, `census.py`'s `main()`, and the
+nightly trickle's `run_nightly` (which defaults its `status_fetcher` seam
+to it). It unwraps the real MCP `tools/call` JSON-RPC envelope via
 `_extract_tool_result` (the tool's actual return value lives at
 `result.structuredContent` or `result.content[0].text`, never at the
-envelope's top level); task ε injects the real MCP-backed fetcher. It
-resolves its `project_root` to an ABSOLUTE path before sending it: the MCP
+envelope's top level). It resolves its `project_root` to an ABSOLUTE path
+before sending it: the MCP
 argument is interpreted by the server's cwd, not the client's, and
 fused-memory's `_normalize_project_root` hard-rejects any relative path
 (task 3291). Whatever the fetcher returns is converted to a number by
@@ -166,7 +180,11 @@ class CensusConfig:
     from `legibility.config.Census` (see `_CENSUS_DEFAULTS` above), not
     re-hardcoded here. `from_mapping` merges a partial override mapping
     (e.g. the `census:` sub-dict of a project's legibility.yaml) over these
-    defaults."""
+    defaults, validating each override so an unusable hand-edited value
+    falls back to the default here rather than reaching `evaluate()`.
+
+    Every field is therefore a non-negative `int` by construction, which is
+    what lets `evaluate()` compare and arithmetic on them unguarded."""
 
     max_interval_days: int = _CENSUS_DEFAULTS.max_interval_days
     tasks_landed_threshold: int = _CENSUS_DEFAULTS.tasks_landed_threshold
@@ -181,24 +199,97 @@ class CensusConfig:
         `census:` block, e.g. `{"max_interval_days": 3, "novelty_spike":
         {"count": 9}}`) over the defaults. Keys absent from `mapping`
         (including either nested `novelty_spike` key) keep their default
-        value. `mapping=None` (or `{}`) returns plain defaults."""
+        value. `mapping=None` (or `{}`) returns plain defaults.
+
+        Every override is VALIDATED, never coerced, exactly as
+        `compute_tasks_landed` validates the hand-seeded
+        `last_census_done_count` baseline (task 4085) -- legibility.yaml is
+        the same operator-authored-input class, so a value that is not a
+        non-negative `int` is an expected input, not a hypothetical. A bad
+        value is REJECTED: that one field falls back to its default and the
+        whole batch is reported in exactly one WARNING. This method NEVER
+        raises.
+
+        Per-field fallback, not a whole-block reject, because the six
+        thresholds are independent: one typo'd `novelty_spike.count` must not
+        also disarm the (a) max-interval backstop.
+
+        The stakes are the never-raises contract of everything above this.
+        Unvalidated, a quoted `max_interval_days: '10'` reaches `evaluate()`'s
+        `days_since >= config.max_interval_days` and raises `TypeError` out of
+        `load_census_config` (documented "never raises") and out of
+        `decide_for_project` (same) into `census.main`, which calls it
+        unguarded. A `novelty_spike.window_hours: null` reaches
+        `timedelta(hours=None)`; a non-mapping `novelty_spike:` used to raise
+        `AttributeError` from the `.get` below. `bool` is rejected explicitly
+        because it is an `int` subclass, so `max_interval_days: true` would
+        otherwise silently mean 1 -- a daily ~$100 census.
+        """
         defaults = cls()
         mapping = mapping or {}
-        novelty_spike = mapping.get("novelty_spike") or {}
-        return cls(
-            max_interval_days=mapping.get("max_interval_days", defaults.max_interval_days),
-            tasks_landed_threshold=mapping.get(
-                "tasks_landed_threshold", defaults.tasks_landed_threshold
+        rejected: list[str] = []
+
+        novelty_spike = mapping.get("novelty_spike")
+        if novelty_spike is None:
+            novelty_spike = {}
+        elif not isinstance(novelty_spike, dict):
+            rejected.append(
+                f"novelty_spike={_bounded_repr(novelty_spike)} "
+                f"({type(novelty_spike).__name__}, expected a mapping)"
+            )
+            novelty_spike = {}
+
+        def _threshold(label: str, source: dict, key: str, default: int) -> int:
+            if key not in source:
+                return default
+            value = source[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                rejected.append(
+                    f"{label}={_bounded_repr(value)} ({type(value).__name__})"
+                )
+                return default
+            return value
+
+        config = cls(
+            max_interval_days=_threshold(
+                "max_interval_days", mapping, "max_interval_days",
+                defaults.max_interval_days,
             ),
-            tasks_landed_min_days=mapping.get(
-                "tasks_landed_min_days", defaults.tasks_landed_min_days
+            tasks_landed_threshold=_threshold(
+                "tasks_landed_threshold", mapping, "tasks_landed_threshold",
+                defaults.tasks_landed_threshold,
             ),
-            novelty_spike_count=novelty_spike.get("count", defaults.novelty_spike_count),
-            novelty_spike_window_hours=novelty_spike.get(
-                "window_hours", defaults.novelty_spike_window_hours
+            tasks_landed_min_days=_threshold(
+                "tasks_landed_min_days", mapping, "tasks_landed_min_days",
+                defaults.tasks_landed_min_days,
             ),
-            floor_days=mapping.get("floor_days", defaults.floor_days),
+            novelty_spike_count=_threshold(
+                "novelty_spike.count", novelty_spike, "count",
+                defaults.novelty_spike_count,
+            ),
+            novelty_spike_window_hours=_threshold(
+                "novelty_spike.window_hours", novelty_spike, "window_hours",
+                defaults.novelty_spike_window_hours,
+            ),
+            floor_days=_threshold(
+                "floor_days", mapping, "floor_days", defaults.floor_days,
+            ),
         )
+
+        # ONE warning for the whole block, not one per field: this is a single
+        # operator fault (a hand-edited census: block) and the message is one
+        # nightly journal line. Every rejected value is named, with its type,
+        # so the fix is obvious without opening the file.
+        if rejected:
+            logger.warning(
+                "legibility config census: block has %d unusable value(s), each "
+                "falling back to its default -- every §7.4 threshold must be a "
+                "non-negative int (unquoted, not a float/bool): %s",
+                len(rejected),
+                "; ".join(rejected),
+            )
+
+        return config
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +317,9 @@ def evaluate(
 ) -> Decision:
     """Pure decision core for the §6/§8.5 fire logic. Fires at the earliest
     of condition (a) max_interval_days, (b) tasks_landed_min_days +
-    tasks_landed_threshold, (c) novelty_spike — currently only (a) is
-    implemented; (b)/(c)/the hard floor are added by later steps. No I/O:
+    tasks_landed_threshold, (c) novelty_spike — all three, and the
+    floor_days hard floor that overrides them, are implemented in the body
+    below (`cond_a`, `cond_b`, `cond_c`, `floor_blocks`). No I/O:
     all inputs are plain values so the full §8.5 matrix is testable without
     a filesystem or a live get_statuses call.
     """
@@ -418,6 +510,14 @@ def load_census_config(project_root: str | Path) -> CensusConfig:
     non-dict `census:` block) returns defaults plus exactly one WARNING --
     never raises. Those defaults are `Census`'s, not independently
     hardcoded -- see `CensusConfig`.
+
+    A file that parses but holds an unusable threshold VALUE (a quoted
+    `'10'`, a float, a JSON `true`, a negative) is handled one level down by
+    `CensusConfig.from_mapping`, which rejects that field alone -- default
+    plus one WARNING for the batch -- so the other five thresholds stay live.
+    Between the two, this function returns a fully-typed `CensusConfig` for
+    any input whatsoever, which is what makes its never-raises contract, and
+    `decide_for_project`'s, actually hold.
     """
     path = Path(project_root) / "docs" / "legibility" / "legibility.yaml"
     if not path.exists():
@@ -583,7 +683,9 @@ def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
 
     Returns `None` (never fires condition (b)) plus exactly one WARNING
     when: `status_fetcher` is `None`; `state` has no `last_census_done_count`
-    baseline (§7.5 extended read contract, see module docstring); calling
+    baseline (§7.5 extended read contract, see module docstring);
+    `last_census_done_count` is PRESENT but is not a non-negative int -- a
+    malformed hand-seeded baseline (task 4085; see below); calling
     `status_fetcher` raises for any reason; or the fetched payload is not a
     usable `{"statuses": {id: status}}` envelope (matching get_statuses' real
     shape -- fused-memory/src/fused_memory/server/tools.py:2665). In
@@ -596,12 +698,50 @@ def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
     A bad payload and an unreachable server deliberately share ONE code path
     and ONE warning, so there is no separate failure mode to reason about --
     only the warning TEXT distinguishes them in the journal.
+
+    The baseline is VALIDATED, never coerced. `int("2872")` would silently
+    bless a malformed state file and arm an expensive census run on an
+    unaudited number -- exactly the defect class task 3291 closed on the fetch
+    side (see `extract_done_count` on the fabricated-0 baseline). A value that
+    is not what the documented contract says is REPORTED, not repaired behind
+    the operator's back.
     """
     baseline = (state or {}).get("last_census_done_count")
     if baseline is None:
         logger.warning(
             "tasks-landed: no last_census_done_count baseline in census state "
             "-- condition (b) fails safe (no fire)"
+        )
+        return None
+
+    # Checked BEFORE the status_fetcher guard on purpose: this is a state-side
+    # fault with a different owner (the operator's state file), and reporting
+    # the MORE SPECIFIC fault first is what keeps a mis-seeded baseline
+    # visible instead of being masked by the generic "no status_fetcher
+    # configured" line whenever a caller reaches here without one. Both public
+    # entrypoints (`decide_for_project`, this function) still default
+    # `status_fetcher=None`, so that arm stays live for any caller that
+    # supplies nothing -- it is just no longer the NIGHTLY TRICKLE, whose
+    # `run_nightly` has built `default_status_fetcher(cfg.project_root)` since
+    # task 4148 (before that it passed None on every real run, which is what
+    # made this ordering load-bearing in production rather than merely in
+    # principle).
+    # `bool` is rejected explicitly because it is an `int` subclass, so a
+    # hand-seeded JSON `true` would otherwise mean `baseline == 1` and arm
+    # condition (b) with every done task ever, silently. A negative count is
+    # definitionally impossible and inflates the delta in the fire-ward
+    # direction. `StatusFetchUnavailable` is deliberately NOT raised here --
+    # that exception is a FETCH-side signal that `census.run_census` reads as
+    # "the done-count could not be observed"; this is a different fault with a
+    # different owner (the operator's state file).
+    if not isinstance(baseline, int) or isinstance(baseline, bool) or baseline < 0:
+        logger.warning(
+            "tasks-landed: last_census_done_count is not a non-negative int "
+            "(got %s: %s) -- condition (b) fails safe (no fire); the census-state "
+            "baseline is hand-seedable (skills/census/SKILL.md) and this one is "
+            "unusable",
+            type(baseline).__name__,
+            _bounded_repr(baseline),
         )
         return None
 
@@ -1082,10 +1222,18 @@ def post_mcp_tool_call(
 
 
 def default_status_fetcher(project_root: str | Path):
-    """Return a zero-arg best-effort get_statuses caller for the standalone
-    `evaluate` CLI (task ε injects the real MCP-backed fetcher for the
-    nightly trickle instead -- see module docstring). Reads the fused-memory
-    MCP endpoint from the `FUSED_MEMORY_MCP_URL` env var, defaulting to
+    """Return a zero-arg best-effort get_statuses caller.
+
+    Since task 4148 this is the SHARED production factory for all three
+    consumers -- the standalone `evaluate` CLI below, `census.py`'s `main()`,
+    and the nightly trickle, whose `run_nightly` defaults its
+    `status_fetcher` seam to `default_status_fetcher(cfg.project_root)`.
+    (It previously served the `evaluate` CLI alone: nothing on the nightly
+    path ever built a fetcher, so condition (b) fell through to
+    `compute_tasks_landed`'s `status_fetcher is None` arm on every real run.)
+
+    Reads the fused-memory MCP endpoint from the `FUSED_MEMORY_MCP_URL` env
+    var, defaulting to
     `http://localhost:8002`. `httpx` is imported lazily so importing this
     module for its pure core never needs it, and so tests can substitute a
     stub for the real POST -- not for availability (see module docstring);
@@ -1189,6 +1337,22 @@ def decide_for_project(
     short-circuits to a fail-safe `Decision(fire=False, ...)` immediately
     (before touching the codebook or `status_fetcher`) -- `load_census_state`
     has already logged its one WARNING, so nothing else needs to.
+
+    This function NEVER raises: it always returns a `Decision`. Every risky
+    input is guarded -- the config load and its individual threshold VALUES
+    (`load_census_config` / `CensusConfig.from_mapping`), the census state
+    (`load_census_state`), the codebook load, and the tasks-landed
+    computation -- each degrading to a neutral value or a default plus one
+    WARNING, so a fault in one signal takes out only the condition it feeds
+    -- never the whole evaluation. All four are hand-editable operator
+    inputs, so all four are validated rather than trusted; a `census:` block
+    holding a quoted `max_interval_days: '10'` used to raise `TypeError` from
+    inside `evaluate()` and defeat this promise (task 4085 amendment).
+    That matters because the caller's fallback is coarse: the
+    `evaluate` CLI's outermost catch-all turns any escaping exception into a
+    blanket NO-FIRE, which would suppress the (a) max-interval backstop that
+    exists precisely to survive a broken (b). `nightly.evaluate_census_step`
+    documents this guarantee of this function; it is held here.
     """
     project_root = Path(project_root)
     now = now if now is not None else datetime.now(UTC)
@@ -1224,7 +1388,27 @@ def decide_for_project(
             datetime.fromisoformat(raw_last_census_at) if raw_last_census_at else None
         )
 
-    tasks_landed = compute_tasks_landed(state=state, status_fetcher=status_fetcher)
+    try:
+        tasks_landed = compute_tasks_landed(state=state, status_fetcher=status_fetcher)
+    except Exception as exc:  # noqa: BLE001 - a fail-safe decision must never crash the caller
+        # `_bounded_repr(str(exc))`, not a bare `exc`: an escaping exception's
+        # message is arbitrary (a chained fetch failure can carry a whole
+        # get_statuses payload) and this WARNING is re-emitted as ONE nightly
+        # journal line, exactly like every other message in this module. The
+        # repr also escapes embedded newlines, so a multi-line exception text
+        # cannot break the one-line guarantee either.
+        logger.warning(
+            "tasks-landed computation failed unexpectedly (%s) -- condition (b) "
+            "fails safe (no fire); conditions (a)/(c) are unaffected: %s",
+            type(exc).__name__,
+            _bounded_repr(str(exc)),
+        )
+        # `None`, never `0` and never a re-raise: `evaluate()` already renders
+        # None as "tasks-landed: delta unavailable ... -> N/A", so condition (b)
+        # goes inert while the (a) max-interval backstop and (c) novelty-spike
+        # still evaluate. Re-raising would let one fault in (b) discard the
+        # whole decision via the CLI's outermost catch-all.
+        tasks_landed = None
 
     return evaluate(
         now=now,

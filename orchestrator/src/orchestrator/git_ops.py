@@ -70,7 +70,7 @@ from shared.proc_group import (
     scan_process_groups_under_path,
     snapshot_process_group,
 )
-from shared.transcript_archive import archive_task_transcripts
+from shared.transcript_archive import archive_before_delete
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
@@ -155,8 +155,21 @@ RecoverResult = Literal['rewound', 'cas_failed', 'error']
 # 'failed'              — the flock was acquired and the path existed, but
 #                         `git worktree remove --force` itself returned
 #                         non-zero.
+# 'skipped_lock_error' — the lane's `<path>.lock` could not be opened at all
+#                         (OSError from acquire_merge_verify_flock's pre-wait
+#                         mkdir/os.open: ENOSPC, EACCES, EMFILE, EROFS).
+#                         Removal is skipped and the tree is left for the
+#                         merge reaper. Deliberately NOT 'failed': 'failed'
+#                         means the lease acquire SUCCEEDED and proved no
+#                         live holder, which is what licenses
+#                         cleanup_merge_worktree's force-rmtree fallback. An
+#                         unopenable lock proves nothing about holders (a
+#                         live verify can hold the flock on an existing lock
+#                         inode while our own open fails), so this outcome
+#                         must never reach that fallback.
 RemovalOutcome = Literal[
     'removed', 'skipped_lease_held', 'skipped_persistent', 'not_present', 'failed',
+    'skipped_lock_error',
 ]
 
 
@@ -3774,9 +3787,19 @@ class GitOps:
                         'creating fresh',
                         worktree_path, stored_title, expected_title,
                     )
-                    await self.quarantine_worktree(
+                    dest = await self.quarantine_worktree(
                         worktree_path, branch_name, 'reuse-identity-mismatch',
                     )
+                    # Relocate (not delete) the foreign sibling .task-meta
+                    # root alongside the quarantined worktree — mirrors the
+                    # cold-reattach guard's identical call below; see
+                    # _relocate_foreign_meta_root's docstring. Skipped when
+                    # dest is None (relocation failed): worktree_path is
+                    # still a live registered worktree, so the elif
+                    # self-heal branch below raises rather than destroying
+                    # anything, and the sidecar is correctly left in place.
+                    if dest is not None:
+                        self._relocate_foreign_meta_root(worktree_path, dest)
                     reuse_ok = False
             if reuse_ok:
                 logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
@@ -3955,10 +3978,17 @@ class GitOps:
             # new task ids fall through to _cleanup_leftover_branch /
             # fresh-create unchanged.
             if not worktree_path.exists() and await self._orphan_has_commits(full_branch):
-                return await self._reattach_cold_worktree(
+                reattached = await self._reattach_cold_worktree(
                     worktree_path, full_branch, stale_commits,
+                    branch_name=branch_name, expected_title=expected_title,
                 )
-            await self._cleanup_leftover_branch(full_branch, branch_name)
+                if reattached is not None:
+                    return reattached
+                # Mismatch quarantined full_branch — skip
+                # _cleanup_leftover_branch (it would rev-list a now-gone
+                # branch, hit the fail-safe True, and raise spuriously).
+            else:
+                await self._cleanup_leftover_branch(full_branch, branch_name)
 
         # Create worktree with new branch from the freshened ref
         rc, out, err = await _run(
@@ -3996,8 +4026,14 @@ class GitOps:
         )
 
     async def _reattach_cold_worktree(
-        self, worktree_path: Path, full_branch: str, stale_commits: int | None,
-    ) -> 'WorktreeInfo':
+        self,
+        worktree_path: Path,
+        full_branch: str,
+        stale_commits: int | None,
+        *,
+        branch_name: str,
+        expected_title: str | None = None,
+    ) -> 'WorktreeInfo | None':
         """Re-attach ``worktree_path`` to a surviving orphan ``full_branch``.
 
         Called by :meth:`create_worktree`'s cold path (the γ reattach guard)
@@ -4024,6 +4060,34 @@ class GitOps:
         cold re-attach is not guaranteed to reflect a same-tick remote
         fetch the way a fresh create would.
 
+        Identity guard (mirrors the REUSE path's ``expected_title`` guard on
+        create_worktree's reuse-existing block, git_ops.py ~3564-3576):
+        once the orphan is attached above, if *expected_title* is not
+        ``None`` its stored title — read via :func:`read_worktree_title`,
+        which resolves the sibling ``.task-meta/<branch_name>`` root first
+        (the only root that can survive a gone worktree dir) — is compared
+        against *expected_title* via :func:`identities_match`. A confirmed
+        mismatch means the orphan belongs to a DIFFERENT (deleted) task
+        whose id was recycled: the attached worktree + branch are
+        quarantined (preserving the WIP) and ``None`` is returned so the
+        caller falls through to a fresh create. The check runs AFTER the
+        attach (not before) because :meth:`quarantine_worktree` ->
+        :meth:`rename_worktree` starts with ``git worktree move``, which
+        requires a registered worktree directory — attaching first is
+        non-destructive and is what makes that existing primitive usable
+        unchanged here. ``identities_match`` fails open (returns ``True``)
+        when either side is blank, so a title-less legacy orphan is never
+        falsely quarantined. ``expected_title=None`` (the default) skips the
+        guard entirely, so every existing caller is unaffected.
+
+        Args:
+            branch_name: The bare branch name (no ``branch_prefix``) — used
+                only for the identity-guard quarantine relocation
+                (:meth:`quarantine_worktree` takes the bare name and derives
+                the full branch itself).
+            expected_title: The live task's title, or ``None`` to skip the
+                identity guard.
+
         Raises:
             RuntimeError: ``git worktree add`` failed (e.g. *full_branch* is
                 still checked out in another live worktree). The branch is
@@ -4034,7 +4098,9 @@ class GitOps:
         Returns:
             WorktreeInfo for the resumed worktree, with *stale_commits*
             carried over from the freshen result (mirrors create_worktree's
-            reuse-existing path).
+            reuse-existing path); or ``None`` if a confirmed identity
+            mismatch caused the orphan to be quarantined — the caller must
+            fall through to a fresh create.
         """
         logger.info(
             'create_worktree: cold-path reattach — orphan %s has commits; '
@@ -4056,6 +4122,54 @@ class GitOps:
                 f'preserved, remove the other worktree and retry: '
                 f'`git branch -D {full_branch}` only after preserving work.'
             )
+
+        # Identity guard — see docstring for why this runs after the attach.
+        if expected_title is not None:
+            stored_title = read_worktree_title(worktree_path)
+            if not identities_match(stored_title, expected_title):
+                logger.warning(
+                    'create_worktree: cold-reattach identity MISMATCH for %s — '
+                    'stored title %r != expected %r; quarantining orphan %s and '
+                    'creating fresh',
+                    worktree_path, stored_title, expected_title, full_branch,
+                )
+                dest = await self.quarantine_worktree(
+                    worktree_path, branch_name, 'cold-reattach-identity-mismatch',
+                )
+                if dest is None:
+                    # quarantine_worktree never raises — a None return means
+                    # the relocation could not complete, so the branch is
+                    # STILL task/<branch_name> and worktree_path is STILL
+                    # attached. Falling through here would make the caller's
+                    # fresh `git worktree add -b` collide with both, surfacing
+                    # the opaque "a branch named ... already exists" —
+                    # precisely the regression _cleanup_leftover_branch's
+                    # raise-not-destroy contract eliminated. Raise instead:
+                    # nothing is deleted, and this routes to blocked+L1
+                    # (non-stranding via Harness Fix #1a), matching this
+                    # method's `git worktree add` failure branch above.
+                    raise RuntimeError(
+                        f'create_worktree: refusing to proceed for {worktree_path} '
+                        f'— the orphan branch {full_branch!r} carries commits '
+                        f'belonging to a different task (stored title '
+                        f'{stored_title!r} != expected {expected_title!r}) and '
+                        f'could not be quarantined. Nothing was deleted: the '
+                        f'branch, its commits, and the re-attached worktree are '
+                        f'intact. Inspect them and, once any wanted work is '
+                        f'preserved, relocate them manually (`git worktree move` '
+                        f'+ `git branch -m`) and re-dispatch.'
+                    )
+                # Relocate (not delete) the foreign sibling .task-meta root
+                # alongside the quarantined worktree — see
+                # _relocate_foreign_meta_root's docstring for why this must
+                # be a move, not a delete. Placement is load-bearing: runs
+                # AFTER read_worktree_title (which reads this same root to
+                # detect the mismatch) and ONLY on this confirmed-mismatch
+                # route — never on the match/fail-open path below, a
+                # same-task resume whose own artifacts must be preserved.
+                self._relocate_foreign_meta_root(worktree_path, dest)
+                return None
+
         info = await self._reuse_warm_lane(worktree_path, full_branch)
         return WorktreeInfo(
             path=info.path,
@@ -7002,6 +7116,49 @@ class GitOps:
             lane.name,
         )
 
+    def _relocate_foreign_meta_root(self, lane: Path, dest: Path) -> None:
+        """Move the sibling ``.task-meta/<lane.name>`` dir alongside *dest*.
+
+        Used by the two "nothing is destroyed" quarantine guards —
+        ``create_worktree``'s REUSE-path and ``_reattach_cold_worktree``'s
+        cold-path ``expected_title`` mismatch checks — where *dest* is the
+        :meth:`quarantine_worktree` return value
+        (``quarantine_base/<branch>-<ts>``). Unlike
+        :meth:`_clear_foreign_meta_root` (used by the warm-lane
+        DIFFERENT-task ACQUISITION routes, where the sidecar is genuinely
+        superseded by the new occupant's own artifacts), a quarantine must
+        not destroy anything: the sidecar
+        (plan.json/metadata.json/blocking_dependency.json/…) is the only
+        record tying the quarantined branch back to its original task, so
+        an operator inspecting ``quarantine_base/<branch>-<ts>`` later must
+        still be able to tell what task it was.
+
+        Moves ``TaskArtifacts.meta_root_for(self.worktree_base, lane.name)``
+        to ``TaskArtifacts.meta_root_for(self.quarantine_base, dest.name)``.
+        Best-effort and never raises: a no-op if the source root does not
+        exist, and falls back to :meth:`_clear_foreign_meta_root` (delete)
+        if the move itself fails, so a quarantine-time fault here can never
+        strand the caller.
+        """
+        src = TaskArtifacts.meta_root_for(self.worktree_base, lane.name)
+        if not src.exists():
+            return
+        dst = TaskArtifacts.meta_root_for(self.quarantine_base, dest.name)
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+            logger.debug(
+                '_relocate_foreign_meta_root: relocated .task-meta/%s -> %s',
+                lane.name, dst,
+            )
+        except Exception as e:
+            logger.warning(
+                '_relocate_foreign_meta_root: failed to relocate %s -> %s '
+                '(%s) — falling back to clearing it in place',
+                src, dst, e,
+            )
+            self._clear_foreign_meta_root(lane)
+
     async def _reset_warm_lane(
         self, lane_dir: Path, full_branch: str, target_commit: str,
     ) -> None:
@@ -7680,7 +7837,8 @@ class GitOps:
         AND the commits probe confirms work beyond main (including fail-safe
         ``True`` on git error — retain direction).
 
-        Used by both γ reattach sites in :meth:`acquire_warm_lane` to avoid
+        Used by all three γ reattach sites — :meth:`create_worktree`'s cold
+        path and both sites in :meth:`acquire_warm_lane` — to avoid
         duplicating the two-step existence-then-probe gate.
         """
         rp_rc, _, _ = await _run(
@@ -9892,10 +10050,46 @@ class GitOps:
         still held (mirroring :meth:`ephemeral_worktree`), so an ephemeral
         merge-worktree removal leaves no orphan ``_merge-<uuid>.lock`` behind.
         The lock is NEVER unlinked on ``'skipped_lease_held'`` (this call did
-        not acquire it — a live holder's lock is left untouched) or on
-        ``'failed'`` (the tree, and thus its lane, survives). This differs
-        from :meth:`merge_verify_lease`, whose persistent-lane lock is
+        not acquire it — a live holder's lock is left untouched), on
+        ``'skipped_lock_error'`` (likewise not acquired), or on ``'failed'``
+        (the tree, and thus its lane, survives). This differs from
+        :meth:`merge_verify_lease`, whose persistent-lane lock is
         deliberately retained across attempts.
+
+        **Unopenable lock**: :func:`~orchestrator.verify_cancel.
+        acquire_merge_verify_flock` prepares the lock file (``mkdir`` +
+        ``os.open``) BEFORE its bounded-wait loop, so ENOSPC, EACCES, EMFILE
+        or EROFS raises out of it rather than returning the ``None`` that
+        means "contended". This method catches that ``OSError``, logs a
+        single WARNING, and returns ``'skipped_lock_error'`` — it never
+        propagates, because :meth:`cleanup_merge_worktree` documents a
+        never-raises contract on top of it. The outcome is deliberately
+        distinct from ``'failed'``: a failed open confirms NOTHING about
+        live holders (a verify can hold the flock on an existing lock inode
+        while our own open fails), so the tree is left intact for the merge
+        reaper — exactly as for ``'skipped_lease_held'`` — and must never
+        reach cleanup's force-rmtree fallback.
+
+        **Unrunnable git removal**: :func:`_run` likewise raises before the
+        child ever executes — :class:`WorktreeMissing` (a
+        ``FileNotFoundError``, hence an ``OSError``) when ``project_root``
+        has vanished, or a bare ``OSError`` from
+        ``asyncio.create_subprocess_exec`` under EMFILE/ENOMEM. That is the
+        SAME fd/memory exhaustion that can fail the lock open, so both
+        escapes co-occur; this method catches it too, logs a single WARNING
+        and returns ``'failed'``. ``'failed'`` — not a second skip literal —
+        because by then the flock IS held: the lease acquire has already
+        proved no live holder, which is precisely what licenses cleanup's
+        force-rmtree, and "git's removal did not succeed, the tree survives"
+        is exactly what ``'failed'`` already means. Both catches are narrow
+        (``OSError`` only) so ``CancelledError`` and programmer errors stay
+        loud. Together they make this method total with respect to
+        ``OSError``: every other call in its body — :func:`lane_lock_path`
+        (pure path math), :meth:`Path.exists`/:meth:`Path.resolve` (which
+        swallow ``OSError`` by contract), :func:`_register_held_lane_lock`,
+        :func:`read_lock_holder_pgid` and
+        :func:`_release_and_forget_held_lane_lock` — already suppresses its
+        own.
 
         *reason* is a short caller-supplied label (e.g. the calling
         function's name) recorded in logs for diagnostics.
@@ -9908,7 +10102,26 @@ class GitOps:
             return 'skipped_persistent'
 
         lock_path = lane_lock_path(path)
-        fd = acquire_merge_verify_flock(lock_path, 0.0)
+        # acquire_merge_verify_flock's `path.parent.mkdir(...)` + `os.open(...)`
+        # run BEFORE its own bounded-wait try, so a lock file that cannot be
+        # prepared at all (ENOSPC/EACCES/EMFILE/EROFS) raises rather than
+        # returning the None that means "contended". Degrade to a distinct skip
+        # instead of propagating: this method backs cleanup_merge_worktree's
+        # "Never raises" contract. OSError ONLY — never bare Exception —
+        # so CancelledError keeps propagating and a non-OSError programmer
+        # error stays loud (loud-over-silent-degradation). The return sits
+        # BEFORE the try/finally below so `unlink_lock` stays False (we never
+        # unlink a lock we did not acquire) and the release never sees no fd.
+        try:
+            fd = acquire_merge_verify_flock(lock_path, 0.0)
+        except OSError as exc:
+            logger.warning(
+                'remove_merge_worktree_guarded: cannot open lane lock %s (%s); '
+                'skipping removal of %s (reason=%s) -- lease unconfirmed, leaving '
+                'for the merge reaper',
+                lock_path, exc, path, reason,
+            )
+            return 'skipped_lock_error'
         if fd is not None:
             # Registered like every other in-process lane-lock hold (task 3081):
             # this acquire is sub-millisecond and ephemeral-lane-only, but
@@ -9937,10 +10150,38 @@ class GitOps:
             if not path.exists():
                 unlink_lock = True
                 return 'not_present'
-            rc, _, err = await _run(
-                ['git', 'worktree', 'remove', str(path), '--force'],
-                cwd=self.project_root,
-            )
+            try:
+                rc, _, err = await _run(
+                    ['git', 'worktree', 'remove', str(path), '--force'],
+                    cwd=self.project_root,
+                )
+            except OSError as exc:
+                # The SECOND escape from cleanup_merge_worktree's never-raises
+                # contract: _run can raise before the child ever executes --
+                # WorktreeMissing (a FileNotFoundError, so an OSError) when
+                # project_root has vanished, or a bare OSError out of
+                # asyncio.create_subprocess_exec under EMFILE/ENOMEM. EMFILE is
+                # the pointed case: fd exhaustion fails the lock open above AND
+                # this spawn from one root cause, so guarding only the former
+                # would leave the contract false under exactly the condition
+                # that motivated it.
+                #
+                # Degrade to 'failed', NOT to 'skipped_lock_error': we HOLD the
+                # flock here, so the lease acquire already proved there is no
+                # live holder -- the exact premise that licenses cleanup's
+                # force-rmtree fallback. 'failed' is also the honest reading of
+                # this state ("git's removal did not succeed, the tree
+                # survives"), so it needs no new outcome literal. OSError ONLY,
+                # never bare Exception: CancelledError must keep propagating,
+                # and degrading a programmer error to 'failed' would be worse
+                # than raising, since 'failed' routes to a destructive fallback.
+                logger.warning(
+                    'remove_merge_worktree_guarded: git worktree remove could not '
+                    'run for %s (reason=%s): %s -- treating as failed; the lease '
+                    'was held, so the tree is unleased and the caller may reclaim it',
+                    path, reason, exc,
+                )
+                return 'failed'
             if rc == 0:
                 logger.info(
                     'remove_merge_worktree_guarded: removed %s (reason=%s)', path, reason,
@@ -9997,7 +10238,12 @@ class GitOps:
         construction AND ``'failed'`` already means the primitive's lease
         acquire confirmed NO live holder (a live holder yields
         ``'skipped_lease_held'``), so the tree is unleased and safe to
-        remove from the filesystem.
+        remove from the filesystem. That premise is exactly why a lock-file
+        ``OSError`` deliberately does NOT reach this fallback: the primitive
+        degrades it to ``'skipped_lock_error'``, not ``'failed'``, because a
+        lock it could not even open confirmed nothing about live holders —
+        force-removing on it would reintroduce the 23s TOCTOU C1 exists to
+        close, in silence.
 
         On ``'failed'`` the fallback: (1) band-guards via
         :meth:`_refuse_foreign_band` (defense-in-depth — the outcome check
@@ -10013,10 +10259,39 @@ class GitOps:
         already handle, so an interrupted teardown is always completable by
         a later sweep.
 
-        Every other outcome (``'removed'`` / ``'not_present'`` / the two
-        ``'skipped_*'``) returns immediately, so a live-leased tree and the
-        warm persistent lanes are NEVER force-removed. Never raises;
-        idempotent — a re-call sees the tree already gone → primitive
+        Every other outcome (``'removed'`` / ``'not_present'`` / the three
+        ``'skipped_*'``, including ``'skipped_lock_error'``) returns
+        immediately, so a live-leased tree, a tree whose lease could not be
+        established, and the warm persistent lanes are NEVER force-removed.
+
+        **Observability caveat**: this method returns ``None``, so the
+        primitive's outcome is DISCARDED here and a ``'skipped_lock_error'``
+        reached through this path is visible only as the primitive's single
+        WARNING — there is no event or escalation keyed on it. A durable
+        EACCES/EROFS/ENOSPC on the lane therefore accumulates ``_merge-``
+        trees quietly, backstopped only by the age-keyed worktree ledger.
+        Callers that need it structurally should use
+        :meth:`remove_merge_worktree_guarded` directly and emit the outcome
+        themselves, as merge_queue's cancel-retire arms already do.
+        Never raises. The primitive absorbs BOTH ``OSError`` escapes on the
+        way here — preparing the lane lock file (→ ``'skipped_lock_error'``,
+        tree retained) and a ``git worktree remove`` that cannot spawn at
+        all, i.e. :class:`WorktreeMissing` or EMFILE/ENOMEM out of
+        ``create_subprocess_exec`` (→ ``'failed'``, lease already confirmed,
+        so the fallback below is licensed). The two matter together because
+        fd exhaustion fails both from one root cause. Downstream of the
+        primitive nothing else can raise either: ``shutil.rmtree`` runs with
+        ``ignore_errors=True``, the ``.lock`` unlink is wrapped in
+        :func:`contextlib.suppress`, and both
+        :meth:`_refuse_foreign_band` and :meth:`_prune_registrations` carry
+        their own documented never-raise guarantees. Only a
+        ``BaseException`` deliberately let through — notably
+        ``CancelledError``, and a programmer error escaping the narrow
+        ``except OSError`` guards — still propagates, which is the intended
+        loud-over-silent behaviour and is pinned by
+        ``test_non_oserror_from_git_removal_propagates``.
+
+        Idempotent — a re-call sees the tree already gone → primitive
         ``'not_present'`` → early return.
         """
         outcome = await self.remove_merge_worktree_guarded(
@@ -12279,53 +12554,52 @@ class GitOps:
             await self.release_spec_lane(worktree, warm=True)
             return
 
-        # ── Teardown-archival backstop (task 2786, agent-transcript-archival-prd
-        # β) ────────────────────────────────────────────────────────────────
-        # Before the worktree (and the per-task Claude config dir INSIDE it) is
-        # destroyed, archive any still-un-archived agent transcript to the
-        # durable root OUTSIDE the worktree. This closes the abandoned-in-flight
-        # tail the producer hook (α/workflow.py _invoke) cannot: a role in-flight
-        # when the orchestrator died, whose task is reaped without a completed
-        # resume. Idempotent with the producer — same archive_root + task_id, so
-        # the helper's size/mtime skip fires (a no-op in the normal case).
-        # Reached only on COLD removals: warm/spec lanes returned above (they are
-        # retained, not removed), and branch == task_id at every cold call site,
-        # so it is the task_id the config-dir path and archive layout key on.
-        # Offloaded to a worker thread so the blocking file-copy I/O never stalls
-        # the shared event loop (mirrors the producer's loop-stall avoidance).
-        # Task 3619 (leaf 2) collapses the copy into a rename, at which point
-        # this offload can go too.
+        # ── Teardown-archival guard (task 2786 β; task 3619 leaf 2)  ────────
+        # Before the worktree — and the per-task Claude config dir INSIDE it —
+        # is destroyed, make every still-un-archived agent transcript durable
+        # in the archive root OUTSIDE the worktree. This closes the
+        # abandoned-in-flight tail the producer hook (workflow.py _invoke)
+        # cannot: a role in flight when the orchestrator died, whose task is
+        # reaped without a completed resume.
+        #
+        # SYNCHRONOUS, and that is the point. This used to be
+        # `await asyncio.to_thread(archive_task_transcripts, ...)` with an
+        # `except asyncio.CancelledError: raise` clause below it, offloaded so
+        # a blocking file copy could not stall the shared event loop. Task 3618
+        # dropped the compression and task 3619 turned the copy into a rename,
+        # so what remains is a glob plus O(1) metadata syscalls — and the
+        # offload had become strictly harmful: an `await` is a cancellation
+        # point, the SIGTERM that triggers teardown is what delivers the
+        # cancellation, and `git worktree remove --force` below is NOT
+        # cancellable. The archival was therefore the one part of teardown a
+        # shutdown could skip, immediately before the step that destroys what
+        # it skipped. There is no longer an await here to cancel.
+        #
+        # Reached only on COLD removals: warm/spec lanes returned above (they
+        # are retained, not removed), and branch == task_id at every cold call
+        # site, so it is the task_id the config-dir path and archive layout
+        # key on. Idempotent with the producer — same archive_root + task_id,
+        # so the already-current skip fires and the normal case is a cheap
+        # corroboration.
         if self.transcript_archive is not None and self.transcript_archive.enabled:
             config_dir = worktree / '.task' / f'claude-config-{branch}'
-            # Fast-skip when the config dir is already gone (external worktrees,
-            # already-cleaned dirs): a cheap no-op that never spins up a worker
-            # thread just to glob an absent projects/ tree. The producer already
-            # archived the normal case; the size/mtime skip inside the helper
-            # (matching archive_root + task_id) makes any overlap idempotent.
+            # Fast-skip when the config dir is already gone (external
+            # worktrees, already-cleaned dirs): a cheap no-op rather than a
+            # glob of an absent projects/ tree.
             if config_dir.exists():
                 archive_root = self.project_root / self.transcript_archive.root
                 try:
-                    await asyncio.to_thread(
-                        archive_task_transcripts,
+                    outcome = archive_before_delete(
                         config_dir,
                         branch,
-                        None,
                         archive_root=archive_root,
                     )
-                except asyncio.CancelledError:
-                    # Cooperative cancellation (loop teardown / hard-kill)
-                    # surfaces here from the await, NOT an archival error — it
-                    # must propagate, never be swallowed (mirrors the producer,
-                    # workflow.py _invoke). CancelledError is a BaseException, so
-                    # the `except Exception` below deliberately does not catch it.
-                    raise
                 except Exception:
-                    # Best-effort: teardown must never be blocked by a broken or
-                    # contract-regressed archiver. archive_task_transcripts is
-                    # total by contract (per-file OSErrors are swallowed +
-                    # counted), but its top-level glob / Path / archive_root
-                    # construction is not individually guarded — swallow any
-                    # escaped non-cancellation error here so `git worktree remove`
+                    # Best-effort: teardown must never be blocked by a broken
+                    # or contract-regressed archiver. archive_before_delete is
+                    # total by contract, but its top-level glob / Path /
+                    # archive_root construction is not individually guarded —
+                    # swallow any escaped error here so `git worktree remove`
                     # still runs. Loud, not silent: logged as a structured fact.
                     logger.warning(
                         'Transcript archival backstop failed for task %s '
@@ -12335,6 +12609,34 @@ class GitOps:
                         exc_info=True,
                         extra={'task_id': branch, 'worktree': str(worktree)},
                     )
+                else:
+                    if outcome.held:
+                        # A hold at THIS site is a genuine loss, and taking it
+                        # is still the right call. Everywhere else a held
+                        # transcript survives until the next boot's sweeper
+                        # re-archives it; here `git worktree remove --force`
+                        # destroys it moments from now. The guard's promise is
+                        # that IT never deletes an un-archived transcript, not
+                        # that it can save one from the removal it is a
+                        # precondition of. Blocking the removal instead would
+                        # trade a bounded, counted, escalated transcript loss
+                        # for an unbounded hold on a worktree and the lane slot
+                        # it occupies — the worse failure. So: name it, then
+                        # proceed.
+                        logger.warning(
+                            'Transcript archival backstop: %d transcript(s) '
+                            'could not be archived for task %s and are about '
+                            'to be destroyed with worktree %s: %s',
+                            len(outcome.held),
+                            branch,
+                            worktree,
+                            ', '.join(str(q) for q in outcome.held),
+                            extra={
+                                'task_id': branch,
+                                'worktree': str(worktree),
+                                'held': [str(q) for q in outcome.held],
+                            },
+                        )
 
         full_branch = f'{self.config.branch_prefix}{branch}'
 

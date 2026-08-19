@@ -1,15 +1,15 @@
 """Tests for the submit_and_resolve helper in _fm_helpers.py."""
 
-import ast
 import json
+import sys
+import types
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 from _fm_helpers import (
-    calls_named,
-    imported_names_from,
-    parse_python_module,
+    _LOADED_SCRIPT_MODULE_NAMES,
+    load_script_module,
     submit_and_resolve,
 )
 
@@ -1505,255 +1505,267 @@ class TestAwaitIndexOperational:
 
 
 # ---------------------------------------------------------------------------
-# Tests for the shared AST migration-guard machinery (task 3502 / 3574)
+# Tests for the shared load_script_module() loader (task 3738)
 # ---------------------------------------------------------------------------
-# parse_python_module() and calls_named() are the single parse/search
-# implementation behind three migration guards — test_falkor_probe_routing_guard,
-# test_falkor_index_barrier_guard and test_gather_idiom_helper_routing. Those
-# guards are themselves the enforcement layer for two false-green mechanisms
-# (an unbarriered async index build; a hand-rolled gather Pass-2), so a silent
-# weakening HERE disarms all three at once while every one of them still
-# reports green. The semantics they rest on are pinned below.
+# load_script_module imports a script that is NOT a package member and NOT on
+# PYTHONPATH (anything under `scripts/`) by file path, so its pure functions
+# can be tested without sys.path pollution. It was hoisted out of
+# test_sweep_toolcall_xml_leak.py and test_toolcall_xml_leak_sweep_artifacts.py,
+# which carried two independent copies of it.
 #
-# NOTE the sample identifiers are deliberately inert (`widget`, `mod.widget`)
-# and no snippet contains an index-creating literal. test_falkor_index_barrier_guard
-# discovers its parametrized module set by selecting every tests/test_*.py that
-# holds BOTH a /CREATE\s+INDEX|createNodeIndex/i string constant AND a real
-# ast.Call to select_graph. This file already mentions select_graph in prose, so
-# a sample that combined a select_graph(...) call with an index-creation string
-# would drag THIS file into that guard's scope and fail it — and the failure
-# would read as a barrier-guard bug rather than a bad fixture here.
-# ---------------------------------------------------------------------------
+# The REUSE guard is the reason the more-robust of those two copies was the one
+# promoted, and it is precisely the behaviour nothing pinned: both sweep modules
+# register the SAME sys.modules key, so an unconditional second load would
+# re-execute the 965-line script and silently replace the first module object,
+# leaving two live module objects whose identity depends on collection order.
+# That guard is currently exercised only INCIDENTALLY, as a side effect of
+# collection order across those two modules — drop it and both still pass. These
+# tests make it load-bearing directly.
+#
+# Everything here drives throwaway tmp_path scripts, never a real repo script,
+# so no case depends on the content of anything under scripts/.
+#
+# load_script_module is imported at module level (with submit_and_resolve),
+# deliberately NOT lazily per-test the way the 8df8 section above does it:
+# every test in this section needs it, so seven copies of one import line bought
+# nothing.
 
-# A bare call, an attribute call, an unrelated callee, and the SAME token
-# appearing only inside a string constant.
-_CALLS_SNIPPET = """
-widget(1)
-mod.widget(2)
-gadget(3)
-note = 'widget(4) is described here but never called'
-"""
+@pytest.fixture
+def registered_module_names():
+    """Yield a registrar for sys.modules keys a test is about to create.
 
-# Calls in three distinct positions so a node-scoped query can be shown to see
-# only its own subtree.
-_NESTED_SNIPPET = """
-@decorate(widget('in-decorator'))
-def decorated():
-    pass
+    Every registered key is popped afterwards, pass or fail, so a test that
+    loads a throwaway tmp_path script cannot leak a module object into sibling
+    tests (or shadow a real module for the rest of the session).
 
-assigned = [widget('in-assignment'), gadget('sibling')]
-
-def elsewhere():
-    return widget('in-function-body')
-"""
+    The helper's own record of which keys it installed is cleared for the same
+    keys, so a tmp_path name cannot arrive at a sibling test already marked as
+    helper-owned and quietly disarm the shadowing guard there.
+    """
+    names: list[str] = []
+    yield names.append
+    for name in names:
+        sys.modules.pop(name, None)
+        _LOADED_SCRIPT_MODULE_NAMES.discard(name)
 
 
-class TestSharedAstGuardMachinery:
-    """Unit coverage for parse_python_module() / calls_named()."""
+class TestLoadScriptModule:
+    """Unit tests for load_script_module(script_path, mod_name=None)."""
 
-    def test_parses_arbitrary_python_source(self, tmp_path):
-        """Any Python file parses — which is why the name says module, not TEST module.
+    def test_module_level_names_are_reachable_on_the_returned_module(
+        self, tmp_path, registered_module_names
+    ):
+        """The whole point: a by-path script's constants and functions come back
+        as ordinary attributes of the returned module."""
+        script = tmp_path / 'probe_script.py'
+        script.write_text('VALUE = 41\n\n\ndef bump(n):\n    return n + 1\n')
+        registered_module_names('probe_script')
 
-        test_gather_idiom_helper_routing asserts over src/fused_memory/*.py, so
-        a parse that only claimed to handle test modules would be lying at one
-        of its three call sites. The helper is path-agnostic (read_text +
-        ast.parse), so a module written here pins that property without
-        coupling this file to some production module's current location.
+        mod = load_script_module(script)
+
+        assert mod.VALUE == 41
+        assert mod.bump(41) == 42
+
+    def test_registers_under_the_explicit_mod_name(
+        self, tmp_path, registered_module_names
+    ):
+        """An explicit mod_name is the sys.modules key — this is what lets two
+        test modules deliberately SHARE one key for the same script."""
+        script = tmp_path / 'stem_is_ignored.py'
+        script.write_text("ORIGIN = 'explicit'\n")
+        registered_module_names('chosen_key')
+
+        mod = load_script_module(script, mod_name='chosen_key')
+
+        assert sys.modules['chosen_key'] is mod
+        assert 'stem_is_ignored' not in sys.modules
+
+    def test_registers_under_the_file_stem_when_mod_name_is_omitted(
+        self, tmp_path, registered_module_names
+    ):
+        """mod_name defaults to the file stem."""
+        script = tmp_path / 'defaults_to_stem.py'
+        script.write_text("ORIGIN = 'stem'\n")
+        registered_module_names('defaults_to_stem')
+
+        mod = load_script_module(script)
+
+        assert sys.modules['defaults_to_stem'] is mod
+
+    def test_a_second_load_of_the_same_file_reuses_the_module_object(
+        self, tmp_path, registered_module_names
+    ):
+        """REUSE — the guard this loader exists for.
+
+        The second call must return the IDENTICAL object without re-executing
+        the file. Asserted by mutating the first module and looking for the
+        mutation afterwards: a re-execution would hand back a freshly built
+        module object with no SENTINEL on it, so `is`-identity plus the
+        surviving attribute together rule out both replacement and re-exec.
         """
-        source = tmp_path / 'prod.py'
-        source.write_text('def f():\n    return 1\n')
+        script = tmp_path / 'reused_script.py'
+        script.write_text('VALUE = 1\n')
+        registered_module_names('reused_script')
 
-        tree = parse_python_module(source)
+        first = load_script_module(script)
+        first.SENTINEL = 'set-by-first-caller'  # type: ignore[attr-defined]
 
-        assert isinstance(tree, ast.Module)
-        assert tree.body, 'parsed an empty module — the parse silently read nothing'
+        second = load_script_module(script)
 
-    def test_repeated_parses_return_the_identical_tree(self, tmp_path):
-        """Memoised: the same path yields the SAME object, not an equal copy.
+        assert second is first
+        assert second.SENTINEL == 'set-by-first-caller'
 
-        Consequence every consumer must respect: the tree is SHARED across
-        guards and across tests within a session, so no caller may mutate it
-        (no ast.NodeTransformer in place, no attribute assignment on nodes).
-        A mutation here would silently corrupt an unrelated guard's view of the
-        same file.
+    def test_reuse_survives_a_non_normalised_path_to_the_same_file(
+        self, tmp_path, registered_module_names
+    ):
+        """The guard compares RESOLVED paths, so an unnormalised spelling of the
+        same file still reuses.
+
+        Callers build these paths with `Path(__file__).parent.parent / ...`, so
+        the second caller's spelling need not be string-equal to the first's.
+        An implementation comparing the cached ``__file__`` as a raw string
+        would re-execute here.
         """
-        source = tmp_path / 'memoised.py'
-        source.write_text('value = 1\n')
+        subdir = tmp_path / 'subdir'
+        subdir.mkdir()
+        script = tmp_path / 'roundabout_script.py'
+        script.write_text('VALUE = 1\n')
+        registered_module_names('roundabout_script')
 
-        assert parse_python_module(source) is parse_python_module(source)
+        first = load_script_module(script)
+        first.SENTINEL = 'set-by-first-caller'  # type: ignore[attr-defined]
 
-    def test_missing_path_raises_assertion_error(self, tmp_path):
-        """A path that does not exist fails loudly rather than parsing empty.
+        second = load_script_module(subdir / '..' / 'roundabout_script.py')
 
-        A guard whose target file was renamed must break, not quietly assert
-        over an empty tree and report green having checked nothing.
+        assert second is first
+        assert second.SENTINEL == 'set-by-first-caller'
+
+    def test_a_different_file_under_a_used_mod_name_is_not_reused(
+        self, tmp_path, registered_module_names
+    ):
+        """The guard keys on the FILE, not on the name.
+
+        Reusing on a name match alone would hand the second caller the first
+        script's module — silently serving the wrong code under the right key.
+
+        Replacement is allowed here because the helper installed that key
+        itself; the shadowing test below covers the case where it did not.
         """
-        missing = tmp_path / 'nope.py'
+        first_script = tmp_path / 'first_source.py'
+        first_script.write_text("ORIGIN = 'first'\n")
+        second_script = tmp_path / 'second_source.py'
+        second_script.write_text("ORIGIN = 'second'\n")
+        registered_module_names('shared_key')
 
-        with pytest.raises(AssertionError):
-            parse_python_module(missing)
+        first = load_script_module(first_script, mod_name='shared_key')
+        assert first.ORIGIN == 'first'
 
-    def test_finds_bare_and_attribute_calls_but_not_string_mentions(self):
-        """Bare `widget()` and `mod.widget()` match; the same token in a string does not.
+        second = load_script_module(second_script, mod_name='shared_key')
 
-        The attribute form is what makes `asyncio.gather(...)` and
-        `db.select_graph(...)` match in the real guards. The string clause is
-        the AST-not-grep property every guard docstring claims: prose that
-        merely *describes* the idiom being migrated must not satisfy or trip a
-        check.
+        assert second is not first
+        assert second.ORIGIN == 'second'
+        assert sys.modules['shared_key'] is second
+
+    def test_an_exception_during_exec_propagates_and_leaves_no_partial_entry(
+        self, tmp_path, registered_module_names
+    ):
+        """A script that blows up mid-exec must not leave its half-built module
+        registered.
+
+        The module is inserted into sys.modules BEFORE exec_module (so the
+        script can import itself), which means the failure path has to undo
+        that. Otherwise the next caller's reuse check would find the cached
+        entry, match its __file__, and return a module whose top level never
+        finished running — a partially-initialised module served as a good one.
         """
-        tree = ast.parse(_CALLS_SNIPPET)
+        script = tmp_path / 'exploding_script.py'
+        script.write_text("LOADED_SO_FAR = 1\nraise RuntimeError('boom during exec')\n")
+        registered_module_names('exploding_script')
 
-        found = calls_named(tree, 'widget')
+        with pytest.raises(RuntimeError, match='boom during exec'):
+            load_script_module(script)
 
-        assert len(found) == 2, (
-            f'expected the bare and attribute calls only, got {len(found)} — a '
-            f'string constant mentioning the name must not count.'
-        )
-        assert calls_named(tree, 'gadget'), 'an unrelated callee should still match its own name'
-        assert calls_named(tree, 'absent') == [], 'a name that is never called must match nothing'
+        assert 'exploding_script' not in sys.modules
 
-    def test_returns_real_call_nodes_with_keywords_and_lineno(self):
-        """Results keep `.keywords` and `.lineno` — both are load-bearing.
+    def test_a_module_the_helper_did_not_install_is_never_shadowed(
+        self, tmp_path, registered_module_names
+    ):
+        """A key some OTHER importer owns must raise, not be overwritten.
 
-        The gather guard filters results on `kw.arg == 'return_exceptions'`, and
-        all three guards print `.lineno` in their failure messages so a
-        developer can find the offending call.
+        mod_name defaults to the file stem, and `scripts/` is full of names
+        that are also ordinary module names (config.py, utils.py, types.py).
+        Silently replacing `sys.modules['config']` with a script would persist
+        for the rest of the pytest process and surface as an unrelated test
+        failing far away, so the helper refuses and says which name collided.
         """
-        tree = ast.parse('x = widget(payload, return_exceptions=True)\n')
+        script = tmp_path / 'shadow_target.py'
+        script.write_text("ORIGIN = 'the script'\n")
+        registered_module_names('shadow_target')
+        pre_existing = types.ModuleType('shadow_target')
+        pre_existing.__file__ = str(tmp_path / 'somewhere_else.py')
+        pre_existing.ORIGIN = 'the real module'  # type: ignore[attr-defined]
+        sys.modules['shadow_target'] = pre_existing
 
-        (call,) = calls_named(tree, 'widget')
+        with pytest.raises(ImportError, match='refusing to shadow'):
+            load_script_module(script)
 
-        assert isinstance(call, ast.Call)
-        assert [kw.arg for kw in call.keywords] == ['return_exceptions']
-        assert call.lineno == 1
+        assert sys.modules['shadow_target'] is pre_existing
+        assert sys.modules['shadow_target'].ORIGIN == 'the real module'
 
-    def test_accepts_a_non_module_node_and_searches_only_that_subtree(self):
-        """Any ast.AST, not just a Module — so a guard can ask "is it called *here*".
+    def test_a_foreign_module_without_a_file_attribute_is_also_not_shadowed(
+        self, tmp_path, registered_module_names
+    ):
+        """Namespace packages and C/builtin modules have no usable __file__.
 
-        The probe-routing guard uses exactly this to distinguish a marker call
-        in a gating position (a decorator, or the value of a `pytestmark`
-        assignment) from one that merely builds a marker object and drops it.
+        The reuse check reads __file__ to decide whether the cached entry IS
+        this script; a None there must fall through to the ownership guard
+        rather than to a replacement.
         """
-        tree = ast.parse(_NESTED_SNIPPET)
-        (decorated,) = [
-            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'decorated'
-        ]
-        (decorator,) = decorated.decorator_list
+        script = tmp_path / 'fileless_target.py'
+        script.write_text("ORIGIN = 'the script'\n")
+        registered_module_names('fileless_target')
+        pre_existing = types.ModuleType('fileless_target')
+        sys.modules['fileless_target'] = pre_existing
 
-        scoped = calls_named(decorator, 'widget')
+        with pytest.raises(ImportError, match='refusing to shadow'):
+            load_script_module(script, mod_name='fileless_target')
 
-        assert len(scoped) == 1, f'node-scoped search leaked outside its subtree: {scoped}'
-        marker = scoped[0].args[0]
-        assert isinstance(marker, ast.Constant) and marker.value == 'in-decorator'
-        assert len(calls_named(tree, 'widget')) == 3, (
-            'the whole-module search should still see every call — the narrowing '
-            'must come from the node passed in, not from the search itself.'
-        )
+        assert sys.modules['fileless_target'] is pre_existing
 
+    def test_ownership_lapses_when_a_load_fails_mid_exec(
+        self, tmp_path, registered_module_names
+    ):
+        """A failed load leaves nothing installed, so it must leave no claim.
 
-# The two properties below are what the barrier guard's "must import the shared
-# barrier" clause and the gather guard's "must import a named helper" clause
-# both rest on, so they are pinned rather than left to the two former copies to
-# agree by luck.
-_IMPORTS_SNIPPET = """
-from pkg.mod import alpha, beta
-from pkg.other import gamma
-from pkg.mod import delta as renamed
-import pkg.mod
-from . import relative
-"""
-
-# The same module imported inside two sibling function bodies, so a node-scoped
-# query can be shown to see only its own subtree.
-_SCOPED_IMPORTS_SNIPPET = """
-def inner():
-    from pkg.mod import scoped
-
-def sibling():
-    from pkg.mod import elsewhere
-"""
-
-
-class TestImportedNamesFrom:
-    """Unit coverage for imported_names_from(node, module)."""
-
-    def test_collects_names_imported_from_the_named_module(self):
-        assert imported_names_from(ast.parse(_IMPORTS_SNIPPET), 'pkg.mod') == {
-            'alpha',
-            'beta',
-            'delta',
-        }
-
-    def test_excludes_names_imported_from_other_modules(self):
-        """`gamma` comes from pkg.other and must not leak into a pkg.mod query."""
-        assert 'gamma' not in imported_names_from(ast.parse(_IMPORTS_SNIPPET), 'pkg.mod')
-        assert imported_names_from(ast.parse(_IMPORTS_SNIPPET), 'pkg.other') == {'gamma'}
-
-    def test_unimported_module_returns_an_empty_set(self):
-        """Empty, not None — both call sites render it as `imported or "nothing"`.
-
-        A None return would print "None" in a guard's failure message and break
-        the set intersection the gather guard performs on the result.
+        Otherwise the helper would still consider the name its own, and a
+        genuine `import <name>` landing in between would be replaced by the
+        next by-path load — the exact shadowing the guard exists to stop,
+        reachable through a failed load.
         """
-        result = imported_names_from(ast.parse(_IMPORTS_SNIPPET), 'pkg.absent')
+        exploding = tmp_path / 'lapsed_key.py'
+        exploding.write_text("raise RuntimeError('boom during exec')\n")
+        script = tmp_path / 'later_script.py'
+        script.write_text("ORIGIN = 'the script'\n")
+        registered_module_names('lapsed_key')
 
-        assert result == set()
-        assert not result
+        with pytest.raises(RuntimeError, match='boom during exec'):
+            load_script_module(exploding)
 
-    def test_plain_import_statement_contributes_nothing(self):
-        """`import pkg.mod` is an ast.Import, not an ast.ImportFrom.
+        pre_existing = types.ModuleType('lapsed_key')
+        pre_existing.__file__ = str(tmp_path / 'a_real_module.py')
+        sys.modules['lapsed_key'] = pre_existing
 
-        It binds the module, never a name FROM it, so it cannot satisfy a
-        guard demanding that a specific helper be imported.
+        with pytest.raises(ImportError, match='refusing to shadow'):
+            load_script_module(script, mod_name='lapsed_key')
+
+        assert sys.modules['lapsed_key'] is pre_existing
+
+    def test_a_path_with_no_importable_loader_raises_import_error(self, tmp_path):
+        """The helper's only explicit error contract.
+
+        spec_from_file_location returns None when no loader claims the suffix,
+        and the helper must turn that into a named ImportError rather than an
+        AttributeError on None further down.
         """
-        assert imported_names_from(ast.parse('import pkg.mod\n'), 'pkg.mod') == set()
-
-    def test_aliased_import_reports_the_source_side_name(self):
-        """`from pkg.mod import delta as renamed` reports `delta`, not `renamed`.
-
-        Load-bearing: both guards compare the result against SOURCE-side names
-        (`await_index_operational`, `gather_or_raise`), so reporting the local
-        binding instead would make a legitimately-aliased import look missing.
-        """
-        tree = ast.parse('from pkg.mod import delta as renamed\n')
-
-        assert imported_names_from(tree, 'pkg.mod') == {'delta'}
-
-    def test_relative_import_does_not_match_a_named_module(self):
-        """`from . import relative` has `node.module is None` — must not match.
-
-        Guards against a None/str comparison crash or a spurious match when a
-        parsed module happens to use relative imports.
-        """
-        assert imported_names_from(ast.parse('from . import relative\n'), 'pkg.mod') == set()
-        assert 'relative' not in imported_names_from(ast.parse(_IMPORTS_SNIPPET), 'pkg.mod')
-
-    def test_star_import_reports_the_literal_star(self):
-        """`from pkg.mod import *` reports `'*'` — an edge, pinned as deliberate.
-
-        `alias.name` is the literal `'*'` for a star import, so both former
-        forks behaved this way and the extraction preserved it rather than
-        quietly filtering it. The consequence is visible at the call sites: a
-        star-importing module reads as importing `['*']`, which satisfies no
-        guard demanding a NAMED helper. Pinned so the behaviour is a documented
-        choice rather than a surprise in a failure message.
-        """
-        assert imported_names_from(ast.parse('from pkg.mod import *\n'), 'pkg.mod') == {'*'}
-
-    def test_accepts_a_non_module_node_and_searches_only_that_subtree(self):
-        """Any ast.AST, not just a Module — the symmetry with calls_named the docstring claims.
-
-        Pinned rather than left as an unverified promise: without this, the
-        annotation could be narrowed to ast.Module tomorrow with every test
-        still green.
-        """
-        tree = ast.parse(_SCOPED_IMPORTS_SNIPPET)
-        inner, sibling = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
-
-        assert imported_names_from(inner, 'pkg.mod') == {'scoped'}
-        assert imported_names_from(sibling, 'pkg.mod') == {'elsewhere'}
-        assert imported_names_from(tree, 'pkg.mod') == {'scoped', 'elsewhere'}, (
-            'the whole-module search should still see every import — the narrowing '
-            'must come from the node passed in, not from the search itself.'
-        )
+        with pytest.raises(ImportError, match='Cannot load'):
+            load_script_module(tmp_path / 'not_a_module.txt')

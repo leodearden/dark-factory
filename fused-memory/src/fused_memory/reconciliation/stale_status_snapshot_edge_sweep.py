@@ -12,247 +12,146 @@ deterministic direct-lookup sweep, mirroring the deterministic-lookup-over-
 semantic-search precedent set by task 1680 (count_memories_by_metadata) and
 task 2107 (degenerate_task_node_sweep).
 
-Design decisions (captured in plan.json):
+Extraction paths. Each anchors its status marker directly to what it
+describes rather than resting on the whole-fact gate alone — see the
+marker-addition rule below, and ``extract_snapshot_edge_task_ids`` for how
+the paths compose. Full per-path rationale lives at each regex constant,
+not here:
 
-- extract_snapshot_edge_task_ids returns the empty set for pure count-only
-  snapshots with no specific task-id reference (e.g. "There are 8 tasks in
-  progress", "1505 done / 148 cancelled") — these are OUT OF SCOPE,
-  stale-by-design audit trail per Snapshot Discipline, and must never be
-  invalidated by this sweep.
-- extract_snapshot_edge_task_ids anchors the status marker directly to its
-  own task reference (INDIVIDUAL_SNAPSHOT_RE) rather than gating on
-  whole-fact marker presence, so an incidental status word describing
-  something else in the same fact (e.g. "Task 142 landed on the active
-  branch" — the active BRANCH, not task 142) is never wrongly attributed to
-  the reference. (amendment, reviewer_comprehensive precision finding, task
-  2613)
-- Invalidate-only-on-positively-terminal: an unknown/missing/still-active
-  status for a referenced id never triggers invalidation (fail-safe,
-  mirrors flag_dedup.filter_terminal_metadata_flags) — a transient census
-  hiccup can only under-invalidate (self-heals next cycle), never wrongly
-  retire a valid edge.
-- An aggregate snapshot edge ("the active pending tasks are [A, B, C]") is
-  invalidated as a whole the moment ANY one referenced id is now terminal —
-  the snapshot as asserted no longer holds.
-- Best-effort throughout (modelled on
-  ``degenerate_task_node_sweep.sweep_degenerate_task_nodes``): every caught
-  failure is logged and tallied into ``stats['errors']`` rather than
-  raised. ``get_all_valid_edges``/``get_statuses`` are single bulk calls the
-  rest of the cycle depends on, so a failure there ends this cycle's sweep
-  early with the stats gathered so far (self-heals next cycle). A per-edge
-  ``update_edge`` failure, by contrast, does NOT abort the loop — the
-  remaining stale edges are still attempted, exactly like the per-item
-  find/delete calls in ``sweep_degenerate_task_nodes``.
-- 'blocked' is now a recognized non-terminal snapshot status marker. Its
-  absence made the gate short-circuit
-  (``if not SNAPSHOT_STATUS_RE.search(fact): return set()``) fire before
-  the ``INACTIVE_TASK_STATUSES`` cross-reference could ever run, so
-  blocked-worded edges were structurally invisible regardless of the
-  referenced task's real status (task 2885 repro: 4 stale edges survived a
-  blocked->done transition; scanned=5868/invalidated=0). (amendment, task
-  3042)
-- The single ``_STATUS_MARKER_ALT`` constant now feeds the gate, the
-  anchored individual regex, and the phrase regex, so the gate can never
-  again be narrower than the anchored matchers — that drift (a marker
-  present in one but not the other) is the exact bug class task 3042
-  fixes. (amendment, task 3042)
-- 'blocked' is matched only in copula/article form by the anchored
-  individual matcher, because unlike the adjective-only markers it is
-  also a common transitive verb ('Task 5 blocked the merge queue' is a
-  permanently-true historical fact, not a status snapshot). Same hazard
-  and same remedy as task 2824's transitive-verb caveat on
-  ``task_filter.PRESENT_TENSE_COMPLETION_RE``. (amendment,
+- ``INDIVIDUAL_SNAPSHOT_RE`` — 'Task N is/was <marker>' / 'Task N <marker>'.
+- ``GENITIVE_STATUS_RE`` — "Task N's status is <marker>" (task 3079).
+- ``SNAPSHOT_STATUS_PHRASE_RE`` — 'Task N ... in <marker> status'.
+- ``PLURAL_ENUM_SNAPSHOT_RE`` — 'Tasks A, B and C are <marker>' (task 3079).
+- ``LIST_INTRODUCER_RE`` (+ aggregate list segments) — '<marker> tasks:
+  [...]' / '<marker> tasks are [...]'.
+
+Standing invariants — these are cross-cutting and apply to every path
+above; re-check all of them before changing any single path. (Per-path
+detail, examples, and residuals are documented once, at the owning
+constant — do not restate them here.)
+
+- Fail-safe direction, throughout the module: under-selection self-heals
+  next cycle (or is caught by Stage 2); over-selection is unrecoverable,
+  since an invalidated Graphiti edge is never re-validated. Every
+  extraction path is deliberately biased toward missing a snapshot over
+  wrongly retiring one.
+- Marker-addition rule: EVERY extraction path must anchor its marker
+  adjacently to whatever it describes; the whole-fact gate
+  (``SNAPSHOT_STATUS_RE``) only decides whether a fact is worth
+  considering at all — it matches a marker ANYWHERE in the fact, so it can
+  never be what separates a status snapshot from an unrelated fact. The
+  aggregate list path was once left resting on the gate alone and had to
+  be re-anchored (``LIST_INTRODUCER_RE``) once 'blocked' widened the gate
+  — task 2885 repro: 4 stale edges survived a blocked->done transition
+  (scanned=5868, invalidated=0) because the gate short-circuited before
+  the ``INACTIVE_TASK_STATUSES`` cross-reference ever ran. Any marker
+  added to ``_STATUS_MARKER_ALT`` must therefore be re-checked against
+  every path individually, not just the individual form —
+  ``COUNT_QUANTITY_RE`` is the one existing consumer that is NOT safe by
+  default under such a widening (see its own comment). (amendment,
   reviewer_comprehensive precision finding, task 3042)
-- EVERY extraction path anchors its marker adjacently to whatever the
-  marker describes; no path may rest on the whole-fact gate alone. The
-  gate only decides whether a fact is worth considering at all — it
-  matches a marker ANYWHERE in the fact, so it can never be the thing
-  separating a status snapshot from a historical fact. The aggregate
-  list path was left resting on the gate and had to be re-anchored once
-  'blocked' widened it (LIST_INTRODUCER_RE). Any future marker added to
-  ``_STATUS_MARKER_ALT`` must be checked against every path, not just
-  the individual form. (amendment, reviewer_comprehensive precision
-  finding, task 3042)
-- Two anchoring paths with an explicit precision contract: closed-class
-  connective only (copula / article — NOT the preposition 'in', which
-  would let the marker bind to a noun the task is merely located in) for
-  the general individual form (``INDIVIDUAL_SNAPSHOT_RE``); a lazy
-  ``{0,3}``-word open-class gap and an 'in' preposition permitted ONLY
-  when the marker is immediately followed by the literal noun 'status'
-  (``SNAPSHOT_STATUS_PHRASE_RE``). That status-noun requirement is what
-  keeps 'Task N is in the active branch' / 'is in the pending merge
-  queue' out while still reaching 'Task N is in a blocked status ...'.
-  (amendment, task 3042)
-- The status-noun requirement narrows binding ambiguity but does not
-  eliminate it, and the code must not claim otherwise. Two shapes were
-  identified: a following head noun ('...in the pending status report' —
-  a status REPORT), now excluded by requiring the span to end its noun
-  phrase; and a gap-internal nominal subject ('Task 5 depends on work in
-  blocked status' — the WORK is blocked), which still binds and is
-  pinned by a documented-behaviour test rather than claimed away. See
-  SNAPSHOT_STATUS_PHRASE_RE. (amendment, reviewer_comprehensive
-  suggestion, task 3042)
-- 'blocked' is deliberately NOT added to ``INACTIVE_TASK_STATUSES`` — that
-  frozenset stays ``{done, cancelled}`` — which is what preserves
-  invalidate-only-on-positively-terminal (a genuinely-still-blocked task is
-  never selected). (amendment, task 3042)
-- Known residual (task 3042): a blocked-status assertion that neither uses
-  a closed-class connective nor the literal 'status' noun (e.g. "Task N
-  remains parked awaiting adjudication") is still not extracted. This is
-  the deliberate fail-safe direction — under-selection self-heals or is
-  caught by Stage 2, whereas over-selection would wrongly retire true
-  facts.
-- The genitive/possessive form "Task N's status is <marker>"
-  (GENITIVE_STATUS_RE) is now extracted. It is the canonical shape
-  Graphiti writes for a per-task status snapshot, yet every prior path
-  missed it structurally while the gate fired — the "matched the gate yet
-  went undetected" symptom. It needs neither the trailing noun-phrase
-  lookahead SNAPSHOT_STATUS_PHRASE_RE carries (requiring 'status' to be
-  IMMEDIATELY followed by the copula already excludes the "status report
-  is pending review" modifier-head reading) nor a _GAP_EXCLUDED_ALT
-  equivalent (its connective is closed-class, so negation and past-exit
-  qualifiers are refused for free — the same asymmetry recorded for the
-  individual form). (amendment, task 3079)
-- The plural enumeration form "Tasks A, B and C are <marker>"
-  (PLURAL_ENUM_SNAPSHOT_RE) is now extracted. Previously it yielded NONE
-  of the ids — not merely the first: TASK_REF_RE anchors '\\btask\\b' and
-  so does not match the plural head, and the enumeration tail carries no
-  reference token of its own. Its copula is mandatory (refusing the
-  transitive-verb reading), its enumeration requires 2+ ids (a plural
-  head over a lone digit is more likely a count than an id), and its
-  separator must absorb the Oxford comma — a single-token separator
-  alternation silently misses the real-world fact shape. Unlike the
-  aggregate path it applies no COUNT_QUANTITY_RE strip: its enumeration
-  alphabet admits no count noun, so the strip could never fire usefully,
-  while it WOULD misfire on the reference-token separator and drop a
-  legitimate leading id (see PLURAL_ENUM_SNAPSHOT_RE). (amendment, task
-  3079)
-- 'stalled' is now a recognized non-terminal marker, and — like
-  'blocked' — goes in ``_TRANSITIVE_MARKER_ALT`` rather than
-  ``_ADJECTIVE_MARKER_ALT``, because it is also a common transitive verb
-  ('Task 5 stalled the merge queue' is a permanently-true historical
-  fact). Discharging the standing marker-addition rule above found the
-  non-obvious consumer: ``COUNT_QUANTITY_RE`` is the only one of the four
-  that is NOT safe by default, since a marker missing from its count-noun
-  alternation turns '3 stalled others' into a spurious task id. The other
-  three are safe by construction (gate-only widening; 'in stalled status'
-  and 'Stalled tasks:' are both genuine status assertions).
-  ``INACTIVE_TASK_STATUSES`` stays ``{done, cancelled}``. (amendment,
-  task 3079)
-- ``_COMPOUND_PREFIX`` admits ONE optional hyphenated modifier before the
-  marker in the adjacency-anchored arms, so 'pairwise-stalled' anchors to
-  its copula. The single-token bound ('\\w+' cannot cross whitespace)
-  bounds the gap's WIDTH only — NOT its lexical class. 'un-', 'non-',
-  'previously-', 'in-' are each one '\\w+-' token, so the unguarded prefix
-  re-admitted the negation / past-exit readings ('Task 5 is un-blocked'
-  -> {5}) that ``_ADVERB_ALT``'s closed-class discipline refuses for free
-  on the bare marker. What refuses them is a negative lookahead
-  subtracting a closed class of inverting prefixes, kept as a
-  SUBTRACTION from an open-class
-  prefix because the innocent modifier vocabulary ('pairwise-', 'merge-',
-  'self-', 'auto-') is not closed. The privative 'in-' needs a second,
-  narrower lookahead, since 'in[-\\s]?progress' is itself a marker.
-  (amendment, reviewer_comprehensive correctness-precision findings,
-  task 3079)
-- A plural enumeration REJECTED by the subjecthood guard also suppresses
-  every id inside its own span on the other anchored paths. Suppressing
-  only the plural match left the tail of a repeated-reference-token
-  enumeration — a shape this task newly supports as a positive — reaching
-  the individual arm on its own ('Reviews for tasks 1020, task 1030 and
-  task 1031 are pending' -> {1031}). Scoped to the span, not the fact, so
-  a genuine snapshot in a later clause survives. (amendment,
-  reviewer_comprehensive correctness-precision finding, task 3079)
-- Two hypotheses were investigated and RULED OUT; do not re-open them.
-  (1) Edge traversal/scope: ``GraphitiBackend.get_all_valid_edges`` runs
-  ``MATCH (n:Entity)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL`` with
-  no entity-type, label, or episode filter, so the sweep demonstrably
-  SCANNED the missed edges and dropped them at extraction — reproduced
-  end-to-end against the branch base, which reported scanned=3 with
-  candidate_edges=0. Every gap here was lexical. (2) A shared blind spot
-  with ``task_count_verification``: that is not an edge sweep at all, but
-  the ``cross_verify_task_counts(tree, statuses)`` census-vs-tree
-  consistency dict (``task_filter``), whose remit is aggregate counts and
-  never per-task status edges — its 'healthy' report was correct, not
-  blind. (amendment, task 3079)
-- Known residual (task 3079): the genitive path requires the literal noun
-  'status', so "Task N's state is pending" is still not extracted — the
-  same deliberate fail-safe under-selection direction as the task-3042
-  residual above.
-- The plural enumeration is required to be the copula's SUBJECT, via TWO
-  remedies that are BOTH necessary: plural agreement on the copula
-  (``_PLURAL_COPULA_ALT``) and a rejection of a preposition governing the
-  enumeration (``_ENUM_PREP_WORDS``). Adjacency of the marker to the
-  copula does NOT establish subjecthood — that was the defect: in "The
-  merge of tasks A and B is blocked" the plural NP is a preposition's
-  complement and the MERGE is what is blocked, yet the fact would be
-  retired the instant either id went terminal. Neither remedy suffices
-  alone: agreement kills the singular-outer-head shapes but not a plural
-  outer head ("Dependencies for tasks A and B are blocked" — the copula
-  agrees with 'Dependencies'), while the preposition check is a closed
-  word list. The preposition half was FIRST written as fixed-width
-  negative lookbehinds pinned immediately before '\\btasks\\b', which a
-  single intervening determiner defeated wholesale ("Reviews for the
-  tasks A and B are pending"); it now runs in Python against the
-  preceding text. The gap between the preposition and the list noun is
-  an OPEN class (quantifiers, adjectives, possessives — "Statuses of
-  quite a few tasks A and B are pending"), so it is neither enumerated
-  nor bounded: the guard rejects a listed preposition anywhere in the
-  enumeration's CLAUSE (``_enumeration_is_prepositional_complement``).
-  Only SENTENCE-FINAL punctuation ends that clause — a colon, comma,
-  bracket, quote or line wrap does not end prepositional government, and
-  admitting any of them as a break re-opens the over-selection outright
-  (see ``_CLAUSE_BREAK_CHARS``). A '.' INSIDE a token — a filename
-  extension, version string, dotted module path or dotted section
-  number — is likewise not sentence-final punctuation, so that
-  occurrence is disqualified as a break too; this narrows WHICH
-  OCCURRENCES of '.' count rather than the break character class itself
-  (task 4149). That narrowing is strictly FAIL-SAFE: dropping a break
-  can only LENGTHEN the scanned clause, never shorten it, so it can only
-  ever cost under-selection — the same asymmetry argument
-  ``_CLAUSE_BREAK_CHARS`` itself is built on — and can never re-open the
-  over-selection this guard exists to close. Three residuals result, in
-  OPPOSITE directions, and the first is the forbidden
-  one: an unlisted preposition slips through and OVER-selects (the
-  vocabulary was widened once already, for exactly this reason — see
-  ``_ENUM_PREP_WORDS``), while a genuine subject-position enumeration
-  sharing a clause with a listed word is missed — chiefly behind a
-  sentence-initial adverbial preamble ("As of <date>, tasks A and B are
-  pending"), or behind a genuine sentence period with no following space
-  and a following alphanumeric ("...are done.Then tasks A and B are
-  pending" reads the period as intra-token — task 4149) — both pinned by
-  a test so the recall cost stays visible — which is the fail-safe
-  direction. Note ``_COPULA_ALT`` is untouched and
-  still shared by the other paths; only this one narrows.
-  (amendment, reviewer_comprehensive
-  correctness-precision finding, task 3079; '.'-occurrence narrowing,
-  task 4149)
-- ``_ENUM_SEP_ALT``/``_ENUM_IDS_ALT`` are written with POSSESSIVE
-  quantifiers. Greedily written, the separator's trailing '\\s*' overlaps
-  its own leading '\\s*,\\s*'/'\\s+', so a whitespace run between two ids
-  can be apportioned (w+1) ways and the '+' repetition has (w+1)**n
-  parses — all explored whenever the overall match FAILS, which is the
-  common case since most enumerations in prose are not followed by a
-  copula and a marker. The sharper finding is that the base scales with
-  whitespace-run WIDTH, not id count alone: ', ' is ~2**n, ',  ' ~3**n and
-  ',\\n    ' ~6**n, so a newline-indented list of only NINE ids already
-  cost 16.6s (measured 6.1s at n=20 for ', ' on this branch). That is a far
-  lower real-world trigger threshold than a flat 2**n reading suggests,
-  and is why the regression test sizes each whitespace shape separately.
-  Possessive-ness is language-preserving here because every possessive
-  element is followed by something that can never match whitespace, so no
-  quantifier can hold a character a later element needs; post-fix all
-  shapes parse in ~0.1ms and n=200 in 0.6ms. The 2+-ids requirement is
-  still carried by the separator's mandatory leading comma-or-whitespace,
-  now spelled possessively. Requires Python >= 3.11, exactly this
-  package's floor. (amendment, reviewer_comprehensive performance-redos
-  finding, task 3079)
-- Why a regex in this module gets a performance test at all:
-  ``sweep_stale_status_snapshot_edges`` calls
-  ``extract_snapshot_edge_task_ids`` once per valid edge from an UNGUARDED
-  dict comprehension with no per-edge timeout, over the whole group's edge
-  set (~5868 edges in the task-3042 record). Extractor cost is therefore a
-  whole-cycle LIVENESS property — one pathological fact stalls the entire
-  reconciliation cycle — not a micro-optimisation. (amendment, task 3079)
+- 'blocked' and 'stalled' are also common transitive verbs ('Task 5
+  blocked the merge queue' is a permanently-true historical fact, not a
+  status snapshot), so both are matched only in copula/article form, never
+  as a bare adjective — see ``_TRANSITIVE_MARKER_ALT``. Same hazard and
+  remedy as task 2824's transitive-verb caveat on
+  ``task_filter.PRESENT_TENSE_COMPLETION_RE``.
+- ``INDIVIDUAL_SNAPSHOT_RE`` admits only a closed-class connective (copula
+  / article — never the preposition 'in', which would let the marker bind
+  to a noun the task is merely located in); ``SNAPSHOT_STATUS_PHRASE_RE``
+  is the one path that DOES permit an open-class gap and the 'in'
+  preposition, and only because it additionally requires the marker be
+  immediately followed by the literal noun 'status'. That status-noun
+  requirement is what keeps 'Task N is in the active branch' out while
+  still reaching 'Task N is in a blocked status ...'. (amendment, task
+  3042)
+- Invalidate-only-on-positively-terminal, and an aggregate/plural edge is
+  invalidated as a whole the moment any ONE referenced id is terminal —
+  see ``select_stale_status_snapshot_edges``.
+- The sweep is best-effort throughout (mirrors
+  ``degenerate_task_node_sweep``): an edge-enumeration
+  (``get_all_valid_edges``) or status cross-reference (``get_statuses``)
+  failure ends this cycle's sweep early (self-heals next cycle); a
+  per-edge invalidation failure does not — see
+  ``sweep_stale_status_snapshot_edges``.
+- 'blocked' is deliberately NOT added to ``INACTIVE_TASK_STATUSES`` (stays
+  ``{done, cancelled}``), which is what preserves
+  invalidate-only-on-positively-terminal for a genuinely-still-blocked
+  task.
+
+Known residuals (deliberate; all fail-safe/under-selection unless noted)
+— shape-by-shape detail lives at the matching constant:
+
+- task 3042: a blocked-status assertion using neither a closed-class
+  connective nor the literal 'status' noun (e.g. "Task N remains parked
+  awaiting adjudication") is not extracted.
+- task 3042: ``SNAPSHOT_STATUS_PHRASE_RE``'s status-noun requirement
+  narrows but does not eliminate binding ambiguity — see its PRECISION
+  RESIDUAL comment for the one surviving shape.
+- task 3079: the genitive path requires the literal noun 'status', so
+  "Task N's state is pending" is not extracted.
+- task 3079: ``PLURAL_ENUM_SNAPSHOT_RE``'s preposition guard has one
+  residual pointed the WRONG way (an unlisted preposition over-selects)
+  and one fail-safe residual (a genuine subject-position enumeration
+  sharing a clause with a listed preposition is missed) — see
+  ``_ENUM_PREP_WORDS``.
+- task 4149: ``_CLAUSE_BREAK_CHARS``'s ';' and '?' are unconditional
+  breaks (only '.' gets the occurrence-level flanking test), so one
+  residual is pointed the WRONG way: a '?' inside a URL query string or a
+  ';' inside a path/branch name truncates the backward scan past the
+  governing preposition and OVER-selects — see ``_CLAUSE_BREAK_CHARS``.
+
+Two hypotheses were investigated and RULED OUT for the task-2613 miss
+rate; do not re-open them:
+
+1. Edge traversal/scope: ``GraphitiBackend.get_all_valid_edges`` runs an
+   unfiltered ``MATCH`` (no entity-type, label, or episode filter),
+   reproduced end-to-end scanning every missed edge and dropping it at
+   extraction — every gap was lexical, not a query-scope gap.
+
+   AMENDED, task 4340 (2026-08-17).  The lexical findings above STAND and
+   are unaffected; what does not stand is the scope of the ruling-out.
+   Those grounds covered query FILTERS only and were silent about
+   server-side TRUNCATION.  Task 4340 measured a FalkorDB
+   ``RESULTSET_SIZE`` cap silently truncating that very query to roughly
+   HALF the valid-edge corpus on dark_factory (exact figures: the
+   RESULT-SET CAP AUDIT block in ``backends/graphiti_client.py``, which is
+   the one place they are recorded).  So at the time of the task-2613
+   investigation this sweep saw about half the edges, and the miss rate was
+   computed against a truncated denominator.  ``get_all_valid_edges`` is
+   paginated as of task 4340 and the truncation is gone, but the RATE has
+   not been recomputed: a re-measurement against the now-complete corpus is
+   warranted, and the residuals list above is calibrated against the old
+   figure.  Filed as ticket tkt_0RSJP92VQNATQB0FSR20YMXGW8 (a TICKET id,
+   not a task id — the curator resolves it to a task asynchronously).  Do
+   not re-open the LEXICAL hypothesis; do not treat the old rate as
+   measured on a whole corpus.
+2. A shared blind spot with ``task_count_verification``: that function is
+   an aggregate census-vs-tree consistency check (``task_filter``), not a
+   per-task edge sweep at all — its 'healthy' report was correct, not
+   blind.
+
+Why a regex in this module gets a performance test at all:
+``sweep_stale_status_snapshot_edges`` calls
+``extract_snapshot_edge_task_ids`` once per valid edge from an UNGUARDED
+dict comprehension with no per-edge timeout, over the whole group's edge
+set (tens of thousands of edges; current figures in the RESULT-SET CAP
+AUDIT block in ``backends/graphiti_client.py``).  Extractor cost is
+therefore a whole-cycle LIVENESS property — one pathological fact stalls
+the entire reconciliation cycle — not a micro-optimisation. (amendment,
+task 3079)
+
+The figure was ~5868 in the task-3042 record; that number is consistent
+with a truncated enumeration and has been corrected upward by task 4340's
+live census (see the amendment to ruled-out hypothesis 1 above). The
+LIVENESS argument gets STRONGER, not weaker: with the truncation removed
+the per-edge extractor now runs over roughly twice as many edges per
+cycle, so the per-edge cost this test guards matters more than the
+original number implied, not less.  The read that feeds it was timed
+2026-08-18 at ~3.3 s per full enumeration on dark_factory (~3.7 s on
+reify) — bounded, and roughly +2.6 s per cycle over the old truncated
+read; see the MEASURED COST section of that same audit block, so this
+claim rests on a number rather than on an estimate. (amendment, task 4340)
 """
 
 from __future__ import annotations
@@ -818,6 +717,15 @@ def _is_intra_token_dot(text: str, index: int) -> bool:
     one. A flanked '.' is a filename extension, version string, dotted
     module path or dotted section number — it ends no sentence, so it must
     not count as a clause break. (task 4149)
+
+    Cost (fail-safe, under-selection): a genuine sentence period with no
+    following space AND a following alphanumeric — e.g. 'Reviews for the
+    branch are done.Then tasks 1020 and 1030 are pending.' — is flanked by
+    alphanumerics on both sides too, so it reads as intra-token and the
+    backward scan extends past the governing preposition, suppressing a
+    real snapshot; the edge is simply not retired this cycle. Pinned by
+    test_intra_token_dot_narrowing_costs_only_under_selection in
+    test_stale_status_snapshot_edge_sweep.py.
     """
     return (
         index > 0

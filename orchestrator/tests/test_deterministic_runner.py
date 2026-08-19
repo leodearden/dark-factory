@@ -3560,6 +3560,24 @@ class TestDefaultRunScriptEnv:
 # Task 2090 — Layer A: whole-process-group kill on subprocess timeout
 # ---------------------------------------------------------------------------
 
+def _fake_pgid() -> int:
+    """A stand-in pgid that ``_unsafe_pgid_reason`` will never refuse.
+
+    ``_terminate_process_tree`` sanity-checks the pgid against this process's
+    own identifiers (task 3884 amendment), so a hard-coded literal can collide
+    with ``os.getpid()``/``os.getppid()``/``os.getpgrp()`` and make the helper
+    refuse-and-fall-back instead of dispatching the killpg these tests assert
+    on. That is ~1-in-1.4M with this box's ``pid_max=4194304``, but ~1-in-10k
+    on the older 32768 default — a real flake, and a baffling one to debug.
+    Deriving a provably-distinct value removes the class outright.
+    """
+    live = {os.getpid(), os.getppid(), os.getpgrp()}
+    candidate = 12345
+    while candidate in live:
+        candidate += 1
+    return candidate
+
+
 @pytest.mark.asyncio
 class TestBeforeDoneSubprocessTimeoutHardening:
     """DeterministicRunner — Layer A: kill the WHOLE process tree on timeout.
@@ -3650,9 +3668,13 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         BOTH the killpg path and the proc.kill() fallback — an already-exited
         process must never propagate out of the timeout-cleanup helper.
 
-        RED today: ``_terminate_process_tree`` does not exist yet
-        (AttributeError).
+        Task 3884: the killpg now targets the pgid FROZEN at spawn (passed in
+        by the caller) rather than one re-derived via ``os.getpgid(proc.pid)``
+        at kill time, so the dispatch is actually reached here — the swallow
+        being asserted is the killpg's own ProcessLookupError, then the
+        proc.kill() fallback's.
         """
+        import signal
         from unittest.mock import patch
 
         from orchestrator.deterministic_runner import DeterministicRunner
@@ -3664,18 +3686,24 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             reap_grace_secs=0.05,
         )
 
+        pgid = _fake_pgid()
         mock_proc = MagicMock()
-        mock_proc.pid = 12345
+        # pid must equal the pgid: _unsafe_pgid_reason refuses a mismatch as a
+        # corrupted capture, which would short-circuit before the killpg.
+        mock_proc.pid = pgid
+        # A bare MagicMock's `.returncode` is a truthy Mock (i.e. `is not None`),
+        # which the task-3884 reaped-proc short-circuit would read as "already
+        # reaped" and skip the signal entirely.  This proc is still running.
+        mock_proc.returncode = None
         mock_proc.kill = MagicMock(side_effect=ProcessLookupError('already exited'))
         mock_proc.wait = AsyncMock(return_value=None)
 
-        with (
-            patch('os.getpgid', side_effect=ProcessLookupError('no such process')),
-            patch('os.killpg', side_effect=ProcessLookupError('no such process')) as mock_killpg,
-        ):
-            await runner._terminate_process_tree(mock_proc)
+        with patch(
+            'os.killpg', side_effect=ProcessLookupError('no such process'),
+        ) as mock_killpg:
+            await runner._terminate_process_tree(mock_proc, pgid)
 
-        mock_killpg.assert_not_called()
+        mock_killpg.assert_called_once_with(pgid, signal.SIGKILL)
         mock_proc.kill.assert_called_once()
 
     async def test_terminate_process_tree_bounds_reap_when_proc_never_exits(
@@ -3704,24 +3732,116 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             reap_grace_secs=0.05,
         )
 
+        pgid = _fake_pgid()
         mock_proc = MagicMock()
-        mock_proc.pid = 12345
+        # pid must equal the pgid — see the sibling test.
+        mock_proc.pid = pgid
+        # Still running (see the sibling test): a bare MagicMock's `.returncode`
+        # is truthy, which the task-3884 reaped-proc short-circuit would treat
+        # as already-reaped and skip the killpg this test asserts on.
+        mock_proc.returncode = None
         # proc.wait() never resolves — simulates an unkillable/D-state process
         # that ignores SIGKILL.
         never_resolves = asyncio.Event()
         mock_proc.wait = AsyncMock(side_effect=never_resolves.wait)
 
-        with (
-            patch('os.getpgid', return_value=12345),
-            patch('os.killpg') as mock_killpg,
-        ):
+        with patch('os.killpg') as mock_killpg:
             # Hang tripwire: if reap_grace_secs stops bounding the wait, fail
             # loudly instead of stalling the suite.
             await asyncio.wait_for(
-                runner._terminate_process_tree(mock_proc), timeout=5,
+                runner._terminate_process_tree(mock_proc, pgid), timeout=5,
             )
 
         mock_killpg.assert_called_once()
+
+    async def test_no_killpg_after_proc_reaped(self, tmp_path: Path):
+        """A reaped proc must receive NO killpg — its pid may already be recycled.
+
+        Task 3884 / task 845: freezing the pgid at spawn removes the
+        ``os.getpgid`` lookup, but the frozen NUMBER is itself stale once the
+        leader has been reaped — the kernel may have recycled that pid onto an
+        unrelated group (in the original incidents, the user's ``systemd --user``
+        group, which killed the whole login session).  So the helper must
+        dispatch no signal at all once ``proc.returncode is not None``, mirroring
+        ``shared.proc_group.terminate_process_group``'s step 1.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        runner = DeterministicRunner(
+            scheduler=MagicMock(),
+            escalation_queue=EscalationQueue(tmp_path),
+            reap_grace_secs=0.05,
+        )
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.returncode = 0          # already reaped by asyncio's child watcher
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=0)
+        killpg_calls: list[tuple[int, int]] = []
+        getpgid_calls: list[int] = []
+        with (
+            patch('os.killpg', side_effect=lambda pgid, sig: killpg_calls.append((pgid, sig))),
+            patch('os.getpgid', side_effect=lambda pid: getpgid_calls.append(pid) or 999),
+        ):
+            await runner._terminate_process_tree(mock_proc, 12345)
+        assert killpg_calls == [], f'must not killpg a reaped proc (task 845); got {killpg_calls}'
+        assert getpgid_calls == [], f'must never re-derive the pgid at kill time; got {getpgid_calls}'
+        mock_proc.kill.assert_not_called()
+
+    @pytest.mark.parametrize('scenario', ['own_process_group', 'pid_mismatch'])
+    async def test_refuses_to_killpg_an_unsafe_pgid(
+        self, tmp_path: Path, scenario: str,
+    ):
+        """An unsafe pgid must be refused and degraded to a direct kill().
+
+        The residual defence behind the frozen capture and the reaped-proc
+        short-circuit: this helper reuses
+        ``shared.proc_group._unsafe_pgid_reason`` rather than growing a third
+        divergent copy of the same sanity checks (the shared helper and
+        ``df_pytest_isolation._kill_process_group`` are the other two).
+
+        ``own_process_group`` is the consequential case, not a synthetic one —
+        it is precisely the task-845 outcome. A pgid that resolves to our OWN
+        group means the killpg would SIGKILL this test session, the
+        orchestrator, and everything else sharing it. ``pid_mismatch`` covers a
+        corrupted capture, where the frozen int no longer describes ``proc``.
+
+        Degrading to ``proc.kill()`` rather than doing nothing matches
+        ``df_pytest_isolation``'s handling of the same refusal: the timed-out
+        child still dies, and only the (unreachable) grandchildren are forgone.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        runner = DeterministicRunner(
+            scheduler=MagicMock(),
+            escalation_queue=EscalationQueue(tmp_path),
+            reap_grace_secs=0.05,
+        )
+        mock_proc = MagicMock()
+        mock_proc.returncode = None          # still running: not the reaped path
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=None)
+
+        if scenario == 'own_process_group':
+            pgid = os.getpgrp()
+            mock_proc.pid = pgid
+        else:
+            pgid = _fake_pgid()
+            mock_proc.pid = pgid + 1         # capture no longer describes proc
+
+        killpg_calls: list[tuple[int, int]] = []
+        with patch('os.killpg', side_effect=lambda p, s: killpg_calls.append((p, s))):
+            await runner._terminate_process_tree(mock_proc, pgid)
+
+        assert killpg_calls == [], (
+            f'{scenario}: refused pgid must never be signalled -- killpg on our '
+            f'own group is the task-845 login-session kill; got {killpg_calls}'
+        )
+        mock_proc.kill.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

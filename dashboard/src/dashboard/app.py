@@ -40,6 +40,7 @@ from dashboard.data.burndown import (
     aggregate_burndown_series,
     collect_snapshot,
     downsample,
+    ensure_snapshot_columns,
 )
 from dashboard.data.cap_history import (
     AccountsSummary,
@@ -63,9 +64,14 @@ from dashboard.data.escalation_analytics import (
     archive_scan_succeeded,
     build_escalation_analytics,
 )
-from dashboard.data.escalations import build_escalation_queues
+from dashboard.data.escalations import build_escalation_queues, fetch_pins_recovery
 from dashboard.data.load import get_load_metrics
-from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.data.mcp_fanout import (
+    PreformattedFanoutError,
+    TTLCache,
+    describe_exc,
+    first_success,
+)
 from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
@@ -208,6 +214,23 @@ class _BurndownStore(AsyncSqliteBase):
     def connection(self) -> aiosqlite.Connection:
         """Public accessor for the open connection; raises RuntimeError if not opened."""
         return self._require_conn()
+
+    async def open(self) -> None:
+        """Open, then bring an existing DB up to the current column set.
+
+        ``BURNDOWN_SCHEMA`` is applied with ``CREATE TABLE IF NOT EXISTS``, so a
+        burndown.db created before a column was added never gains it from the
+        DDL alone.  Migrating here — before ``_burndown_loop`` can run — is what
+        keeps the collector from ever meeting an un-migrated table.  Closes the
+        connection on failure so a half-open store is never left behind.
+        """
+        await super().open()
+        try:
+            await ensure_snapshot_columns(self.connection)
+            await self.connection.commit()
+        except BaseException:
+            await self.close()
+            raise
 
 
 class _MetricsStore(AsyncSqliteBase):
@@ -1056,8 +1079,12 @@ async def api_performance(request: Request) -> JSONResponse:
 # only its message arg — NOT the response body — so the cap defends
 # against long message strings rather than response-body leakage.  The
 # WARNING log still records the full untruncated exception text.
-# Intentionally cancel-handler-scoped for now; other proxy handlers can
-# adopt the same constant if they gain an equivalent truncation path.
+# Also adopted by _scheduler_proxy, whose hand-rolled `str(exc)[:200]` was the
+# "equivalent truncation path" this comment anticipated; the name is kept for
+# its original site rather than renamed across both.  Note the two caps differ
+# slightly in what they bound: the cancel handler truncates str(exc) and then
+# prefixes the type, while _scheduler_proxy truncates the already-rendered
+# 'Type: message' — so the type name there is inside the cap, never after it.
 _CANCEL_DETAIL_EXC_CHAR_LIMIT = 200
 
 
@@ -1124,7 +1151,14 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
             ValueError,
         ) as exc:
             logger.warning('cancel_ticket failed for %s: %s', url, exc)
-            raise ValueError(
+            # PreformattedFanoutError, not ValueError: the message below is
+            # already a rendered 'Type: message', and first_success renders
+            # every caught exception through describe_exc — which would
+            # prepend a second type name, surfacing 'ValueError: ConnectError:
+            # refused' in the 502 detail and the offline pill. See that
+            # class's docstring. str(exc) (NOT the composed string) is what
+            # gets truncated, so the cap bounds the exception text alone.
+            raise PreformattedFanoutError(
                 f'{type(exc).__name__}: {str(exc)[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]}'
             ) from exc
         if result.get('error') == 'not_found':
@@ -1309,6 +1343,7 @@ async def api_scheduler(request: Request) -> JSONResponse:
         events_by_task,
         offline_projects,
         paused_projects,
+        recovery_events,
     ), snapshot_at = await get_scheduler_snapshot(http_client, config)
     return JSONResponse(
         redux_api.shape_scheduler(
@@ -1318,6 +1353,7 @@ async def api_scheduler(request: Request) -> JSONResponse:
             events_by_task=events_by_task,
             offline_projects=offline_projects,
             paused_projects=paused_projects,
+            recovery_events=recovery_events,
             snapshot_at=snapshot_at,
         )
     )
@@ -1360,8 +1396,18 @@ async def _scheduler_proxy(
             httpx.HTTPStatusError,
             ValueError,
         ) as exc:
-            logger.warning('%s failed for %s: %s', tool_name, url, exc)
-            raise ValueError(str(exc)[:200]) from exc
+            # describe_exc, not the bare exc: several exceptions on this path
+            # stringify to '' (most importantly httpx.PoolTimeout, i.e. THIS
+            # client's pool is saturated rather than the server being down), so
+            # a bare str(exc) made both this WARNING and the 502 detail
+            # content-free.  PreformattedFanoutError, not ValueError: the
+            # message is already a rendered 'Type: message' and first_success
+            # renders every caught exception through describe_exc again, which
+            # would prepend a second type name.  Mirrors the cancel_ticket
+            # fan-out above — the two proxies must render errors identically.
+            detail = describe_exc(exc)
+            logger.warning('%s failed for %s: %s', tool_name, url, detail)
+            raise PreformattedFanoutError(detail[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]) from exc
         # Guard the not_found mapping with isinstance: an MCP tool that
         # returns a list or None (buggy/older server) would AttributeError
         # on `.get(...)` and escape as a 500.  Defensive at the single
@@ -1730,11 +1776,33 @@ async def api_escalation_analytics(request: Request) -> JSONResponse:
     cache forever in front of the very walk it protects.
     """
     config: DashboardConfig = request.app.state.config
+    http_client: httpx.AsyncClient = request.app.state.http_client
     project_dirs = _analytics_project_dirs(config)
     key = str(project_dirs)
 
     async def _refresh() -> dict:
-        return await asyncio.to_thread(build_escalation_analytics, project_dirs)
+        # The pins_recovery fan-out is async and MUST stay on this side of the
+        # to_thread boundary: build_escalation_analytics is the pure-sync
+        # archive walker, and an MCP round-trip inside it would block a worker
+        # thread on the network. It runs inside _refresh (not per request) so
+        # it is paid only on a cache miss, giving the annotation the same ~60s
+        # freshness as the payload it rides in — a fresher annotation could not
+        # be shown anyway, since the cache serves the whole dict.
+        #
+        # fetch_pins_recovery already isolates per-project failures (an
+        # unreachable orchestrator maps to None, i.e. unknown, and never sinks
+        # its siblings). This guard covers only the unexpected: whatever the
+        # cause, the analytics tab must still render, one annotation short.
+        try:
+            pins = await fetch_pins_recovery(http_client, config.escalation_urls)
+        except Exception as exc:  # noqa: BLE001 — the tab must survive this
+            logger.warning(
+                'pins_recovery fan-out failed (analytics served unannotated): %s', exc,
+            )
+            pins = None
+        return await asyncio.to_thread(
+            build_escalation_analytics, project_dirs, pins_by_project=pins,
+        )
 
     result = await _analytics_cache.get_or_refresh(
         key, _refresh, cache_ok=archive_scan_succeeded,
