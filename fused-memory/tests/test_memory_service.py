@@ -12950,3 +12950,115 @@ class TestListDescendantIds:
 
         assert scan.truncated is True
         assert scan.ids == [_DM_CHILD_A]
+
+
+def _lci_children(svc, child_ids, *, count=None):
+    """Report *child_ids* as DIRECT children, mocked at the service seam.
+
+    Mocked one layer above `_dm_children` (which stubs the mem0 backend) so
+    the `limit=` the scan passes down is observable at all — the bound is a
+    `get_memories_by_metadata` keyword, invisible from the backend mock.
+
+    *count* defaults to ``len(child_ids)``; pass it explicitly to model a
+    count/scroll DISAGREEMENT (the `_CHILD_SCAN_LIMIT` bound, or a
+    concurrent write landing between the two reads).
+    """
+    svc.count_memories_by_metadata = AsyncMock(
+        return_value=len(child_ids) if count is None else count
+    )
+    svc.get_memories_by_metadata = AsyncMock(
+        return_value=[{'id': cid, 'created_at': None, 'metadata': {}} for cid in child_ids]
+    )
+
+
+class TestListChildIds:
+    """The DIRECT-children enumeration the consolidate op reparents from.
+
+    Deliberately not `list_descendant_ids`: consolidation re-points a
+    victim's immediate children onto the new canonical and then deletes only
+    that victim, so the boundary it needs is one level deep. A transitive
+    post-order walk would enumerate grandchildren the op never touches and
+    invite reparenting records whose parent is still alive.
+    """
+
+    @pytest.mark.asyncio
+    async def test_childless_target_costs_one_count_and_zero_scrolls(self, service):
+        """The cheap exact count short-circuits before any payload fetch.
+
+        The scroll pulls full payloads; the count is exact and cheap. A
+        consolidation pre-flights this once per supersede, so paying a
+        scroll for a listing that is empty by construction would be a real
+        per-victim cost for nothing.
+        """
+        _lci_children(service, [])
+
+        scan = await service.list_child_ids(_DM_PARENT, project_id='test')
+
+        assert scan == ([], False)
+        assert scan.truncated is False
+        service.get_memories_by_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_child_ids_in_scroll_order(self, service):
+        grandchild = _dm_uuid('9a1')
+        _lci_children(service, [_DM_CHILD_A, _DM_CHILD_B, grandchild])
+
+        scan = await service.list_child_ids(_DM_PARENT, project_id='test')
+
+        assert scan.ids == [_DM_CHILD_A, _DM_CHILD_B, grandchild]
+        assert scan.truncated is False
+
+    @pytest.mark.asyncio
+    async def test_asks_exactly_one_question_bounded_by_the_scan_limit(self, service):
+        _lci_children(service, [_DM_CHILD_A])
+
+        await service.list_child_ids(_DM_PARENT, project_id='dark_factory')
+
+        count_args = service.count_memories_by_metadata.call_args
+        assert count_args.args[0] == 'dark_factory'
+        assert count_args.args[1] == {'parent_id': _DM_PARENT}
+        scroll_args = service.get_memories_by_metadata.call_args
+        assert scroll_args.args[0] == 'dark_factory'
+        assert scroll_args.args[1] == {'parent_id': _DM_PARENT}
+        assert scroll_args.kwargs['limit'] == MemoryService._CHILD_SCAN_LIMIT
+
+    @pytest.mark.asyncio
+    async def test_fan_out_past_the_scan_limit_reports_truncated(self, service):
+        """THE load-bearing case: a partial listing must not read as complete.
+
+        A caller that reparents the visible page and then deletes the parent
+        would silently orphan every child it could not see.
+        """
+        visible = [_dm_uuid(f'c{n:03x}') for n in range(MemoryService._CHILD_SCAN_LIMIT)]
+        _lci_children(service, visible, count=150)
+
+        scan = await service.list_child_ids(_DM_PARENT, project_id='test')
+
+        assert scan.truncated is True
+        assert scan.ids == visible
+
+    @pytest.mark.asyncio
+    async def test_count_scroll_disagreement_is_never_downgraded(self, service):
+        """A concurrent write between the two reads still reports truncated.
+
+        Reconciling the disagreement toward the smaller answer would turn a
+        "I could not see all of them" into a confident partial listing.
+        """
+        _lci_children(service, [_DM_CHILD_A, _DM_CHILD_B], count=3)
+
+        scan = await service.list_child_ids(_DM_PARENT, project_id='test')
+
+        assert scan.truncated is True
+        assert scan.ids == [_DM_CHILD_A, _DM_CHILD_B]
+
+    @pytest.mark.asyncio
+    async def test_scan_is_read_only(self, service):
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        _lci_children(service, [_DM_CHILD_A])
+
+        await service.list_child_ids(_DM_PARENT, project_id='test')
+
+        service.mem0.delete.assert_not_awaited()
+        journal.log_write_op.assert_not_awaited()
+        buffer.push.assert_not_awaited()

@@ -4975,6 +4975,47 @@ class MemoryService:
         await walk(memory_id)
         return DescendantScan(ids=ordered, truncated=truncated)
 
+    async def list_child_ids(
+        self, memory_id: str, *, project_id: str
+    ) -> DescendantScan:
+        """*memory_id*'s DIRECT children — one level deep, WITHOUT deleting.
+
+        Deliberately not :meth:`list_descendant_ids`' transitive post-order
+        walk.  The consolidate op re-points a victim's immediate children
+        onto the new canonical and then deletes only that victim; its
+        grandchildren keep a living parent throughout and are never touched.
+        Enumerating them here would invite reparenting records whose own
+        parent is still alive — a pointer rewrite nothing asked for.
+
+        Public and side-effect-free for the same reason
+        :meth:`refuse_if_children` is: the tool layer has to pre-flight
+        "what would I have to reparent?" BEFORE the destructive part of the
+        operation starts.
+
+        Built from the same :meth:`_count_children` / :meth:`_list_children`
+        primitives as every other child read (INV-5) — no new scroll — so
+        the count-then-scroll ordering, the ``_CHILD_SCAN_LIMIT`` bound and
+        the truncation semantics keep exactly one home.  Count first: the
+        count is exact and cheap while the scroll fetches full payloads, and
+        a childless victim (the common case) must not pay for a listing
+        with nothing in it.
+
+        Returns:
+            DescendantScan: ``ids`` in scroll order, bounded by
+            ``_CHILD_SCAN_LIMIT``; and ``truncated``, true when the live
+            count exceeds what the scroll returned — the bound above, or a
+            concurrent write landing between the two reads.  A caller that
+            reparents a truncated listing and then deletes the parent
+            silently orphans everything it could not see, so the
+            disagreement is carried as data rather than reconciled toward
+            the smaller answer.
+        """
+        count = await self._count_children(memory_id, project_id=project_id)
+        if not count:
+            return DescendantScan(ids=[], truncated=False)
+        ids = await self._list_children(memory_id, project_id=project_id)
+        return DescendantScan(ids=ids, truncated=len(ids) < count)
+
     async def refuse_if_children(self, memory_id: str, *, project_id: str) -> None:
         """Raise ``ParentHasChildrenError`` if *memory_id* still has children.
 

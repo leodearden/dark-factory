@@ -193,6 +193,7 @@ def _build_tombstone_record(
     victim_created_at: str | None,
     deleter: str,
     deleting_run_id: str,
+    absorbed_by: str | None = None,
     now_dt: datetime,
 ) -> ReconLedgerRecord:
     """Build the one ledger row describing a single confirmed deletion.
@@ -205,6 +206,14 @@ def _build_tombstone_record(
     stay at their ``''`` defaults, so a later lookup needs only the one thing
     an auditor actually knows. ``expires_at`` hands retention to the ``gc()``
     pass ``_gc_recon_markers`` already runs every cycle.
+
+    ``absorbed_by`` (task 3133) is written ALWAYS, explicitly ``None`` when
+    absent, for the same reason the identity projection writes ``None`` for
+    victim keys the record did not have: only presence can distinguish
+    "reaped by a sweep, nothing absorbed it" from a tombstone written before
+    the field existed. It is a top-level field rather than part of the
+    projection because :data:`_VICTIM_IDENTITY_KEYS` is deliberately what the
+    VICTIM recorded about itself, and the id that absorbed it is not that.
     """
     metadata = victim_metadata if isinstance(victim_metadata, dict) else {}
     payload = {
@@ -212,6 +221,7 @@ def _build_tombstone_record(
         'deleting_run_id': deleting_run_id,
         'deleted_at': now_dt.isoformat(),
         'created_at': victim_created_at,
+        'absorbed_by': absorbed_by,
         **{key: metadata.get(key) for key in _VICTIM_IDENTITY_KEYS},
     }
     return ReconLedgerRecord(
@@ -236,6 +246,7 @@ async def record_mem0_deletion_tombstone(
     victim_created_at: str | None,
     deleter: str,
     deleting_run_id: str,
+    absorbed_by: str | None = None,
     now: datetime | None = None,
 ) -> bool:
     """Record that a recon sweep deleted the Mem0 record *memory_id*.
@@ -291,6 +302,15 @@ async def record_mem0_deletion_tombstone(
             distinct from the victim's own ``metadata['run_id']`` (also stored,
             via ``victim_metadata``) — conflating the two is precisely what
             made the original recon-gate-165 finding unreadable.
+        absorbed_by: For a CONSOLIDATION delete, the surviving canonical
+            id that absorbed this record — the REVERSE pointer, and the one
+            that closes the recon-gate-165 audit dead-end: the survivor
+            already carries a forward ``consolidated_from``, but an auditor
+            chasing a broken reference holds only the DEAD id, from which
+            that deletion was previously indistinguishable from silent data
+            loss. ``None`` for a pure GC/trim sweep, which absorbs nothing,
+            and written into the payload explicitly so absence reads as
+            "nothing absorbed it" rather than "this predates the field".
         now: Reference "current time". Defaults to ``datetime.now(UTC)``;
             tests inject a fixed value. Normalized via :func:`_assume_utc` and
             rendered with ``.isoformat()`` so ``expires_at`` stays correct
@@ -313,6 +333,7 @@ async def record_mem0_deletion_tombstone(
                 victim_created_at=victim_created_at,
                 deleter=deleter,
                 deleting_run_id=deleting_run_id,
+                absorbed_by=absorbed_by,
                 now_dt=_assume_utc(now or datetime.now(UTC)),
             )
         )
@@ -342,6 +363,7 @@ async def record_mem0_deletion_tombstones(
     *,
     deleter: str,
     deleting_run_id: str,
+    absorbed_by: str | None = None,
     now: datetime | None = None,
 ) -> int:
     """Tombstone a whole sweep's worth of deletions in ONE ledger transaction.
@@ -381,6 +403,15 @@ async def record_mem0_deletion_tombstones(
             ``'created_at'``. A victim with no usable ``'id'`` is skipped.
         deleter: The delete's ``_source`` audit tag — WHICH sweep took them.
         deleting_run_id: The run that performed the deletions.
+        absorbed_by: For a CONSOLIDATION delete, the surviving canonical
+            id that absorbed this record — the REVERSE pointer, and the one
+            that closes the recon-gate-165 audit dead-end: the survivor
+            already carries a forward ``consolidated_from``, but an auditor
+            chasing a broken reference holds only the DEAD id, from which
+            that deletion was previously indistinguishable from silent data
+            loss. ``None`` for a pure GC/trim sweep, which absorbs nothing,
+            and written into the payload explicitly so absence reads as
+            "nothing absorbed it" rather than "this predates the field".
         now: Reference "current time" for all rows in the batch (they share
             one timestamp, which is accurate: one sweep, one instant).
 
@@ -401,6 +432,10 @@ async def record_mem0_deletion_tombstones(
                 victim_created_at=victim.get('created_at'),
                 deleter=deleter,
                 deleting_run_id=deleting_run_id,
+                # Batch-LEVEL by construction: every victim in one
+                # consolidation is absorbed by the same canonical, so this
+                # is a property of the call rather than of each row.
+                absorbed_by=absorbed_by,
                 now_dt=now_dt,
             )
             for victim in victims
