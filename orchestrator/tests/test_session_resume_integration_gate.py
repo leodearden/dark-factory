@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import shutil
+import uuid
 from collections import namedtuple
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -451,6 +452,50 @@ _InvokeCapture = namedtuple(
 )
 
 
+# The ``projects/<encoded-cwd>/`` component the CLI writes its session JSONL
+# under.  Its VALUE is deliberately arbitrary here: CLI 2.1.236 was measured
+# (task 3578 hard gate) to scan every ``projects/*/`` subdir by session id and
+# to ignore both this directory's name and the ``cwd`` recorded inside the
+# records, which is exactly why the restore mirrors the archive's own encoded
+# component verbatim instead of re-deriving one for the new lane.
+_RESUME_ENC = '-home-leo-src-dark-factory--worktrees-lane-a'
+_TRANSCRIPT_BYTES = b'{"type":"user","message":{"role":"user","content":"p"}}\n'
+
+
+def _seed_live_transcript(
+    config_dir: Path, sid: str, data: bytes = _TRANSCRIPT_BYTES,
+) -> Path:
+    """Lay a transcript where ``transcript_exists`` (and the CLI) finds it:
+    ``<config_dir>/projects/<ENC>/<sid>.jsonl``.
+
+    Shape copied from test_transcript_archival_boundary_gate.py:_write_transcript
+    so the two suites cannot drift on the layout the producer writes.
+    """
+    p = Path(config_dir) / 'projects' / _RESUME_ENC / f'{sid}.jsonl'
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return p
+
+
+def _seed_archived_transcript(
+    repo: Path, task_id: str, sid: str, data: bytes = _TRANSCRIPT_BYTES,
+) -> Path:
+    """Lay a DURABLE archive entry where ``durable_archive_path`` finds it:
+    ``<project_root>/data/orchestrator/agent-transcripts/<task_id>/<ENC>/<sid>.jsonl``.
+
+    ``_config(repo)`` sets ``project_root=repo``, so the archive root the
+    dispatch path composes (``project_root / transcript_archive.root``) lands
+    under the repo tmpdir — OUTSIDE the worktree, exactly as in production.
+    """
+    p = (
+        Path(repo) / 'data' / 'orchestrator' / 'agent-transcripts'
+        / str(task_id) / _RESUME_ENC / f'{sid}.jsonl'
+    )
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return p
+
+
 async def _init_resume_repo(repo: Path) -> None:
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
     await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
@@ -517,15 +562,26 @@ async def _make_resumed_workflow(
 
 async def _drive_resumed_invoke(
     tmp_path: Path, recovered_session, role, caplog, *, task_id: str = '42',
+    seed_transcript: bool = False,
+    seed_archive: bool = False,
+    config_overrides: dict | None = None,
+    event_store=None,
+    slug: str = '',
 ) -> _InvokeCapture:
     """Feed *recovered_session* as ``resume_session_id`` into a REAL
     ``TaskWorkflow`` and drive ``_invoke(role, 'p', cwd)`` with
     ``invoke_with_cap_retry`` patched. Snapshots the sidecar MID-invocation
     (the finally clears it on completion) and captures the iwcr kwargs.
+
+    ``seed_transcript`` lays the recovered session's JSONL into the workflow's
+    OWN ``_config_dir`` before the drive — the state a same-lane resume starts
+    from, and the premise every pre-3578 caller left implicit.
+    ``seed_archive`` instead lays it only into the durable archive under
+    ``project_root``, the pooled-warm-lane state this task exists to rehydrate.
     """
     caplog.set_level(logging.INFO)
     sid = (recovered_session or {}).get('session_id', 'x')
-    repo = tmp_path / f'resume-repo-{sid}'
+    repo = tmp_path / f'resume-repo-{slug or sid}'
     repo.mkdir()
     await _init_resume_repo(repo)
     git_ops = GitOps(
@@ -536,11 +592,17 @@ async def _drive_resumed_invoke(
         repo,
     )
     with patch.dict(os.environ, {'ORCH_CONFIG_PATH': ''}):
-        config = _config(repo)
+        config = _config(repo, **(config_overrides or {}))
     assignment = _resume_assignment(task_id)
     workflow, cwd = await _make_resumed_workflow(
         config, git_ops, assignment, recovered_session,
     )
+    workflow.event_store = event_store
+    if seed_transcript:
+        assert workflow._config_dir is not None
+        _seed_live_transcript(workflow._config_dir.path, sid)
+    if seed_archive:
+        _seed_archived_transcript(repo, task_id, sid)
     snapshot: dict = {}
 
     def _side_effect(**kwargs):
@@ -585,6 +647,79 @@ async def test_b1_resumed_invocation_journals_prior_session(
     cap = await _drive_resumed_invoke(tmp_path, recovered, IMPLEMENTER, caplog)
 
     assert cap.kwargs['resume_session_id'] == session_id
+    assert f'resuming prior session {session_id}' in caplog.text
+
+
+# ── B1v: the arm-site VETO — corroborate against the config dir we will USE ──
+@pytest.mark.asyncio
+async def test_b1v_invoke_vetoes_resume_when_transcript_provably_absent(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The core defect (task 3578): ``_invoke`` armed ``--resume`` from the
+    recovered sidecar with ZERO corroboration against ``self._config_dir`` —
+    the directory it is about to export as ``CLAUDE_CONFIG_DIR``.
+
+    The harness guard corroborated a BOOT-TIME snapshot path; under a pooled
+    warm lane ``self._config_dir`` is constructed fresh from whatever lane was
+    acquired AFTERWARDS, so the two can disagree.  When they do, the CLI exits
+    ``No conversation found with session ID`` having emitted no runs.db event at
+    all — the measured, invisible failure population.
+
+    Here the config dir is real but EMPTY and no archive exists, so the resume
+    is provably unreachable: ``_invoke`` must fall through to a FRESH session
+    rather than arm a doomed one.  The pending fields must also be consumed, so
+    a permanently-unreachable sid cannot be re-attempted every iteration.
+    """
+    task_id, session_id = '78', 'uuid-b1v-veto'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+
+    cap = await _drive_resumed_invoke(tmp_path, recovered, IMPLEMENTER, caplog)
+
+    # Armed nothing, and allocated a genuinely fresh id — not the doomed one.
+    assert cap.kwargs['resume_session_id'] is None
+    fresh = cap.kwargs['session_id']
+    assert fresh != session_id
+    uuid.UUID(fresh)  # a real uuid4, not a recycled or empty string
+    # Consumed-on-first-use: a sid we just proved unreachable must not be
+    # retried on the next invocation of this role.
+    assert cap.workflow._pending_resume_session_id is None
+    assert cap.workflow._pending_resume_role is None
+    # Loud, and greppable by BOTH coordinates of the disagreement.
+    assert session_id in caplog.text
+    assert str(cap.workflow._config_dir.path) in caplog.text
+    assert any(
+        r.levelname == 'WARNING' and session_id in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_b1v_invoke_arms_resume_when_transcript_present_in_config_dir(
+    harness: Harness, tmp_path: Path, caplog,
+):
+    """The veto's mirror image: it is scoped to PROVABLE ABSENCE, not blanket.
+
+    Same recovered session, same real config dir — but the transcript is
+    actually sitting in it, so the corroboration succeeds and ``--resume`` is
+    armed exactly as before.  Scoping copied verbatim from the precedent at
+    ``cli_invoke.py`` ("we have a directory and the transcript is provably not
+    in it"), whose own comment says it mirrors the orchestrator's guard.
+    """
+    task_id, session_id = '79', 'uuid-b1v-present'
+    _setup_warm_lane_session(harness, task_id, session_id, role='implementer')
+    harness.config.session_resume = SessionResumeConfig()
+    await harness._recover_crashed_tasks()
+    recovered = harness._recovered_sessions[task_id]
+
+    cap = await _drive_resumed_invoke(
+        tmp_path, recovered, IMPLEMENTER, caplog, seed_transcript=True,
+    )
+
+    assert cap.kwargs['resume_session_id'] == session_id
+    assert cap.kwargs['session_id'] == session_id
     assert f'resuming prior session {session_id}' in caplog.text
 
 
