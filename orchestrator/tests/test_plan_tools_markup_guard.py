@@ -59,10 +59,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from escalation.models import Escalation
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
-from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY, detect
+from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY, detect, repair
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
@@ -226,10 +227,21 @@ class Harness:
 
 
 @pytest.fixture()
-def harness(tmp_path) -> Harness:
-    """A plan-tools server over a temp worktree — mirrors ``test_plan_tools_server``."""
-    artifacts = TaskArtifacts(tmp_path)
-    artifacts.init('test-1', 'Test task', 'A test')
+def artifacts(tmp_path) -> TaskArtifacts:
+    """TaskArtifacts over a temp worktree — mirrors ``test_plan_tools_server``."""
+    a = TaskArtifacts(tmp_path)
+    a.init('test-1', 'Test task', 'A test')
+    return a
+
+
+@pytest.fixture()
+def harness(artifacts: TaskArtifacts) -> Harness:
+    """A plan-tools server over a temp worktree.
+
+    Kept SEPARATE from ``artifacts`` because the residue rows below must
+    install their fakes BEFORE ``create_server`` runs — the escalation sink is
+    built once, at the registration site.
+    """
     return Harness(artifacts)
 
 
@@ -500,3 +512,316 @@ class TestDeliberateQuotingOverride:
         assert 'metadata' not in stored, (
             'the override is write-time-only control, never payload'
         )
+
+
+# ---------------------------------------------------------------------------
+# Residue preservation on the UNREPAIRABLE path.
+# ---------------------------------------------------------------------------
+#
+# plan-tools owns 52 of the system's 95 unrepairable specimens
+# (add_design_decision.decision x45, add_design_decision.rationale x4,
+# add_reuse_item.how x3), so this is the path that decides whether
+# REJECT_WITH_REPAIR is NON-DESTRUCTIVE here. Registering REJECT with no
+# residue channel would convert "corrupt but present in plan.json" into
+# "silently absent", which is a regression in data preservation dressed as a
+# fix — and the middleware's own hint tells the caller its payload "is
+# preserved verbatim in the escalation named above".
+
+#: The committed corpus of REAL leaked calls (task 3688, boundary row B13).
+CORPUS_PATH = (
+    Path(__file__).resolve().parents[2]
+    / 'shared' / 'tests' / 'fixtures' / 'toolcall_markup_corpus.jsonl'
+)
+
+
+def _specimen(tool_use_id: str) -> dict[str, Any]:
+    """The committed corpus record with this ``tool_use_id``.
+
+    Keyed by id rather than by index or by "the shortest one", so a corpus
+    refresh that adds records cannot silently repoint a test at a different
+    payload. Read as JSON, which is also how the raw envelope literals reach
+    this module WITHOUT appearing in its own source text — the corpus escapes
+    every one of them as ``\\u003c``.
+    """
+    for line in CORPUS_PATH.read_text(encoding='utf-8').splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if record.get('tool_use_id') == tool_use_id:
+            return record
+    raise AssertionError(f'specimen {tool_use_id!r} is missing from {CORPUS_PATH}')
+
+
+#: A REAL ``add_design_decision.decision`` payload whose own boundary cannot be
+#: determined. A refusal is the one outcome an invented specimen can trivially
+#: fake — anything sufficiently mangled refuses — so the assertion that this
+#: guard never guesses is only worth something against input the harness really
+#: produced.
+UNREPAIRABLE_SPECIMEN = _specimen('toolu_01CX8okLpKgz5auenVYQzY23')
+UNREPAIRABLE_DECISION: str = UNREPAIRABLE_SPECIMEN['value']
+
+#: What ``add_design_decision`` declares, as the middleware resolves it LIVE
+#: off the tool. Spelled here only so the specimen's unrepairability can be
+#: re-derived independently of the server.
+_DECISION_SCHEMA = ('decision', 'rationale')
+
+
+class _FakeQueue:
+    """Stands in for ``EscalationQueue``: records what was filed, hands ids back.
+
+    A bare list would return ``None`` from ``submit``, which would let a sink
+    that never propagated the queue's id pass the payload assertions by
+    accident.
+    """
+
+    def __init__(
+        self,
+        *,
+        submit_error: Exception | None = None,
+        read_error: Exception | None = None,
+    ) -> None:
+        self.submitted: list[Escalation] = []
+        self.pending: list[Escalation] = []
+        self.submit_error = submit_error
+        self.read_error = read_error
+
+    def make_id(self, task_id: str) -> str:
+        return f'esc-{task_id}-{len(self.submitted) + 1}'
+
+    def submit(self, escalation: Escalation) -> str:
+        if self.submit_error is not None:
+            raise self.submit_error
+        self.submitted.append(escalation)
+        self.pending.append(escalation)
+        return escalation.id
+
+    def get_by_task(self, task_id: str, status: str | None = None) -> list[Escalation]:
+        if self.read_error is not None:
+            raise self.read_error
+        return [
+            esc for esc in self.pending
+            if esc.task_id == task_id and (status is None or esc.status == status)
+        ]
+
+
+class ResidueRig:
+    """A real plan-tools server whose escalation channel points at a fake queue.
+
+    ``records`` holds every record the MIDDLEWARE handed the sink, so the
+    contracted keys are assertable directly rather than reconstructed from what
+    the queue happens to have kept.
+    """
+
+    def __init__(self, harness: Harness, queue: _FakeQueue, records: list[dict[str, Any]]):
+        self.harness = harness
+        self.queue = queue
+        self.records = records
+
+    async def refuse(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Drive one call that must be refused; return the refusal payload."""
+        with pytest.raises(ToolError) as excinfo:
+            await self.harness.call(tool, arguments)
+        return _refusal(excinfo)
+
+
+def build_residue_rig(
+    monkeypatch, artifacts: TaskArtifacts, queue: _FakeQueue | None = None
+) -> ResidueRig:
+    """The REAL sink, with only its queue-facing seams faked.
+
+    The two patched seams are the ones step-4 introduces: where this server
+    files (``_markup_project_root``, normally derived from git) and what it
+    files through (``_escalation_channel``, normally the lazily imported
+    ``EscalationQueue``). The record BUILDER — attribution, level, category,
+    the raw payload — is the real one, which is the part under test.
+    """
+    queue = _FakeQueue() if queue is None else queue
+    records: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(plan_tools, '_markup_project_root', lambda worktree: artifacts.worktree)
+    monkeypatch.setattr(plan_tools, '_escalation_channel', lambda root: (Escalation, queue))
+
+    real_factory = plan_tools._markup_escalation_sink
+
+    def recording_factory(sink_artifacts: TaskArtifacts):
+        sink = real_factory(sink_artifacts)
+
+        def wrapper(record: dict[str, Any]):
+            records.append(record)
+            return sink(record)
+
+        return wrapper
+
+    monkeypatch.setattr(plan_tools, '_markup_escalation_sink', recording_factory)
+    return ResidueRig(Harness(artifacts), queue, records)
+
+
+class TestTheSpecimenIsReal:
+    """Non-circular pins on the corpus row these rows are driven by."""
+
+    def test_it_is_a_measured_plan_tools_unrepairable_payload(self):
+        assert UNREPAIRABLE_SPECIMEN['expected_outcome'] == 'unrepairable'
+        assert UNREPAIRABLE_SPECIMEN['tool'] == 'mcp__plan-tools__add_design_decision'
+        assert UNREPAIRABLE_SPECIMEN['param'] == 'decision'
+        assert not UNREPAIRABLE_SPECIMEN['truncated']
+
+    def test_it_is_still_unrepairable_against_this_tool_s_own_schema(self):
+        """A corpus row is scored against the tool it was CAPTURED on.
+
+        Re-derived here against ``add_design_decision``'s live parameter set,
+        so a schema drift that made this payload repairable would fail loudly
+        instead of quietly turning the residue rows into rejection rows.
+        """
+        assert detect(UNREPAIRABLE_DECISION) is not None
+        assert repair(
+            UNREPAIRABLE_DECISION, 'decision', _DECISION_SCHEMA, ('decision',)
+        ) is None
+
+
+class TestUnrepairableResidueIsPreserved:
+    """C2: unrepairable input is never guessed — refused, and never discarded."""
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_names_the_escalation_holding_the_payload(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(a) The hint promises a named record; an unwired sink makes it a lie."""
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        payload = await rig.refuse(
+            'add_design_decision', {'decision': UNREPAIRABLE_DECISION}
+        )
+
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['outcome'] == 'unrepairable'
+        assert payload['tool'] == 'add_design_decision'
+        assert payload['field'] == 'decision'
+        assert 'repaired_call' not in payload, (
+            'there is no repair — offering one would invite a retry that '
+            're-sends a guess'
+        )
+        assert isinstance(payload['escalation_id'], str) and payload['escalation_id']
+
+    @pytest.mark.asyncio
+    async def test_the_residue_record_carries_the_caller_payload_verbatim(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(b) INV-7's contracted keys, and the only surviving copy of the data."""
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': UNREPAIRABLE_DECISION})
+
+        assert len(rig.records) == 1
+        record = rig.records[0]
+        assert record['error_type'] == 'mcp_markup_unrepairable'
+        assert record['category'] == 'mcp_markup_residue'
+        assert record['owner'] == 'l2-escalation-watcher'
+        assert record['level'] == 2
+        assert record['tool'] == 'add_design_decision'
+        assert record['field'] == 'decision'
+        assert record['matched_pattern'] == detect(UNREPAIRABLE_DECISION)
+        assert record['raw_value'] == UNREPAIRABLE_DECISION
+
+    @pytest.mark.asyncio
+    async def test_the_filed_escalation_holds_the_payload_byte_for_byte(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The record is only preserved if it reaches the QUEUE intact.
+
+        Asserted against the exact string sent — not a prefix, not an excerpt:
+        after the refusal this is the only copy that exists anywhere.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        payload = await rig.refuse(
+            'add_design_decision', {'decision': UNREPAIRABLE_DECISION}
+        )
+
+        assert len(rig.queue.submitted) == 1
+        esc = rig.queue.submitted[0]
+        assert esc.id == payload['escalation_id']
+        assert esc.category == 'mcp_markup_residue'
+        assert esc.level == 2
+        assert esc.agent_role == 'plan-tools-markup-guard'
+        assert esc.severity == 'blocking'
+        assert UNREPAIRABLE_DECISION in esc.detail
+        assert str(artifacts.worktree) == esc.worktree
+
+    @pytest.mark.asyncio
+    async def test_the_task_id_comes_from_the_plan(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(c) The middleware's own identity fields are structurally None here.
+
+        ``_identity`` reads ``agent_id`` / ``project_root`` / ``project_id`` off
+        the call's arguments, and NO plan-tools tool declares any of the three
+        — so the sink is the only party that can attribute the record.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': UNREPAIRABLE_DECISION})
+
+        assert rig.harness.plan()['task_id'] == 'test-1'
+        assert rig.queue.submitted[0].task_id == 'test-1'
+
+    @pytest.mark.asyncio
+    async def test_the_task_id_falls_back_to_the_worktree_name(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(c) The create_plan-rejected-before-any-plan-exists case."""
+        rig = build_residue_rig(monkeypatch, artifacts)
+
+        await rig.refuse(
+            'create_plan',
+            {
+                'task_id': 'test-1',
+                'title': UNREPAIRABLE_DECISION,
+                'analysis': 'Clean analysis prose.',
+                'files': ['a.py'],
+            },
+        )
+
+        assert not rig.harness.plan_path.exists()
+        assert rig.queue.submitted[0].task_id == artifacts.worktree.name
+
+    @pytest.mark.asyncio
+    async def test_a_queue_failure_never_changes_the_refusal(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(d) A queue outage costs visibility, never a working guard.
+
+        The refusal is already decided before escalation is attempted, so every
+        failure mode degrades to a logged ``None`` plus an unchanged payload.
+        """
+        queue = _FakeQueue(submit_error=OSError('queue is unwritable'))
+        rig = build_residue_rig(monkeypatch, artifacts, queue)
+        await rig.harness.seed_plan()
+
+        payload = await rig.refuse(
+            'add_design_decision', {'decision': UNREPAIRABLE_DECISION}
+        )
+
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        assert payload['matched_pattern'] == detect(UNREPAIRABLE_DECISION)
+        assert payload['escalation_id'] is None, (
+            'the caller is better told nothing than pointed at a record that '
+            'was never written'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_unrepairable_path_writes_nothing(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """(e) Refusing is what makes the residue the ONLY copy — so it must hold."""
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+        before = rig.harness.plan_bytes()
+
+        await rig.refuse('add_design_decision', {'decision': UNREPAIRABLE_DECISION})
+
+        assert rig.harness.plan_bytes() == before
+        assert rig.harness.plan()['design_decisions'] == []
