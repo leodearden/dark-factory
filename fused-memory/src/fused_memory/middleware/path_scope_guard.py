@@ -104,16 +104,20 @@ if TYPE_CHECKING:
 
 _PATTERN_CACHE: dict[tuple[str, ...], re.Pattern[str]] = {}
 
-# One path segment: the chars that may legally appear in a single path
-# component (no '/').  Used only inside the right-context lookahead.
-_SEG: str = r'[A-Za-z0-9_.\-]+'
+# The chars that may legally appear in a single path component (no '/').
+_SEG_CHARS: str = r'[A-Za-z0-9_.\-]'
 
-# Right-context assertion (task 3120): the token after '<prefix>/' must
-# look like a path segment — either another '/' follows, or it carries a
-# file extension.  NOTE: the interval quantifier is written {{1,6}} here
-# because this is an f-string; braces in the RENDERED value are not
-# re-processed when it is interpolated into _build_pattern below.
-_RIGHT_CONTEXT: str = rf'(?={_SEG}/|[A-Za-z0-9_\-]*\.[A-Za-z]{{1,6}}(?![A-Za-z0-9]))'
+# One path segment.
+_SEG: str = rf'{_SEG_CHARS}+'
+
+# A file-extension-bearing token.  The stem is DOT-INCLUSIVE (_SEG_CHARS*)
+# so a multi-dot filename ('a.b.txt') can backtrack the stem to 'a.b' and
+# still expose '.txt'; the extension itself must be 2-6 ALPHABETIC chars.
+# NOTE: {{2,6}} is doubled because this is an f-string; braces in the
+# RENDERED value are not re-processed when it is interpolated below.
+_EXT: str = rf'{_SEG_CHARS}*\.[A-Za-z]{{2,6}}(?![A-Za-z0-9])'
+
+_RIGHT_CONTEXT: str = rf'(?={_SEG}/|{_EXT})'
 
 
 def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
