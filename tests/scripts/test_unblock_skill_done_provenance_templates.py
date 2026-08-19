@@ -1,73 +1,35 @@
 """Contract guard: every ``done_provenance`` payload literal in the /unblock
 runbook validates against the LIVE ``DoneProvenance`` model.
 
-Task 4095. ``skills/unblock/SKILL.md`` is the runbook an agent follows to land
-a stuck task, and its final step tells that agent to call
-``set_task_status(status="done", done_provenance=...)``. Five of its templates
-omitted the REQUIRED ``kind`` field, so an agent that copied them verbatim ate
-a hard rejection at the write chokepoint on the very last step of a successful
-unblock — after the merge had already landed.
+Task 4095. ``skills/unblock/SKILL.md`` ends by telling an agent to call
+``set_task_status(status="done", done_provenance=...)``. A template that omits
+the REQUIRED ``kind`` — or a ``found_on_main`` missing its ``commit``/``note``
+— is hard-rejected at the write chokepoint on the last step of a SUCCESSFUL
+unblock, after the merge has already landed, leaving the task stuck in exactly
+the state /unblock exists to clear.
 
-SCOPE — THIS GUARD PINS PAYLOAD STRUCTURE ONLY, NEVER PROSE. It makes no
-assertion about a single word of this runbook. Every sentence of guidance
-around these literals stays free to be rewritten, reordered or deleted; what
-is held is only that a JSON object the doc presents as a ``done_provenance``
-payload is one the server will actually accept.
+SCOPE — PAYLOAD STRUCTURE ONLY, NEVER PROSE. Every word of guidance around
+these literals stays free to be rewritten, reordered or deleted; what is held
+is only that a JSON object the doc presents as a payload is one the server
+will accept. Nothing about the schema is hand-copied — the key vocabulary and
+the requirements are read off the same pydantic model the chokepoint
+(``fused-memory``'s ``_validate_done_provenance``) derives its own from.
 
-WHY THAT SCOPE LINE IS EXPLICIT. This repo has a recorded refusal to grep
-``skills/unblock/SKILL.md`` for prose: ``orchestrator/tests/
-test_roles_ancestry_check.py``'s docstring rejects exactly that as "a
-documentation meta-test that would couple this suite to prose in two skill docs
-that legitimately get rewritten". The resolved position, stated in
-``scripts/tests/test_design_invariants_consistency.py``, is "STRUCTURE, NEVER
-WORDING ... it deliberately pins no documentation prose" — pin marked spans and
-mechanically-derived cross-artifact correspondence instead. This guard is that
-sanctioned shape: it extracts STRUCTURED JSON literals and validates them
-against the same pydantic model the write chokepoint derives its vocabulary
-from (``fused-memory/src/fused_memory/middleware/task_interceptor.py``'s
-``_validate_done_provenance``, whose ``_DONE_PROVENANCE_KINDS`` is
-``get_args(DoneProvenance.model_fields['kind'].annotation)``). Nothing about
-the schema is hand-copied here, so if a kind is added or a requirement changes
-this guard follows the live contract automatically. Precedent for the same
-extract-from-markdown-and-check-against-live-code shape:
-``tests/scripts/test_contributing_lint_command_drift.py`` and
-``tests/scripts/test_systemd_restart_backoff.py``.
+COUNTER-EXAMPLES. To show a REJECTED shape verbatim next to a good one, put
+``<!-- provenance-guard: negative -->`` on the same line: the extractor skips
+marked literals, and the anchor cross-check skips marked anchors. Without that
+marker a valid-JSON counter-example fails this guard, as it should.
 
-MEASURED RED at base main ``58bd8e6103`` (recorded per the ratchet convention
-in ``test_skills_module_config_decision.py``) — the extractor below, run
-against ``skills/unblock/SKILL.md`` before the fix::
+PLACEMENT. ``tests/scripts/`` is collected by its own module config so this
+runs inside verify; ``skills/`` may hold no tests of its own
+(``test_skills_module_config_decision.py``). Because this READS a real path
+under ``skills/`` it is registered in that module's ``SKILLS_CONSUMING_TESTS``
+and mirrored into ``dark-factory-orchestrator.yaml``, which must not drift
+apart from it.
 
-    OK   line 496: {"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}
-    FAIL line 501: {"commit": "<sha>"}
-    FAIL line 501: {"note": "<explanation>"}
-    FAIL line 507: {"commit": "<sha>"}
-    FAIL line 508: {"commit": "<sha>"}
-    FAIL line 508: {"note": "<one-sentence explanation>"}
-    OK   line 678: {"kind": "found_on_main", "commit": "<sha>", "note": "absorbed into train <train_id>"}
-
-7 literals total; 4 textual ``done_provenance={`` anchors (496, 501, 507, 678),
-all 4 recognised by the structural scanner, 0 missed. Two of the five failures
-(the note-only fallbacks at 501 and 508) are NOT mechanically fixable by adding
-a ``kind``: no accepted kind takes a ``note`` without a ``commit``.
-
-PLACEMENT IS LOAD-BEARING. ``tests/scripts/`` carries its own module config
-(``tests/scripts/orchestrator.yaml``), whose ``test_command`` collects this
-directory, so the guard runs inside ``verify.run_full_verification``'s gather.
-Placing it under ``skills/`` is forbidden by
-``test_skills_module_config_decision.py::test_skills_has_no_tests_of_its_own``.
-Because it READS a real path under ``skills/`` at runtime it is registered in
-that module's ``SKILLS_CONSUMING_TESTS`` inventory, and mirrored into the
-``DECIDED — skills/orchestrator.yaml`` comment enumeration in
-``dark-factory-orchestrator.yaml``, which must not drift apart from it.
-
-ANTI-VACUITY. Once the fix lands this ratchet is green by construction, so
-three independent measures prove it still bites: (a) the extractor is unit
-tested against hand-written fixture markdown rather than the real doc, so its
-behaviour is pinned regardless of what the doc happens to contain; (b) each
-guarded doc must exist and yield at least one literal, failing loudly by name
-otherwise; (c) every textual ``done_provenance={`` anchor must have been
-recognised by the structural scanner, catching a future edit that reintroduces
-a payload in a form the brace walker misses.
+The measured-red transcript, the precedent argument for this test's shape and
+the anti-vacuity design narrative live in task 4095's record and in the commit
+that introduced this file.
 """
 from __future__ import annotations
 
@@ -91,9 +53,18 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # reason outside its scope.
 _GUARDED_DOCS: tuple[str, ...] = ("skills/unblock/SKILL.md",)
 
+# Keys the write chokepoint documents as accepted but the model does not
+# DECLARE — they ride on `extra='allow'`. See the schema block in
+# `fused-memory/src/fused_memory/middleware/task_interceptor.py`'s
+# `_validate_done_provenance`: `transient_unit` (str) and `fire_delay_secs`
+# (int) are read off the raw payload for kind='deterministic-deploy-scheduled'.
+# Unioned into the recognised vocabulary below so a payload carrying them is
+# EXTRACTED and checked rather than silently dropped by the key-subset filter.
+_CHOKEPOINT_EXTRA_KEYS = frozenset({"transient_unit", "fire_delay_secs"})
+
 # The recognised key vocabulary, DERIVED from the live model rather than
 # hand-listed, so a field added to DoneProvenance is picked up here for free.
-_PROVENANCE_FIELDS = frozenset(DoneProvenance.model_fields)
+_PROVENANCE_FIELDS = frozenset(DoneProvenance.model_fields) | _CHOKEPOINT_EXTRA_KEYS
 
 # Bounded lookahead for the balanced-brace walk: an unbalanced `{` in prose
 # must abandon that start, never run away over the rest of the file.
@@ -104,6 +75,11 @@ _MAX_LITERAL_CHARS = 4000
 # deliberately anchor-free, since the bare fallback literals this doc states
 # mid-sentence carry no `done_provenance=` prefix at all.
 _ANCHOR_RE = re.compile(r"done_provenance\s*=\s*\{")
+
+# Opt-out marker for a literal the doc quotes as a shape the server REJECTS.
+# A machine token in an HTML comment (invisible in rendered markdown), so it
+# pins no prose and costs the author one inline annotation.
+_NEGATIVE_MARKER = "provenance-guard: negative"
 
 
 class ProvenanceLiteral(NamedTuple):
@@ -120,6 +96,18 @@ class ProvenanceLiteral(NamedTuple):
     start: int
 
 
+def _line_at(text: str, offset: int) -> str:
+    """The whole physical line of *text* containing *offset*."""
+    start = text.rfind("\n", 0, offset) + 1
+    end = text.find("\n", offset)
+    return text[start:] if end == -1 else text[start:end]
+
+
+def _is_negated(text: str, offset: int) -> bool:
+    """True if the line at *offset* opts out via `_NEGATIVE_MARKER`."""
+    return _NEGATIVE_MARKER in _line_at(text, offset)
+
+
 def _provenance_literals(text: str, *, source: str) -> list[ProvenanceLiteral]:
     """Every JSON object literal in *text* that is shaped like a provenance blob.
 
@@ -127,9 +115,9 @@ def _provenance_literals(text: str, *, source: str) -> list[ProvenanceLiteral]:
     (so a ``}`` inside a JSON string cannot close the object early) under a
     bounded lookahead. Embedded newlines and markdown indentation are collapsed
     to single spaces so a literal wrapped across two source lines is still
-    parsed as one object. Non-dicts, empty dicts and parse failures are
-    discarded. Each surviving literal is stamped with *source* so a failure
-    downstream can name where it came from.
+    parsed as one object. Non-dicts, empty dicts, parse failures and literals
+    on a `_NEGATIVE_MARKER` line are discarded. Each surviving literal is
+    stamped with *source* so a failure downstream can name where it came from.
 
     THE KEY-SUBSET FILTER BELOW IS LOAD-BEARING — DO NOT DROP IT AS REDUNDANT
     "the model would reject it anyway" TIDYING. ``DoneProvenance.model_config``
@@ -139,7 +127,7 @@ def _provenance_literals(text: str, *, source: str) -> list[ProvenanceLiteral]:
     reject it for MISSING KIND — indistinguishably from a real defect, and the
     guard would report a false positive on a literal that has nothing to do
     with provenance. Restricting to objects whose keys are a SUBSET of the
-    model's own fields is what makes this guard sound.
+    recognised vocabulary is what makes this guard sound.
 
     This function is TOTAL — it never raises, so it can be unit-tested against
     fixture markdown that legitimately yields nothing. Loud failure on an empty
@@ -164,6 +152,11 @@ def _provenance_literals(text: str, *, source: str) -> list[ProvenanceLiteral]:
             i += 1
             continue
         if isinstance(obj, dict) and obj and set(obj) <= _PROVENANCE_FIELDS:
+            if _is_negated(text, i):
+                # Quoted deliberately as a shape the server rejects. Skip past
+                # it so nothing inside is re-reported either.
+                i = end
+                continue
             out.append(
                 ProvenanceLiteral(
                     source=source,
@@ -208,6 +201,15 @@ def _match_brace(text: str, start: int) -> int | None:
     return None
 
 
+def _unmarked_anchors(text: str) -> list[tuple[int, int]]:
+    """``(line, brace_offset)`` for each `done_provenance={` not opted out."""
+    return [
+        (text.count("\n", 0, m.end() - 1) + 1, m.end() - 1)
+        for m in _ANCHOR_RE.finditer(text)
+        if not _is_negated(text, m.start())
+    ]
+
+
 def _doc_text(rel_path: str) -> str:
     return (REPO_ROOT / rel_path).read_text(encoding="utf-8")
 
@@ -240,7 +242,8 @@ _REQUIRED_SHAPES = (
     "kind='found_on_main' additionally requires BOTH `commit` AND `note` "
     "(note alone is no longer accepted — post-3092 phantom-done hardening). "
     "There is no note-only provenance: if you cannot cite a commit, the merge "
-    "did not land."
+    "did not land. If this literal is deliberately quoting a shape the server "
+    f"REJECTS, mark its line `<!-- {_NEGATIVE_MARKER} -->`."
 )
 
 
@@ -297,27 +300,21 @@ def test_every_textual_anchor_is_recognised_by_the_extractor(rel_path: str) -> N
     """(c) COVERAGE: every `done_provenance={` the doc writes must be scanned.
 
     Catches a future edit that reintroduces a payload in a shape the balanced
-    brace walker misses. Asserts anchor COVERAGE, never total equality: the
-    extractor legitimately finds MORE literals than there are anchors, because
-    this runbook also states bare fallback payloads mid-sentence with no
-    `done_provenance=` prefix (exactly the sites an anchor-only regex would
-    have missed, and exactly where two of task 4095's five defects lived).
+    brace walker misses. Asserts anchor COVERAGE only — never a count, and
+    never total equality. The extractor legitimately finds MORE literals than
+    there are anchors, because this runbook also states bare fallback payloads
+    mid-sentence with no `done_provenance=` prefix (exactly the sites an
+    anchor-only regex would have missed, and exactly where two of task 4095's
+    five defects lived); and a doc that presented every payload some other way
+    — a table, a variable threaded into the call — is a legitimate rewrite this
+    check must not block. Non-vacuity is test (b)'s job, from extracted
+    literals, which is the stronger signal anyway.
 
     It counts a machine token, not wording, so it pins no prose.
     """
     text = _doc_text(rel_path)
     starts = {lit.start for lit in _DOC_LITERALS[rel_path]}
-    anchors = [
-        (text.count("\n", 0, m.end() - 1) + 1, m.end() - 1)
-        for m in _ANCHOR_RE.finditer(text)
-    ]
-    assert len(anchors) > 0, (
-        f"{rel_path} contains no `done_provenance={{` anchor at all (task "
-        f"4095) — this coverage check would pass vacuously. If the runbook "
-        f"genuinely stopped threading provenance, re-take that on the record "
-        f"rather than deleting this guard."
-    )
-    missed = [line for line, offset in anchors if offset not in starts]
+    missed = [line for line, offset in _unmarked_anchors(text) if offset not in starts]
     assert not missed, (
         f"{rel_path} writes a `done_provenance={{...}}` payload at line(s) "
         f"{missed} that the structural extractor did NOT recognise (task "
@@ -414,3 +411,103 @@ def test_extractor_ignores_non_objects_and_unparseable_braces() -> None:
         "An empty `{}` is not a payload, nor is a shell `${VAR}` expansion.\n"
     )
     assert found == []
+
+
+def test_extractor_keeps_chokepoint_extra_keys_that_the_model_does_not_declare() -> None:
+    """`transient_unit`/`fire_delay_secs` ride on `extra='allow'`.
+
+    They are documented as accepted by `_validate_done_provenance` but are not
+    declared fields, so a key-subset filter built from `model_fields` ALONE
+    would silently drop this payload — an unanchored one would then be checked
+    by nothing at all.
+    """
+    assert not _CHOKEPOINT_EXTRA_KEYS & frozenset(DoneProvenance.model_fields), (
+        "these keys became real model fields — drop them from "
+        "_CHOKEPOINT_EXTRA_KEYS rather than carrying a stale union."
+    )
+    found = _fixture(
+        'Stamp `{"kind": "deterministic-deploy-scheduled", "unit": "orch.service", '
+        '"transient_unit": "restart-orch.service", "fire_delay_secs": 30}`.\n'
+    )
+    assert [lit.obj for lit in found] == [
+        {
+            "kind": "deterministic-deploy-scheduled",
+            "unit": "orch.service",
+            "transient_unit": "restart-orch.service",
+            "fire_delay_secs": 30,
+        }
+    ]
+    DoneProvenance.model_validate(found[0].obj)
+
+
+def test_extractor_is_string_aware_about_braces_and_escaped_quotes() -> None:
+    """A `}` or an escaped `"` inside a JSON string must not close the object.
+
+    This is the entire reason `_match_brace` tracks `in_str`/`escaped`; without
+    it the literal below truncates at the `}` in the note and silently drops.
+    """
+    found = _fixture(
+        'Pass `{"kind": "merged", "commit": "<sha>", '
+        '"note": "closes the {stuck} state; queue said \\"landed\\""}`.\n'
+    )
+    assert [lit.obj for lit in found] == [
+        {
+            "kind": "merged",
+            "commit": "<sha>",
+            "note": 'closes the {stuck} state; queue said "landed"',
+        }
+    ]
+    DoneProvenance.model_validate(found[0].obj)
+
+
+def test_match_brace_abandons_a_run_longer_than_the_bounded_lookahead() -> None:
+    """The lookahead bound, pinned at both sides of the boundary.
+
+    An unbalanced `{` in prose must abandon that start rather than walk the
+    rest of the file; a literal comfortably inside the bound must still match.
+    """
+    assert _match_brace("{" + "x" * 10 + "}", 0) == 12
+    runaway = "{" + "x" * (_MAX_LITERAL_CHARS + 100) + "}"
+    assert _match_brace(runaway, 0) is None
+    assert _fixture(runaway) == []
+
+
+def test_extractor_reports_a_nested_payload_exactly_once() -> None:
+    """A payload nested in a larger object is reported once, as the payload.
+
+    Pins the `i = end` skip: the enclosing objects fail the key-subset filter
+    and are walked past, and the accepted inner literal is not re-scanned into
+    a second overlapping hit.
+    """
+    text = (
+        'The task record holds `{"metadata": {"done_provenance": '
+        '{"kind": "merged", "commit": "<sha>"}}}` after the write.\n'
+    )
+    found = _fixture(text)
+    assert [lit.obj for lit in found] == [{"kind": "merged", "commit": "<sha>"}]
+    assert found[0].start == text.index('{"kind"')
+
+
+def test_extractor_skips_a_literal_marked_as_a_negative_example() -> None:
+    """A quoted counter-example opts out with an inline marker.
+
+    Without the escape the guard silently forbids showing the rejected shape
+    verbatim next to the good one — a normal and useful doc improvement.
+    """
+    bad = 'A bare `{"commit": "<sha>"}` is hard-rejected at the chokepoint.'
+    # Unmarked, the same literal IS extracted — so the marker, not the shape,
+    # is what suppresses it below.
+    assert [lit.obj for lit in _fixture(bad + "\n")] == [{"commit": "<sha>"}]
+    assert _fixture(f"{bad} <!-- {_NEGATIVE_MARKER} -->\n") == []
+
+
+def test_anchor_crosscheck_skips_a_marked_negative_anchor() -> None:
+    """A marked counter-example must not read as an unrecognised payload.
+
+    The extractor drops it by design, so the (c) coverage check has to drop its
+    anchor too — otherwise the escape would trade a false payload failure for a
+    false coverage failure.
+    """
+    line = 'Never write `done_provenance={"commit": "<sha>"}`'
+    assert len(_unmarked_anchors(f"{line}.\n")) == 1
+    assert _unmarked_anchors(f"{line} <!-- {_NEGATIVE_MARKER} -->\n") == []
