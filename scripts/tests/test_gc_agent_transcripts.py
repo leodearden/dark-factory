@@ -536,3 +536,156 @@ def test_cli_absent_root_is_noop(tmp_path):
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     report = json.loads(result.stdout)
     assert report["removed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-1 (task 3621): observed_daily_rate(task_dirs) — the DERIVED task-dir
+# arrival-rate sampler that sizes the count cap.
+#
+# The cap must be a DERIVED bound that re-derives itself against real archive
+# throughput, not a magic number that silently binds when the fleet speeds up.
+# These tests pin the sampler against a SYNTHETIC archive with a per-day
+# arrival pattern known by construction, fed through the production
+# scan_task_dirs so the sampler consumes exactly the (path, mtime) shape the
+# GC already prunes on.
+# ---------------------------------------------------------------------------
+
+# The UTC day bucket holding NOW, so a synthetic archive can be stamped into
+# known consecutive day buckets exactly the way scan_task_dirs' mtimes fall.
+NOW_DAY = int(NOW // DAY)
+
+
+def _archive_with_daily_arrivals(root: Path, counts: list[int]) -> None:
+    """Materialise an archive whose task dirs land in KNOWN consecutive UTC day
+    buckets: ``counts[i]`` task dirs in the i-th day, OLDEST day first, with the
+    last entry landing in NOW's own day bucket.
+
+    Each dir holds one transcript stamped MID-day, so the bucket a dir falls in
+    is unambiguous regardless of rounding. ``counts[0]`` and ``counts[-1]`` must
+    be > 0: they define the observed span's boundary buckets, which
+    observed_daily_rate drops as partial by construction.
+    """
+    first_day = NOW_DAY - (len(counts) - 1)
+    for offset, count in enumerate(counts):
+        mtime = (first_day + offset) * DAY + DAY / 2
+        for n in range(count):
+            _touch(root / f"d{offset}_{n}" / "enc" / "session.jsonl", mtime)
+
+
+def _rate_for(root: Path):
+    """Derive the observed rate the same way the live guard does: scan the
+    archive with the production scanner, then sample its mtimes."""
+    return gct.observed_daily_rate(gct.scan_task_dirs(root))
+
+
+def test_observed_rate_peak_is_the_busiest_complete_day(tmp_path):
+    """(a) peak_per_day IS the injected burst-day dir count, and the other
+    fields report the sample honestly rather than only the buckets that
+    happened to drive the peak."""
+    root = tmp_path / "agent-transcripts"
+    #        boundary  <------------ interior (8 days) ------------>  boundary
+    counts = [3,        1, 1, 5, 1, 1, 1, 1, 1,                       2]
+    _archive_with_daily_arrivals(root, counts)
+
+    rate = _rate_for(root)
+
+    assert rate is not None
+    assert rate.peak_per_day == 5          # the injected burst day
+    assert rate.complete_days == 8         # span minus the two partial ends
+    assert rate.span_days == 10            # every observed bucket, ends included
+    assert rate.sample_dirs == sum(counts) == 17   # the WHOLE sample, honestly
+    assert rate.mean_per_day == pytest.approx(12 / 8)  # interior dirs / interior days
+
+
+def test_observed_rate_counts_idle_interior_days_as_days(tmp_path):
+    """(b) A zero-arrival interior day IS a day: it lowers the mean and does
+    NOT shrink complete_days. The live archive has genuinely idle days, and
+    dropping them would inflate the mean and overstate steady-state throughput.
+    """
+    root = tmp_path / "agent-transcripts"
+    #        bnd  <-------- interior: 3 of the 8 days are idle -------->  bnd
+    counts = [1,   2, 0, 0, 2, 2, 2, 0, 2,                                1]
+    _archive_with_daily_arrivals(root, counts)
+
+    rate = _rate_for(root)
+
+    assert rate is not None
+    # Idle days are still days. Were they dropped instead, this would read
+    # complete_days == 5 and mean_per_day == 2.0.
+    assert rate.complete_days == 8
+    assert rate.mean_per_day == pytest.approx(10 / 8)
+    assert rate.peak_per_day == 2
+    assert rate.sample_dirs == sum(counts) == 12
+
+
+def test_observed_rate_drops_partial_boundary_buckets(tmp_path):
+    """(c) The FIRST and LAST day buckets are partial BY CONSTRUCTION (the
+    sample starts and ends mid-day), so neither may set the peak — even when it
+    holds more dirs than any complete interior day.
+
+    Direction matters: a partial trailing bucket UNDERSTATES the rate (the live
+    archive's trailing bucket held a handful of dirs against a ~90-dir peak), and
+    silently weakening the derived bound is the exact failure the derived cap
+    exists to prevent.
+    """
+    root = tmp_path / "agent-transcripts"
+    #        BIG boundary  <---- interior: every day holds 1 ---->  BIG boundary
+    counts = [12,           1, 1, 1, 1, 1, 1, 1, 1,                 9]
+    _archive_with_daily_arrivals(root, counts)
+
+    rate = _rate_for(root)
+
+    assert rate is not None
+    assert rate.peak_per_day == 1, (
+        "a partial boundary bucket must never set the peak"
+    )
+    assert rate.complete_days == 8
+    assert rate.span_days == 10
+    # The dropped dirs are still reported in the raw sample size — dropping them
+    # from the RATE is a methodology choice, not a reason to under-report.
+    assert rate.sample_dirs == sum(counts) == 29
+
+
+def test_observed_rate_is_none_for_absent_root(tmp_path):
+    """(d) An absent archive root yields no sample — None, never a zero rate.
+
+    A zero rate would satisfy any cap trivially, so absence MUST be
+    distinguishable from "measured and fine".
+    """
+    assert _rate_for(tmp_path / "does-not-exist") is None
+
+
+def test_observed_rate_is_none_for_empty_root(tmp_path):
+    """(d) An existing-but-empty archive root likewise yields None."""
+    root = tmp_path / "agent-transcripts"
+    root.mkdir(parents=True)
+
+    assert _rate_for(root) is None
+
+
+def test_observed_rate_is_none_below_min_sample_days(tmp_path):
+    """(d) A sample with fewer than MIN_RATE_SAMPLE_DAYS COMPLETE interior days
+    is too sparse to read a peak from, and returns None rather than a weak
+    number. Pinned either side of the threshold, driven off the constant."""
+    min_days = gct.MIN_RATE_SAMPLE_DAYS
+
+    # span = min_days + 1  ->  complete interior days = min_days - 1: too sparse.
+    sparse = tmp_path / "sparse"
+    _archive_with_daily_arrivals(sparse, [1] * (min_days + 1))
+    assert _rate_for(sparse) is None
+
+    # One more day of span clears the bar: complete interior days == min_days.
+    enough = tmp_path / "enough"
+    _archive_with_daily_arrivals(enough, [1] * (min_days + 2))
+    rate = _rate_for(enough)
+    assert rate is not None
+    assert rate.complete_days == min_days
+
+
+def test_observed_rate_is_none_for_single_day_sample(tmp_path):
+    """(d) A one-day span has NO complete interior bucket at all (both ends are
+    partial), so it must return None rather than a degenerate zero-day mean."""
+    root = tmp_path / "agent-transcripts"
+    _archive_with_daily_arrivals(root, [5])
+
+    assert _rate_for(root) is None
