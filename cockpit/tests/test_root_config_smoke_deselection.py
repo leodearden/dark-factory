@@ -44,6 +44,17 @@ and the two guard-rejection tests
 test_positive_control_guard_rejects_a_run_that_collected_nothing) feed
 hand-built subprocess.CompletedProcess stubs and spawn no subprocess at
 all, so the whole file remains safe to run on a live DISPLAY=:0 desktop.
+
+THE TAG CONTRACT (task 4060 review finding): `_deselection_problems` and
+`_collection_problems` each return `list[(tag, message)]` rather than
+`list[str]`. `tag` is a stable machine-readable identifier for the check
+that failed (TAG_EXIT_CODE, TAG_DESELECTED_SUMMARY, TAG_SMOKE_COLLECTED,
+TAG_UNKNOWN_MARKER, TAG_NOT_COLLECTED); `message` is human-readable prose
+for assertion-failure output. The two guard-rejection tests assert on
+TAGS only, never on message wording or problem count, so a message can be
+reworded and new checks can be added later without breaking a passing
+test -- a prior revision asserted on message substrings/counts, which
+pinned this file's own scaffolding prose rather than behaviour.
 """
 
 from __future__ import annotations
@@ -62,6 +73,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # producing a false pass. Shared between the deselection guard and the
 # positive control so the two cannot drift apart.
 SMOKE_TEST_NAME = 'test_wm_focus_raises_exactly_the_disposable_window'
+
+# Stable per-problem tags (task 4060 review finding): the guard-rejection
+# tests below assert on these identifiers, never on message prose, so a
+# message may be REWORDED freely but a tag must not be renamed casually.
+TAG_EXIT_CODE = 'exit_code'  # wrong/absent process exit status
+TAG_DESELECTED_SUMMARY = 'deselected_summary'  # no `(N deselected)` clause, N >= 1
+TAG_SMOKE_COLLECTED = 'smoke_collected'  # a smoke test was SELECTED
+TAG_UNKNOWN_MARKER = 'unknown_marker'  # `smoke` marker not registered
+TAG_NOT_COLLECTED = 'not_collected'  # smoke test MISSING, not deselected
 
 _DESELECTED_RE = re.compile(r'\((\d+) deselected\)')
 
@@ -89,8 +109,13 @@ def _collect_only(*extra_args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _deselection_problems(result: subprocess.CompletedProcess[str]) -> list[str]:
-    """Every reason `result` fails to prove a REAL collection deselected the smoke tests."""
+def _deselection_problems(result: subprocess.CompletedProcess[str]) -> list[tuple[str, str]]:
+    """Every reason `result` fails to prove a REAL collection deselected the smoke tests.
+
+    Returns a list of `(tag, message)`: `tag` is a stable identifier for the
+    check that failed (asserted on by the guard-rejection tests), `message`
+    is human-readable output for the assertion failure.
+    """
     combined = result.stdout + result.stderr
     problems = []
 
@@ -99,51 +124,64 @@ def _deselection_problems(result: subprocess.CompletedProcess[str]) -> list[str]
     # error, a broken conftest, or an interpreter without pytest lands on
     # some other rc and is rejected here.
     if result.returncode != pytest.ExitCode.NO_TESTS_COLLECTED:
-        problems.append(
+        problems.append((
+            TAG_EXIT_CODE,
             f'expected exit code {int(pytest.ExitCode.NO_TESTS_COLLECTED)} '
             f'(NO_TESTS_COLLECTED), got {result.returncode} -- collection '
-            f'may never have run'
-        )
+            f'may never have run',
+        ))
 
     # (2) collection actually walked the smoke dir and found tests to
     # filter. Necessary alongside (1): an empty/missing smoke dir also
     # exits 5 but prints no `deselected` clause.
     m = _DESELECTED_RE.search(combined)
     if m is None or int(m.group(1)) < 1:
-        problems.append(
+        problems.append((
+            TAG_DESELECTED_SUMMARY,
             'expected a `(N deselected)` summary with N >= 1 in the collection '
-            'output, found none -- collection may not have walked the smoke dir'
-        )
+            'output, found none -- collection may not have walked the smoke dir',
+        ))
 
     # (3) DESELECTED -- a smoke test FUNCTION name appears in --collect-only
     # output only when the test is actually SELECTED/collected.
     if SMOKE_TEST_NAME in combined:
-        problems.append(
+        problems.append((
+            TAG_SMOKE_COLLECTED,
             'smoke tests were collected under the root pytest config -- '
-            'not deselected by default'
-        )
+            'not deselected by default',
+        ))
 
     # (4) MARKER REGISTERED -- no unknown-mark warning for @pytest.mark.smoke.
     if 'PytestUnknownMarkWarning' in combined or 'Unknown pytest.mark.smoke' in combined:
-        problems.append('the `smoke` marker is not registered under the root pytest config')
+        problems.append((
+            TAG_UNKNOWN_MARKER,
+            'the `smoke` marker is not registered under the root pytest config',
+        ))
 
     return problems
 
 
-def _collection_problems(result: subprocess.CompletedProcess[str]) -> list[str]:
-    """Every reason `result` fails to prove the smoke tests EXIST and are collectible."""
+def _collection_problems(result: subprocess.CompletedProcess[str]) -> list[tuple[str, str]]:
+    """Every reason `result` fails to prove the smoke tests EXIST and are collectible.
+
+    Returns a list of `(tag, message)`: `tag` is a stable identifier for the
+    check that failed (asserted on by the guard-rejection tests), `message`
+    is human-readable output for the assertion failure.
+    """
     combined = result.stdout + result.stderr
     problems = []
     if result.returncode != pytest.ExitCode.OK:
-        problems.append(
+        problems.append((
+            TAG_EXIT_CODE,
             f'expected exit code {int(pytest.ExitCode.OK)} (OK), got '
-            f'{result.returncode} -- collection did not complete cleanly'
-        )
+            f'{result.returncode} -- collection did not complete cleanly',
+        ))
     if SMOKE_TEST_NAME not in combined:
-        problems.append(
+        problems.append((
+            TAG_NOT_COLLECTED,
             f'{SMOKE_TEST_NAME!r} was not collected even with the root addopts marker '
-            f'filter removed -- the smoke tests are MISSING, not merely deselected'
-        )
+            f'filter removed -- the smoke tests are MISSING, not merely deselected',
+        ))
     return problems
 
 
@@ -151,7 +189,8 @@ def test_repo_root_pytest_config_deselects_smoke_and_registers_marker() -> None:
     result = _collect_only()
     problems = _deselection_problems(result)
     assert not problems, (
-        '\n'.join(problems) + f'\n\nfull output:\n{result.stdout + result.stderr}'
+        '\n'.join(msg for _, msg in problems)
+        + f'\n\nfull output:\n{result.stdout + result.stderr}'
     )
 
 
@@ -239,5 +278,6 @@ def test_smoke_tests_are_collectible_when_root_addopts_is_overridden() -> None:
     result = _collect_only('-o', 'addopts=--import-mode=importlib')
     problems = _collection_problems(result)
     assert not problems, (
-        '\n'.join(problems) + f'\n\nfull output:\n{result.stdout + result.stderr}'
+        '\n'.join(msg for _, msg in problems)
+        + f'\n\nfull output:\n{result.stdout + result.stderr}'
     )
