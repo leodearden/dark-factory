@@ -357,6 +357,37 @@ class TestFindPathsRightBoundary:
         assert find_paths('plans/*.md', ('plans/',)) == []
 
     # ------------------------------------------------------------------
+    # task 4160: numeric/single-letter "extension" false positives
+    # ------------------------------------------------------------------
+
+    def test_numeric_extension_is_not_an_extension(self):
+        """Task 4160: a DIGIT-BEARING "extension" no longer lexes as a path.
+
+        The WIN fixtures below are MEASURED false positives from the
+        gatekeeper reproduction, not synthetic: ``[A-Za-z0-9]{1,6}`` accepted
+        a purely numeric extension, so a version string ('v1.2') or a decimal
+        ('0.5') satisfied the right-context extension alternative and the
+        registered prefix in front of it lexed as a path.
+        """
+        # WIN — the reported false positives (all currently return the
+        # matched prefix instead of []).
+        assert find_paths('upgrade backend/v1.2 protocol', ('backend/',)) == []
+        assert find_paths('threshold corpus/0.5 value', ('corpus/',)) == []
+        # generalisation: proves this is the DIGIT rule, not merely a length rule
+        assert find_paths('backend/v1.10 protocol', ('backend/',)) == []
+
+        # COST: NEW missed-detection residue — a digit-bearing extension is
+        # no longer an extension.  Accepted — the safe direction, matching
+        # the module's stance.
+        assert find_paths('crates/x.mp3', ('crates/',)) == []
+        assert find_paths('crates/x.h5', ('crates/',)) == []
+
+        # RETENTION companions — must stay matching through this change.
+        assert find_paths('gui/package.json', ('gui/',)) == ['gui/']
+        assert find_paths('crates/x.RS', ('crates/',)) == ['crates/']
+        assert find_paths('docs/.env', ('docs/',)) == ['docs/']
+
+    # ------------------------------------------------------------------
     # RETENTION: the task-1494 LEFT boundary survives the right-boundary change
     # ------------------------------------------------------------------
 
