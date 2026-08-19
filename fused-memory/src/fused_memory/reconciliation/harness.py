@@ -3270,19 +3270,19 @@ class ReconciliationHarness:
                     #     would have fired anyway, and can never manufacture a row
                     #     the cycle would not otherwise have ended with.
                     #
-                    # The finally-block calls STAY: they remain the terminal
+                    # The finally-block call STAYS: it remains the terminal
                     # backstop for paths this flush cannot reach (a stage that
                     # raised before Stage 3, an interrupted/resumed run) and the
                     # last chance after a flush attempt that did not CONFIRM (the
                     # write-missing predicate excludes only a marker that is True).
-                    # _run_remediation_pass carries the identical flush — keep the
-                    # two spellings in sync.
+                    # _run_remediation_pass carries the identical flush; all four
+                    # sites go through _flush_cycle_summaries, so the arms and
+                    # their load-bearing Stage-1-before-Stage-2 order cannot
+                    # drift between drivers or between flush and finally.
                     if stage_key == StageId.integrity_check.value:
-                        await self._ensure_stage1_cycle_summary(
-                            run, run_id, project_id, current_stage_name, cycle_start_time,
-                        )
-                        await self._ensure_stage2_cycle_summary(
-                            run, run_id, project_id, cycle_start_time,
+                        await self._flush_cycle_summaries(
+                            run, run_id, project_id, current_stage_name,
+                            cycle_start_time,
                         )
 
                     # Apply tier limits, prior S3 findings, cycle fence, and task tree to Stage 1
@@ -3482,24 +3482,20 @@ class ReconciliationHarness:
                 )
                 raise
             finally:
-                # TERMINAL backstop. Task 4186 hoisted a copy of these two calls
-                # to the top of the Stage-3 iteration above (the pre-Stage-3
-                # flush); these stay as the last resort for the paths that flush
+                # TERMINAL backstop. Task 4186 hoisted a copy of this call to
+                # the top of the Stage-3 iteration above (the pre-Stage-3
+                # flush); this stays as the last resort for the paths that flush
                 # cannot reach — a stage that raised before Stage 3, an
                 # interrupted/resumed run — and as the second attempt after a
                 # flush attempt that did not CONFIRM. A flush that DID confirm
-                # makes these no-op via _cycle_summary_ledger_write_missing's
+                # makes it no-op via _cycle_summary_ledger_write_missing's
                 # write-recovered exclusion, so one recovery logs one WARNING.
-                await self._ensure_stage1_cycle_summary(
+                # Stays before update_run_stage_reports so the persisted
+                # stage_reports copy captures whatever markers either arm
+                # stamped; the Stage-1-strictly-before-Stage-2 order the pair
+                # fires in is single-sourced on the helper (task 3732).
+                await self._flush_cycle_summaries(
                     run, run_id, project_id, current_stage_name, cycle_start_time,
-                )
-                # Strictly AFTER the Stage 1 arm (task 3732): that arm is
-                # pre-existing, load-bearing behaviour and a Stage 2 backstop
-                # fault must never be able to starve it. Both stay before
-                # update_run_stage_reports so the persisted stage_reports copy
-                # captures whatever markers either arm stamped.
-                await self._ensure_stage2_cycle_summary(
-                    run, run_id, project_id, cycle_start_time,
                 )
                 await self.journal.update_run_stage_reports(run_id, run.stage_reports)
                 # Task 2744/σ: GC this run's per-run recon CLI config dir on every
@@ -3725,6 +3721,54 @@ class ReconciliationHarness:
         if isinstance(error_record, dict):
             error_record[f'{stage_prefix}_cycle_summary_backstop_written'] = ledger_written
 
+    async def _flush_cycle_summaries(
+        self,
+        run: ReconciliationRun,
+        run_id: str,
+        project_id: str,
+        current_stage_name: str | None,
+        anchor: datetime,
+    ) -> None:
+        """Fire both cycle-summary backstop arms for *run_id*, Stage 1 first.
+
+        Single-sourced call pair for the FOUR sites that need it — each of the
+        two S1→S2→S3 drivers (:meth:`run_full_cycle` and
+        :meth:`_run_remediation_pass`) calls it twice:
+
+        - as task 4186's **pre-Stage-3 flush**, at the top of the Stage-3
+          iteration, so a current-cycle in-stage write failure is re-attempted
+          BEFORE Stage 3's ledger-primary presence check can read the row as
+          genuinely absent (the full why lives at those call sites);
+        - from its ``finally``, as the **terminal backstop** for the paths the
+          flush cannot reach and as the last chance after a flush attempt that
+          did not CONFIRM.
+
+        It exists because the pair's ORDER is load-bearing and must not be able
+        to drift between those sites: Stage 1 runs STRICTLY FIRST so a Stage-2
+        backstop fault can never starve that pre-existing arm (task 3732). That
+        is the same argument that put the arm BODIES in
+        :meth:`_reattempt_cycle_summary_write` /
+        :meth:`_write_degraded_cycle_summary` — "so a fix to either arm cannot
+        be applied to one stage and forgotten on the other" — applied one level
+        up, to the sequence itself.
+
+        *anchor* is the cycle-anchor timestamp the degraded-synth paths stamp
+        when a stage's real ``started_at`` is unrecoverable: ``cycle_start_time``
+        on a full cycle, ``run.started_at`` on a remediation pass (that driver
+        has no separate local). *current_stage_name* is read only by Stage 1's
+        arm-1 gate.
+
+        Never raises: both callees swallow ``BaseException`` themselves and
+        shield their own writes, which is what makes it safe to await unshielded
+        from a ``finally``.
+        """
+        await self._ensure_stage1_cycle_summary(
+            run, run_id, project_id, current_stage_name, anchor,
+        )
+        await self._ensure_stage2_cycle_summary(
+            run, run_id, project_id, anchor,
+        )
+
     async def _ensure_stage1_cycle_summary(
         self,
         run: ReconciliationRun,
@@ -3735,10 +3779,11 @@ class ReconciliationHarness:
     ) -> None:
         """Guarantee a Stage 1 ``cycle_summary`` ledger row exists for *run_id*.
 
-        Structural backstop with two independent arms, both firing from the
-        harness's two S1→S2→S3 drivers' ``finally`` blocks
-        (:meth:`run_full_cycle` and :meth:`_run_remediation_pass`) so this
-        runs on every exit path of either:
+        Structural backstop with two independent arms, both firing through
+        :meth:`_flush_cycle_summaries` — which the harness's two S1→S2→S3
+        drivers (:meth:`run_full_cycle` and :meth:`_run_remediation_pass`)
+        call from their ``finally`` blocks, so this runs on every exit path of
+        either, and again as task 4186's pre-Stage-3 flush:
 
         - **Arm 1** (task 2440) — Stage 1's own turn raised before ``run()``
           could return a report at all (its in-stage write,
@@ -3891,8 +3936,8 @@ class ReconciliationHarness:
         Stage 2 ran but its row did not land (task 3732).
 
         Stage-2 counterpart of :meth:`_ensure_stage1_cycle_summary`, fired
-        from the same two S1→S2→S3 drivers' ``finally`` blocks
-        (:meth:`run_full_cycle` and :meth:`_run_remediation_pass`), and
+        from the same :meth:`_flush_cycle_summaries` call pair (both S1→S2→S3
+        drivers' ``finally`` blocks, plus task 4186's pre-Stage-3 flush), and
         deliberately NARROWER than the Stage 1 method in one decisive way:
         it has no analogue of Stage 1's arm 1 (synthesize a row when the
         stage produced no report at all). Fabricating a summary for a cycle
@@ -3996,8 +4041,9 @@ class ReconciliationHarness:
 
         Must never raise: awaited unshielded in the ``finally``, immediately
         before ``update_run_stage_reports``, and AFTER
-        :meth:`_ensure_stage1_cycle_summary` so a fault here can never starve
-        that pre-existing arm. An exception escaping would replace whatever
+        :meth:`_ensure_stage1_cycle_summary` (an order now single-sourced on
+        :meth:`_flush_cycle_summaries`) so a fault here can never starve that
+        pre-existing arm. An exception escaping would replace whatever
         exception is already propagating and skip that persistence call, so
         the body swallows ``BaseException`` and each write itself runs under
         ``asyncio.shield`` to survive a second cancellation arriving
@@ -4936,10 +4982,10 @@ class ReconciliationHarness:
             for stage in stages:
                 current_stage_name = stage.stage_id.value
 
-                # Task 4186 — pre-Stage-3 cycle_summary flush, kept structurally
-                # identical to run_full_cycle's (see the long WHY comment there;
-                # do not let the two spellings drift). Same defect on this
-                # driver: a Stage-2 in-stage write that failed transiently is
+                # Task 4186 — pre-Stage-3 cycle_summary flush, the very same
+                # call run_full_cycle makes (see the long WHY comment there);
+                # both go through _flush_cycle_summaries so the two drivers
+                # cannot drift. Same defect on this driver: a Stage-2 in-stage write that failed transiently is
                 # only re-attempted in the finally below, i.e. AFTER this pass's
                 # own Stage 3 has already read the ledger and ruled the summary
                 # genuinely absent. The stakes differ — this driver's Stage-3
@@ -4949,17 +4995,14 @@ class ReconciliationHarness:
                 #
                 # Anchored at run.started_at because this driver has no separate
                 # cycle_start_time local, exactly as its own finally already is.
-                # The Stage 1 call is INERT here by that arm's
+                # The helper's Stage 1 arm is INERT here by that arm's
                 # run_type != RunType.remediation gate (a remediation pass's
                 # Stage 1 deliberately writes no summary of its own), so it can
-                # never fabricate a Stage-1 row; it is kept only so the two
-                # drivers' flushes read identically.
+                # never fabricate a Stage-1 row.
                 if current_stage_name == StageId.integrity_check.value:
-                    await self._ensure_stage1_cycle_summary(
-                        run, run_id, project_id, current_stage_name, run.started_at,
-                    )
-                    await self._ensure_stage2_cycle_summary(
-                        run, run_id, project_id, run.started_at,
+                    await self._flush_cycle_summaries(
+                        run, run_id, project_id, current_stage_name,
+                        run.started_at,
                     )
 
                 report = await stage.run(
@@ -5286,26 +5329,23 @@ class ReconciliationHarness:
 
         finally:
             # TERMINAL backstop, mirroring run_full_cycle's: task 4186 hoisted a
-            # copy of these two calls to the top of the Stage-3 iteration above
-            # (the pre-Stage-3 flush). These stay as the last resort for the
-            # paths that flush cannot reach — a stage that raised before Stage 3
-            # — and as the second attempt after a flush attempt that did not
-            # CONFIRM. A flush that DID confirm makes these no-op via
+            # copy of this call to the top of the Stage-3 iteration above (the
+            # pre-Stage-3 flush). This stays as the last resort for the paths
+            # that flush cannot reach — a stage that raised before Stage 3 — and
+            # as the second attempt after a flush attempt that did not CONFIRM.
+            # A flush that DID confirm makes it no-op via
             # _cycle_summary_ledger_write_missing's write-recovered exclusion.
-            await self._ensure_stage1_cycle_summary(
+            #
+            # Task 3732: unlike the helper's Stage 1 arm — which deliberately
+            # no-ops on a remediation pass, since Stage 1 skips its own summary
+            # write there — the Stage 2 backstop is wired into this driver with
+            # NO remediation exclusion: Stage 2's in-stage write is unconditional
+            # by explicit design, so a lost row here is a genuine gap. Anchored
+            # at run.started_at (this driver has no separate cycle_start_time
+            # local), and placed strictly before update_run_stage_reports so the
+            # persisted copy captures whatever markers either arm stamped.
+            await self._flush_cycle_summaries(
                 run, run_id, project_id, current_stage_name, run.started_at,
-            )
-            # Task 3732: unlike the Stage 1 arm — which deliberately no-ops on a
-            # remediation pass, since Stage 1 skips its own summary write there —
-            # the Stage 2 backstop is wired into this driver with NO remediation
-            # exclusion: Stage 2's in-stage write is unconditional by explicit
-            # design, so a lost row here is a genuine gap. Anchored at
-            # run.started_at (this driver has no separate cycle_start_time local),
-            # exactly as the Stage 1 call above. Placed strictly after it so a
-            # Stage 2 fault can never starve that arm, and strictly before
-            # update_run_stage_reports so the persisted copy captures its markers.
-            await self._ensure_stage2_cycle_summary(
-                run, run_id, project_id, run.started_at,
             )
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
             # Task 2744: GC this remediation run's per-run recon CLI config dir on
