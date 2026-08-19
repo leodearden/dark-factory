@@ -11930,11 +11930,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         fires well before escalation does, this is what lets an operator tell
         a self-healing leak from a stuck one.  The string is the ONLY channel
         for the distinction — it is the single value flowing to all three
-        consumers (the WARNING log in :meth:`_check_resource_audit`, the
+        consumers (the report log in :meth:`_check_resource_audit`, the
         ``snapshot()['resource_audit']`` census, and the escalation body), so
         annotating it reaches every consumer without adding a snapshot
         sub-key (``snapshot()`` is under an additive-only freeze and its
-        ``resource_audit`` value is pinned by exact dict equality).  The
+        ``resource_audit`` value is pinned by exact dict equality).
+
+        A FOURTH CONSUMER, ADDED BY TASK 3203: this string is also the input
+        to :func:`_resource_audit_fingerprint`, the coalescence key for
+        :meth:`_check_resource_audit`'s report line.  Its FORMAT is therefore
+        load-bearing for log CADENCE, not only for log content.  The
+        normaliser elides the volatile ``(age Ns > grace Ms)`` span and keys
+        on everything else, so re-wording that span makes every poll read as
+        a change and degrades to the pre-3203 log-every-poll cadence (loud,
+        never silent), while making the disposition suffix volatile would
+        make a real transition invisible.  ``TestResourceAuditFingerprint``
+        in tests/test_merge_queue_resource_audit.py pins this method's real
+        output against the normaliser and fails first on either drift.
+
+        The
         disposition is computed against
         :attr:`PERIODIC_REAP_MIN_AGE_SECS`, NOT against the resolved
         *grace_secs* floor, so a raised-floor caller cannot misreport an
@@ -12878,6 +12892,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # speculation_accounting_violations / worktree_ledger_violations
             # docstrings for what each identity checks). No collision with
             # existing keys.
+            #
+            # UNTOUCHED BY TASK 3203: that task coalesces only
+            # _check_resource_audit's LOG cadence. This census is recomputed
+            # on every read and stays exactly as truthful and immediate as
+            # before — a leak whose log line was suppressed by the backoff is
+            # still fully reported here. The key's value remains under its
+            # additive-only freeze (pinned by exact dict equality in
+            # tests/test_merge_queue_invariant_integration_gate.py).
             'resource_audit': {
                 'speculation_accounting': self.speculation_accounting_violations(),
                 'worktree_ledger': self.worktree_ledger_violations(),
