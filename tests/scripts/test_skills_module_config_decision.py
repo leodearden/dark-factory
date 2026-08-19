@@ -177,6 +177,9 @@ SKILLS_CONSUMING_TESTS = (
     # LOADS AND EXECUTES the real skills/factory-init/scripts/find_escalation_port.py
     # via importlib (task 3705) — a REAL consumer, not a synthetic mention.
     "tests/scripts/test_find_escalation_port.py",
+    # Reads skills/unblock/SKILL.md to validate its done_provenance payload
+    # literals against the live DoneProvenance model (task 4095).
+    "tests/scripts/test_unblock_skill_done_provenance_templates.py",
 )
 
 
