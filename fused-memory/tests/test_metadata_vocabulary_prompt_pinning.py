@@ -32,7 +32,6 @@ the very second copy INV-5 forbids.
 
 from __future__ import annotations
 
-import inspect
 import re
 
 import pytest
@@ -206,7 +205,21 @@ def _pin_kinds(text: str, registry: frozenset[str] | set[str]) -> set[str]:
 
 
 class TestReconPromptKindLiteralsPinned:
-    """Every `'kind'` filter example a recon prompt shows is a REGISTERED kind."""
+    """Every `'kind'` filter example a recon prompt shows is a REGISTERED kind.
+
+    These RENDERED-OUTPUT assertions are the INV-5 guard for
+    ``render_cycle_summary_section``: if it re-typed the literal instead of
+    interpolating ``CYCLE_SUMMARY_KIND``, a rename in ``recon_pool_map`` would
+    leave the rendered text on the old value and
+    ``test_kind_literals_extracted_and_include_cycle_summary`` would go RED.
+
+    An ``inspect.getsource`` pin on the *identifier text* was removed in review
+    (task 3202): it passed for a function that merely MENTIONS the name in a
+    comment, and failed correct refactors -- ``import ... as CSK``, a
+    module-qualified ``recon_pool_map.CYCLE_SUMMARY_KIND``, or extracting the
+    f-string into a helper.  Do NOT re-add it, and do not replace it with a
+    stricter source-text regex; assert on rendered output instead.
+    """
 
     @pytest.mark.parametrize('source_name', sorted(_PROMPT_SOURCES))
     def test_kind_literals_extracted_and_include_cycle_summary(self, source_name: str) -> None:
@@ -224,16 +237,6 @@ class TestReconPromptKindLiteralsPinned:
         """The constant<->registry edge itself: the shared kind constant the
         writers use must be a member of the closed registry."""
         assert CYCLE_SUMMARY_KIND in KIND_REGISTRY
-
-
-class TestCycleSummarySectionRendersFromTheConstant:
-    """INV-5 for the rendered section: one normative copy of the literal."""
-
-    def test_render_uses_the_shared_constant(self) -> None:
-        """`render_cycle_summary_section` must interpolate CYCLE_SUMMARY_KIND
-        rather than re-type `cycle_summary`, so a rename in recon_pool_map
-        reaches the prompt instead of silently stranding it."""
-        assert 'CYCLE_SUMMARY_KIND' in inspect.getsource(render_cycle_summary_section)
 
 
 class TestKindPinFiresOnDrift:
