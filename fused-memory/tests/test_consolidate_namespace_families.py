@@ -1168,19 +1168,101 @@ class TestCliParser:
         assert (args.apply, args.limit, args.max_pages) == (True, 250, 7)
         assert args.config == '/tmp/c.yaml'
 
-    def test_the_budget_remediation_text_names_a_flag_that_exists(self):
-        """The WARNING must not advise raising a knob the CLI does not expose.
+    @pytest.mark.asyncio
+    async def test_every_flag_the_budget_warnings_name_is_a_real_parser_option(self, caplog):
+        """CROSS-CHECK the emitted WARNINGS against the parser.
 
-        Asserted against the parser itself rather than a hardcoded string, so
-        renaming the flag cannot leave the remediation text stale.
+        The remediation text must not advise raising a knob the CLI does not
+        expose -- an unreachable --max-pages is exactly the defect this change
+        exists to fix. Asserting that the flags happen to be declared (see
+        test_exposes_the_documented_flags) does NOT catch that: the regression
+        is a flag RENAMED in the parser while the message keeps the old
+        spelling. So this extracts every --token the messages actually emit
+        and requires each to be a live parser option string.
+
+        Both budget WARNINGS are covered: the preflight's over-budget branch
+        and merge_collection's mid-drain exhaustion.
         """
-        flags = {
+        import re as _re
+
+        with caplog.at_level('WARNING'):
+            await _mod.preflight_collection_points(
+                TestPreflightCollectionPoints._client(count=5),
+                'reify_reify', page_size=2, max_pages=2,
+            )
+            await _mod.merge_collection(
+                _make_backend_pager([[_make_point('p1')]], raise_budget_after=1),
+                _make_qdrant_mock(), 'reify_reify', 'fused_reify', 'reify',
+            )
+
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert len(messages) == 2, f'both budget WARNINGS must fire; got {messages}'
+
+        named = {flag for m in messages for flag in _re.findall(r'--[a-z][a-z0-9-]*', m)}
+        assert named, f'the remediation text must actually name a flag; got {messages}'
+
+        real = {
             option
             for action in _mod._build_parser()._actions
             for option in action.option_strings
         }
-        assert '--max-pages' in flags
-        assert '--limit' in flags
+        assert named <= real, (
+            f'the WARNINGS advise flags the CLI does not expose: {sorted(named - real)}'
+        )
+
+
+class TestMainWiring:
+    """main() -> run() argument wiring.
+
+    _build_parser() is covered in isolation above and run(..., max_pages=...)
+    forwarding is covered in TestRunApply, but nothing covered the SEAM
+    between them. A transposition typo (max_pages=args.limit) would leave the
+    whole suite green while making the newly-added --max-pages flag inert --
+    the same class of defect (an advertised knob that does not reach the code)
+    this change exists to fix.
+    """
+
+    def test_main_forwards_both_budget_knobs_from_the_parsed_args(self, monkeypatch, capsys):
+        from fused_memory.config import schema as _schema
+        from fused_memory.services import memory_service as _ms
+
+        captured: dict = {}
+
+        async def _fake_run(args, memory, **kwargs):
+            captured['args'] = args
+            captured['memory'] = memory
+            captured['kwargs'] = dict(kwargs)
+            return {
+                'dry_run': True,
+                'graph_family_merges': [],
+                'collection_merges': [],
+                'junk_key_deletions': [],
+                'empty_collection_deletions': [],
+            }
+
+        memory = MagicMock()
+        memory.initialize = AsyncMock(return_value=None)
+        memory.close = AsyncMock(return_value=None)
+
+        monkeypatch.setattr(_mod, 'run', _fake_run)
+        monkeypatch.setattr(_schema, 'FusedMemoryConfig', MagicMock())
+        monkeypatch.setattr(_ms, 'MemoryService', MagicMock(return_value=memory))
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['consolidate_namespace_families.py', '--max-pages', '7', '--limit', '250'],
+        )
+
+        exit_code = _mod.main()
+
+        assert captured['kwargs'] == {'limit': 250, 'max_pages': 7}, (
+            'main() must forward each flag to its OWN keyword -- a transposed '
+            'max_pages=args.limit makes --max-pages inert'
+        )
+        assert captured['memory'] is memory
+        assert captured['args'].max_pages == 7
+        assert exit_code == 0
+        memory.close.assert_awaited_once()
+        capsys.readouterr()
 
 
 # ===========================================================================
