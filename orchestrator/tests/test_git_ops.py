@@ -6760,8 +6760,16 @@ async def _start_hung_child(
     try:
         child_pid = await _wait_for_child_pid(pid_file)
     except BaseException:
+        # Drive the cancellation to completion rather than just scheduling
+        # it: _wait_for_child_pid's pytest.fail() raises a BaseException, and
+        # if we returned immediately after task.cancel() the event loop would
+        # never get a turn to run _run's own except BaseException: proc.kill()
+        # + await proc.wait() cleanup. Without this await, a genuine
+        # never-started-child diagnostic would itself leak the orphan
+        # sleeping child this test class exists to catch (task 4109).
+        task.cancel()
         with contextlib.suppress(BaseException):
-            task.cancel()
+            await task
         raise
     return task, child_pid
 
