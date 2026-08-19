@@ -304,7 +304,15 @@ else
        --print-verdicts 2>&1)" && _orch_parity_exit=0 || _orch_parity_exit=$?
   printf '%s\n' "$_orch_parity_out"
 
-  if ! printf '%s\n' "$_orch_parity_out" | grep -q '\[orchestrator_unit_parity\]'; then
+  # The tag is matched in BASH, not through `printf ... | grep -q`. grep exits
+  # the instant it matches and the tag is on line 1, so once the report exceeds
+  # the pipe buffer (~64KB) the printf dies of SIGPIPE, `pipefail` makes the
+  # pipeline return 141, and `!` turns that into "it did not run" with the tag
+  # plainly present — a verdict manufactured by the mechanism rather than read
+  # from the checker, which is the exact class of failure this guard removes.
+  # `[[ ]]` forks nothing and cannot be signalled. (Measured: the pipe form
+  # flips at ~82KB of tagged output; the pattern below does not.)
+  if [[ "$_orch_parity_out" != *'[orchestrator_unit_parity]'* ]]; then
     fail "Orchestrator parity gate produced no [orchestrator_unit_parity] report"
     fail "  (status $_orch_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
@@ -722,13 +730,51 @@ info "Installing dashboard systemd units"
 # Deliberately no --fix in the checker (see its module docstring): re-running
 # this installer is the propagation path, and re-ARMING the watchdog timer
 # belongs to task 3289.
-if python3 "$REPO_ROOT/scripts/check_dashboard_unit_parity.py" \
-     --installed-dir "$UNIT_DIR" \
-     --repo-root     "$REPO_ROOT"; then
-  ok "Dashboard units: already at parity with the committed copies"
+#
+# The gate distinguishes "ran and found drift" from "did not run at all", and
+# the install proceeds either way. Exit code alone is NOT trusted, because 2 is
+# overloaded three ways: the checker's "not yet installed" (benign), `python3`
+# refusing to open a missing script file, and argparse rejecting an unknown
+# flag. Renaming the checker or one of its flags would otherwise print a
+# reassuring "installing below" on a host whose units are installed AND
+# drifted — a gate reporting green because it never ran, which is the silent-
+# drift failure the checker exists to catch, reproduced in its own wiring.
+# So no status is believed unless the checker's own [dashboard_unit_parity] tag
+# appears in the output it produced. That tag is on EVERY line it emits, which
+# test_main_every_emitted_line_carries_the_log_tag pins, so its absence is
+# conclusive rather than a heuristic.
+#
+# UNLIKE the orchestrator gate above, a bad verdict does NOT make the install
+# opt-in, and must not be changed to: the install is itself the remediation,
+# the checker's own report tells the operator to run this script, and the
+# incident it guards has the INSTALLED side stale. See
+# test_section_8_installs_even_when_the_gate_did_not_run for the full argument.
+# What changes on a gate that did not run is only the EPISTEMICS — the operator
+# is no longer told a check passed when none ran.
+_dash_parity_script="$REPO_ROOT/scripts/check_dashboard_unit_parity.py"
+
+if [ ! -f "$_dash_parity_script" ]; then
+  fail "Dashboard parity gate missing: $_dash_parity_script"
+  fail "  Not treating that as 'nothing to check' — it is 'nothing checked'."
+  fail "  The install below still runs; it simply gathered no evidence first."
 else
-  _dash_parity_exit=$?
-  if [ "$_dash_parity_exit" -eq 2 ]; then
+  # The `&& x=0 || x=$?` idiom is what keeps `set -e` from aborting here.
+  _dash_parity_out="$(python3 "$_dash_parity_script" \
+       --installed-dir "$UNIT_DIR" \
+       --repo-root     "$REPO_ROOT" 2>&1)" && _dash_parity_exit=0 || _dash_parity_exit=$?
+  printf '%s\n' "$_dash_parity_out"
+
+  # Matched in bash, not through a pipe to grep — see the orchestrator gate
+  # above for why a `printf | grep -q` here can report "it did not run" on a
+  # report that carries the tag.
+  if [[ "$_dash_parity_out" != *'[dashboard_unit_parity]'* ]]; then
+    fail "Dashboard parity gate produced no [dashboard_unit_parity] report"
+    fail "  (status $_dash_parity_exit) — it did not run, so its status says"
+    fail "  nothing about this host. Check the script path and its flags."
+    fail "  The install below still runs; it simply gathered no evidence first."
+  elif [ "$_dash_parity_exit" -eq 0 ]; then
+    ok "Dashboard units: already at parity with the committed copies"
+  elif [ "$_dash_parity_exit" -eq 2 ]; then
     info "Dashboard units: not yet installed in $UNIT_DIR (installing below)"
   else
     # Exit 1 is "drift OR unverifiable" — it also covers a vanished committed
@@ -876,16 +922,62 @@ fi
 # (Environment=MEM0_TELEMETRY=false, WatchdogSec=120).  Warn-only: drift does
 # not abort the install; re-run with --fix to correct in-place without clobbering
 # host-specific lines (e.g. extra DASHBOARD_KNOWN_PROJECT_ROOTS entries).
-if python3 "$REPO_ROOT/scripts/check_fused_memory_unit_parity.py" \
-     --installed "$UNIT_DIR/fused-memory.service" \
-     --template  "$REPO_ROOT/scripts/fused-memory.service.template"; then
-  ok "Fused-memory unit: parity with template (all safety directives present)"
+#
+# POST-INSTALL HEALTH CHECK, not a gate on anything: the fused-memory unit is
+# rendered and installed back in section 4, and nothing installs after this
+# block, so there is no action here to make conditional. What it owes the
+# operator is an honest verdict.
+#
+# The exit code alone is NOT trusted, because 2 is overloaded three ways: the
+# checker's "not installed on this host" (benign), `python3` refusing to open a
+# missing script file, and argparse rejecting an unknown flag. Renaming the
+# checker or one of its flags would therefore print a reassuring "skipping
+# parity check" — a check reporting green because it never ran, which is the
+# silent-drift failure the checker exists to catch, reproduced one level up in
+# its own wiring.
+#
+# The orchestrator gate above greps the checker's [orchestrator_unit_parity]
+# tag. This checker has no LOG_TAG (and is read-only for this task), so its own
+# bracketed markers stand in for one. That vocabulary is an implicit contract of
+# a file this block does not own, so it is pinned directly by
+# test_gate_markers_appear_on_every_real_exit_path_and_neither_collision in
+# tests/scripts/test_check_fused_memory_unit_parity.py: markers present on all
+# three real exit paths, absent on both collision sources.
+_fm_parity_script="$REPO_ROOT/scripts/check_fused_memory_unit_parity.py"
+
+if [ ! -f "$_fm_parity_script" ]; then
+  fail "Fused-memory parity check missing: $_fm_parity_script"
+  fail "  Not treating that as 'nothing to check' — it is 'nothing checked'."
 else
-  _parity_exit=$?
-  if [ "$_parity_exit" -eq 2 ]; then
+  # 2>&1 is load-bearing: the [skip] line and the drift trailer go to stderr.
+  # The `&& x=0 || x=$?` idiom is what keeps `set -e` from aborting here.
+  _fm_parity_out="$(python3 "$_fm_parity_script" \
+       --installed "$UNIT_DIR/fused-memory.service" \
+       --template  "$REPO_ROOT/scripts/fused-memory.service.template" 2>&1)" \
+       && _fm_parity_exit=0 || _fm_parity_exit=$?
+  printf '%s\n' "$_fm_parity_out"
+
+  # The marker is line-ANCHORED (the equivalent of `grep -E '^\[(ok|...)\]'`),
+  # so an argparse usage line's `[--fix]` and python3's mid-line `[Errno 2]`
+  # cannot pass for a report. Prefixing a newline makes the first line match
+  # the same way as any other. Done in bash rather than through a pipe to grep
+  # for the SIGPIPE reason spelled out at the orchestrator gate above.
+  _fm_parity_reported=0
+  case $'\n'"$_fm_parity_out" in
+    *$'\n'"[ok]"*|*$'\n'"[skip]"*|*$'\n'"[drift]"*|*$'\n'"[fixed]"*)
+      _fm_parity_reported=1 ;;
+  esac
+
+  if [ "$_fm_parity_reported" -eq 0 ]; then
+    fail "Fused-memory parity check produced no recognizable report"
+    fail "  (status $_fm_parity_exit) — it did not run, so its status says"
+    fail "  nothing about this host. Check the script path and its flags."
+  elif [ "$_fm_parity_exit" -eq 0 ]; then
+    ok "Fused-memory unit: parity with template (all safety directives present)"
+  elif [ "$_fm_parity_exit" -eq 2 ]; then
     warn "Fused-memory unit: not installed at $UNIT_DIR/fused-memory.service (skipping parity check)"
   else
-    warn "Fused-memory unit: DRIFT detected — run: python3 $REPO_ROOT/scripts/check_fused_memory_unit_parity.py --fix"
+    warn "Fused-memory unit: DRIFT detected — run: python3 $_fm_parity_script --fix"
   fi
 fi
 
@@ -900,13 +992,44 @@ fi
 # touch <unit>.d/ directories.
 #
 # Warn-only, like the pre-install check.
-if python3 "$REPO_ROOT/scripts/check_dashboard_unit_parity.py" \
-     --installed-dir "$UNIT_DIR" \
-     --repo-root     "$REPO_ROOT"; then
-  ok "Dashboard units: install verified (installed copies match the committed ones)"
+#
+# Same exit-2 overloading as the section-8 gate, and here the false green is
+# the strongest of the three sites: this is the LAST word the operator reads
+# about whether the install took, and its exit-2 wording is not merely
+# reassuring but already a diagnosis ("section 8 did not run?"). A renamed
+# checker would send them to investigate an install that in fact completed,
+# while the thing that actually failed — the check itself — went unreported.
+# So the script path is guarded and no status is believed without the
+# checker's own [dashboard_unit_parity] tag.
+#
+# Distinct variable names from section 8's on purpose: both blocks share one
+# shell scope, so under `set -u` a stale _dash_parity_out/_exit from section 8
+# would still be readable here and a check that never ran could silently
+# inherit the earlier block's verdict.
+_dash_post_parity_script="$REPO_ROOT/scripts/check_dashboard_unit_parity.py"
+
+if [ ! -f "$_dash_post_parity_script" ]; then
+  fail "Dashboard post-install check missing: $_dash_post_parity_script"
+  fail "  Not treating that as 'nothing to check' — it is 'nothing checked'."
+  fail "  The install above is therefore UNVERIFIED, not verified."
 else
-  _dash_parity_exit=$?
-  if [ "$_dash_parity_exit" -eq 2 ]; then
+  _dash_post_parity_out="$(python3 "$_dash_post_parity_script" \
+       --installed-dir "$UNIT_DIR" \
+       --repo-root     "$REPO_ROOT" 2>&1)" \
+       && _dash_post_parity_exit=0 || _dash_post_parity_exit=$?
+  printf '%s\n' "$_dash_post_parity_out"
+
+  # Matched in bash, not through a pipe to grep — see the orchestrator gate for
+  # why a `printf | grep -q` here can report "it did not run" on a report that
+  # carries the tag.
+  if [[ "$_dash_post_parity_out" != *'[dashboard_unit_parity]'* ]]; then
+    fail "Dashboard post-install check produced no [dashboard_unit_parity] report"
+    fail "  (status $_dash_post_parity_exit) — it did not run, so its status says"
+    fail "  nothing about this host. Check the script path and its flags."
+    fail "  The install above is therefore UNVERIFIED, not verified."
+  elif [ "$_dash_post_parity_exit" -eq 0 ]; then
+    ok "Dashboard units: install verified (installed copies match the committed ones)"
+  elif [ "$_dash_post_parity_exit" -eq 2 ]; then
     warn "Dashboard units: not installed in $UNIT_DIR (section 8 did not run?)"
   else
     warn "Dashboard units: still not at parity AFTER installing — the install"
@@ -933,18 +1056,39 @@ fi
 # bring-up on precisely the state we chose not to auto-fix. Contrast the
 # orchestrator gate above, which may fail — that one guards an install this
 # script actually performs.
-if [ ! -f "$REPO_ROOT/scripts/check_lms_unit_parity.py" ] \
+# Same exit-2 overloading as the gates above: 2 is the checker's own benign
+# "not installed", AND python3 refusing to open a renamed script, AND argparse
+# rejecting a renamed flag. Only the first carries the checker's own
+# [lms_unit_parity] tag, so the status is not read as a verdict without one.
+# The tag is on every emitted line by construction (LOG_TAG in
+# check_lms_unit_parity.py), so its absence is conclusive rather than a
+# heuristic. Warn-only here too: a gate that did not run must be loud, but it
+# still must not brick bring-up.
+_lms_parity_script="$REPO_ROOT/scripts/check_lms_unit_parity.py"
+
+if [ ! -f "$_lms_parity_script" ] \
    || [ ! -f "$REPO_ROOT/scripts/local-model-serving/lms-arm@.service" ]; then
   # A checkout without the checker is not a host with a drop-in. Reporting it
   # as one is the same credibility leak as warning on exit 2.
   info "lms-arm@ unit: parity checker not present in this checkout — skipped"
-elif python3 "$REPO_ROOT/scripts/check_lms_unit_parity.py" \
-       --installed-dir "$UNIT_DIR" \
-       --repo-root     "$REPO_ROOT"; then
-  ok "lms-arm@ unit: parity with the committed template (effective configuration verified)"
 else
-  _lms_parity_exit=$?
-  if [ "$_lms_parity_exit" -eq 2 ]; then
+  # 2>&1 keeps a report written to stderr out of the operator's blind spot.
+  # The `&& x=0 || x=$?` idiom is what keeps `set -e` from aborting here.
+  _lms_parity_out="$(python3 "$_lms_parity_script" \
+       --installed-dir "$UNIT_DIR" \
+       --repo-root     "$REPO_ROOT" 2>&1)" && _lms_parity_exit=0 || _lms_parity_exit=$?
+  printf '%s\n' "$_lms_parity_out"
+
+  # Matched in bash, not through a pipe to grep — see the orchestrator gate
+  # above for why a `printf | grep -q` here can report "it did not run" on a
+  # report that carries the tag.
+  if [[ "$_lms_parity_out" != *'[lms_unit_parity]'* ]]; then
+    warn "lms-arm@ unit: parity gate produced no [lms_unit_parity] report"
+    warn "  (status $_lms_parity_exit) — it did not run, so its status says"
+    warn "  nothing about this host. Check the script path and its flags."
+  elif [ "$_lms_parity_exit" -eq 0 ]; then
+    ok "lms-arm@ unit: parity with the committed template (effective configuration verified)"
+  elif [ "$_lms_parity_exit" -eq 2 ]; then
     info "lms-arm@ unit: not installed on this host (install with scripts/local-model-serving/install-lms-units.sh)"
   else
     # Exit 1 is "drift OR unverifiable" — it also covers a drop-in override and
