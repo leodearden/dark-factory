@@ -1125,6 +1125,89 @@ class TestB3ExtendedListTypedRecovery:
         assert warning['recovered_params'] == ['evidence', 'suggested_action']
 
 
+class TestRejectRepairedCallValidates:
+    """The REJECT tier's ``repaired_call`` must actually be RESUBMITTABLE.
+
+    Task **3690**. ``_REJECT_HINT`` instructs a bounced caller to "Resubmit
+    repaired_call verbatim", and ``_reject`` builds it as
+    ``{**arguments, param: fix.clean_value, **fix.recovered}`` — from the RAW
+    recovered map. Coercing only the forward path would leave this tier
+    handing back a ``str`` for a list-typed parameter, so the promised
+    MECHANICAL retry dies with the same ``list_type`` error the guard just
+    prevented: the guard would be telling a bounced caller to do something
+    that cannot work.
+
+    This is what binds the fix to BOTH tiers, and why siblings 4457
+    (plan-tools) and 4458 (fused-memory) — both REJECT_WITH_REPAIR servers —
+    need it too.
+    """
+
+    SPECIMEN = 'toolu_01Q1FPhhjWsxGhTEQRfvMaLa'
+
+    REQUIRED = {
+        'task_id': '3441',
+        'agent_role': 'implementer',
+        'category': 'cleanup_needed',
+        'summary': 'Eight near-duplicate entries restate the same gotcha.',
+    }
+
+    async def _reject(self):
+        record = specimen(self.SPECIMEN)
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'escalate_info_typed',
+                {**self.REQUIRED, record['param']: record['value']},
+            )
+        return h, _reject_payload(excinfo)
+
+    async def test_the_repaired_call_carries_a_list_not_a_str(self):
+        _, payload = await self._reject()
+
+        evidence = payload['repaired_call']['evidence']
+        assert isinstance(evidence, list), (
+            f'repaired_call.evidence is a {type(evidence).__name__}; a caller '
+            'resubmitting it verbatim would be bounced again by pydantic'
+        )
+        assert all(isinstance(entry, dict) for entry in evidence)
+
+    async def test_it_names_both_recoveries(self):
+        _, payload = await self._reject()
+
+        assert payload['recovered_params'] == ['evidence', 'suggested_action']
+
+    async def test_nothing_was_written(self):
+        h, _ = await self._reject()
+
+        assert h.recorder.calls == []
+
+    async def test_the_round_trip(self):
+        """THE assertion. Resubmit ``repaired_call`` verbatim; it must work.
+
+        Everything else in this class describes the payload. This one is the
+        promise ``_REJECT_HINT`` actually makes, exercised end to end through
+        a second Client call on a fresh server.
+        """
+        _, payload = await self._reject()
+        retry = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        result = await retry.call('escalate_info_typed', payload['repaired_call'])
+
+        assert result.data == 'esc_typed_1'
+        assert len(retry.recorder.calls) == 1
+        assert isinstance(retry.recorder.args['evidence'], list)
+        assert retry.recorder.args['suggested_action']
+
+    async def test_the_retry_is_clean_so_the_guard_does_not_fire_again(self):
+        """A repaired_call that still tripped ``detect`` would loop forever."""
+        _, payload = await self._reject()
+        retry = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        await retry.call('escalate_info_typed', payload['repaired_call'])
+
+        assert retry.facts == [], 'the resubmission re-entered the guard'
+
+
 class TestCoercionNeverGuesses:
     """The three ways a NAIVE decode of a recovered value is wrong.
 
