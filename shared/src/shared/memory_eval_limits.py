@@ -357,7 +357,8 @@ class LimitsConfig:
     """
 
     false_alarm_budget: float = 1.0
-    """Expected false alarms per quarter across the whole eval. PRD-sanctioned default."""
+    """Upper bound on expected false alarms per quarter across the whole eval; the realized
+    rate lands below it — see :func:`derive_alpha`. PRD-sanctioned default."""
 
     runs_per_quarter: int
     """How often this eval runs — 90 for the D10 daily cadence."""
