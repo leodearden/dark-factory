@@ -851,3 +851,207 @@ def test_max_task_dirs_is_derived_from_live_archive_rate():
         "  ...plus this file's test_default_constants_match_orchestrator_config "
         "drift guard."
     )
+
+
+# ---------------------------------------------------------------------------
+# step-7 (task 3621): summarize_count_cap(task_dirs, decision, now,
+# max_task_dirs) — a binding count cap is a STRUCTURED FACT, not a silent one.
+#
+# The count axis prunes OLDEST-FIRST, so when it binds it truncates the age
+# window from the forensic end while the sweep still reports the full
+# max_age_days policy. The defect this leaf fixes is that the two prune causes
+# are INDISTINGUISHABLE in the output. These tests pin the pure summariser
+# that makes them distinguishable, driven through the production
+# select_prunable so the reasons under test are the ones the GC really emits.
+#
+# The alarm is deliberately NARROW: it fires only on a dir whose reason is
+# EXACTLY 'count' — fresh enough to keep by age, dropped by count. A dir tagged
+# 'age+count' would have died of age anyway, so the cap cost nothing and
+# warning about it would be a false positive (INV-4 is loud-over-silent, not
+# noisy-over-useful: an alarm that cries wolf trains operators to ignore it).
+# ---------------------------------------------------------------------------
+
+# Every count_cap block carries exactly these keys, bound or not, so a machine
+# reader keys on `bound` and never has to branch on key presence.
+COUNT_CAP_KEYS = {
+    "bound",
+    "max_task_dirs",
+    "pruned",
+    "truncated",
+    "oldest_dropped_age_days",
+    "effective_window_days",
+}
+
+
+def _summarize(task_dirs, *, max_age_days, max_task_dirs):
+    """Classify *task_dirs* through the production select_prunable, then
+    summarise the count axis over that real decision."""
+    decision = select_prunable(task_dirs, NOW, max_age_days, max_task_dirs)
+    return gct.summarize_count_cap(task_dirs, decision, NOW, max_task_dirs)
+
+
+def test_count_cap_unbound_when_nothing_was_pruned():
+    """Nothing pruned at all — the cap is slack, which is the normal posture
+    the raised (derived) cap is sized to guarantee."""
+    block = _summarize(_fresh_dirs(3), max_age_days=90, max_task_dirs=HIGH_COUNT_CAP)
+
+    assert block["bound"] is False
+    assert block["max_task_dirs"] == HIGH_COUNT_CAP
+    assert block["pruned"] == 0
+    assert block["truncated"] == 0
+    # Age fields are None (not 0) when the count axis dropped nothing: absence
+    # of a measurement must not read as a measured zero.
+    assert block["oldest_dropped_age_days"] is None
+    assert block["effective_window_days"] is None
+    assert set(block) == COUNT_CAP_KEYS
+
+
+def test_count_cap_unbound_when_only_the_age_axis_pruned():
+    """An AGE prune is the policy working as designed — it must never raise
+    the count-cap alarm."""
+    task_dirs = [
+        (_dir("a"), NOW),
+        (_dir("b"), NOW - DAY),
+        (_dir("old"), NOW - 100 * DAY),
+    ]
+
+    decision = select_prunable(task_dirs, NOW, 90, 5)
+    assert decision.reasons == {_dir("old"): "age"}  # the count axis is slack
+
+    block = gct.summarize_count_cap(task_dirs, decision, NOW, 5)
+    assert block["bound"] is False
+    assert block["pruned"] == 0
+    assert block["truncated"] == 0
+    assert block["oldest_dropped_age_days"] is None
+    assert block["effective_window_days"] is None
+
+
+def test_count_cap_unbound_when_the_axis_is_disabled():
+    """A non-positive cap DISABLES the count axis; a disabled axis cannot be
+    binding, whatever the age axis did."""
+    task_dirs = [
+        (_dir("a"), NOW),
+        (_dir("b"), NOW - DAY),
+        (_dir("c"), NOW - 2 * DAY),
+    ]
+
+    for disabled in (0, -1):
+        block = _summarize(task_dirs, max_age_days=90, max_task_dirs=disabled)
+        assert block["bound"] is False, disabled
+        assert block["pruned"] == 0
+        assert block["truncated"] == 0
+        assert block["max_task_dirs"] == disabled
+        assert set(block) == COUNT_CAP_KEYS
+
+
+def test_count_cap_unbound_when_every_count_drop_would_have_died_of_age():
+    """THE FALSE-ALARM CASE. The count axis dropped dirs, but every one is
+    tagged 'age+count' — each fails the age cap independently, so the count cap
+    cost no forensic window and must NOT alarm. `pruned` still reports the
+    drops honestly; only `truncated` (and therefore `bound`) stays at zero."""
+    task_dirs = [
+        (_dir("a"), NOW),                  # rank 0 — kept
+        (_dir("b"), NOW - DAY),            # rank 1 — kept
+        (_dir("c"), NOW - 100 * DAY),      # rank 2 — beyond cap AND past age
+        (_dir("d"), NOW - 120 * DAY),      # rank 3 — beyond cap AND past age
+    ]
+
+    decision = select_prunable(task_dirs, NOW, 90, 2)
+    assert decision.reasons == {_dir("c"): "age+count", _dir("d"): "age+count"}
+
+    block = gct.summarize_count_cap(task_dirs, decision, NOW, 2)
+    assert block["bound"] is False
+    assert block["pruned"] == 2       # the count axis really did touch both
+    assert block["truncated"] == 0    # ...but neither cost a day of window
+    assert block["oldest_dropped_age_days"] == 120.0
+    # No dir was dropped INSIDE the age window, so there is no truncated
+    # window depth to report.
+    assert block["effective_window_days"] is None
+
+
+def test_count_cap_bound_when_a_dir_fresh_enough_to_keep_is_dropped_by_count():
+    """THE ALARM CASE. A dir tagged EXACTLY 'count' was fresh enough for the
+    age policy to keep and was dropped anyway — that is the 90-day window being
+    truncated from the forensic end."""
+    task_dirs = [
+        (_dir("a"), NOW),                  # rank 0 — kept
+        (_dir("b"), NOW - DAY),            # rank 1 — kept
+        (_dir("c"), NOW - 2 * DAY),        # rank 2 — 'count': fresh, dropped
+        (_dir("d"), NOW - 3 * DAY),        # rank 3 — 'count': fresh, dropped
+        (_dir("e"), NOW - 100 * DAY),      # rank 4 — 'age+count'
+    ]
+
+    decision = select_prunable(task_dirs, NOW, 90, 2)
+    assert decision.reasons[_dir("c")] == "count"
+    assert decision.reasons[_dir("e")] == "age+count"
+
+    block = gct.summarize_count_cap(task_dirs, decision, NOW, 2)
+    assert block["bound"] is True
+    assert block["max_task_dirs"] == 2
+    assert block["pruned"] == 3        # every dir the count axis dropped
+    assert block["truncated"] == 2     # ...of which 2 cost real window
+    # The oldest dir the count axis dropped, over the whole count-reason set.
+    assert block["oldest_dropped_age_days"] == 100.0
+    # The NEWEST count-only drop: everything younger than this survived, so
+    # this is the depth the retention window has ACTUALLY been truncated to —
+    # 2 days, against a declared 90-day policy.
+    assert block["effective_window_days"] == 2.0
+    assert set(block) == COUNT_CAP_KEYS
+
+
+def test_count_cap_effective_window_tracks_the_newest_count_only_drop():
+    """`effective_window_days` is the newest count-ONLY drop, not the newest
+    count-reason drop: an 'age+count' dir cannot define the surviving window
+    because the age policy was discarding it anyway."""
+    task_dirs = [(_dir("keep"), NOW)]
+    # Ranks 1..3: fresh, dropped by count at ages 10/20/30 days.
+    task_dirs += [(_dir(f"c{d}"), NOW - d * DAY) for d in (10, 20, 30)]
+    # Rank 4: past the age cap, so it must not set the effective window.
+    task_dirs.append((_dir("ancient"), NOW - 200 * DAY))
+
+    block = _summarize(task_dirs, max_age_days=90, max_task_dirs=1)
+
+    assert block["bound"] is True
+    assert block["pruned"] == 4
+    assert block["truncated"] == 3
+    assert block["oldest_dropped_age_days"] == 200.0
+    assert block["effective_window_days"] == 10.0
+
+
+def test_gc_report_carries_a_stable_count_cap_block_bound_and_unbound():
+    """The `count_cap` key is ALWAYS present in the JSON report under the same
+    schema, so a cron/watchdog reader never branches on key presence (INV-2:
+    the emitter had the fact in a variable; it must not make a consumer
+    re-derive it from the log)."""
+    task_dirs = [
+        (_dir("a"), NOW),
+        (_dir("b"), NOW - DAY),
+        (_dir("c"), NOW - 2 * DAY),
+    ]
+
+    def _report(max_task_dirs):
+        decision = select_prunable(task_dirs, NOW, 90, max_task_dirs)
+        return gct.build_gc_report(
+            root=Path("/archive"),
+            scanned=task_dirs,
+            decision=decision,
+            outcome=gct.PruneOutcome(),
+            caps=(90, max_task_dirs),
+            now=NOW,
+            check=True,
+        )
+
+    bound = _report(1)["count_cap"]
+    unbound = _report(HIGH_COUNT_CAP)["count_cap"]
+
+    assert set(bound) == COUNT_CAP_KEYS
+    assert set(unbound) == COUNT_CAP_KEYS
+    assert bound["bound"] is True
+    assert bound["truncated"] == 2
+    assert bound["effective_window_days"] == 1.0
+    assert unbound["bound"] is False
+    assert unbound["truncated"] == 0
+    assert unbound["effective_window_days"] is None
+    # The block reports the cap that was ACTUALLY applied, matching `caps`.
+    assert bound["max_task_dirs"] == 1
+    assert unbound["max_task_dirs"] == HIGH_COUNT_CAP
