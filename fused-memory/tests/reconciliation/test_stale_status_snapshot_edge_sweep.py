@@ -1374,6 +1374,54 @@ class TestExtractSnapshotEdgeTaskIds:
             'Task 5 blocks task/9 in blocked status'
         ) == {9}
 
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            # The reachable over-selection: 'task/94' is a PATH SEGMENT naming a
+            # worktree, and the sentence asserts something about the WORKTREE,
+            # not about task 94's status. Nothing in the grammar can tell the
+            # two apart — a path segment and a reference are the same six
+            # characters — so the id is extracted. ACCEPTED.
+            ('The worktree .worktrees/task/94 is pending cleanup', {94}),
+            # One more path component and the extraction stops: 'plan.json'
+            # sits between the reference and 'is pending', and the open-class
+            # gap in SNAPSHOT_STATUS_PHRASE_RE does not span it.
+            ('.worktrees/task/94/plan.json is pending review', set()),
+            # The PLURAL segment was never a reference at all: the anchor is
+            # '\btask\b', so 'tasks/94' does not match. (This is the same
+            # property audit_duplicate_memories' untasked-snapshot accounting
+            # depends on.)
+            ('.worktrees/tasks/94/plan.json is pending review', set()),
+            # A trailing word character defeats the digits' '\b': '94_notes'
+            # is one token, not a reference followed by a suffix.
+            ('src/task/94_notes.md is pending review', set()),
+        ],
+    )
+    def test_path_embedded_slash_reference_is_documented_behaviour(self, fact, expected):
+        """Slash refs that are PATH segments rather than sentence subjects:
+        characterized, not silently inherited. (task 3403)
+
+        The slash form was admitted to TASK_REF_RE so 'task/94' — the
+        orchestrator's own branch-name convention — stops being invisible.
+        The cost is that the SAME spelling occurs inside paths, and this
+        module's path ends in memory_service.update_edge(invalid_at=...): the
+        first case below makes an edge asserting something about a WORKTREE
+        retirable as soon as task 94 goes terminal. That is over-selection,
+        the direction this module's docstring forbids, and it is newly
+        reachable — MEASURED set() before the widening.
+
+        It is accepted rather than fixed. Excluding it would mean refusing a
+        reference preceded by a path character, which would also refuse the
+        genuine 'Merge task/3698 into main' shape that motivated the widening;
+        the grammar has no way to distinguish them, and the anchoring that
+        actually bounds over-selection ('\\btask\\b' and the trailing
+        '\\b' on the digits) is what keeps the other three cases at set().
+        Recording the boundary here means a later regression in any of the
+        three safe shapes shows up as a test failure rather than as an
+        unexplained widening of what this sweep retires.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
 
 # --------------------------------------------------------------------------- #
 # extract_snapshot_edge_task_ids — catastrophic-backtracking regression
