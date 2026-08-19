@@ -1927,6 +1927,69 @@ def test_kill_holder_tree_reaps_a_session_escaped_grandchild():
                 os.kill(pid, signal.SIGKILL)
 
 
+def test_kill_holder_tree_never_signals_the_callers_own_process_group():
+    """kill_holder_tree must NEVER killpg the CALLER's own process group.
+
+    This is the guard that makes this task's literally-prescribed
+    ``os.killpg(os.getpgid(holder.pid), SIGKILL)`` one-liner unwritable.
+    The lane-lock holder
+    (``test_live_verify_merge_holds_lane_lock_real_subprocess``) is spawned
+    WITHOUT ``--request-id``, so ``cli.py`` never calls ``os.setsid`` on it
+    (:func:`~orchestrator.verify_cancel.start_own_process_group` is gated on
+    ``if request_id is not None:``) and the holder stays in THIS process's
+    (pytest's) own group -- ``os.getpgid(holder.pid) == os.getpgid(0)``. A
+    naive killpg backstop there would SIGKILL the pytest worker running
+    this very test.
+
+    Reproduces that exact shape: a leader spawned via plain
+    ``subprocess.Popen`` with no ``start_new_session``.  The precondition
+    assertion proves this test really exercises the shared-group case
+    rather than silently testing nothing.
+
+    Passes trivially against the current killpg-free kill_holder_tree; it
+    exists to fail the moment a killpg backstop is added without this
+    guard (see the next impl step).
+    """
+    leader = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    try:
+        assert os.getpgid(leader.pid) == os.getpgid(0), (
+            'harness bug: a plain subprocess.Popen with no start_new_session '
+            'must inherit the caller\'s own process group, or this test is '
+            'not exercising the shared-group case it exists to guard'
+        )
+
+        killpg_calls: list[tuple[int, int]] = []
+
+        def spy(pgid, sig):
+            killpg_calls.append((pgid, sig))
+
+        kill_holder_tree(
+            leader, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS, _killpg=spy,
+        )
+
+        assert leader.poll() is not None, (
+            'kill_holder_tree must still reap the leader even with the '
+            'killpg backstop suppressed -- a guard satisfied by a helper '
+            'that does nothing at all would be worthless'
+        )
+
+        own_pgid = os.getpgid(0)
+        assert all(pgid != own_pgid for pgid, _sig in killpg_calls), (
+            f"kill_holder_tree called killpg with the CALLER'S OWN process "
+            f'group {own_pgid}: {killpg_calls} -- this would SIGKILL the '
+            f'pytest worker itself'
+        )
+        assert killpg_calls == [], (
+            f'kill_holder_tree must not call killpg at all when the holder '
+            f"shares the caller's process group (never setsid'd): "
+            f'{killpg_calls}'
+        )
+    finally:
+        if leader.poll() is None:
+            leader.kill()
+            leader.wait(timeout=5)
+
+
 # ---------------------------------------------------------------------------
 # Task 3369 -- in-child stopwatch for the flock GATE, replacing task 2921/2941's
 # outer wall-clock subtraction in test_flock_wait_env_override_speeds_up_
