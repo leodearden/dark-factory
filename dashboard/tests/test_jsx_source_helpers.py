@@ -264,22 +264,37 @@ class TestSharedServedAssetFixtures:
     """
 
     def test_each_shared_fixture_serves_what_the_app_serves(self, request, _client) -> None:
-        """Every row resolves, is non-empty, and matches the live response.
+        """Every row resolves, is served with HTTP 200, and matches that response.
 
-        Non-empty is asserted separately from the equality: a fixture wired to
-        a mistyped path would return a 404 body, and `body == _client.get(...)`
-        would compare that 404 to itself and pass.
+        THE STATUS CHECK IS THE LOAD-BEARING ONE — do not weaken it back to a
+        non-emptiness check.  A fixture wired to a mistyped path does not yield
+        an EMPTY body: it yields the app's 404 body, `{"detail":"Not Found"}`,
+        which is 22 non-empty characters and compares equal to itself.  So both
+        `assert body` and `body == _client.get(path).text` pass for a mis-wired
+        row, and every downstream absence assertion built on that fixture then
+        passes vacuously against a 22-character JSON blob.  `status_code == 200`
+        is the only one of these assertions a path typo cannot satisfy.
+
+        Non-emptiness is still asserted, but for a DIFFERENT failure that the
+        status cannot catch: an asset genuinely served, yet empty.
         """
         for name, path in _SHARED_ASSET_FIXTURES.items():
             body = request.getfixturevalue(name)
+            # One request per row, reused by both assertions below.
+            resp = _client.get(path)
 
             assert isinstance(body, str), f'fixture {name!r} must yield the response TEXT'
-            assert body, (
-                f'fixture {name!r} is empty — {path} is probably not served under '
-                f'that exact path, and every probe built on it would then pass '
-                f'vacuously'
+            assert resp.status_code == 200, (
+                f'fixture {name!r} is wired to {path}, which the app does not '
+                f'serve (HTTP {resp.status_code}) — its consumers would be probing '
+                f'a {len(resp.text)}-character error body, so every absence '
+                f'assertion built on it would pass vacuously'
             )
-            assert body == _client.get(path).text, (
+            assert body, (
+                f'fixture {name!r} is empty — {path} is served, but with no '
+                f'content, so every probe built on it would pass vacuously'
+            )
+            assert body == resp.text, (
                 f'fixture {name!r} does not serve {path} — it is wired to the '
                 f'wrong asset, so its consumers are asserting against the wrong file'
             )
