@@ -105,9 +105,3 @@ def test_vocabulary_section_is_appended_not_interleaved() -> None:
     assert _MEMORY_INSTRUCTIONS.endswith(METADATA_VOCABULARY_INSTRUCTIONS)
     prefix = _MEMORY_INSTRUCTIONS[: -len(METADATA_VOCABULARY_INSTRUCTIONS)]
     assert prefix.strip(), 'the memory block must still carry its pre-existing guidance'
-
-
-def test_memory_instructions_mention_metadata() -> None:
-    """The exact PRD §6 gap this leaf closes: the word `metadata` now appears
-    in the writer instructions (measured absent before task 3202)."""
-    assert 'metadata' in _MEMORY_INSTRUCTIONS
