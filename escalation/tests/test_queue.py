@@ -2626,6 +2626,171 @@ class TestFindPendingL2ByRootCause:
             f"got caplog.records: {[(r.levelname, r.message) for r in caplog.records]}"
         )
 
+    # ------------------------------------------------------------------
+    # Canonical-form matching (task 3998).  The match used to be stripped
+    # EXACT-string equality, so an L2 filed as 'Watcher lease stolen.' and a
+    # re-promote spelled 'watcher  lease STOLEN' minted two L2s for one cause.
+    # ------------------------------------------------------------------
+
+    def test_root_cause_match_is_canonicalised(self, tmp_path: Path):
+        """THE PIN: case, whitespace runs and trailing punctuation all fold.
+
+        PRD boundary row B4.  This is the capability the task delivers: the
+        stored key and the query differ in case, in internal whitespace and in a
+        trailing '.', and the lookup must still route the re-promote to the
+        existing L2 instead of minting a near-duplicate.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, 'task-1', 'Watcher lease stolen.')
+
+        result = queue.find_pending_l2_by_root_cause('watcher  lease STOLEN')
+
+        assert result == l2.id, (
+            f'Expected the canonically-equal query to find {l2.id!r}; got {result!r}'
+        )
+
+    def test_punctuation_is_a_separator_at_the_match_site(self, tmp_path: Path):
+        """A delimiter-dense key folds onto its space-separated spelling."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = self._make_l2(queue, 'task-1', 'starvation:2370:persistent-lock-contention')
+
+        result = queue.find_pending_l2_by_root_cause(
+            'Starvation 2370 persistent lock contention'
+        )
+
+        assert result == l2.id, f'Expected {l2.id!r}; got {result!r}'
+
+    def test_canonically_distinct_keys_still_miss(self, tmp_path: Path):
+        """The CONSERVATIVE direction — the regression guard against deletion semantics.
+
+        Under DELETION semantics (``a.b`` -> ``ab``) these two keys collapse into
+        one and two distinct incidents are silently absorbed into a single L2.
+        69% of live root_cause keys carry a digit adjacent to a separator, so
+        this is the common shape, not a corner case.  An under-fold leaves a
+        noisy but safe duplicate; an over-fold is silent.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', 'risk:3184')
+
+        assert queue.find_pending_l2_by_root_cause('risk:318:4') is None
+
+        queue2 = EscalationQueue(tmp_path / 'esc2')
+        self._make_l2(queue2, 'task-2', 'curator-failure:account-cap-2026-08-05')
+
+        assert queue2.find_pending_l2_by_root_cause(
+            'curator-failure:account-cap-2026-0-805'
+        ) is None
+
+    @pytest.mark.parametrize('query', ['::', '--', '  :  ', '!!!'])
+    def test_query_with_empty_canonical_form_never_matches(
+        self, tmp_path: Path, query: str,
+    ):
+        """The falsy-key guard now applies to the CANONICAL form, not `.strip()`.
+
+        `'::'` survives `.strip()` but carries no identity at all, so it must not
+        be used as a lookup key against a real L2.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', 'Bad merge strategy')
+
+        assert queue.find_pending_l2_by_root_cause(query) is None
+
+    @pytest.mark.parametrize('query', ['::', '--', 'Bad merge strategy', ''])
+    def test_stored_key_with_empty_canonical_form_is_never_matched(
+        self, tmp_path: Path, query: str,
+    ):
+        """The guard is symmetric: a stored all-punctuation key matches nothing.
+
+        Such an L2 is unfoldable by construction, which is why the server refuses
+        to mint one in the first place (see promote_to_l2's mint validation).
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._make_l2(queue, 'task-1', '::')
+
+        assert queue.find_pending_l2_by_root_cause(query) is None
+
+    def test_oldest_wins_across_canonically_equal_spellings(self, tmp_path: Path):
+        """Oldest-wins still holds when the matches are canonical, not exact.
+
+        Two pending L2s carrying textually-DIFFERENT but canonically-EQUAL keys
+        must resolve to the older one, exactly as two exact-key twins do — the
+        tie-break is unchanged by canonicalisation.
+        """
+        import time
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        older = self._make_l2(queue, 'task-1', 'Watcher lease stolen.')
+        time.sleep(0.01)  # ensure distinct timestamps
+        newer = self._make_l2(queue, 'task-2', 'watcher  lease STOLEN')
+
+        result = queue.find_pending_l2_by_root_cause('WATCHER-LEASE-STOLEN')
+
+        assert result == older.id, (
+            f'Expected oldest id={older.id!r}, got {result!r} (newer={newer.id!r})'
+        )
+
+    def test_l0_l1_with_canonically_matching_root_cause_still_excluded(
+        self, tmp_path: Path,
+    ):
+        """The level==2 filter is unchanged — canonicalisation must not widen it."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        for level, role in ((0, 'implementer'), (1, 'steward')):
+            esc = Escalation(
+                id=queue.make_id(f'task-{level}'),
+                task_id=f'task-{level}',
+                agent_role=role,
+                severity='blocking',
+                category='design_concern',
+                summary=f'L{level} test',
+                level=level,
+                root_cause='Watcher lease stolen.',
+            )
+            queue.submit(esc)
+
+        result = queue.find_pending_l2_by_root_cause('watcher  lease STOLEN')
+
+        assert result is None, f'Expected None (level filter), got {result!r}'
+
+    def test_corrupt_timestamp_warning_fires_on_a_canonical_match(
+        self, tmp_path: Path, caplog,
+    ):
+        """The malformed-timestamp WARNING path survives the switch to canonical matching.
+
+        The parse happens only for entries that MATCHED, so a match found
+        canonically rather than exactly must still reach it — otherwise the
+        data-quality signal would silently vanish for exactly the folds this task
+        adds.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = Escalation(
+            id=queue.make_id('task-99'),
+            task_id='task-99',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster corrupt-ts canonical test',
+            level=2,
+            root_cause='Watcher lease stolen.',
+        )
+        l2.timestamp = 'not-a-timestamp'
+        queue.submit(l2)
+
+        with caplog.at_level(logging.WARNING, logger='shared.timestamps'):
+            result = queue.find_pending_l2_by_root_cause('watcher  lease STOLEN')
+
+        assert result == l2.id, (
+            f'Expected corrupt-ts L2 to still be returned; got result={result!r}'
+        )
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'queue.find_pending_l2_by_root_cause' in r.message
+        ]
+        assert warning_records, (
+            f"Expected >=1 WARNING mentioning 'queue.find_pending_l2_by_root_cause'; "
+            f"got caplog.records: {[(r.levelname, r.message) for r in caplog.records]}"
+        )
+
 
 class TestAddMembersToL2:
     """EscalationQueue.add_members_to_l2() appends member ids to a pending L2."""
