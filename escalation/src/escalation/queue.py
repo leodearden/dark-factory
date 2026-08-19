@@ -18,6 +18,11 @@ from typing import Any, TypedDict
 from shared.timestamps import parse_timestamp_or_warn
 
 from escalation import archive
+
+# escalation.canonical is a LEAF (zero intra-package imports), which is what
+# makes this import legal at all: dedupe.py imports THIS module at module level,
+# so queue.py can never import dedupe.py, where the transform used to live.
+from escalation.canonical import canonical_root_cause
 from escalation.classify import default_resolution_class_for_resolver
 
 # max_severity lives in models.py beside the KNOWN_SEVERITIES vocabulary it must
@@ -238,11 +243,25 @@ def _framing_view(a: Amendment) -> tuple[str, str, str, list[str]]:
     ``timestamp`` likewise: the queue stamps it, so it always differs and would
     defeat the comparison entirely.
 
-    ``root_cause`` is compared STRIPPED because the create path stores
-    ``root_cause.strip()`` on the record itself and
-    ``find_pending_l2_by_root_cause`` matches on that stripped key — a fold
-    differing only in surrounding whitespace found this very L2 BY that key, so
-    treating it as new framing would contradict the lookup that routed it here.
+    ``root_cause`` is compared RAW-STRIPPED — deliberately NOT canonicalised,
+    even though ``find_pending_l2_by_root_cause`` now matches canonically (task
+    3998).  Canonicalising here would suppress exactly the record the system
+    needs: a fold whose root_cause differs only in case/whitespace/punctuation is
+    a re-SPELLING of the cause, and that pre-canonical spelling is the ONLY
+    evidence that canonicalisation folded it.  It must therefore read as NEW
+    framing and be recorded (the entry lands in ``Amendment.root_cause``, which
+    is documented as the pre-canonical incoming root cause, and feeds the
+    over-fold detector's distinct-variant count).  Treating it as a repeat would
+    make an over-fold — distinct causes silently merged under one canonical key —
+    unobservable, which is the failure mode canonicalisation introduces.
+
+    The cost is amendment-cap churn from trivial re-spellings; that is bounded by
+    ``_MAX_AMENDMENTS``, counted in ``amendments_truncated``, and was budgeted:
+    that constant is sized against the post-canonicalisation fold rate.
+
+    ``.strip()`` (rather than nothing) is kept because the create path stores
+    ``root_cause.strip()`` on the record itself, so comparing unstripped text
+    against a stripped field would report new framing for a pure no-op.
     """
     return (
         a.get('root_cause', '').strip(),
@@ -1018,20 +1037,44 @@ class EscalationQueue:
     def find_pending_l2_by_root_cause(self, root_cause: str) -> str | None:
         """Return the id of the oldest pending L2 escalation whose root_cause matches.
 
+        Matching is on the CANONICAL FORM, not the raw string (task 3998).  Two
+        promotes describing one cause but spelled differently — differing only in
+        case, in whitespace runs or in punctuation — used to mint two L2s for one
+        incident; they now fold into the first.
+
         Algorithm:
-        1. Strip *root_cause*; return None immediately for empty/whitespace-only input
-           (the falsy-key guard — mirrors ``dedupe.find_dedupe_parent``'s convention).
+        1. Canonicalise *root_cause* via
+           :func:`escalation.canonical.canonical_root_cause` — THE single
+           canonicalisation site, shared with dedupe's two normalisation
+           consumers.  Return None immediately when the CANONICAL form is empty
+           (the falsy-key guard — mirrors ``dedupe.find_dedupe_parent``'s
+           convention).  Note this is stricter than ``.strip()``: an
+           all-punctuation key like ``'::'`` survives stripping but canonicalises
+           to nothing, and such a key can never identify a cluster.
         2. Iterate ``self.get_pending()``, filtering to ``level == 2`` and
-           ``esc.root_cause.strip() == candidate``.
+           ``canonical_root_cause(esc.root_cause) == candidate``.  BOTH SIDES are
+           canonicalised at compare time; the record's own ``root_cause`` is
+           stored and displayed VERBATIM and is never overwritten with the
+           canonical form — an L2's framing is human-facing and immutable, and a
+           persisted derived value could silently desynchronise from the function
+           that derives it.
         3. Among matches, return the id of the entry with the OLDEST timestamp
            (ISO 8601 string comparison; malformed timestamps fall back to
            ``datetime.min`` so they sort first — never silently lost).
+
+        PUNCTUATION IS A SEPARATOR, NOT DELETED (``a.b`` -> ``a b``): root_cause
+        keys are delimiter-dense identity strings — 69% of the distinct live keys
+        carry a digit adjacent to a separator (task ids, SHA prefixes, dates) —
+        so deleting the separator would glue ``risk:3184`` onto ``risk:318:4``
+        and silently merge two distinct incidents into one L2.  The full
+        measurement and the asymmetric-cost argument are in
+        :mod:`escalation.canonical`'s docstring.
 
         Cost: O(N) over pending escalations, where N is the current queue depth.
         Acceptable at current escalation rates; mirrors the existing
         ``find_dedupe_parent`` O(N) pattern in dedupe.py.
         """
-        candidate = root_cause.strip()
+        candidate = canonical_root_cause(root_cause)
         if not candidate:
             return None
 
@@ -1041,7 +1084,7 @@ class EscalationQueue:
         for esc in self.get_pending():
             if esc.level != 2:
                 continue
-            if esc.root_cause.strip() != candidate:
+            if canonical_root_cause(esc.root_cause) != candidate:
                 continue
             # Parse timestamp; fall back to datetime.min on bad input so malformed
             # entries are treated as oldest (never silently dropped). Emits a WARNING
