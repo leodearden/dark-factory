@@ -68,6 +68,12 @@ from test_merge_verify_lease_guard import (  # noqa: F401 -- fixtures used by na
     real_git_ops,
 )
 
+# The chunked-`/proc/locks` fixtures (task 4227), reused rather than forked:
+# `_locks_row` derives MAJ:MIN:INO from a genuine `os.stat`, and
+# `_ChunkedLocksPath` is the Path SUBCLASS that serves scripted snapshots
+# through the reader's existing `locks_path=` keyword.
+from test_verify_cancel import _ChunkedLocksPath, _locks_row
+
 from orchestrator.git_ops import GitOps, MergeVerifyLeaseContended, _run
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
@@ -3224,3 +3230,150 @@ class TestCancelledResetNeverOrphansTheLaneLock:
             'the reset acquired the lane lock ON the event-loop thread — a '
             'bounded wait of minutes there stalls every other coroutine'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 4227: the ROOT CAUSE beneath 3598/3604/3783 — a CHUNKED READ that
+# succeeds and still drops our record.
+#
+# Task 3783 absorbed this at the two ACQUIRE-TIMEOUT sites, keyed on an EMPTY
+# result (`_settled_lane_lock_holder_pids`).  It deliberately did not cover the
+# two `holder_pids is None` branches — `_lane_lock_holder_facts` (git_ops.py
+# ~1868) and `_lane_lock_self_owned_leak` (git_ops.py ~2939) — which take their
+# OWN unabsorbed one-shot read.  That residue is live and measurable: the
+# staging read at `test_live_in_process_span_is_not_a_leak` goes through
+# `wait_for_lane_lock_holder` (task 3184's fix), but the two-arg
+# `_lane_lock_self_owned_leak(lock_path, 1.0)` calls beside it do not.  The
+# staging read was absorbed; the read UNDER TEST was not.
+#
+# In production that miss is not a flaky assert but a wrong classification: a
+# genuine self-owned B13 leak — the incident this whole module exists for —
+# read as ordinary foreign contention, with the forensics clause degrading to
+# "the kernel reports no FLOCK holder" in exactly the case it was written for.
+#
+# The reader under test is the GENUINE one (`verify_cancel.lane_lock_holder_
+# pids`), merely bound to a chunked table, because this is a root-cause task:
+# a scripted stub would pin the test's model of the reader, not the reader.
+# ---------------------------------------------------------------------------
+
+#: One row for an inode that is never any lock file (inode 1 is not a regular
+#: file), present in EVERY scripted snapshot.  A chunk-skip drops OUR record
+#: while the rest of a system-wide table reads normally — a fixture serving an
+#: empty first snapshot would be modelling a different, easier defect.
+_UNRELATED_LOCKS_ROW = '309: FLOCK  ADVISORY  WRITE 6001 103:08:1 0 EOF\n'
+
+
+def _chunk_skipping_reader(
+    lock_path: Path,
+    holder_pid: int,
+    *,
+    confirm_reads: int | None = None,
+) -> Callable[[Path], list[int]]:
+    """Bind the REAL reader to a lock table whose FIRST read drops our row.
+
+    *confirm_reads* ``None`` means "take production's default, through the
+    plain two-argument call both `holder_pids is None` branches make" — so the
+    fix arm exercises what production actually gets, not an override.  Passing
+    ``1`` reproduces the pre-fix one-shot read exactly and is the control arm.
+
+    A FRESH snapshot sequence per query is deliberate: in production every
+    one-shot consumer of the reader independently rolls the same dice, so a
+    read counter shared across two call sites would let the second inherit the
+    first's recovery — and the control arm would pass vacuously.
+    """
+    ours = _locks_row(lock_path, holder_pid) + '\n'
+    lossy = _UNRELATED_LOCKS_ROW
+    settled = _UNRELATED_LOCKS_ROW + ours
+
+    def _read(path: Path) -> list[int]:
+        chunked = _ChunkedLocksPath(
+            lock_path.parent / 'locks', snapshots=[lossy, settled],
+        )
+        if confirm_reads is None:
+            return lane_lock_holder_pids(path, locks_path=chunked)
+        return lane_lock_holder_pids(
+            path, locks_path=chunked, confirm_reads=confirm_reads,
+        )
+
+    return _read
+
+
+class TestChunkSkippedReadStillClassifiesASelfOwnedLeak:
+    """The `holder_pids is None` branches task 3783 left unabsorbed.
+
+    Both consequences are pinned, because they are separate defects sharing one
+    cause: the PREDICATE silently flips (a leak reads as foreign contention),
+    and the FORENSICS clause degrades to the very "no FLOCK holder" wording
+    that exists to describe a genuinely released lock.
+    """
+
+    def test_a_chunk_skipped_read_still_reports_the_self_owned_leak(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A genuine B13 leak must survive a lossy read of the kernel table.
+
+        Layer (1) of the predicate asks whether OUR pid is among the FLOCK
+        holders.  A chunk-skip makes that `self_pid not in []`, so the
+        predicate returns ``None`` — foreign contention — and the loud,
+        human-escalating leak report the incident needed never fires.  The
+        lane here is genuinely leaked (unregistered fd, no rendezvous); the
+        only thing wrong is the snapshot.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with leaked_lane_lock(lock_path):
+            monkeypatch.setattr(
+                git_ops_mod,
+                'lane_lock_holder_pids',
+                _chunk_skipping_reader(lock_path, os.getpid()),
+            )
+
+            leak = real_git_ops._lane_lock_self_owned_leak(lock_path, 1.0)
+            assert leak is not None, (
+                'a self-owned lane-lock leak was classified as foreign '
+                'contention because ONE chunked /proc/locks read dropped our '
+                'row — the merge then defers quietly for up to four hours, '
+                'the exact outage shape of the incident'
+            )
+
+            facts = git_ops_mod._lane_lock_holder_facts(lock_path)
+            assert str(os.getpid()) in facts, (
+                f'the forensics clause must name the holder pid — degrading to '
+                f'"no FLOCK holder" here drops the one datum DF 3003/3081 had '
+                f'to reconstruct by hand from /proc/locks; got {facts!r}'
+            )
+
+    def test_confirm_reads_one_shows_both_defects_on_the_same_staging(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """CONTROL ARM: the identical staging, with the pre-fix one-shot read.
+
+        Without this the case above could pass because the chunked staging
+        stopped biting rather than because the reader tolerates it.  It also
+        records, executably, what the two unabsorbed branches did before this
+        task: a wrong classification and a degraded message, from a read that
+        never raised and so gave the OSError-keyed retries nothing to catch.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with leaked_lane_lock(lock_path):
+            monkeypatch.setattr(
+                git_ops_mod,
+                'lane_lock_holder_pids',
+                _chunk_skipping_reader(lock_path, os.getpid(), confirm_reads=1),
+            )
+
+            assert real_git_ops._lane_lock_self_owned_leak(lock_path, 1.0) is None, (
+                'staging error: a SINGLE read of this table must miss our row, '
+                'or the case above is not exercising the chunked-read skip'
+            )
+            facts = git_ops_mod._lane_lock_holder_facts(lock_path)
+            assert 'no FLOCK holder' in facts, (
+                f'staging error: the one-shot read must produce the degraded '
+                f'clause, or the fixture is not reproducing the defect; got '
+                f'{facts!r}'
+            )

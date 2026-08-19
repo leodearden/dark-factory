@@ -12,6 +12,7 @@ Steps covered:
   13 (test) real-process capstone: setsid + start_new_session escape tree reaped
 """
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -597,6 +598,58 @@ def _locks_row(
     return f'{row_id}: {arrow}{kind}  ADVISORY  WRITE {pid} {triple} 0 EOF'
 
 
+class _ChunkedLocksPath(Path):
+    """A ``locks_path`` serving SCRIPTED snapshots, one per ``read_text()`` call.
+
+    Makes the measured ``/proc/locks`` CHUNKED-READ SKIP deterministic.  The
+    kernel serves that seq_file one PAGE per ``read(2)`` regardless of the
+    caller's buffer (measured on this host: 4 ``read(2)`` calls returning
+    4049/4087/4083/3536 bytes for a 15755-byte table against a 1 MiB request),
+    and each read restarts the per-CPU lock-list walk from a POSITIONAL index —
+    so a lock released at an earlier position between chunks shifts every later
+    record down and ours is skipped outright.  The result is a read that
+    SUCCEEDS and returns a table missing a record: no ``OSError``, nothing for
+    an errno-keyed retry to notice, and a confident wrong answer at the caller.
+    Reproduced at 1.54% of reads (144/9337) against a real held flock with 24
+    concurrent churners — which is why it is invisible in isolation and red
+    only under a full parallel suite.
+
+    A ``pathlib.Path`` SUBCLASS rather than a duck-typed fake: it is
+    ``isinstance(..., Path)``, so it satisfies the reader's ``locks_path: Path``
+    annotation pyright-clean, and it drives the parser through the EXISTING
+    ``locks_path=`` keyword that :data:`PROC_LOCKS_PATH`'s own comment already
+    blesses — no new production seam.  Monkeypatching ``PROC_LOCKS_PATH``
+    instead would be INERT: both reader variants consume it as a DEF-TIME
+    default (esc-3604-1, recorded at test_lane_lock_leak_guard.py:1241-1246).
+
+    Snapshots are served in order and STICK on the last one, so a scripted list
+    bounds only the LOSSY PREFIX and never the read count — a reader free to
+    take one more read than the script anticipated still gets a well-defined
+    table.  An entry may be an ``OSError`` INSTANCE to raise instead of text,
+    which is how the first-read-vs-later-read failure asymmetry is driven.
+    ``reads`` records how many reads the caller actually took.
+    """
+
+    def __init__(
+        self, *args, snapshots: Sequence[str | OSError] = (), **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._snapshots: list[str | OSError] = list(snapshots)
+        self.reads: int = 0
+
+    def read_text(self, *args, **kwargs) -> str:  # noqa: ARG002 -- signature parity
+        self.reads += 1
+        if not self._snapshots:
+            raise AssertionError(
+                '_ChunkedLocksPath was constructed with no snapshots — the '
+                'fixture would be staging nothing at all'
+            )
+        entry = self._snapshots[min(self.reads - 1, len(self._snapshots) - 1)]
+        if isinstance(entry, OSError):
+            raise entry
+        return entry
+
+
 class TestLaneLockHolderPids:
     """lane_lock_holder_pids reports the pids holding an flock on a lock file."""
 
@@ -967,6 +1020,119 @@ class TestLaneLockHolderPidsStrict:
             'the wrapper must not have been aliased to the strict core — that '
             'would satisfy the identity check above while silently deleting '
             'the fail-safe policy every git_ops call site depends on'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 4227: the CHUNKED-READ skip — a read that SUCCEEDS and is still wrong.
+#
+# Task 3604 drew the line between "this ROW is odd" (skip) and "the whole
+# ANSWER is unknown" (raise).  There is a THIRD case neither variant handled:
+# "this READ was SHORT".  `/proc/locks` is a seq_file served one page per
+# `read(2)`, and each read restarts the per-CPU walk from a positional index,
+# so a lock released at an earlier position between chunks shifts every later
+# record down and ours is dropped.  Nothing raises, so `require_lane_lock_
+# holders`' OSError-keyed retry never fires; both variants render it as a
+# confident, WRONG answer.
+#
+# Every case is an explicit A/B: the SAME staging read with the confirm loop
+# and with `confirm_reads=1`, which reproduces the pre-fix one-shot behaviour
+# exactly.  The divergence is the thing under test, and the control arm is
+# what stops these cases from passing vacuously if the staging stops biting.
+# ---------------------------------------------------------------------------
+
+
+class TestChunkedLocksReadIsToleratedByTheReader:
+    """A record dropped by one chunked read must not read as "no holder"."""
+
+    @staticmethod
+    def _chunk_skipped(lock_path: Path, pid: int) -> _ChunkedLocksPath:
+        """A table whose FIRST read drops *lock_path*'s row, then settles.
+
+        The unrelated row is present throughout: a chunk-skip drops OUR record
+        while the rest of a system-wide table reads normally, so a fixture that
+        served an empty first snapshot would be modelling a different (and
+        easier) defect than the measured one.
+        """
+        unrelated = '309: FLOCK  ADVISORY  WRITE 6001 103:08:1 0 EOF\n'
+        ours = _locks_row(lock_path, pid) + '\n'
+        return _ChunkedLocksPath(
+            lock_path.parent / 'locks', snapshots=[unrelated, unrelated + ours],
+        )
+
+    def test_a_record_dropped_by_the_first_read_is_recovered(self, tmp_path: Path):
+        """THE root-cause case: the holder is reported despite a lossy read.
+
+        A confirm read costs microseconds (procfs, no sleep) and can only ADD
+        an attribution that was true of the kernel at some instant — the defect
+        is FALSE-NEGATIVE-ONLY, since a chunked read can DROP a record but
+        never INVENT one.  Both variants must recover it: the read policy lives
+        in the strict core precisely so the wrapper cannot grow its own.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+
+        strict_locks = self._chunk_skipped(lock_path, 4242)
+        strict = lane_lock_holder_pids_strict(lock_path, locks_path=strict_locks)
+        assert strict == [4242], (
+            f'a holder dropped by ONE chunked read must still be reported — '
+            f'rendering it as "nobody holds it" is what misclassifies a '
+            f'self-owned B13 leak as foreign contention; got {strict!r} after '
+            f'{strict_locks.reads} read(s)'
+        )
+        assert strict_locks.reads > 1, (
+            f'the answer must have come from a CONFIRM read, not from the '
+            f'staging failing to bite; the reader took {strict_locks.reads} '
+            f'read(s)'
+        )
+
+        wrapper_locks = self._chunk_skipped(lock_path, 4242)
+        assert lane_lock_holder_pids(lock_path, locks_path=wrapper_locks) == [4242], (
+            'ANTI-FORK: the fail-safe wrapper must inherit the read policy '
+            'from the strict core, never carry a second copy of it'
+        )
+
+    def test_confirm_reads_one_reproduces_the_pre_fix_miss(self, tmp_path: Path):
+        """THE defect, pinned beside the fix on IDENTICAL staging.
+
+        ``confirm_reads=1`` is the pre-fix one-shot read exactly.  Pinning it
+        is what makes the case above legible (it shows what the confirm loop
+        buys) and what keeps it honest (if the chunked staging ever stops
+        biting, this arm fails rather than the other passing vacuously).
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+
+        strict_locks = self._chunk_skipped(lock_path, 4242)
+        strict = lane_lock_holder_pids_strict(
+            lock_path, locks_path=strict_locks, confirm_reads=1,
+        )
+        assert strict == [], (
+            f'a single read of this staging MUST miss the holder, or the '
+            f'fixture is not reproducing the defect; got {strict!r}'
+        )
+        assert strict_locks.reads == 1, (
+            f'confirm_reads=1 must take exactly one read — otherwise it is '
+            f'not the pre-fix behaviour it claims to reproduce; took '
+            f'{strict_locks.reads}'
+        )
+
+        wrapper_locks = self._chunk_skipped(lock_path, 4242)
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=wrapper_locks, confirm_reads=1,
+        ) == [], (
+            'the wrapper must diverge from the strict core ONLY on OSError '
+            'policy — the read count is core behaviour and must track it'
         )
 
 
