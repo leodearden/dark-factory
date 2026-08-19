@@ -2711,6 +2711,17 @@ class DriftCheckResult:
     verdict:       AGREE / DIVERGE / INCONCLUSIVE.
     local_passed:  bool verdict from the local runner (None when INCONCLUSIVE).
     remote_passed: bool verdict from the remote runner (None when INCONCLUSIVE).
+    local_category:  VerifyResult.category from the local runner, defaulting to ''.
+    remote_category: VerifyResult.category from the remote runner, defaulting to ''.
+                   Both are always populated when a comparison actually happened,
+                   and both stay '' when INCONCLUSIVE (nothing was compared --
+                   `verdict` is the disambiguator, exactly as it is for
+                   local_passed/remote_passed, which stay None there even when
+                   the local arm genuinely produced a result).  '' is ALSO the
+                   ordinary value for a clean verify result carrying no sentinel
+                   category, so '' never means "missing".  A non-empty value such
+                   as 'merge_flake_suppressed' marks an arm whose verdict came
+                   from a sentinel path rather than a clean first-pass run.
     escalated:     True when a new divergence escalation was submitted.
     quarantined:   True when the remote runner was quarantined.
     """
@@ -2718,6 +2729,10 @@ class DriftCheckResult:
     verdict: DriftVerdict
     local_passed: bool | None = None
     remote_passed: bool | None = None
+    # Field order mirrors ParityRow (local_passed, remote_passed, local_category,
+    # remote_category) -- the sibling record of the same two-arm comparison.
+    local_category: str = ''
+    remote_category: str = ''
     escalated: bool = False
     quarantined: bool = False
 
@@ -2789,6 +2804,12 @@ class DriftDetector:
 
         local_passed = local_result.passed
         remote_passed = remote_result.passed
+        # Same defensive getattr form run_verdict_parity uses: merge_drift wraps
+        # this whole check in a broad `except Exception`, so a bare .category
+        # AttributeError against an odd result object would silently kill the
+        # detective control rather than degrade one telemetry field.
+        local_category = getattr(local_result, 'category', '')
+        remote_category = getattr(remote_result, 'category', '')
 
         if local_passed == remote_passed:
             # Agree — emit verdict_parity_ok event.
@@ -2809,6 +2830,8 @@ class DriftDetector:
                 verdict=DriftVerdict.AGREE,
                 local_passed=local_passed,
                 remote_passed=remote_passed,
+                local_category=local_category,
+                remote_category=remote_category,
             )
 
         # Diverge — dedup'd escalation + quarantine.
