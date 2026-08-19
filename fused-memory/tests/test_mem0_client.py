@@ -840,6 +840,58 @@ class TestMem0BackendScrollAllByMetadata:
             await _drain(backend.scroll_all_by_metadata(Scope(project_id='p'), {}))
 
     @pytest.mark.asyncio
+    async def test_empty_filters_raises_at_call_time_not_first_iteration(self, backend):
+        """The empty-filters guard must fire when the method is CALLED.
+
+        ``async def`` + ``yield`` makes this an async GENERATOR function, so
+        calling it merely builds a generator object and runs no body at all --
+        the ``if not filters`` guard does not execute until the first
+        ``__anext__``. A caller that builds the generator and then
+        conditionally never iterates gets NO error for a mistake the
+        docstring documents as rejected, and the whole-collection
+        enumeration this guard exists to prevent passes silently unflagged.
+
+        The coroutine sibling ``scroll_by_metadata`` fails on await, so the
+        two halves of the same addressing contract disagree about when a bad
+        argument is a bad argument.
+
+        No await and no _drain here: the bare call expression is the entire
+        thing under test.
+        """
+        with pytest.raises(ValueError, match='scroll_all_by_metadata requires at least one filter'):
+            backend.scroll_all_by_metadata(Scope(project_id='p'), {})
+
+    @pytest.mark.asyncio
+    async def test_still_streams_lazily_after_eager_validation(self, backend):
+        """Validating eagerly must not make the SCROLL eager too.
+
+        The argument check moves to call time; the paging stays lazy, so
+        peak memory is still one page rather than the corpus. Mirrors
+        test_streams_rather_than_accumulating, but additionally asserts that
+        merely CONSTRUCTING the stream issues no Qdrant round-trip.
+        """
+        client = _paging_client([
+            ([self._make_mock_point('id-1'), self._make_mock_point('id-2')], 'off-1'),
+            ([self._make_mock_point('id-3')], None),
+        ])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            agen = backend.scroll_all_by_metadata(
+                Scope(project_id='p'), {'category': 'x'}, page_size=2,
+            )
+            assert client.scroll.await_count == 0, (
+                'building the stream must not fetch a page; '
+                f'scroll was awaited {client.scroll.await_count} times'
+            )
+            first = await anext(agen)
+            assert first['id'] == 'id-1'
+            assert client.scroll.await_count == 1, (
+                'consuming one record must fetch exactly one page; '
+                f'scroll was awaited {client.scroll.await_count} times'
+            )
+            await agen.aclose()
+
+    @pytest.mark.asyncio
     async def test_timeout_propagates_out_of_the_generator(self, backend):
         """A timed-out page must never be mistaken for the end of the stream."""
         client = AsyncMock()
