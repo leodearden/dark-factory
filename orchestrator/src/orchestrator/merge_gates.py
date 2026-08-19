@@ -1693,22 +1693,41 @@ def _ls_tree_object_type(ls_out: str) -> str | None:
     return None
 
 
+class _RenameProbeError:
+    """Sentinel type: git could not ANSWER the rename probe.
+
+    Distinct from ``None`` ("git answered, and there is no rename pair
+    here") so the resolver can fail CLOSED on an unmeasurable probe
+    instead of silently degrading to the weaker basename heuristic.
+    """
+
+    __slots__ = ()
+
+
+_RENAME_PROBE_ERROR = _RenameProbeError()
+
+
 async def _rename_pair_for(
     path: str,
     branch_head: str,
     git_ops: GitOps,
     *,
     task_id: str | None = None,
-) -> tuple[str, str] | None:
-    """One hop of git's own rename detection for *path*, or ``None``.
+) -> tuple[str, str] | _RenameProbeError | None:
+    """One hop of git's own rename detection for *path*.
 
     Finds the commit reachable from *branch_head* that DELETED *path*
     (``git log --diff-filter=D -1``), then re-reads that commit with
     rename detection on (``git show --name-status -M``) looking for an
     ``R<score>\\t<old>\\t<new>`` pair whose old side is *path*.
 
-    Returns ``(new_path, deleting_sha)``.  Fails CLOSED: a git error, no
-    deleting commit, or no pairable rename all return ``None``.
+    Three-valued outcome: returns ``(new_path, deleting_sha)`` when a pair
+    is found; ``None`` when git answered and there genuinely is no
+    deleting commit or no pairable rename; and ``_RENAME_PROBE_ERROR`` when
+    a git error means the question could not be answered at all.  Callers
+    MUST distinguish the last from ``None`` — see
+    :func:`_resolve_renamed_plan_path`, which fails CLOSED on it rather
+    than falling through to the basename heuristic on unmeasured evidence.
     """
     rc, del_out, del_err = await _run(
         ['git', 'log', '--diff-filter=D', '-1', '--format=%H', branch_head, '--', path],
@@ -1722,7 +1741,7 @@ async def _rename_pair_for(
             'git log --diff-filter=D -1 --format=%H <head> -- <entry>',
             rc, (del_err or '').strip()[:400],
         )
-        return None
+        return _RENAME_PROBE_ERROR
 
     del_sha = del_out.strip().splitlines()[0].strip() if del_out.strip() else ''
     if not del_sha:
@@ -1740,7 +1759,7 @@ async def _rename_pair_for(
             f'git show --name-status -M --format= {del_sha[:12]}',
             rc, (show_err or '').strip()[:400],
         )
-        return None
+        return _RENAME_PROBE_ERROR
 
     for line in show_out.splitlines():
         fields = line.split('\t')
@@ -1874,6 +1893,15 @@ async def _resolve_renamed_plan_path(
     shas: list[str] = []
     for _hop in range(_MAX_RENAME_HOPS):
         pair = await _rename_pair_for(current, branch_head, git_ops, task_id=task_id)
+        if isinstance(pair, _RenameProbeError):
+            logger.warning(
+                'plan-files-touched: rename-probe UNMEASURABLE for %s (declared %s) '
+                'at head=%s — resolution abandoned and the basename fallback '
+                'deliberately not attempted (fail CLOSED: never resolve on evidence '
+                'we could not measure). task_id=%s',
+                current, norm, branch_head, task_id or '<unknown>',
+            )
+            return None
         if pair is None:
             break
         new_path, del_sha = pair
