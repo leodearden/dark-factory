@@ -57,9 +57,9 @@ from fused_memory.middleware.recon_claim_verification_guard import (
     _resolve_git_toplevel,
 )
 from fused_memory.reconciliation.task_filter import (
-    _CLAUSE_SPLIT_RE,
     FUTURE_ASPIRATIONAL_RE,
     NEGATED_TERMINAL_RE,
+    STRICT_CLAUSE_BOUNDARY_RE,
     TASK_REF_RE,
 )
 
@@ -251,16 +251,51 @@ _ASPIRATIONAL_EXTENSION_RE: re.Pattern[str] = re.compile(
 )
 
 
+# The clause boundary is task_filter.STRICT_CLAUSE_BOUNDARY_RE — the
+# fail-safe-STRICT alphabet ('.', ';', newline, '!', '?'), NOT
+# task_filter._CLAUSE_SPLIT_RE, which the gate once imported and which narrowed
+# its dot to '\.(?!\w)' at task 3403 so dotted technical tokens
+# (dark-factory-orchestrator.yaml, CLAUDE.md:95) stop shattering a sentence.
+# The canonical rationale for keeping the two apart lives next to
+# STRICT_CLAUSE_BOUNDARY_RE. This module's stake in it:
+#
+#   A hit here gets WRITTEN. It sets extra['unverified_claim'], which rides
+#   into the Graphiti source_description prefix and every derived Mem0 fact's
+#   metadata (server/tools.py:2805-2807), and it files an operator escalation
+#   (:2815) — on EVERY add_episode regardless of agent, since that call site
+#   is "Deliberately NOT under a recon-stage- guard". A longer clause drags a
+#   still-pending task into a NEIGHBOURING task's completion clause, durably
+#   mislabelling a CORRECT episode as contradicted (INV-2) and injecting a
+#   false escalation into the human queue. MEASURED under the widened form:
+#   'df 1985 landed in orchestrator.yaml and task 1986 is still pending.' ->
+#   claims for BOTH 1985 and 1986.
+#
+# The tie-breaker is this module's own stance, stated in its docstring:
+# requiring a named ref "is also the volume control ... a tag that fires
+# constantly stops being read". Precision over recall — the reverse of the
+# recon detectors' fail-open-on-under-firing default.
+#
+# ACCEPTED RESIDUAL: the gate forgoes the widening's recall win. MEASURED,
+# both pre-3403 and here, 'Task 5252 (see CLAUDE.md:95) has landed and now
+# enforces the gate.' yields NO claim, so a genuine unverifiable completion
+# claim whose sentence contains a dotted token still goes untagged. Fixing
+# that without re-importing the precision loss needs nearest-ref proximity
+# binding instead of whole-clause co-occurrence — an association-algorithm
+# redesign, filed as follow-up ticket tkt_0RSM4JVBN05YSSP1E2ASRZ6VWH.
+#
+# Pinned by tests/test_completion_claim_gate.py::TestClauseBoundaryIsolation.
 def _iter_clauses(text: str):
     """Yield ``(clause, start_offset)`` for each clause of *text*.
 
-    Same boundaries as ``task_filter._CLAUSE_SPLIT_RE.split`` ('.', ';',
-    newline, '!', '?'), but offset-preserving: a claim's span has to point back
-    into the ORIGINAL text so the flag can quote what was claimed (INV-2).
-    Empty clauses are skipped, matching the sibling detectors.
+    Boundaries are '.', ';', newline, '!', '?' — see the block above for why
+    this gate takes ``task_filter.STRICT_CLAUSE_BOUNDARY_RE`` rather than
+    ``task_filter._CLAUSE_SPLIT_RE``, which narrowed its dot at task 3403.
+    Offset-preserving, unlike a plain ``split``: a claim's span has to point
+    back into the ORIGINAL text so the flag can quote what was claimed
+    (INV-2). Empty clauses are skipped, matching the sibling detectors.
     """
     pos = 0
-    for match in _CLAUSE_SPLIT_RE.finditer(text):
+    for match in STRICT_CLAUSE_BOUNDARY_RE.finditer(text):
         if match.start() > pos:
             yield text[pos:match.start()], pos
         pos = match.end()

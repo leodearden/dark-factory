@@ -3225,6 +3225,310 @@ class TestDiffStatusCorrection:
 
 
 # ---------------------------------------------------------------------------
+# Clause boundary grammar — _CLAUSE_SPLIT_RE (task 3403)
+# ---------------------------------------------------------------------------
+
+
+class TestClauseSplitRe:
+    """Tests for _CLAUSE_SPLIT_RE in task_filter.py — the clause boundary shared
+    by find_conflicting_task_status_ids() and
+    find_present_tense_completion_claim_task_ids().
+
+    Task 3403. The original alphabet was a bare character class, ``[.;\\n!?]``,
+    so EVERY dot was a clause boundary. Recon-authored prose is dense with
+    dotted tokens — ``dark-factory-orchestrator.yaml``, ``CLAUDE.md:95``,
+    ``.envrc``, ``v1.2.3``, ``1.5s``, dotted Python identifiers such as
+    ``task_filter.TASK_REF_RE`` — and every one of them shattered the sentence
+    containing it. When the shatter landed BETWEEN a task reference and the
+    status marker in its own sentence, clause-scoped association returned the
+    EMPTY SET on real recon-authored content (probe memory
+    80d3f4c9-c334-490e-ab14-443b8aebb5c1): both detectors were silently inert on
+    exactly the corpus they were written for.
+
+    The widened form guards the dot with a RIGHT-SIDE lookahead only —
+    ``\\.(?!\\w)|[;\\n!?]``. Right-side-only is load-bearing: a left-side
+    lookbehind, or a whitespace-on-both-sides rule, would stop splitting
+    ``'done. Task'`` — and that split is the precision guarantee separating
+    these detectors from is_mixed_temporal_framing (see
+    test_negative_two_different_task_ids below).
+
+    These tests pin both halves of the contract — the dotted tokens that must
+    NOT split, and every terminator that must still split — so a later edit to
+    the splitter can neither re-shatter technical prose nor quietly drop a
+    terminator.
+    """
+
+    # ------------------------------------------------------------------ #
+    # dotted technical tokens must NOT be clause boundaries (the defect)
+    # ------------------------------------------------------------------ #
+
+    def test_negative_dotted_tokens_are_not_clause_boundaries(self):
+        """A dot followed by a word character belongs to a token, not to a
+        sentence boundary: each of these real-corpus shapes must survive as a
+        single, unsplit clause. Under the pre-3403 ``[.;\\n!?]`` alphabet every
+        one of them was broken into two or more pieces.
+        """
+        from fused_memory.reconciliation.task_filter import _CLAUSE_SPLIT_RE
+
+        for text in (
+            'dark-factory-orchestrator.yaml',
+            'CLAUDE.md:95',
+            '.envrc',
+            'v1.2.3',
+            '1.5s',
+            'task_filter.TASK_REF_RE',
+        ):
+            assert _CLAUSE_SPLIT_RE.split(text) == [text], (
+                f'Expected a dotted technical token to yield exactly one '
+                f'non-empty clause, unsplit.\ntext={text!r}'
+            )
+
+    # ------------------------------------------------------------------ #
+    # every pre-existing terminator must still split
+    # ------------------------------------------------------------------ #
+
+    def test_positive_sentence_terminators_still_split(self):
+        """Narrowing the dot must cost no terminator: '.', ';', newline, '!' and
+        '?' all still end a clause, including a trailing '.' at end-of-string.
+
+        ``'a. b'`` is the case the right-side-only guard exists to preserve — a
+        lookbehind-based narrowing would stop splitting it, which is what makes
+        the two-different-ids precision tests pass.
+        """
+        from fused_memory.reconciliation.task_filter import _CLAUSE_SPLIT_RE
+
+        for text, expected in (
+            ('a. b', ['a', ' b']),
+            ('a.', ['a', '']),
+            ('a;b', ['a', 'b']),
+            ('a\nb', ['a', 'b']),
+            ('a!b', ['a', 'b']),
+            ('a?b', ['a', 'b']),
+        ):
+            assert _CLAUSE_SPLIT_RE.split(text) == expected, (
+                f'Expected the clause splitter to still break on this sentence '
+                f'terminator.\ntext={text!r}'
+            )
+
+    # ------------------------------------------------------------------ #
+    # arity: the splitter must never capture
+    # ------------------------------------------------------------------ #
+
+    def test_clause_split_re_has_no_capture_group(self):
+        """``re.split`` on a pattern carrying a capture group interleaves the
+        matched separators into its result, so both callers' per-clause loops
+        would start seeing bare '.'/';' fragments as clauses. The widened form
+        uses a non-capturing lookahead precisely for this reason; the arity is
+        pinned so a later edit cannot reintroduce a group.
+        """
+        from fused_memory.reconciliation.task_filter import _CLAUSE_SPLIT_RE
+
+        assert _CLAUSE_SPLIT_RE.groups == 0, (
+            f'Expected _CLAUSE_SPLIT_RE to carry zero capture groups so re.split '
+            f'returns clauses only.\npattern={_CLAUSE_SPLIT_RE.pattern!r}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # consumer set: the safety case is a claim about WHO imports this
+    # ------------------------------------------------------------------ #
+
+    def test_clause_split_re_has_no_out_of_module_consumers(self):
+        """_CLAUSE_SPLIT_RE is module-private BY CONTRACT — scanned, not asserted
+        in prose.
+
+        Widening the splitter is only defensible because of who reads it: both
+        consumers (find_conflicting_task_status_ids,
+        find_present_tense_completion_claim_task_ids) feed early-return
+        SOFT-BLOCK write gates in server/tools.py, where the widening's
+        characterized over-fire
+        (test_widened_clause_tags_both_coordinated_ids, and its mirror in
+        TestFindPresentTenseCompletionClaimTaskIds) costs an author a
+        rephrase-and-retry and nothing else. The argument is restated in the
+        comment block above the constant and in those two tests' docstrings —
+        but a restatement is not an enforcement.
+
+        That contract was already violated once, before anything checked it:
+        the task 3403 review found services/completion_claim_gate.py importing
+        this constant while durably tagging episodes as unverified and filing
+        operator escalations, which made the shipped bounded-blast-radius claim
+        false as written. It now takes STRICT_CLAUSE_BOUNDARY_RE instead. Absent
+        this test, the NEXT such importer would invalidate the safety case just
+        as silently — every existing test would still pass, because they pin the
+        splitter's alphabet and arity, not its blast radius.
+
+        The scan is AST-based rather than textual on purpose: the name appears
+        in prose all over this subsystem (comment blocks, docstrings,
+        cross-references in audit_duplicate_memories), and only a CODE-level
+        reference — an import, a Name, an attribute access — can actually
+        propagate the widening. ast.walk sees none of the prose.
+
+        A new importer must first show its fail-safe direction matches the two
+        soft-block consumers'. If a longer clause on its path costs anything
+        that does not self-heal next cycle — a retired edge, a durable tag, an
+        escalation already in the human queue — it wants
+        STRICT_CLAUSE_BOUNDARY_RE, and adding itself to the allowlist below is
+        the wrong fix.
+        """
+        import ast
+        from pathlib import Path
+
+        package_root = Path(__file__).resolve().parents[1]
+        # Every file allowed to reference the private constant in CODE.
+        allowlist = {'src/fused_memory/reconciliation/task_filter.py'}
+        skip_parts = {'.venv', 'site-packages', '__pycache__'}
+
+        consumers: set[str] = set()
+        scanned = 0
+        for root in (package_root / 'src', package_root / 'scripts'):
+            for path in sorted(root.rglob('*.py')):
+                if skip_parts.intersection(path.parts):
+                    continue
+                scanned += 1
+                tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+                for node in ast.walk(tree):
+                    if (
+                        (isinstance(node, ast.Name) and node.id == '_CLAUSE_SPLIT_RE')
+                        or (isinstance(node, ast.Attribute) and node.attr == '_CLAUSE_SPLIT_RE')
+                        or (
+                            isinstance(node, ast.ImportFrom)
+                            and any(alias.name == '_CLAUSE_SPLIT_RE' for alias in node.names)
+                        )
+                    ):
+                        consumers.add(path.relative_to(package_root).as_posix())
+                        break
+
+        assert scanned > 50, (
+            f'Expected the scan to reach the package sources; only {scanned} files '
+            f'were parsed, so a passing result would be vacuous.\nroot={package_root}'
+        )
+        assert consumers == allowlist, (
+            f'_CLAUSE_SPLIT_RE gained an out-of-module consumer. The widening is '
+            f'only safe for callers that fail toward a SOFT BLOCK; if a longer '
+            f'clause on this path retires an edge, writes a durable tag, or files '
+            f'an escalation, import task_filter.STRICT_CLAUSE_BOUNDARY_RE instead '
+            f'(see completion_claim_gate for the worked example).'
+            f'\nunexpected={sorted(consumers - allowlist)!r}'
+            f'\nmissing={sorted(allowlist - consumers)!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task-reference grammar — TASK_REF_RE (task 3403)
+# ---------------------------------------------------------------------------
+
+
+class TestTaskRefRe:
+    """Tests for TASK_REF_RE in task_filter.py — the shared explicit
+    task-reference grammar.
+
+    Task 3403, second half. The separator between the anchor and the digits was
+    ``\\s*#?\\s*``, which admits 'task 94', 'df 94', '#94', 'task #94' and
+    'task # 94' but NOT 'task/94' — the orchestrator's own branch-name
+    convention, the form that appears in every merge commit subject ('Merge
+    task/3698 into main') and throughout recon prose about branches and
+    worktrees. Adding '/' to that separator character class is what this
+    widening does; the prior art is
+    audit_found_on_main_provenance.py:98, which already spells the same
+    reference form with the same trailing-\\b discipline.
+
+    This regex is the most consequential in the module: two of its three
+    out-of-module consumers end in memory_service.update_edge(invalid_at=...),
+    a real Graphiti edge retirement. So the negative cases below matter as much
+    as the positive ones — they are the net that keeps the anchoring honest.
+    ``\\btask\\b`` (not ``task\\w*``) is what keeps 'get_task' and
+    'task_knowledge_sync' from being read as references, and the trailing
+    ``\\b`` on the digit group is what stops 'task/339' being read out of
+    'task/3399'.
+    """
+
+    # ------------------------------------------------------------------ #
+    # slash form — the new grammar (task 3403)
+    # ------------------------------------------------------------------ #
+
+    def test_positive_slash_form_references(self):
+        """The 'task/<id>' branch-name form, and its df/spaced variants, must
+        each resolve to the bare id. All MEASURED [] before the widening.
+        """
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        for text in ('task/94', 'df/94', 'task / 94', 'Task/94'):
+            assert TASK_REF_RE.findall(text) == ['94'], (
+                f"Expected ['94'] for the slash-form task reference.\ntext={text!r}"
+            )
+
+    # ------------------------------------------------------------------ #
+    # pre-existing forms must not regress
+    # ------------------------------------------------------------------ #
+
+    def test_positive_existing_forms_still_match(self):
+        """Every reference form the grammar already admitted must survive the
+        widening unchanged — the '/' is added to the existing separator, it does
+        not replace anything.
+        """
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        for text in ('task 94', 'df 94', '#94', 'task #94', 'task # 94'):
+            assert TASK_REF_RE.findall(text) == ['94'], (
+                f"Expected ['94'] for a pre-existing task-reference form."
+                f'\ntext={text!r}'
+            )
+
+    # ------------------------------------------------------------------ #
+    # word-boundary guard — the false positives that must stay excluded
+    # ------------------------------------------------------------------ #
+
+    def test_negative_word_boundary_guard_holds(self):
+        """The anchor must stay ``\\btask\\b``/``\\bdf\\b``, never ``task\\w*`` and
+        never a '/'-folded anchor.
+
+        Each of these is a real shape from the corpus that must NOT read as a
+        task reference: a tool name ('get_task'), a recon stage name
+        ('task_knowledge_sync'), a worktree path whose segment is the PLURAL
+        'tasks' (not ``\\btask\\b``), and a filesystem path that merely follows
+        the word 'task'. All four MEASURED [] both before and after the
+        widening; they are the regression net that keeps a future widening
+        honest. The audit script's
+        test_untasked_snapshot_is_counted_not_silently_dropped depends on the
+        first two in particular.
+        """
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        for text in (
+            'get_task reports status="in-progress"',
+            'task_knowledge_sync 12',
+            '.worktrees/tasks/94/plan.json',
+            'task /tmp/5 was written',
+        ):
+            assert TASK_REF_RE.findall(text) == [], (
+                f'Expected [] — this must not read as an explicit task '
+                f'reference.\ntext={text!r}'
+            )
+
+    # ------------------------------------------------------------------ #
+    # arity: exactly one capture group
+    # ------------------------------------------------------------------ #
+
+    def test_task_ref_re_has_exactly_one_capture_group(self):
+        """The id must be the pattern's ONLY group.
+
+        Load-bearing in three places: find_conflicting_task_status_ids and
+        find_present_tense_completion_claim_task_ids both call ``int(m)`` over
+        ``TASK_REF_RE.findall(clause)`` — a second group makes findall return
+        tuples and that raises — and
+        stale_priority_override_edge_sweep.extract_priority_override_task_id
+        reads ``.group(1)``. This is why the slash form is added as a character
+        class in the existing separator (``\\s*[#/]?\\s*``) rather than as a new
+        alternation arm.
+        """
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        assert TASK_REF_RE.groups == 1, (
+            f'Expected TASK_REF_RE to carry exactly one capture group (the id), '
+            f'so findall returns plain strings.\npattern={TASK_REF_RE.pattern!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Conflicting task-status framing detection (task 2276)
 # ---------------------------------------------------------------------------
 
@@ -3287,6 +3591,46 @@ class TestConflictingTaskStatusFraming:
             f'case-insensitively.\ntext={text!r}'
         )
 
+    def test_positive_dotted_token_between_ref_and_status(self):
+        """Task 3403: a dotted technical token sitting BETWEEN the task ref and
+        its status marker must not hide the contradiction.
+
+        Under the pre-3403 clause splitter every dot was a boundary, so
+        'dark-factory-orchestrator.yaml' shattered the first sentence into
+        '...Task 4802 (tracked in dark-factory-orchestrator' + 'yaml) is still
+        pending' — divorcing the ref from 'still pending' and dropping the
+        non-terminal tag entirely. MEASURED: returned set() before the widening,
+        i.e. the detector was inert on the very filenames recon prose is full of.
+        """
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = (
+            'Task 4802 (tracked in dark-factory-orchestrator.yaml) is still '
+            'pending. Task 4802 landed as merge commit eb7f5d6437.'
+        )
+        assert find_conflicting_task_status_ids(text) == {4802}, (
+            f'Expected find_conflicting_task_status_ids to return {{4802}} when a '
+            f'dotted filename separates the ref from its status marker.'
+            f'\ntext={text!r}'
+        )
+
+    def test_positive_slash_form_task_ref(self):
+        """Task 3403: a contradiction narrated with the 'task/<id>' branch-name
+        form must fire just as it does for 'task <id>'.
+
+        That form is the orchestrator's own branch convention and appears
+        throughout recon prose about branches and merges, so a detector blind to
+        it was blind to a large slice of the corpus. MEASURED: set() before the
+        widening.
+        """
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = 'task/4802 is still pending. task/4802 landed as merge commit abc.'
+        assert find_conflicting_task_status_ids(text) == {4802}, (
+            f'Expected find_conflicting_task_status_ids to return {{4802}} for the '
+            f'slash-form branch-name reference.\ntext={text!r}'
+        )
+
     def test_is_conflicting_task_status_framing_true_for_incident_shape(self):
         """is_conflicting_task_status_framing must mirror find_...ids() as a bool."""
         from fused_memory.reconciliation.task_filter import is_conflicting_task_status_framing
@@ -3318,6 +3662,29 @@ class TestConflictingTaskStatusFraming:
             f'Expected empty set for two different ids with different statuses, '
             f'got a non-empty set.\ntext={text!r}'
         )
+
+    def test_negative_two_different_ids_across_every_terminator(self):
+        """The same precision check as above, once per NON-dot terminator.
+
+        Only the dot form had coverage before task 3403, so ';', '!', '?' and a
+        newline could each have been dropped from the splitter's alphabet
+        without a single test failing. These four are green both before and
+        after the widening — they exist so a later edit to the clause splitter
+        cannot silently collapse a terminator and start merging two
+        independently-framed tasks into one clause.
+        """
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        for text in (
+            'Task 100 is done; Task 200 is still pending.',
+            'Task 100 is done! Task 200 is still pending.',
+            'Task 100 is done? Task 200 is still pending.',
+            'Task 100 is done\nTask 200 is still pending.',
+        ):
+            assert find_conflicting_task_status_ids(text) == set(), (
+                f'Expected empty set for two different ids separated by this '
+                f'clause terminator, got a non-empty set.\ntext={text!r}'
+            )
 
     def test_negative_terminal_only(self):
         """Terminal-only framing for one id must NOT fire."""
@@ -3370,6 +3737,54 @@ class TestConflictingTaskStatusFraming:
         assert is_conflicting_task_status_framing(text) is False, (
             f'Expected is_conflicting_task_status_framing to return False for two '
             f'different ids, got True.\ntext={text!r}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # clause-granularity caveat (task 3403): a wider clause makes the module's
+    # already-documented over-broad tagging fire MORE often. Pinned, not hidden.
+    # ------------------------------------------------------------------ #
+
+    def test_widened_clause_tags_both_coordinated_ids(self):
+        """Two different ids coordinated in ONE sentence, each with its own
+        status, are now BOTH tagged — a deliberate, characterized over-fire.
+
+        This is the module's inherited clause-granularity caveat
+        (task_filter.py:450-460 — a clause naming several ids tags ALL of them,
+        the detector does not bind a status marker to its nearest ref) firing
+        more often now that 'orchestrator.yaml' no longer shatters the sentence
+        into two clauses. MEASURED: set() before the widening, {1985, 1986}
+        after. It moves these two detectors off the module's
+        fail-open-on-under-firing default toward over-firing.
+
+        What bounds the blast radius is the CONSUMER SET of the private
+        _CLAUSE_SPLIT_RE, not any property of these detectors. It holds while
+        the consumers are exactly find_conflicting_task_status_ids
+        (conflicting_task_status_framing_write_blocked) and
+        find_present_tense_completion_claim_task_ids
+        (premature_completion_claim_write_blocked) — both early-return
+        SOFT-BLOCK gates in server/tools.py, where a hit costs a
+        rephrase-and-retry: no exception, no write, no data corruption. The
+        claim is contingent, and it was already falsified once: the task 3403
+        review found services/completion_claim_gate.py importing the same
+        constant while durably tagging episodes and filing operator
+        escalations. That consumer now takes STRICT_CLAUSE_BOUNDARY_RE, the
+        narrow variant task_filter exports for exactly this case, and the
+        consumer set is enforced rather than merely asserted here — see
+        TestClauseSplitRe.test_clause_split_re_has_no_out_of_module_consumers.
+
+        Suppressing the over-fire here instead would require nearest-ref
+        proximity binding, a redesign of the association algorithm and a far
+        larger risk to the two edge-invalidation consumers of TASK_REF_RE.
+        Following the module's house idiom, the trade-off is pinned by a test
+        so it stays visible rather than being discovered later.
+        """
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = 'df 1985 landed in orchestrator.yaml and task 1986 is still pending.'
+        assert find_conflicting_task_status_ids(text) == {1985, 1986}, (
+            f'Expected {{1985, 1986}} — the widened clause tags every id in a '
+            f'sentence carrying both a terminal and a non-terminal marker.'
+            f'\ntext={text!r}'
         )
 
 
@@ -3766,6 +4181,27 @@ class TestFindPresentTenseCompletionClaimTaskIds:
             f'complete.\ntext={text!r}'
         )
 
+    def test_positive_dotted_token_between_ref_and_claim(self):
+        """Task 3403: a dotted technical token BETWEEN the task ref and its
+        completion phrase must not hide the claim.
+
+        Under the pre-3403 clause splitter every dot was a boundary, so the
+        doc-and-line citation 'CLAUDE.md:95' shattered the sentence into 'Task
+        5252 (see CLAUDE' + 'md:95) has landed and now enforces the gate' — the
+        first clause holds the ref with no completion phrase, the second holds
+        the completion phrase with no ref, and the detector tagged neither.
+        MEASURED: returned set() before the widening.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'Task 5252 (see CLAUDE.md:95) has landed and now enforces the gate.'
+        assert find_present_tense_completion_claim_task_ids(text) == {5252}, (
+            f'Expected {{5252}} when a dotted doc citation separates the ref from '
+            f'its completion phrase.\ntext={text!r}'
+        )
+
     # ------------------------------------------------------------------ #
     # negative/exemption fixtures (must return empty set)
     # ------------------------------------------------------------------ #
@@ -3932,6 +4368,52 @@ class TestFindPresentTenseCompletionClaimTaskIds:
         assert find_present_tense_completion_claim_task_ids(text) == {5252}, (
             f'Expected {{5252}} — a clause boundary isolates the aspirational 5253.'
             f'\ntext={text!r}'
+        )
+
+    # ------------------------------------------------------------------ #
+    # clause-granularity caveat (task 3403): the mirror of
+    # TestConflictingTaskStatusFraming.test_widened_clause_tags_both_coordinated_ids
+    # ------------------------------------------------------------------ #
+
+    def test_widened_clause_tags_both_coordinated_ids(self):
+        """The same over-fire as the sibling detector's — pinned HERE because
+        this is the arm that actually rejects an author's write.
+
+        Task 3403 widened _CLAUSE_SPLIT_RE's dot to '\\.(?!\\w)' so dotted
+        technical tokens stop shattering a sentence. Residual (i) of that change
+        is that clauses are longer, so the clause-granularity caveat documented
+        above (a clause naming several ids tags ALL of them — the detector binds
+        no status marker to its NEAREST ref) fires more often. MEASURED on this
+        fixture: set() before the widening, {1985, 1986} after.
+
+        find_conflicting_task_status_ids pins the same fixture, but the
+        consequence differs in kind. This detector feeds
+        _premature_completion_block in server/tools.py, which cross-checks the
+        ids against LIVE statuses and returns
+        premature_completion_claim_write_blocked for any that are non-terminal.
+        So on a sentence like this one — which is CORRECT, and which explicitly
+        says 1986 is still pending — the write is rejected whenever 1986 really
+        is in-progress. That is the residual costing an author a rejected write,
+        not just a tagged id.
+
+        It is a soft block: an early-return error dict with a rephrase hint, no
+        exception and no write, and the bound holds only while this constant's
+        consumer set stays the two soft-block detectors (enforced by
+        TestClauseSplitRe.test_clause_split_re_has_no_out_of_module_consumers).
+        Suppressing the over-fire needs nearest-ref proximity binding — an
+        association-algorithm redesign, filed as a follow-up. Pinning it in both
+        detectors means a later narrowing has to move both trade-offs visibly
+        together.
+        """
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'df 1985 landed in orchestrator.yaml and task 1986 is still pending.'
+        assert find_present_tense_completion_claim_task_ids(text) == {1985, 1986}, (
+            f'Expected {{1985, 1986}} — the widened clause carries the completion '
+            f'phrase across every id in the sentence, including the one the '
+            f'sentence calls pending.\ntext={text!r}'
         )
 
 
