@@ -827,15 +827,18 @@ def render_report(
         # the total number of ENUMERATED sessions is not knowable here
         # (batch_source is a generic injected iterable), and claiming
         # "X of Y (enumerated)" would assert a number the code never
-        # measured. Reports `succeeded`, not `total`, as the coverage count:
-        # `total` counts digests DRAWN into a batch, including any that
-        # failed to code and so contributed no signal to the codebook (a
-        # storm batch, PRD §8.6, is the extreme case) -- `succeeded` is what
-        # this run actually coded. `drawn` is still reported alongside it,
-        # labelled, so nothing previously visible is lost.
-        coded = sum(stats.succeeded for stats in mining_result.batch_stats)
-        drawn = sum(stats.total for stats in mining_result.batch_stats)
+        # measured.
         if mining_result.stop_reason == "capped":
+            # Reports `succeeded`, not `total`, as the coverage count:
+            # `total` counts digests DRAWN into a batch, including any that
+            # failed to code and so contributed no signal to the codebook (a
+            # storm batch, PRD §8.6, is the extreme case) -- `succeeded` is
+            # what this run actually coded. `drawn` is still reported
+            # alongside it, labelled, so nothing previously visible is lost.
+            # Computed here, not at the outer `max_batches is not None`
+            # scope, because the "not reached" branch below never uses them.
+            coded = sum(stats.succeeded for stats in mining_result.batch_stats)
+            drawn = sum(stats.total for stats in mining_result.batch_stats)
             coverage_line = (
                 f"- coverage: coded {coded} of {drawn} session digest(s) drawn across "
                 f"{len(mining_result.batch_stats)} batch(es); operator batch cap = "
