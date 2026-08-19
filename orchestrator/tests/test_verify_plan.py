@@ -2514,6 +2514,17 @@ class TestPlanRecordScopedTargets:
         never a ModuleConfig, so the module-config axis is deliberately
         absent rather than inert: crossing it in would re-run each case five
         times under ids naming a dimension nothing reads.
+
+        Coverage boundary: the ``fallback/real-suite`` x ``collectable-test``
+        case DOES execute the ``collectable_tests`` + ``has_real_suite``
+        fidelity branch, but this sweep pins only the scope-consistency
+        invariant above — a regression to the pre-fix FILE_SCOPED
+        (with populated ``scoped_targets``) shape satisfies that invariant
+        too. The fidelity pin itself (exact command equality against the
+        unmodified parsed configured suite) lives in
+        ``TestDeriveVerifyPlanFallbackPath
+        .test_collectable_tests_with_configured_suite_run_verbatim_unscoped``,
+        not here.
         """
         plan = derive_verify_plan(files, [], config, fake_worktree_reader, role=role)
         _assert_scoped_targets_invariant(plan, files, f'{branch_name}/{diff_name}')
