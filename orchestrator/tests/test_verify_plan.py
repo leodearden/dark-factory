@@ -1870,6 +1870,40 @@ class TestDeriveVerifyPlanFallbackPath:
         assert run.cmd is not None
         assert run.cmd.targets == ('.',)
 
+    def test_collectable_tests_with_configured_suite_run_verbatim_unscoped(self):
+        """Fidelity fix (task γ review, correctness finding): configured suite runs VERBATIM.
+
+        Distinct from every other test in this class: the diff here is
+        collectable test file(s) ONLY — no conftest, no test-data module, no
+        structural file — so this exercises the ``elif collectable_tests:``
+        arm with ``has_real_suite`` True. ``_build_fallback_config`` never
+        file-scopes a real configured suite; it always runs it verbatim
+        (unscoped) or skips it entirely. Recording FILE_SCOPED here — as the
+        bare-default else-branch below it does — would misrepresent what
+        actually executes.
+
+        The parametrized sweep
+        (``test_fallback_path_scoped_targets_nonempty_exactly_for_file_scoped_runs``,
+        ids ``fallback/real-suite`` x ``collectable-test``) DOES execute this
+        same branch, but its body (``_assert_scoped_targets_invariant``)
+        pins only ``bool(scoped_targets) == (scope_kind is FILE_SCOPED)`` — a
+        regression to the pre-fix FILE_SCOPED-with-populated-scoped_targets
+        shape satisfies that invariant too, so the sweep would stay green
+        through it. Assertion 4 below (exact command equality against the
+        unmodified parsed configured suite) is the fidelity pin the sweep
+        does not provide: a FILE_SCOPED regression necessarily scopes the
+        command to the touched file and so cannot satisfy it.
+        """
+        config = OrchestratorConfig(project_root=Path('/fake'), test_command=ROOT_TEST_COMMAND)
+        plan = derive_verify_plan(
+            ['shared/tests/test_widget.py'], [], config, fake_worktree_reader,
+        )
+        run = _run_for(plan, '__fallback__', 'pytest:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FULL_SUITE
+        assert run.scoped_targets == ()
+        assert run.cmd == parse_config_command(config.test_command)
+
 
 # ---------------------------------------------------------------------------
 # Plan-level flags: needs_pipeline_guard_check / TRIVIAL (step-11: RED)
