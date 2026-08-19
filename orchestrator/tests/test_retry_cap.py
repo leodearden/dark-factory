@@ -139,15 +139,47 @@ class TestIsTransientApiRequeue:
             'Planning failed: agent API error: HTTP 503',
         ) is True
 
-    def test_inv5_single_source_5xx_predicate(self):
-        """INV-5: the scheduler must IMPORT the canonical 5xx band rather
-        than re-encode ``500 <= n <= 599`` (mirrors the re-export identity
-        pin in shared/tests/test_server_error.py)."""
-        from shared.cli_invoke import is_server_error_status
+    def test_inv5_single_source_5xx_predicate(self, monkeypatch):
+        """INV-5 BEHAVIOURALLY: the predicate must DELEGATE the band decision
+        to ``shared.cli_invoke.is_server_error_status`` rather than re-encode
+        ``500 <= n <= 599`` inline.
 
+        Redefining the canonical band to "only 418 is a server error" must
+        flip BOTH routes.  A hand-rolled inline comparison would ignore the
+        substitution and keep answering on the real band, so this fails for
+        exactly the regression it names — unlike a module-attribute identity
+        assertion, which an inline re-encode would happily pass.
+        """
         import orchestrator.scheduler as sched
 
-        assert sched.is_server_error_status is is_server_error_status
+        monkeypatch.setattr(sched, 'is_server_error_status', lambda s: s == 418)
+
+        # Field route follows the substituted band...
+        assert sched.is_transient_api_requeue('x', api_error_status=418) is True
+        assert sched.is_transient_api_requeue('x', api_error_status=500) is False
+        # ...and so does the legacy marker route.
+        assert sched.is_transient_api_requeue('agent API error: HTTP 418') is True
+        assert sched.is_transient_api_requeue('agent API error: HTTP 500') is False
+
+    # --- Conflicting evidence: POSITIVE-ONLY field, OR semantics ----------
+    # The field is checked FIRST but can only ever say "transient" — a
+    # non-5xx/None status is "no evidence", not an authoritative False.  Pin
+    # the disagreement both ways so the chosen rule cannot drift silently
+    # once tasks γ/η/θ start composing reasons from an earlier phase.
+
+    def test_non_5xx_field_does_not_veto_legacy_marker(self):
+        """field=400 + a ``HTTP 503`` marker resolves TRANSIENT: route 1
+        falls THROUGH on non-5xx rather than vetoing route 2."""
+        assert is_transient_api_requeue(
+            'Planning failed: agent API error: HTTP 503', api_error_status=400,
+        ) is True
+
+    def test_5xx_field_wins_without_any_marker(self):
+        """field=503 + a marker-free reason resolves TRANSIENT: route 1 needs
+        no cooperation from the prose."""
+        assert is_transient_api_requeue(
+            'implementer produced zero output', api_error_status=503,
+        ) is True
 
 
 # --- Counter mechanics --------------------------------------------------------
@@ -583,7 +615,19 @@ def _build_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float = 2
     )
 
 
-def _build_529_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float = 2.5):
+def _build_529_report(
+    outcome,
+    *,
+    cost_usd: float = 5.0,
+    steward_cost_usd: float = 2.5,
+    block_reason: str = 'Planning failed: agent API error: HTTP 529',
+    block_phase: str = 'plan',
+    api_error_status: int | None = None,
+):
+    """A 529-flavoured report.  Defaults carry the 5xx evidence in the LEGACY
+    marker prose; ``_build_field_only_529_report`` flips it to the structured
+    field instead.  Both shapes share this one construction site so the pair
+    of tests that contrast them cannot drift apart."""
     from orchestrator.harness import TaskReport
 
     return TaskReport(
@@ -592,28 +636,27 @@ def _build_529_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float
         outcome=outcome,
         cost_usd=cost_usd,
         steward_cost_usd=steward_cost_usd,
-        block_reason='Planning failed: agent API error: HTTP 529',
+        block_reason=block_reason,
         block_detail='transient provider overload',
-        block_phase='plan',
+        block_phase=block_phase,
+        api_error_status=api_error_status,
     )
 
 
-def _build_field_only_529_report(outcome, *, cost_usd: float = 5.0, steward_cost_usd: float = 2.5):
+def _build_field_only_529_report(outcome, **kwargs):
     """Task 3315: a REQUEUED report whose ONLY 5xx evidence is the structured
     ``api_error_status`` field — ``block_reason`` is deliberately MARKER-FREE,
-    so the legacy ``agent API error: HTTP <n>`` regex cannot classify it."""
-    from orchestrator.harness import TaskReport
+    so the legacy ``agent API error: HTTP <n>`` regex cannot classify it.
 
-    return TaskReport(
-        task_id='t1',
-        title='T1',
-        outcome=outcome,
-        cost_usd=cost_usd,
-        steward_cost_usd=steward_cost_usd,
+    A thin delegator, NOT a second builder: it overrides exactly the three
+    fields that differ, so there is nothing here to fall out of sync with
+    ``_build_529_report``."""
+    return _build_529_report(
+        outcome,
         block_reason='implementer produced zero output',
-        block_detail='see iteration log',
         block_phase='execute',
         api_error_status=529,
+        **kwargs,
     )
 
 
