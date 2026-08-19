@@ -30,11 +30,26 @@ axis (fail-safe: a mis-set ``0`` imposes no bound and never wipes the whole
 archive rather than being read as "keep zero"). Both caps non-positive is a
 pure no-op sweep.
 
+The two prune causes are NOT interchangeable. The count axis prunes
+OLDEST-FIRST, so whenever it drops a dir the age cap would have KEPT (reason
+exactly ``count``) it truncates the ``max_age_days`` window from the FORENSIC
+end while the sweep still advertises the full policy. That is no longer
+silent: such a run emits a distinct, greppable ``COUNT CAP BOUND`` WARNING and
+a machine-readable ``count_cap`` block in the JSON report (see
+:func:`summarize_count_cap`), carrying how deep the retention window has
+actually been truncated to and how to re-derive the cap. A dir tagged
+``age+count`` does NOT raise it — the age cap was discarding that dir anyway,
+so the count cap cost no history. ``max_task_dirs`` is sized as a DERIVED
+bound precisely so this alarm stays quiet in normal operation; see
+:func:`required_max_task_dirs`.
+
 Posture: best-effort, LOUD, never-raise (mirrors α's archival posture and
 docs/legibility/design-invariants.md INV-4 loud-over-silent). Every dropped
 dir and a summary count are logged with a stable greppable ``gc_agent_transcripts:``
-prefix; a per-dir ``shutil.rmtree`` failure is logged at WARNING and counted
-while its siblings are still pruned; the run always exits 0. An empty or absent
+prefix; a count-cap bind that truncates the age window is a distinct WARNING
+plus a ``count_cap`` block in the report rather than a silent prune; a per-dir
+``shutil.rmtree`` failure is logged at WARNING and counted while its siblings
+are still pruned; the run always exits 0. An empty or absent
 archive root is a no-op.
 
 Usage
@@ -656,6 +671,20 @@ def build_gc_report(
     }
 
 
+def _fmt_days(value: float | None) -> str:
+    """Render an age in days for the operator log, tolerating a missing one.
+
+    The count-cap alarm must never be the thing that breaks this module's
+    never-raise / always-exit-0 contract. ``bound`` is derived from the prune
+    REASONS, while the ages come from joining those paths back to their scanned
+    mtimes, so a caller that hand-builds a mismatched decision can be bound with
+    no age to report. That is a programming error rather than an operational
+    one — but the right response is to say ``unknown`` LOUDLY, not to crash and
+    not to fall silent about a truncated retention window.
+    """
+    return 'unknown' if value is None else f'{value:.1f}'
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the sweep: scan → classify → prune (or dry-run), report, exit 0.
 
@@ -663,6 +692,10 @@ def main(argv: list[str] | None = None) -> int:
     LOUD summary on stderr carry the signal (including any per-dir failures);
     the process always exits 0 so a cron/watchdog hook does not alarm on routine
     per-dir hiccups. ``--check`` never deletes.
+
+    A count-cap bind additionally raises a distinct ``COUNT CAP BOUND``
+    WARNING, read STRAIGHT OFF the report block so the human line and the
+    machine-readable one cannot drift.
     """
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args(argv)
@@ -684,6 +717,41 @@ def main(argv: list[str] | None = None) -> int:
         check=args.check,
     )
     print(json.dumps(report))
+
+    # LOUD on the operator-facing channel when the count axis truncated the
+    # retention window. Reads the report block rather than recomputing it, so
+    # the log line and the JSON can never disagree (INV-5: one derivation
+    # site). Emitted in a dry-run too — --check is precisely when an operator
+    # wants to hear that the cap is about to bite.
+    #
+    # WORDING IS CONSTRAINED, not free prose: this line must not contain the
+    # substring 'pruned task dir' or 'would prune', because those are the
+    # greppable markers of the per-removal and dry-run lines above. An alarm
+    # that collides with them silently inflates any count an operator (or a
+    # test) derives by grepping for them — an earlier draft read
+    # 'count-pruned task dirs' and did exactly that. Both exclusions are
+    # pinned by tests.
+    count_cap = report['count_cap']
+    if count_cap['bound']:
+        logger.warning(
+            '%s COUNT CAP BOUND — max_task_dirs=%d dropped %d of %d '
+            'count-axis drops that the age policy would have KEPT '
+            '(kept=%d): the count axis prunes oldest-first, so the effective '
+            'retention window is now %s days (oldest drop was %s days old) '
+            'against max_age_days=%d. RE-DERIVE the cap as max_age_days x the '
+            'observed peak daily arrival rate x a safety factor (see '
+            'gc_agent_transcripts.required_max_task_dirs) and raise every '
+            'lock-step site in ONE commit — ruling: '
+            'plans/transcript-preservation-seam-prd.md D8.',
+            _LOG_PREFIX,
+            count_cap['max_task_dirs'],
+            count_cap['truncated'],
+            count_cap['pruned'],
+            report['kept'],
+            _fmt_days(count_cap['effective_window_days']),
+            _fmt_days(count_cap['oldest_dropped_age_days']),
+            args.max_age_days,
+        )
 
     logger.info(
         '%s sweep complete — root=%s scanned=%d kept=%d pruned=%d removed=%d '

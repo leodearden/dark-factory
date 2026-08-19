@@ -826,7 +826,7 @@ def test_max_task_dirs_is_derived_from_live_archive_rate():
         rate.peak_per_day, gct.DEFAULT_MAX_AGE_DAYS, gct.RETENTION_SAFETY_FACTOR
     )
 
-    assert gct.DEFAULT_MAX_TASK_DIRS >= required, (
+    assert required <= gct.DEFAULT_MAX_TASK_DIRS, (
         "retention count cap is too small for the archive's MEASURED "
         "throughput: it will prune oldest-first and silently truncate the "
         f"{gct.DEFAULT_MAX_AGE_DAYS}-day retention window.\n"
@@ -1142,6 +1142,13 @@ def test_cli_count_cap_bind_is_loud_and_carries_the_same_numbers(tmp_path):
     # test_cli_count_cap_prunes_oldest_over_cap asserts 'would prune' is absent
     # from a REAL run's stderr and must keep passing unmodified.
     assert "would prune" not in alarm
+    # ...and it is not a per-removal line either. 'pruned task dir' is the
+    # greppable marker of the per-dir removal log, which the E8 boundary gate
+    # counts by grepping for it. An alarm carrying that substring silently
+    # inflates that count by one — an earlier draft read 'count-pruned task
+    # dirs' and broke the gate exactly this way. The alarm must be greppable
+    # as ITSELF, never as one of the lines it sits beside.
+    assert "pruned task dir" not in alarm
 
 
 def test_cli_age_only_prune_is_not_a_count_cap_alarm(tmp_path):
