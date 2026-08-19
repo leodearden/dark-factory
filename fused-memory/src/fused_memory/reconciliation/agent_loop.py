@@ -57,6 +57,44 @@ CLAUDE_CLI_RESPONSE_SCHEMA = {
     'required': ['thinking', 'tool_calls'],
 }
 
+# max_turns for ONE reconciliation-agent CLI invocation.  This caps a SINGLE
+# assistant round-trip, NOT the conversation: AgentLoop.run() drives multi-turn
+# EXTERNALLY, calling _call_claude_cli once per outer step (bounded by
+# ``agent_max_steps``) and threading them with ``resume_session_id``.
+#
+# NOT 1.  The superseded comment here claimed the schema tool-use and the JSON
+# response "happen within the same turn when --json-schema is used", so one turn
+# sufficed.  That is measurably FALSE: the model emits a PROSE turn before it
+# calls ``StructuredOutput``, and a cap of 1 leaves no room for it — the CLI then
+# returns ``error_max_turns`` with NO structured payload attached, so the call
+# hard-fails (see the ``not result.success`` guard in _call_claude_cli).
+#
+# Measured (task 3241) on the REAL shape this module sends — EXPLORE_AGENT_SYSTEM_PROMPT
+# through _build_cli_system_prompt with verify.py's tools, plus
+# CLAUDE_CLI_RESPONSE_SCHEMA — against Claude CLI 2.1.236:
+#
+#     max_turns=1  ->  0/6 succeeded     max_turns=6  ->  4/6
+#     max_turns=3  ->  4/6               max_turns=10 ->  6/6
+#
+# mt=1 also measured 0/6 on the earlier CLI 2.1.233, so the result is stable
+# across CLI versions; the intermediate rates are not.  The failure is
+# STOCHASTIC and prompt-sensitive, not a fixed per-schema turn tax.
+#
+# Honest limit: 6 trials at mt=10 showed no failures, but cannot exclude a low
+# residual rate — one mt=10 failure was seen on 2.1.233.  This is a large
+# MEASURED improvement (0% -> 100% observed), not a reliability guarantee.  The
+# behaviour is CLI-version-dependent and will drift; re-measure with
+# fused-memory/scripts/probe_schema_max_turns.py rather than trusting this table.
+#
+# Raising the cap is free when unused: max_turns is a CEILING, not a target, and
+# spend stays bounded independently by cli_invoke's ``max_budget_usd`` and
+# ``agent_cli_timeout_seconds``.
+#
+# Failures fire at ``num_turns == max_turns + 1`` in every observed case — but do
+# NOT read that as "num_turns is the counter --max-turns bounds": successes were
+# measured reporting num_turns of 9, 11 and 14 at mt=10, so the two differ.
+_AGENT_CLI_MAX_TURNS = 10
+
 
 class CircuitBreakerError(Exception):
     """Raised when mutation count exceeds the per-stage limit."""
@@ -411,11 +449,11 @@ class AgentLoop:
                 mcp_config=no_mcp_servers_config(),
                 strict_mcp_config=True,
                 model=self.config.agent_llm_model,
-                # max_turns=1: AgentLoop.run() drives multi-turn externally by calling
-                # _call_claude_cli again with resume_session_id.  A single CLI
-                # invocation only needs one assistant turn (schema tool-use → JSON
-                # response happens within the same turn when --json-schema is used).
-                max_turns=1,
+                # See _AGENT_CLI_MAX_TURNS: this bounds ONE assistant round-trip
+                # (run() drives multi-turn externally via resume_session_id), and
+                # 1 is too few — it leaves no room for the prose turn the model
+                # emits before calling StructuredOutput.
+                max_turns=_AGENT_CLI_MAX_TURNS,
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.agent_cli_timeout_seconds),
                 resume_session_id=self._cli_session_id,
@@ -475,8 +513,13 @@ class AgentLoop:
             )
 
             if not result.success:
-                # schema_salvaged=True implies success=True (cli_invoke.py:749-751),
-                # so `not result.success` is the complete failure guard.
+                # schema_salvaged=True implies success=True (see the
+                # ``schema_salvaged`` assignment in cli_invoke's CLI result
+                # parser), so `not result.success` is the complete failure guard.
+                # Salvage is NOT load-bearing here, though: measured (task 3241),
+                # an ``error_max_turns`` failure on this path carries no
+                # structured payload at all — 0 of 12 observed failures salvaged
+                # — so this guard is what actually fires, not a fallback.
                 raise RuntimeError(build_failure_message('Claude CLI agent', result))
         except Exception:
             # Clear stale session id so callers that retry don't --resume an abandoned session.
